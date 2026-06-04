@@ -3,6 +3,12 @@
 Copy this prompt into Claude, GPT, Codex, or another coding agent that has
 terminal access to the machine where Stitch should run.
 
+Coding agents (including Codex) often block `curl ... | sh` because the script is
+not inspected before execution. The prompt below forbids pipe-to-shell installs,
+downloads the release installer to disk first (so `stitch --update` keeps working),
+and documents a checksum-verified archive fallback when an agent will not run any
+installer script.
+
 ```text
 You are helping me install and configure Textile Stitch, the operator bot at:
 https://github.com/textile-protocol/textile-stitch
@@ -19,6 +25,9 @@ Hard rules:
   workspace or any operator workspace.
 - Do not build from source unless I explicitly request a source install.
 - Install only from the latest GitHub Release assets.
+- Never pipe a remote script into an interpreter. Forbidden patterns include
+  `curl ... | sh`, `curl ... | bash`, and `irm ... | iex`. Download release
+  assets to a local file first, then run or extract them from disk.
 - If release discovery, asset download, checksum verification, installer
   execution, config writing, secret writing, or dry run fails, stop and explain.
 - If the release installer URL in older docs is stale, discover the actual
@@ -125,34 +134,70 @@ Release install procedure:
 
 2. Determine the latest tag and available assets from the release metadata.
 
-3. Prefer a release installer asset in this order:
-   - Unix: stitch-bot-installer.sh, then stitch-installer.sh
-   - Windows: stitch-bot-installer.ps1, then stitch-installer.ps1
+3. Choose an install path:
 
-4. Run only the discovered latest-release installer URL.
+   A. Recommended (supports `stitch --update` later): run the release installer
+      from a downloaded local file. The cargo-dist installer writes an install
+      receipt that `stitch --update` requires. Do not use `curl | sh`.
 
-   Unix example:
+   B. Fallback (for strict agent safety policies that block any remote
+      installer script): install the matching release binary archive with
+      checksum verification. This path does not create an install receipt, so
+      `stitch --update` will not work until the operator runs path A once or
+      upgrades by repeating path B on each release.
 
-   curl --proto '=https' --tlsv1.2 -LsSf "<discovered-installer-url>" | sh
+4. Path A — installer from disk (Unix):
 
-   Windows example:
+   INSTALLER_URL="<discovered-installer-url>"
+   INSTALLER_PATH="$(mktemp -t stitch-installer.XXXXXX.sh)"
+   curl --proto '=https' --tlsv1.2 -fsSL "$INSTALLER_URL" -o "$INSTALLER_PATH"
+   chmod 700 "$INSTALLER_PATH"
+   sh "$INSTALLER_PATH"
+   rm -f "$INSTALLER_PATH"
 
-   powershell -ExecutionPolicy Bypass -c "irm '<discovered-installer-url>' | iex"
+   Pick the installer asset in this order:
+   - stitch-bot-installer.sh, then stitch-installer.sh
 
-5. If no installer asset exists, offer to install the matching release binary
-   archive asset instead:
+   Path A — installer from disk (Windows PowerShell):
+
+   $InstallerUrl = "<discovered-installer-url>"
+   $InstallerPath = Join-Path $env:TEMP "stitch-installer.ps1"
+   Invoke-WebRequest -Uri $InstallerUrl -OutFile $InstallerPath
+   powershell -ExecutionPolicy Bypass -File $InstallerPath
+   Remove-Item -Force $InstallerPath
+
+   Pick the installer asset in this order:
+   - stitch-bot-installer.ps1, then stitch-installer.ps1
+
+   If your environment still blocks executing a downloaded installer script,
+   stop and ask me to choose one of:
+   - I run the installer command myself in a normal terminal (paste the exact
+     `curl -o` + `sh` commands you prepared).
+   - You continue with path B (archive install; no `stitch --update` until I
+     run path A manually later).
+
+5. Path B — binary archive (when path A is blocked or I explicitly request it):
    - macOS Apple Silicon: *-aarch64-apple-darwin.tar.xz
    - macOS Intel: *-x86_64-apple-darwin.tar.xz
    - Linux ARM64: *-aarch64-unknown-linux-gnu.tar.xz
    - Linux x64: *-x86_64-unknown-linux-gnu.tar.xz
    - Windows x64: *-x86_64-pc-windows-msvc.zip
 
-6. If using a binary archive, download its matching .sha256 asset, verify the
-   checksum, extract, install the binary, and ensure stitch is on PATH.
+   Download the archive and its matching .sha256 asset, verify the checksum,
+   extract, copy `stitch` (or `stitch.exe`) into a directory on PATH (release
+   builds use the cargo-dist install path, typically `~/.cargo/bin` on Unix),
+   and ensure the binary is executable.
 
-7. Verify:
+6. Verify:
 
    stitch --version
+
+   Optional: confirm self-update will work:
+
+   stitch --update
+
+   If that errors with "no install receipt found", explain that path B was used
+   and offer path A (installer from disk) or a manual re-run of the installer.
 
 If stitch is not on PATH, locate the installed release binary and use its
 absolute path.

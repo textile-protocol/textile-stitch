@@ -214,12 +214,12 @@ sell_max_orders = 150
 
 Amounts are atomic token units. For a 6-decimal token:
 
-| Human amount | Atomic value |
-| ---: | ---: |
-| 10 | `10000000` |
-| 100 | `100000000` |
-| 1,000 | `1000000000` |
-| 50,000 | `50000000000` |
+| Human amount |  Atomic value |
+| -----------: | ------------: |
+|           10 |    `10000000` |
+|          100 |   `100000000` |
+|        1,000 |  `1000000000` |
+|       50,000 | `50000000000` |
 
 The buy side spends the `debt` token. The sell side spends the `collateral`
 token.
