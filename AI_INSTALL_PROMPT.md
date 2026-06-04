@@ -61,8 +61,13 @@ Question tool rules:
 - Make every question multiple choice. Pass an options array of concrete,
   tappable choices so I can pick instead of type. Phrase the question in plain
   language and add one short sentence on why it matters.
+- Offer at most 3 options per question. Some equivalents (Codex's
+  request_user_input) only accept 2-3 choices and add the free-form answer
+  themselves, so more than 3 can fail to render or fall back to chat. If there
+  are more than 3 good choices, show the top 3 (recommended first) and put the
+  rest behind the free-form answer or a follow-up question.
 - Put the recommended value first and label it "(recommended)". For numeric
-  settings, offer a few sensible presets around the default (see each step
+  settings, offer a couple of sensible presets around the default (see each step
   below). For values with no good presets (URLs, addresses), still offer the
   known or discovered value as an option when you have one.
 - The tool adds a free-form answer automatically, so I can always type a custom
@@ -80,11 +85,12 @@ Skip a step only when discovery or defaults already fixed the value and you
 only need a quick confirm question for that step.
 
 1. Chain — which network should Stitch run on?
-   - Options (recommended first): Base — 8453; BNB Smart Chain — 56;
-     Ethereum — 1; Celo — 42220; Local Hardhat — 31337. Only include a public
-     chain if it's listed on https://app.textilecredit.com/s/deposit; Local
-     Hardhat is for debugging. For anything else I'll type a custom chain ID in
-     the free-form answer.
+   - Options (3 max): Base — 8453 (recommended); Local Hardhat — 31337 (for
+     debugging); Another network. If I pick "Another network", ask a follow-up
+     with the other supported chains as options (BNB Smart Chain — 56;
+     Ethereum — 1; Celo — 42220), and only list a public chain if it's on
+     https://app.textilecredit.com/s/deposit. For anything else I'll type a
+     custom chain ID in the free-form answer.
    - After I answer, set chain_id and RPC URL: Base -> https://mainnet.base.org,
      31337 -> http://127.0.0.1:8545. For other chains, ask a follow-up RPC URL
      question if you don't know the right default. On 31337, skip public catalog
@@ -109,10 +115,11 @@ only need a quick confirm question for that step.
    chain as an option if you have one; otherwise I'll paste it in the free-form
    answer.
 
-6. Pool — after discovery, present each pool as an option (display name or pair
-   label, recommended = first listed) so I pick a row instead of typing an
-   address. If discovery returned nothing on a real chain, stop; on 31337 use
-   the local-address flow.
+6. Pool — after discovery, present pools as options (display name or pair label,
+   recommended = first listed) so I pick a row instead of typing an address.
+   Show at most 3; if there are more, show the first 3 and let me name another
+   via the free-form answer. If discovery returned nothing on a real chain,
+   stop; on 31337 use the local-address flow.
 
 Market-making setup (steps 7-12 all have safe defaults). To avoid a long quiz,
 ask one gate question first:
@@ -125,22 +132,22 @@ For steps 7-12, present the presets below (recommended first); I can also type a
 custom value in the free-form answer.
 
 7. Buy spread (bps below mid).
-   - Options: 150 / 1.5% (recommended); 100 / 1.0%; 200 / 2.0%; 300 / 3.0%.
+   - Options: 150 / 1.5% (recommended); 100 / 1.0%; 200 / 2.0%.
 
 8. Sell spread (bps above mid).
-   - Options: 150 / 1.5% (recommended); 100 / 1.0%; 200 / 2.0%; 300 / 3.0%.
+   - Options: 150 / 1.5% (recommended); 100 / 1.0%; 200 / 2.0%.
 
 9. Buy-side total liquidity (human amount, debt/stable token).
-   - Options: 50000 (recommended); 10000; 100000; 250000.
+   - Options: 50000 (recommended); 10000; 100000.
 
 10. Sell-side total liquidity (human amount, collateral/soft token).
-    - Options: 50000 (recommended); 10000; 100000; 250000.
+    - Options: 50000 (recommended); 10000; 100000.
 
 11. Minimum order slice (human amount, debt/stable units).
-    - Options: 10 (recommended); 5; 25; 100.
+    - Options: 10 (recommended); 5; 25.
 
 12. Maximum ladder orders per side.
-    - Options: 150 (recommended); 50; 100; 300.
+    - Options: 150 (recommended); 50; 100.
 
 Use defaults without asking only for values not listed above (indexer URL,
 price feed URL, Permit2, tick interval, TTL, refresh threshold, platform paths)
