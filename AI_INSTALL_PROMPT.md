@@ -14,6 +14,14 @@ Goal:
 - Run a dry run first.
 - Start a persistent background service only after I confirm.
 
+Release rules:
+- Do not clone https://github.com/textile-protocol/textile-stitch into my
+  workspace or any operator workspace.
+- Install from the latest GitHub Release only. Do not build from source unless I
+  explicitly ask for a source install.
+- If a release installer or release asset download fails, stop and explain the
+  failure. Do not clone the repo as a fallback.
+
 Supported platforms:
 - Linux: install the release binary and configure a systemd service named stitch.
 - macOS: install the release binary and offer either a launchd service or a
@@ -110,9 +118,8 @@ Install instructions:
     https://github.com/textile-protocol/textile-stitch/releases/latest/download/stitch-installer.sh | sh
 - On Windows PowerShell, install with:
   powershell -ExecutionPolicy Bypass -c "irm https://github.com/textile-protocol/textile-stitch/releases/latest/download/stitch-installer.ps1 | iex"
-- If the installer does not put stitch on PATH, locate the installed binary or
-  download the correct binary from the latest GitHub Release and place it in a
-  standard user-accessible binary directory.
+- If the installer does not put stitch on PATH, locate the installed binary from
+  the release install and add that directory to PATH.
 
 Configuration instructions:
 1. Download the example config from:

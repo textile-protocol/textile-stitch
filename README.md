@@ -41,9 +41,11 @@ Use this short prompt to begin:
 Help me install and configure Textile Stitch:
 https://github.com/textile-protocol/textile-stitch
 
-Use the full install prompt in AI_INSTALL_PROMPT.md. Use recommended defaults
-where safe, ask for values with no safe default, protect STITCH_PRIVATE_KEY, run
-a dry run first, and do not start live operation until I confirm.
+Use the full install prompt at
+https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/AI_INSTALL_PROMPT.md.
+Use recommended defaults where safe, ask for values with no safe default, protect
+STITCH_PRIVATE_KEY, run a dry run first, and do not start live operation until I
+confirm.
 ```
 
 For the full copyable prompt, open [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
