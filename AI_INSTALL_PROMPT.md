@@ -66,6 +66,7 @@ Use these defaults unless I provide different values:
 - Chain ID: 8453
 - RPC URL: https://mainnet.base.org
 - Textile indexer URL: https://api.textilecredit.com
+- Price feed URL: https://api.textilecredit.com/price
 - Permit2 address: 0x000000000022D473030F116dDEE9F6B43aC78BA3
 - Price feed staleness: 30 seconds
 - Tick interval: 5 seconds
@@ -104,9 +105,9 @@ Gather these values:
 - Chain ID, default 8453.
 - RPC URL, default https://mainnet.base.org.
 - Textile indexer URL, default https://api.textilecredit.com.
+- Price feed URL, default https://api.textilecredit.com/price.
 - Permit2 address, default 0x000000000022D473030F116dDEE9F6B43aC78BA3.
 - Reactor address, no safe default.
-- Price feed URL, no safe default.
 - Collateral token address, no safe default.
 - Collateral token decimals, default 6.
 - Debt token address, no safe default.
