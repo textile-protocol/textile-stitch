@@ -58,14 +58,18 @@ Question tool rules:
 - Before the first question, tell me in one line what you're setting up and
   roughly how many questions to expect. Prefix each question with progress like
   "(3 of ~9)" so I know where I am.
-- Phrase each question in plain language and add one short sentence on why it
-  matters. Put the recommended value first in the options and label it
-  "(recommended)". Keep options short and concrete.
-- For free-form values (RPC URL, reactor address, liquidity amounts), offer the
-  recommended value as an option and let me type a custom value through the
-  tool's built-in free-form answer. Do not invent your own "Other" option; the
-  tool already adds one.
-- These are single-choice questions. Do not enable multi-select.
+- Make every question multiple choice. Pass an options array of concrete,
+  tappable choices so I can pick instead of type. Phrase the question in plain
+  language and add one short sentence on why it matters.
+- Put the recommended value first and label it "(recommended)". For numeric
+  settings, offer a few sensible presets around the default (see each step
+  below). For values with no good presets (URLs, addresses), still offer the
+  known or discovered value as an option when you have one.
+- The tool adds a free-form answer automatically, so I can always type a custom
+  value (custom chain ID, RPC URL, address, amount). Don't add your own "Other"
+  option and don't drop to plain chat for anything the tool can ask.
+- Keep questions single-select unless a step explicitly says I may pick several;
+  don't enable multi-select otherwise.
 - Never ask for STITCH_PRIVATE_KEY through a question tool or chat.
 - If no question tool exists, ask the same sequence as concise chat questions,
   still one at a time, with the same progress and recommended-first style.
@@ -75,62 +79,68 @@ Run this sequence after detecting OS/architecture and before writing config.
 Skip a step only when discovery or defaults already fixed the value and you
 only need a quick confirm question for that step.
 
-1. Chain — confirm the network Stitch should run on.
-   - Recommended option: Base (chain ID 8453).
-   - Other options you may include if supported on
-     https://app.textilecredit.com/s/deposit: BNB Smart Chain (56),
-     Ethereum (1), or Celo (42220). For any other chain, let me type the chain
-     ID through the tool's free-form answer.
-   - Local debugging: if I say I'm running against my local Hardhat chain, use
-     chain ID 31337 with RPC URL http://127.0.0.1:8545 (do not use the public
-     deposit catalog for discovery on this chain; I'll provide local pool and
-     token addresses, or you read them from local deploy output).
-   - After I answer, set chain_id and RPC URL. For Base use
-     https://mainnet.base.org unless I override. For chain 31337 use
-     http://127.0.0.1:8545. For other chains, ask a follow-up question for RPC
-     URL if you do not know the correct default.
+1. Chain — which network should Stitch run on?
+   - Options (recommended first): Base — 8453; BNB Smart Chain — 56;
+     Ethereum — 1; Celo — 42220; Local Hardhat — 31337. Only include a public
+     chain if it's listed on https://app.textilecredit.com/s/deposit; Local
+     Hardhat is for debugging. For anything else I'll type a custom chain ID in
+     the free-form answer.
+   - After I answer, set chain_id and RPC URL: Base -> https://mainnet.base.org,
+     31337 -> http://127.0.0.1:8545. For other chains, ask a follow-up RPC URL
+     question if you don't know the right default. On 31337, skip public catalog
+     discovery and use local pool/token addresses (see discovery section).
 
-2. Run mode — persistent background service vs manual foreground.
-   - Recommended: foreground/manual on macOS and Windows; systemd on Linux.
+2. Run mode — how should Stitch run? Offer the choices for my OS, recommended
+   first:
+   - macOS: Foreground / manual; launchd background service.
+   - Linux: systemd service; Foreground / manual.
+   - Windows: Foreground / manual; Task Scheduler; Windows service.
 
-3. Settlement closing — enable blue-leg closing or market-making only?
-   - Recommended: disabled (market-making only).
+3. Settlement closing — what should Stitch do?
+   - Options: Market-making only (recommended); Enable blue-leg closing too.
 
-4. If closing is enabled — ask for the subgraph URL now (it's independent of
-   pool discovery). Defer the closer params (floor_ray, buffer_ray, window):
-   pull them from pool discovery in step 6, and only ask for any value still
-   missing from GraphQL, one question each.
+4. If closing is enabled — ask for the subgraph URL (offer the known Goldsky
+   subgraph for my chain as an option if you have it, otherwise free-form). It's
+   independent of pool discovery. Defer the closer params (floor_ray, buffer_ray,
+   window): pull them from pool discovery in step 6, and only ask for any value
+   still missing from GraphQL, one question each.
 
-5. Reactor address — no safe default; ask explicitly.
+5. Reactor address — no safe default. Offer the known filler reactor for my
+   chain as an option if you have one; otherwise I'll paste it in the free-form
+   answer.
 
-6. Pool discovery — query the deposit catalog for my confirmed chain ID (see
-   below), show the table, then ask which pool to operate on (recommended =
-   first listed pool or the one I name).
+6. Pool — after discovery, present each pool as an option (display name or pair
+   label, recommended = first listed) so I pick a row instead of typing an
+   address. If discovery returned nothing on a real chain, stop; on 31337 use
+   the local-address flow.
 
 Market-making setup (steps 7-12 all have safe defaults). To avoid a long quiz,
 ask one gate question first:
    "Use the recommended market-making defaults (150 bps each side, 50000 per
    side, 10 min slice, 150 max orders), or set each value yourself?"
-   - Recommended: Use the defaults — then skip steps 7-12.
-   - Customize — then ask steps 7-12 below, one at a time.
+   - Options: Use the defaults (recommended) — skip steps 7-12; Customize — ask
+     steps 7-12 one at a time.
 
-7. Buy spread — basis points below mid for the buy side.
-   - Recommended: 150 bps.
+For steps 7-12, present the presets below (recommended first); I can also type a
+custom value in the free-form answer.
 
-8. Sell spread — basis points above mid for the sell side.
-   - Recommended: 150 bps.
+7. Buy spread (bps below mid).
+   - Options: 150 / 1.5% (recommended); 100 / 1.0%; 200 / 2.0%; 300 / 3.0%.
 
-9. Buy-side total liquidity — human amount in the debt/stable token.
-   - Recommended: 50000.
+8. Sell spread (bps above mid).
+   - Options: 150 / 1.5% (recommended); 100 / 1.0%; 200 / 2.0%; 300 / 3.0%.
 
-10. Sell-side total liquidity — human amount in the collateral/soft token.
-    - Recommended: 50000.
+9. Buy-side total liquidity (human amount, debt/stable token).
+   - Options: 50000 (recommended); 10000; 100000; 250000.
 
-11. Minimum order slice — human amount in debt/stable units.
-    - Recommended: 10.
+10. Sell-side total liquidity (human amount, collateral/soft token).
+    - Options: 50000 (recommended); 10000; 100000; 250000.
+
+11. Minimum order slice (human amount, debt/stable units).
+    - Options: 10 (recommended); 5; 25; 100.
 
 12. Maximum ladder orders per side.
-    - Recommended: 150.
+    - Options: 150 (recommended); 50; 100; 300.
 
 Use defaults without asking only for values not listed above (indexer URL,
 price feed URL, Permit2, tick interval, TTL, refresh threshold, platform paths)
@@ -187,6 +197,14 @@ The public deposit picker at https://app.textilecredit.com/s/deposit lists the
 same settlement pools Stitch can quote. Propose to query that catalog for me
 instead of guessing addresses.
 
+Local Hardhat chain (31337) — skip catalog discovery entirely. The public
+deposit catalog only lists production chains, so chain 31337 will always come
+back empty; do not query it and do not treat the empty result as a failure.
+Instead get pool and token addresses from local deploy output (for example a
+deployments/addresses file, broadcast/run-latest.json from the deploy script, or
+the addresses the deploy printed), or ask me for them one at a time via
+AskUserQuestion. Then continue to the pool pick (step 6) as usual.
+
 Preferred — GraphQL (same data as the deposit page):
 1. POST to https://app.textilecredit.com/api/graphql with Content-Type:
    application/json.
@@ -231,8 +249,10 @@ Fallback — browse the deposit page:
   or ask me to confirm after you show the table from a successful query.
 
 If discovery returns no pools for my chain, stop and explain before writing
-config. If discovery succeeds, confirm the pool via AskUserQuestion rather
-than asking me to re-type addresses.
+config — unless I'm on chain 31337, where an empty catalog is expected and you
+should use the local-address flow above instead of stopping. If discovery
+succeeds, confirm the pool via AskUserQuestion rather than asking me to re-type
+addresses.
 
 Token decimals after discovery:
 - Default 6 for both tokens when symbols look like USDT/USDC-style stables.
@@ -343,12 +363,32 @@ Configuration procedure:
 5. Restrict config file permissions:
    - Unix: config directory 700, config file 600.
 
-Private key collection:
-- Use a terminal-opening tool if available.
-- If an OpenTerminalTool, integrated terminal tool, or equivalent exists, open a
-  local terminal running the script below.
-- The script must prompt with hidden input.
-- Wait for me to complete it before continuing.
+Private key collection (needs a REAL interactive terminal):
+This step hides input, which needs a real TTY. Most coding agents do NOT have an
+interactive terminal in their own tool sandbox — running the script there just
+hangs or errors with "stty: stdin isn't a terminal" and I never see a prompt.
+Do not announce that you launched a TTY unless keystrokes actually reach the
+script. Pick the first option that genuinely gives a TTY:
+
+1. If you have a tool that opens a real interactive terminal, run the script
+   there and wait for me to finish.
+2. macOS without such a tool — open my Terminal.app on a saved script:
+
+     KEY_SCRIPT="$(mktemp -t stitch-key.XXXXXX.sh)"
+     cat > "$KEY_SCRIPT" <<'EOF'
+     <paste the Unix script below>
+     EOF
+     chmod 700 "$KEY_SCRIPT"
+     open -a Terminal "$KEY_SCRIPT"
+
+   Tell me to type the key in the Terminal window that opens, then wait. Remove
+   the script after I confirm the env file exists.
+3. If you cannot open any terminal, print the commands for me to paste into my
+   own terminal. Make the line that RUNS the script the last line you give me,
+   so the hidden prompt reads my keystrokes and not the rest of the paste.
+
+The script reads from /dev/tty (not piped stdin) so it works under `open -a
+Terminal` and when pasted. Do not proceed until I confirm the env file exists.
 
 Unix and macOS private-key script:
 
@@ -361,11 +401,11 @@ Unix and macOS private-key script:
    mkdir -p "$CONFIG_DIR"
    chmod 700 "$CONFIG_DIR"
 
-   printf 'Enter STITCH_PRIVATE_KEY: '
-   stty -echo
-   IFS= read -r key
-   stty echo
-   printf '\n'
+   printf 'Enter STITCH_PRIVATE_KEY: ' > /dev/tty
+   stty -echo < /dev/tty
+   IFS= read -r key < /dev/tty
+   stty echo < /dev/tty
+   printf '\n' > /dev/tty
 
    if [ -z "$key" ]; then
      echo "No private key entered; not writing env file."
@@ -377,12 +417,7 @@ Unix and macOS private-key script:
    unset key
    chmod 600 "$ENV_FILE"
 
-   echo "Wrote $ENV_FILE with restricted permissions."
-
-If no terminal-opening tool is available:
-- Try running an interactive TTY command.
-- If that is not possible, print the script for me to run manually.
-- Do not proceed until I confirm the env file has been created.
+   echo "Wrote $ENV_FILE with restricted permissions." > /dev/tty
 
 Windows PowerShell private-key script:
 
@@ -452,9 +487,12 @@ Show me a short summary:
 - Dry-run result.
 
 Then use AskUserQuestion for explicit confirmation before any live or
-persistent operation (foreground live run, launchd, systemd, Task Scheduler,
-Windows service, or similar). Do not start until I confirm after a successful
-dry run.
+persistent operation. Make it multiple choice, recommended first:
+   - Not yet — review the summary first (recommended).
+   - Start a foreground live run.
+   - Install and start the background service I picked (launchd / systemd / Task
+     Scheduler / Windows service).
+Do not start until I pick a start option after a successful dry run.
 
 Service setup after confirmation only:
 - macOS: If I choose launchd, create a LaunchAgent plist that runs
