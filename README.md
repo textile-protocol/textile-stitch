@@ -16,6 +16,78 @@ You can run either job by itself, or both jobs together for the same pool.
 
 ## Quick Start
 
+The recommended way to install Stitch is to give the following prompt to the
+Claude, GPT, or Codex agent that has terminal access to the server where Stitch
+will run.
+
+```text
+You are helping me install and configure Textile Stitch, the operator bot at
+https://github.com/textile-protocol/textile-stitch.
+
+Goal:
+- Install the latest Stitch release.
+- Create /etc/stitch/stitch.toml from the public example config.
+- Create /etc/stitch/stitch.env for secrets.
+- Configure Stitch to run as a systemd service.
+- Run a dry run first, then start the service only after I confirm.
+
+Security rules:
+- Do not ask me to paste my private key into chat.
+- When a private key is needed, give me a local terminal command that prompts
+  for it without echoing, writes it to /etc/stitch/stitch.env, and chmods the
+  file 600.
+- Keep the private key out of stitch.toml, shell history, logs, and command
+  arguments.
+
+Use these defaults unless I provide different values:
+- Binary name: stitch
+- Config path: /etc/stitch/stitch.toml
+- Env path: /etc/stitch/stitch.env
+- Service name: stitch
+- GitHub repo: textile-protocol/textile-stitch
+
+Before editing files, ask me for:
+- chain ID
+- RPC URL
+- Textile indexer URL
+- Permit2 address
+- reactor address
+- price feed URL
+- collateral token address and decimals
+- debt token address and decimals
+- buy/sell spread and order sizing
+- whether settlement closing should be enabled
+- if closing is enabled: subgraph URL, settlement pool address, floor_ray,
+  buffer_ray, window_secs, min margin, and max positions per fill
+
+Install steps to perform:
+1. Install the latest release:
+   curl --proto '=https' --tlsv1.2 -LsSf \
+     https://github.com/textile-protocol/textile-stitch/releases/latest/download/stitch-installer.sh | sh
+2. Ensure stitch is on PATH, or install the binary to /usr/local/bin/stitch.
+3. Download the example config:
+   curl -L -o /tmp/stitch.example.toml \
+     https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
+4. Create /etc/stitch/stitch.toml from that example using my values.
+5. Create /etc/stitch/stitch.env using a local hidden prompt for STITCH_PRIVATE_KEY.
+6. Download and install the systemd unit:
+   curl -L -o /tmp/stitch.service \
+     https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/deploy/stitch.service
+7. Run:
+   stitch --config /etc/stitch/stitch.toml --dry-run
+8. Show me the dry-run output summary and ask before starting the service.
+9. If I confirm, run:
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now stitch
+   journalctl -u stitch -f
+
+If anything fails, stop and explain the failure before retrying.
+```
+
+For troubleshooting and operational checks, see [DEBUGGING.md](DEBUGGING.md).
+
+## Manual Install
+
 Install the latest release:
 
 ```bash
@@ -54,8 +126,6 @@ Run live:
 ```bash
 stitch --config stitch.toml
 ```
-
-For troubleshooting and operational checks, see [DEBUGGING.md](DEBUGGING.md).
 
 ## How It Works
 
@@ -239,7 +309,7 @@ sudo install -m 0755 "$(command -v stitch)" /usr/local/bin/stitch
 sudo mkdir -p /etc/stitch
 sudo install -m 0644 stitch.toml /etc/stitch/stitch.toml
 sudo install -m 0600 stitch.env /etc/stitch/stitch.env
-sudo install -m 0644 deploy/stitch.service /etc/systemd/system/stitch.service
+sudo install -m 0644 stitch.service /etc/systemd/system/stitch.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now stitch
 ```
