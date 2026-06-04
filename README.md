@@ -2,163 +2,265 @@
 
 # Stitch
 
-Stitch is the Textile filler-network operator bot (binary: `stitch`). It
-market-makes the Settlement pairs:
+Stitch is the Textile operator bot for filler-network market making and
+settlement closing. It runs as a single binary named `stitch`.
 
-- **Green leg (two-sided)** — keeps live, funded UniswapX LimitOrders in the
-  off-chain order book on _both_ sides of each pair: a **bid** (buy cNGN below
-  the mid — "buy low") and an **ask** (sell cNGN above the mid — "sell high").
-  A `/s/trade` sell fills against these via the reactor's `executeBatch`. The
-  bid serves a trader selling cNGN; the ask serves a trader selling USDT (the
-  reverse direction). Each side is independent — run one or both.
-- **Blue leg** — closes settlement auction positions on-chain via `pool.fill()`
-  to earn the closer fee (enabled per pool when `closer_pool` + `subgraph_url`
-  are set).
+Stitch can do two jobs:
 
-Each side's spread is the operator's strategy, expressed however they prefer:
-`*_offset_bps` (relative basis points) or `*_offset_abs` (absolute, in the
-soft-per-stable price — collateral per debt, e.g. cNGN/USDT, COPM/USDT — so it
-works for any pair). The bid needs the operator funded in the stable (USDT) with
-a Permit2 approval on it; the ask needs the soft asset (cNGN) approved instead.
+- **Market making**: keep live buy and sell quotes for a configured
+  soft-asset/stablecoin pair.
+- **Settlement closing**: close eligible settlement auction positions on-chain
+  when the configured margin rules are met.
 
-The wallet key is never in the config — pass `STITCH_PRIVATE_KEY` in the env.
-See `stitch.example.toml` for every field.
+You can run either job by itself, or both jobs together for the same pool.
 
-## Install & run (operators)
+## Quick Start
 
-The bot is a single binary. It reads `stitch.toml` fresh on every start (change
-the file, restart, new values apply — there's no hot reload), takes the wallet
-key from `STITCH_PRIVATE_KEY`, and traps `SIGTERM`/Ctrl-C to exit cleanly after
-the current tick.
+Install the latest release:
 
 ```bash
-STITCH_PRIVATE_KEY=0x... stitch --config stitch.toml
-STITCH_PRIVATE_KEY=0x... stitch --config stitch.toml --dry-run   # sign + log, don't post
-stitch --version    # print version
-stitch --update     # self-update to the latest release
-stitch --help
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/textile-protocol/textile-stitch/releases/latest/download/stitch-installer.sh | sh
 ```
 
-### Linux server (systemd)
-
-Run it as a service so it restarts on crash and on reboot, with the key in a
-mode-600 `EnvironmentFile` rather than the unit. See `deploy/stitch.service`
-and `deploy/stitch.env.example` — the unit header has the copy-paste install
-steps. Logs go to `journalctl -u stitch -f`; a config change is
-`sudo systemctl restart stitch`.
-
-### Windows
-
-Drop `stitch.exe` next to `stitch.toml`, set the key, and run it:
-
-```powershell
-$env:STITCH_PRIVATE_KEY="0x..."
-.\stitch.exe --config stitch.toml
-```
-
-To keep it running across reboots, register it as a Windows service with
-[NSSM](https://nssm.cc) (`nssm install stitch`) or a Task Scheduler entry
-set to run at startup. Set `STITCH_PRIVATE_KEY` as the service/user environment
-variable, not on the command line.
-
-## Upgrading
-
-`stitch --update` checks the latest GitHub release and replaces the binary
-in place. It only works for a binary installed via the release installer (it
-reads the install receipt) — a `cargo build` binary has no receipt and prints a
-clear message instead. On startup the bot also logs a one-line nudge when a
-newer release exists, so operators know without having to check.
-
-Under systemd, `--update` swaps the binary; `sudo systemctl restart stitch`
-picks it up. (Releases and the one-line install/update scripts are produced by
-the `dist` release workflow — see the build/release setup before the first tag.)
-
-## Source sync and releases
-
-The monorepo is the source of truth while the public repository at
-`textile-protocol/textile-stitch` is the distribution mirror. Changes merged to the
-monorepo `dev` branch under `packages/stitch-bot/**` run
-`.github/workflows/sync-stitch.yml`, which tests the crate, creates a source
-export artifact, and pushes the flattened package to the public repo.
-
-The sync workflow needs a monorepo secret named `STITCH_SYNC_TOKEN`. Use a
-GitHub App token or PAT with write access to `textile-protocol/textile-stitch`;
-because the export includes `.github/workflows/**`, the token also needs
-workflow-write permission (`workflow` scope for a classic PAT).
-
-Do not edit generated mirror files directly in `textile-protocol/textile-stitch`.
-Make changes here, merge them to `dev`, and let the sync workflow update the
-public repo. The public repo then runs its own CI on `main` and uploads a Linux
-binary artifact for each synced change. To publish operator-facing binaries,
-tag the synced public repo commit with a version such as `v0.1.0`; that runs the
-cargo-dist release workflow and publishes the binaries and installers that power
-`stitch --update`.
-
-## Run against the local chain (e2e)
-
-The local Docker stack runs Stitch by default:
+Make sure the install directory is on your `PATH`, then check the binary:
 
 ```bash
-docker compose -f docker/docker-compose.yml up
+stitch --version
 ```
 
-The app deploys the local chain, exposes prices at `/api/price`, and then the
-`stitch` service starts. `run-local.mjs` funds **Hardhat account #1** on both
-tokens (mints + approves Permit2 on USDT for the bid and cNGN for the ask), so
-both sides post with no extra setup.
-
-One command from the repo root — it funds the operator, regenerates
-`stitch.local.toml` (one `[[pools]]` block per deployed corridor, each with its
-own `feed_url` pointed at `/api/price?pair=<key>`), waits for the app price
-endpoint, then runs the bot:
+Create a config file:
 
 ```bash
-node packages/stitch-bot/scripts/run-local.mjs
+cp stitch.example.toml stitch.toml
 ```
 
-The app endpoint serves `{ price, timestamp }` per corridor via `?pair=<key>`,
-read live from each corridor's on-chain oracle:
+Set the operator wallet key in the environment. Do not put the private key in
+`stitch.toml`.
 
 ```bash
-curl -s 'http://localhost:8916/api/price?pair=cngn-usdt'
+export STITCH_PRIVATE_KEY=0x...
 ```
 
-It quotes **all** the local corridors (cNGN/USDT, cNGN/USDC, COPM/USDT…), each
-priced off its own oracle — so every pair and direction on `/s/trade` has bids,
-not just cNGN/USDT. You'll see `posted order label="bid"` /
-`label="ask"` lines for each.
-
-> Local oracles other than cNGN/USDT have no keepalive job, so they go stale
-> after 30 min and their reads (the `/s/trade` rate and `/api/price`) start
-> reverting. `run-local.mjs` re-pushes every forward oracle at startup and every
-> 20 min to keep them warm.
-
-Both directions of any corridor have depth. Local depth is laddered by default:
-`TOTAL_ORDER_SIZE_USD` controls the per-side total and `MIN_ORDER_SIZE_USD`
-controls the smallest slice, defaulting to 20 and 10.
+Run once in dry-run mode before posting live orders:
 
 ```bash
-# forward (sell cNGN): collateralAsset=<cNGN>, debtAsset=<USDT> → the bid
-# reverse (sell USDT): collateralAsset=<USDT>, debtAsset=<cNGN> → the ask
-curl -s localhost:8916/api/graphql -H 'content-type: application/json' \
-  --data '{"query":"query{fillerOrderBook(chainId:31337,collateralAsset:\"<cNGN>\",debtAsset:\"<USDT>\"){inputToken outputToken inputAmount outputAmount rateRay}}"}'
+stitch --config stitch.toml --dry-run
 ```
 
-On `/s/trade`, **either direction** now fills: pick a **−1% / −2% / −5%** chip
-(the bot quotes 0.5% off the mid, so Market is just too strict) and enter a sell
-amount above the bid/ask size. The strip shows the fill; Confirm runs the swap.
-
-Knobs (env): `OFFSET_BPS` / `SELL_OFFSET_BPS` (the two spreads),
-`TOTAL_ORDER_SIZE_USD` (per-side depth), `MIN_ORDER_SIZE_USD` (smallest ladder
-slice), `MAX_LADDER_ORDERS`, `STITCH_PRIVATE_KEY`, `FEED_URL`, `INDEXER_URL`,
-`BLOCKCHAIN_RPC_URL`. `ORDER_SIZE_USD` is still accepted as a backwards-
-compatible alias for `TOTAL_ORDER_SIZE_USD`. The addresses rotate on every
-docker restart; `run-local.mjs` re-reads them each run, so just rerun it.
-
-## Tests
+Run live:
 
 ```bash
-cargo test --manifest-path packages/stitch-bot/Cargo.toml
-# on-chain tx submission against a local node (opt-in):
-cargo test --manifest-path packages/stitch-bot/Cargo.toml -- --ignored
+stitch --config stitch.toml
 ```
+
+For troubleshooting and operational checks, see [DEBUGGING.md](DEBUGGING.md).
+
+## How It Works
+
+Stitch reads `stitch.toml`, polls your configured price feed, signs UniswapX
+limit orders, and posts those signed orders to the Textile indexer. The wallet
+private key is read from `STITCH_PRIVATE_KEY`.
+
+For market making, each configured pool can have:
+
+- a **buy side**, where Stitch spends the stable/debt asset to buy the
+  soft/collateral asset below the feed price;
+- a **sell side**, where Stitch spends the soft/collateral asset to sell above
+  the feed price.
+
+For settlement closing, Stitch can also discover open positions through a
+subgraph and submit `fill()` transactions when a close is profitable under your
+configured margin and auction parameters.
+
+Stitch reads the config at startup. After changing `stitch.toml`, restart the
+process.
+
+## Requirements
+
+You need:
+
+- an operator wallet private key;
+- RPC access for the target chain;
+- Textile indexer URL;
+- a price feed endpoint returning fresh `{ "price": ..., "timestamp": ... }`;
+- the Permit2 and reactor addresses for the target chain;
+- funded token balances for the sides you enable;
+- Permit2 approvals for the tokens Stitch will spend;
+- a subgraph URL if you enable settlement closing.
+
+## Configuration
+
+Start from [stitch.example.toml](stitch.example.toml). A minimal market-making
+pool looks like this:
+
+```toml
+chain_id = 8453
+rpc_url = "https://mainnet.base.org"
+indexer_url = "https://api.textilecredit.com"
+permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor = "0x0000000000000000000000000000000000000000"
+tick_interval_secs = 5
+
+[feed]
+url = "https://your-feed.example/cngn-usdc"
+staleness_secs = 30
+
+[[pools]]
+collateral = "0xcngn0000000000000000000000000000000000c0"
+collateral_decimals = 6
+debt = "0xusdc0000000000000000000000000000000000d7"
+debt_decimals = 6
+
+buy_offset_bps = 150
+buy_total_liquidity_debt = "50000000000"
+buy_min_slice_debt = "10000000"
+buy_max_orders = 150
+
+sell_offset_bps = 150
+sell_total_liquidity_collateral = "50000000000"
+sell_min_slice_debt = "10000000"
+sell_max_orders = 150
+
+ttl_secs = 30
+refresh_threshold_bps = 10
+```
+
+### Price Feed
+
+The feed must return JSON with a price and Unix timestamp:
+
+```json
+{ "price": 1234.56, "timestamp": 1760000000 }
+```
+
+`price` is the soft-per-stable price for the pool, for example cNGN per USDC.
+If you quote multiple pairs with different prices, set a `feed_url` inside each
+`[[pools]]` block instead of relying on the top-level `[feed]`.
+
+### Spreads
+
+Each side needs one spread:
+
+```toml
+buy_offset_bps = 150
+sell_offset_bps = 150
+```
+
+or an absolute spread in soft-per-stable units:
+
+```toml
+buy_offset_abs = 2.0
+sell_offset_abs = 2.0
+```
+
+If both are set for a side, basis points win.
+
+### Liquidity And Order Sizing
+
+Stitch can post one order per side or a ladder of smaller orders. The example
+uses laddered liquidity:
+
+```toml
+buy_total_liquidity_debt = "50000000000"
+buy_min_slice_debt = "10000000"
+buy_max_orders = 150
+
+sell_total_liquidity_collateral = "50000000000"
+sell_min_slice_debt = "10000000"
+sell_max_orders = 150
+```
+
+Amounts are atomic token units. For a 6-decimal token:
+
+| Human amount | Atomic value |
+| ---: | ---: |
+| 10 | `10000000` |
+| 100 | `100000000` |
+| 1,000 | `1000000000` |
+| 50,000 | `50000000000` |
+
+The buy side spends the `debt` token. The sell side spends the `collateral`
+token.
+
+### Settlement Closing
+
+To enable settlement closing, add the closing fields to a pool and set the
+top-level `subgraph_url`:
+
+```toml
+subgraph_url = "https://api.goldsky.com/.../textile-protocol/gn"
+
+[[pools]]
+closer_pool = "0x0000000000000000000000000000000000000000"
+floor_ray = "20000000000000000000000000"
+buffer_ray = "20000000000000000000000000"
+window_secs = 432000
+min_margin_collateral = "0"
+max_positions_per_fill = 10
+discover_first = 200
+skip_past_window = true
+```
+
+Omit these fields to run market making only.
+
+## Running As A Service
+
+On Linux, run Stitch under systemd so it restarts after crashes and reboots.
+
+Create `/etc/stitch/stitch.env`:
+
+```bash
+STITCH_PRIVATE_KEY=0x...
+RUST_LOG=info
+```
+
+Install files:
+
+```bash
+sudo install -m 0755 "$(command -v stitch)" /usr/local/bin/stitch
+sudo mkdir -p /etc/stitch
+sudo install -m 0644 stitch.toml /etc/stitch/stitch.toml
+sudo install -m 0600 stitch.env /etc/stitch/stitch.env
+sudo install -m 0644 deploy/stitch.service /etc/systemd/system/stitch.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now stitch
+```
+
+View logs:
+
+```bash
+journalctl -u stitch -f
+```
+
+Restart after config changes:
+
+```bash
+sudo systemctl restart stitch
+```
+
+## Updating
+
+If Stitch was installed from the release installer, update the binary in place:
+
+```bash
+stitch --update
+```
+
+Then restart the service:
+
+```bash
+sudo systemctl restart stitch
+```
+
+You can also download a new binary or installer from the latest GitHub Release.
+
+## Security Notes
+
+- Keep `STITCH_PRIVATE_KEY` out of `stitch.toml`, shell history, and process
+  managers that expose command lines.
+- Use a dedicated operator wallet.
+- Fund only the inventory you intend Stitch to use.
+- Review token balances, Permit2 approvals, spreads, and order sizes before
+  running live.
+- Use `--dry-run` after every config change that affects pricing or sizing.
