@@ -209,6 +209,7 @@ Omit these fields to run market making only.
 
 On Linux, run Stitch under systemd so it restarts after crashes and reboots.
 
+<<<<<<< HEAD
 Create local config and environment files:
 
 ```bash
@@ -222,6 +223,13 @@ EOF
 
 curl -L -o stitch.service \
   https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/deploy/stitch.service
+=======
+Create `/etc/stitch/stitch.env`:
+
+```bash
+STITCH_PRIVATE_KEY=0x...
+RUST_LOG=info
+>>>>>>> dd7be7e (Update Stitch README header)
 ```
 
 Install files:
