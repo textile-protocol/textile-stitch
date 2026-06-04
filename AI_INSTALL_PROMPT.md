@@ -56,6 +56,11 @@ Question tool rules:
 - Ask focused questions. Batch only short, related fields when the tool is
   designed for that.
 - Ask for values with no safe default.
+- Always use a question tool (when available) for:
+  - Which settlement pool / token pair to operate on, when the catalog has
+    more than one pool on the chosen chain.
+  - Buy-side total liquidity (human amount in the debt/stable token).
+  - Sell-side total liquidity (human amount in the collateral/soft token).
 - Never ask for STITCH_PRIVATE_KEY through a question tool or chat.
 - If no question tool exists, ask concise chat questions instead.
 
@@ -108,20 +113,79 @@ Gather these values:
 - Price feed URL, default https://api.textilecredit.com/price.
 - Permit2 address, default 0x000000000022D473030F116dDEE9F6B43aC78BA3.
 - Reactor address, no safe default.
-- Collateral token address, no safe default.
-- Collateral token decimals, default 6.
-- Debt token address, no safe default.
-- Debt token decimals, default 6.
+- Pool and token addresses — discover from the Textile deposit catalog (see
+  below); do not ask me to paste raw addresses unless discovery fails.
+- Collateral token decimals, default 6 unless discovery or RPC says otherwise.
+- Debt token decimals, default 6 unless discovery or RPC says otherwise.
 - Buy and sell spread, default 150 bps each.
-- Buy and sell order sizing, default 50000 total depth, 10 minimum slice, and
-  150 max orders per side.
+- Buy-side total liquidity and sell-side total liquidity — ask with a question
+  tool (recommended defaults 50000 debt units and 50000 collateral units).
+- Minimum order slice, default 10 debt units.
+- Maximum ladder orders per side, default 150.
 - Whether settlement closing should be enabled, default no.
+
+Discover pool and token addresses (before collateral/debt questions):
+The public deposit picker at https://app.textilecredit.com/s/deposit lists the
+same settlement pools Stitch can quote. Propose to query that catalog for me
+instead of guessing addresses.
+
+Preferred — GraphQL (same data as the deposit page):
+1. POST to https://app.textilecredit.com/api/graphql with Content-Type:
+   application/json.
+2. Use the gathered chain ID (default 8453) in the query variables.
+3. Example query:
+
+   query SettlementV3PoolsForStitch($chainId: Int!) {
+     settlementV3Pools(chainId: $chainId, includeUnlisted: false) {
+       address
+       chainId
+       collateralAsset
+       debtAsset
+       displayName
+       buffer
+       floorFee
+       window
+     }
+   }
+
+4. Example request body (replace chainId if I chose another network):
+
+   {"query":"query SettlementV3PoolsForStitch($chainId: Int!) { settlementV3Pools(chainId: $chainId, includeUnlisted: false) { address chainId collateralAsset debtAsset displayName buffer floorFee window } }","variables":{"chainId":8453}}
+
+5. Map each pool to stitch.toml fields:
+   - collateral token address = collateralAsset (soft / collateral column on
+     the deposit page)
+   - debt token address = debtAsset (stable / Supply column on the deposit page)
+   - closer_pool (only if settlement closing is enabled) = pool address
+
+6. Present a short table: displayName or pair label, chainId, supply/debt
+   symbol hint if known, collateralAsset, debtAsset, pool address. If I have
+   not picked a pool yet, use a question tool to ask which row to operate on
+   (recommended = first listed pool or the one I name).
+
+Fallback — browse the deposit page:
+- Open https://app.textilecredit.com/s/deposit (or use a browser/scrape tool).
+- Match pools on my chosen chain ID.
+- Columns: Supply ≈ debt/stable token; Collateral ≈ soft/collateral token.
+- Pool detail URLs look like /s/deposit/{chainId}/{poolAddress}; use the pool
+  address from the link or GraphQL when enabling settlement closing.
+- If the page shows symbols but not addresses, still use the GraphQL path above
+  or ask me to confirm after you show the table from a successful query.
+
+If discovery returns no pools for my chain, stop and explain before writing
+config. If discovery succeeds, only ask me to confirm the chosen pool (question
+tool) rather than re-typing addresses.
+
+Token decimals after discovery:
+- Default 6 for both tokens when symbols look like USDT/USDC-style stables.
+- If unsure, read decimals() from each token contract via the gathered RPC URL.
 
 If settlement closing is enabled, also gather:
 - Subgraph URL, no safe default.
-- Settlement pool address, no safe default.
-- floor_ray, no safe default unless I explicitly allow example values.
-- buffer_ray, no safe default unless I explicitly allow example values.
+- Settlement pool address — use the chosen pool address from discovery unless I
+  override.
+- floor_ray and buffer_ray — prefer values from the chosen pool's floorFee and
+  buffer fields in the discovery query (RAY strings). Ask only if missing.
 - window_secs, default 432000.
 - min_margin_collateral, default 0.
 - max_positions_per_fill, default 10.
@@ -211,6 +275,9 @@ Configuration procedure:
 2. Create stitch.toml at the platform config path using gathered values.
 
 3. Convert human token amounts to base units using token decimals.
+   - buy_total_liquidity_debt from my buy-side total liquidity answer.
+   - sell_total_liquidity_collateral from my sell-side total liquidity answer.
+   - buy_min_slice_debt and sell_min_slice_debt from the minimum slice default.
    - Example: 50000 with 6 decimals becomes "50000000000".
    - Example: 10 with 6 decimals becomes "10000000".
 
@@ -322,7 +389,12 @@ Show me a short summary:
   contents.
 - Network, chain ID, and RPC URL.
 - Reactor address.
-- Pool token addresses and decimals.
+- Chosen pool (display name or pair) and how it was discovered (GraphQL vs
+  deposit page).
+- Collateral and debt token addresses, decimals, and human-readable symbols if
+  known.
+- Buy-side and sell-side total liquidity (human amounts and atomic values in
+  config).
 - Settlement closing enabled or disabled.
 - Dry-run result.
 

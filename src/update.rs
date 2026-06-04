@@ -8,8 +8,9 @@ use anyhow::{anyhow, Context};
 use axoupdater::AxoUpdater;
 use tracing::{info, warn};
 
-/// The package name cargo-dist records in the install receipt.
-const APP_NAME: &str = "stitch";
+/// Cargo package name cargo-dist uses for the install receipt directory
+/// (`~/.config/stitch-bot/stitch-bot-receipt.json`), not the binary name `stitch`.
+const APP_NAME: &str = "stitch-bot";
 
 /// Self-update to the latest release. Returns Ok even when already current.
 /// Errors only on a real failure (network, bad receipt) so `--update` can
