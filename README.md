@@ -32,7 +32,8 @@ stitch --version
 Create a config file:
 
 ```bash
-cp stitch.example.toml stitch.toml
+curl -L -o stitch.toml \
+  https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
 ```
 
 Set the operator wallet key in the environment. Do not put the private key in
@@ -208,11 +209,19 @@ Omit these fields to run market making only.
 
 On Linux, run Stitch under systemd so it restarts after crashes and reboots.
 
-Create `/etc/stitch/stitch.env`:
+Create local config and environment files:
 
 ```bash
+curl -L -o stitch.toml \
+  https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
+
+cat > stitch.env <<'EOF'
 STITCH_PRIVATE_KEY=0x...
 RUST_LOG=info
+EOF
+
+curl -L -o stitch.service \
+  https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/deploy/stitch.service
 ```
 
 Install files:
