@@ -49,18 +49,28 @@ Security rules:
   approvals.
 
 Question tool rules:
-- Use AskUserQuestionTool for every non-secret operator question when that tool
-  exists in your environment. If the exact name differs (request_user_input,
-  AskQuestion, etc.), use the equivalent question tool — never substitute chat
-  for a question the tool can ask.
-- Ask exactly one question per tool call. Wait for my answer before the next
-  question. Do not batch multiple fields into one prompt.
-- Put the recommended default first in the options and label it recommended.
+- Use AskUserQuestion for every non-secret operator question when that tool
+  exists in your environment. If the exact name differs (AskUserQuestionTool,
+  request_user_input, AskQuestion, etc.), use the equivalent question tool —
+  never substitute plain chat for a question the tool can ask.
+- Ask one question per tool call and wait for my answer before asking the next.
+  Don't batch unrelated fields into one prompt. I want to answer one at a time.
+- Before the first question, tell me in one line what you're setting up and
+  roughly how many questions to expect. Prefix each question with progress like
+  "(3 of ~9)" so I know where I am.
+- Phrase each question in plain language and add one short sentence on why it
+  matters. Put the recommended value first in the options and label it
+  "(recommended)". Keep options short and concrete.
+- For free-form values (RPC URL, reactor address, liquidity amounts), offer the
+  recommended value as an option and let me type a custom value through the
+  tool's built-in free-form answer. Do not invent your own "Other" option; the
+  tool already adds one.
+- These are single-choice questions. Do not enable multi-select.
 - Never ask for STITCH_PRIVATE_KEY through a question tool or chat.
 - If no question tool exists, ask the same sequence as concise chat questions,
-  still one at a time.
+  still one at a time, with the same progress and recommended-first style.
 
-Operator interview (AskUserQuestionTool, one question at a time):
+Operator interview (AskUserQuestion, one question at a time):
 Run this sequence after detecting OS/architecture and before writing config.
 Skip a step only when discovery or defaults already fixed the value and you
 only need a quick confirm question for that step.
@@ -68,10 +78,17 @@ only need a quick confirm question for that step.
 1. Chain — confirm the network Stitch should run on.
    - Recommended option: Base (chain ID 8453).
    - Other options you may include if supported on
-     https://app.textilecredit.com/s/deposit: BNB Smart Chain (56), Ethereum, (1), Celo (42220), or Other (custom chain ID).
+     https://app.textilecredit.com/s/deposit: BNB Smart Chain (56),
+     Ethereum (1), or Celo (42220). For any other chain, let me type the chain
+     ID through the tool's free-form answer.
+   - Local debugging: if I say I'm running against my local Hardhat chain, use
+     chain ID 31337 with RPC URL http://127.0.0.1:8545 (do not use the public
+     deposit catalog for discovery on this chain; I'll provide local pool and
+     token addresses, or you read them from local deploy output).
    - After I answer, set chain_id and RPC URL. For Base use
-     https://mainnet.base.org unless I override. For other chains, ask a
-     follow-up question for RPC URL if you do not know the correct default.
+     https://mainnet.base.org unless I override. For chain 31337 use
+     http://127.0.0.1:8545. For other chains, ask a follow-up question for RPC
+     URL if you do not know the correct default.
 
 2. Run mode — persistent background service vs manual foreground.
    - Recommended: foreground/manual on macOS and Windows; systemd on Linux.
@@ -79,16 +96,23 @@ only need a quick confirm question for that step.
 3. Settlement closing — enable blue-leg closing or market-making only?
    - Recommended: disabled (market-making only).
 
-4. If closing is enabled — ask separately, one question each:
-   - Subgraph URL.
-   - Any closer field you cannot take from pool discovery (floor_ray, buffer_ray
-     only if missing from GraphQL).
+4. If closing is enabled — ask for the subgraph URL now (it's independent of
+   pool discovery). Defer the closer params (floor_ray, buffer_ray, window):
+   pull them from pool discovery in step 6, and only ask for any value still
+   missing from GraphQL, one question each.
 
 5. Reactor address — no safe default; ask explicitly.
 
 6. Pool discovery — query the deposit catalog for my confirmed chain ID (see
    below), show the table, then ask which pool to operate on (recommended =
    first listed pool or the one I name).
+
+Market-making setup (steps 7-12 all have safe defaults). To avoid a long quiz,
+ask one gate question first:
+   "Use the recommended market-making defaults (150 bps each side, 50000 per
+   side, 10 min slice, 150 max orders), or set each value yourself?"
+   - Recommended: Use the defaults — then skip steps 7-12.
+   - Customize — then ask steps 7-12 below, one at a time.
 
 7. Buy spread — basis points below mid for the buy side.
    - Recommended: 150 bps.
@@ -152,16 +176,11 @@ Use these defaults unless I provide different values:
 Before editing files, first detect the OS, architecture, shell, package
 environment, and available terminal/question tools.
 
-Gather operator settings via the interview above. Apply these defaults for
-fields not covered by a question unless I override:
-- Textile indexer URL: https://api.textilecredit.com
-- Price feed URL: https://api.textilecredit.com/price
-- Permit2 address: 0x000000000022D473030F116dDEE9F6B43aC78BA3
-- Price feed staleness: 30 seconds; tick interval: 5 seconds; order TTL: 30
-  seconds; refresh threshold: 10 bps
-- Collateral and debt token decimals: 6 unless discovery or RPC says otherwise
-- Pool and token addresses: from deposit catalog discovery (below); do not ask
-  me to paste raw addresses unless discovery fails
+Gather operator settings via the interview above. For any field not covered by a
+question, use the values from "Use these defaults unless I provide different
+values" above, unless I override. Do not ask me to paste pool or token
+addresses: take them from deposit catalog discovery (below), and only ask if
+discovery fails.
 
 Discover pool and token addresses (after chain is confirmed, before pool pick):
 The public deposit picker at https://app.textilecredit.com/s/deposit lists the
@@ -199,7 +218,7 @@ Preferred — GraphQL (same data as the deposit page):
 
 6. Present a short table: displayName or pair label, chainId, supply/debt
    symbol hint if known, collateralAsset, debtAsset, pool address. Then ask
-   which row to operate on with AskUserQuestionTool (interview step 6;
+   which row to operate on with AskUserQuestion (interview step 6;
    recommended = first listed pool or the one I name).
 
 Fallback — browse the deposit page:
@@ -212,7 +231,7 @@ Fallback — browse the deposit page:
   or ask me to confirm after you show the table from a successful query.
 
 If discovery returns no pools for my chain, stop and explain before writing
-config. If discovery succeeds, confirm the pool via AskUserQuestionTool rather
+config. If discovery succeeds, confirm the pool via AskUserQuestion rather
 than asking me to re-type addresses.
 
 Token decimals after discovery:
@@ -222,7 +241,7 @@ Token decimals after discovery:
 If settlement closing is enabled:
 - Settlement pool address = chosen pool address from discovery.
 - floor_ray and buffer_ray from the pool's floorFee and buffer in GraphQL when
-  present; otherwise ask via AskUserQuestionTool.
+  present; otherwise ask via AskUserQuestion.
 - window_secs 432000, min_margin_collateral 0, max_positions_per_fill 10,
   discover_first 200, skip_past_window true unless I override in the interview.
 
@@ -432,7 +451,7 @@ Show me a short summary:
 - Settlement closing enabled or disabled.
 - Dry-run result.
 
-Then use AskUserQuestionTool for explicit confirmation before any live or
+Then use AskUserQuestion for explicit confirmation before any live or
 persistent operation (foreground live run, launchd, systemd, Task Scheduler,
 Windows service, or similar). Do not start until I confirm after a successful
 dry run.
