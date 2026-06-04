@@ -49,20 +49,68 @@ Security rules:
   approvals.
 
 Question tool rules:
-- If your environment provides a question tool such as AskUserQuestionTool,
-  request_user_input, or equivalent, use it for all non-secret operator
-  questions.
-- Put the recommended default first and label it recommended.
-- Ask focused questions. Batch only short, related fields when the tool is
-  designed for that.
-- Ask for values with no safe default.
-- Always use a question tool (when available) for:
-  - Which settlement pool / token pair to operate on, when the catalog has
-    more than one pool on the chosen chain.
-  - Buy-side total liquidity (human amount in the debt/stable token).
-  - Sell-side total liquidity (human amount in the collateral/soft token).
+- Use AskUserQuestionTool for every non-secret operator question when that tool
+  exists in your environment. If the exact name differs (request_user_input,
+  AskQuestion, etc.), use the equivalent question tool — never substitute chat
+  for a question the tool can ask.
+- Ask exactly one question per tool call. Wait for my answer before the next
+  question. Do not batch multiple fields into one prompt.
+- Put the recommended default first in the options and label it recommended.
 - Never ask for STITCH_PRIVATE_KEY through a question tool or chat.
-- If no question tool exists, ask concise chat questions instead.
+- If no question tool exists, ask the same sequence as concise chat questions,
+  still one at a time.
+
+Operator interview (AskUserQuestionTool, one question at a time):
+Run this sequence after detecting OS/architecture and before writing config.
+Skip a step only when discovery or defaults already fixed the value and you
+only need a quick confirm question for that step.
+
+1. Chain — confirm the network Stitch should run on.
+   - Recommended option: Base (chain ID 8453).
+   - Other options you may include if supported on
+     https://app.textilecredit.com/s/deposit: BNB Smart Chain (56), Ethereum, (1), Celo (42220), or Other (custom chain ID).
+   - After I answer, set chain_id and RPC URL. For Base use
+     https://mainnet.base.org unless I override. For other chains, ask a
+     follow-up question for RPC URL if you do not know the correct default.
+
+2. Run mode — persistent background service vs manual foreground.
+   - Recommended: foreground/manual on macOS and Windows; systemd on Linux.
+
+3. Settlement closing — enable blue-leg closing or market-making only?
+   - Recommended: disabled (market-making only).
+
+4. If closing is enabled — ask separately, one question each:
+   - Subgraph URL.
+   - Any closer field you cannot take from pool discovery (floor_ray, buffer_ray
+     only if missing from GraphQL).
+
+5. Reactor address — no safe default; ask explicitly.
+
+6. Pool discovery — query the deposit catalog for my confirmed chain ID (see
+   below), show the table, then ask which pool to operate on (recommended =
+   first listed pool or the one I name).
+
+7. Buy spread — basis points below mid for the buy side.
+   - Recommended: 150 bps.
+
+8. Sell spread — basis points above mid for the sell side.
+   - Recommended: 150 bps.
+
+9. Buy-side total liquidity — human amount in the debt/stable token.
+   - Recommended: 50000.
+
+10. Sell-side total liquidity — human amount in the collateral/soft token.
+    - Recommended: 50000.
+
+11. Minimum order slice — human amount in debt/stable units.
+    - Recommended: 10.
+
+12. Maximum ladder orders per side.
+    - Recommended: 150.
+
+Use defaults without asking only for values not listed above (indexer URL,
+price feed URL, Permit2, tick interval, TTL, refresh threshold, platform paths)
+unless I ask to change them.
 
 Use these defaults unless I provide different values:
 - Binary command name: stitch
@@ -104,27 +152,18 @@ Use these defaults unless I provide different values:
 Before editing files, first detect the OS, architecture, shell, package
 environment, and available terminal/question tools.
 
-Gather these values:
-- Persistent background service or manual foreground run. Default to systemd on
-  Linux, foreground/manual on macOS, and foreground/manual on Windows.
-- Chain ID, default 8453.
-- RPC URL, default https://mainnet.base.org.
-- Textile indexer URL, default https://api.textilecredit.com.
-- Price feed URL, default https://api.textilecredit.com/price.
-- Permit2 address, default 0x000000000022D473030F116dDEE9F6B43aC78BA3.
-- Reactor address, no safe default.
-- Pool and token addresses — discover from the Textile deposit catalog (see
-  below); do not ask me to paste raw addresses unless discovery fails.
-- Collateral token decimals, default 6 unless discovery or RPC says otherwise.
-- Debt token decimals, default 6 unless discovery or RPC says otherwise.
-- Buy and sell spread, default 150 bps each.
-- Buy-side total liquidity and sell-side total liquidity — ask with a question
-  tool (recommended defaults 50000 debt units and 50000 collateral units).
-- Minimum order slice, default 10 debt units.
-- Maximum ladder orders per side, default 150.
-- Whether settlement closing should be enabled, default no.
+Gather operator settings via the interview above. Apply these defaults for
+fields not covered by a question unless I override:
+- Textile indexer URL: https://api.textilecredit.com
+- Price feed URL: https://api.textilecredit.com/price
+- Permit2 address: 0x000000000022D473030F116dDEE9F6B43aC78BA3
+- Price feed staleness: 30 seconds; tick interval: 5 seconds; order TTL: 30
+  seconds; refresh threshold: 10 bps
+- Collateral and debt token decimals: 6 unless discovery or RPC says otherwise
+- Pool and token addresses: from deposit catalog discovery (below); do not ask
+  me to paste raw addresses unless discovery fails
 
-Discover pool and token addresses (before collateral/debt questions):
+Discover pool and token addresses (after chain is confirmed, before pool pick):
 The public deposit picker at https://app.textilecredit.com/s/deposit lists the
 same settlement pools Stitch can quote. Propose to query that catalog for me
 instead of guessing addresses.
@@ -132,7 +171,7 @@ instead of guessing addresses.
 Preferred — GraphQL (same data as the deposit page):
 1. POST to https://app.textilecredit.com/api/graphql with Content-Type:
    application/json.
-2. Use the gathered chain ID (default 8453) in the query variables.
+2. Use the chain ID I confirmed in the interview (default 8453 / Base).
 3. Example query:
 
    query SettlementV3PoolsForStitch($chainId: Int!) {
@@ -159,9 +198,9 @@ Preferred — GraphQL (same data as the deposit page):
    - closer_pool (only if settlement closing is enabled) = pool address
 
 6. Present a short table: displayName or pair label, chainId, supply/debt
-   symbol hint if known, collateralAsset, debtAsset, pool address. If I have
-   not picked a pool yet, use a question tool to ask which row to operate on
-   (recommended = first listed pool or the one I name).
+   symbol hint if known, collateralAsset, debtAsset, pool address. Then ask
+   which row to operate on with AskUserQuestionTool (interview step 6;
+   recommended = first listed pool or the one I name).
 
 Fallback — browse the deposit page:
 - Open https://app.textilecredit.com/s/deposit (or use a browser/scrape tool).
@@ -173,24 +212,19 @@ Fallback — browse the deposit page:
   or ask me to confirm after you show the table from a successful query.
 
 If discovery returns no pools for my chain, stop and explain before writing
-config. If discovery succeeds, only ask me to confirm the chosen pool (question
-tool) rather than re-typing addresses.
+config. If discovery succeeds, confirm the pool via AskUserQuestionTool rather
+than asking me to re-type addresses.
 
 Token decimals after discovery:
 - Default 6 for both tokens when symbols look like USDT/USDC-style stables.
 - If unsure, read decimals() from each token contract via the gathered RPC URL.
 
-If settlement closing is enabled, also gather:
-- Subgraph URL, no safe default.
-- Settlement pool address — use the chosen pool address from discovery unless I
-  override.
-- floor_ray and buffer_ray — prefer values from the chosen pool's floorFee and
-  buffer fields in the discovery query (RAY strings). Ask only if missing.
-- window_secs, default 432000.
-- min_margin_collateral, default 0.
-- max_positions_per_fill, default 10.
-- discover_first, default 200.
-- skip_past_window, default true.
+If settlement closing is enabled:
+- Settlement pool address = chosen pool address from discovery.
+- floor_ray and buffer_ray from the pool's floorFee and buffer in GraphQL when
+  present; otherwise ask via AskUserQuestionTool.
+- window_secs 432000, min_margin_collateral 0, max_positions_per_fill 10,
+  discover_first 200, skip_past_window true unless I override in the interview.
 
 Release install procedure:
 1. Query the latest GitHub Release metadata:
@@ -398,13 +432,10 @@ Show me a short summary:
 - Settlement closing enabled or disabled.
 - Dry-run result.
 
-Then ask for explicit confirmation before:
-- Foreground live run.
-- launchd.
-- systemd.
-- Task Scheduler.
-- Windows service.
-- Any other persistent or live operation.
+Then use AskUserQuestionTool for explicit confirmation before any live or
+persistent operation (foreground live run, launchd, systemd, Task Scheduler,
+Windows service, or similar). Do not start until I confirm after a successful
+dry run.
 
 Service setup after confirmation only:
 - macOS: If I choose launchd, create a LaunchAgent plist that runs

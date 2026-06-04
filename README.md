@@ -38,11 +38,11 @@ and only start live operation after you confirm.
 Use this short prompt to begin:
 
 ```text
-Help me install and configure Textile Stitch:
-https://github.com/textile-protocol/textile-stitch
+Help me install and configure Textile Stitch.
 
-Use the full install prompt at
-https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/AI_INSTALL_PROMPT.md.
+Follow the full install prompt at
+https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/AI_INSTALL_PROMPT.md
+in full.
 Use recommended defaults where safe, ask for values with no safe default, protect
 STITCH_PRIVATE_KEY, run a dry run first, and do not start live operation until I
 confirm.
