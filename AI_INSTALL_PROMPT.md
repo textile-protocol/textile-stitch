@@ -34,6 +34,28 @@ Security rules:
 Use these defaults unless I provide different values:
 - Binary name: stitch
 - GitHub repo: textile-protocol/textile-stitch
+- Chain ID: 8453
+- Network: Base
+- RPC URL: https://mainnet.base.org
+- Textile indexer URL: https://api.textilecredit.com
+- Permit2 address: 0x000000000022D473030F116dDEE9F6B43aC78BA3
+- Price feed staleness: 30 seconds
+- Tick interval: 5 seconds
+- Token decimals: 6, unless I provide different decimals
+- Buy spread: 150 bps
+- Sell spread: 150 bps
+- Buy total liquidity: 50000 units of the debt/stable token
+- Sell total liquidity: 50000 units of the collateral/soft token
+- Minimum order slice: 10 units of the debt/stable token
+- Maximum ladder orders per side: 150
+- Order TTL: 30 seconds
+- Refresh threshold: 10 bps
+- Settlement closing: disabled unless I explicitly enable it
+- Settlement close window: 432000 seconds, only if closing is enabled
+- Minimum close margin: 0, only if closing is enabled
+- Max positions per fill: 10, only if closing is enabled
+- Discover first: 200, only if closing is enabled
+- Skip past-window positions: true, only if closing is enabled
 - Linux config directory: /etc/stitch
 - Linux config path: /etc/stitch/stitch.toml
 - Linux env path: /etc/stitch/stitch.env
@@ -45,20 +67,42 @@ Use these defaults unless I provide different values:
 - Windows config path: %ProgramData%\Stitch\stitch.toml
 - Windows env path: %ProgramData%\Stitch\stitch.env
 
-Before editing files, first detect the OS and package environment. Then ask me:
-- whether I want a persistent background service or a manual foreground run;
-- chain ID;
-- RPC URL;
-- Textile indexer URL;
-- Permit2 address;
-- reactor address;
-- price feed URL;
-- collateral token address and decimals;
-- debt token address and decimals;
-- buy/sell spread and order sizing;
-- whether settlement closing should be enabled;
-- if closing is enabled: subgraph URL, settlement pool address, floor_ray,
-  buffer_ray, window_secs, min margin, and max positions per fill.
+Question style:
+- If your environment provides AskUserQuestionTool, use it for operator
+  questions whenever possible.
+- Put the recommended default first in AskUserQuestionTool options and label it
+  as recommended.
+- Ask one focused question at a time unless the tool is designed for a short
+  batch of related fields.
+- For values with safe defaults, show the default and ask whether to use it.
+- For values with no safe default, ask me to provide the value.
+- Do not ask for STITCH_PRIVATE_KEY through AskUserQuestionTool or chat. Use a
+  local hidden terminal prompt for that secret.
+
+Before editing files, first detect the OS and package environment. Then gather:
+- persistent background service or manual foreground run; default to systemd on
+  Linux, foreground/manual on macOS, and foreground/manual on Windows;
+- chain ID, default 8453;
+- RPC URL, default https://mainnet.base.org;
+- Textile indexer URL, default https://api.textilecredit.com;
+- Permit2 address, default 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+- reactor address, no safe default;
+- price feed URL, no safe default;
+- collateral token address, no safe default;
+- collateral token decimals, default 6;
+- debt token address, no safe default;
+- debt token decimals, default 6;
+- buy/sell spread, default 150 bps each;
+- buy/sell order sizing, default 50000 total depth, 10 minimum slice, 150 max
+  orders per side;
+- whether settlement closing should be enabled, default no;
+- if closing is enabled: subgraph URL and settlement pool address, no safe
+  defaults;
+- if closing is enabled: floor_ray and buffer_ray, no safe defaults unless I
+  explicitly tell you to use the example values;
+- if closing is enabled: window_secs default 432000, min_margin_collateral
+  default 0, max_positions_per_fill default 10, discover_first default 200, and
+  skip_past_window default true.
 
 Install instructions:
 - On Linux or macOS, install with:

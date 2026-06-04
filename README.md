@@ -58,8 +58,13 @@ Security rules:
 - Keep the private key out of stitch.toml, shell history, logs, command
   arguments, and screenshots.
 
-Before editing files, first detect the OS and ask for my chain, RPC, indexer,
-price feed, token, spread, order sizing, and settlement-closing settings.
+Question style:
+- Use AskUserQuestionTool for operator questions whenever available.
+- Show recommended defaults where safe, such as Base chain ID 8453,
+  https://mainnet.base.org, https://api.textilecredit.com, 150 bps spreads,
+  50000 total depth, 10 minimum slice, and settlement closing disabled.
+- Ask for values with no safe default, such as reactor address, price feed URL,
+  and token addresses.
 
 Install the latest release, create stitch.toml and a protected secret env file,
 run stitch --config <config-path> --dry-run, summarize the dry-run output, and
