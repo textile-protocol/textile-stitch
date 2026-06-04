@@ -4,46 +4,57 @@ Copy this prompt into Claude, GPT, Codex, or another coding agent that has
 terminal access to the machine where Stitch should run.
 
 ```text
-You are helping me install and configure Textile Stitch, the operator bot at
-https://github.com/textile-protocol/textile-stitch.
+You are helping me install and configure Textile Stitch, the operator bot at:
+https://github.com/textile-protocol/textile-stitch
 
 Goal:
 - Install the latest Stitch release on this machine.
 - Configure Stitch with my operator settings.
 - Store secrets safely.
 - Run a dry run first.
-- Start a persistent background service only after I confirm.
+- Start live or persistent operation only after I explicitly confirm.
 
-Release rules:
+Hard rules:
 - Do not clone https://github.com/textile-protocol/textile-stitch into my
   workspace or any operator workspace.
-- Install from the latest GitHub Release only. Do not build from source unless I
-  explicitly ask for a source install.
-- If a release installer or release asset download fails, stop and explain the
-  failure. Do not clone the repo as a fallback.
-
-Supported platforms:
-- Linux: install the release binary and configure a systemd service named stitch.
-- macOS: install the release binary and offer either a launchd service or a
-  foreground/manual run, depending on what I want.
-- Windows: install the release binary with PowerShell and offer either a Windows
-  service, Task Scheduler startup task, or foreground/manual run, depending on
-  what I want.
+- Do not build from source unless I explicitly request a source install.
+- Install only from the latest GitHub Release assets.
+- If release discovery, asset download, checksum verification, installer
+  execution, config writing, secret writing, or dry run fails, stop and explain.
+- If the release installer URL in older docs is stale, discover the actual
+  latest-release installer asset from GitHub Release metadata instead of
+  guessing or cloning.
+- Do not start live operation, background services, launchd, systemd, Task
+  Scheduler, Windows services, or any persistent process until after a
+  successful dry run and my explicit confirmation.
 
 Security rules:
-- Do not ask me to paste my private key into chat.
-- When a private key is needed, give me a local terminal command that prompts
-  for it without echoing and writes it to the platform-appropriate secret file.
-- Keep the private key out of stitch.toml, shell history, logs, command
-  arguments, and screenshots.
+- Do not ask me to paste STITCH_PRIVATE_KEY into chat or any question tool.
+- Do not put STITCH_PRIVATE_KEY in stitch.toml, shell history, logs, screenshots,
+  or command arguments.
+- Collect STITCH_PRIVATE_KEY only through a local hidden terminal prompt.
+- Write it only to the platform env file as STITCH_PRIVATE_KEY=...
+- Restrict env file permissions. On Unix, use chmod 600.
 - Use a dedicated operator wallet.
-- Before running live, remind me to confirm token balances and Permit2 approvals.
+- Before any live operation, remind me to confirm token balances and Permit2
+  approvals.
+
+Question tool rules:
+- If your environment provides a question tool such as AskUserQuestionTool,
+  request_user_input, or equivalent, use it for all non-secret operator
+  questions.
+- Put the recommended default first and label it recommended.
+- Ask focused questions. Batch only short, related fields when the tool is
+  designed for that.
+- Ask for values with no safe default.
+- Never ask for STITCH_PRIVATE_KEY through a question tool or chat.
+- If no question tool exists, ask concise chat questions instead.
 
 Use these defaults unless I provide different values:
-- Binary name: stitch
+- Binary command name: stitch
 - GitHub repo: textile-protocol/textile-stitch
-- Chain ID: 8453
 - Network: Base
+- Chain ID: 8453
 - RPC URL: https://mainnet.base.org
 - Textile indexer URL: https://api.textilecredit.com
 - Permit2 address: 0x000000000022D473030F116dDEE9F6B43aC78BA3
@@ -75,89 +86,218 @@ Use these defaults unless I provide different values:
 - Windows config path: %ProgramData%\Stitch\stitch.toml
 - Windows env path: %ProgramData%\Stitch\stitch.env
 
-Question style:
-- If your environment provides AskUserQuestionTool, use it for operator
-  questions whenever possible.
-- Put the recommended default first in AskUserQuestionTool options and label it
-  as recommended.
-- Ask one focused question at a time unless the tool is designed for a short
-  batch of related fields.
-- For values with safe defaults, show the default and ask whether to use it.
-- For values with no safe default, ask me to provide the value.
-- Do not ask for STITCH_PRIVATE_KEY through AskUserQuestionTool or chat. Use a
-  local hidden terminal prompt for that secret.
+Before editing files, first detect the OS, architecture, shell, package
+environment, and available terminal/question tools.
 
-Before editing files, first detect the OS and package environment. Then gather:
-- persistent background service or manual foreground run; default to systemd on
-  Linux, foreground/manual on macOS, and foreground/manual on Windows;
-- chain ID, default 8453;
-- RPC URL, default https://mainnet.base.org;
-- Textile indexer URL, default https://api.textilecredit.com;
-- Permit2 address, default 0x000000000022D473030F116dDEE9F6B43aC78BA3;
-- reactor address, no safe default;
-- price feed URL, no safe default;
-- collateral token address, no safe default;
-- collateral token decimals, default 6;
-- debt token address, no safe default;
-- debt token decimals, default 6;
-- buy/sell spread, default 150 bps each;
-- buy/sell order sizing, default 50000 total depth, 10 minimum slice, 150 max
-  orders per side;
-- whether settlement closing should be enabled, default no;
-- if closing is enabled: subgraph URL and settlement pool address, no safe
-  defaults;
-- if closing is enabled: floor_ray and buffer_ray, no safe defaults unless I
-  explicitly tell you to use the example values;
-- if closing is enabled: window_secs default 432000, min_margin_collateral
-  default 0, max_positions_per_fill default 10, discover_first default 200, and
-  skip_past_window default true.
+Gather these values:
+- Persistent background service or manual foreground run. Default to systemd on
+  Linux, foreground/manual on macOS, and foreground/manual on Windows.
+- Chain ID, default 8453.
+- RPC URL, default https://mainnet.base.org.
+- Textile indexer URL, default https://api.textilecredit.com.
+- Permit2 address, default 0x000000000022D473030F116dDEE9F6B43aC78BA3.
+- Reactor address, no safe default.
+- Price feed URL, no safe default.
+- Collateral token address, no safe default.
+- Collateral token decimals, default 6.
+- Debt token address, no safe default.
+- Debt token decimals, default 6.
+- Buy and sell spread, default 150 bps each.
+- Buy and sell order sizing, default 50000 total depth, 10 minimum slice, and
+  150 max orders per side.
+- Whether settlement closing should be enabled, default no.
 
-Install instructions:
-- On Linux or macOS, install with:
-  curl --proto '=https' --tlsv1.2 -LsSf \
-    https://github.com/textile-protocol/textile-stitch/releases/latest/download/stitch-installer.sh | sh
-- On Windows PowerShell, install with:
-  powershell -ExecutionPolicy Bypass -c "irm https://github.com/textile-protocol/textile-stitch/releases/latest/download/stitch-installer.ps1 | iex"
-- If the installer does not put stitch on PATH, locate the installed binary from
-  the release install and add that directory to PATH.
+If settlement closing is enabled, also gather:
+- Subgraph URL, no safe default.
+- Settlement pool address, no safe default.
+- floor_ray, no safe default unless I explicitly allow example values.
+- buffer_ray, no safe default unless I explicitly allow example values.
+- window_secs, default 432000.
+- min_margin_collateral, default 0.
+- max_positions_per_fill, default 10.
+- discover_first, default 200.
+- skip_past_window, default true.
 
-Configuration instructions:
-1. Download the example config from:
-   https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
-2. Create stitch.toml at the platform-appropriate config path using my values.
-3. Create the secret env file at the platform-appropriate env path using a local
-   hidden prompt for STITCH_PRIVATE_KEY.
-4. Restrict permissions on the config and secret files. On Unix, chmod the env
-   file 600.
-5. Run:
-   stitch --config <config-path> --dry-run
-6. Show me a short dry-run summary and ask before starting any persistent
-   service or live run.
+Release install procedure:
+1. Query the latest GitHub Release metadata:
 
-Linux service instructions:
-- Download the systemd unit from:
-  https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/deploy/stitch.service
-- Install it to /etc/systemd/system/stitch.service.
-- Run:
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now stitch
-  journalctl -u stitch -f
+   curl -fsSL https://api.github.com/repos/textile-protocol/textile-stitch/releases/latest
 
-macOS service instructions:
-- If I choose launchd, create a LaunchAgent plist that runs:
-  stitch --config ~/.config/stitch/stitch.toml
-- Load it with launchctl.
-- Make sure STITCH_PRIVATE_KEY is available from the env file without exposing it
-  in command arguments.
+2. Determine the latest tag and available assets from the release metadata.
 
-Windows service instructions:
-- If I choose Task Scheduler, create a startup task that runs:
-  stitch.exe --config "%ProgramData%\Stitch\stitch.toml"
-- If I choose a Windows service, use an installed service manager such as NSSM
-  only after asking me to confirm that dependency.
-- Make sure STITCH_PRIVATE_KEY is available from the env file without exposing it
-  in command arguments.
+3. Prefer a release installer asset in this order:
+   - Unix: stitch-bot-installer.sh, then stitch-installer.sh
+   - Windows: stitch-bot-installer.ps1, then stitch-installer.ps1
 
-If anything fails, stop and explain the failure before retrying. Do not start
-live mode until I explicitly confirm after a successful dry run.
+4. Run only the discovered latest-release installer URL.
+
+   Unix example:
+
+   curl --proto '=https' --tlsv1.2 -LsSf "<discovered-installer-url>" | sh
+
+   Windows example:
+
+   powershell -ExecutionPolicy Bypass -c "irm '<discovered-installer-url>' | iex"
+
+5. If no installer asset exists, offer to install the matching release binary
+   archive asset instead:
+   - macOS Apple Silicon: *-aarch64-apple-darwin.tar.xz
+   - macOS Intel: *-x86_64-apple-darwin.tar.xz
+   - Linux ARM64: *-aarch64-unknown-linux-gnu.tar.xz
+   - Linux x64: *-x86_64-unknown-linux-gnu.tar.xz
+   - Windows x64: *-x86_64-pc-windows-msvc.zip
+
+6. If using a binary archive, download its matching .sha256 asset, verify the
+   checksum, extract, install the binary, and ensure stitch is on PATH.
+
+7. Verify:
+
+   stitch --version
+
+If stitch is not on PATH, locate the installed release binary and use its
+absolute path.
+
+Configuration procedure:
+1. Download the example config:
+
+   curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
+
+2. Create stitch.toml at the platform config path using gathered values.
+
+3. Convert human token amounts to base units using token decimals.
+   - Example: 50000 with 6 decimals becomes "50000000000".
+   - Example: 10 with 6 decimals becomes "10000000".
+
+4. If settlement closing is disabled:
+   - Omit subgraph_url.
+   - Omit closer fields such as closer_pool, floor_ray, buffer_ray, window_secs,
+     min_margin_collateral, max_positions_per_fill, discover_first, and
+     skip_past_window.
+
+5. Restrict config file permissions:
+   - Unix: config directory 700, config file 600.
+
+Private key collection:
+- Use a terminal-opening tool if available.
+- If an OpenTerminalTool, integrated terminal tool, or equivalent exists, open a
+  local terminal running the script below.
+- The script must prompt with hidden input.
+- Wait for me to complete it before continuing.
+
+Unix and macOS private-key script:
+
+   #!/usr/bin/env sh
+   set -eu
+
+   CONFIG_DIR="${HOME}/.config/stitch"
+   ENV_FILE="${CONFIG_DIR}/stitch.env"
+
+   mkdir -p "$CONFIG_DIR"
+   chmod 700 "$CONFIG_DIR"
+
+   printf 'Enter STITCH_PRIVATE_KEY: '
+   stty -echo
+   IFS= read -r key
+   stty echo
+   printf '\n'
+
+   if [ -z "$key" ]; then
+     echo "No private key entered; not writing env file."
+     exit 1
+   fi
+
+   umask 077
+   printf 'STITCH_PRIVATE_KEY=%s\n' "$key" > "$ENV_FILE"
+   unset key
+   chmod 600 "$ENV_FILE"
+
+   echo "Wrote $ENV_FILE with restricted permissions."
+
+If no terminal-opening tool is available:
+- Try running an interactive TTY command.
+- If that is not possible, print the script for me to run manually.
+- Do not proceed until I confirm the env file has been created.
+
+Windows PowerShell private-key script:
+
+   $ConfigDir = "$env:ProgramData\Stitch"
+   $EnvFile = "$ConfigDir\stitch.env"
+
+   New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+
+   $key = Read-Host "Enter STITCH_PRIVATE_KEY" -AsSecureString
+   $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($key)
+   $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+
+   if ([string]::IsNullOrWhiteSpace($plain)) {
+     Write-Error "No private key entered; not writing env file."
+     exit 1
+   }
+
+   "STITCH_PRIVATE_KEY=$plain" | Set-Content -NoNewline -Path $EnvFile
+   [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+   $plain = $null
+
+   Write-Host "Wrote $EnvFile."
+
+Dry run:
+- Run dry run only after config and env file exist.
+- Load STITCH_PRIVATE_KEY from the env file into the process environment.
+- Do not print the private key.
+- Do not pass the private key in command arguments.
+
+Unix and macOS:
+
+   set -a
+   . "<env-path>"
+   set +a
+   stitch --config "<config-path>" --dry-run
+
+Windows PowerShell:
+
+   Get-Content "<env-path>" | ForEach-Object {
+     if ($_ -match '^([^=]+)=(.*)$') {
+       [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+     }
+   }
+   stitch.exe --config "<config-path>" --dry-run
+
+Do not use command substitution such as:
+
+   STITCH_PRIVATE_KEY="$(...)" stitch ...
+
+because that can expose secrets through command construction or logs.
+
+After dry run:
+Show me a short summary:
+- Installed Stitch version.
+- Config path.
+- Env path exists and permissions are restricted, without showing secret
+  contents.
+- Network, chain ID, and RPC URL.
+- Reactor address.
+- Pool token addresses and decimals.
+- Settlement closing enabled or disabled.
+- Dry-run result.
+
+Then ask for explicit confirmation before:
+- Foreground live run.
+- launchd.
+- systemd.
+- Task Scheduler.
+- Windows service.
+- Any other persistent or live operation.
+
+Service setup after confirmation only:
+- macOS: If I choose launchd, create a LaunchAgent plist that runs
+  stitch --config ~/.config/stitch/stitch.toml, and make sure the env file is
+  loaded without putting STITCH_PRIVATE_KEY in command arguments.
+- Linux: If I confirm systemd, install a stitch.service that loads the env file
+  via EnvironmentFile, then run sudo systemctl daemon-reload and
+  sudo systemctl enable --now stitch.
+- Windows: If I choose Task Scheduler, create a startup task. If I choose a
+  Windows service, ask before installing or using NSSM.
+
+Never start any live operation until I explicitly confirm after a successful dry
+run.
 ```
