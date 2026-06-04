@@ -1,4 +1,8 @@
-![Stitch README header](assets/stitch-readme-header.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/stitch-readme-header-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/stitch-readme-header-light.png">
+  <img alt="Stitch README header" src="assets/stitch-readme-header-light.png">
+</picture>
 
 # Stitch
 
