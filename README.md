@@ -20,61 +20,22 @@ You can run either job by itself, or both jobs together for the same pool.
 
 ## Quick Start
 
-The recommended way to install Stitch is to give an AI coding agent terminal
-access to the machine where Stitch will run, then ask it to install and
-configure Stitch for you.
+The recommended way to install Stitch is to have an AI assistant guide the
+setup, collect the required operator settings, create the config, run a dry run,
+and only start live operation after you confirm.
 
-Copy the prompt from [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md). On GitHub,
-open that file and use the copy button. GitHub does not expose a copy button for
-content hidden inside a collapsed section, so the prompt lives in its own file
-for easy copying.
-
-<details>
-<summary>Preview the AI install prompt</summary>
+Use this short prompt to begin:
 
 ```text
-You are helping me install and configure Textile Stitch, the operator bot at
-https://github.com/textile-protocol/textile-stitch.
+Help me install and configure Textile Stitch:
+https://github.com/textile-protocol/textile-stitch
 
-Goal:
-- Install the latest Stitch release on this machine.
-- Configure Stitch with my operator settings.
-- Store secrets safely.
-- Run a dry run first.
-- Start a persistent background service only after I confirm.
-
-Supported platforms:
-- Linux: install the release binary and configure a systemd service named stitch.
-- macOS: install the release binary and offer either a launchd service or a
-  foreground/manual run, depending on what I want.
-- Windows: install the release binary with PowerShell and offer either a Windows
-  service, Task Scheduler startup task, or foreground/manual run, depending on
-  what I want.
-
-Security rules:
-- Do not ask me to paste my private key into chat.
-- When a private key is needed, give me a local terminal command that prompts
-  for it without echoing and writes it to the platform-appropriate secret file.
-- Keep the private key out of stitch.toml, shell history, logs, command
-  arguments, and screenshots.
-
-Question style:
-- Use AskUserQuestionTool for operator questions whenever available.
-- Show recommended defaults where safe, such as Base chain ID 8453,
-  https://mainnet.base.org, https://api.textilecredit.com, 150 bps spreads,
-  50000 total depth, 10 minimum slice, and settlement closing disabled.
-- Ask for values with no safe default, such as reactor address, price feed URL,
-  and token addresses.
-
-Install the latest release, create stitch.toml and a protected secret env file,
-run stitch --config <config-path> --dry-run, summarize the dry-run output, and
-ask before starting any persistent service or live run.
-
-If anything fails, stop and explain the failure before retrying.
+Use the full install prompt in AI_INSTALL_PROMPT.md. Use recommended defaults
+where safe, ask for values with no safe default, protect STITCH_PRIVATE_KEY, run
+a dry run first, and do not start live operation until I confirm.
 ```
 
-</details>
-
+For the full copyable prompt, open [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
 For troubleshooting and operational checks, see [DEBUGGING.md](DEBUGGING.md).
 
 ## Manual Install
