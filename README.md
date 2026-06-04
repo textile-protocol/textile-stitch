@@ -18,6 +18,17 @@ Stitch can do two jobs:
 
 You can run either job by itself, or both jobs together for the same pool.
 
+## Contents
+
+- [Quick Start](#quick-start)
+- [Manual Install](#manual-install)
+- [How It Works](#how-it-works)
+- [Requirements](#requirements)
+- [Configuration](#configuration)
+- [Running As A Service](#running-as-a-service)
+- [Updating](#updating)
+- [Security Notes](#security-notes)
+
 ## Quick Start
 
 The recommended way to install Stitch is to have an AI assistant guide the
