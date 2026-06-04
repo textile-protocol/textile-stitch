@@ -1,0 +1,39 @@
+[package]
+name = "stitch-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/textile-protocol/textile-stitch"
+homepage = "https://github.com/textile-protocol/textile-stitch"
+
+[lib]
+name = "stitch_bot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stitch"
+path = "src/main.rs"
+
+[dependencies]
+alloy-primitives = { version = "1", features = ["rlp"] }
+alloy-rlp = "0.3"
+k256 = { version = "0.13", features = ["ecdsa"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axoupdater = "0.10.0"
+
+[dev-dependencies]
+hex = "0.4"
+
+# The profile that 'dist' will build with.
+[profile.dist]
+inherits = "release"
+lto = "thin"

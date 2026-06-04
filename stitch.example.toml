@@ -1,0 +1,61 @@
+# Textile Stitch — example config.
+# The wallet key is NOT here; export STITCH_PRIVATE_KEY in the environment.
+
+chain_id = 8453                     # Base
+rpc_url = "https://mainnet.base.org"
+indexer_url = "https://api.textilecredit.com"
+permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor = "0x0000000000000000000000000000000000000000"  # SETTLEMENT_V3_FILLER_REACTOR
+# Subgraph for blue-leg discovery (OPEN positions). Omit to run green-leg only.
+subgraph_url = "https://api.goldsky.com/.../textile-protocol/gn"
+tick_interval_secs = 5
+
+# Default price feed: used by any pool that doesn't set its own `feed_url`.
+[feed]
+url = "https://your-feed.example/cngn-usdt"
+staleness_secs = 30
+
+# One block per corridor you serve. Add more [[pools]] for other pairs/chains.
+# Pairs with different prices (cNGN, COPM, …) MUST each set `feed_url` — one
+# shared feed can't price them all.
+[[pools]]
+collateral = "0xcngn0000000000000000000000000000000000c0"  # cNGN (soft asset)
+collateral_decimals = 6
+debt = "0xusdc0000000000000000000000000000000000d7"        # USDC on Base (stable)
+debt_decimals = 6
+# feed_url = "https://your-feed.example/cngn-usdc"  # per-pool price (optional)
+
+# Two-sided market making. Each side is independent — set a spread + a size to
+# run it; omit a side to skip it. Express the spread however you prefer:
+#   *_offset_bps  — relative, in basis points off the mid
+#   *_offset_abs  — absolute, in the soft-per-stable price (collateral per debt,
+#                   e.g. cNGN/USDT, COPM/USDT — currency-agnostic)
+# Set one per side; if both are set, bps wins.
+
+# Buy low: bid below the mid, paying USDC for cNGN.
+buy_offset_bps = 150                # 1.5% below the mid   (or: buy_offset_abs = 2.0)
+buy_total_liquidity_debt = "50000000000"  # 50,000 USDC total depth (6dp)
+buy_min_slice_debt = "10000000"           # 10 USDC smallest slice (6dp)
+buy_max_orders = 150
+
+# Sell high: ask above the mid, selling cNGN for USDC. Needs cNGN inventory +
+# a Permit2 approval on cNGN.
+sell_offset_abs = 2.0                       # 2 soft/stable above the mid (or: sell_offset_bps = 150)
+sell_total_liquidity_collateral = "50000000000" # total cNGN inventory to quote
+sell_min_slice_debt = "10000000"                # 10 USDC-equivalent smallest slice
+sell_max_orders = 150
+
+ttl_secs = 30
+refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
+
+# ----- Blue leg (auction closer). Set these to also close this pool's
+# positions via pool.fill(); omit them to run this pool green-only. The
+# floor/buffer/window mirror the pool's on-chain auction params. -----
+closer_pool = "0x0000000000000000000000000000000000000000"  # SettlementPool
+floor_ray = "20000000000000000000000000"     # 2% opening rate (RAY)
+buffer_ray = "20000000000000000000000000"    # 2% decaying buffer (RAY)
+window_secs = 432000                          # 5-day auction window
+min_margin_collateral = "0"                   # accept any positive net margin
+max_positions_per_fill = 10                   # close up to N from the FIFO front
+discover_first = 200                          # candidates pulled per tick
+skip_past_window = true                       # leave fully-decayed positions

@@ -165,12 +165,17 @@ refresh_threshold_bps = 10
 The feed must return JSON with a price and Unix timestamp:
 
 ```json
-{ "price": 1234.56, "timestamp": 1760000000 }
+{ "price": 0.000724, "timestamp": 1760000000 }
 ```
 
-`price` is the soft-per-stable price for the pool, for example cNGN per USDC.
-If you quote multiple pairs with different prices, set a `feed_url` inside each
-`[[pools]]` block instead of relying on the top-level `[feed]`.
+`price` is **debt per collateral** — the stable per soft, e.g. USDC per cNGN
+(≈ 0.000724), **not** cNGN per USDC. Stitch quotes off it directly as the
+bid/ask mid (USDT per cNGN); publishing the inverted soft-per-stable number
+(e.g. 1382) makes the bot post wildly mispriced orders. (The absolute spread
+below is the opposite orientation — soft per stable — by design; only the feed
+`price` is debt per collateral.) If you quote multiple pairs with different
+prices, set a `feed_url` inside each `[[pools]]` block instead of relying on the
+top-level `[feed]`.
 
 ### Spreads
 
@@ -306,3 +311,13 @@ You can also download a new binary or installer from the latest GitHub Release.
 - Review token balances, Permit2 approvals, spreads, and order sizes before
   running live.
 - Use `--dry-run` after every config change that affects pricing or sizing.
+
+## License
+
+Stitch is free, open-source software licensed under the **GNU Affero General
+Public License v3.0 or later** (`AGPL-3.0-or-later`). Copyright (c) 2026
+Textile, Inc.
+
+Copyleft: if you modify Stitch and distribute it — or run a modified version as
+a network service — you must release your changes under the same license. See
+[`LICENSE`](./LICENSE) for the full text.

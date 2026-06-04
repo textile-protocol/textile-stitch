@@ -1,0 +1,37 @@
+# systemd unit for the Textile Stitch.
+#
+# Install:
+#   sudo cp stitch /usr/local/bin/
+#   sudo mkdir -p /etc/stitch
+#   sudo cp stitch.toml /etc/stitch/stitch.toml
+#   sudo cp stitch.env  /etc/stitch/stitch.env   # holds STITCH_PRIVATE_KEY, chmod 600
+#   sudo chmod 600 /etc/stitch/stitch.env
+#   sudo cp stitch.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now stitch
+#
+# Logs:    journalctl -u stitch -f
+# Restart: sudo systemctl restart stitch   (re-reads stitch.toml on start)
+
+[Unit]
+Description=Textile filler network operator bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The wallet key lives here, never in stitch.toml or the unit. chmod 600.
+EnvironmentFile=/etc/stitch/stitch.env
+ExecStart=/usr/local/bin/stitch --config /etc/stitch/stitch.toml
+# The bot traps SIGTERM and exits cleanly after the current tick.
+Restart=always
+RestartSec=5
+# Optional hardening.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/stitch
+
+[Install]
+WantedBy=multi-user.target
