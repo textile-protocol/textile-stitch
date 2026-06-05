@@ -80,6 +80,33 @@ Set the operator wallet key in the environment. Do not put the private key in
 export STITCH_PRIVATE_KEY=0x...
 ```
 
+Approve Permit2 to pull the tokens Stitch quotes. The operator wallet needs a
+one-time approval for each input token (the `debt` token on the buy side, the
+`collateral` token on the sell side). Without it, orders post but silently fail
+to fill, and a live start refuses to run. Preview what's needed, then approve:
+
+```bash
+stitch approve --config stitch.toml --dry-run   # show what needs approving
+stitch approve --config stitch.toml             # maximum allowance (recommended)
+```
+
+Maximum is the standard market-maker choice: approve once and never re-approve.
+You're approving the canonical Permit2 contract, and the reactor can only pull
+against orders you actually signed.
+
+If you'd rather cap the allowance, use `--exact` to approve only the liquidity in
+your config:
+
+```bash
+stitch approve --config stitch.toml --exact
+```
+
+Be aware of the trade-off: an exact allowance is consumed as orders fill, so once
+it's used up Stitch keeps posting orders that **silently fail to fill** until you
+re-approve, and you must re-run `stitch approve` every time you raise your
+configured liquidity. Each approval is one gas-paying transaction per token, and
+the command is idempotent (it skips tokens already approved).
+
 Run once in dry-run mode before posting live orders:
 
 ```bash
@@ -122,7 +149,9 @@ You need:
 - a price feed endpoint returning fresh `{ "price": ..., "timestamp": ... }`;
 - the Permit2 and reactor addresses for the target chain;
 - funded token balances for the sides you enable;
-- Permit2 approvals for the tokens Stitch will spend;
+- Permit2 approvals for the tokens Stitch will spend (set up with
+  `stitch approve` — see [Manual Install](#manual-install));
+- a small native balance for gas (approvals and, for closing, `fill()` txs);
 - a subgraph URL if you enable settlement closing.
 
 ## Configuration
@@ -276,6 +305,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now stitch
 ```
 
+Approve Permit2 before the first live start (the service won't run until the
+input tokens are approved):
+
+```bash
+STITCH_PRIVATE_KEY=0x... stitch approve --config /etc/stitch/stitch.toml
+```
+
 View logs:
 
 ```bash
@@ -311,7 +347,8 @@ You can also download a new binary or installer from the latest GitHub Release.
 - Use a dedicated operator wallet.
 - Fund only the inventory you intend Stitch to use.
 - Review token balances, Permit2 approvals, spreads, and order sizes before
-  running live.
+  running live. Set approvals with `stitch approve`; prefer a maximum allowance
+  unless you have a specific reason to cap it.
 - Use `--dry-run` after every config change that affects pricing or sizing.
 
 ## License

@@ -12,6 +12,7 @@
 //! the pricing rule ([`quote`]) — then the feed, indexer client, and auction
 //! closer wire on top.
 
+pub mod approve;
 pub mod banner;
 pub mod cli;
 pub mod closer;

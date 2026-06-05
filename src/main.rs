@@ -19,6 +19,7 @@ use anyhow::{anyhow, Context};
 use k256::ecdsa::SigningKey;
 use tracing::{info, warn};
 
+use stitch_bot::approve::{run_approvals, unapproved_tokens, ApprovalMode};
 use stitch_bot::banner::print_startup_banner;
 use stitch_bot::cli::{parse, Command};
 use stitch_bot::closer::discover::Discoverer;
@@ -145,10 +146,16 @@ fn print_help() {
         "stitch {VERSION}\n\
          The Textile filler network operator bot.\n\n\
          USAGE:\n    \
-         STITCH_PRIVATE_KEY=0x... stitch --config <path> [--dry-run]\n\n\
+         STITCH_PRIVATE_KEY=0x... stitch --config <path> [--dry-run]\n    \
+         STITCH_PRIVATE_KEY=0x... stitch approve --config <path> [--exact] [--dry-run]\n\n\
+         COMMANDS:\n    \
+         approve           Approve the config's input tokens to Permit2, then exit.\n                      \
+         Required before going live; uses a max allowance unless --exact.\n\n\
          OPTIONS:\n    \
          --config <path>   Operator config (TOML). Read fresh on every start.\n    \
-         --dry-run         Sign and log orders without posting or sending tx.\n    \
+         --dry-run         Sign/plan without posting orders or sending tx.\n    \
+         --exact           With `approve`: approve only the committed liquidity,\n                      \
+         not an unlimited allowance (must re-approve as it's spent).\n    \
          --update          Update to the latest release, then exit.\n    \
          -V, --version     Print version and exit.\n    \
          -h, --help        Print this help and exit.\n\n\
@@ -229,8 +236,42 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Update => run_update().await,
+        Command::Approve {
+            config,
+            dry_run,
+            exact,
+        } => run_approve(config, dry_run, exact).await,
         Command::Run { config, dry_run } => run(config, dry_run).await,
     }
+}
+
+/// `stitch approve`: ensure the config's input tokens are approved to Permit2,
+/// then exit. Max allowance by default; `--exact` approves only the committed
+/// liquidity. `--dry-run` reports without sending.
+async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow::Result<()> {
+    let cfg = Config::from_toml(
+        &std::fs::read_to_string(&config_path)
+            .with_context(|| format!("reading config {config_path}"))?,
+    )?;
+    let key = load_key()?;
+    let permit2: Address = cfg.permit2.parse().context("invalid permit2 address")?;
+    let wallet = Wallet::new(cfg.rpc_url.clone(), key, cfg.chain_id);
+    let mode = if exact {
+        ApprovalMode::Exact
+    } else {
+        ApprovalMode::Max
+    };
+    info!(
+        maker = %wallet.address(), chain_id = cfg.chain_id, mode = ?mode, dry_run,
+        "stitch approve: ensuring Permit2 approvals"
+    );
+    let sent = run_approvals(&wallet, permit2, &cfg, mode, dry_run).await?;
+    if dry_run {
+        info!("dry-run complete; no transactions sent");
+    } else {
+        info!(approvals_sent = sent, "approvals complete");
+    }
+    Ok(())
 }
 
 async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
@@ -269,6 +310,33 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // Blue-leg I/O: a signing wallet (pays gas, sends fill()) and the subgraph
     // discoverer. The discoverer is only built when a subgraph is configured.
     let wallet = Wallet::new(cfg.rpc_url.clone(), key.clone(), cfg.chain_id);
+
+    // Preflight: a maker can't fill orders it hasn't approved Permit2 to pull,
+    // so block a live start on a missing approval (orders would post but
+    // silently revert on fill). In dry-run we only warn, so signing can still be
+    // exercised offline. A flaky RPC shouldn't hard-block dry-run, but a live
+    // start stays cautious and surfaces the error.
+    match unapproved_tokens(&wallet, permit2, &cfg).await {
+        Ok(missing) if !missing.is_empty() => {
+            for m in &missing {
+                warn!(token = %m.token, reasons = ?m.reasons, "input token not approved to Permit2");
+            }
+            if dry_run {
+                warn!("missing Permit2 approvals: orders would post but fail to fill. Run `stitch approve` before going live.");
+            } else {
+                anyhow::bail!(
+                    "missing Permit2 approvals for {} token(s); run `stitch approve` (or `stitch approve --exact`) first, or pass --dry-run to test without them",
+                    missing.len()
+                );
+            }
+        }
+        Ok(_) => info!("Permit2 approvals present for all enabled sides"),
+        Err(e) if dry_run => {
+            warn!(error = %e, "could not verify Permit2 approvals; continuing dry-run")
+        }
+        Err(e) => return Err(e).context("verifying Permit2 approvals"),
+    }
+
     let discoverer = cfg
         .subgraph_url
         .as_ref()

@@ -45,8 +45,9 @@ Security rules:
 - Write it only to the platform env file as STITCH_PRIVATE_KEY=...
 - Restrict env file permissions. On Unix, use chmod 600.
 - Use a dedicated operator wallet.
-- Before any live operation, remind me to confirm token balances and Permit2
-  approvals.
+- Before any live operation, confirm token balances and set up Permit2 approvals
+  with `stitch approve` (see the Permit2 approvals step). A live start refuses to
+  run until the input tokens are approved.
 
 Question tool rules:
 - Use AskUserQuestion for every non-secret operator question when that tool
@@ -85,10 +86,10 @@ Skip a step only when discovery or defaults already fixed the value and you
 only need a quick confirm question for that step.
 
 1. Chain — which network should Stitch run on?
-   - Options (3 max): Base — 8453 (recommended); Local Hardhat — 31337 (for
-     debugging); Another network. If I pick "Another network", ask a follow-up
-     with the other supported chains as options (BNB Smart Chain — 56;
-     Ethereum — 1; Celo — 42220), and only list a public chain if it's on
+   - Options (3 max): Base — 8453 (recommended); BNB Smart Chain — 56; Another
+     network. If I pick "Another network", ask a follow-up with the rest as
+     options (Ethereum — 1; Celo — 42220; Local Hardhat — 31337 for debugging),
+     and only list a public chain if it's on
      https://app.textilecredit.com/s/deposit. For anything else I'll type a
      custom chain ID in the free-form answer.
    - After I answer, set chain_id and RPC URL: Base -> https://mainnet.base.org,
@@ -448,6 +449,41 @@ Windows PowerShell private-key script:
 
    Write-Host "Wrote $EnvFile."
 
+Permit2 approvals (after the env file exists, before the dry run):
+The operator wallet must approve Permit2 to pull each token Stitch quotes as
+order input — debt on the buy side, collateral on the sell side. Without it,
+orders post but silently fail to fill, and a live start refuses to run. The
+binary handles this; do not ask me to paste token addresses or send raw approve
+transactions.
+
+1. Load STITCH_PRIVATE_KEY from the env file into the process environment (same
+   as the dry run below — never on the command line).
+2. Check what's needed without sending anything:
+
+   stitch approve --config "<config-path>" --dry-run
+
+3. If it reports tokens that are already approved, skip the rest. Only if at
+   least one token still needs approval, ask me how much to approve with
+   AskUserQuestion (recommended first):
+   - Maximum (recommended) — approve once, never re-approve. Standard for a
+     market maker; you're approving the canonical audited Permit2 contract, and
+     the reactor can only pull against orders I actually signed.
+   - Exact amount — approve only the liquidity in my config.
+
+   If I choose Exact, warn me clearly before running it: an exact allowance is
+   consumed as orders fill, so once it's used up Stitch keeps posting orders that
+   silently fail to fill until I re-approve. I also have to re-run `stitch
+   approve` every time I raise my configured liquidity. Max avoids both.
+
+4. Run the approval (omit `--exact` for Maximum):
+
+   stitch approve --config "<config-path>"            # maximum
+   stitch approve --config "<config-path>" --exact    # exact amount
+
+   Each approval is one on-chain transaction per token and costs gas, so the
+   operator wallet needs a small native balance. The command is idempotent —
+   it skips tokens already approved.
+
 Dry run:
 - Run dry run only after config and env file exist.
 - Load STITCH_PRIVATE_KEY from the env file into the process environment.
@@ -491,6 +527,8 @@ Show me a short summary:
 - Buy-side and sell-side total liquidity (human amounts and atomic values in
   config).
 - Settlement closing enabled or disabled.
+- Permit2 approvals: which input tokens are approved, and whether I chose
+  maximum or exact.
 - Dry-run result.
 
 Then use AskUserQuestion for explicit confirmation before any live or
