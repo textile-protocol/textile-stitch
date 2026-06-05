@@ -7,7 +7,7 @@ indexer_url = "https://api.textilecredit.com"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0x0000000000000000000000000000000000000000"  # SETTLEMENT_V3_FILLER_REACTOR
 # Subgraph for blue-leg discovery (OPEN positions). Omit to run green-leg only.
-subgraph_url = "https://api.goldsky.com/.../textile-protocol/gn"
+subgraph_url = "https://api.textilecredit.com/subgraph?chainId={...}"
 tick_interval_secs = 5
 
 # Default price feed: used by any pool that doesn't set its own `feed_url`.
