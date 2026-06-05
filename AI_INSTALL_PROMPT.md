@@ -54,6 +54,9 @@ Question tool rules:
   exists in your environment. If the exact name differs (AskUserQuestionTool,
   request_user_input, AskQuestion, etc.), use the equivalent question tool —
   never substitute plain chat for a question the tool can ask.
+- If running in Codex and request_user_input is unavailable because the thread
+  is in Default mode, stop and ask me to switch to Plan mode if I want structured
+  tappable questions. Otherwise continue with one-at-a-time chat questions.
 - Ask one question per tool call and wait for my answer before asking the next.
   Don't batch unrelated fields into one prompt. I want to answer one at a time.
 - Before the first question, tell me in one line what you're setting up and
