@@ -48,8 +48,11 @@ stable):
 ```toml
 buy_offset_bps = 10        # 0.1% below the mid
 sell_offset_bps = 10       # 0.1% above the mid
-# or, absolute soft-per-stable units:
-buy_offset_abs = 5.0       # 5 soft per stable below the mid
+# or, absolute in soft-per-stable units (collateral per debt, e.g. cNGN/USDC),
+# added to the bid and subtracted from the ask so the bid always buys cheaper
+# and the ask sells dearer. At a 1382 soft-per-stable mid, buy_offset_abs = 5
+# bids at 1387 and sell_offset_abs = 5 asks at 1377.
+buy_offset_abs = 5.0
 sell_offset_abs = 5.0
 ```
 

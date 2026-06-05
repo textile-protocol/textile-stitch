@@ -27,6 +27,7 @@ You can run either job by itself, or both jobs together for the same pool.
 - [Configuration](#configuration)
 - [Running As A Service](#running-as-a-service)
 - [Updating](#updating)
+- [Stopping and Uninstalling](#stopping-and-uninstalling)
 - [Security Notes](#security-notes)
 
 ## Quick Start
@@ -264,6 +265,74 @@ sudo systemctl restart stitch
 ```
 
 You can also download a new binary or installer from the latest GitHub Release.
+
+## Stopping and Uninstalling
+
+To stop a foreground run, press `Ctrl-C`. Stitch shuts down cleanly on `Ctrl-C`
+or `SIGTERM`, finishing the current tick first, so it never leaves a half-sent
+fill or a dangling order.
+
+To stop a background service or uninstall completely, expand your platform:
+
+<details>
+<summary><strong>Linux (systemd)</strong></summary>
+
+```bash
+# stop
+sudo systemctl stop stitch
+sudo systemctl disable --now stitch   # also stop it restarting on boot
+
+# uninstall
+sudo rm -f /etc/systemd/system/stitch.service
+sudo systemctl daemon-reload
+sudo rm -f "$(command -v stitch)"     # the installed binary
+sudo rm -rf /etc/stitch               # config + env
+```
+
+</details>
+
+<details>
+<summary><strong>macOS (launchd)</strong></summary>
+
+Use the label you installed the LaunchAgent under (the file in
+`~/Library/LaunchAgents/`).
+
+```bash
+# stop
+launchctl bootout gui/$(id -u)/<label>        # older macOS: launchctl unload ~/Library/LaunchAgents/<label>.plist
+
+# uninstall
+rm -f ~/Library/LaunchAgents/<label>.plist
+rm -f "$(command -v stitch)"                   # the installed binary
+rm -rf ~/.config/stitch                        # config + env
+```
+
+</details>
+
+<details>
+<summary><strong>Windows (PowerShell)</strong></summary>
+
+Use the task or service name you created at install time.
+
+```powershell
+# stop — Task Scheduler:
+schtasks /End /TN "Stitch"
+# or, if you installed it as a service with NSSM:
+nssm stop Stitch
+
+# uninstall — remove the task or service first:
+schtasks /Delete /TN "Stitch" /F                        # Task Scheduler
+nssm remove Stitch confirm                              # or the NSSM service
+Remove-Item -Force (Get-Command stitch).Source          # the installed binary
+Remove-Item -Recurse -Force "$env:ProgramData\Stitch"   # config + env
+```
+
+</details>
+
+Removing the binary does **not** revoke on-chain Permit2 approvals. If you
+approved a maximum allowance, it stays on the operator wallet after uninstall.
+To fully wind down, revoke each token's Permit2 approval (set its allowance to
+0) or retire the dedicated operator wallet.
 
 ## Security Notes
 
