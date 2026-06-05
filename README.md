@@ -51,7 +51,8 @@ confirm.
 ```
 
 For the full copyable prompt, open [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
-For troubleshooting and operational checks, see [DEBUGGING.md](DEBUGGING.md).
+For configuration reference, tuning, and troubleshooting, see
+[ADVANCED.md](ADVANCED.md).
 
 ## Manual Install
 
@@ -179,12 +180,12 @@ collateral_decimals = 6
 debt = "0xusdc0000000000000000000000000000000000d7"
 debt_decimals = 6
 
-buy_offset_bps = 150
+buy_offset_bps = 10
 buy_total_liquidity_debt = "50000000000"
 buy_min_slice_debt = "10000000"
 buy_max_orders = 150
 
-sell_offset_bps = 150
+sell_offset_bps = 10
 sell_total_liquidity_collateral = "50000000000"
 sell_min_slice_debt = "10000000"
 sell_max_orders = 150
@@ -193,88 +194,10 @@ ttl_secs = 30
 refresh_threshold_bps = 10
 ```
 
-### Price Feed
-
-The feed must return JSON with a price and Unix timestamp:
-
-```json
-{ "price": 0.000724, "timestamp": 1760000000 }
-```
-
-`price` is **debt per collateral** — the stable per soft, e.g. USDC per cNGN
-(≈ 0.000724), **not** cNGN per USDC. Stitch quotes off it directly as the
-bid/ask mid (USDT per cNGN); publishing the inverted soft-per-stable number
-(e.g. 1382) makes the bot post wildly mispriced orders. (The absolute spread
-below is the opposite orientation — soft per stable — by design; only the feed
-`price` is debt per collateral.) If you quote multiple pairs with different
-prices, set a `feed_url` inside each `[[pools]]` block instead of relying on the
-top-level `[feed]`.
-
-### Spreads
-
-Each side needs one spread:
-
-```toml
-buy_offset_bps = 150
-sell_offset_bps = 150
-```
-
-or an absolute spread in soft-per-stable units:
-
-```toml
-buy_offset_abs = 2.0
-sell_offset_abs = 2.0
-```
-
-If both are set for a side, basis points win.
-
-### Liquidity And Order Sizing
-
-Stitch can post one order per side or a ladder of smaller orders. The example
-uses laddered liquidity:
-
-```toml
-buy_total_liquidity_debt = "50000000000"
-buy_min_slice_debt = "10000000"
-buy_max_orders = 150
-
-sell_total_liquidity_collateral = "50000000000"
-sell_min_slice_debt = "10000000"
-sell_max_orders = 150
-```
-
-Amounts are atomic token units. For a 6-decimal token:
-
-| Human amount |  Atomic value |
-| -----------: | ------------: |
-|           10 |    `10000000` |
-|          100 |   `100000000` |
-|        1,000 |  `1000000000` |
-|       50,000 | `50000000000` |
-
-The buy side spends the `debt` token. The sell side spends the `collateral`
-token.
-
-### Settlement Closing
-
-To enable settlement closing, add the closing fields to a pool and set the
-top-level `subgraph_url`:
-
-```toml
-subgraph_url = "https://api.goldsky.com/.../textile-protocol/gn"
-
-[[pools]]
-closer_pool = "0x0000000000000000000000000000000000000000"
-floor_ray = "20000000000000000000000000"
-buffer_ray = "20000000000000000000000000"
-window_secs = 432000
-min_margin_collateral = "0"
-max_positions_per_fill = 10
-discover_first = 200
-skip_past_window = true
-```
-
-Omit these fields to run market making only.
+Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
+`50000000000`). For the price-feed orientation, spread options, ladder sizing,
+and settlement-closing fields, see the
+[configuration reference in ADVANCED.md](ADVANCED.md#configuration-reference).
 
 ## Running As A Service
 
