@@ -70,12 +70,22 @@ Make sure the install directory is on your `PATH`, then check the binary:
 stitch --version
 ```
 
-Create a config file:
+Create a config file. On macOS and foreground Linux installs, keep operator
+support files in `~/Stitch` so they are easy to find. The release installer
+receipt used by `stitch --update` stays in `~/.config/stitch-bot`; operators do
+not need to edit it.
 
 ```bash
-curl -L -o stitch.toml \
+mkdir -p ~/Stitch
+chmod 700 ~/Stitch
+curl -L -o ~/Stitch/stitch.toml \
   https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
+chmod 600 ~/Stitch/stitch.toml
 ```
+
+If you previously followed older docs, move existing files from
+`~/.config/stitch` or `~/.config/stitch-bot` to `~/Stitch` and update any saved
+commands or launchd plist to pass `--config ~/Stitch/stitch.toml`.
 
 Set the operator wallet key in the environment. Do not put the private key in
 `stitch.toml`.
@@ -90,8 +100,8 @@ one-time approval for each input token (the `debt` token on the buy side, the
 to fill, and a live start refuses to run. Preview what's needed, then approve:
 
 ```bash
-stitch approve --config stitch.toml --dry-run   # show what needs approving
-stitch approve --config stitch.toml             # maximum allowance (recommended)
+stitch approve --config ~/Stitch/stitch.toml --dry-run
+stitch approve --config ~/Stitch/stitch.toml
 ```
 
 Maximum is the standard market-maker choice: approve once and never re-approve.
@@ -102,7 +112,7 @@ If you'd rather cap the allowance, use `--exact` to approve only the liquidity i
 your config:
 
 ```bash
-stitch approve --config stitch.toml --exact
+stitch approve --config ~/Stitch/stitch.toml --exact
 ```
 
 Be aware of the trade-off: an exact allowance is consumed as orders fill, so once
@@ -114,13 +124,13 @@ the command is idempotent (it skips tokens already approved).
 Run once in dry-run mode before posting live orders:
 
 ```bash
-stitch --config stitch.toml --dry-run
+stitch --config ~/Stitch/stitch.toml --dry-run
 ```
 
 Run live:
 
 ```bash
-stitch --config stitch.toml
+stitch --config ~/Stitch/stitch.toml
 ```
 
 ## How It Works
@@ -203,6 +213,8 @@ and settlement-closing fields, see the
 ## Running As A Service
 
 On Linux, run Stitch under systemd so it restarts after crashes and reboots.
+System-wide service files use `/etc/stitch-bot`, which keeps service-owned
+config separate from foreground operator files in `~/Stitch`.
 
 Create local config and environment files:
 
@@ -223,9 +235,9 @@ Install files:
 
 ```bash
 sudo install -m 0755 "$(command -v stitch)" /usr/local/bin/stitch
-sudo mkdir -p /etc/stitch
-sudo install -m 0644 stitch.toml /etc/stitch/stitch.toml
-sudo install -m 0600 stitch.env /etc/stitch/stitch.env
+sudo mkdir -p /etc/stitch-bot
+sudo install -m 0644 stitch.toml /etc/stitch-bot/stitch.toml
+sudo install -m 0600 stitch.env /etc/stitch-bot/stitch.env
 sudo install -m 0644 stitch.service /etc/systemd/system/stitch.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now stitch
@@ -235,7 +247,7 @@ Approve Permit2 before the first live start (the service won't run until the
 input tokens are approved):
 
 ```bash
-STITCH_PRIVATE_KEY=0x... stitch approve --config /etc/stitch/stitch.toml
+STITCH_PRIVATE_KEY=0x... stitch approve --config /etc/stitch-bot/stitch.toml
 ```
 
 View logs:
@@ -286,7 +298,7 @@ sudo systemctl disable --now stitch   # also stop it restarting on boot
 sudo rm -f /etc/systemd/system/stitch.service
 sudo systemctl daemon-reload
 sudo rm -f "$(command -v stitch)"     # the installed binary
-sudo rm -rf /etc/stitch               # config + env
+sudo rm -rf /etc/stitch-bot           # config + env
 ```
 
 </details>
@@ -304,7 +316,7 @@ launchctl bootout gui/$(id -u)/<label>        # older macOS: launchctl unload ~/
 # uninstall
 rm -f ~/Library/LaunchAgents/<label>.plist
 rm -f "$(command -v stitch)"                   # the installed binary
-rm -rf ~/.config/stitch                        # config + env
+rm -rf ~/Stitch                                # config + env
 ```
 
 </details>
@@ -324,7 +336,7 @@ nssm stop Stitch
 schtasks /Delete /TN "Stitch" /F                        # Task Scheduler
 nssm remove Stitch confirm                              # or the NSSM service
 Remove-Item -Force (Get-Command stitch).Source          # the installed binary
-Remove-Item -Recurse -Force "$env:ProgramData\Stitch"   # config + env
+Remove-Item -Recurse -Force "$env:USERPROFILE\Stitch"   # config + env
 ```
 
 </details>

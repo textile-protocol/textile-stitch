@@ -8,8 +8,10 @@ use anyhow::{anyhow, Context};
 use axoupdater::AxoUpdater;
 use tracing::{info, warn};
 
-/// Cargo package name cargo-dist uses for the install receipt directory
-/// (`~/.config/stitch-bot/stitch-bot-receipt.json`), not the binary name `stitch`.
+/// Cargo package name cargo-dist uses for the installer receipt directory
+/// (`~/.config/stitch-bot/stitch-bot-receipt.json`). This is updater state, not
+/// the operator-facing config directory (`~/Stitch`), and not the binary name
+/// `stitch`.
 const APP_NAME: &str = "stitch-bot";
 
 /// Self-update to the latest release. Returns Ok even when already current.

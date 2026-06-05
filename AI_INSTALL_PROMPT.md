@@ -189,16 +189,19 @@ Use these defaults unless I provide different values:
 - Max positions per fill: 10 (advanced)
 - Discover first: 200 (advanced)
 - Skip past-window positions: true (advanced)
-- Linux config directory: /etc/stitch
-- Linux config path: /etc/stitch/stitch.toml
-- Linux env path: /etc/stitch/stitch.env
+- Foreground config directory on macOS/Linux: ~/Stitch
+- Foreground config path on macOS/Linux: ~/Stitch/stitch.toml
+- Foreground env path on macOS/Linux: ~/Stitch/stitch.env
+- Linux systemd config directory: /etc/stitch-bot
+- Linux systemd config path: /etc/stitch-bot/stitch.toml
+- Linux systemd env path: /etc/stitch-bot/stitch.env
 - Linux service name: stitch
-- macOS config directory: ~/.config/stitch
-- macOS config path: ~/.config/stitch/stitch.toml
-- macOS env path: ~/.config/stitch/stitch.env
-- Windows config directory: %ProgramData%\Stitch
-- Windows config path: %ProgramData%\Stitch\stitch.toml
-- Windows env path: %ProgramData%\Stitch\stitch.env
+- macOS config directory: ~/Stitch
+- macOS config path: ~/Stitch/stitch.toml
+- macOS env path: ~/Stitch/stitch.env
+- Windows config directory: %USERPROFILE%\Stitch
+- Windows config path: %USERPROFILE%\Stitch\stitch.toml
+- Windows env path: %USERPROFILE%\Stitch\stitch.env
 
 Before editing files, first detect the OS, architecture, shell, package
 environment, and available terminal/question tools.
@@ -419,7 +422,7 @@ Unix and macOS private-key script:
    #!/usr/bin/env sh
    set -eu
 
-   CONFIG_DIR="${HOME}/.config/stitch"
+   CONFIG_DIR="${HOME}/Stitch"
    ENV_FILE="${CONFIG_DIR}/stitch.env"
 
    mkdir -p "$CONFIG_DIR"
@@ -445,7 +448,7 @@ Unix and macOS private-key script:
 
 Windows PowerShell private-key script:
 
-   $ConfigDir = "$env:ProgramData\Stitch"
+   $ConfigDir = "$env:USERPROFILE\Stitch"
    $EnvFile = "$ConfigDir\stitch.env"
 
    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
@@ -563,8 +566,8 @@ Do not start until I pick a start option after a successful dry run.
 
 Service setup after confirmation only:
 - macOS: If I choose launchd, create a LaunchAgent plist that runs
-  stitch --config ~/.config/stitch/stitch.toml, and make sure the env file is
-  loaded without putting STITCH_PRIVATE_KEY in command arguments.
+  stitch --config ~/Stitch/stitch.toml, and make sure the env file is loaded
+  without putting STITCH_PRIVATE_KEY in command arguments.
 - Linux: If I confirm systemd, install a stitch.service that loads the env file
   via EnvironmentFile, then run sudo systemctl daemon-reload and
   sudo systemctl enable --now stitch.

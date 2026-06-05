@@ -126,7 +126,7 @@ stitch --help
 Run without posting live orders:
 
 ```bash
-STITCH_PRIVATE_KEY=0x... stitch --config stitch.toml --dry-run
+STITCH_PRIVATE_KEY=0x... stitch --config ~/Stitch/stitch.toml --dry-run
 ```
 
 Increase log detail:
@@ -134,7 +134,7 @@ Increase log detail:
 ```bash
 RUST_LOG=info,stitch=debug,stitch_bot=debug \
   STITCH_PRIVATE_KEY=0x... \
-  stitch --config stitch.toml --dry-run
+  stitch --config ~/Stitch/stitch.toml --dry-run
 ```
 
 If running under systemd:
@@ -206,7 +206,7 @@ self-updates.
 
 Before restarting live:
 
-1. Run `stitch --config stitch.toml --dry-run`.
+1. Run `stitch --config ~/Stitch/stitch.toml --dry-run`.
 2. Confirm the feed price is current.
 3. Confirm balances and Permit2 approvals.
 4. Confirm order sizes are in atomic units.

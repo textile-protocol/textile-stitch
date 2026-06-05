@@ -1,11 +1,14 @@
 # systemd unit for the Textile Stitch.
 #
+# This template is only for a root-managed Linux systemd service. Foreground
+# operator runs use ~/Stitch/stitch.toml and ~/Stitch/stitch.env instead.
+#
 # Install:
 #   sudo cp stitch /usr/local/bin/
-#   sudo mkdir -p /etc/stitch
-#   sudo cp stitch.toml /etc/stitch/stitch.toml
-#   sudo cp stitch.env  /etc/stitch/stitch.env   # holds STITCH_PRIVATE_KEY, chmod 600
-#   sudo chmod 600 /etc/stitch/stitch.env
+#   sudo mkdir -p /etc/stitch-bot
+#   sudo cp stitch.toml /etc/stitch-bot/stitch.toml
+#   sudo cp stitch.env  /etc/stitch-bot/stitch.env   # holds STITCH_PRIVATE_KEY, chmod 600
+#   sudo chmod 600 /etc/stitch-bot/stitch.env
 #   sudo cp stitch.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now stitch
@@ -21,8 +24,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 # The wallet key lives here, never in stitch.toml or the unit. chmod 600.
-EnvironmentFile=/etc/stitch/stitch.env
-ExecStart=/usr/local/bin/stitch --config /etc/stitch/stitch.toml
+EnvironmentFile=/etc/stitch-bot/stitch.env
+ExecStart=/usr/local/bin/stitch --config /etc/stitch-bot/stitch.toml
 # The bot traps SIGTERM and exits cleanly after the current tick.
 Restart=always
 RestartSec=5
@@ -31,7 +34,7 @@ DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadOnlyPaths=/etc/stitch
+ReadOnlyPaths=/etc/stitch-bot
 
 [Install]
 WantedBy=multi-user.target
