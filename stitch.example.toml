@@ -52,7 +52,7 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
 # positions via pool.fill(); omit them to run this pool green-only. The
 # floor/buffer/window mirror the pool's on-chain auction params. -----
 closer_pool = "0x0000000000000000000000000000000000000000"  # SettlementPool
-floor_ray = "20000000000000000000000000"     # 2% opening rate (RAY)
+floor_ray = "500000000000000000000000"       # 0.05% opening rate (RAY)
 buffer_ray = "20000000000000000000000000"    # 2% decaying buffer (RAY)
 window_secs = 432000                          # 5-day auction window
 min_margin_collateral = "0"                   # accept any positive net margin

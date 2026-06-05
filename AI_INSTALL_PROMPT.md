@@ -178,6 +178,10 @@ Use these defaults unless I provide different values:
 - Order TTL: 30 seconds
 - Refresh threshold: 10 bps
 - Settlement closing: disabled unless I explicitly enable it
+- Floor rate (floor_ray): 500000000000000000000000 (0.05%), only if closing is
+  enabled and discovery didn't supply it
+- Buffer rate (buffer_ray): 20000000000000000000000000 (2%), only if closing is
+  enabled and discovery didn't supply it
 - Settlement close window: 432000 seconds, only if closing is enabled
 - Minimum close margin: 0, only if closing is enabled
 - Max positions per fill: 10, only if closing is enabled
@@ -272,7 +276,9 @@ Token decimals after discovery:
 If settlement closing is enabled:
 - Settlement pool address = chosen pool address from discovery.
 - floor_ray and buffer_ray from the pool's floorFee and buffer in GraphQL when
-  present; otherwise ask via AskUserQuestion.
+  present; otherwise default to floor_ray = 500000000000000000000000 (0.05%
+  opening rate) and buffer_ray = 20000000000000000000000000 (2% buffer), the
+  current production values. Confirm with me before writing if discovery missed.
 - window_secs 432000, min_margin_collateral 0, max_positions_per_fill 10,
   discover_first 200, skip_past_window true unless I override in the interview.
 
