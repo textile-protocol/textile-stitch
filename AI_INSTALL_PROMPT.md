@@ -79,14 +79,18 @@ Question tool rules:
   option and don't drop to plain chat for anything the tool can ask.
 - Keep questions single-select unless a step explicitly says I may pick several;
   don't enable multi-select otherwise.
+- Ask only the strictly-needed questions the interview lists. Everything else is
+  auto-filled from discovery, the example config, my wallet, or safe defaults —
+  don't invent extra questions. After the dry run, tell me I can edit the config
+  file directly for advanced settings.
 - Never ask for STITCH_PRIVATE_KEY through a question tool or chat.
 - If no question tool exists, ask the same sequence as concise chat questions,
   still one at a time, with the same progress and recommended-first style.
 
 Operator interview (AskUserQuestion, one question at a time):
-Run this sequence after detecting OS/architecture and before writing config.
-Skip a step only when discovery or defaults already fixed the value and you
-only need a quick confirm question for that step.
+Keep it short — ask ONLY the questions below. Everything else is auto-filled from
+discovery, the example config, my wallet, or the defaults; never ask about it.
+Run after detecting OS/architecture and before writing config.
 
 1. Chain — which network should Stitch run on?
    - Options (3 max): Base — 8453 (recommended); BNB Smart Chain — 56; Another
@@ -106,56 +110,50 @@ only need a quick confirm question for that step.
    - Linux: systemd service; Foreground / manual.
    - Windows: Foreground / manual; Task Scheduler; Windows service.
 
-3. Settlement closing — what should Stitch do?
-   - Options: Market-making only (recommended); Enable blue-leg closing too.
+3. Pool — after discovery (below), present pools as options (display name or pair
+   label, recommended = first listed) so I pick a row instead of typing an
+   address. Show at most 3; if there are more, show the first 3 and let me name
+   another via the free-form answer. If discovery returned nothing on a real
+   chain, stop; on 31337 use the local-address flow. Both legs run by default, so
+   the pool I pick is also the settlement-closing target — don't ask me whether
+   to enable closing.
 
-4. If closing is enabled — ask for the subgraph URL (offer the known Goldsky
-   subgraph for my chain as an option if you have it, otherwise free-form). It's
-   independent of pool discovery. Defer the closer params (floor_ray, buffer_ray,
-   window): pull them from pool discovery in step 6, and only ask for any value
-   still missing from GraphQL, one question each.
+4. Buy spread — how far below the mid should the bid sit?
+   - Options: 0.1% (recommended); 0.25%; 0.5%. Or type an absolute like "5 cNGN"
+     or "5 NGN" (soft units per stable). Mapping: a percentage X% ->
+     buy_offset_bps = X * 100 (0.1% -> 10); an absolute N -> buy_offset_abs = N.
 
-5. Reactor address — no safe default. Offer the known filler reactor for my
-   chain as an option if you have one; otherwise I'll paste it in the free-form
-   answer.
+5. Sell spread — how far above the mid should the ask sit?
+   - Same options and mapping as the buy side (sell_offset_bps / sell_offset_abs).
 
-6. Pool — after discovery, present pools as options (display name or pair label,
-   recommended = first listed) so I pick a row instead of typing an address.
-   Show at most 3; if there are more, show the first 3 and let me name another
-   via the free-form answer. If discovery returned nothing on a real chain,
-   stop; on 31337 use the local-address flow.
+6. Liquidity — don't ask me for amounts; read them from my wallet. Get my
+   operator wallet address (ask me for the public 0x... address — never the
+   private key), then read each side's input-token balance via the RPC:
+   debt-token balanceOf for the buy side, collateral-token balanceOf for the
+   sell side. Tell me what you found (human-readable) and ask me to confirm
+   quoting my full balance per side, or to enter a smaller amount. Map the
+   confirmed values to buy_total_liquidity_debt and
+   sell_total_liquidity_collateral (balanceOf is already atomic — no decimal
+   conversion). If a side's balance is 0, tell me to fund it and skip that side.
 
-Market-making setup (steps 7-12 all have safe defaults). To avoid a long quiz,
-ask one gate question first:
-   "Use the recommended market-making defaults (150 bps each side, 50000 per
-   side, 10 min slice, 150 max orders), or set each value yourself?"
-   - Options: Use the defaults (recommended) — skip steps 7-12; Customize — ask
-     steps 7-12 one at a time.
+Never ask about these — map the answers above to the primary parameters and
+leave every advanced parameter at its default. If you can't tell whether a field
+is primary or advanced, ask me rather than guess.
 
-For steps 7-12, present the presets below (recommended first); I can also type a
-custom value in the free-form answer.
-
-7. Buy spread (bps below mid).
-   - Options: 150 / 1.5% (recommended); 100 / 1.0%; 200 / 2.0%.
-
-8. Sell spread (bps above mid).
-   - Options: 150 / 1.5% (recommended); 100 / 1.0%; 200 / 2.0%.
-
-9. Buy-side total liquidity (human amount, debt/stable token).
-   - Options: 50000 (recommended); 10000; 100000.
-
-10. Sell-side total liquidity (human amount, collateral/soft token).
-    - Options: 50000 (recommended); 10000; 100000.
-
-11. Minimum order slice (human amount, debt/stable units).
-    - Options: 10 (recommended); 5; 25.
-
-12. Maximum ladder orders per side.
-    - Options: 150 (recommended); 50; 100.
-
-Use defaults without asking only for values not listed above (indexer URL,
-price feed URL, Permit2, tick interval, TTL, refresh threshold, platform paths)
-unless I ask to change them.
+Auto-fill (never ask):
+- Reactor: use the reactor value already in the downloaded stitch.example.toml
+  (we prefill it per deployment). If it's still the zero address, ask me for the
+  deployed reactor address for my chain (free-form) before writing config — never
+  write a zero reactor.
+- subgraph_url: set to https://api.textilecredit.com/subgraph?chainId=<my chain
+  id> (the Textile proxy). Both legs run by default, so always set it.
+- Settlement closing (blue leg) runs by default on the chosen pool: closer_pool =
+  the chosen pool address; floor_ray / buffer_ray / window_secs from the pool's
+  floorFee / buffer / window in GraphQL (defaults below if discovery misses);
+  min_margin_collateral 0, max_positions_per_fill 10, discover_first 200,
+  skip_past_window true.
+- Advanced (defaults, never ask): minimum order slice, maximum orders per side,
+  tick interval, order TTL, refresh threshold, indexer URL, price feed, Permit2.
 
 Use these defaults unless I provide different values:
 - Binary command name: stitch
@@ -166,27 +164,31 @@ Use these defaults unless I provide different values:
 - Textile indexer URL: https://api.textilecredit.com
 - Price feed URL: https://api.textilecredit.com/price
 - Permit2 address: 0x000000000022D473030F116dDEE9F6B43aC78BA3
+- Reactor address: from stitch.example.toml (prefilled per deployment); ask only
+  if it's still the zero address
+- Subgraph URL: https://api.textilecredit.com/subgraph?chainId=<chain id> (the
+  Textile proxy); never ask
 - Price feed staleness: 30 seconds
 - Tick interval: 5 seconds
 - Token decimals: 6, unless I provide different decimals
-- Buy spread: 150 bps
-- Sell spread: 150 bps
-- Buy total liquidity: 50000 units of the debt/stable token
-- Sell total liquidity: 50000 units of the collateral/soft token
-- Minimum order slice: 10 units of the debt/stable token
-- Maximum ladder orders per side: 150
+- Buy spread: 0.1% (10 bps)
+- Sell spread: 0.1% (10 bps)
+- Buy total liquidity: from my wallet's debt-token balance (don't ask)
+- Sell total liquidity: from my wallet's collateral-token balance (don't ask)
+- Minimum order slice (advanced, never ask): 10 units of the debt/stable token
+- Maximum ladder orders per side (advanced, never ask): 150
 - Order TTL: 30 seconds
 - Refresh threshold: 10 bps
-- Settlement closing: disabled unless I explicitly enable it
-- Floor rate (floor_ray): 500000000000000000000000 (0.05%), only if closing is
-  enabled and discovery didn't supply it
-- Buffer rate (buffer_ray): 20000000000000000000000000 (2%), only if closing is
-  enabled and discovery didn't supply it
-- Settlement close window: 432000 seconds, only if closing is enabled
-- Minimum close margin: 0, only if closing is enabled
-- Max positions per fill: 10, only if closing is enabled
-- Discover first: 200, only if closing is enabled
-- Skip past-window positions: true, only if closing is enabled
+- Settlement closing: enabled by default (both legs)
+- Floor rate (floor_ray): 500000000000000000000000 (0.05%), if discovery didn't
+  supply it
+- Buffer rate (buffer_ray): 20000000000000000000000000 (2%), if discovery didn't
+  supply it
+- Settlement close window: 432000 seconds, if discovery didn't supply it
+- Minimum close margin: 0 (advanced)
+- Max positions per fill: 10 (advanced)
+- Discover first: 200 (advanced)
+- Skip past-window positions: true (advanced)
 - Linux config directory: /etc/stitch
 - Linux config path: /etc/stitch/stitch.toml
 - Linux env path: /etc/stitch/stitch.env
@@ -218,7 +220,7 @@ back empty; do not query it and do not treat the empty result as a failure.
 Instead get pool and token addresses from local deploy output (for example a
 deployments/addresses file, broadcast/run-latest.json from the deploy script, or
 the addresses the deploy printed), or ask me for them one at a time via
-AskUserQuestion. Then continue to the pool pick (step 6) as usual.
+AskUserQuestion. Then continue to the pool pick (step 3) as usual.
 
 Preferred — GraphQL (same data as the deposit page):
 1. POST to https://app.textilecredit.com/api/graphql with Content-Type:
@@ -247,11 +249,11 @@ Preferred — GraphQL (same data as the deposit page):
    - collateral token address = collateralAsset (soft / collateral column on
      the deposit page)
    - debt token address = debtAsset (stable / Supply column on the deposit page)
-   - closer_pool (only if settlement closing is enabled) = pool address
+   - closer_pool = pool address (closing runs by default)
 
 6. Present a short table: displayName or pair label, chainId, supply/debt
    symbol hint if known, collateralAsset, debtAsset, pool address. Then ask
-   which row to operate on with AskUserQuestion (interview step 6;
+   which row to operate on with AskUserQuestion (interview step 3;
    recommended = first listed pool or the one I name).
 
 Fallback — browse the deposit page:
@@ -273,14 +275,17 @@ Token decimals after discovery:
 - Default 6 for both tokens when symbols look like USDT/USDC-style stables.
 - If unsure, read decimals() from each token contract via the gathered RPC URL.
 
-If settlement closing is enabled:
-- Settlement pool address = chosen pool address from discovery.
+Settlement closing (runs by default — don't ask whether to enable it):
+- subgraph_url = https://api.textilecredit.com/subgraph?chainId=<my chain id>
+  (the Textile proxy). Never ask me for a subgraph URL.
+- closer_pool = chosen pool address from discovery.
 - floor_ray and buffer_ray from the pool's floorFee and buffer in GraphQL when
   present; otherwise default to floor_ray = 500000000000000000000000 (0.05%
   opening rate) and buffer_ray = 20000000000000000000000000 (2% buffer), the
-  current production values. Confirm with me before writing if discovery missed.
+  current production values.
 - window_secs 432000, min_margin_collateral 0, max_positions_per_fill 10,
-  discover_first 200, skip_past_window true unless I override in the interview.
+  discover_first 200, skip_past_window true. These are advanced — leave them at
+  the defaults; I can edit the config file if I want to change them.
 
 Release install procedure:
 1. Query the latest GitHub Release metadata:
@@ -364,18 +369,20 @@ Configuration procedure:
 
 2. Create stitch.toml at the platform config path using gathered values.
 
-3. Convert human token amounts to base units using token decimals.
-   - buy_total_liquidity_debt from my buy-side total liquidity answer.
-   - sell_total_liquidity_collateral from my sell-side total liquidity answer.
-   - buy_min_slice_debt and sell_min_slice_debt from the minimum slice default.
-   - Example: 50000 with 6 decimals becomes "50000000000".
-   - Example: 10 with 6 decimals becomes "10000000".
+3. Token amounts are atomic (uint256 strings).
+   - buy_total_liquidity_debt / sell_total_liquidity_collateral = the wallet
+     balances I confirmed in the interview (balanceOf is already atomic — no
+     conversion).
+   - buy_min_slice_debt / sell_min_slice_debt = the default (advanced), e.g.
+     "10000000" for a 10-unit minimum on a 6-decimal token.
 
-4. If settlement closing is disabled:
-   - Omit subgraph_url.
-   - Omit closer fields such as closer_pool, floor_ray, buffer_ray, window_secs,
-     min_margin_collateral, max_positions_per_fill, discover_first, and
+4. Settlement closing runs by default:
+   - Set subgraph_url to the Textile proxy
+     (https://api.textilecredit.com/subgraph?chainId=<chain id>).
+   - Include the closer fields: closer_pool, floor_ray, buffer_ray, window_secs,
+     min_margin_collateral, max_positions_per_fill, discover_first,
      skip_past_window.
+   - Only omit these if I explicitly ask to run the green leg only.
 
 5. Restrict config file permissions:
    - Unix: config directory 700, config file 600.
@@ -528,17 +535,23 @@ Show me a short summary:
 - Env path exists and permissions are restricted, without showing secret
   contents.
 - Network, chain ID, and RPC URL.
-- Reactor address.
+- Reactor address (from stitch.example.toml).
 - Chosen pool (display name or pair) and how it was discovered (GraphQL vs
   deposit page).
 - Collateral and debt token addresses, decimals, and human-readable symbols if
   known.
-- Buy-side and sell-side total liquidity (human amounts and atomic values in
-  config).
-- Settlement closing enabled or disabled.
+- Buy and sell spread (the percentage or absolute I picked).
+- Buy-side and sell-side liquidity, read from my wallet balances (human +
+  atomic).
+- Settlement closing: on by default, with the closer pool and the subgraph proxy.
 - Permit2 approvals: which input tokens are approved, and whether I chose
   maximum or exact.
 - Dry-run result.
+
+Then remind me that advanced parameters (minimum order slice, maximum orders,
+tick interval, TTL, refresh threshold, and the closer's margin / positions /
+discover / skip settings) are at safe defaults, and that I can edit the config
+file directly and restart to change any of them.
 
 Then use AskUserQuestion for explicit confirmation before any live or
 persistent operation. Make it multiple choice, recommended first:
