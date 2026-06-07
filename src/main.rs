@@ -89,7 +89,7 @@ impl Poster<'_> {
     async fn post(
         &self,
         nonce: u64,
-        deadline: u64,
+        ttl_secs: u64,
         input_token: Address,
         input_amount: U256,
         output_token: Address,
@@ -102,6 +102,7 @@ impl Poster<'_> {
             warn!(label, "zero-size order; skipping");
             return false;
         }
+        let deadline = unix_now().saturating_add(ttl_secs);
         let order = OrderParams {
             reactor: self.reactor,
             swapper: self.maker,
@@ -502,7 +503,6 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                 pool.collateral.to_lowercase(),
                 pool.debt.to_lowercase()
             );
-            let deadline = now + pool.ttl_secs;
 
             // BID — buy collateral (cNGN) below mid with debt (USDT). "Buy low."
             if let Some(spread) = pool.buy_spread() {
@@ -557,7 +557,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         if poster
                             .post(
                                 nonce,
-                                deadline,
+                                pool.ttl_secs,
                                 debt,
                                 input,
                                 collateral,
@@ -675,7 +675,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         if poster
                             .post(
                                 nonce,
-                                deadline,
+                                pool.ttl_secs,
                                 collateral,
                                 input,
                                 debt,
