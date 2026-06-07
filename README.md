@@ -71,9 +71,7 @@ stitch --version
 ```
 
 Create a config file. On macOS and foreground Linux installs, keep operator
-support files in `~/Stitch` so they are easy to find. The release installer
-receipt used by `stitch --update` stays in `~/.config/stitch-bot`; operators do
-not need to edit it.
+support files in `~/Stitch` so they are easy to find.
 
 ```bash
 mkdir -p ~/Stitch
@@ -82,10 +80,6 @@ curl -L -o ~/Stitch/stitch.toml \
   https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
 chmod 600 ~/Stitch/stitch.toml
 ```
-
-If you previously followed older docs, move existing files from
-`~/.config/stitch` or `~/.config/stitch-bot` to `~/Stitch` and update any saved
-commands or launchd plist to pass `--config ~/Stitch/stitch.toml`.
 
 Store the operator wallet key in a separate key file. Do not put the private key
 in `stitch.toml`.

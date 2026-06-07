@@ -30,9 +30,8 @@ Hard rules:
   assets to a local file first, then run or extract them from disk.
 - If release discovery, asset download, checksum verification, installer
   execution, config writing, secret writing, or dry run fails, stop and explain.
-- If the release installer URL in older docs is stale, discover the actual
-  latest-release installer asset from GitHub Release metadata instead of
-  guessing or cloning.
+- Discover the actual latest-release installer asset from GitHub Release
+  metadata instead of guessing or cloning.
 - Do not start live operation, background services, launchd, systemd, Task
   Scheduler, Windows services, or any persistent process until after a
   successful dry run and my explicit confirmation.
