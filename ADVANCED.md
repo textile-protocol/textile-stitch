@@ -126,14 +126,15 @@ stitch --help
 Run without posting live orders:
 
 ```bash
-STITCH_PRIVATE_KEY=0x... stitch --config ~/Stitch/stitch.toml --dry-run
+STITCH_PRIVATE_KEY_FILE=~/Stitch/stitch.key \
+  stitch --config ~/Stitch/stitch.toml --dry-run
 ```
 
 Increase log detail:
 
 ```bash
 RUST_LOG=info,stitch=debug,stitch_bot=debug \
-  STITCH_PRIVATE_KEY=0x... \
+  STITCH_PRIVATE_KEY_FILE=~/Stitch/stitch.key \
   stitch --config ~/Stitch/stitch.toml --dry-run
 ```
 

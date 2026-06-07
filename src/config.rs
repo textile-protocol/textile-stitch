@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
 //! Operator config (a TOML file). The wallet key comes from the environment
-//! (`STITCH_PRIVATE_KEY`), never the file.
+//! (`STITCH_PRIVATE_KEY_FILE` or `STITCH_PRIVATE_KEY`), never the config file.
 
 use serde::Deserialize;
 

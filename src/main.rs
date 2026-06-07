@@ -8,10 +8,11 @@
 //! `closer_pool` configured and a `subgraph_url` set.
 //!
 //! Usage:
-//!   STITCH_PRIVATE_KEY=0x... stitch --config stitch.toml
-//!   STITCH_PRIVATE_KEY=0x... stitch --config stitch.toml --dry-run
+//!   STITCH_PRIVATE_KEY_FILE=stitch.key stitch --config stitch.toml
+//!   STITCH_PRIVATE_KEY_FILE=stitch.key stitch --config stitch.toml --dry-run
 
 use std::collections::HashMap;
+use std::env::VarError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, U256};
@@ -140,14 +141,16 @@ impl Poster<'_> {
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PRIVATE_KEY_ENV: &str = "STITCH_PRIVATE_KEY";
+const PRIVATE_KEY_FILE_ENV: &str = "STITCH_PRIVATE_KEY_FILE";
 
 fn print_help() {
     println!(
         "stitch {VERSION}\n\
          The Textile filler network operator bot.\n\n\
          USAGE:\n    \
-         STITCH_PRIVATE_KEY=0x... stitch --config <path> [--dry-run]\n    \
-         STITCH_PRIVATE_KEY=0x... stitch approve --config <path> [--exact] [--dry-run]\n\n\
+         STITCH_PRIVATE_KEY_FILE=/path/to/key stitch --config <path> [--dry-run]\n    \
+         STITCH_PRIVATE_KEY_FILE=/path/to/key stitch approve --config <path> [--exact] [--dry-run]\n\n\
          COMMANDS:\n    \
          approve           Approve the config's input tokens to Permit2, then exit.\n                      \
          Required before going live; uses a max allowance unless --exact.\n\n\
@@ -159,7 +162,8 @@ fn print_help() {
          --update          Update to the latest release, then exit.\n    \
          -V, --version     Print version and exit.\n    \
          -h, --help        Print this help and exit.\n\n\
-         The wallet key is never in the config — pass STITCH_PRIVATE_KEY in the env."
+         The wallet key is never in the config — pass STITCH_PRIVATE_KEY or \
+         STITCH_PRIVATE_KEY_FILE in the env."
     );
 }
 
@@ -192,9 +196,89 @@ async fn shutdown_signal() {
 }
 
 fn load_key() -> anyhow::Result<SigningKey> {
-    let raw =
-        std::env::var("STITCH_PRIVATE_KEY").context("STITCH_PRIVATE_KEY env var is required")?;
+    let raw = load_key_material()?;
     parse_private_key(&raw)
+}
+
+fn load_key_material() -> anyhow::Result<String> {
+    load_key_material_from_vars(
+        std::env::var(PRIVATE_KEY_FILE_ENV),
+        std::env::var(PRIVATE_KEY_ENV),
+    )
+}
+
+fn load_key_material_from_vars(
+    key_file: Result<String, VarError>,
+    key: Result<String, VarError>,
+) -> anyhow::Result<String> {
+    match key_file {
+        Ok(path) => return read_private_key_file(&path),
+        Err(VarError::NotPresent) => {}
+        Err(VarError::NotUnicode(_)) => {
+            return Err(anyhow!("{PRIVATE_KEY_FILE_ENV} must be valid unicode"));
+        }
+    }
+    key.with_context(|| format!("set {PRIVATE_KEY_FILE_ENV} or {PRIVATE_KEY_ENV}"))
+}
+
+fn read_private_key_file(path: &str) -> anyhow::Result<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(anyhow!("{PRIVATE_KEY_FILE_ENV} is empty"));
+    }
+    std::fs::read_to_string(path).with_context(|| format!("reading {PRIVATE_KEY_FILE_ENV} {path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    fn temp_key_file(contents: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "stitch-test-key-{}-{}.txt",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn key_material_uses_direct_env_when_no_file_is_set() {
+        let raw = load_key_material_from_vars(Err(VarError::NotPresent), Ok(TEST_KEY.into()))
+            .expect("key loads");
+        assert_eq!(raw, TEST_KEY);
+    }
+
+    #[test]
+    fn key_material_file_takes_precedence_over_direct_env() {
+        let path = temp_key_file(&format!("0x{TEST_KEY}\n"));
+        let raw = load_key_material_from_vars(
+            Ok(path.to_string_lossy().into_owned()),
+            Ok("0x0000000000000000000000000000000000000000000000000000000000000001".into()),
+        )
+        .expect("key file loads");
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(raw.trim(), format!("0x{TEST_KEY}"));
+    }
+
+    #[test]
+    fn key_material_requires_some_source() {
+        let err = load_key_material_from_vars(Err(VarError::NotPresent), Err(VarError::NotPresent))
+            .expect_err("missing key source should fail");
+        assert!(err.to_string().contains(PRIVATE_KEY_FILE_ENV));
+        assert!(err.to_string().contains(PRIVATE_KEY_ENV));
+    }
+
+    #[test]
+    fn empty_key_file_path_is_an_error() {
+        let err =
+            load_key_material_from_vars(Ok(" ".into()), Ok(TEST_KEY.into())).expect_err("empty");
+        assert!(err.to_string().contains(PRIVATE_KEY_FILE_ENV));
+    }
 }
 
 fn unix_now() -> u64 {

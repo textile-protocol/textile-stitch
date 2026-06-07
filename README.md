@@ -87,11 +87,23 @@ If you previously followed older docs, move existing files from
 `~/.config/stitch` or `~/.config/stitch-bot` to `~/Stitch` and update any saved
 commands or launchd plist to pass `--config ~/Stitch/stitch.toml`.
 
-Set the operator wallet key in the environment. Do not put the private key in
-`stitch.toml`.
+Store the operator wallet key in a separate key file. Do not put the private key
+in `stitch.toml`.
 
 ```bash
-export STITCH_PRIVATE_KEY=0x...
+printf 'Enter STITCH_PRIVATE_KEY: '
+stty -echo
+IFS= read -r key
+stty echo
+printf '\n'
+umask 077
+printf '%s\n' "$key" > ~/Stitch/stitch.key
+unset key
+printf 'STITCH_PRIVATE_KEY_FILE=%s\n' "$HOME/Stitch/stitch.key" > ~/Stitch/stitch.env
+chmod 600 ~/Stitch/stitch.key ~/Stitch/stitch.env
+set -a
+. ~/Stitch/stitch.env
+set +a
 ```
 
 Approve Permit2 to pull the tokens Stitch quotes. The operator wallet needs a
@@ -137,7 +149,8 @@ stitch --config ~/Stitch/stitch.toml
 
 Stitch reads `stitch.toml`, polls your configured price feed, signs UniswapX
 limit orders, and posts those signed orders to the Textile indexer. The wallet
-private key is read from `STITCH_PRIVATE_KEY`.
+private key is read from `STITCH_PRIVATE_KEY_FILE`, or from `STITCH_PRIVATE_KEY`
+for compatibility. If both are set, `STITCH_PRIVATE_KEY_FILE` takes precedence.
 
 For market making, each configured pool can have:
 
@@ -216,14 +229,22 @@ On Linux, run Stitch under systemd so it restarts after crashes and reboots.
 System-wide service files use `/etc/stitch-bot`, which keeps service-owned
 config separate from foreground operator files in `~/Stitch`.
 
-Create local config and environment files:
+Create local config, key, and environment files:
 
 ```bash
 curl -L -o stitch.toml \
   https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
 
+printf 'Enter STITCH_PRIVATE_KEY: '
+stty -echo
+IFS= read -r key
+stty echo
+printf '\n'
+umask 077
+printf '%s\n' "$key" > stitch.key
+unset key
+
 cat > stitch.env <<'EOF'
-STITCH_PRIVATE_KEY=0x...
 RUST_LOG=info
 EOF
 
@@ -237,17 +258,24 @@ Install files:
 sudo install -m 0755 "$(command -v stitch)" /usr/local/bin/stitch
 sudo mkdir -p /etc/stitch-bot
 sudo install -m 0644 stitch.toml /etc/stitch-bot/stitch.toml
-sudo install -m 0600 stitch.env /etc/stitch-bot/stitch.env
+sudo install -m 0600 stitch.key /etc/stitch-bot/stitch.key
+sudo install -m 0644 stitch.env /etc/stitch-bot/stitch.env
 sudo install -m 0644 stitch.service /etc/systemd/system/stitch.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now stitch
 ```
 
+The service template uses `LoadCredential` so the private key is injected as a
+systemd credential instead of stored in the process environment. Operators who
+manage encrypted systemd credentials can replace it with
+`LoadCredentialEncrypted`.
+
 Approve Permit2 before the first live start (the service won't run until the
 input tokens are approved):
 
 ```bash
-STITCH_PRIVATE_KEY=0x... stitch approve --config /etc/stitch-bot/stitch.toml
+sudo STITCH_PRIVATE_KEY_FILE=/etc/stitch-bot/stitch.key \
+  stitch approve --config /etc/stitch-bot/stitch.toml
 ```
 
 View logs:
@@ -349,7 +377,8 @@ To fully wind down, revoke each token's Permit2 approval (set its allowance to
 ## Security Notes
 
 - Keep `STITCH_PRIVATE_KEY` out of `stitch.toml`, shell history, and process
-  managers that expose command lines.
+  managers that expose command lines. Prefer `STITCH_PRIVATE_KEY_FILE` pointing
+  at a 600-permission key file.
 - Use a dedicated operator wallet.
 - Fund only the inventory you intend Stitch to use.
 - Review token balances, Permit2 approvals, spreads, and order sizes before

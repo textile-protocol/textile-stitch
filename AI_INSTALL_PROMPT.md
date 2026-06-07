@@ -42,8 +42,10 @@ Security rules:
 - Do not put STITCH_PRIVATE_KEY in stitch.toml, shell history, logs, screenshots,
   or command arguments.
 - Collect STITCH_PRIVATE_KEY only through a local hidden terminal prompt.
-- Write it only to the platform env file as STITCH_PRIVATE_KEY=...
-- Restrict env file permissions. On Unix, use chmod 600.
+- Write it only to the platform key file. On Unix, use chmod 600.
+- Put only STITCH_PRIVATE_KEY_FILE=<key-file-path> in the env file.
+- If both STITCH_PRIVATE_KEY_FILE and STITCH_PRIVATE_KEY are set,
+  STITCH_PRIVATE_KEY_FILE takes precedence.
 - Use a dedicated operator wallet.
 - Before any live operation, confirm token balances and set up Permit2 approvals
   with `stitch approve` (see the Permit2 approvals step). A live start refuses to
@@ -192,16 +194,20 @@ Use these defaults unless I provide different values:
 - Foreground config directory on macOS/Linux: ~/Stitch
 - Foreground config path on macOS/Linux: ~/Stitch/stitch.toml
 - Foreground env path on macOS/Linux: ~/Stitch/stitch.env
+- Foreground key path on macOS/Linux: ~/Stitch/stitch.key
 - Linux systemd config directory: /etc/stitch-bot
 - Linux systemd config path: /etc/stitch-bot/stitch.toml
 - Linux systemd env path: /etc/stitch-bot/stitch.env
+- Linux systemd key path: /etc/stitch-bot/stitch.key
 - Linux service name: stitch
 - macOS config directory: ~/Stitch
 - macOS config path: ~/Stitch/stitch.toml
 - macOS env path: ~/Stitch/stitch.env
+- macOS key path: ~/Stitch/stitch.key
 - Windows config directory: %USERPROFILE%\Stitch
 - Windows config path: %USERPROFILE%\Stitch\stitch.toml
 - Windows env path: %USERPROFILE%\Stitch\stitch.env
+- Windows key path: %USERPROFILE%\Stitch\stitch.key
 
 Before editing files, first detect the OS, architecture, shell, package
 environment, and available terminal/question tools.
@@ -415,7 +421,8 @@ script. Pick the first option that genuinely gives a TTY:
    so the hidden prompt reads my keystrokes and not the rest of the paste.
 
 The script reads from /dev/tty (not piped stdin) so it works under `open -a
-Terminal` and when pasted. Do not proceed until I confirm the env file exists.
+Terminal` and when pasted. Do not proceed until I confirm the key and env files
+exist.
 
 Unix and macOS private-key script:
 
@@ -424,6 +431,7 @@ Unix and macOS private-key script:
 
    CONFIG_DIR="${HOME}/Stitch"
    ENV_FILE="${CONFIG_DIR}/stitch.env"
+   KEY_FILE="${CONFIG_DIR}/stitch.key"
 
    mkdir -p "$CONFIG_DIR"
    chmod 700 "$CONFIG_DIR"
@@ -435,21 +443,24 @@ Unix and macOS private-key script:
    printf '\n' > /dev/tty
 
    if [ -z "$key" ]; then
-     echo "No private key entered; not writing env file."
+     echo "No private key entered; not writing key file."
      exit 1
    fi
 
    umask 077
-   printf 'STITCH_PRIVATE_KEY=%s\n' "$key" > "$ENV_FILE"
+   printf '%s\n' "$key" > "$KEY_FILE"
    unset key
+   chmod 600 "$KEY_FILE"
+   printf 'STITCH_PRIVATE_KEY_FILE=%s\n' "$KEY_FILE" > "$ENV_FILE"
    chmod 600 "$ENV_FILE"
 
-   echo "Wrote $ENV_FILE with restricted permissions." > /dev/tty
+   echo "Wrote $KEY_FILE and $ENV_FILE with restricted permissions." > /dev/tty
 
 Windows PowerShell private-key script:
 
    $ConfigDir = "$env:USERPROFILE\Stitch"
    $EnvFile = "$ConfigDir\stitch.env"
+   $KeyFile = "$ConfigDir\stitch.key"
 
    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 
@@ -458,15 +469,16 @@ Windows PowerShell private-key script:
    $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
 
    if ([string]::IsNullOrWhiteSpace($plain)) {
-     Write-Error "No private key entered; not writing env file."
+     Write-Error "No private key entered; not writing key file."
      exit 1
    }
 
-   "STITCH_PRIVATE_KEY=$plain" | Set-Content -NoNewline -Path $EnvFile
+   $plain | Set-Content -NoNewline -Path $KeyFile
+   "STITCH_PRIVATE_KEY_FILE=$KeyFile" | Set-Content -NoNewline -Path $EnvFile
    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
    $plain = $null
 
-   Write-Host "Wrote $EnvFile."
+   Write-Host "Wrote $KeyFile and $EnvFile."
 
 Permit2 approvals (after the env file exists, before the dry run):
 The operator wallet must approve Permit2 to pull each token Stitch quotes as
@@ -475,8 +487,9 @@ orders post but silently fail to fill, and a live start refuses to run. The
 binary handles this; do not ask me to paste token addresses or send raw approve
 transactions.
 
-1. Load STITCH_PRIVATE_KEY from the env file into the process environment (same
-   as the dry run below — never on the command line).
+1. Load STITCH_PRIVATE_KEY_FILE from the env file into the process environment
+   (same as the dry run below — never put the private key itself on the command
+   line).
 2. Check what's needed without sending anything:
 
    stitch approve --config "<config-path>" --dry-run
@@ -505,7 +518,7 @@ transactions.
 
 Dry run:
 - Run dry run only after config and env file exist.
-- Load STITCH_PRIVATE_KEY from the env file into the process environment.
+- Load STITCH_PRIVATE_KEY_FILE from the env file into the process environment.
 - Do not print the private key.
 - Do not pass the private key in command arguments.
 
@@ -567,10 +580,10 @@ Do not start until I pick a start option after a successful dry run.
 Service setup after confirmation only:
 - macOS: If I choose launchd, create a LaunchAgent plist that runs
   stitch --config ~/Stitch/stitch.toml, and make sure the env file is loaded
-  without putting STITCH_PRIVATE_KEY in command arguments.
-- Linux: If I confirm systemd, install a stitch.service that loads the env file
-  via EnvironmentFile, then run sudo systemctl daemon-reload and
-  sudo systemctl enable --now stitch.
+  without putting the private key itself in command arguments.
+- Linux: If I confirm systemd, install a stitch.service that loads non-secret
+  env via EnvironmentFile and the private key via LoadCredential, then run sudo
+  systemctl daemon-reload and sudo systemctl enable --now stitch.
 - Windows: If I choose Task Scheduler, create a startup task. If I choose a
   Windows service, ask before installing or using NSSM.
 

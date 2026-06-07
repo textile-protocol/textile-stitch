@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 
 /// Parse a hex private key, tolerating an optional `0x`/`0X` prefix and
-/// surrounding whitespace — the documented `STITCH_PRIVATE_KEY` form is `0x…`.
+/// surrounding whitespace — the documented key material form is `0x…`.
 /// Stripping the prefix explicitly keeps that contract working regardless of
 /// which hex backend decodes it.
 pub fn parse_private_key(raw: &str) -> anyhow::Result<SigningKey> {
@@ -18,8 +18,8 @@ pub fn parse_private_key(raw: &str) -> anyhow::Result<SigningKey> {
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
-    let bytes = hex::decode(body).context("STITCH_PRIVATE_KEY must be hex")?;
-    SigningKey::from_slice(&bytes).context("invalid STITCH_PRIVATE_KEY")
+    let bytes = hex::decode(body).context("private key must be hex")?;
+    SigningKey::from_slice(&bytes).context("invalid private key")
 }
 
 /// Ethereum address of a verifying key (keccak of the uncompressed pubkey).
