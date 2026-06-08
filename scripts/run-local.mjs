@@ -217,10 +217,14 @@ for (const [key, c] of Object.entries(CORRIDORS)) {
     })
     const sd = Number(softDec)
     const dd = Number(stableDec)
-    // stable per soft (USDT per cNGN) — same inversion as /api/price, which the
-    // bot quotes off. buyRate is collateral-per-debt, so invert it; using the
-    // un-inverted value made askSoftHuman ~1, producing zero-size ask slices.
-    const price = ((1e27 / Number(br)) * 10 ** sd) / 10 ** dd // stable per soft
+    // stable per soft (USDC per cNGN), human units — same quote convention as
+    // /api/price, which the bot prices off. buyRate is collateral-per-debt in
+    // RAY (a human ratio, e.g. ~1400 cNGN/USDC), so 1e27/br is already the human
+    // price. Do NOT rescale by token decimals: askSoftHuman below divides a USD
+    // notional by this, so it must stay human. The old 10**sd/10**dd factor
+    // inflated it ~1e12x, collapsing every ask to 1 soft token and posting zero
+    // sell depth.
+    const price = 1e27 / Number(br) // stable per soft (human)
     const bidSizeAtomic = BigInt(TOTAL_ORDER_SIZE_USD) * 10n ** BigInt(dd) // stable
     const minBidSizeAtomic = BigInt(MIN_ORDER_SIZE_USD) * 10n ** BigInt(dd)
     const askSoftHuman = Math.max(1, Math.round(TOTAL_ORDER_SIZE_USD / price))
