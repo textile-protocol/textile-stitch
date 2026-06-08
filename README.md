@@ -9,14 +9,12 @@
 Stitch is the Textile operator bot for filler-network market making and
 settlement closing. It runs as a single binary named `stitch`.
 
-Stitch can do two jobs:
+Stitch does two jobs for each configured pool by default:
 
 - **Market making**: keep live buy and sell quotes for a configured
   soft-asset/stablecoin pair.
 - **Settlement closing**: close eligible settlement auction positions on-chain
   when the configured margin rules are met.
-
-You can run either job by itself, or both jobs together for the same pool.
 
 ## Contents
 
@@ -173,17 +171,18 @@ You need:
 - Permit2 approvals for the tokens Stitch will spend (set up with
   `stitch approve` — see [Manual Install](#manual-install));
 - a small native balance for gas (approvals and, for closing, `fill()` txs);
-- a subgraph URL if you enable settlement closing.
+- a subgraph URL for settlement closing.
 
 ## Configuration
 
-Start from [stitch.example.toml](stitch.example.toml). A minimal market-making
-pool looks like this:
+Start from [stitch.example.toml](stitch.example.toml). A minimal default pool
+configuration looks like this:
 
 ```toml
 chain_id = 8453
 rpc_url = "https://mainnet.base.org"
 indexer_url = "https://api.textilecredit.com"
+subgraph_url = "https://api.textilecredit.com/subgraph?chainId=8453"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0x0000000000000000000000000000000000000000"
 tick_interval_secs = 5
@@ -210,6 +209,15 @@ sell_max_orders = 150
 
 ttl_secs = 30
 refresh_threshold_bps = 10
+
+closer_pool = "0x0000000000000000000000000000000000000000"
+floor_ray = "500000000000000000000000"
+buffer_ray = "20000000000000000000000000"
+window_secs = 432000
+min_margin_collateral = "0"
+max_positions_per_fill = 10
+discover_first = 200
+skip_past_window = true
 ```
 
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is

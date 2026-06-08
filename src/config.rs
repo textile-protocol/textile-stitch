@@ -17,8 +17,8 @@ pub struct Config {
     pub permit2: String,
     /// LimitOrderReactor for this chain.
     pub reactor: String,
-    /// Subgraph endpoint for blue-leg discovery (OPEN positions). When unset,
-    /// the bot runs the green leg only.
+    /// Subgraph endpoint for settlement-closing discovery (OPEN positions).
+    /// The default setup sets this; omit only for market-making-only configs.
     #[serde(default)]
     pub subgraph_url: Option<String>,
     /// Re-quote / close cadence.
@@ -107,9 +107,9 @@ pub struct PoolConfig {
     /// Re-sign a side when its price moves more than this since its last order.
     pub refresh_threshold_bps: u32,
 
-    // ----- Blue leg (auction closer). All optional: a pool without
-    // `closer_pool` set is green-only. -----
-    /// The SettlementPool to close positions in (the blue-leg target).
+    // ----- Settlement closing (auction closer). The default setup fills these;
+    // omit `closer_pool` only for market-making-only configs. -----
+    /// The SettlementPool to close positions in.
     #[serde(default)]
     pub closer_pool: Option<String>,
     /// Auction floor rate (RAY) — the pool's opening rate component.

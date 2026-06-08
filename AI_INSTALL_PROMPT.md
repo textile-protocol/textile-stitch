@@ -390,7 +390,7 @@ Configuration procedure:
    - Include the closer fields: closer_pool, floor_ray, buffer_ray, window_secs,
      min_margin_collateral, max_positions_per_fill, discover_first,
      skip_past_window.
-   - Only omit these if I explicitly ask to run the green leg only.
+   - Only omit these if I explicitly ask to run market making only.
 
 5. Restrict config file permissions:
    - Unix: config directory 700, config file 600.

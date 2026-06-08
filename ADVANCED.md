@@ -91,8 +91,9 @@ slice usually increases individual order sizes.
 
 ### Settlement Closing
 
-To run the blue leg (closing settlement auctions), set the top-level
-`subgraph_url` and add the closer fields to a pool:
+Stitch runs settlement closing alongside market making by default. The install
+flow fills the top-level `subgraph_url` and each pool's closer fields from the
+deposit catalog:
 
 ```toml
 subgraph_url = "https://api.textilecredit.com/subgraph?chainId=8453"
@@ -109,8 +110,8 @@ skip_past_window = true
 ```
 
 `floor_ray` / `buffer_ray` / `window_secs` mirror the pool's on-chain auction
-params; the install flow fills them from the deposit catalog. Omit all of these
-fields to run market making only.
+params. Advanced operators can omit the closer fields to run market making only,
+but the recommended setup keeps both jobs enabled.
 
 ## Troubleshooting
 
@@ -164,7 +165,8 @@ the wallet spends the pool's `collateral` token.
 
 ### Settlement Closing Is Not Running
 
-Settlement closing only runs when both conditions are true:
+Settlement closing should run in the default setup. If it is not running, first
+confirm both required config groups are present:
 
 - top-level `subgraph_url` is set;
 - the pool has `closer_pool`, `floor_ray`, `buffer_ray`, and `window_secs`.
