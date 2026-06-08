@@ -5,7 +5,7 @@ chain_id = 8453                     # Base
 rpc_url = "https://mainnet.base.org"
 indexer_url = "https://api.textilecredit.com"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-reactor = "0x0000000000000000000000000000000000000000"  # SETTLEMENT_V3_FILLER_REACTOR
+reactor = "0xEb5A29F869FF084B3Fce18d3487a38A56feDC59E"  # SETTLEMENT_V3_FILLER_REACTOR (Base)
 # Subgraph for blue-leg discovery (OPEN positions). Omit to run green-leg only.
 subgraph_url = "https://api.textilecredit.com/subgraph?chainId={...}"
 tick_interval_secs = 5
