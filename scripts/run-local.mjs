@@ -40,6 +40,12 @@ const positiveIntEnv = (name, fallback) => {
 }
 const FEED_WAIT_SECONDS = positiveIntEnv('FEED_WAIT_SECONDS', 600)
 const FEED_PROBE_TIMEOUT_MS = positiveIntEnv('FEED_PROBE_TIMEOUT_MS', 8000)
+// The local feed is a static seeded rate (the oracle is flat — see
+// refresh_threshold_bps below) and nothing refreshes its observedAt while the
+// stack runs, so a tight staleness window makes the bot skip every pool ~1
+// minute after the last seed. Default to a day so a local stack quotes all day;
+// override with FEED_STALENESS_SECS to exercise real staleness handling.
+const FEED_STALENESS_SECS = positiveIntEnv('FEED_STALENESS_SECS', 86400)
 
 const addrs = JSON.parse(
   readFileSync(`${CRATE}../constants/src/addresses.localhost.json`)
@@ -296,7 +302,7 @@ tick_interval_secs = 5
 
 [feed]
 url = "${FEED_BASE}?pair=cngn-usdt"
-staleness_secs = 60
+staleness_secs = ${FEED_STALENESS_SECS}
 `
 for (const p of pools) {
   toml += `
