@@ -22,10 +22,12 @@ pub fn should_requote(last_bid: Option<f64>, new_bid: f64, threshold_bps: u32) -
 }
 
 /// True when a side's order should be re-signed: no prior order, the price
-/// moved at least `threshold_bps`, or the last post is past half its TTL so a
+/// moved at least `threshold_bps`, or the last post is late enough in its TTL so a
 /// replacement lands before the live order expires. The age gate keeps a stable
 /// market from going dark when the price-move gate alone would never fire before
-/// the TTL lapses. `last` is `(price, posted_at_unix)`.
+/// the TTL lapses, but waits until two-thirds of the TTL to limit how long old
+/// signed orders overlap with their replacements. `last` is
+/// `(price, posted_at_unix)`.
 pub fn should_requote_now(
     last: Option<(f64, u64)>,
     new_bid: f64,
@@ -36,10 +38,14 @@ pub fn should_requote_now(
     match last {
         None => true,
         Some((prev, posted_at)) => {
-            let aged = now.saturating_sub(posted_at) >= ttl_secs / 2;
+            let aged = now.saturating_sub(posted_at) >= requote_age_secs(ttl_secs);
             aged || should_requote(Some(prev), new_bid, threshold_bps)
         }
     }
+}
+
+fn requote_age_secs(ttl_secs: u64) -> u64 {
+    ttl_secs.saturating_mul(2) / 3
 }
 
 #[cfg(test)]
@@ -68,7 +74,9 @@ mod tests {
         assert!(should_requote_now(None, 1.0, 10, 0, 30));
         // 5s into a 30s TTL, flat price → not yet.
         assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 5, 30));
-        // 20s in (past half the TTL), flat price → re-quote to avoid a gap.
+        // 15s in, flat price → wait to reduce old/new signed-order overlap.
+        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 15, 30));
+        // 20s in (two-thirds of TTL), flat price → re-quote to avoid a gap.
         assert!(should_requote_now(Some((1.0, 0)), 1.0, 10, 20, 30));
         // A big move still re-quotes before the age gate.
         assert!(should_requote_now(Some((1.0, 0)), 1.002, 10, 1, 30));

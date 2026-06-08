@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Client for Textile's indexer — POSTs signed orders to the
-//! `submitFillerOrder` GraphQL mutation.
+//! Client for Textile's indexer — POSTs signed orders to the filler-order
+//! GraphQL mutations.
 
 use serde_json::{json, Value};
 
@@ -10,12 +10,29 @@ use crate::submit::SubmitOrder;
 
 const SUBMIT_MUTATION: &str = "mutation Submit($input: SubmitFillerOrderInput!) { \
 submitFillerOrder(input: $input) { id rateRay } }";
+const SUBMIT_MANY_MUTATION: &str = "mutation SubmitMany($input: [SubmitFillerOrderInput!]!) { \
+submitFillerOrders(input: $input) { id rateRay } }";
 
 /// Build the GraphQL request body for one order (pure — easy to assert on).
 pub fn build_submit_request(order: &SubmitOrder) -> Value {
     json!({
         "query": SUBMIT_MUTATION,
-        "variables": { "input": {
+        "variables": { "input": order_input(order) }
+    })
+}
+
+/// Build the GraphQL request body for an atomic order batch.
+pub fn build_submit_many_request(orders: &[SubmitOrder]) -> Value {
+    json!({
+        "query": SUBMIT_MANY_MUTATION,
+        "variables": {
+            "input": orders.iter().map(order_input).collect::<Vec<_>>()
+        }
+    })
+}
+
+fn order_input(order: &SubmitOrder) -> Value {
+    json!({
             "chainId": order.chain_id,
             "clientOrderId": order.client_order_id,
             "reactor": order.reactor,
@@ -28,8 +45,30 @@ pub fn build_submit_request(order: &SubmitOrder) -> Value {
             "nonce": order.nonce,
             "deadline": order.deadline,
             "signature": order.signature,
-        }}
     })
+}
+
+fn response_errors(resp: &Value) -> Option<&Value> {
+    resp.get("errors")
+}
+
+fn order_ids_at(resp: &Value, pointer: &str) -> Vec<String> {
+    resp.pointer(pointer)
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn first_order_id_at(resp: &Value, pointer: &str) -> String {
+    resp.pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub struct Indexer {
@@ -57,15 +96,32 @@ impl Indexer {
             .error_for_status()?
             .json()
             .await?;
-        if let Some(errors) = resp.get("errors") {
+        if let Some(errors) = response_errors(&resp) {
             anyhow::bail!("indexer rejected order: {errors}");
         }
-        let id = resp
-            .pointer("/data/submitFillerOrder/id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        Ok(id)
+        Ok(first_order_id_at(&resp, "/data/submitFillerOrder/id"))
+    }
+
+    /// POST an atomic order batch; returns the created order ids on success.
+    pub async fn submit_many(&self, orders: &[SubmitOrder]) -> anyhow::Result<Vec<String>> {
+        if orders.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let body = build_submit_many_request(orders);
+        let resp: Value = self
+            .client
+            .post(&self.graphql_url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(errors) = response_errors(&resp) {
+            anyhow::bail!("indexer rejected order batch: {errors}");
+        }
+        Ok(order_ids_at(&resp, "/data/submitFillerOrders"))
     }
 }
 
@@ -100,5 +156,18 @@ mod tests {
         assert_eq!(input["maker"], "0xmaker");
         assert_eq!(input["inputAmount"], "1000000");
         assert_eq!(input["signature"], "0xsig");
+    }
+
+    #[test]
+    fn builds_the_graphql_batch_mutation_with_order_array() {
+        let req = build_submit_many_request(&[order(), order()]);
+        assert!(req["query"]
+            .as_str()
+            .unwrap()
+            .contains("submitFillerOrders"));
+        let input = req["variables"]["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["clientOrderId"], "bid:0");
+        assert_eq!(input[1]["maker"], "0xmaker");
     }
 }

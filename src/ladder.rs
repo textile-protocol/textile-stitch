@@ -6,9 +6,6 @@
 //! starting at the configured minimum slice. It allocates more inventory to the
 //! lower/middle denominations and uses larger denominations to carry scale.
 
-const MAX_PER_DENOMINATION: usize = 20;
-const INITIAL_BALANCE_DIVISOR: u128 = 5;
-
 /// Generate a deterministic, ascending list of whole-order sizes.
 ///
 /// `total` and `min_slice` are atomic units in the same token. The returned
@@ -24,38 +21,68 @@ pub fn balanced_ladder(total: u128, min_slice: u128, max_orders: usize) -> Vec<u
         return Vec::new();
     }
 
-    build_with_divisor(total, max_orders, &denoms, INITIAL_BALANCE_DIVISOR)
+    build_balanced(total, min_slice, max_orders, &denoms)
 }
 
-fn build_with_divisor(total: u128, max_orders: usize, denoms: &[u128], divisor: u128) -> Vec<u128> {
+fn build_balanced(total: u128, min_slice: u128, max_orders: usize, denoms: &[u128]) -> Vec<u128> {
     let mut remaining = total;
     let mut ladder = Vec::new();
-    let precision_limit = max_orders.saturating_sub((max_orders / 4).max(1));
 
-    for &denom in denoms {
-        if ladder.len() >= precision_limit || denom > remaining {
-            continue;
+    // Reserve enough slots for carry depth, then add one precision rung at each
+    // small denomination. Avoid repeating the minimum slice until we know the
+    // larger orders can carry the target liquidity.
+    let precision_limit = ((max_orders * 3) / 5).max(1);
+    let precision_ceiling = (total / 10).max(min_slice);
+    for &denom in denoms.iter().filter(|&&d| d <= precision_ceiling) {
+        if ladder.len() >= precision_limit || ladder.len() + 1 >= max_orders {
+            break;
         }
-        let target = (total / denom / divisor) as usize;
-        let count = target.clamp(1, MAX_PER_DENOMINATION);
-        for _ in 0..count {
-            if ladder.len() >= precision_limit || denom > remaining {
-                break;
-            }
+        if denom <= remaining {
             ladder.push(denom);
             remaining -= denom;
         }
     }
 
-    for &denom in denoms.iter().rev() {
-        while ladder.len() < max_orders && denom <= remaining {
-            ladder.push(denom);
-            remaining -= denom;
+    while remaining >= min_slice && ladder.len() < max_orders {
+        let slots_left = max_orders - ladder.len();
+        if slots_left == 1 {
+            ladder.push(remaining);
+            remaining = 0;
+            break;
+        }
+
+        let next = carry_slice(remaining, min_slice, slots_left, denoms);
+        ladder.push(next);
+        remaining -= next;
+    }
+
+    if remaining > 0 {
+        if let Some(last) = ladder.last_mut() {
+            *last += remaining;
         }
     }
 
     ladder.sort_unstable();
     ladder
+}
+
+fn carry_slice(remaining: u128, min_slice: u128, slots_left: usize, denoms: &[u128]) -> u128 {
+    let reserved_tail = min_slice.saturating_mul((slots_left - 1) as u128);
+    let max_now = remaining.saturating_sub(reserved_tail);
+    if max_now <= min_slice {
+        return min_slice.min(remaining);
+    }
+
+    let average = remaining / slots_left as u128;
+    let target = average.saturating_mul(2).max(min_slice);
+    let cap = max_now.min(target);
+
+    denoms
+        .iter()
+        .rev()
+        .copied()
+        .find(|&denom| denom <= cap)
+        .unwrap_or_else(|| min_slice.min(max_now))
 }
 
 fn denominations(total: u128, min_slice: u128) -> Vec<u128> {
@@ -106,8 +133,22 @@ mod tests {
         let total: u128 = ladder.iter().sum();
 
         assert!(ladder.len() <= 40);
-        assert!(total <= 50_000);
-        assert!(total >= 45_000);
+        assert_eq!(total, 50_000);
+    }
+
+    #[test]
+    fn low_order_cap_still_carries_meaningful_depth() {
+        let ladder = balanced_ladder(50_000, 10, 15);
+        let total: u128 = ladder.iter().sum();
+
+        assert_eq!(
+            ladder,
+            vec![
+                10, 25, 50, 100, 250, 500, 565, 1_000, 2_500, 5_000, 5_000, 5_000, 10_000, 10_000,
+                10_000
+            ]
+        );
+        assert_eq!(total, 50_000);
     }
 
     #[test]

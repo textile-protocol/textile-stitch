@@ -200,12 +200,12 @@ debt_decimals = 6
 buy_offset_bps = 10
 buy_total_liquidity_debt = "50000000000"
 buy_min_slice_debt = "10000000"
-buy_max_orders = 150
+buy_max_orders = 40
 
 sell_offset_bps = 10
 sell_total_liquidity_collateral = "50000000000"
 sell_min_slice_debt = "10000000"
-sell_max_orders = 150
+sell_max_orders = 40
 
 ttl_secs = 30
 refresh_threshold_bps = 10
@@ -221,8 +221,11 @@ skip_past_window = true
 ```
 
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
-`50000000000`). For the price-feed orientation, spread options, ladder sizing,
-and settlement-closing fields, see the
+`50000000000`). The total liquidity fields are targets; if `*_max_orders` is
+too low to express the full target with the configured minimum slice, Stitch
+leaves the remainder unquoted instead of posting an oversized live book. For
+the price-feed orientation, spread options, ladder sizing, and
+settlement-closing fields, see the
 [configuration reference in ADVANCED.md](ADVANCED.md#configuration-reference).
 
 ## Running As A Service

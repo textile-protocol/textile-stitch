@@ -26,7 +26,7 @@ use stitch_bot::cli::{parse, Command};
 use stitch_bot::closer::discover::Discoverer;
 use stitch_bot::closer::runner::{close_pool_once, CloseOutcome, CloserPool};
 use stitch_bot::closer::strategy::{PoolParams, StrategyConfig};
-use stitch_bot::config::{Config, PoolConfig};
+use stitch_bot::config::{Config, PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
 use stitch_bot::feed::{HttpFeed, PriceFeed};
 use stitch_bot::indexer::Indexer;
 use stitch_bot::ladder::balanced_ladder;
@@ -82,60 +82,83 @@ struct Poster<'a> {
     dry_run: bool,
 }
 
+struct OrderDraft {
+    nonce: u64,
+    input_amount: U256,
+    output_amount: U256,
+    client_order_id: Option<String>,
+}
+
 impl Poster<'_> {
-    /// Build, sign, and POST one order. Returns true if it was posted (or would
-    /// be, in dry-run) so the caller can record the quote.
-    #[allow(clippy::too_many_arguments)]
-    async fn post(
+    /// Build, sign, and POST a side's order batch. Returns the number of orders
+    /// posted (or that would be posted in dry-run). The indexer writes the batch
+    /// atomically, so a ladder refresh cannot partially replace live slots.
+    async fn post_many(
         &self,
-        nonce: u64,
         ttl_secs: u64,
         input_token: Address,
-        input_amount: U256,
         output_token: Address,
-        output_amount: U256,
-        client_order_id: Option<String>,
+        drafts: Vec<OrderDraft>,
         label: &str,
         price: f64,
-    ) -> bool {
-        if input_amount == U256::ZERO || output_amount == U256::ZERO {
-            warn!(label, "zero-size order; skipping");
-            return false;
-        }
+    ) -> usize {
         let deadline = unix_now().saturating_add(ttl_secs);
-        let order = OrderParams {
-            reactor: self.reactor,
-            swapper: self.maker,
-            nonce: U256::from(nonce),
-            deadline: U256::from(deadline),
-            input_token,
-            input_amount,
-            output_token,
-            output_amount,
-            recipient: self.maker,
-        };
-        let submission = match sign_submission(&order, self.permit2, self.chain_id, self.key) {
-            Ok(mut s) => {
-                s.client_order_id = client_order_id;
-                s
+        let mut submissions = Vec::new();
+
+        for draft in drafts {
+            if draft.input_amount == U256::ZERO || draft.output_amount == U256::ZERO {
+                warn!(label, "zero-size order; skipping");
+                continue;
             }
-            Err(e) => {
-                warn!(label, error = %e, "signing failed; skipping");
-                return false;
+
+            let order = OrderParams {
+                reactor: self.reactor,
+                swapper: self.maker,
+                nonce: U256::from(draft.nonce),
+                deadline: U256::from(deadline),
+                input_token,
+                input_amount: draft.input_amount,
+                output_token,
+                output_amount: draft.output_amount,
+                recipient: self.maker,
+            };
+            match sign_submission(&order, self.permit2, self.chain_id, self.key) {
+                Ok(mut s) => {
+                    s.client_order_id = draft.client_order_id;
+                    submissions.push(s);
+                }
+                Err(e) => {
+                    warn!(label, error = %e, "signing failed; skipping batch");
+                    return 0;
+                }
             }
-        };
-        if self.dry_run {
-            info!(label, price, input = %input_amount, output = %output_amount, "[dry-run] would post order");
-            return true;
         }
-        match self.indexer.submit(&submission).await {
-            Ok(id) => {
-                info!(label, price, id = %id, "posted order");
-                true
+
+        if submissions.is_empty() {
+            return 0;
+        }
+
+        if self.dry_run {
+            for submission in &submissions {
+                info!(
+                    label,
+                    price,
+                    input = %submission.input_amount,
+                    output = %submission.output_amount,
+                    "[dry-run] would post order"
+                );
+            }
+            return submissions.len();
+        }
+
+        match self.indexer.submit_many(&submissions).await {
+            Ok(ids) => {
+                info!(label, price, orders = ids.len(), "posted order batch");
+                ids.len()
             }
             Err(e) => {
-                warn!(label, error = %e, "post failed");
-                false
+                warn!(label, error = %e, "batch post failed");
+                0
             }
         }
     }
@@ -527,7 +550,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                 (Ok(total), Ok(min)) => balanced_ladder(
                                     total,
                                     min,
-                                    pool.buy_max_orders.unwrap_or(150) as usize,
+                                    pool.buy_max_orders.unwrap_or(DEFAULT_MAX_LADDER_ORDERS)
+                                        as usize,
                                 ),
                                 (Err(e), _) | (_, Err(e)) => {
                                     warn!(pair = %pair, error = %e, "invalid buy ladder; skipping bid");
@@ -549,28 +573,21 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     };
 
                     let laddered = pool.buy_ladder_enabled();
-                    let mut posted = 0usize;
+                    let mut drafts = Vec::new();
                     for (i, size) in sizes.into_iter().enumerate() {
                         let (input, output) =
                             buy_amounts_at(bid, size, pool.debt_decimals, pool.collateral_decimals);
                         nonce += 1;
-                        if poster
-                            .post(
-                                nonce,
-                                pool.ttl_secs,
-                                debt,
-                                input,
-                                collateral,
-                                output,
-                                laddered.then(|| format!("bid:{i}")),
-                                "bid",
-                                bid,
-                            )
-                            .await
-                        {
-                            posted += 1;
-                        }
+                        drafts.push(OrderDraft {
+                            nonce,
+                            input_amount: input,
+                            output_amount: output,
+                            client_order_id: laddered.then(|| format!("bid:{i}")),
+                        });
                     }
+                    let posted = poster
+                        .post_many(pool.ttl_secs, debt, collateral, drafts, "bid", bid)
+                        .await;
                     if posted > 0 {
                         info!(pair = %pair, orders = posted, "posted bid ladder");
                         last_quote.insert(key_id, (bid, now));
@@ -611,7 +628,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                             Ok(total_debt) => balanced_ladder(
                                                 total_debt,
                                                 min_debt,
-                                                pool.sell_max_orders.unwrap_or(150) as usize,
+                                                pool.sell_max_orders
+                                                    .unwrap_or(DEFAULT_MAX_LADDER_ORDERS)
+                                                    as usize,
                                             ),
                                             Err(e) => {
                                                 warn!(pair = %pair, error = %e, "invalid sell ladder; skipping ask");
@@ -640,7 +659,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     };
 
                     let laddered = pool.sell_ladder_enabled();
-                    let mut posted = 0usize;
+                    let mut drafts = Vec::new();
                     for (i, size) in sizes.into_iter().enumerate() {
                         let (input, output) = if pool.sell_ladder_enabled() {
                             let (_, collateral_for_debt) = buy_amounts_at(
@@ -672,23 +691,16 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             (input, output)
                         };
                         nonce += 1;
-                        if poster
-                            .post(
-                                nonce,
-                                pool.ttl_secs,
-                                collateral,
-                                input,
-                                debt,
-                                output,
-                                laddered.then(|| format!("ask:{i}")),
-                                "ask",
-                                ask,
-                            )
-                            .await
-                        {
-                            posted += 1;
-                        }
+                        drafts.push(OrderDraft {
+                            nonce,
+                            input_amount: input,
+                            output_amount: output,
+                            client_order_id: laddered.then(|| format!("ask:{i}")),
+                        });
                     }
+                    let posted = poster
+                        .post_many(pool.ttl_secs, collateral, debt, drafts, "ask", ask)
+                        .await;
                     if posted > 0 {
                         info!(pair = %pair, orders = posted, "posted ask ladder");
                         last_quote.insert(key_id, (ask, now));

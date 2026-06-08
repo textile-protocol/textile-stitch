@@ -33,7 +33,7 @@ const TOTAL_ORDER_SIZE_USD = Number(
   process.env.TOTAL_ORDER_SIZE_USD || process.env.ORDER_SIZE_USD || 2000
 ) // each side quotes roughly this many USD
 const MIN_ORDER_SIZE_USD = Number(process.env.MIN_ORDER_SIZE_USD || 10)
-const MAX_LADDER_ORDERS = Number(process.env.MAX_LADDER_ORDERS || 150)
+const MAX_LADDER_ORDERS = Number(process.env.MAX_LADDER_ORDERS || 40)
 const positiveIntEnv = (name, fallback) => {
   const value = Number.parseInt(process.env[name] || '', 10)
   return Number.isFinite(value) && value > 0 ? value : fallback

@@ -177,7 +177,7 @@ Use these defaults unless I provide different values:
 - Buy total liquidity: from my wallet's debt-token balance (don't ask)
 - Sell total liquidity: from my wallet's collateral-token balance (don't ask)
 - Minimum order slice (advanced, never ask): 10 units of the debt/stable token
-- Maximum ladder orders per side (advanced, never ask): 150
+- Maximum ladder orders per side (advanced, never ask): 40
 - Order TTL: 30 seconds
 - Refresh threshold: 10 bps
 - Settlement closing: enabled by default (both legs)

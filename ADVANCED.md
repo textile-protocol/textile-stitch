@@ -65,16 +65,18 @@ Stitch can post one order per side or a ladder of smaller orders:
 ```toml
 buy_total_liquidity_debt = "50000000000"
 buy_min_slice_debt = "10000000"
-buy_max_orders = 150
+buy_max_orders = 40
 
 sell_total_liquidity_collateral = "50000000000"
 sell_min_slice_debt = "10000000"
-sell_max_orders = 150
+sell_max_orders = 40
 ```
 
 - `*_total_liquidity_*` controls total depth for that side.
 - `*_min_slice_debt` controls the smallest order slice.
-- `*_max_orders` caps the number of live slices.
+- `*_max_orders` caps the number of live slices. If the cap is too low to
+  express the full target depth with the configured minimum slice, Stitch leaves
+  the remainder unquoted instead of flooding the live book.
 
 All amounts are atomic token units. For a 6-decimal token:
 

@@ -7,6 +7,11 @@ use serde::Deserialize;
 
 use crate::quote::Spread;
 
+/// Default cap for generated ladder slices per side. Keep this low enough that
+/// one market-maker wallet does not dominate or churn the live order book.
+pub const MAX_SUPPORTED_LADDER_ORDERS: u32 = 40;
+pub const DEFAULT_MAX_LADDER_ORDERS: u32 = MAX_SUPPORTED_LADDER_ORDERS;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub chain_id: u64,
@@ -183,7 +188,27 @@ impl PoolConfig {
 
 impl Config {
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(s)?)
+        let cfg = toml::from_str::<Self>(s)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if let Some(max_orders) = pool.buy_max_orders {
+                anyhow::ensure!(
+                    max_orders <= MAX_SUPPORTED_LADDER_ORDERS,
+                    "pools[{idx}].buy_max_orders {max_orders} exceeds supported limit {MAX_SUPPORTED_LADDER_ORDERS}"
+                );
+            }
+            if let Some(max_orders) = pool.sell_max_orders {
+                anyhow::ensure!(
+                    max_orders <= MAX_SUPPORTED_LADDER_ORDERS,
+                    "pools[{idx}].sell_max_orders {max_orders} exceeds supported limit {MAX_SUPPORTED_LADDER_ORDERS}"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -230,11 +255,11 @@ mod tests {
             buy_offset_bps = 150
             buy_total_liquidity_debt = "50000000000"
             buy_min_slice_debt = "10000000"
-            buy_max_orders = 150
+            buy_max_orders = 40
             sell_offset_abs = 2.0
             sell_total_liquidity_collateral = "30000000000000000000000"
             sell_min_slice_debt = "10000000"
-            sell_max_orders = 150
+            sell_max_orders = 40
             ttl_secs = 30
             refresh_threshold_bps = 10
         "#;
@@ -245,6 +270,48 @@ mod tests {
         assert!(pool.buy_enabled() && pool.sell_enabled());
         assert!(pool.buy_ladder_enabled() && pool.sell_ladder_enabled());
         assert!(!pool.closer_enabled());
+    }
+
+    #[test]
+    fn rejects_ladder_order_caps_above_supported_limit() {
+        let toml = r#"
+            chain_id = 8453
+            rpc_url = "http://x"
+            indexer_url = "http://x"
+            permit2 = "0x0000000000000000000000000000000000000000"
+            reactor = "0x0000000000000000000000000000000000000000"
+            tick_interval_secs = 5
+            [feed]
+            url = "http://x"
+            staleness_secs = 30
+            [[pools]]
+            collateral = "0x0000000000000000000000000000000000000001"
+            collateral_decimals = 18
+            debt = "0x0000000000000000000000000000000000000002"
+            debt_decimals = 6
+            buy_offset_bps = 150
+            buy_total_liquidity_debt = "50000000000"
+            buy_min_slice_debt = "10000000"
+            buy_max_orders = 41
+            sell_offset_abs = 2.0
+            sell_total_liquidity_collateral = "30000000000000000000000"
+            sell_min_slice_debt = "10000000"
+            sell_max_orders = 40
+            ttl_secs = 30
+            refresh_threshold_bps = 10
+        "#;
+        let err = Config::from_toml(toml).expect_err("oversized buy cap is rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("buy_max_orders"));
+        assert!(msg.contains("40"));
+
+        let toml = toml
+            .replace("buy_max_orders = 41", "buy_max_orders = 40")
+            .replace("sell_max_orders = 40", "sell_max_orders = 41");
+        let err = Config::from_toml(&toml).expect_err("oversized sell cap is rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("sell_max_orders"));
+        assert!(msg.contains("40"));
     }
 
     #[test]
