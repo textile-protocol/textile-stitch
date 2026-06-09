@@ -45,7 +45,7 @@ sell_total_liquidity_collateral = "50000000000" # total cNGN inventory to quote
 sell_min_slice_debt = "10000000"                # 10 USDC-equivalent smallest slice
 sell_max_orders = 40
 
-ttl_secs = 30
+ttl_secs = 120
 # repost_lead_secs = 60   # repost each side this many secs before its order
                           # expires, so the new ladder overlaps the old one and
                           # the book never blanks between reposts. Capped at

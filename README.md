@@ -207,7 +207,7 @@ sell_total_liquidity_collateral = "50000000000"
 sell_min_slice_debt = "10000000"
 sell_max_orders = 40
 
-ttl_secs = 30
+ttl_secs = 120
 refresh_threshold_bps = 10
 
 closer_pool = "0x0000000000000000000000000000000000000000"
