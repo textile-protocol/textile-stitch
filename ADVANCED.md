@@ -77,6 +77,10 @@ sell_max_orders = 40
 - `*_max_orders` caps the number of live slices. If the cap is too low to
   express the full target depth with the configured minimum slice, Stitch leaves
   the remainder unquoted instead of flooding the live book.
+- Configured liquidity is a ceiling. Stitch reads the side's input token balance
+  and Permit2 allowance every quote tick, then posts only the funded portion.
+  If inventory falls below the target, the ladder shrinks until the wallet is
+  rebalanced or the config is lowered.
 
 All amounts are atomic token units. For a 6-decimal token:
 

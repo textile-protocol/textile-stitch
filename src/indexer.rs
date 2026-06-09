@@ -12,6 +12,9 @@ const SUBMIT_MUTATION: &str = "mutation Submit($input: SubmitFillerOrderInput!) 
 submitFillerOrder(input: $input) { id rateRay } }";
 const SUBMIT_MANY_MUTATION: &str = "mutation SubmitMany($input: [SubmitFillerOrderInput!]!) { \
 submitFillerOrders(input: $input) { id rateRay } }";
+const COMMITTED_INPUT_QUERY: &str =
+    "query CommittedInput($chainId: Int!, $maker: String!, $inputToken: String!) { \
+fillerCommittedInput(chainId: $chainId, maker: $maker, inputToken: $inputToken) }";
 
 /// Build the GraphQL request body for one order (pure — easy to assert on).
 pub fn build_submit_request(order: &SubmitOrder) -> Value {
@@ -27,6 +30,17 @@ pub fn build_submit_many_request(orders: &[SubmitOrder]) -> Value {
         "query": SUBMIT_MANY_MUTATION,
         "variables": {
             "input": orders.iter().map(order_input).collect::<Vec<_>>()
+        }
+    })
+}
+
+pub fn build_committed_input_request(chain_id: u64, maker: &str, input_token: &str) -> Value {
+    json!({
+        "query": COMMITTED_INPUT_QUERY,
+        "variables": {
+            "chainId": chain_id,
+            "maker": maker,
+            "inputToken": input_token,
         }
     })
 }
@@ -123,6 +137,36 @@ impl Indexer {
         }
         Ok(order_ids_at(&resp, "/data/submitFillerOrders"))
     }
+
+    pub async fn committed_input(
+        &self,
+        chain_id: u64,
+        maker: &str,
+        input_token: &str,
+    ) -> anyhow::Result<String> {
+        let body = build_committed_input_request(chain_id, maker, input_token);
+        let resp: Value = self
+            .client
+            .post(&self.graphql_url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(errors) = response_errors(&resp) {
+            anyhow::bail!("indexer rejected committed input query: {errors}");
+        }
+        resp.pointer("/data/fillerCommittedInput")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                resp.pointer("/data/fillerCommittedInput")
+                    .and_then(Value::as_u64)
+                    .map(|v| v.to_string())
+            })
+            .ok_or_else(|| anyhow::anyhow!("indexer committed input query returned no amount"))
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +213,17 @@ mod tests {
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["clientOrderId"], "bid:0");
         assert_eq!(input[1]["maker"], "0xmaker");
+    }
+
+    #[test]
+    fn builds_the_committed_input_query() {
+        let req = build_committed_input_request(8453, "0xmaker", "0xusdt");
+        assert!(req["query"]
+            .as_str()
+            .unwrap()
+            .contains("fillerCommittedInput"));
+        assert_eq!(req["variables"]["chainId"], 8453);
+        assert_eq!(req["variables"]["maker"], "0xmaker");
+        assert_eq!(req["variables"]["inputToken"], "0xusdt");
     }
 }

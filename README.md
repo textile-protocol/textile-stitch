@@ -223,7 +223,11 @@ skip_past_window = true
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
 `50000000000`). The total liquidity fields are targets; if `*_max_orders` is
 too low to express the full target with the configured minimum slice, Stitch
-leaves the remainder unquoted instead of posting an oversized live book. For
+leaves the remainder unquoted instead of posting an oversized live book.
+Configured liquidity is also a ceiling: on each quote tick, Stitch caps the
+posted bid or ask size to the operator wallet's current token balance and
+Permit2 allowance for that side, so normal fills or inventory transfers reduce
+the next ladder instead of causing the indexer to reject an unfunded batch. For
 the price-feed orientation, spread options, ladder sizing, and
 settlement-closing fields, see the
 [configuration reference in ADVANCED.md](ADVANCED.md#configuration-reference).

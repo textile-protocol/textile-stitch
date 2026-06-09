@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::env::VarError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, Bytes, U256};
 use anyhow::{anyhow, Context};
 use k256::ecdsa::SigningKey;
 use tracing::{info, warn};
@@ -24,6 +24,7 @@ use stitch_bot::approve::{run_approvals, unapproved_tokens, ApprovalMode};
 use stitch_bot::banner::print_startup_banner;
 use stitch_bot::cli::{parse, Command};
 use stitch_bot::closer::discover::Discoverer;
+use stitch_bot::closer::executor::{encode_allowance, encode_balance_of};
 use stitch_bot::closer::runner::{close_pool_once, CloseOutcome, CloserPool};
 use stitch_bot::closer::strategy::{PoolParams, StrategyConfig};
 use stitch_bot::config::{Config, PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
@@ -303,6 +304,45 @@ mod tests {
             load_key_material_from_vars(Ok(" ".into()), Ok(TEST_KEY.into())).expect_err("empty");
         assert!(err.to_string().contains(PRIVATE_KEY_FILE_ENV));
     }
+
+    #[test]
+    fn input_liquidity_keeps_configured_size_when_fully_funded() {
+        assert_eq!(
+            cap_input_liquidity(
+                1_000_000,
+                U256::from(2_000_000u64),
+                U256::from(3_000_000u64)
+            ),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn input_liquidity_caps_to_balance_or_allowance() {
+        assert_eq!(
+            cap_input_liquidity(1_000_000, U256::from(750_000u64), U256::from(900_000u64)),
+            750_000
+        );
+        assert_eq!(
+            cap_input_liquidity(1_000_000, U256::from(900_000u64), U256::from(500_000u64)),
+            500_000
+        );
+    }
+
+    #[test]
+    fn reserving_funded_input_decrements_a_shared_token_budget() {
+        let token: Address = "0x00000000000000000000000000000000000000bb"
+            .parse()
+            .unwrap();
+        let mut funded_inputs = HashMap::new();
+        funded_inputs.insert(token, U256::from(75u64));
+
+        reserve_funded_input(&mut funded_inputs, token, U256::from(50u64));
+        assert_eq!(funded_inputs[&token], U256::from(25u64));
+
+        reserve_funded_input(&mut funded_inputs, token, U256::from(50u64));
+        assert_eq!(funded_inputs[&token], U256::ZERO);
+    }
 }
 
 fn unix_now() -> u64 {
@@ -323,6 +363,119 @@ fn u256_to_u128(value: U256, field: &str) -> anyhow::Result<u128> {
         .to_string()
         .parse::<u128>()
         .with_context(|| format!("{field} does not fit in u128"))
+}
+
+fn cap_input_liquidity(configured: u128, balance: U256, allowance: U256) -> u128 {
+    let funded = if balance < allowance {
+        balance
+    } else {
+        allowance
+    };
+    let configured = U256::from(configured);
+    let capped = if funded < configured {
+        funded
+    } else {
+        configured
+    };
+    capped.to::<u128>()
+}
+
+async fn funded_input_cap(
+    indexer: &Indexer,
+    wallet: &Wallet,
+    chain_id: u64,
+    maker: Address,
+    token: Address,
+    permit2: Address,
+    configured: u128,
+    dry_run: bool,
+    funded_inputs: &mut HashMap<Address, U256>,
+    pair: &str,
+    label: &str,
+) -> Option<u128> {
+    if !funded_inputs.contains_key(&token) {
+        let balance = wallet
+            .read_uint(token, &Bytes::from(encode_balance_of(wallet.address())))
+            .await;
+        let allowance = wallet
+            .read_uint(
+                token,
+                &Bytes::from(encode_allowance(wallet.address(), permit2)),
+            )
+            .await;
+
+        match (balance, allowance) {
+            (Ok(balance), Ok(allowance)) => {
+                let funded = if balance < allowance {
+                    balance
+                } else {
+                    allowance
+                };
+                match indexer
+                    .committed_input(chain_id, &maker.to_string(), &token.to_string())
+                    .await
+                {
+                    Ok(committed) => match committed.parse::<U256>() {
+                        Ok(committed) => {
+                            funded_inputs.insert(token, funded.saturating_sub(committed));
+                        }
+                        Err(e) if dry_run => {
+                            warn!(pair = %pair, label, committed = %committed, error = %e, "could not parse committed input; using configured size for dry-run");
+                            funded_inputs.insert(token, U256::from(configured));
+                        }
+                        Err(e) => {
+                            warn!(pair = %pair, label, committed = %committed, error = %e, "could not parse committed input; skipping side");
+                            return None;
+                        }
+                    },
+                    Err(e) if dry_run => {
+                        warn!(pair = %pair, label, error = %e, "could not read committed input; using configured size for dry-run");
+                        funded_inputs.insert(token, U256::from(configured));
+                    }
+                    Err(e) => {
+                        warn!(pair = %pair, label, error = %e, "could not read committed input; skipping side");
+                        return None;
+                    }
+                }
+            }
+            (Err(e), _) | (_, Err(e)) if dry_run => {
+                warn!(pair = %pair, label, error = %e, "could not read funded input; using configured size for dry-run");
+                funded_inputs.insert(token, U256::from(configured));
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                warn!(pair = %pair, label, error = %e, "could not read funded input; skipping side");
+                return None;
+            }
+        }
+    }
+
+    let remaining = *funded_inputs.get(&token).unwrap_or(&U256::ZERO);
+    let capped = cap_input_liquidity(configured, remaining, U256::MAX);
+    if capped < configured {
+        warn!(
+            pair = %pair,
+            label,
+            configured,
+            capped,
+            remaining = %remaining,
+            "capping order liquidity to remaining funded input"
+        );
+    }
+    Some(capped)
+}
+
+fn reserve_funded_input(funded_inputs: &mut HashMap<Address, U256>, token: Address, amount: U256) {
+    if amount == U256::ZERO {
+        return;
+    }
+    let remaining = funded_inputs.entry(token).or_insert(U256::ZERO);
+    *remaining = remaining.saturating_sub(amount);
+}
+
+fn drafted_input(drafts: &[OrderDraft]) -> U256 {
+    drafts.iter().fold(U256::ZERO, |sum, draft| {
+        sum.saturating_add(draft.input_amount)
+    })
 }
 
 #[tokio::main]
@@ -492,6 +645,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             _ = interval.tick() => {}
         }
         let now = unix_now();
+        let mut funded_inputs: HashMap<Address, U256> = HashMap::new();
 
         for pool in &cfg.pools {
             // Each pool prices off its own feed (or the bot-level default).
@@ -548,12 +702,31 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                 parse_u128(total, "buy_total_liquidity_debt"),
                                 parse_u128(min, "buy_min_slice_debt"),
                             ) {
-                                (Ok(total), Ok(min)) => balanced_ladder(
-                                    total,
-                                    min,
-                                    pool.buy_max_orders.unwrap_or(DEFAULT_MAX_LADDER_ORDERS)
-                                        as usize,
-                                ),
+                                (Ok(total), Ok(min)) => {
+                                    match funded_input_cap(
+                                        &indexer,
+                                        &wallet,
+                                        cfg.chain_id,
+                                        maker,
+                                        debt,
+                                        permit2,
+                                        total,
+                                        dry_run,
+                                        &mut funded_inputs,
+                                        &pair,
+                                        "bid",
+                                    )
+                                    .await
+                                    {
+                                        Some(total) => balanced_ladder(
+                                            total,
+                                            min,
+                                            pool.buy_max_orders.unwrap_or(DEFAULT_MAX_LADDER_ORDERS)
+                                                as usize,
+                                        ),
+                                        None => Vec::new(),
+                                    }
+                                }
                                 (Err(e), _) | (_, Err(e)) => {
                                     warn!(pair = %pair, error = %e, "invalid buy ladder; skipping bid");
                                     Vec::new()
@@ -563,7 +736,23 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         }
                     } else if let Some(size_str) = &pool.buy_order_size_debt {
                         match parse_u128(size_str, "buy_order_size_debt") {
-                            Ok(size) => vec![size],
+                            Ok(size) => funded_input_cap(
+                                &indexer,
+                                &wallet,
+                                cfg.chain_id,
+                                maker,
+                                debt,
+                                permit2,
+                                size,
+                                dry_run,
+                                &mut funded_inputs,
+                                &pair,
+                                "bid",
+                            )
+                            .await
+                            .filter(|size| *size > 0)
+                            .map(|size| vec![size])
+                            .unwrap_or_default(),
                             Err(e) => {
                                 warn!(pair = %pair, error = %e, "invalid buy_order_size_debt; skipping bid");
                                 Vec::new()
@@ -586,10 +775,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             client_order_id: laddered.then(|| format!("bid:{i}")),
                         });
                     }
+                    let input_reserved = drafted_input(&drafts);
                     let posted = poster
                         .post_many(pool.ttl_secs, debt, collateral, drafts, "bid", bid)
                         .await;
                     if posted > 0 {
+                        reserve_funded_input(&mut funded_inputs, debt, input_reserved);
                         info!(pair = %pair, orders = posted, "posted bid ladder");
                         last_quote.insert(key_id, (bid, now));
                     }
@@ -618,28 +809,47 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                     parse_u128(total_collateral, "sell_total_liquidity_collateral"),
                                     parse_u128(min_debt, "sell_min_slice_debt"),
                                 ) {
-                                    (Ok(total_collateral), Ok(min_debt)) => {
-                                        let (_, total_debt) = sell_amounts_at(
-                                            ask,
-                                            total_collateral,
-                                            pool.debt_decimals,
-                                            pool.collateral_decimals,
-                                        );
-                                        match u256_to_u128(total_debt, "sell total debt equivalent")
-                                        {
-                                            Ok(total_debt) => balanced_ladder(
+                                    (Ok(total_collateral), Ok(min_debt)) => match funded_input_cap(
+                                        &indexer,
+                                        &wallet,
+                                        cfg.chain_id,
+                                        maker,
+                                        collateral,
+                                        permit2,
+                                        total_collateral,
+                                        dry_run,
+                                        &mut funded_inputs,
+                                        &pair,
+                                        "ask",
+                                    )
+                                    .await
+                                    {
+                                        Some(total_collateral) => {
+                                            let (_, total_debt) = sell_amounts_at(
+                                                ask,
+                                                total_collateral,
+                                                pool.debt_decimals,
+                                                pool.collateral_decimals,
+                                            );
+                                            match u256_to_u128(
                                                 total_debt,
-                                                min_debt,
-                                                pool.sell_max_orders
-                                                    .unwrap_or(DEFAULT_MAX_LADDER_ORDERS)
-                                                    as usize,
-                                            ),
-                                            Err(e) => {
-                                                warn!(pair = %pair, error = %e, "invalid sell ladder; skipping ask");
-                                                Vec::new()
+                                                "sell total debt equivalent",
+                                            ) {
+                                                Ok(total_debt) => balanced_ladder(
+                                                    total_debt,
+                                                    min_debt,
+                                                    pool.sell_max_orders
+                                                        .unwrap_or(DEFAULT_MAX_LADDER_ORDERS)
+                                                        as usize,
+                                                ),
+                                                Err(e) => {
+                                                    warn!(pair = %pair, error = %e, "invalid sell ladder; skipping ask");
+                                                    Vec::new()
+                                                }
                                             }
                                         }
-                                    }
+                                        None => Vec::new(),
+                                    },
                                     (Err(e), _) | (_, Err(e)) => {
                                         warn!(pair = %pair, error = %e, "invalid sell ladder; skipping ask");
                                         Vec::new()
@@ -650,7 +860,23 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         }
                     } else if let Some(size_str) = &pool.sell_order_size_collateral {
                         match parse_u128(size_str, "sell_order_size_collateral") {
-                            Ok(size) => vec![size],
+                            Ok(size) => funded_input_cap(
+                                &indexer,
+                                &wallet,
+                                cfg.chain_id,
+                                maker,
+                                collateral,
+                                permit2,
+                                size,
+                                dry_run,
+                                &mut funded_inputs,
+                                &pair,
+                                "ask",
+                            )
+                            .await
+                            .filter(|size| *size > 0)
+                            .map(|size| vec![size])
+                            .unwrap_or_default(),
                             Err(e) => {
                                 warn!(pair = %pair, error = %e, "invalid sell_order_size_collateral; skipping ask");
                                 Vec::new()
@@ -700,10 +926,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             client_order_id: laddered.then(|| format!("ask:{i}")),
                         });
                     }
+                    let input_reserved = drafted_input(&drafts);
                     let posted = poster
                         .post_many(pool.ttl_secs, collateral, debt, drafts, "ask", ask)
                         .await;
                     if posted > 0 {
+                        reserve_funded_input(&mut funded_inputs, collateral, input_reserved);
                         info!(pair = %pair, orders = posted, "posted ask ladder");
                         last_quote.insert(key_id, (ask, now));
                     }

@@ -39,6 +39,14 @@ pub fn encode_allowance(owner: Address, spender: Address) -> Vec<u8> {
     data
 }
 
+/// Calldata for ERC20 `balanceOf(address owner)` (a read).
+pub fn encode_balance_of(owner: Address) -> Vec<u8> {
+    let mut data = Vec::with_capacity(36);
+    data.extend_from_slice(&selector("balanceOf(address)"));
+    data.extend_from_slice(&owner.into_word().0);
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +78,14 @@ mod tests {
         assert_eq!(data.len(), 68);
         assert_eq!(&data[4 + 12..4 + 32], owner.as_slice());
         assert_eq!(&data[36 + 12..36 + 32], spender.as_slice());
+    }
+
+    #[test]
+    fn balance_of_has_the_right_selector_and_owner() {
+        let owner = address!("00000000000000000000000000000000000000bb");
+        let data = encode_balance_of(owner);
+        assert_eq!(&data[..4], &hex::decode("70a08231").unwrap()[..]);
+        assert_eq!(data.len(), 36);
+        assert_eq!(&data[4 + 12..4 + 32], owner.as_slice());
     }
 }
