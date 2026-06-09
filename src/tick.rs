@@ -22,11 +22,10 @@ pub fn should_requote(last_bid: Option<f64>, new_bid: f64, threshold_bps: u32) -
 }
 
 /// True when a side's order should be re-signed: no prior order, the price
-/// moved at least `threshold_bps`, or the last post is late enough in its TTL so a
-/// replacement lands before the live order expires. The age gate keeps a stable
-/// market from going dark when the price-move gate alone would never fire before
-/// the TTL lapses, but waits until two-thirds of the TTL to limit how long old
-/// signed orders overlap with their replacements. `last` is
+/// moved at least `threshold_bps`, or the last post is old enough that a
+/// replacement should land while the live order still has `repost_lead_secs` of
+/// life. The age gate keeps a stable market from going dark when the price-move
+/// gate alone would never fire before the TTL lapses. `last` is
 /// `(price, posted_at_unix)`.
 pub fn should_requote_now(
     last: Option<(f64, u64)>,
@@ -34,18 +33,32 @@ pub fn should_requote_now(
     threshold_bps: u32,
     now: u64,
     ttl_secs: u64,
+    repost_lead_secs: u64,
 ) -> bool {
     match last {
         None => true,
         Some((prev, posted_at)) => {
-            let aged = now.saturating_sub(posted_at) >= requote_age_secs(ttl_secs);
+            let aged =
+                now.saturating_sub(posted_at) >= requote_age_secs(ttl_secs, repost_lead_secs);
             aged || should_requote(Some(prev), new_bid, threshold_bps)
         }
     }
 }
 
-fn requote_age_secs(ttl_secs: u64) -> u64 {
-    ttl_secs.saturating_mul(2) / 3
+/// The order age at which a side reposts: `ttl_secs - repost_lead_secs`, so the
+/// replacement is signed while the live order still has `repost_lead_secs` of
+/// life and the two overlap instead of leaving a gap.
+///
+/// The lead is capped at half the TTL. That cap is a safety floor against a
+/// large or misconfigured lead driving the repost age to zero (which would
+/// re-sign the whole ladder every tick), but it has a cost: below `ttl ≈ 2 ×
+/// lead` the effective overlap is `ttl/2`, not the configured lead. So as the
+/// TTL drops the gap-free margin shrinks back toward the indexer's deadline
+/// margin. Keep `ttl_secs ≥ 2 × repost_lead_secs` to actually get the lead you
+/// asked for.
+fn requote_age_secs(ttl_secs: u64, repost_lead_secs: u64) -> u64 {
+    let lead = repost_lead_secs.min(ttl_secs / 2);
+    ttl_secs.saturating_sub(lead)
 }
 
 #[cfg(test)]
@@ -70,15 +83,38 @@ mod tests {
 
     #[test]
     fn requotes_near_expiry_even_when_price_is_flat() {
+        // 30s TTL, 10s lead → repost at age 20 (30 - 10).
         // First quote always.
-        assert!(should_requote_now(None, 1.0, 10, 0, 30));
-        // 5s into a 30s TTL, flat price → not yet.
-        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 5, 30));
-        // 15s in, flat price → wait to reduce old/new signed-order overlap.
-        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 15, 30));
-        // 20s in (two-thirds of TTL), flat price → re-quote to avoid a gap.
-        assert!(should_requote_now(Some((1.0, 0)), 1.0, 10, 20, 30));
+        assert!(should_requote_now(None, 1.0, 10, 0, 30, 10));
+        // 5s into the TTL, flat price → not yet.
+        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 5, 30, 10));
+        // 15s in, flat price → still before the repost age.
+        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 15, 30, 10));
+        // 20s in (lead before expiry), flat price → re-quote to avoid a gap.
+        assert!(should_requote_now(Some((1.0, 0)), 1.0, 10, 20, 30, 10));
         // A big move still re-quotes before the age gate.
-        assert!(should_requote_now(Some((1.0, 0)), 1.002, 10, 1, 30));
+        assert!(should_requote_now(Some((1.0, 0)), 1.002, 10, 1, 30, 10));
+    }
+
+    #[test]
+    fn lead_time_sets_repost_age_and_clamps_at_half_ttl() {
+        // ttl 240, lead 60 → repost at age 180 (240 - 60), 60s overlap.
+        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 179, 240, 60));
+        assert!(should_requote_now(Some((1.0, 0)), 1.0, 10, 180, 240, 60));
+
+        // The clamp: an oversized lead is capped at ttl/2, so the repost age
+        // never collapses toward zero. ttl 120, lead 1000 → age 60, not 0.
+        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 59, 120, 1000));
+        assert!(should_requote_now(Some((1.0, 0)), 1.0, 10, 60, 120, 1000));
+
+        // The cost of the clamp: at ttl = 2 × lead the overlap is exactly the
+        // lead; below that it silently shrinks to ttl/2. ttl 90, lead 60 → the
+        // lead is capped to 45, so the real overlap is 45s, not 60s.
+        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 44, 90, 60));
+        assert!(should_requote_now(Some((1.0, 0)), 1.0, 10, 45, 90, 60));
+
+        // Zero lead → repost only at the deadline (age == ttl).
+        assert!(!should_requote_now(Some((1.0, 0)), 1.0, 10, 239, 240, 0));
+        assert!(should_requote_now(Some((1.0, 0)), 1.0, 10, 240, 240, 0));
     }
 }

@@ -537,6 +537,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     pool.refresh_threshold_bps,
                     now,
                     pool.ttl_secs,
+                    pool.repost_lead_secs(),
                 ) {
                     let sizes = if pool.buy_ladder_enabled() {
                         match (
@@ -605,6 +606,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     pool.refresh_threshold_bps,
                     now,
                     pool.ttl_secs,
+                    pool.repost_lead_secs(),
                 ) {
                     let sizes = if pool.sell_ladder_enabled() {
                         match (

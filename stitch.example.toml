@@ -46,6 +46,10 @@ sell_min_slice_debt = "10000000"                # 10 USDC-equivalent smallest sl
 sell_max_orders = 40
 
 ttl_secs = 30
+# repost_lead_secs = 60   # repost each side this many secs before its order
+                          # expires, so the new ladder overlaps the old one and
+                          # the book never blanks between reposts. Capped at
+                          # ttl/2, so keep ttl_secs >= 2 x this. Defaults to 60.
 refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
 
 # ----- Blue leg (auction closer). Set these to also close this pool's

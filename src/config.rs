@@ -12,6 +12,14 @@ use crate::quote::Spread;
 pub const MAX_SUPPORTED_LADDER_ORDERS: u32 = 40;
 pub const DEFAULT_MAX_LADDER_ORDERS: u32 = MAX_SUPPORTED_LADDER_ORDERS;
 
+/// Default seconds before a live order's deadline at which the bot reposts its
+/// side, so the replacement overlaps the old order instead of leaving a gap.
+/// Sized to clear the indexer's order-deadline margin (30s) plus the ~15s web
+/// poll with headroom, so the live order book never blanks between reposts.
+/// Effective overlap is capped at half the TTL (see `requote_age_secs`), so
+/// keep `ttl_secs ≥ 2 × repost_lead_secs` to get the full lead.
+pub const DEFAULT_REPOST_LEAD_SECS: u64 = 60;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub chain_id: u64,
@@ -109,6 +117,11 @@ pub struct PoolConfig {
 
     /// Order lifetime.
     pub ttl_secs: u64,
+    /// Repost a side this many seconds before its live order expires, so the
+    /// replacement overlaps the old order rather than leaving a book gap.
+    /// Capped at half the TTL. Defaults to `DEFAULT_REPOST_LEAD_SECS`.
+    #[serde(default)]
+    pub repost_lead_secs: Option<u64>,
     /// Re-sign a side when its price moves more than this since its last order.
     pub refresh_threshold_bps: u32,
 
@@ -151,6 +164,10 @@ fn spread_from(bps: Option<u32>, abs: Option<f64>) -> Option<Spread> {
 }
 
 impl PoolConfig {
+    /// Seconds before expiry at which this side reposts, with the default applied.
+    pub fn repost_lead_secs(&self) -> u64 {
+        self.repost_lead_secs.unwrap_or(DEFAULT_REPOST_LEAD_SECS)
+    }
     /// The bid spread for this pool, however the operator expressed it.
     pub fn buy_spread(&self) -> Option<Spread> {
         spread_from(self.buy_offset_bps, self.buy_offset_abs)
