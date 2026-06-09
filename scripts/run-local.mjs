@@ -323,7 +323,13 @@ sell_offset_bps = ${SELL_OFFSET_BPS}
 sell_total_liquidity_collateral = "${p.askSizeAtomic}"
 sell_min_slice_debt = "${p.minAskDebtAtomic}"
 sell_max_orders = ${MAX_LADDER_ORDERS}
-ttl_secs = 300
+# The bot signs deadlines off its wall clock, but the local Hardhat chain's
+# block.timestamp can run minutes ahead of wall time (tests bump EVM time and
+# it can't go back). A short TTL then makes every order expire on-chain before
+# it's fillable — executeBatch reverts with Permit2 SignatureExpired. 30 min
+# absorbs realistic local drift. (Prod chains track wall time, so TTL there is
+# the bot's own short value.)
+ttl_secs = 1800
 # 0 → re-sign with a fresh Permit2 nonce every tick. The local oracle is flat,
 # so a price-gated bot would never rotate the nonce, and a filled order would
 # linger in the book and revert the next fill with InvalidNonce. (Production
