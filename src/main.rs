@@ -13,11 +13,14 @@
 
 use std::collections::HashMap;
 use std::env::VarError;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, Bytes, U256};
 use anyhow::{anyhow, Context};
 use k256::ecdsa::SigningKey;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use stitch_bot::approve::{run_approvals, unapproved_tokens, ApprovalMode};
@@ -85,9 +88,26 @@ struct Poster<'a> {
 
 struct OrderDraft {
     nonce: u64,
+    slot_key: String,
     input_amount: U256,
     output_amount: U256,
     client_order_id: Option<String>,
+}
+
+#[derive(Default)]
+struct PostResult {
+    posted: usize,
+    spent_nonce: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SlotNonceState {
+    chain_id: u64,
+    maker: String,
+    next_nonce: u64,
+    slot_nonces: HashMap<String, u64>,
+    #[serde(default)]
+    slot_inputs: HashMap<String, String>,
 }
 
 impl Poster<'_> {
@@ -99,10 +119,10 @@ impl Poster<'_> {
         ttl_secs: u64,
         input_token: Address,
         output_token: Address,
-        drafts: Vec<OrderDraft>,
+        drafts: &[OrderDraft],
         label: &str,
         price: f64,
-    ) -> usize {
+    ) -> PostResult {
         let deadline = unix_now().saturating_add(ttl_secs);
         let mut submissions = Vec::new();
 
@@ -125,18 +145,18 @@ impl Poster<'_> {
             };
             match sign_submission(&order, self.permit2, self.chain_id, self.key) {
                 Ok(mut s) => {
-                    s.client_order_id = draft.client_order_id;
+                    s.client_order_id = draft.client_order_id.clone();
                     submissions.push(s);
                 }
                 Err(e) => {
                     warn!(label, error = %e, "signing failed; skipping batch");
-                    return 0;
+                    return PostResult::default();
                 }
             }
         }
 
         if submissions.is_empty() {
-            return 0;
+            return PostResult::default();
         }
 
         if self.dry_run {
@@ -149,17 +169,26 @@ impl Poster<'_> {
                     "[dry-run] would post order"
                 );
             }
-            return submissions.len();
+            return PostResult {
+                posted: submissions.len(),
+                spent_nonce: None,
+            };
         }
 
         match self.indexer.submit_many(&submissions).await {
             Ok(ids) => {
                 info!(label, price, orders = ids.len(), "posted order batch");
-                ids.len()
+                PostResult {
+                    posted: ids.len(),
+                    spent_nonce: None,
+                }
             }
             Err(e) => {
                 warn!(label, error = %e, "batch post failed");
-                0
+                PostResult {
+                    posted: 0,
+                    spent_nonce: spent_nonce_from_error(&e.to_string()),
+                }
             }
         }
     }
@@ -271,6 +300,16 @@ mod tests {
         path
     }
 
+    fn temp_state_file(label: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "stitch-test-state-{label}-{}-{}.json",
+            std::process::id(),
+            unix_now()
+        ));
+        path
+    }
+
     #[test]
     fn key_material_uses_direct_env_when_no_file_is_set() {
         let raw = load_key_material_from_vars(Err(VarError::NotPresent), Ok(TEST_KEY.into()))
@@ -343,6 +382,165 @@ mod tests {
         reserve_funded_input(&mut funded_inputs, token, U256::from(50u64));
         assert_eq!(funded_inputs[&token], U256::ZERO);
     }
+
+    #[test]
+    fn replacement_reservation_only_charges_the_incremental_delta() {
+        assert_eq!(
+            replacement_reservation(U256::from(100u64), U256::from(75u64)),
+            U256::from(25u64)
+        );
+        assert_eq!(
+            replacement_reservation(U256::from(75u64), U256::from(100u64)),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn slot_nonce_is_stable_per_replacement_slot() {
+        let mut slot_nonces = HashMap::new();
+        let mut next_nonce = 1_000u64;
+
+        let bid_0 = slot_nonce(&mut slot_nonces, &mut next_nonce, "buy:pair:bid:0");
+        let bid_1 = slot_nonce(&mut slot_nonces, &mut next_nonce, "buy:pair:bid:1");
+        let bid_0_again = slot_nonce(&mut slot_nonces, &mut next_nonce, "buy:pair:bid:0");
+
+        assert_eq!(bid_0, 1_001);
+        assert_eq!(bid_1, 1_002);
+        assert_eq!(bid_0_again, bid_0);
+    }
+
+    #[test]
+    fn spent_nonce_errors_are_parsed_from_indexer_failures() {
+        let error =
+            r#"indexer rejected order batch: [{"message":"Permit2 nonce already spent: 1002"}]"#;
+
+        assert_eq!(spent_nonce_from_error(error), Some(1002));
+    }
+
+    #[test]
+    fn forgetting_a_spent_nonce_only_rotates_that_slot() {
+        let mut slot_nonces = HashMap::new();
+        let mut slot_inputs = HashMap::new();
+        slot_nonces.insert("buy:pair:bid:0".to_string(), 1001);
+        slot_nonces.insert("buy:pair:bid:1".to_string(), 1002);
+        slot_inputs.insert("buy:pair:bid:0".to_string(), "1".to_string());
+        slot_inputs.insert("buy:pair:bid:1".to_string(), "1".to_string());
+        let drafts = vec![
+            OrderDraft {
+                nonce: 1001,
+                slot_key: "buy:pair:bid:0".to_string(),
+                input_amount: U256::from(1u64),
+                output_amount: U256::from(1u64),
+                client_order_id: Some("bid:0".to_string()),
+            },
+            OrderDraft {
+                nonce: 1002,
+                slot_key: "buy:pair:bid:1".to_string(),
+                input_amount: U256::from(1u64),
+                output_amount: U256::from(1u64),
+                client_order_id: Some("bid:1".to_string()),
+            },
+        ];
+
+        forget_spent_slot_nonce(&mut slot_nonces, &mut slot_inputs, &drafts, 1002);
+
+        assert_eq!(slot_nonces.get("buy:pair:bid:0"), Some(&1001));
+        assert!(!slot_nonces.contains_key("buy:pair:bid:1"));
+        assert_eq!(slot_inputs.get("buy:pair:bid:0"), Some(&"1".to_string()));
+        assert!(!slot_inputs.contains_key("buy:pair:bid:1"));
+    }
+
+    #[test]
+    fn reusable_slot_input_sums_only_the_current_side() {
+        let mut slot_inputs = HashMap::new();
+        slot_inputs.insert("buy:pair:bid:0".to_string(), "100".to_string());
+        slot_inputs.insert("buy:pair:bid:1".to_string(), "25".to_string());
+        slot_inputs.insert("sell:pair:ask:0".to_string(), "50".to_string());
+
+        assert_eq!(
+            reusable_slot_input(&slot_inputs, "buy:pair"),
+            U256::from(125u64)
+        );
+    }
+
+    #[test]
+    fn remembering_slot_inputs_replaces_only_the_current_side() {
+        let mut slot_inputs = HashMap::new();
+        slot_inputs.insert("buy:pair:bid:0".to_string(), "100".to_string());
+        slot_inputs.insert("buy:pair:bid:1".to_string(), "25".to_string());
+        slot_inputs.insert("sell:pair:ask:0".to_string(), "50".to_string());
+        let drafts = vec![OrderDraft {
+            nonce: 1001,
+            slot_key: "buy:pair:bid:0".to_string(),
+            input_amount: U256::from(80u64),
+            output_amount: U256::from(1u64),
+            client_order_id: Some("bid:0".to_string()),
+        }];
+
+        remember_slot_inputs(&mut slot_inputs, "buy:pair", &drafts);
+
+        assert_eq!(slot_inputs.get("buy:pair:bid:0"), Some(&"80".to_string()));
+        assert!(!slot_inputs.contains_key("buy:pair:bid:1"));
+        assert_eq!(slot_inputs.get("sell:pair:ask:0"), Some(&"50".to_string()));
+    }
+
+    #[test]
+    fn slot_nonce_state_path_is_scoped_by_chain_and_maker() {
+        let maker: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+
+        let path = slot_nonce_state_path("/tmp/stitch.toml", 8453, maker);
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/tmp/stitch.8453.0x00000000000000000000000000000000000000aa.slot-nonces.json"
+            )
+        );
+    }
+
+    #[test]
+    fn persisted_slot_nonce_state_round_trips() {
+        let maker: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let path = temp_state_file("round-trip");
+        let mut slot_nonces = HashMap::new();
+        let mut slot_inputs = HashMap::new();
+        slot_nonces.insert("buy:pair:bid:0".to_string(), 1001);
+        slot_nonces.insert("sell:pair:ask:0".to_string(), 1002);
+        slot_inputs.insert("buy:pair:bid:0".to_string(), "10".to_string());
+        slot_inputs.insert("sell:pair:ask:0".to_string(), "20".to_string());
+
+        save_slot_nonce_state(&path, 8453, maker, 1002, &slot_nonces, &slot_inputs)
+            .expect("state saves");
+        let (next_nonce, loaded_nonces, loaded_inputs) =
+            load_slot_nonce_state(&path, 8453, maker, 1).expect("state loads");
+
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(next_nonce, 1002);
+        assert_eq!(loaded_nonces, slot_nonces);
+        assert_eq!(loaded_inputs, slot_inputs);
+    }
+
+    #[test]
+    fn persisted_slot_nonce_state_rejects_wrong_maker() {
+        let maker: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let other: Address = "0x00000000000000000000000000000000000000bb"
+            .parse()
+            .unwrap();
+        let path = temp_state_file("wrong-maker");
+        save_slot_nonce_state(&path, 8453, maker, 1002, &HashMap::new(), &HashMap::new())
+            .expect("state saves");
+
+        let err = load_slot_nonce_state(&path, 8453, other, 1).expect_err("maker mismatch");
+
+        std::fs::remove_file(path).unwrap();
+        assert!(err.to_string().contains("maker"));
+    }
 }
 
 fn unix_now() -> u64 {
@@ -388,6 +586,7 @@ async fn funded_input_cap(
     token: Address,
     permit2: Address,
     configured: u128,
+    reusable_input: U256,
     dry_run: bool,
     funded_inputs: &mut HashMap<Address, U256>,
     pair: &str,
@@ -450,7 +649,8 @@ async fn funded_input_cap(
     }
 
     let remaining = *funded_inputs.get(&token).unwrap_or(&U256::ZERO);
-    let capped = cap_input_liquidity(configured, remaining, U256::MAX);
+    let available = remaining.saturating_add(reusable_input);
+    let capped = cap_input_liquidity(configured, available, U256::MAX);
     if capped < configured {
         warn!(
             pair = %pair,
@@ -458,6 +658,7 @@ async fn funded_input_cap(
             configured,
             capped,
             remaining = %remaining,
+            reusable = %reusable_input,
             "capping order liquidity to remaining funded input"
         );
     }
@@ -476,6 +677,157 @@ fn drafted_input(drafts: &[OrderDraft]) -> U256 {
     drafts.iter().fold(U256::ZERO, |sum, draft| {
         sum.saturating_add(draft.input_amount)
     })
+}
+
+fn replacement_reservation(drafted_input: U256, reusable_input: U256) -> U256 {
+    drafted_input.saturating_sub(reusable_input)
+}
+
+fn slot_nonce(
+    slot_nonces: &mut HashMap<String, u64>,
+    next_nonce: &mut u64,
+    slot_key: impl Into<String>,
+) -> u64 {
+    *slot_nonces.entry(slot_key.into()).or_insert_with(|| {
+        *next_nonce = next_nonce.saturating_add(1);
+        *next_nonce
+    })
+}
+
+fn spent_nonce_from_error(error: &str) -> Option<u64> {
+    const MARKER: &str = "Permit2 nonce already spent:";
+    let tail = error.split(MARKER).nth(1)?;
+    let digits: String = tail
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn forget_spent_slot_nonce(
+    slot_nonces: &mut HashMap<String, u64>,
+    slot_inputs: &mut HashMap<String, String>,
+    drafts: &[OrderDraft],
+    spent_nonce: u64,
+) {
+    for draft in drafts {
+        if draft.nonce == spent_nonce {
+            slot_nonces.remove(&draft.slot_key);
+            slot_inputs.remove(&draft.slot_key);
+        }
+    }
+}
+
+fn reusable_slot_input(slot_inputs: &HashMap<String, String>, key_id: &str) -> U256 {
+    let prefix = format!("{key_id}:");
+    slot_inputs
+        .iter()
+        .filter(|(slot_key, _)| slot_key.starts_with(&prefix))
+        .fold(U256::ZERO, |sum, (_, input)| {
+            sum.saturating_add(input.parse::<U256>().unwrap_or(U256::ZERO))
+        })
+}
+
+fn remember_slot_inputs(
+    slot_inputs: &mut HashMap<String, String>,
+    key_id: &str,
+    drafts: &[OrderDraft],
+) {
+    let prefix = format!("{key_id}:");
+    slot_inputs.retain(|slot_key, _| !slot_key.starts_with(&prefix));
+    for draft in drafts {
+        slot_inputs.insert(draft.slot_key.clone(), draft.input_amount.to_string());
+    }
+}
+
+fn slot_nonce_state_path(config_path: &str, chain_id: u64, maker: Address) -> PathBuf {
+    let config_path = Path::new(config_path);
+    let dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("stitch");
+    dir.join(format!(
+        "{stem}.{chain_id}.{}.slot-nonces.json",
+        maker.to_string().to_lowercase()
+    ))
+}
+
+fn load_slot_nonce_state(
+    path: &Path,
+    chain_id: u64,
+    maker: Address,
+    initial_next_nonce: u64,
+) -> anyhow::Result<(u64, HashMap<String, u64>, HashMap<String, String>)> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok((initial_next_nonce, HashMap::new(), HashMap::new()));
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let state: SlotNonceState =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let maker = maker.to_string().to_lowercase();
+    anyhow::ensure!(
+        state.chain_id == chain_id,
+        "slot nonce state chain_id {} does not match {chain_id}",
+        state.chain_id
+    );
+    anyhow::ensure!(
+        state.maker.eq_ignore_ascii_case(&maker),
+        "slot nonce state maker {} does not match {maker}",
+        state.maker
+    );
+    for (slot_key, input) in &state.slot_inputs {
+        input.parse::<U256>().with_context(|| {
+            format!(
+                "invalid slot input amount for {slot_key} in {}",
+                path.display()
+            )
+        })?;
+    }
+    let max_slot_nonce = state.slot_nonces.values().copied().max().unwrap_or(0);
+    Ok((
+        initial_next_nonce.max(state.next_nonce).max(max_slot_nonce),
+        state.slot_nonces,
+        state.slot_inputs,
+    ))
+}
+
+fn save_slot_nonce_state(
+    path: &Path,
+    chain_id: u64,
+    maker: Address,
+    next_nonce: u64,
+    slot_nonces: &HashMap<String, u64>,
+    slot_inputs: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let state = SlotNonceState {
+        chain_id,
+        maker: maker.to_string().to_lowercase(),
+        next_nonce,
+        slot_nonces: slot_nonces.clone(),
+        slot_inputs: slot_inputs.clone(),
+    };
+    let mut json = serde_json::to_string_pretty(&state)?;
+    json.push('\n');
+    let mut tmp = path.to_path_buf();
+    tmp.set_extension("json.tmp");
+    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))
 }
 
 #[tokio::main]
@@ -627,7 +979,27 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // Per closer pool: position id → unix time we last submitted a fill for it,
     // so a pending tx or lagging subgraph can't trigger a duplicate `fill()`.
     let mut closer_pending: HashMap<Address, HashMap<U256, u64>> = HashMap::new();
-    let mut nonce: u64 = unix_now().saturating_mul(1000);
+    let slot_nonce_state_path = slot_nonce_state_path(&config_path, cfg.chain_id, maker);
+    let initial_next_nonce = unix_now().saturating_mul(1000);
+    let (mut next_nonce, mut slot_nonces, mut slot_inputs) = if dry_run {
+        (initial_next_nonce, HashMap::new(), HashMap::new())
+    } else {
+        load_slot_nonce_state(
+            &slot_nonce_state_path,
+            cfg.chain_id,
+            maker,
+            initial_next_nonce,
+        )?
+    };
+    if !dry_run {
+        info!(
+            path = %slot_nonce_state_path.display(),
+            slots = slot_nonces.len(),
+            slot_inputs = slot_inputs.len(),
+            next_nonce,
+            "loaded slot nonce state"
+        );
+    }
     let mut interval = tokio::time::interval(Duration::from_secs(cfg.tick_interval_secs.max(1)));
 
     // Exit cleanly on Ctrl-C / SIGTERM. We only check between ticks, so a signal
@@ -693,6 +1065,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     pool.ttl_secs,
                     pool.repost_lead_secs(),
                 ) {
+                    let reusable_input = reusable_slot_input(&slot_inputs, &key_id);
                     let sizes = if pool.buy_ladder_enabled() {
                         match (
                             pool.buy_total_liquidity_debt.as_deref(),
@@ -711,6 +1084,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                         debt,
                                         permit2,
                                         total,
+                                        reusable_input,
                                         dry_run,
                                         &mut funded_inputs,
                                         &pair,
@@ -744,6 +1118,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                 debt,
                                 permit2,
                                 size,
+                                reusable_input,
                                 dry_run,
                                 &mut funded_inputs,
                                 &pair,
@@ -767,21 +1142,78 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     for (i, size) in sizes.into_iter().enumerate() {
                         let (input, output) =
                             buy_amounts_at(bid, size, pool.debt_decimals, pool.collateral_decimals);
-                        nonce += 1;
+                        let slot_id = if laddered {
+                            format!("bid:{i}")
+                        } else {
+                            "default".to_string()
+                        };
+                        let slot_key = format!("{key_id}:{slot_id}");
+                        let nonce = slot_nonce(&mut slot_nonces, &mut next_nonce, slot_key.clone());
                         drafts.push(OrderDraft {
                             nonce,
+                            slot_key,
                             input_amount: input,
                             output_amount: output,
-                            client_order_id: laddered.then(|| format!("bid:{i}")),
+                            client_order_id: laddered.then_some(slot_id),
                         });
                     }
                     let input_reserved = drafted_input(&drafts);
-                    let posted = poster
-                        .post_many(pool.ttl_secs, debt, collateral, drafts, "bid", bid)
+                    if !dry_run && !drafts.is_empty() {
+                        if let Err(e) = save_slot_nonce_state(
+                            &slot_nonce_state_path,
+                            cfg.chain_id,
+                            maker,
+                            next_nonce,
+                            &slot_nonces,
+                            &slot_inputs,
+                        ) {
+                            warn!(pair = %pair, label = "bid", error = %e, "could not persist slot nonce state; skipping post");
+                            continue;
+                        }
+                    }
+                    let result = poster
+                        .post_many(pool.ttl_secs, debt, collateral, &drafts, "bid", bid)
                         .await;
-                    if posted > 0 {
-                        reserve_funded_input(&mut funded_inputs, debt, input_reserved);
-                        info!(pair = %pair, orders = posted, "posted bid ladder");
+                    if let Some(spent_nonce) = result.spent_nonce {
+                        forget_spent_slot_nonce(
+                            &mut slot_nonces,
+                            &mut slot_inputs,
+                            &drafts,
+                            spent_nonce,
+                        );
+                        if !dry_run {
+                            if let Err(e) = save_slot_nonce_state(
+                                &slot_nonce_state_path,
+                                cfg.chain_id,
+                                maker,
+                                next_nonce,
+                                &slot_nonces,
+                                &slot_inputs,
+                            ) {
+                                warn!(pair = %pair, label = "bid", error = %e, "could not persist spent nonce rotation");
+                            }
+                        }
+                    }
+                    if result.posted > 0 {
+                        remember_slot_inputs(&mut slot_inputs, &key_id, &drafts);
+                        if !dry_run {
+                            if let Err(e) = save_slot_nonce_state(
+                                &slot_nonce_state_path,
+                                cfg.chain_id,
+                                maker,
+                                next_nonce,
+                                &slot_nonces,
+                                &slot_inputs,
+                            ) {
+                                warn!(pair = %pair, label = "bid", error = %e, "could not persist posted slot inputs");
+                            }
+                        }
+                        reserve_funded_input(
+                            &mut funded_inputs,
+                            debt,
+                            replacement_reservation(input_reserved, reusable_input),
+                        );
+                        info!(pair = %pair, orders = result.posted, "posted bid ladder");
                         last_quote.insert(key_id, (bid, now));
                     }
                 }
@@ -799,6 +1231,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     pool.ttl_secs,
                     pool.repost_lead_secs(),
                 ) {
+                    let reusable_input = reusable_slot_input(&slot_inputs, &key_id);
                     let sizes = if pool.sell_ladder_enabled() {
                         match (
                             pool.sell_total_liquidity_collateral.as_deref(),
@@ -817,6 +1250,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                         collateral,
                                         permit2,
                                         total_collateral,
+                                        reusable_input,
                                         dry_run,
                                         &mut funded_inputs,
                                         &pair,
@@ -868,6 +1302,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                 collateral,
                                 permit2,
                                 size,
+                                reusable_input,
                                 dry_run,
                                 &mut funded_inputs,
                                 &pair,
@@ -918,21 +1353,78 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             );
                             (input, output)
                         };
-                        nonce += 1;
+                        let slot_id = if laddered {
+                            format!("ask:{i}")
+                        } else {
+                            "default".to_string()
+                        };
+                        let slot_key = format!("{key_id}:{slot_id}");
+                        let nonce = slot_nonce(&mut slot_nonces, &mut next_nonce, slot_key.clone());
                         drafts.push(OrderDraft {
                             nonce,
+                            slot_key,
                             input_amount: input,
                             output_amount: output,
-                            client_order_id: laddered.then(|| format!("ask:{i}")),
+                            client_order_id: laddered.then_some(slot_id),
                         });
                     }
                     let input_reserved = drafted_input(&drafts);
-                    let posted = poster
-                        .post_many(pool.ttl_secs, collateral, debt, drafts, "ask", ask)
+                    if !dry_run && !drafts.is_empty() {
+                        if let Err(e) = save_slot_nonce_state(
+                            &slot_nonce_state_path,
+                            cfg.chain_id,
+                            maker,
+                            next_nonce,
+                            &slot_nonces,
+                            &slot_inputs,
+                        ) {
+                            warn!(pair = %pair, label = "ask", error = %e, "could not persist slot nonce state; skipping post");
+                            continue;
+                        }
+                    }
+                    let result = poster
+                        .post_many(pool.ttl_secs, collateral, debt, &drafts, "ask", ask)
                         .await;
-                    if posted > 0 {
-                        reserve_funded_input(&mut funded_inputs, collateral, input_reserved);
-                        info!(pair = %pair, orders = posted, "posted ask ladder");
+                    if let Some(spent_nonce) = result.spent_nonce {
+                        forget_spent_slot_nonce(
+                            &mut slot_nonces,
+                            &mut slot_inputs,
+                            &drafts,
+                            spent_nonce,
+                        );
+                        if !dry_run {
+                            if let Err(e) = save_slot_nonce_state(
+                                &slot_nonce_state_path,
+                                cfg.chain_id,
+                                maker,
+                                next_nonce,
+                                &slot_nonces,
+                                &slot_inputs,
+                            ) {
+                                warn!(pair = %pair, label = "ask", error = %e, "could not persist spent nonce rotation");
+                            }
+                        }
+                    }
+                    if result.posted > 0 {
+                        remember_slot_inputs(&mut slot_inputs, &key_id, &drafts);
+                        if !dry_run {
+                            if let Err(e) = save_slot_nonce_state(
+                                &slot_nonce_state_path,
+                                cfg.chain_id,
+                                maker,
+                                next_nonce,
+                                &slot_nonces,
+                                &slot_inputs,
+                            ) {
+                                warn!(pair = %pair, label = "ask", error = %e, "could not persist posted slot inputs");
+                            }
+                        }
+                        reserve_funded_input(
+                            &mut funded_inputs,
+                            collateral,
+                            replacement_reservation(input_reserved, reusable_input),
+                        );
+                        info!(pair = %pair, orders = result.posted, "posted ask ladder");
                         last_quote.insert(key_id, (ask, now));
                     }
                 }
