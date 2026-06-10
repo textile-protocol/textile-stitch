@@ -81,6 +81,11 @@ sell_max_orders = 40
   and Permit2 allowance every quote tick, then posts only the funded portion.
   If inventory falls below the target, the ladder shrinks until the wallet is
   rebalanced or the config is lowered.
+- Requotes reuse stable replacement slots for each side. When a slot is
+  refreshed, Stitch reuses the slot's nonce and treats that slot's previous
+  input as replaceable, so funded checks reserve only the additional input
+  needed by the new quote. If a fill spends a slot nonce, Stitch rotates only
+  that slot on the next retry.
 
 All amounts are atomic token units. For a 6-decimal token:
 

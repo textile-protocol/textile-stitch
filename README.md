@@ -227,7 +227,9 @@ leaves the remainder unquoted instead of posting an oversized live book.
 Configured liquidity is also a ceiling: on each quote tick, Stitch caps the
 posted bid or ask size to the operator wallet's current token balance and
 Permit2 allowance for that side, so normal fills or inventory transfers reduce
-the next ladder instead of causing the indexer to reject an unfunded batch. For
+the next ladder instead of causing the indexer to reject an unfunded batch.
+Requotes reuse the same replacement slots, so Stitch can refresh funded depth
+without double-counting the ladder it is replacing. For
 the price-feed orientation, spread options, ladder sizing, and
 settlement-closing fields, see the
 [configuration reference in ADVANCED.md](ADVANCED.md#configuration-reference).
