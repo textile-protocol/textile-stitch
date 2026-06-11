@@ -119,7 +119,22 @@ pub fn approval_action(
 ) -> ApprovalAction {
     // A side with no committed size needs nothing; and an allowance that already
     // covers the commitment is left alone whichever mode was asked for.
-    if required == U256::ZERO || current_allowance >= required {
+    //
+    // `required == U256::MAX` is the `"max"`-liquidity sentinel: the operator
+    // approved an unlimited allowance, but Permit2 decrements the ERC20
+    // allowance by every filled order's input, so it never stays exactly
+    // `U256::MAX`. Comparing against the literal max would flag a healthy wallet
+    // as unapproved the moment its first order fills — the cause of the
+    // live-start crash loop. Treat any allowance still above half of max as
+    // effectively unlimited: dropping below would take 2^255 atomic units of
+    // fills, which no real balance can reach. A genuinely under-approved wallet
+    // (allowance below the floor) still gets a fresh unlimited approval below.
+    let covered = if required == U256::MAX {
+        current_allowance >= (U256::MAX >> 1usize)
+    } else {
+        current_allowance >= required
+    };
+    if required == U256::ZERO || covered {
         return ApprovalAction::AlreadyApproved;
     }
     match mode {
@@ -483,6 +498,26 @@ mod tests {
         let required = U256::from(50_000_000_000u64);
         assert_eq!(
             approval_action(U256::ZERO, required, ApprovalMode::Max),
+            ApprovalAction::Approve(U256::MAX)
+        );
+    }
+
+    #[test]
+    fn max_liquidity_allowance_stays_covered_as_fills_consume_it() {
+        // Regression: with `"max"` liquidity the required amount is U256::MAX,
+        // but Permit2 decrements the unlimited allowance by each filled order's
+        // input. An allowance just below max (here ~$0.05 of USDC already pulled)
+        // must still count as approved — otherwise the live-start preflight
+        // crash-loops after the first fill.
+        let consumed = U256::MAX - U256::from(50_000u64);
+        assert_eq!(
+            approval_action(consumed, U256::MAX, ApprovalMode::Max),
+            ApprovalAction::AlreadyApproved
+        );
+        // But a genuinely under-approved wallet (below the unlimited floor) still
+        // gets a fresh max approval.
+        assert_eq!(
+            approval_action((U256::MAX >> 1usize) - U256::from(1u8), U256::MAX, ApprovalMode::Max),
             ApprovalAction::Approve(U256::MAX)
         );
     }
