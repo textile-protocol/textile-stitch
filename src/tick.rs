@@ -3,6 +3,16 @@
 //! Pure tick-loop decisions: when the feed is too stale to quote, and when the
 //! bid has moved enough to be worth re-signing.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Current unix time in seconds; 0 if the clock is before the epoch.
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// True if the feed hasn't updated within `staleness_secs` — never trade on it.
 pub fn is_stale(feed_ts: u64, now: u64, staleness_secs: u64) -> bool {
     now.saturating_sub(feed_ts) > staleness_secs
