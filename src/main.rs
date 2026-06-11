@@ -30,7 +30,9 @@ use stitch_bot::closer::discover::Discoverer;
 use stitch_bot::closer::executor::{encode_allowance, encode_balance_of};
 use stitch_bot::closer::runner::{close_pool_once, CloseOutcome, CloserPool};
 use stitch_bot::closer::strategy::{PoolParams, StrategyConfig};
-use stitch_bot::config::{Config, PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
+use stitch_bot::config::{
+    parse_liquidity_amount, Config, LiquidityAmount, PoolConfig, DEFAULT_MAX_LADDER_ORDERS,
+};
 use stitch_bot::feed::{HttpFeed, PriceFeed};
 use stitch_bot::indexer::Indexer;
 use stitch_bot::ladder::balanced_ladder;
@@ -347,24 +349,33 @@ mod tests {
     #[test]
     fn input_liquidity_keeps_configured_size_when_fully_funded() {
         assert_eq!(
-            cap_input_liquidity(
-                1_000_000,
-                U256::from(2_000_000u64),
-                U256::from(3_000_000u64)
-            ),
+            cap_input_liquidity(InputLiquidity::Exact(1_000_000), U256::from(2_000_000u64))
+                .unwrap(),
             1_000_000
         );
     }
 
     #[test]
-    fn input_liquidity_caps_to_balance_or_allowance() {
+    fn input_liquidity_caps_to_available_funded_input() {
         assert_eq!(
-            cap_input_liquidity(1_000_000, U256::from(750_000u64), U256::from(900_000u64)),
-            750_000
+            cap_input_liquidity(InputLiquidity::Exact(1_000_000), U256::from(500_000u64)).unwrap(),
+            500_000
+        );
+    }
+
+    #[test]
+    fn max_input_liquidity_uses_all_available_funded_input() {
+        assert_eq!(
+            parse_input_liquidity("max", "buy_total_liquidity_debt").unwrap(),
+            InputLiquidity::Max
         );
         assert_eq!(
-            cap_input_liquidity(1_000_000, U256::from(900_000u64), U256::from(500_000u64)),
-            500_000
+            parse_input_liquidity("MAX", "sell_total_liquidity_collateral").unwrap(),
+            InputLiquidity::Max
+        );
+        assert_eq!(
+            cap_input_liquidity(InputLiquidity::Max, U256::from(750_000u64)).unwrap(),
+            750_000
         );
     }
 
@@ -556,6 +567,19 @@ fn parse_u128(value: &str, field: &str) -> anyhow::Result<u128> {
         .with_context(|| format!("invalid {field}"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputLiquidity {
+    Exact(u128),
+    Max,
+}
+
+fn parse_input_liquidity(value: &str, field: &str) -> anyhow::Result<InputLiquidity> {
+    match parse_liquidity_amount(value, field)? {
+        LiquidityAmount::Exact(amount) => u256_to_u128(amount, field).map(InputLiquidity::Exact),
+        LiquidityAmount::Max => Ok(InputLiquidity::Max),
+    }
+}
+
 fn u256_to_u128(value: U256, field: &str) -> anyhow::Result<u128> {
     value
         .to_string()
@@ -563,19 +587,19 @@ fn u256_to_u128(value: U256, field: &str) -> anyhow::Result<u128> {
         .with_context(|| format!("{field} does not fit in u128"))
 }
 
-fn cap_input_liquidity(configured: u128, balance: U256, allowance: U256) -> u128 {
-    let funded = if balance < allowance {
-        balance
-    } else {
-        allowance
+fn fallback_liquidity(configured: InputLiquidity) -> U256 {
+    match configured {
+        InputLiquidity::Exact(configured) => U256::from(configured),
+        InputLiquidity::Max => U256::from(u128::MAX),
+    }
+}
+
+fn cap_input_liquidity(configured: InputLiquidity, available: U256) -> anyhow::Result<u128> {
+    let capped = match configured {
+        InputLiquidity::Exact(configured) => available.min(U256::from(configured)),
+        InputLiquidity::Max => available,
     };
-    let configured = U256::from(configured);
-    let capped = if funded < configured {
-        funded
-    } else {
-        configured
-    };
-    capped.to::<u128>()
+    u256_to_u128(capped, "funded input liquidity")
 }
 
 async fn funded_input_cap(
@@ -585,7 +609,7 @@ async fn funded_input_cap(
     maker: Address,
     token: Address,
     permit2: Address,
-    configured: u128,
+    configured: InputLiquidity,
     reusable_input: U256,
     dry_run: bool,
     funded_inputs: &mut HashMap<Address, U256>,
@@ -620,7 +644,7 @@ async fn funded_input_cap(
                         }
                         Err(e) if dry_run => {
                             warn!(pair = %pair, label, committed = %committed, error = %e, "could not parse committed input; using configured size for dry-run");
-                            funded_inputs.insert(token, U256::from(configured));
+                            funded_inputs.insert(token, fallback_liquidity(configured));
                         }
                         Err(e) => {
                             warn!(pair = %pair, label, committed = %committed, error = %e, "could not parse committed input; skipping side");
@@ -629,7 +653,7 @@ async fn funded_input_cap(
                     },
                     Err(e) if dry_run => {
                         warn!(pair = %pair, label, error = %e, "could not read committed input; using configured size for dry-run");
-                        funded_inputs.insert(token, U256::from(configured));
+                        funded_inputs.insert(token, fallback_liquidity(configured));
                     }
                     Err(e) => {
                         warn!(pair = %pair, label, error = %e, "could not read committed input; skipping side");
@@ -639,7 +663,7 @@ async fn funded_input_cap(
             }
             (Err(e), _) | (_, Err(e)) if dry_run => {
                 warn!(pair = %pair, label, error = %e, "could not read funded input; using configured size for dry-run");
-                funded_inputs.insert(token, U256::from(configured));
+                funded_inputs.insert(token, fallback_liquidity(configured));
             }
             (Err(e), _) | (_, Err(e)) => {
                 warn!(pair = %pair, label, error = %e, "could not read funded input; skipping side");
@@ -650,17 +674,25 @@ async fn funded_input_cap(
 
     let remaining = *funded_inputs.get(&token).unwrap_or(&U256::ZERO);
     let available = remaining.saturating_add(reusable_input);
-    let capped = cap_input_liquidity(configured, available, U256::MAX);
-    if capped < configured {
-        warn!(
-            pair = %pair,
-            label,
-            configured,
-            capped,
-            remaining = %remaining,
-            reusable = %reusable_input,
-            "capping order liquidity to remaining funded input"
-        );
+    let capped = match cap_input_liquidity(configured, available) {
+        Ok(capped) => capped,
+        Err(e) => {
+            warn!(pair = %pair, label, error = %e, "funded input liquidity is too large; skipping side");
+            return None;
+        }
+    };
+    if let InputLiquidity::Exact(configured) = configured {
+        if capped < configured {
+            warn!(
+                pair = %pair,
+                label,
+                configured,
+                capped,
+                remaining = %remaining,
+                reusable = %reusable_input,
+                "capping order liquidity to remaining funded input"
+            );
+        }
     }
     Some(capped)
 }
@@ -938,7 +970,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                 warn!("missing Permit2 approvals: orders would post but fail to fill. Run `stitch approve` before going live.");
             } else {
                 anyhow::bail!(
-                    "missing Permit2 approvals for {} token(s); run `stitch approve` (or `stitch approve --exact`) first, or pass --dry-run to test without them",
+                    "missing Permit2 approvals for {} token(s); run `stitch approve` first, or pass --dry-run to test without them",
                     missing.len()
                 );
             }
@@ -1072,7 +1104,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             pool.buy_min_slice_debt.as_deref(),
                         ) {
                             (Some(total), Some(min)) => match (
-                                parse_u128(total, "buy_total_liquidity_debt"),
+                                parse_input_liquidity(total, "buy_total_liquidity_debt"),
                                 parse_u128(min, "buy_min_slice_debt"),
                             ) {
                                 (Ok(total), Ok(min)) => {
@@ -1109,7 +1141,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             _ => Vec::new(),
                         }
                     } else if let Some(size_str) = &pool.buy_order_size_debt {
-                        match parse_u128(size_str, "buy_order_size_debt") {
+                        match parse_input_liquidity(size_str, "buy_order_size_debt") {
                             Ok(size) => funded_input_cap(
                                 &indexer,
                                 &wallet,
@@ -1239,7 +1271,10 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         ) {
                             (Some(total_collateral), Some(min_debt)) => {
                                 match (
-                                    parse_u128(total_collateral, "sell_total_liquidity_collateral"),
+                                    parse_input_liquidity(
+                                        total_collateral,
+                                        "sell_total_liquidity_collateral",
+                                    ),
                                     parse_u128(min_debt, "sell_min_slice_debt"),
                                 ) {
                                     (Ok(total_collateral), Ok(min_debt)) => match funded_input_cap(
@@ -1293,7 +1328,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             _ => Vec::new(),
                         }
                     } else if let Some(size_str) = &pool.sell_order_size_collateral {
-                        match parse_u128(size_str, "sell_order_size_collateral") {
+                        match parse_input_liquidity(size_str, "sell_order_size_collateral") {
                             Ok(size) => funded_input_cap(
                                 &indexer,
                                 &wallet,

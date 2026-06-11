@@ -18,11 +18,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use alloy_primitives::{Address, Bytes, U256};
-use anyhow::Context;
+use anyhow::{bail, Context};
 use tracing::info;
 
 use crate::closer::executor::{encode_allowance, encode_approve};
-use crate::config::{Config, PoolConfig};
+use crate::config::{parse_liquidity_amount, Config, LiquidityAmount, PoolConfig};
 use crate::rpc::Wallet;
 
 /// How much of each token to approve to Permit2.
@@ -44,6 +44,9 @@ pub struct RequiredApproval {
     pub token: Address,
     /// Committed input liquidity in this token's atomic units.
     pub required: U256,
+    /// True when at least one side uses `"max"` and therefore cannot be
+    /// represented by a fixed exact approval amount.
+    pub uses_max_liquidity: bool,
     /// Human labels for logs, e.g. "debt (buy side)".
     pub reasons: Vec<String>,
 }
@@ -61,29 +64,49 @@ pub enum ApprovalAction {
 /// amount per token. Deduped by address (one approval covers every pool/side
 /// that spends the token) and returned in a stable order.
 pub fn required_approvals(cfg: &Config) -> anyhow::Result<Vec<RequiredApproval>> {
-    let mut by_token: BTreeMap<Address, (U256, Vec<String>)> = BTreeMap::new();
+    let mut by_token: BTreeMap<Address, (U256, bool, Vec<String>)> = BTreeMap::new();
     for pool in &cfg.pools {
         if pool.buy_enabled() {
             let token = parse_addr(&pool.debt, "debt token")?;
-            let entry = by_token.entry(token).or_insert((U256::ZERO, Vec::new()));
-            entry.0 = entry.0.saturating_add(buy_input_amount(pool)?);
-            entry.1.push("debt (buy side)".to_string());
+            let entry = by_token
+                .entry(token)
+                .or_insert((U256::ZERO, false, Vec::new()));
+            add_required_amount(entry, buy_input_amount(pool)?);
+            entry.2.push("debt (buy side)".to_string());
         }
         if pool.sell_enabled() {
             let token = parse_addr(&pool.collateral, "collateral token")?;
-            let entry = by_token.entry(token).or_insert((U256::ZERO, Vec::new()));
-            entry.0 = entry.0.saturating_add(sell_input_amount(pool)?);
-            entry.1.push("collateral (sell side)".to_string());
+            let entry = by_token
+                .entry(token)
+                .or_insert((U256::ZERO, false, Vec::new()));
+            add_required_amount(entry, sell_input_amount(pool)?);
+            entry.2.push("collateral (sell side)".to_string());
         }
     }
     Ok(by_token
         .into_iter()
-        .map(|(token, (required, reasons))| RequiredApproval {
-            token,
-            required,
-            reasons,
-        })
+        .map(
+            |(token, (required, uses_max_liquidity, reasons))| RequiredApproval {
+                token,
+                required,
+                uses_max_liquidity,
+                reasons,
+            },
+        )
         .collect())
+}
+
+fn add_required_amount(entry: &mut (U256, bool, Vec<String>), amount: LiquidityAmount) {
+    match amount {
+        LiquidityAmount::Exact(amount) if !entry.1 => {
+            entry.0 = entry.0.saturating_add(amount);
+        }
+        LiquidityAmount::Exact(_) => {}
+        LiquidityAmount::Max => {
+            entry.0 = U256::MAX;
+            entry.1 = true;
+        }
+    }
 }
 
 /// Decide the action for one token. Skips when the current allowance already
@@ -105,34 +128,34 @@ pub fn approval_action(
     }
 }
 
-/// The committed buy-side input is debt: prefer the ladder total, fall back to a
-/// single order size.
-fn buy_input_amount(pool: &PoolConfig) -> anyhow::Result<U256> {
-    let raw = pool
-        .buy_total_liquidity_debt
-        .as_ref()
-        .or(pool.buy_order_size_debt.as_ref())
-        .context("buy side enabled but no debt size configured")?;
-    parse_u256(raw, "buy debt size")
+/// The committed buy-side input is debt. Use the same active sizing field as
+/// the quote path: ladder total only when the ladder is fully configured,
+/// otherwise the single order size.
+fn buy_input_amount(pool: &PoolConfig) -> anyhow::Result<LiquidityAmount> {
+    let raw = if pool.buy_ladder_enabled() {
+        pool.buy_total_liquidity_debt.as_ref()
+    } else {
+        pool.buy_order_size_debt.as_ref()
+    }
+    .context("buy side enabled but no active debt size configured")?;
+    parse_liquidity_amount(raw, "buy debt size")
 }
 
-/// The committed sell-side input is collateral inventory.
-fn sell_input_amount(pool: &PoolConfig) -> anyhow::Result<U256> {
-    let raw = pool
-        .sell_total_liquidity_collateral
-        .as_ref()
-        .or(pool.sell_order_size_collateral.as_ref())
-        .context("sell side enabled but no collateral size configured")?;
-    parse_u256(raw, "sell collateral size")
+/// The committed sell-side input is collateral inventory, selected from the
+/// same active sizing field used by the quote path.
+fn sell_input_amount(pool: &PoolConfig) -> anyhow::Result<LiquidityAmount> {
+    let raw = if pool.sell_ladder_enabled() {
+        pool.sell_total_liquidity_collateral.as_ref()
+    } else {
+        pool.sell_order_size_collateral.as_ref()
+    }
+    .context("sell side enabled but no active collateral size configured")?;
+    parse_liquidity_amount(raw, "sell collateral size")
 }
 
 fn parse_addr(s: &str, what: &str) -> anyhow::Result<Address> {
     s.parse()
         .with_context(|| format!("invalid {what} address: {s}"))
-}
-
-fn parse_u256(s: &str, what: &str) -> anyhow::Result<U256> {
-    s.parse().with_context(|| format!("invalid {what}: {s}"))
 }
 
 /// Read a token's current Permit2 allowance for the operator wallet.
@@ -184,6 +207,16 @@ pub async fn run_approvals(
     if required.is_empty() {
         info!("no enabled order sides; nothing to approve");
         return Ok(0);
+    }
+    if mode == ApprovalMode::Exact {
+        for req in &required {
+            if req.uses_max_liquidity {
+                bail!(
+                    "approve --exact cannot be used with \"max\" liquidity for token {}; use the default max approval or set a fixed liquidity amount",
+                    req.token
+                );
+            }
+        }
     }
     let mut sent = 0usize;
     for req in &required {
@@ -269,6 +302,8 @@ mod tests {
         let coll: Address = COLLATERAL.parse().unwrap();
         let debt_req = reqs.iter().find(|r| r.token == debt).unwrap();
         let coll_req = reqs.iter().find(|r| r.token == coll).unwrap();
+        assert!(!debt_req.uses_max_liquidity);
+        assert!(!coll_req.uses_max_liquidity);
         assert_eq!(debt_req.required, U256::from(50_000_000_000u64));
         assert_eq!(
             coll_req.required,
@@ -340,6 +375,94 @@ mod tests {
         // A spread with no size is not an enabled side.
         let cfg = cfg_from_pool(r#"buy_offset_bps = 150"#);
         assert!(required_approvals(&cfg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn max_liquidity_requires_max_approval() {
+        let cfg = cfg_from_pool(
+            r#"
+            buy_offset_bps = 150
+            buy_total_liquidity_debt = "max"
+            buy_min_slice_debt = "10000000"
+        "#,
+        );
+        let reqs = required_approvals(&cfg).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].required, U256::MAX);
+        assert!(reqs[0].uses_max_liquidity);
+    }
+
+    #[test]
+    fn inactive_buy_ladder_total_does_not_drive_approval() {
+        let cfg = cfg_from_pool(
+            r#"
+            buy_offset_bps = 150
+            buy_total_liquidity_debt = "max"
+            buy_order_size_debt = "1000000000"
+        "#,
+        );
+        let reqs = required_approvals(&cfg).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].required, U256::from(1_000_000_000u64));
+        assert!(!reqs[0].uses_max_liquidity);
+    }
+
+    #[test]
+    fn inactive_sell_ladder_total_does_not_drive_approval() {
+        let cfg = cfg_from_pool(
+            r#"
+            sell_offset_bps = 150
+            sell_total_liquidity_collateral = "max"
+            sell_order_size_collateral = "2000000000"
+        "#,
+        );
+        let reqs = required_approvals(&cfg).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].token, COLLATERAL.parse::<Address>().unwrap());
+        assert_eq!(reqs[0].required, U256::from(2_000_000_000u64));
+        assert!(!reqs[0].uses_max_liquidity);
+    }
+
+    #[test]
+    fn max_liquidity_dominates_fixed_requirements_for_the_same_token() {
+        let toml = format!(
+            r#"
+            chain_id = 8453
+            rpc_url = "http://x"
+            indexer_url = "http://x"
+            permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+            reactor = "0x0000000000000000000000000000000000000000"
+            tick_interval_secs = 5
+            [feed]
+            url = "http://x"
+            staleness_secs = 30
+            [[pools]]
+            collateral = "0x00000000000000000000000000000000000000a1"
+            collateral_decimals = 6
+            debt = "{DEBT}"
+            debt_decimals = 6
+            ttl_secs = 30
+            refresh_threshold_bps = 10
+            buy_offset_bps = 150
+            buy_total_liquidity_debt = "max"
+            buy_min_slice_debt = "10000000"
+            [[pools]]
+            collateral = "0x00000000000000000000000000000000000000a2"
+            collateral_decimals = 6
+            debt = "{DEBT}"
+            debt_decimals = 6
+            ttl_secs = 30
+            refresh_threshold_bps = 10
+            buy_offset_bps = 150
+            buy_order_size_debt = "2000000000"
+        "#
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        let reqs = required_approvals(&cfg).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].required, U256::MAX);
+        assert!(reqs[0].uses_max_liquidity);
+        assert_eq!(reqs[0].reasons.len(), 2);
     }
 
     #[test]

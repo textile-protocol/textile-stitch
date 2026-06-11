@@ -73,6 +73,10 @@ sell_max_orders = 40
 ```
 
 - `*_total_liquidity_*` controls total depth for that side.
+- Set `*_total_liquidity_* = "max"` to quote all currently funded wallet
+  inventory for that side. Stitch resolves this at quote time from the wallet's
+  token balance, Permit2 allowance, live committed input, and reusable
+  same-slot replacement input.
 - `*_min_slice_debt` controls the smallest order slice.
 - `*_max_orders` caps the number of live slices. If the cap is too low to
   express the full target depth with the configured minimum slice, Stitch leaves
@@ -86,6 +90,9 @@ sell_max_orders = 40
   input as replaceable, so funded checks reserve only the additional input
   needed by the new quote. If a fill spends a slot nonce, Stitch rotates only
   that slot on the next retry.
+- The default `stitch approve` mode pairs naturally with `"max"` because it
+  grants Permit2 a max allowance once. `stitch approve --exact` is only for
+  fixed numeric liquidity amounts.
 
 All amounts are atomic token units. For a 6-decimal token:
 

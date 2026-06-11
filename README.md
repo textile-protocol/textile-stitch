@@ -112,8 +112,8 @@ Maximum is the standard market-maker choice: approve once and never re-approve.
 You're approving the canonical Permit2 contract, and the reactor can only pull
 against orders you actually signed.
 
-If you'd rather cap the allowance, use `--exact` to approve only the liquidity in
-your config:
+If you'd rather cap the allowance and your config uses fixed numeric liquidity,
+use `--exact` to approve only that configured amount:
 
 ```bash
 stitch approve --config ~/Stitch/stitch.toml --exact
@@ -221,13 +221,15 @@ skip_past_window = true
 ```
 
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
-`50000000000`). The total liquidity fields are targets; if `*_max_orders` is
-too low to express the full target with the configured minimum slice, Stitch
-leaves the remainder unquoted instead of posting an oversized live book.
-Configured liquidity is also a ceiling: on each quote tick, Stitch caps the
-posted bid or ask size to the operator wallet's current token balance and
-Permit2 allowance for that side, so normal fills or inventory transfers reduce
-the next ladder instead of causing the indexer to reject an unfunded batch.
+`50000000000`). Use `"max"` for `*_total_liquidity_*` when Stitch should quote
+all currently funded wallet inventory for that side. The total liquidity fields
+are targets; if `*_max_orders` is too low to express the full target with the
+configured minimum slice, Stitch leaves the remainder unquoted instead of
+posting an oversized live book. Configured liquidity is also a ceiling: on each
+quote tick, Stitch caps the posted bid or ask size to the operator wallet's
+current token balance and Permit2 allowance for that side, so normal fills or
+inventory transfers reduce the next ladder instead of causing the indexer to
+reject an unfunded batch.
 Requotes reuse the same replacement slots, so Stitch can refresh funded depth
 without double-counting the ladder it is replacing. For
 the price-feed orientation, spread options, ladder sizing, and

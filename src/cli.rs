@@ -11,7 +11,7 @@ pub enum Command {
     /// Run the bot against a config file.
     Run { config: String, dry_run: bool },
     /// Approve the config's input tokens to Permit2 and exit. `exact` approves
-    /// only the committed liquidity instead of an unlimited allowance.
+    /// only fixed configured liquidity instead of an unlimited allowance.
     Approve {
         config: String,
         dry_run: bool,

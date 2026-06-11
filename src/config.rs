@@ -3,6 +3,8 @@
 //! Operator config (a TOML file). The wallet key comes from the environment
 //! (`STITCH_PRIVATE_KEY_FILE` or `STITCH_PRIVATE_KEY`), never the config file.
 
+use alloy_primitives::U256;
+use anyhow::Context;
 use serde::Deserialize;
 
 use crate::quote::Spread;
@@ -11,6 +13,7 @@ use crate::quote::Spread;
 /// one market-maker wallet does not dominate or churn the live order book.
 pub const MAX_SUPPORTED_LADDER_ORDERS: u32 = 40;
 pub const DEFAULT_MAX_LADDER_ORDERS: u32 = MAX_SUPPORTED_LADDER_ORDERS;
+pub const MAX_LIQUIDITY_SENTINEL: &str = "max";
 
 /// Default seconds before a live order's deadline at which the bot reposts its
 /// side, so the replacement overlaps the old order instead of leaving a gap.
@@ -46,6 +49,25 @@ pub struct FeedConfig {
     pub url: String,
     /// Stop quoting if the feed hasn't updated within this many seconds.
     pub staleness_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidityAmount {
+    Exact(U256),
+    Max,
+}
+
+pub fn parse_liquidity_amount(value: &str, field: &str) -> anyhow::Result<LiquidityAmount> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case(MAX_LIQUIDITY_SENTINEL) {
+        return Ok(LiquidityAmount::Max);
+    }
+    trimmed
+        .parse::<U256>()
+        .map(LiquidityAmount::Exact)
+        .with_context(|| {
+            format!("invalid {field}; use an atomic integer or \"{MAX_LIQUIDITY_SENTINEL}\"")
+        })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -287,6 +309,22 @@ mod tests {
         assert!(pool.buy_enabled() && pool.sell_enabled());
         assert!(pool.buy_ladder_enabled() && pool.sell_ladder_enabled());
         assert!(!pool.closer_enabled());
+    }
+
+    #[test]
+    fn max_liquidity_sentinel_parses_case_insensitively() {
+        assert_eq!(
+            parse_liquidity_amount("max", "buy_total_liquidity_debt").unwrap(),
+            LiquidityAmount::Max
+        );
+        assert_eq!(
+            parse_liquidity_amount(" MAX ", "sell_total_liquidity_collateral").unwrap(),
+            LiquidityAmount::Max
+        );
+        assert_eq!(
+            parse_liquidity_amount("50000000000", "buy_total_liquidity_debt").unwrap(),
+            LiquidityAmount::Exact(U256::from(50_000_000_000u64))
+        );
     }
 
     #[test]
