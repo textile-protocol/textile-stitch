@@ -1,0 +1,524 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Self-hosted Textile Stitch operator bot on isolated AWS ECS Fargate infrastructure.
+
+Parameters:
+  BotName:
+    Type: String
+    Default: stitch-operator
+    Description: Lowercase name for this bot stack. Use one stack per operator wallet.
+    AllowedPattern: '^[a-z][a-z0-9-]{2,38}$'
+    ConstraintDescription: Use 3-39 lowercase letters, numbers, and hyphens, starting with a letter.
+  ContainerImage:
+    Type: String
+    Default: ghcr.io/textile-protocol/textile-stitch:latest
+    Description: Stitch container image to run. Pin a sha-* tag for production once selected.
+  DesiredCount:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 1]
+    Description: Keep 0 until secrets are set and approvals are complete. Set to 1 to run live.
+  TaskSize:
+    Type: String
+    Default: '256/512'
+    AllowedValues:
+      - '256/512'
+      - '256/1024'
+      - '512/1024'
+      - '512/2048'
+      - '1024/2048'
+      - '1024/4096'
+    Description: >-
+      Fargate task size as CPU units / memory MiB. Only ECS-valid pairs are
+      listed; 256 CPU allows 512-2048 MiB, 512 CPU needs >=1024 MiB, 1024 CPU
+      needs >=2048 MiB.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+    Description: CloudWatch log retention.
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for SNS alarms. Leave blank to skip email subscription.
+  VpcCidr:
+    Type: String
+    Default: 10.81.0.0/16
+    Description: CIDR for the dedicated Stitch VPC.
+  PublicSubnetACidr:
+    Type: String
+    Default: 10.81.0.0/24
+    Description: CIDR for public subnet A.
+  PublicSubnetBCidr:
+    Type: String
+    Default: 10.81.1.0/24
+    Description: CIDR for public subnet B (NAT gateway only, no workloads).
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.81.10.0/24
+    Description: CIDR for private subnet A. The bot task runs here, with no public IP.
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.81.11.0/24
+    Description: CIDR for private subnet B. The bot task runs here, with no public IP.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub KMS key for ${BotName} Stitch secrets
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountIamPolicies
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  KmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${BotName}-stitch
+      TargetKeyId: !Ref KmsKey
+
+  OperatorSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${BotName}/operator
+      Description: !Sub Private key and TOML config for ${BotName}. Update before starting the ECS service.
+      KmsKeyId: !Ref KmsKey
+      SecretString: '{"STITCH_PRIVATE_KEY":"replace-me-before-start","STITCH_CONFIG_TOML":"replace-me-before-start"}'
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-igw
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-public-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-public-b
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-nat
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-private-b
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-private-rt
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Outbound-only security group for ${BotName}
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound HTTPS/RPC/feed/API access
+      Tags:
+        - Key: Name
+          Value: !Sub ${BotName}-task-sg
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${BotName}-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${BotName}/stitch
+      RetentionInDays: !Ref LogRetentionDays
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-stitch-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref OperatorSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt KmsKey.Arn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${BotName}-stitch
+      Cpu: !Select [0, !Split ['/', !Ref TaskSize]]
+      Memory: !Select [1, !Split ['/', !Ref TaskSize]]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: stitch
+          Image: !Ref ContainerImage
+          Essential: true
+          Command:
+            - stitch
+            - --config
+            - /home/stitch/run/stitch.toml
+          User: stitch
+          Environment:
+            - Name: RUST_LOG
+              Value: info
+          Secrets:
+            - Name: STITCH_PRIVATE_KEY
+              ValueFrom: !Sub '${OperatorSecret}:STITCH_PRIVATE_KEY::'
+            - Name: STITCH_CONFIG_TOML
+              ValueFrom: !Sub '${OperatorSecret}:STITCH_CONFIG_TOML::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: stitch
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - test -s /home/stitch/run/stitch.toml && test -s /home/stitch/run/stitch.key && kill -0 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${BotName}-stitch
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: false
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${BotName}-alarms
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlarmTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${BotName}-stitch-*
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  StoppedTaskRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Alert when the Stitch ECS task stops.
+      EventPattern:
+        source:
+          - aws.ecs
+        detail-type:
+          - ECS Task State Change
+        detail:
+          clusterArn:
+            - !GetAtt Cluster.Arn
+          lastStatus:
+            - STOPPED
+      State: ENABLED
+      Targets:
+        - Arn: !Ref AlarmTopic
+          Id: sns
+
+  LogErrorMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogGroup
+      FilterPattern: ERROR
+      MetricTransformations:
+        - MetricNamespace: !Sub Stitch/${BotName}
+          MetricName: ErrorLogLines
+          MetricValue: '1'
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${BotName}-stitch-error-logs
+      AlarmDescription: Stitch logged ERROR lines.
+      Namespace: !Sub Stitch/${BotName}
+      MetricName: ErrorLogLines
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  NoRunningTasksAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${BotName}-stitch-no-running-tasks
+      AlarmDescription: ECS wants a Stitch task running but no task is running.
+      Metrics:
+        - Id: running
+          MetricStat:
+            Metric:
+              Namespace: ECS/ContainerInsights
+              MetricName: RunningTaskCount
+              Dimensions:
+                - Name: ClusterName
+                  Value: !Ref Cluster
+                - Name: ServiceName
+                  Value: !GetAtt Service.Name
+            Period: 60
+            Stat: Average
+          ReturnData: false
+        - Id: desired
+          MetricStat:
+            Metric:
+              Namespace: ECS/ContainerInsights
+              MetricName: DesiredTaskCount
+              Dimensions:
+                - Name: ClusterName
+                  Value: !Ref Cluster
+                - Name: ServiceName
+                  Value: !GetAtt Service.Name
+            Period: 60
+            Stat: Average
+          ReturnData: false
+        - Id: missing
+          Expression: IF(desired > running, desired - running, 0)
+          Label: Desired tasks not running
+          ReturnData: true
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+  ClusterName:
+    Description: ECS cluster name.
+    Value: !Ref Cluster
+  ServiceName:
+    Description: ECS service name.
+    Value: !GetAtt Service.Name
+  SecretArn:
+    Description: Secret to update with STITCH_PRIVATE_KEY and STITCH_CONFIG_TOML before starting.
+    Value: !Ref OperatorSecret
+  LogGroupName:
+    Description: CloudWatch log group for Stitch.
+    Value: !Ref LogGroup
+  AlarmTopicArn:
+    Description: SNS topic for alarms.
+    Value: !Ref AlarmTopic
+  StartCommand:
+    Description: Start the bot after secrets and approvals are ready.
+    Value: !Sub aws ecs update-service --cluster ${Cluster} --service ${Service.Name} --desired-count 1 --region ${AWS::Region}
+  StopCommand:
+    Description: Pause the bot without deleting infrastructure.
+    Value: !Sub aws ecs update-service --cluster ${Cluster} --service ${Service.Name} --desired-count 0 --region ${AWS::Region}

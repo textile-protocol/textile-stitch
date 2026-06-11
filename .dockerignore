@@ -1,0 +1,8 @@
+target
+.git
+.github
+*.local.toml
+stitch.key
+stitch.env
+deploy/aws/.terraform
+deploy/aws/terraform.tfstate*

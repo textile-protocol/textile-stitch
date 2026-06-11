@@ -1,0 +1,61 @@
+name: Publish CloudFormation Template
+
+# Publishes deploy/aws/cloudformation.yaml to a public S3 URL so the README's
+# "Launch Stack" button (CloudFormation Quick Create) has a template to load.
+# Quick Create only accepts an S3-hosted templateURL, not a raw GitHub URL.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/aws/cloudformation.yaml'
+      - '.github/workflows/publish-template.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-template
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # The bucket and key the README button points at. The bucket must exist, have
+  # a policy granting public s3:GetObject on the aws/* prefix, and the role
+  # below must be allowed to PutObject into it. See deploy/aws/README.md.
+  TEMPLATE_BUCKET: textile-stitch-deploy
+  TEMPLATE_KEY: aws/cloudformation.yaml
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TEMPLATE_PUBLISH_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://deploy/aws/cloudformation.yaml
+
+      - name: Publish template to S3
+        run: |
+          # Immutable per-commit copy operators can pin, plus the stable key the
+          # README's one-click button loads.
+          aws s3 cp deploy/aws/cloudformation.yaml \
+            "s3://${TEMPLATE_BUCKET}/aws/cloudformation-${GITHUB_SHA}.yaml" \
+            --content-type text/yaml
+          aws s3 cp deploy/aws/cloudformation.yaml \
+            "s3://${TEMPLATE_BUCKET}/${TEMPLATE_KEY}" \
+            --content-type text/yaml
