@@ -225,4 +225,5 @@ fetch the canonical one:
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/AI_INSTALL_PROMPT.md
 ```
 
-Once it's installed and dry-run-clean, come back here to operate it.
+Once it's installed and dry-run-clean, tell the operator to run `/stitch` again
+to operate it later.

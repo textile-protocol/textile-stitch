@@ -34,14 +34,14 @@ debt_decimals = 6
 
 # Buy low: bid below the mid, paying USDC for cNGN.
 buy_offset_bps = 150                # 1.5% below the mid   (or: buy_offset_abs = 2.0)
-buy_total_liquidity_debt = "50000000000"  # 50,000 USDC total depth (6dp)
+buy_total_liquidity_debt = "max"          # quote all currently funded USDC
 buy_min_slice_debt = "10000000"           # 10 USDC smallest slice (6dp)
 buy_max_orders = 40
 
 # Sell high: ask above the mid, selling cNGN for USDC. Needs cNGN inventory +
 # a Permit2 approval on cNGN.
 sell_offset_abs = 2.0                       # 2 soft/stable above the mid (or: sell_offset_bps = 150)
-sell_total_liquidity_collateral = "50000000000" # total cNGN inventory to quote
+sell_total_liquidity_collateral = "max"        # quote all currently funded cNGN
 sell_min_slice_debt = "10000000"                # 10 USDC-equivalent smallest slice
 sell_max_orders = 40
 

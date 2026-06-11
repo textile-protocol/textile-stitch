@@ -316,11 +316,11 @@ debt = "${p.stable}"
 debt_decimals = ${p.dd}
 feed_url = "${FEED_BASE}?pair=${p.key}"
 buy_offset_bps = ${BUY_OFFSET_BPS}
-buy_total_liquidity_debt = "${p.bidSizeAtomic}"
+buy_total_liquidity_debt = "max"
 buy_min_slice_debt = "${p.minBidSizeAtomic}"
 buy_max_orders = ${MAX_LADDER_ORDERS}
 sell_offset_bps = ${SELL_OFFSET_BPS}
-sell_total_liquidity_collateral = "${p.askSizeAtomic}"
+sell_total_liquidity_collateral = "max"
 sell_min_slice_debt = "${p.minAskDebtAtomic}"
 sell_max_orders = ${MAX_LADDER_ORDERS}
 # The bot signs deadlines off its wall clock, but the local Hardhat chain's

@@ -43,7 +43,7 @@ changes, upgrades. Ask your agent to install it:
 
 - **Claude Code** — paste:
 
-  > `curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/.claude/skills/stitch/SKILL.md --create-dirs -o ~/.claude/skills/stitch/SKILL.md` — run that as-is (don't WebFetch the URL).
+  > `curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/.claude/skills/stitch/SKILL.md --create-dirs -o ~/.claude/skills/stitch/SKILL.md` — run that as-is (don't WebFetch the URL). After it succeeds, tell me to run `/stitch`.
 
   Then run `/stitch`.
 
@@ -51,9 +51,10 @@ changes, upgrades. Ask your agent to install it:
 
   > Install the stitch skill from
   > https://github.com/textile-protocol/textile-stitch/tree/main/.codex/skills/stitch
+  > After it succeeds, tell me to restart Codex and ask: `Use the stitch skill to install and run Stitch.`
 
   Codex's skill-installer drops it under `~/.codex/skills`. Restart Codex, then
-  ask it to run or install Stitch and it picks up the skill.
+  ask: `Use the stitch skill to install and run Stitch.`
 
 With the repo checked out, Claude Code finds the skill automatically.
 
@@ -241,12 +242,12 @@ debt = "0xusdc0000000000000000000000000000000000d7"
 debt_decimals = 6
 
 buy_offset_bps = 10
-buy_total_liquidity_debt = "50000000000"
+buy_total_liquidity_debt = "max"
 buy_min_slice_debt = "10000000"
 buy_max_orders = 40
 
 sell_offset_bps = 10
-sell_total_liquidity_collateral = "50000000000"
+sell_total_liquidity_collateral = "max"
 sell_min_slice_debt = "10000000"
 sell_max_orders = 40
 
@@ -264,9 +265,10 @@ skip_past_window = true
 ```
 
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
-`50000000000`). Use `"max"` for `*_total_liquidity_*` when Stitch should quote
-all currently funded wallet inventory for that side. The total liquidity fields
-are targets; if `*_max_orders` is too low to express the full target with the
+`50000000000`). The default `*_total_liquidity_*` value is `"max"`, which quotes
+all currently funded wallet inventory for that side. Use a fixed numeric amount
+instead when you want a hard cap below the wallet balance. The total liquidity
+fields are targets; if `*_max_orders` is too low to express the full target with the
 configured minimum slice, Stitch leaves the remainder unquoted instead of
 posting an oversized live book. Configured liquidity is also a ceiling: on each
 quote tick, Stitch caps the posted bid or ask size to the operator wallet's

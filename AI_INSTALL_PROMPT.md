@@ -127,15 +127,12 @@ Run after detecting OS/architecture and before writing config.
 5. Sell spread — how far above the mid should the ask sit?
    - Same options and mapping as the buy side (sell_offset_bps / sell_offset_abs).
 
-6. Liquidity — don't ask me for amounts; read them from my wallet. Get my
-   operator wallet address (ask me for the public 0x... address — never the
-   private key), then read each side's input-token balance via the RPC:
-   debt-token balanceOf for the buy side, collateral-token balanceOf for the
-   sell side. Tell me what you found (human-readable) and ask me to confirm
-   quoting my full balance per side, or to enter a smaller amount. Map the
-   confirmed values to buy_total_liquidity_debt and
-   sell_total_liquidity_collateral (balanceOf is already atomic — no decimal
-   conversion). If a side's balance is 0, tell me to fund it and skip that side.
+6. Liquidity — don't ask me for amounts; default both market-making sides to
+   `"max"` so Stitch quotes the currently funded wallet inventory on each tick.
+   Set buy_total_liquidity_debt = "max" and
+   sell_total_liquidity_collateral = "max". After the config is written, use
+   the dry run and approval preflight to surface missing balances or approvals
+   for each enabled side.
 
 Never ask about these — map the answers above to the primary parameters and
 leave every advanced parameter at its default. If you can't tell whether a field
@@ -174,8 +171,8 @@ Use these defaults unless I provide different values:
 - Token decimals: 6, unless I provide different decimals
 - Buy spread: 0.1% (10 bps)
 - Sell spread: 0.1% (10 bps)
-- Buy total liquidity: from my wallet's debt-token balance (don't ask)
-- Sell total liquidity: from my wallet's collateral-token balance (don't ask)
+- Buy total liquidity: "max" (quote the currently funded debt-token balance)
+- Sell total liquidity: "max" (quote the currently funded collateral-token balance)
 - Minimum order slice (advanced, never ask): 10 units of the debt/stable token
 - Maximum ladder orders per side (advanced, never ask): 40
 - Order TTL: 30 seconds
@@ -377,10 +374,10 @@ Configuration procedure:
 
 2. Create stitch.toml at the platform config path using gathered values.
 
-3. Token amounts are atomic (uint256 strings).
-   - buy_total_liquidity_debt / sell_total_liquidity_collateral = the wallet
-     balances I confirmed in the interview (balanceOf is already atomic — no
-     conversion).
+3. Token amounts are atomic (uint256 strings), except the market-making total
+   liquidity fields default to the `"max"` sentinel.
+   - buy_total_liquidity_debt / sell_total_liquidity_collateral = "max" unless
+     I explicitly ask for fixed numeric caps.
    - buy_min_slice_debt / sell_min_slice_debt = the default (advanced), e.g.
      "10000000" for a 10-unit minimum on a 6-decimal token.
 
@@ -556,8 +553,8 @@ Show me a short summary:
 - Collateral and debt token addresses, decimals, and human-readable symbols if
   known.
 - Buy and sell spread (the percentage or absolute I picked).
-- Buy-side and sell-side liquidity, read from my wallet balances (human +
-  atomic).
+- Buy-side and sell-side liquidity: "max", plus any dry-run balance or approval
+  warnings for those sides.
 - Settlement closing: on by default, with the closer pool and the subgraph proxy.
 - Permit2 approvals: which input tokens are approved, and whether I chose
   maximum or exact.
@@ -575,6 +572,10 @@ persistent operation. Make it multiple choice, recommended first:
    - Install and start the background service I picked (launchd / systemd / Task
      Scheduler / Windows service).
 Do not start until I pick a start option after a successful dry run.
+After the install flow, tell me how to operate Stitch later:
+- Claude Code skill: run `/stitch`.
+- Codex skill: ask `Use the stitch skill to run Stitch`.
+- No skill: run `stitch --config <config-path>` after loading the env file.
 
 Service setup after confirmation only:
 - macOS: If I choose launchd, create a LaunchAgent plist that runs
