@@ -43,8 +43,7 @@ changes, upgrades. Ask your agent to install it:
 
 - **Claude Code** — paste:
 
-  > Install this skill into `~/.claude/skills/stitch/SKILL.md`:
-  > https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/.claude/skills/stitch/SKILL.md
+  > `curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/.claude/skills/stitch/SKILL.md --create-dirs -o ~/.claude/skills/stitch/SKILL.md` — run that as-is (don't WebFetch the URL).
 
   Then run `/stitch`.
 
