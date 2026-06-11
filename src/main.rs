@@ -112,6 +112,13 @@ struct SlotNonceState {
     slot_inputs: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FundedInputBudget {
+    funded: U256,
+    committed: U256,
+    reserved: U256,
+}
+
 impl Poster<'_> {
     /// Build, sign, and POST a side's order batch. Returns the number of orders
     /// posted (or that would be posted in dry-run). The indexer writes the batch
@@ -380,18 +387,58 @@ mod tests {
     }
 
     #[test]
+    fn input_budget_subtracts_other_corridor_commitments_before_max() {
+        let budget = FundedInputBudget {
+            funded: U256::from(4_000u64),
+            committed: U256::from(8_000u64),
+            reserved: U256::ZERO,
+        };
+
+        assert_eq!(
+            available_funded_input(&budget, U256::from(4_000u64)),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn input_budget_reuses_current_corridor_commitment_for_replacement() {
+        let budget = FundedInputBudget {
+            funded: U256::from(4_000u64),
+            committed: U256::from(4_000u64),
+            reserved: U256::ZERO,
+        };
+
+        assert_eq!(
+            available_funded_input(&budget, U256::from(4_000u64)),
+            U256::from(4_000u64)
+        );
+    }
+
+    #[test]
     fn reserving_funded_input_decrements_a_shared_token_budget() {
         let token: Address = "0x00000000000000000000000000000000000000bb"
             .parse()
             .unwrap();
-        let mut funded_inputs = HashMap::new();
-        funded_inputs.insert(token, U256::from(75u64));
+        let mut funded_inputs = HashMap::from([(
+            token,
+            FundedInputBudget {
+                funded: U256::from(75u64),
+                committed: U256::ZERO,
+                reserved: U256::ZERO,
+            },
+        )]);
 
         reserve_funded_input(&mut funded_inputs, token, U256::from(50u64));
-        assert_eq!(funded_inputs[&token], U256::from(25u64));
+        assert_eq!(
+            available_funded_input(&funded_inputs[&token], U256::ZERO),
+            U256::from(25u64)
+        );
 
         reserve_funded_input(&mut funded_inputs, token, U256::from(50u64));
-        assert_eq!(funded_inputs[&token], U256::ZERO);
+        assert_eq!(
+            available_funded_input(&funded_inputs[&token], U256::ZERO),
+            U256::ZERO
+        );
     }
 
     #[test]
@@ -612,7 +659,7 @@ async fn funded_input_cap(
     configured: InputLiquidity,
     reusable_input: U256,
     dry_run: bool,
-    funded_inputs: &mut HashMap<Address, U256>,
+    funded_inputs: &mut HashMap<Address, FundedInputBudget>,
     pair: &str,
     label: &str,
 ) -> Option<u128> {
@@ -640,11 +687,25 @@ async fn funded_input_cap(
                 {
                     Ok(committed) => match committed.parse::<U256>() {
                         Ok(committed) => {
-                            funded_inputs.insert(token, funded.saturating_sub(committed));
+                            funded_inputs.insert(
+                                token,
+                                FundedInputBudget {
+                                    funded,
+                                    committed,
+                                    reserved: U256::ZERO,
+                                },
+                            );
                         }
                         Err(e) if dry_run => {
                             warn!(pair = %pair, label, committed = %committed, error = %e, "could not parse committed input; using configured size for dry-run");
-                            funded_inputs.insert(token, fallback_liquidity(configured));
+                            funded_inputs.insert(
+                                token,
+                                FundedInputBudget {
+                                    funded: fallback_liquidity(configured),
+                                    committed: U256::ZERO,
+                                    reserved: U256::ZERO,
+                                },
+                            );
                         }
                         Err(e) => {
                             warn!(pair = %pair, label, committed = %committed, error = %e, "could not parse committed input; skipping side");
@@ -653,7 +714,14 @@ async fn funded_input_cap(
                     },
                     Err(e) if dry_run => {
                         warn!(pair = %pair, label, error = %e, "could not read committed input; using configured size for dry-run");
-                        funded_inputs.insert(token, fallback_liquidity(configured));
+                        funded_inputs.insert(
+                            token,
+                            FundedInputBudget {
+                                funded: fallback_liquidity(configured),
+                                committed: U256::ZERO,
+                                reserved: U256::ZERO,
+                            },
+                        );
                     }
                     Err(e) => {
                         warn!(pair = %pair, label, error = %e, "could not read committed input; skipping side");
@@ -663,7 +731,14 @@ async fn funded_input_cap(
             }
             (Err(e), _) | (_, Err(e)) if dry_run => {
                 warn!(pair = %pair, label, error = %e, "could not read funded input; using configured size for dry-run");
-                funded_inputs.insert(token, fallback_liquidity(configured));
+                funded_inputs.insert(
+                    token,
+                    FundedInputBudget {
+                        funded: fallback_liquidity(configured),
+                        committed: U256::ZERO,
+                        reserved: U256::ZERO,
+                    },
+                );
             }
             (Err(e), _) | (_, Err(e)) => {
                 warn!(pair = %pair, label, error = %e, "could not read funded input; skipping side");
@@ -672,8 +747,15 @@ async fn funded_input_cap(
         }
     }
 
-    let remaining = *funded_inputs.get(&token).unwrap_or(&U256::ZERO);
-    let available = remaining.saturating_add(reusable_input);
+    let budget = funded_inputs
+        .get(&token)
+        .copied()
+        .unwrap_or(FundedInputBudget {
+            funded: U256::ZERO,
+            committed: U256::ZERO,
+            reserved: U256::ZERO,
+        });
+    let available = available_funded_input(&budget, reusable_input);
     let capped = match cap_input_liquidity(configured, available) {
         Ok(capped) => capped,
         Err(e) => {
@@ -688,7 +770,9 @@ async fn funded_input_cap(
                 label,
                 configured,
                 capped,
-                remaining = %remaining,
+                funded = %budget.funded,
+                committed = %budget.committed,
+                reserved = %budget.reserved,
                 reusable = %reusable_input,
                 "capping order liquidity to remaining funded input"
             );
@@ -697,12 +781,28 @@ async fn funded_input_cap(
     Some(capped)
 }
 
-fn reserve_funded_input(funded_inputs: &mut HashMap<Address, U256>, token: Address, amount: U256) {
+fn available_funded_input(budget: &FundedInputBudget, reusable_input: U256) -> U256 {
+    budget
+        .funded
+        .saturating_add(reusable_input)
+        .saturating_sub(budget.committed)
+        .saturating_sub(budget.reserved)
+}
+
+fn reserve_funded_input(
+    funded_inputs: &mut HashMap<Address, FundedInputBudget>,
+    token: Address,
+    amount: U256,
+) {
     if amount == U256::ZERO {
         return;
     }
-    let remaining = funded_inputs.entry(token).or_insert(U256::ZERO);
-    *remaining = remaining.saturating_sub(amount);
+    let budget = funded_inputs.entry(token).or_insert(FundedInputBudget {
+        funded: U256::ZERO,
+        committed: U256::ZERO,
+        reserved: U256::ZERO,
+    });
+    budget.reserved = budget.reserved.saturating_add(amount);
 }
 
 fn drafted_input(drafts: &[OrderDraft]) -> U256 {
@@ -1049,7 +1149,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             _ = interval.tick() => {}
         }
         let now = unix_now();
-        let mut funded_inputs: HashMap<Address, U256> = HashMap::new();
+        let mut funded_inputs: HashMap<Address, FundedInputBudget> = HashMap::new();
 
         for pool in &cfg.pools {
             // Each pool prices off its own feed (or the bot-level default).
