@@ -1,5 +1,5 @@
 ---
-name: run-stitch
+name: stitch
 description: Operate Stitch, the Textile operator bot — start, stop, restart, check status, tail logs, upgrade, change pool parameters (spreads, liquidity), and manage Permit2 approvals. Falls back to install if Stitch isn't set up yet. Use when asked to "start/stop/restart stitch", "run the bot", "check the bot", "stitch logs", "upgrade stitch", "change the spread/liquidity", or "install stitch".
 metadata:
   short-description: Operate the Stitch operator bot
@@ -8,8 +8,49 @@ metadata:
 # Operate Stitch
 
 Stitch is the Textile operator bot (binary `stitch`): per-pool market making plus
-settlement closing. This skill is for running and tending a Stitch that's already
-installed. If it isn't installed yet, jump to [Not installed yet](#not-installed-yet).
+settlement closing. This skill both runs an existing Stitch and installs one that
+isn't set up yet.
+
+## Always start here
+
+1. **Find the run layout and whether it's installed** — the next section.
+2. **If it's not installed**, don't show the menu. Tell the operator, then with a
+   single question confirm they want to install now. On yes, install by reading
+   `AI_INSTALL_PROMPT.md` and following it in full — see
+   [Not installed yet](#not-installed-yet).
+3. **If it's installed**, ask the operator what they want to do, **one question at
+   a time**. Never guess the action from a vague request — ask. Wait for each
+   answer before the next question or any command.
+
+Question-tool rules (same as the install prompt): use `request_user_input` in Plan
+mode — one question per call, multiple choice, most-likely option first; it adds a
+free-form answer so the operator can type something else. If it isn't available
+(Default mode), ask the same thing in chat, still one at a time.
+
+**The menu** — keep every question to **at most three options**, most-likely
+first (`request_user_input` caps at 2–3, and the install prompt warns more can
+fail to render or fall back to chat). The tool always adds a free-form answer, so
+the operator can type anything else.
+
+First question — "What do you want to do with Stitch?":
+
+- **Start / resume live** → [Start](#start) (cloud: [AWS cloud](#aws-cloud-ecs-fargate))
+- **Stop / pause** → [Stop](#stop)
+- **Inspect or change it** — status/logs, parameters, approvals, or upgrade
+
+If they pick **Inspect or change it**, ask a second question:
+
+- **Status and logs** → [Status and logs](#status-and-logs)
+- **Change parameters** → [Change parameters](#change-parameters)
+- **Approvals or upgrade**
+
+If they pick **Approvals or upgrade**, ask a third:
+
+- **Run Permit2 approvals** → [Permit2 approvals](#permit2-approvals)
+- **Upgrade** → [Upgrade](#upgrade)
+
+Then carry out the chosen action from the matching section, against the layout you
+detected, honoring the golden rules throughout.
 
 ## First: find the install and how it runs
 
