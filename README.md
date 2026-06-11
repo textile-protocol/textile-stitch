@@ -50,6 +50,27 @@ STITCH_PRIVATE_KEY, run a dry run first, and do not start live operation until I
 confirm.
 ```
 
+On Claude Code or Codex? Install the `run-stitch` skill once and skip the prompt
+above next time. It guides install when Stitch isn't set up, and otherwise helps
+you run it — start, stop, logs, upgrades, parameter changes. No checkout needed,
+each is a single file in your user config:
+
+```bash
+# Claude Code
+mkdir -p ~/.claude/skills/run-stitch
+curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/.claude/skills/run-stitch/SKILL.md \
+  -o ~/.claude/skills/run-stitch/SKILL.md
+
+# Codex (skills live under ~/.codex/skills; restart Codex after installing)
+mkdir -p ~/.codex/skills/run-stitch
+curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/.codex/skills/run-stitch/SKILL.md \
+  -o ~/.codex/skills/run-stitch/SKILL.md
+```
+
+In Claude Code, run `/run-stitch`. In Codex, restart it, then just ask to run or
+install Stitch and it picks up the skill. (With the repo checked out, Claude Code
+finds the skill automatically.)
+
 For the full copyable prompt, open [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
 For configuration reference, tuning, and troubleshooting, see
 [ADVANCED.md](ADVANCED.md).
