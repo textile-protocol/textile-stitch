@@ -9,9 +9,10 @@
 //
 //   node packages/stitch-bot/scripts/run-local.mjs
 //
-// Env: STITCH_PRIVATE_KEY, FEED_URL (base), INDEXER_URL, BLOCKCHAIN_RPC_URL,
-// OFFSET_BPS / SELL_OFFSET_BPS (spreads), TOTAL_ORDER_SIZE_USD (per-side
-// notional), MIN_ORDER_SIZE_USD (smallest ladder slice).
+// Env: STITCH_PRIVATE_KEY, FEED_URL (base), INDEXER_URL, BLOCKCHAIN_RPC_URL.
+// Production-like defaults are intentional: short TTL, real refresh threshold,
+// one book of inventory, and max liquidity. Override STITCH_LOCAL_* only when
+// you deliberately want local convenience over production parity.
 import { spawn } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -27,8 +28,10 @@ const PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3'
 const KEY =
   process.env.STITCH_PRIVATE_KEY ||
   '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'
-const BUY_OFFSET_BPS = Number(process.env.OFFSET_BPS || 50)
-const SELL_OFFSET_BPS = Number(process.env.SELL_OFFSET_BPS || 50)
+const BUY_OFFSET_BPS = Number(process.env.OFFSET_BPS || 3)
+const SELL_OFFSET_BPS = Number(
+  process.env.SELL_OFFSET_BPS || process.env.OFFSET_BPS || 3
+)
 const TOTAL_ORDER_SIZE_USD = Number(
   process.env.TOTAL_ORDER_SIZE_USD || process.env.ORDER_SIZE_USD || 2000
 ) // each side quotes roughly this many USD
@@ -38,14 +41,23 @@ const positiveIntEnv = (name, fallback) => {
   const value = Number.parseInt(process.env[name] || '', 10)
   return Number.isFinite(value) && value > 0 ? value : fallback
 }
+const nonNegativeIntEnv = (name, fallback) => {
+  const value = Number.parseInt(process.env[name] || '', 10)
+  return Number.isFinite(value) && value >= 0 ? value : fallback
+}
 const FEED_WAIT_SECONDS = positiveIntEnv('FEED_WAIT_SECONDS', 600)
 const FEED_PROBE_TIMEOUT_MS = positiveIntEnv('FEED_PROBE_TIMEOUT_MS', 8000)
-// The local feed is a static seeded rate (the oracle is flat — see
-// refresh_threshold_bps below) and nothing refreshes its observedAt while the
-// stack runs, so a tight staleness window makes the bot skip every pool ~1
-// minute after the last seed. Default to a day so a local stack quotes all day;
-// override with FEED_STALENESS_SECS to exercise real staleness handling.
-const FEED_STALENESS_SECS = positiveIntEnv('FEED_STALENESS_SECS', 86400)
+const FEED_STALENESS_SECS = positiveIntEnv('FEED_STALENESS_SECS', 900)
+const ORACLE_REFRESH_SECONDS = positiveIntEnv('ORACLE_REFRESH_SECONDS', 300)
+const STITCH_LOCAL_TTL_SECS = positiveIntEnv('STITCH_LOCAL_TTL_SECS', 120)
+const STITCH_LOCAL_REFRESH_THRESHOLD_BPS = nonNegativeIntEnv(
+  'STITCH_LOCAL_REFRESH_THRESHOLD_BPS',
+  nonNegativeIntEnv('REFRESH_THRESHOLD_BPS', 10)
+)
+const STITCH_LOCAL_FUNDING_HEADROOM = positiveIntEnv(
+  'STITCH_LOCAL_FUNDING_HEADROOM',
+  1
+)
 
 const addrs = JSON.parse(
   readFileSync(`${CRATE}../constants/src/addresses.localhost.json`)
@@ -87,6 +99,7 @@ const erc20 = parseAbi([
   'function balanceOf(address) view returns (uint256)',
   'function allowance(address,address) view returns (uint256)',
   'function mint(address,uint256)',
+  'function burn(address,uint256)',
   'function approve(address,uint256) returns (bool)',
 ])
 const oracleAbi = parseAbi(['function buyRate() view returns (uint256)'])
@@ -260,7 +273,7 @@ const account = privateKeyToAccount(KEY)
 const wallet = createWalletClient({ account, chain, transport: http(RPC) })
 const MAX = (1n << 256n) - 1n
 for (const [token, amt] of Object.entries(need)) {
-  const want = amt * 100n // headroom for many re-quotes
+  const want = amt * BigInt(STITCH_LOCAL_FUNDING_HEADROOM)
   const [bal, allow] = await Promise.all([
     pub.readContract({
       address: token,
@@ -283,6 +296,23 @@ for (const [token, amt] of Object.entries(need)) {
       args: [account.address, want],
     })
     await pub.waitForTransactionReceipt({ hash })
+  } else if (bal > want && STITCH_LOCAL_FUNDING_HEADROOM === 1) {
+    try {
+      const hash = await wallet.writeContract({
+        address: token,
+        abi: erc20,
+        functionName: 'burn',
+        args: [account.address, bal - want],
+      })
+      await pub.waitForTransactionReceipt({ hash })
+    } catch {
+      console.warn(
+        `  ${token} balance is above the production-like target and could ` +
+          `not be burned down; "max" will quote the full local balance. Run ` +
+          `yarn dev:reset or use a fresh STITCH_PRIVATE_KEY to test one-book ` +
+          `funding exactly.`
+      )
+    }
   }
   if (allow < want) {
     const hash = await wallet.writeContract({
@@ -323,18 +353,8 @@ sell_offset_bps = ${SELL_OFFSET_BPS}
 sell_total_liquidity_collateral = "max"
 sell_min_slice_debt = "${p.minAskDebtAtomic}"
 sell_max_orders = ${MAX_LADDER_ORDERS}
-# The bot signs deadlines off its wall clock, but the local Hardhat chain's
-# block.timestamp can run minutes ahead of wall time (tests bump EVM time and
-# it can't go back). A short TTL then makes every order expire on-chain before
-# it's fillable — executeBatch reverts with Permit2 SignatureExpired. 30 min
-# absorbs realistic local drift. (Prod chains track wall time, so TTL there is
-# the bot's own short value.)
-ttl_secs = 1800
-# 0 → re-sign with a fresh Permit2 nonce every tick. The local oracle is flat,
-# so a price-gated bot would never rotate the nonce, and a filled order would
-# linger in the book and revert the next fill with InvalidNonce. (Production
-# uses a real threshold — the live feed moves, so nonces rotate on their own.)
-refresh_threshold_bps = 0
+ttl_secs = ${STITCH_LOCAL_TTL_SECS}
+refresh_threshold_bps = ${STITCH_LOCAL_REFRESH_THRESHOLD_BPS}
 `
 }
 
@@ -346,6 +366,12 @@ for (const p of pools) {
     `  ${p.key}: bid ${TOTAL_ORDER_SIZE_USD} stable / ask ~${p.askSoftHuman} soft, min ${MIN_ORDER_SIZE_USD} stable (feed ${FEED_BASE}?pair=${p.key})`
   )
 }
+console.log(
+  `  production-like defaults: ttl=${STITCH_LOCAL_TTL_SECS}s, ` +
+    `refresh_threshold=${STITCH_LOCAL_REFRESH_THRESHOLD_BPS}bps, ` +
+    `funding_headroom=${STITCH_LOCAL_FUNDING_HEADROOM}x, ` +
+    `feed_staleness=${FEED_STALENESS_SECS}s`
+)
 console.log('')
 
 // A bot with no reachable feed silently skips every pool ("feed fetch failed")
@@ -400,13 +426,12 @@ if (!feedUp) {
 }
 console.log(`Using price endpoint ${FEED_BASE}.\n`)
 
-// Keep the oracles fresh for the whole session (they'd otherwise re-stale after
-// 30 min and the feed/UI would start reverting again).
+// Keep local oracles fresh inside the production-like feed staleness window.
 const refreshTimer = setInterval(
   () => {
     refreshOracles().catch(() => {})
   },
-  20 * 60 * 1000
+  ORACLE_REFRESH_SECONDS * 1000
 )
 
 const bot = spawn(
