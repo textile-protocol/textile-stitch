@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.43"
+version = "0.1.44"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
 license = "AGPL-3.0-or-later"

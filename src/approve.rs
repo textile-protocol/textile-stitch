@@ -115,17 +115,37 @@ fn add_required_amount(entry: &mut (U256, bool, Vec<String>), amount: LiquidityA
 pub fn approval_action(
     current_allowance: U256,
     required: U256,
+    uses_max_liquidity: bool,
     mode: ApprovalMode,
 ) -> ApprovalAction {
     // A side with no committed size needs nothing; and an allowance that already
     // covers the commitment is left alone whichever mode was asked for.
-    if required == U256::ZERO || current_allowance >= required {
+    if required == U256::ZERO
+        || allowance_covers_requirement(current_allowance, required, uses_max_liquidity)
+    {
         return ApprovalAction::AlreadyApproved;
     }
     match mode {
         ApprovalMode::Max => ApprovalAction::Approve(U256::MAX),
         ApprovalMode::Exact => ApprovalAction::Approve(required),
     }
+}
+
+fn allowance_covers_requirement(
+    current_allowance: U256,
+    required: U256,
+    uses_max_liquidity: bool,
+) -> bool {
+    if uses_max_liquidity {
+        // Permit2 spends down ERC20 allowance on some tokens, so a max-liquidity
+        // side should tolerate a once-max approval that has already filled.
+        return current_allowance >= max_liquidity_allowance_floor();
+    }
+    current_allowance >= required
+}
+
+fn max_liquidity_allowance_floor() -> U256 {
+    U256::MAX >> 1
 }
 
 /// The committed buy-side input is debt. Use the same active sizing field as
@@ -185,7 +205,12 @@ pub async fn unapproved_tokens(
     for req in required_approvals(cfg)? {
         let allowance = permit2_allowance(wallet, req.token, permit2).await?;
         if matches!(
-            approval_action(allowance, req.required, ApprovalMode::Max),
+            approval_action(
+                allowance,
+                req.required,
+                req.uses_max_liquidity,
+                ApprovalMode::Max
+            ),
             ApprovalAction::Approve(_)
         ) {
             short.push(req);
@@ -221,7 +246,7 @@ pub async fn run_approvals(
     let mut sent = 0usize;
     for req in &required {
         let allowance = permit2_allowance(wallet, req.token, permit2).await?;
-        match approval_action(allowance, req.required, mode) {
+        match approval_action(allowance, req.required, req.uses_max_liquidity, mode) {
             ApprovalAction::AlreadyApproved => {
                 info!(token = %req.token, reasons = ?req.reasons, "already approved; skipping");
             }
@@ -469,11 +494,16 @@ mod tests {
     fn already_approved_when_allowance_covers_the_commitment() {
         let required = U256::from(50_000_000_000u64);
         assert_eq!(
-            approval_action(required, required, ApprovalMode::Max),
+            approval_action(required, required, false, ApprovalMode::Max),
             ApprovalAction::AlreadyApproved
         );
         assert_eq!(
-            approval_action(required + U256::from(1u8), required, ApprovalMode::Exact),
+            approval_action(
+                required + U256::from(1u8),
+                required,
+                false,
+                ApprovalMode::Exact
+            ),
             ApprovalAction::AlreadyApproved
         );
     }
@@ -482,7 +512,38 @@ mod tests {
     fn max_mode_approves_uint_max_when_short() {
         let required = U256::from(50_000_000_000u64);
         assert_eq!(
-            approval_action(U256::ZERO, required, ApprovalMode::Max),
+            approval_action(U256::ZERO, required, false, ApprovalMode::Max),
+            ApprovalAction::Approve(U256::MAX)
+        );
+    }
+
+    #[test]
+    fn max_liquidity_allowance_stays_covered_as_fills_consume_it() {
+        let consumed_allowance = U256::MAX - U256::from(50_000u64);
+        assert_eq!(
+            approval_action(consumed_allowance, U256::MAX, true, ApprovalMode::Max),
+            ApprovalAction::AlreadyApproved
+        );
+        assert_eq!(
+            approval_action(
+                max_liquidity_allowance_floor() - U256::from(1u8),
+                U256::MAX,
+                true,
+                ApprovalMode::Max
+            ),
+            ApprovalAction::Approve(U256::MAX)
+        );
+    }
+
+    #[test]
+    fn exact_max_amount_still_requires_literal_coverage_without_max_liquidity() {
+        assert_eq!(
+            approval_action(
+                U256::MAX - U256::from(1u8),
+                U256::MAX,
+                false,
+                ApprovalMode::Max
+            ),
             ApprovalAction::Approve(U256::MAX)
         );
     }
@@ -492,7 +553,7 @@ mod tests {
         let required = U256::from(50_000_000_000u64);
         // Even a partial existing allowance is topped up to exactly `required`.
         assert_eq!(
-            approval_action(U256::from(10u8), required, ApprovalMode::Exact),
+            approval_action(U256::from(10u8), required, false, ApprovalMode::Exact),
             ApprovalAction::Approve(required)
         );
     }
@@ -500,7 +561,7 @@ mod tests {
     #[test]
     fn zero_requirement_is_a_noop() {
         assert_eq!(
-            approval_action(U256::ZERO, U256::ZERO, ApprovalMode::Max),
+            approval_action(U256::ZERO, U256::ZERO, false, ApprovalMode::Max),
             ApprovalAction::AlreadyApproved
         );
     }
