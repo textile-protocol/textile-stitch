@@ -107,6 +107,14 @@ The buy side spends the `debt` token; the sell side spends the `collateral`
 token. Raising total liquidity increases total quoted depth; raising the minimum
 slice usually increases individual order sizes.
 
+A fixed numeric size also caps depth when the wallet later grows: top up the
+wallet without raising `*_total_liquidity_*` and the extra inventory never
+reaches the book. Stitch logs
+`wallet can back more than the configured size` (info level) when this happens.
+If you want the book to track the wallet, use `"max"`; keep a fixed size only
+when you deliberately reserve inventory, e.g. debt-token budget for the
+settlement closer, which spends from the same wallet.
+
 ### Settlement Closing
 
 Stitch runs settlement closing alongside market making by default. The install

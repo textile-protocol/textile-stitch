@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use alloy_primitives::{Address, Bytes, U256};
 use anyhow::Context;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::approve::{buy_input_amount, sell_input_amount};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
@@ -261,9 +261,29 @@ pub async fn funded_input_cap(
                 reusable = %reusable_input,
                 "capping order liquidity to remaining funded input"
             );
+        } else if is_underutilized(InputLiquidity::Exact(configured), granted) {
+            info!(
+                pair = %pair,
+                label,
+                configured,
+                fundable = %granted,
+                funded = %budget.funded,
+                "wallet can back more than the configured size; raise it or set \"max\" to quote the full balance"
+            );
         }
     }
     Some(capped)
+}
+
+/// True when an Exact-sized side could back strictly more than its configured
+/// size — the wallet holds funded input the book never quotes. Surfaced so an
+/// operator whose balance outgrew a fixed size hears about it instead of
+/// silently quoting a fraction of their liquidity.
+pub fn is_underutilized(configured: InputLiquidity, fundable: U256) -> bool {
+    match configured {
+        InputLiquidity::Exact(configured) => fundable > U256::from(configured),
+        InputLiquidity::Max => false,
+    }
 }
 
 pub fn available_funded_input(budget: &FundedInputBudget, reusable_input: U256) -> U256 {
@@ -326,6 +346,29 @@ mod tests {
             cap_input_liquidity(InputLiquidity::Max, U256::from(750_000u64)).unwrap(),
             750_000
         );
+    }
+
+    #[test]
+    fn underutilization_flags_exact_sizes_the_wallet_outgrew() {
+        // Wallet can back 10_000 but the side only quotes 4_300.
+        assert!(is_underutilized(
+            InputLiquidity::Exact(4_300),
+            U256::from(10_000u64)
+        ));
+        // Fully used or underfunded exact sizes are not underutilized.
+        assert!(!is_underutilized(
+            InputLiquidity::Exact(4_300),
+            U256::from(4_300u64)
+        ));
+        assert!(!is_underutilized(
+            InputLiquidity::Exact(4_300),
+            U256::from(1_000u64)
+        ));
+        // "max" always quotes the full fundable budget.
+        assert!(!is_underutilized(
+            InputLiquidity::Max,
+            U256::from(10_000u64)
+        ));
     }
 
     #[test]
