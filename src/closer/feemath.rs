@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Rust port of `contracts/v3/libraries/logic/FeeLogic.sol` — the Settlement v3
 //! fee curve and fill-time distribution. Mirrors the Solidity exactly (and its
-//! TS twin `settlement-closer/src/feeMath.ts`); the tests assert against
+//! TS twin `packages/constants/src/feeMath.ts`); the tests assert against
 //! vectors generated from that TS mirror, which the Foundry suite already
 //! proves equivalent to the Solidity. Any change to FeeLogic.sol must be
 //! mirrored here.
@@ -160,7 +160,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    // Vectors generated from settlement-closer/src/feeMath.ts (the TS mirror the
+    // Vectors generated from packages/constants/src/feeMath.ts (the TS mirror the
     // Foundry suite proves equivalent to FeeLogic.sol). floor 0.2%, buffer 2%,
     // window 5d; C = 1,550,000,000; D = 1,000,000,000.
     fn quote_at(elapsed: u64) -> FillQuote {

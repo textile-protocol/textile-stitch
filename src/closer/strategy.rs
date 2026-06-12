@@ -7,7 +7,7 @@
 //! [`super::runner::plan_batch`]) stops at the first position that doesn't clear
 //! rather than cherry-picking later profitable ones.
 //!
-//! Mirrors `settlement-closer/src/strategy.ts`.
+//! Mirrors the strategy behavior used by the TypeScript app layer.
 
 use alloy_primitives::U256;
 

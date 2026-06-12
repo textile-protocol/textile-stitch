@@ -98,21 +98,29 @@ impl Indexer {
         }
     }
 
-    /// POST the order; returns the new order id on success.
-    pub async fn submit(&self, order: &SubmitOrder) -> anyhow::Result<String> {
-        let body = build_submit_request(order);
+    /// POST a GraphQL request and surface indexer-side errors. `what` names the
+    /// request in the error ("order", "order batch", …).
+    async fn post_graphql(&self, body: &Value, what: &str) -> anyhow::Result<Value> {
         let resp: Value = self
             .client
             .post(&self.graphql_url)
-            .json(&body)
+            .json(body)
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
         if let Some(errors) = response_errors(&resp) {
-            anyhow::bail!("indexer rejected order: {errors}");
+            anyhow::bail!("indexer rejected {what}: {errors}");
         }
+        Ok(resp)
+    }
+
+    /// POST the order; returns the new order id on success.
+    pub async fn submit(&self, order: &SubmitOrder) -> anyhow::Result<String> {
+        let resp = self
+            .post_graphql(&build_submit_request(order), "order")
+            .await?;
         Ok(first_order_id_at(&resp, "/data/submitFillerOrder/id"))
     }
 
@@ -122,19 +130,9 @@ impl Indexer {
             return Ok(Vec::new());
         }
 
-        let body = build_submit_many_request(orders);
-        let resp: Value = self
-            .client
-            .post(&self.graphql_url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        let resp = self
+            .post_graphql(&build_submit_many_request(orders), "order batch")
             .await?;
-        if let Some(errors) = response_errors(&resp) {
-            anyhow::bail!("indexer rejected order batch: {errors}");
-        }
         Ok(order_ids_at(&resp, "/data/submitFillerOrders"))
     }
 
@@ -145,18 +143,7 @@ impl Indexer {
         input_token: &str,
     ) -> anyhow::Result<String> {
         let body = build_committed_input_request(chain_id, maker, input_token);
-        let resp: Value = self
-            .client
-            .post(&self.graphql_url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        if let Some(errors) = response_errors(&resp) {
-            anyhow::bail!("indexer rejected committed input query: {errors}");
-        }
+        let resp = self.post_graphql(&body, "committed input query").await?;
         resp.pointer("/data/fillerCommittedInput")
             .and_then(Value::as_str)
             .map(str::to_string)
