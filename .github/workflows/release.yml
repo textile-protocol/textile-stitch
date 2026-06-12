@@ -181,9 +181,22 @@ jobs:
         # inconsistent syntax between shell and powershell.
         shell: bash
         run: |
+          print_upload_paths() {
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              if command -v cygpath >/dev/null 2>&1; then
+                path="$(cygpath -u "$path")"
+              fi
+              case "$path" in
+                "$PWD"/*) path="${path#"$PWD"/}" ;;
+              esac
+              printf '%s\n' "$path"
+            done
+          }
+
           # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json | print_upload_paths >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -191,6 +204,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          compression-level: 0
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
@@ -225,12 +239,25 @@ jobs:
       - id: cargo-dist
         shell: bash
         run: |
+          print_upload_paths() {
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              if command -v cygpath >/dev/null 2>&1; then
+                path="$(cygpath -u "$path")"
+              fi
+              case "$path" in
+                "$PWD"/*) path="${path#"$PWD"/}" ;;
+              esac
+              printf '%s\n' "$path"
+            done
+          }
+
           dist build --allow-dirty ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json | print_upload_paths >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -238,6 +265,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: artifacts-build-global
+          compression-level: 0
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
