@@ -357,8 +357,13 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     let mut closer_pending: HashMap<Address, HashMap<U256, u64>> = HashMap::new();
     let slot_nonce_state_path = slot_nonce_state_path(&config_path, cfg.chain_id, maker);
     let initial_next_nonce = unix_now().saturating_mul(1000);
-    let (next_nonce, slot_nonces, slot_inputs) = if dry_run {
-        (initial_next_nonce, HashMap::new(), HashMap::new())
+    let (next_nonce, slot_nonces, slot_inputs, slot_deadlines) = if dry_run {
+        (
+            initial_next_nonce,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
     } else {
         load_slot_nonce_state(
             &slot_nonce_state_path,
@@ -384,6 +389,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         next_nonce,
         slot_nonces,
         slot_inputs,
+        slot_deadlines,
     };
     let ctx = TickCtx {
         poster: &poster,

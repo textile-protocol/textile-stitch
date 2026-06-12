@@ -148,6 +148,7 @@ pub struct QuoteState {
     pub next_nonce: u64,
     pub slot_nonces: HashMap<String, u64>,
     pub slot_inputs: HashMap<String, String>,
+    pub slot_deadlines: HashMap<String, u64>,
 }
 
 /// How a side's quote attempt ended. `AbortPool` means the nonce ledger could
@@ -192,7 +193,8 @@ pub async fn quote_side(
         return SideOutcome::Done;
     }
 
-    let reusable_input = reusable_slot_input(&state.slot_inputs, &key_id);
+    let reusable_input =
+        reusable_slot_input(&state.slot_inputs, &state.slot_deadlines, &key_id, now);
     let (input_token, output_token) = side.tokens(debt, collateral);
     let sizes = side_sizes(
         ctx,
@@ -246,6 +248,7 @@ pub async fn quote_side(
         forget_spent_slot_nonce(
             &mut state.slot_nonces,
             &mut state.slot_inputs,
+            &mut state.slot_deadlines,
             &drafts,
             spent_nonce,
         );
@@ -258,7 +261,13 @@ pub async fn quote_side(
         );
     }
     if result.posted > 0 {
-        remember_slot_inputs(&mut state.slot_inputs, &key_id, &drafts);
+        remember_slot_inputs(
+            &mut state.slot_inputs,
+            &mut state.slot_deadlines,
+            &key_id,
+            &drafts,
+            result.deadline,
+        );
         persist_slot_state(
             ctx,
             state,
@@ -482,6 +491,7 @@ fn persist_slot_state(
         state.next_nonce,
         &state.slot_nonces,
         &state.slot_inputs,
+        &state.slot_deadlines,
     ) {
         Ok(()) => true,
         Err(e) => {

@@ -26,7 +26,17 @@ pub struct SlotNonceState {
     pub slot_nonces: HashMap<String, u64>,
     #[serde(default)]
     pub slot_inputs: HashMap<String, String>,
+    #[serde(default)]
+    pub slot_deadlines: HashMap<String, u64>,
 }
+
+/// How long before a slot's order deadline its input stops counting as
+/// reusable. Mirrors the indexer's `FILLER_ORDER_DEADLINE_MARGIN_SECS` (the
+/// committed-input cutoff is `chain time + 30s`): once the server stops
+/// counting a row, crediting its input on top of the funded balance makes the
+/// replacement batch exceed `min(balance, allowance)` and every submit gets
+/// rejected as not funded.
+const REUSABLE_DEADLINE_MARGIN_SECS: u64 = 30;
 
 /// Stable nonce for a replacement slot: reuse the slot's nonce if it has one,
 /// otherwise mint the next one.
@@ -46,6 +56,7 @@ pub fn slot_nonce(
 pub fn forget_spent_slot_nonce(
     slot_nonces: &mut HashMap<String, u64>,
     slot_inputs: &mut HashMap<String, String>,
+    slot_deadlines: &mut HashMap<String, u64>,
     drafts: &[OrderDraft],
     spent_nonce: u64,
 ) {
@@ -53,32 +64,54 @@ pub fn forget_spent_slot_nonce(
         if draft.nonce == spent_nonce {
             slot_nonces.remove(&draft.slot_key);
             slot_inputs.remove(&draft.slot_key);
+            slot_deadlines.remove(&draft.slot_key);
         }
     }
 }
 
 /// Input already committed by this side's live slots (`key_id` is
-/// `buy:<pair>` / `sell:<pair>`) — a replacement can reuse it.
-pub fn reusable_slot_input(slot_inputs: &HashMap<String, String>, key_id: &str) -> U256 {
+/// `buy:<pair>` / `sell:<pair>`) — a replacement can reuse it. Only slots whose
+/// posted order is still comfortably unexpired count: once a slot's deadline
+/// passes, the indexer no longer holds that input against the maker, so its
+/// "credit" is gone — keeping it would size every replacement above the funded
+/// balance and livelock the side on "Order batch is not funded". A slot with
+/// no recorded deadline (ledger written by an older version) is treated as
+/// expired; the first successful post re-records it.
+pub fn reusable_slot_input(
+    slot_inputs: &HashMap<String, String>,
+    slot_deadlines: &HashMap<String, u64>,
+    key_id: &str,
+    now: u64,
+) -> U256 {
     let prefix = format!("{key_id}:");
     slot_inputs
         .iter()
         .filter(|(slot_key, _)| slot_key.starts_with(&prefix))
+        .filter(|(slot_key, _)| {
+            slot_deadlines.get(*slot_key).is_some_and(|deadline| {
+                *deadline > now.saturating_add(REUSABLE_DEADLINE_MARGIN_SECS)
+            })
+        })
         .fold(U256::ZERO, |sum, (_, input)| {
             sum.saturating_add(input.parse::<U256>().unwrap_or(U256::ZERO))
         })
 }
 
-/// Replace this side's recorded slot inputs with the drafts just posted.
+/// Replace this side's recorded slot inputs (and their order deadline) with
+/// the drafts just posted.
 pub fn remember_slot_inputs(
     slot_inputs: &mut HashMap<String, String>,
+    slot_deadlines: &mut HashMap<String, u64>,
     key_id: &str,
     drafts: &[OrderDraft],
+    deadline: u64,
 ) {
     let prefix = format!("{key_id}:");
     slot_inputs.retain(|slot_key, _| !slot_key.starts_with(&prefix));
+    slot_deadlines.retain(|slot_key, _| !slot_key.starts_with(&prefix));
     for draft in drafts {
         slot_inputs.insert(draft.slot_key.clone(), draft.input_amount.to_string());
+        slot_deadlines.insert(draft.slot_key.clone(), deadline);
     }
 }
 
@@ -100,19 +133,31 @@ pub fn slot_nonce_state_path(config_path: &str, chain_id: u64, maker: Address) -
     ))
 }
 
-/// Load the ledger, returning `(next_nonce, slot_nonces, slot_inputs)`. A
-/// missing file is a fresh start; a chain/maker mismatch is an error (the file
-/// belongs to another deployment and its nonces must not be reused).
+/// Load the ledger, returning `(next_nonce, slot_nonces, slot_inputs,
+/// slot_deadlines)`. A missing file is a fresh start; a chain/maker mismatch
+/// is an error (the file belongs to another deployment and its nonces must
+/// not be reused).
+#[allow(clippy::type_complexity)]
 pub fn load_slot_nonce_state(
     path: &Path,
     chain_id: u64,
     maker: Address,
     initial_next_nonce: u64,
-) -> anyhow::Result<(u64, HashMap<String, u64>, HashMap<String, String>)> {
+) -> anyhow::Result<(
+    u64,
+    HashMap<String, u64>,
+    HashMap<String, String>,
+    HashMap<String, u64>,
+)> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Ok((initial_next_nonce, HashMap::new(), HashMap::new()));
+            return Ok((
+                initial_next_nonce,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ));
         }
         Err(e) => {
             return Err(e).with_context(|| format!("reading {}", path.display()));
@@ -144,6 +189,7 @@ pub fn load_slot_nonce_state(
         initial_next_nonce.max(state.next_nonce).max(max_slot_nonce),
         state.slot_nonces,
         state.slot_inputs,
+        state.slot_deadlines,
     ))
 }
 
@@ -155,6 +201,7 @@ pub fn save_slot_nonce_state(
     next_nonce: u64,
     slot_nonces: &HashMap<String, u64>,
     slot_inputs: &HashMap<String, String>,
+    slot_deadlines: &HashMap<String, u64>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
@@ -166,6 +213,7 @@ pub fn save_slot_nonce_state(
         next_nonce,
         slot_nonces: slot_nonces.clone(),
         slot_inputs: slot_inputs.clone(),
+        slot_deadlines: slot_deadlines.clone(),
     };
     let mut json = serde_json::to_string_pretty(&state)?;
     json.push('\n');
@@ -215,6 +263,16 @@ mod tests {
         assert_eq!(bid_0_again, bid_0);
     }
 
+    /// Far-future deadline so slots count as reusable unless a test expires them.
+    const LIVE_DEADLINE: u64 = u64::MAX;
+
+    fn deadlines_for(slot_inputs: &HashMap<String, String>, deadline: u64) -> HashMap<String, u64> {
+        slot_inputs
+            .keys()
+            .map(|slot_key| (slot_key.clone(), deadline))
+            .collect()
+    }
+
     #[test]
     fn forgetting_a_spent_nonce_only_rotates_that_slot() {
         let mut slot_nonces = HashMap::new();
@@ -223,6 +281,7 @@ mod tests {
         slot_nonces.insert("buy:pair:bid:1".to_string(), 1002);
         slot_inputs.insert("buy:pair:bid:0".to_string(), "1".to_string());
         slot_inputs.insert("buy:pair:bid:1".to_string(), "1".to_string());
+        let mut slot_deadlines = deadlines_for(&slot_inputs, LIVE_DEADLINE);
         let drafts = vec![
             OrderDraft {
                 nonce: 1001,
@@ -240,12 +299,20 @@ mod tests {
             },
         ];
 
-        forget_spent_slot_nonce(&mut slot_nonces, &mut slot_inputs, &drafts, 1002);
+        forget_spent_slot_nonce(
+            &mut slot_nonces,
+            &mut slot_inputs,
+            &mut slot_deadlines,
+            &drafts,
+            1002,
+        );
 
         assert_eq!(slot_nonces.get("buy:pair:bid:0"), Some(&1001));
         assert!(!slot_nonces.contains_key("buy:pair:bid:1"));
         assert_eq!(slot_inputs.get("buy:pair:bid:0"), Some(&"1".to_string()));
         assert!(!slot_inputs.contains_key("buy:pair:bid:1"));
+        assert!(slot_deadlines.contains_key("buy:pair:bid:0"));
+        assert!(!slot_deadlines.contains_key("buy:pair:bid:1"));
     }
 
     #[test]
@@ -254,10 +321,55 @@ mod tests {
         slot_inputs.insert("buy:pair:bid:0".to_string(), "100".to_string());
         slot_inputs.insert("buy:pair:bid:1".to_string(), "25".to_string());
         slot_inputs.insert("sell:pair:ask:0".to_string(), "50".to_string());
+        let slot_deadlines = deadlines_for(&slot_inputs, LIVE_DEADLINE);
 
         assert_eq!(
-            reusable_slot_input(&slot_inputs, "buy:pair"),
+            reusable_slot_input(&slot_inputs, &slot_deadlines, "buy:pair", 0),
             U256::from(125u64)
+        );
+    }
+
+    #[test]
+    fn reusable_slot_input_skips_expired_slots() {
+        // The livelock regression: the side's posted orders expired server-side
+        // (the indexer no longer counts them as committed), so their input must
+        // not be credited on top of the funded balance — otherwise every
+        // replacement is sized at balance + stale ladder and the indexer
+        // rejects it as not funded forever.
+        let now = 1_000_000u64;
+        let mut slot_inputs = HashMap::new();
+        slot_inputs.insert("buy:pair:bid:0".to_string(), "100".to_string());
+        slot_inputs.insert("buy:pair:bid:1".to_string(), "25".to_string());
+        let mut slot_deadlines = HashMap::new();
+        // bid:0 expired in the past; bid:1 expires inside the 30s server margin.
+        slot_deadlines.insert("buy:pair:bid:0".to_string(), now - 1);
+        slot_deadlines.insert("buy:pair:bid:1".to_string(), now + 10);
+
+        assert_eq!(
+            reusable_slot_input(&slot_inputs, &slot_deadlines, "buy:pair", now),
+            U256::ZERO
+        );
+
+        // Still comfortably live → fully reusable again.
+        slot_deadlines.insert("buy:pair:bid:0".to_string(), now + 300);
+        slot_deadlines.insert("buy:pair:bid:1".to_string(), now + 300);
+        assert_eq!(
+            reusable_slot_input(&slot_inputs, &slot_deadlines, "buy:pair", now),
+            U256::from(125u64)
+        );
+    }
+
+    #[test]
+    fn reusable_slot_input_treats_missing_deadlines_as_expired() {
+        // Ledgers written before slot_deadlines existed have inputs but no
+        // deadlines; treating them as reusable would re-introduce the livelock
+        // right after an upgrade, so they count for nothing until re-posted.
+        let mut slot_inputs = HashMap::new();
+        slot_inputs.insert("buy:pair:bid:0".to_string(), "100".to_string());
+
+        assert_eq!(
+            reusable_slot_input(&slot_inputs, &HashMap::new(), "buy:pair", 0),
+            U256::ZERO
         );
     }
 
@@ -267,13 +379,23 @@ mod tests {
         slot_inputs.insert("buy:pair:bid:0".to_string(), "100".to_string());
         slot_inputs.insert("buy:pair:bid:1".to_string(), "25".to_string());
         slot_inputs.insert("sell:pair:ask:0".to_string(), "50".to_string());
+        let mut slot_deadlines = deadlines_for(&slot_inputs, 500);
         let drafts = vec![draft(1001, "buy:pair:bid:0", 80)];
 
-        remember_slot_inputs(&mut slot_inputs, "buy:pair", &drafts);
+        remember_slot_inputs(
+            &mut slot_inputs,
+            &mut slot_deadlines,
+            "buy:pair",
+            &drafts,
+            900,
+        );
 
         assert_eq!(slot_inputs.get("buy:pair:bid:0"), Some(&"80".to_string()));
         assert!(!slot_inputs.contains_key("buy:pair:bid:1"));
         assert_eq!(slot_inputs.get("sell:pair:ask:0"), Some(&"50".to_string()));
+        assert_eq!(slot_deadlines.get("buy:pair:bid:0"), Some(&900));
+        assert!(!slot_deadlines.contains_key("buy:pair:bid:1"));
+        assert_eq!(slot_deadlines.get("sell:pair:ask:0"), Some(&500));
     }
 
     #[test]
@@ -304,16 +426,26 @@ mod tests {
         slot_nonces.insert("sell:pair:ask:0".to_string(), 1002);
         slot_inputs.insert("buy:pair:bid:0".to_string(), "10".to_string());
         slot_inputs.insert("sell:pair:ask:0".to_string(), "20".to_string());
+        let slot_deadlines = deadlines_for(&slot_inputs, 1_700_000_000);
 
-        save_slot_nonce_state(&path, 8453, maker, 1002, &slot_nonces, &slot_inputs)
-            .expect("state saves");
-        let (next_nonce, loaded_nonces, loaded_inputs) =
+        save_slot_nonce_state(
+            &path,
+            8453,
+            maker,
+            1002,
+            &slot_nonces,
+            &slot_inputs,
+            &slot_deadlines,
+        )
+        .expect("state saves");
+        let (next_nonce, loaded_nonces, loaded_inputs, loaded_deadlines) =
             load_slot_nonce_state(&path, 8453, maker, 1).expect("state loads");
 
         std::fs::remove_file(path).unwrap();
         assert_eq!(next_nonce, 1002);
         assert_eq!(loaded_nonces, slot_nonces);
         assert_eq!(loaded_inputs, slot_inputs);
+        assert_eq!(loaded_deadlines, slot_deadlines);
     }
 
     #[test]
@@ -325,8 +457,16 @@ mod tests {
             .parse()
             .unwrap();
         let path = temp_state_file("wrong-maker");
-        save_slot_nonce_state(&path, 8453, maker, 1002, &HashMap::new(), &HashMap::new())
-            .expect("state saves");
+        save_slot_nonce_state(
+            &path,
+            8453,
+            maker,
+            1002,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("state saves");
 
         let err = load_slot_nonce_state(&path, 8453, other, 1).expect_err("maker mismatch");
 

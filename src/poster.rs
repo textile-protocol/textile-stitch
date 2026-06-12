@@ -36,6 +36,10 @@ pub struct OrderDraft {
 pub struct PostResult {
     pub posted: usize,
     pub spent_nonce: Option<u64>,
+    /// Unix-seconds order deadline the posted batch was signed with; 0 when
+    /// nothing was posted. The slot ledger records it so a replacement only
+    /// reuses input the indexer still counts as live.
+    pub deadline: u64,
 }
 
 impl Poster<'_> {
@@ -100,6 +104,7 @@ impl Poster<'_> {
             return PostResult {
                 posted: submissions.len(),
                 spent_nonce: None,
+                deadline,
             };
         }
 
@@ -109,6 +114,7 @@ impl Poster<'_> {
                 PostResult {
                     posted: ids.len(),
                     spent_nonce: None,
+                    deadline,
                 }
             }
             Err(e) => {
@@ -116,6 +122,7 @@ impl Poster<'_> {
                 PostResult {
                     posted: 0,
                     spent_nonce: spent_nonce_from_error(&e.to_string()),
+                    deadline,
                 }
             }
         }
