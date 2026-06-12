@@ -46,34 +46,6 @@ The operator can change the region and any parameter in the console before
 creating the stack. Nothing in this URL touches their wallet; the secret is
 loaded separately after the stack exists (see below).
 
-### One-Time Hosting Setup
-
-The button works once the template is published. This is a one-time setup on the
-Textile side, not something operators do:
-
-1. Create the S3 bucket `textile-stitch-deploy` (region `us-east-1`).
-2. Add a bucket policy granting public read on the published prefix only:
-
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [{
-       "Sid": "PublicReadTemplates",
-       "Effect": "Allow",
-       "Principal": "*",
-       "Action": "s3:GetObject",
-       "Resource": "arn:aws:s3:::textile-stitch-deploy/aws/*"
-     }]
-   }
-   ```
-
-3. Create an IAM role that trusts GitHub OIDC for this repo and allows
-   `s3:PutObject` on `arn:aws:s3:::textile-stitch-deploy/aws/*`, then set its ARN
-   as the `AWS_TEMPLATE_PUBLISH_ROLE` repo secret.
-
-To change the bucket, region, or key, update the `env` block in
-`publish-template.yml` and the `templateURL` in both READMEs together.
-
 ### Deploy From A Local Checkout
 
 The button is the easy path. You can also deploy the same template directly:
