@@ -151,7 +151,7 @@ fn max_liquidity_allowance_floor() -> U256 {
 /// The committed buy-side input is debt. Use the same active sizing field as
 /// the quote path: ladder total only when the ladder is fully configured,
 /// otherwise the single order size.
-fn buy_input_amount(pool: &PoolConfig) -> anyhow::Result<LiquidityAmount> {
+pub(crate) fn buy_input_amount(pool: &PoolConfig) -> anyhow::Result<LiquidityAmount> {
     let raw = if pool.buy_ladder_enabled() {
         pool.buy_total_liquidity_debt.as_ref()
     } else {
@@ -163,7 +163,7 @@ fn buy_input_amount(pool: &PoolConfig) -> anyhow::Result<LiquidityAmount> {
 
 /// The committed sell-side input is collateral inventory, selected from the
 /// same active sizing field used by the quote path.
-fn sell_input_amount(pool: &PoolConfig) -> anyhow::Result<LiquidityAmount> {
+pub(crate) fn sell_input_amount(pool: &PoolConfig) -> anyhow::Result<LiquidityAmount> {
     let raw = if pool.sell_ladder_enabled() {
         pool.sell_total_liquidity_collateral.as_ref()
     } else {

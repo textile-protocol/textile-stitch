@@ -276,7 +276,11 @@ current token balance and Permit2 allowance for that side, so normal fills or
 inventory transfers reduce the next ladder instead of causing the indexer to
 reject an unfunded batch.
 Requotes reuse the same replacement slots, so Stitch can refresh funded depth
-without double-counting the ladder it is replacing. For
+without double-counting the ladder it is replacing.
+When several corridors spend the same token (for example two pools that both
+buy with USDC) and more than one of them is set to `"max"`, Stitch splits the
+token's funded balance into even target shares on every tick, so an existing
+corridor can't keep the whole wallet after another max side is added. For
 the price-feed orientation, spread options, ladder sizing, and
 settlement-closing fields, see the
 [configuration reference in ADVANCED.md](ADVANCED.md#configuration-reference).

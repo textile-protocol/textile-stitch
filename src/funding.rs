@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Funded-input budgeting: how much of a token the maker can actually commit
 //! to new orders this tick. The budget per token is
-//! `min(balance, Permit2 allowance)` minus what the indexer already holds as
-//! live commitments, minus what earlier sides of this tick reserved — with the
-//! side's own live input counted as reusable (a replacement supersedes it).
+//! `min(balance, Permit2 allowance)` minus what the book will hold after earlier
+//! replacements in this tick — with the side's own live input counted as
+//! reusable (a replacement supersedes it).
 
 use std::collections::HashMap;
 
@@ -12,8 +12,9 @@ use alloy_primitives::{Address, Bytes, U256};
 use anyhow::Context;
 use tracing::warn;
 
+use crate::approve::{buy_input_amount, sell_input_amount};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
-use crate::config::{parse_liquidity_amount, LiquidityAmount};
+use crate::config::{parse_liquidity_amount, Config, LiquidityAmount};
 use crate::indexer::Indexer;
 use crate::rpc::Wallet;
 
@@ -26,12 +27,96 @@ pub enum InputLiquidity {
 }
 
 /// Per-token budget for one tick: on-chain funded amount, indexer-side live
-/// commitments, and what this tick has already reserved.
+/// commitments adjusted by earlier replacements this tick.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FundedInputBudget {
     pub funded: U256,
     pub committed: U256,
-    pub reserved: U256,
+}
+
+/// Mutable per-tick funding state: the per-token budgets read so far, and how
+/// many "max"-sized sides share each token.
+pub struct TickBudgets {
+    pub funded_inputs: HashMap<Address, FundedInputBudget>,
+    pub max_sides_total: HashMap<Address, u32>,
+    pub max_sides_remaining: HashMap<Address, u32>,
+}
+
+impl TickBudgets {
+    pub fn new(max_sides_by_token: HashMap<Address, u32>) -> Self {
+        Self {
+            funded_inputs: HashMap::new(),
+            max_sides_total: max_sides_by_token.clone(),
+            max_sides_remaining: max_sides_by_token,
+        }
+    }
+}
+
+/// How many enabled sides quote `"max"` liquidity per input token. Sides whose
+/// size fails to parse are skipped here — the quote path warns about them.
+pub fn count_max_sides(cfg: &Config) -> HashMap<Address, u32> {
+    cfg.pools
+        .iter()
+        .flat_map(|pool| {
+            [
+                pool.buy_enabled()
+                    .then(|| (pool.debt.as_str(), buy_input_amount(pool))),
+                pool.sell_enabled()
+                    .then(|| (pool.collateral.as_str(), sell_input_amount(pool))),
+            ]
+        })
+        .flatten()
+        .filter_map(|(token, amount)| match amount {
+            Ok(LiquidityAmount::Max) => token.parse::<Address>().ok(),
+            _ => None,
+        })
+        .fold(HashMap::new(), |mut counts, token| {
+            *counts.entry(token).or_insert(0) += 1;
+            counts
+        })
+}
+
+/// One "max" side's grant this tick: no more than its equal target share of the
+/// funded token balance, capped by what can be posted against the current book.
+/// When prior commitments are uneven, over-allocated sides shrink toward the
+/// target and release budget for under-allocated sides in the same or next tick.
+/// A funding deficit can still land on the first side to re-quote, because a
+/// replacement cannot exceed the post-supersede funded book.
+pub fn max_input_share(
+    budget: &FundedInputBudget,
+    reusable_input: U256,
+    total_max_sides: u32,
+    remaining_max_sides: u32,
+) -> U256 {
+    let available = available_funded_input(budget, reusable_input);
+    let total = total_max_sides.max(1);
+    if total == 1 {
+        return available;
+    }
+    let remaining = remaining_max_sides.clamp(1, total);
+    let processed = total.saturating_sub(remaining);
+    let total_u256 = U256::from(total);
+    let mut target = budget.funded / total_u256;
+    if U256::from(processed) < budget.funded % total_u256 {
+        target = target.saturating_add(U256::from(1u8));
+    }
+    available.min(target)
+}
+
+/// Grant a "max" side its share and consume one of the token's max-side slots
+/// for this tick.
+pub fn take_max_share(
+    max_sides_total: &HashMap<Address, u32>,
+    max_sides_remaining: &mut HashMap<Address, u32>,
+    token: Address,
+    budget: &FundedInputBudget,
+    reusable_input: U256,
+) -> U256 {
+    let total = max_sides_total.get(&token).copied().unwrap_or(1).max(1);
+    let remaining = max_sides_remaining.get(&token).copied().unwrap_or(1).max(1);
+    let grant = max_input_share(budget, reusable_input, total, remaining);
+    max_sides_remaining.insert(token, remaining - 1);
+    grant
 }
 
 /// `min(balance, Permit2 allowance)` on-chain minus nothing yet — the fresh
@@ -65,7 +150,6 @@ async fn read_funded_budget(
     Ok(FundedInputBudget {
         funded: balance.min(allowance),
         committed,
-        reserved: U256::ZERO,
     })
 }
 
@@ -115,20 +199,20 @@ pub async fn funded_input_cap(
     configured: InputLiquidity,
     reusable_input: U256,
     dry_run: bool,
-    funded_inputs: &mut HashMap<Address, FundedInputBudget>,
+    budgets: &mut TickBudgets,
     pair: &str,
     label: &str,
 ) -> Option<u128> {
-    if !funded_inputs.contains_key(&token) {
+    if !budgets.funded_inputs.contains_key(&token) {
         match read_funded_budget(indexer, wallet, chain_id, maker, token, permit2).await {
             Ok(budget) => {
-                funded_inputs.insert(token, budget);
+                budgets.funded_inputs.insert(token, budget);
             }
             // `{:#}` prints the context chain ("could not read committed
             // input: <cause>"), preserving which read failed.
             Err(e) if dry_run => {
                 warn!(pair = %pair, label, error = %format!("{e:#}"), "could not read funded budget; using configured size for dry-run");
-                funded_inputs.insert(
+                budgets.funded_inputs.insert(
                     token,
                     FundedInputBudget {
                         funded: fallback_liquidity(configured),
@@ -143,9 +227,22 @@ pub async fn funded_input_cap(
         }
     }
 
-    let budget = funded_inputs.get(&token).copied().unwrap_or_default();
-    let available = available_funded_input(&budget, reusable_input);
-    let capped = match cap_input_liquidity(configured, available) {
+    let budget = budgets
+        .funded_inputs
+        .get(&token)
+        .copied()
+        .unwrap_or_default();
+    let granted = match configured {
+        InputLiquidity::Max => take_max_share(
+            &budgets.max_sides_total,
+            &mut budgets.max_sides_remaining,
+            token,
+            &budget,
+            reusable_input,
+        ),
+        InputLiquidity::Exact(_) => available_funded_input(&budget, reusable_input),
+    };
+    let capped = match cap_input_liquidity(configured, granted) {
         Ok(capped) => capped,
         Err(e) => {
             warn!(pair = %pair, label, error = %e, "funded input liquidity is too large; skipping side");
@@ -161,7 +258,6 @@ pub async fn funded_input_cap(
                 capped,
                 funded = %budget.funded,
                 committed = %budget.committed,
-                reserved = %budget.reserved,
                 reusable = %reusable_input,
                 "capping order liquidity to remaining funded input"
             );
@@ -175,24 +271,24 @@ pub fn available_funded_input(budget: &FundedInputBudget, reusable_input: U256) 
         .funded
         .saturating_add(reusable_input)
         .saturating_sub(budget.committed)
-        .saturating_sub(budget.reserved)
 }
 
-pub fn reserve_funded_input(
+/// Update the tick budget after a side posts: the old live input is superseded
+/// by the drafted input, so later sides see the post-replacement book.
+pub fn record_funded_input_replacement(
     funded_inputs: &mut HashMap<Address, FundedInputBudget>,
     token: Address,
-    amount: U256,
+    drafted_input: U256,
+    reusable_input: U256,
 ) {
-    if amount == U256::ZERO {
+    if drafted_input == reusable_input {
         return;
     }
     let budget = funded_inputs.entry(token).or_default();
-    budget.reserved = budget.reserved.saturating_add(amount);
-}
-
-/// Only the increment over the side's reusable live input needs fresh budget.
-pub fn replacement_reservation(drafted_input: U256, reusable_input: U256) -> U256 {
-    drafted_input.saturating_sub(reusable_input)
+    budget.committed = budget
+        .committed
+        .saturating_sub(reusable_input)
+        .saturating_add(drafted_input);
 }
 
 #[cfg(test)]
@@ -237,7 +333,6 @@ mod tests {
         let budget = FundedInputBudget {
             funded: U256::from(4_000u64),
             committed: U256::from(8_000u64),
-            reserved: U256::ZERO,
         };
 
         assert_eq!(
@@ -251,7 +346,6 @@ mod tests {
         let budget = FundedInputBudget {
             funded: U256::from(4_000u64),
             committed: U256::from(4_000u64),
-            reserved: U256::ZERO,
         };
 
         assert_eq!(
@@ -261,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn reserving_funded_input_decrements_a_shared_token_budget() {
+    fn recording_replacement_updates_the_shared_token_budget() {
         let token: Address = "0x00000000000000000000000000000000000000bb"
             .parse()
             .unwrap();
@@ -270,32 +364,212 @@ mod tests {
             FundedInputBudget {
                 funded: U256::from(75u64),
                 committed: U256::ZERO,
-                reserved: U256::ZERO,
             },
         )]);
 
-        reserve_funded_input(&mut funded_inputs, token, U256::from(50u64));
+        record_funded_input_replacement(&mut funded_inputs, token, U256::from(50u64), U256::ZERO);
         assert_eq!(
             available_funded_input(&funded_inputs[&token], U256::ZERO),
             U256::from(25u64)
         );
 
-        reserve_funded_input(&mut funded_inputs, token, U256::from(50u64));
+        record_funded_input_replacement(
+            &mut funded_inputs,
+            token,
+            U256::from(25u64),
+            U256::from(50u64),
+        );
         assert_eq!(
             available_funded_input(&funded_inputs[&token], U256::ZERO),
-            U256::ZERO
+            U256::from(50u64)
         );
     }
 
     #[test]
-    fn replacement_reservation_only_charges_the_incremental_delta() {
+    fn max_share_splits_the_funded_balance_evenly_across_sides() {
+        // Cold start: two max sides on one token, nothing committed yet.
+        let budget = FundedInputBudget {
+            funded: U256::from(10_000u64),
+            committed: U256::ZERO,
+        };
         assert_eq!(
-            replacement_reservation(U256::from(100u64), U256::from(75u64)),
-            U256::from(25u64)
+            max_input_share(&budget, U256::ZERO, 2, 2),
+            U256::from(5_000u64)
         );
+
+        // The second side draws after the first posted its half.
+        let budget = FundedInputBudget {
+            funded: U256::from(10_000u64),
+            committed: U256::from(5_000u64),
+        };
         assert_eq!(
-            replacement_reservation(U256::from(75u64), U256::from(100u64)),
-            U256::ZERO
+            max_input_share(&budget, U256::ZERO, 2, 1),
+            U256::from(5_000u64)
         );
+    }
+
+    #[test]
+    fn max_share_keeps_a_sides_live_input_when_nothing_is_free() {
+        // Steady state: both sides hold half, the whole balance is committed.
+        let budget = FundedInputBudget {
+            funded: U256::from(10_000u64),
+            committed: U256::from(10_000u64),
+        };
+        assert_eq!(
+            max_input_share(&budget, U256::from(5_000u64), 2, 2),
+            U256::from(5_000u64)
+        );
+    }
+
+    #[test]
+    fn max_share_splits_a_topped_up_balance_without_shrinking_either_side() {
+        // Both sides hold 5k, then the wallet receives 4k more.
+        let budget = FundedInputBudget {
+            funded: U256::from(14_000u64),
+            committed: U256::from(10_000u64),
+        };
+        assert_eq!(
+            max_input_share(&budget, U256::from(5_000u64), 2, 2),
+            U256::from(7_000u64)
+        );
+    }
+
+    #[test]
+    fn max_share_rebalances_when_one_side_holds_the_full_balance() {
+        let token: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let mut funded_inputs = HashMap::from([(
+            token,
+            FundedInputBudget {
+                funded: U256::from(10_000u64),
+                committed: U256::from(10_000u64),
+            },
+        )]);
+
+        let first_grant = max_input_share(&funded_inputs[&token], U256::from(10_000u64), 2, 2);
+        assert_eq!(first_grant, U256::from(5_000u64));
+        record_funded_input_replacement(
+            &mut funded_inputs,
+            token,
+            first_grant,
+            U256::from(10_000u64),
+        );
+
+        assert_eq!(
+            max_input_share(&funded_inputs[&token], U256::ZERO, 2, 1),
+            U256::from(5_000u64)
+        );
+    }
+
+    #[test]
+    fn max_share_with_one_side_takes_the_full_available_budget() {
+        let budget = FundedInputBudget {
+            funded: U256::from(10_000u64),
+            committed: U256::from(4_000u64),
+        };
+        assert_eq!(
+            max_input_share(&budget, U256::from(4_000u64), 1, 1),
+            available_funded_input(&budget, U256::from(4_000u64))
+        );
+    }
+
+    #[test]
+    fn max_share_deficit_lands_on_the_first_side_to_requote() {
+        // Balance fell below the live commitments: no immediately postable budget, and the
+        // side shrinks to what the wallet can still back.
+        let budget = FundedInputBudget {
+            funded: U256::from(8_000u64),
+            committed: U256::from(10_000u64),
+        };
+        assert_eq!(
+            max_input_share(&budget, U256::from(5_000u64), 2, 2),
+            U256::from(3_000u64)
+        );
+    }
+
+    #[test]
+    fn taking_a_max_share_consumes_one_side_slot_per_tick() {
+        let token: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let mut remaining = HashMap::from([(token, 2u32)]);
+        let budget = FundedInputBudget {
+            funded: U256::from(10_000u64),
+            committed: U256::ZERO,
+        };
+
+        let total = remaining.clone();
+        assert_eq!(
+            take_max_share(&total, &mut remaining, token, &budget, U256::ZERO),
+            U256::from(5_000u64)
+        );
+        assert_eq!(remaining[&token], 1);
+
+        // An unknown or exhausted counter behaves like a single max side.
+        let other: Address = "0x00000000000000000000000000000000000000ab"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            take_max_share(&HashMap::new(), &mut remaining, other, &budget, U256::ZERO),
+            U256::from(10_000u64)
+        );
+    }
+
+    #[test]
+    fn count_max_sides_groups_enabled_max_sides_by_input_token() {
+        let toml = r#"
+            chain_id = 8453
+            rpc_url = "http://x"
+            indexer_url = "http://x"
+            permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+            reactor = "0x0000000000000000000000000000000000000000"
+            tick_interval_secs = 5
+            [feed]
+            url = "http://x"
+            staleness_secs = 30
+            [[pools]]
+            collateral = "0x00000000000000000000000000000000000000a1"
+            collateral_decimals = 6
+            debt = "0x00000000000000000000000000000000000000dd"
+            debt_decimals = 6
+            ttl_secs = 30
+            refresh_threshold_bps = 10
+            buy_offset_bps = 150
+            buy_total_liquidity_debt = "max"
+            buy_min_slice_debt = "10000000"
+            sell_offset_bps = 150
+            sell_total_liquidity_collateral = "max"
+            sell_min_slice_debt = "10000000"
+            [[pools]]
+            collateral = "0x00000000000000000000000000000000000000a2"
+            collateral_decimals = 6
+            debt = "0x00000000000000000000000000000000000000dd"
+            debt_decimals = 6
+            ttl_secs = 30
+            refresh_threshold_bps = 10
+            buy_offset_bps = 150
+            buy_total_liquidity_debt = "max"
+            buy_min_slice_debt = "10000000"
+            sell_offset_bps = 150
+            sell_order_size_collateral = "2000000000"
+        "#;
+        let cfg = crate::config::Config::from_toml(toml).unwrap();
+
+        let counts = count_max_sides(&cfg);
+
+        let debt: Address = "0x00000000000000000000000000000000000000dd"
+            .parse()
+            .unwrap();
+        let coll_a1: Address = "0x00000000000000000000000000000000000000a1"
+            .parse()
+            .unwrap();
+        let coll_a2: Address = "0x00000000000000000000000000000000000000a2"
+            .parse()
+            .unwrap();
+        // Two pools bid "max" with the same debt token; only pool A1 asks "max".
+        assert_eq!(counts.get(&debt), Some(&2));
+        assert_eq!(counts.get(&coll_a1), Some(&1));
+        assert_eq!(counts.get(&coll_a2), None);
     }
 }

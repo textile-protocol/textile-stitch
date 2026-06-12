@@ -15,8 +15,8 @@ use tracing::{info, warn};
 
 use crate::config::{PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
 use crate::funding::{
-    funded_input_cap, parse_input_liquidity, parse_u128, replacement_reservation,
-    reserve_funded_input, u256_to_u128, FundedInputBudget, InputLiquidity,
+    funded_input_cap, parse_input_liquidity, parse_u128, record_funded_input_replacement,
+    u256_to_u128, InputLiquidity, TickBudgets,
 };
 use crate::ladder::balanced_ladder;
 use crate::poster::{drafted_input, OrderDraft, Poster};
@@ -161,12 +161,12 @@ pub enum SideOutcome {
 
 /// Quote one side of one pool for this tick. Mirrors the historical inline
 /// flow exactly: requote gate → sizes → drafts → persist ledger → post →
-/// rotate any spent nonce → record posted inputs → reserve funded input.
+/// rotate any spent nonce → record posted inputs → account for the replacement.
 #[allow(clippy::too_many_arguments)]
 pub async fn quote_side(
     ctx: &TickCtx<'_>,
     state: &mut QuoteState,
-    funded_inputs: &mut HashMap<Address, FundedInputBudget>,
+    budgets: &mut TickBudgets,
     pool: &PoolConfig,
     pair: &str,
     debt: Address,
@@ -196,7 +196,7 @@ pub async fn quote_side(
     let (input_token, output_token) = side.tokens(debt, collateral);
     let sizes = side_sizes(
         ctx,
-        funded_inputs,
+        budgets,
         pool,
         pair,
         side,
@@ -266,10 +266,11 @@ pub async fn quote_side(
             label,
             "could not persist posted slot inputs",
         );
-        reserve_funded_input(
-            funded_inputs,
+        record_funded_input_replacement(
+            &mut budgets.funded_inputs,
             input_token,
-            replacement_reservation(input_reserved, reusable_input),
+            input_reserved,
+            reusable_input,
         );
         info!(pair = %pair, orders = result.posted, "posted {label} ladder");
         state.last_quote.insert(key_id, (price, now));
@@ -283,7 +284,7 @@ pub async fn quote_side(
 #[allow(clippy::too_many_arguments)]
 async fn side_sizes(
     ctx: &TickCtx<'_>,
-    funded_inputs: &mut HashMap<Address, FundedInputBudget>,
+    budgets: &mut TickBudgets,
     pool: &PoolConfig,
     pair: &str,
     side: Side,
@@ -307,16 +308,8 @@ async fn side_sizes(
                 return Vec::new();
             }
         };
-        let Some(funded_total) = capped_input(
-            ctx,
-            funded_inputs,
-            pair,
-            side,
-            total,
-            input_token,
-            reusable_input,
-        )
-        .await
+        let Some(funded_total) =
+            capped_input(ctx, budgets, pair, side, total, input_token, reusable_input).await
         else {
             return Vec::new();
         };
@@ -344,19 +337,11 @@ async fn side_sizes(
         balanced_ladder(total_debt, min, side.max_orders(pool))
     } else if let Some(size_str) = side.single_size(pool) {
         match parse_input_liquidity(size_str, side.single_size_field_name()) {
-            Ok(size) => capped_input(
-                ctx,
-                funded_inputs,
-                pair,
-                side,
-                size,
-                input_token,
-                reusable_input,
-            )
-            .await
-            .filter(|size| *size > 0)
-            .map(|size| vec![size])
-            .unwrap_or_default(),
+            Ok(size) => capped_input(ctx, budgets, pair, side, size, input_token, reusable_input)
+                .await
+                .filter(|size| *size > 0)
+                .map(|size| vec![size])
+                .unwrap_or_default(),
             Err(e) => {
                 warn!(pair = %pair, error = %e, "invalid {}; skipping {label}", side.single_size_field_name());
                 Vec::new()
@@ -371,7 +356,7 @@ async fn side_sizes(
 #[allow(clippy::too_many_arguments)]
 async fn capped_input(
     ctx: &TickCtx<'_>,
-    funded_inputs: &mut HashMap<Address, FundedInputBudget>,
+    budgets: &mut TickBudgets,
     pair: &str,
     side: Side,
     configured: InputLiquidity,
@@ -389,7 +374,7 @@ async fn capped_input(
         configured,
         reusable_input,
         poster.dry_run,
-        funded_inputs,
+        budgets,
         pair,
         side.label(),
     )

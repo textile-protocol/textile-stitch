@@ -28,7 +28,7 @@ use stitch_bot::closer::runner::{close_pool_once, CloseOutcome, CloserPool};
 use stitch_bot::closer::strategy::{PoolParams, StrategyConfig};
 use stitch_bot::config::{Config, PoolConfig};
 use stitch_bot::feed::{HttpFeed, PriceFeed};
-use stitch_bot::funding::FundedInputBudget;
+use stitch_bot::funding::{count_max_sides, TickBudgets};
 use stitch_bot::indexer::Indexer;
 use stitch_bot::maker::{quote_side, QuoteState, Side, SideOutcome, TickCtx};
 use stitch_bot::poster::Poster;
@@ -390,6 +390,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         wallet: &wallet,
         state_path: &slot_nonce_state_path,
     };
+    // Sides quoting "max" liquidity target an even share of each token's funded
+    // balance instead of letting the first corridor keep draining it.
+    let max_sides_by_token = count_max_sides(&cfg);
     let mut interval = tokio::time::interval(Duration::from_secs(cfg.tick_interval_secs.max(1)));
 
     // Exit cleanly on Ctrl-C / SIGTERM. We only check between ticks, so a signal
@@ -407,7 +410,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             _ = interval.tick() => {}
         }
         let now = unix_now();
-        let mut funded_inputs: HashMap<Address, FundedInputBudget> = HashMap::new();
+        let mut budgets = TickBudgets::new(max_sides_by_token.clone());
 
         'pools: for pool in &cfg.pools {
             // Each pool prices off its own feed (or the bot-level default).
@@ -447,7 +450,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                 let outcome = quote_side(
                     &ctx,
                     &mut state,
-                    &mut funded_inputs,
+                    &mut budgets,
                     pool,
                     &pair,
                     debt,
