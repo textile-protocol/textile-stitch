@@ -35,7 +35,10 @@ pub struct OrderDraft {
 #[derive(Default)]
 pub struct PostResult {
     pub posted: usize,
-    pub spent_nonce: Option<u64>,
+    /// Every nonce the indexer reported as already spent. The whole atomic
+    /// batch is rejected when any one slot is spent, so we rotate all of them
+    /// at once rather than one-per-tick.
+    pub spent_nonces: Vec<u64>,
     /// Unix-seconds order deadline the posted batch was signed with; 0 when
     /// nothing was posted. The slot ledger records it so a replacement only
     /// reuses input the indexer still counts as live.
@@ -103,7 +106,7 @@ impl Poster<'_> {
             }
             return PostResult {
                 posted: submissions.len(),
-                spent_nonce: None,
+                spent_nonces: Vec::new(),
                 deadline,
             };
         }
@@ -113,7 +116,7 @@ impl Poster<'_> {
                 info!(label, price, orders = ids.len(), "posted order batch");
                 PostResult {
                     posted: ids.len(),
-                    spent_nonce: None,
+                    spent_nonces: Vec::new(),
                     deadline,
                 }
             }
@@ -121,7 +124,7 @@ impl Poster<'_> {
                 warn!(label, error = %e, "batch post failed");
                 PostResult {
                     posted: 0,
-                    spent_nonce: spent_nonce_from_error(&e.to_string()),
+                    spent_nonces: spent_nonces_from_error(&e.to_string()),
                     deadline,
                 }
             }
@@ -136,18 +139,38 @@ pub fn drafted_input(drafts: &[OrderDraft]) -> U256 {
     })
 }
 
-/// Pull the nonce out of the indexer's "Permit2 nonce already spent: <n>"
-/// rejection. The marker must stay in sync with the API's `submitFillerOrder`
-/// validation message (api/src/services/fillerOrders).
-pub fn spent_nonce_from_error(error: &str) -> Option<u64> {
+/// Pull every nonce out of the indexer's "Permit2 nonce already spent: <n>,
+/// <n>, ..." rejection. The whole atomic batch is rejected when any slot is
+/// spent, and the indexer names all of them, so we rotate the full set in one
+/// pass. The marker must stay in sync with the API's `submitFillerOrders`
+/// validation message (api/src/services/fillerOrders/submit.ts). A single-nonce
+/// message (older API) parses to a one-element vec.
+pub fn spent_nonces_from_error(error: &str) -> Vec<u64> {
     const MARKER: &str = "Permit2 nonce already spent:";
-    let tail = error.split(MARKER).nth(1)?;
-    let digits: String = tail
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
+    let Some(tail) = error.split(MARKER).nth(1) else {
+        return Vec::new();
+    };
+    // Read the comma/space-separated digit runs right after the marker, stopping
+    // at the first char that isn't a digit or list separator (e.g. the closing
+    // quote of the JSON message).
+    let mut nonces = Vec::new();
+    let mut current = String::new();
+    for c in tail.chars() {
+        if c.is_ascii_digit() {
+            current.push(c);
+        } else if c == ',' || c.is_whitespace() {
+            if let Ok(nonce) = current.parse::<u64>() {
+                nonces.push(nonce);
+            }
+            current.clear();
+        } else {
+            break;
+        }
+    }
+    if let Ok(nonce) = current.parse::<u64>() {
+        nonces.push(nonce);
+    }
+    nonces
 }
 
 #[cfg(test)]
@@ -159,6 +182,23 @@ mod tests {
         let error =
             r#"indexer rejected order batch: [{"message":"Permit2 nonce already spent: 1002"}]"#;
 
-        assert_eq!(spent_nonce_from_error(error), Some(1002));
+        assert_eq!(spent_nonces_from_error(error), vec![1002]);
+    }
+
+    #[test]
+    fn every_spent_nonce_in_a_batch_rejection_is_parsed() {
+        let error = r#"indexer rejected order batch: [{"message":"Permit2 nonce already spent: 1781638093041, 1781638093043, 1781638093044"}]"#;
+
+        assert_eq!(
+            spent_nonces_from_error(error),
+            vec![1781638093041, 1781638093043, 1781638093044]
+        );
+    }
+
+    #[test]
+    fn a_rejection_without_the_marker_yields_no_nonces() {
+        let error = "indexer rejected order batch: [{\"message\":\"Order batch is not funded\"}]";
+
+        assert!(spent_nonces_from_error(error).is_empty());
     }
 }

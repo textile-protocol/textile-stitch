@@ -22,7 +22,7 @@ use crate::ladder::balanced_ladder;
 use crate::poster::{drafted_input, OrderDraft, Poster};
 use crate::quote::{ask_price, bid_price, buy_amounts_at, sell_amounts_at, Spread};
 use crate::slots::{
-    forget_spent_slot_nonce, remember_slot_inputs, reusable_slot_input, save_slot_nonce_state,
+    forget_spent_slot_nonces, remember_slot_inputs, reusable_slot_input, save_slot_nonce_state,
     slot_nonce,
 };
 use crate::tick::should_requote_now;
@@ -244,13 +244,13 @@ pub async fn quote_side(
             price,
         )
         .await;
-    if let Some(spent_nonce) = result.spent_nonce {
-        forget_spent_slot_nonce(
+    if !result.spent_nonces.is_empty() {
+        forget_spent_slot_nonces(
             &mut state.slot_nonces,
             &mut state.slot_inputs,
             &mut state.slot_deadlines,
             &drafts,
-            spent_nonce,
+            &result.spent_nonces,
         );
         persist_slot_state(
             ctx,

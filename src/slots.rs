@@ -51,17 +51,19 @@ pub fn slot_nonce(
     })
 }
 
-/// Drop the slot whose nonce the chain reports as spent, so the next quote
-/// mints a fresh nonce for that slot only.
-pub fn forget_spent_slot_nonce(
+/// Drop every slot whose nonce the indexer reports as spent, so the next quote
+/// mints fresh nonces for exactly those slots. The whole atomic batch is
+/// rejected when any slot is spent, so rotating all of them at once lets the
+/// side recover in one tick instead of one spent nonce per tick.
+pub fn forget_spent_slot_nonces(
     slot_nonces: &mut HashMap<String, u64>,
     slot_inputs: &mut HashMap<String, String>,
     slot_deadlines: &mut HashMap<String, u64>,
     drafts: &[OrderDraft],
-    spent_nonce: u64,
+    spent_nonces: &[u64],
 ) {
     for draft in drafts {
-        if draft.nonce == spent_nonce {
+        if spent_nonces.contains(&draft.nonce) {
             slot_nonces.remove(&draft.slot_key);
             slot_inputs.remove(&draft.slot_key);
             slot_deadlines.remove(&draft.slot_key);
@@ -299,12 +301,12 @@ mod tests {
             },
         ];
 
-        forget_spent_slot_nonce(
+        forget_spent_slot_nonces(
             &mut slot_nonces,
             &mut slot_inputs,
             &mut slot_deadlines,
             &drafts,
-            1002,
+            &[1002],
         );
 
         assert_eq!(slot_nonces.get("buy:pair:bid:0"), Some(&1001));
@@ -313,6 +315,42 @@ mod tests {
         assert!(!slot_inputs.contains_key("buy:pair:bid:1"));
         assert!(slot_deadlines.contains_key("buy:pair:bid:0"));
         assert!(!slot_deadlines.contains_key("buy:pair:bid:1"));
+    }
+
+    #[test]
+    fn forgetting_rotates_every_spent_slot_in_one_pass() {
+        let mut slot_nonces = HashMap::new();
+        let mut slot_inputs = HashMap::new();
+        for (slot, nonce) in [
+            ("sell:pair:ask:0", 2001u64),
+            ("sell:pair:ask:1", 2002),
+            ("sell:pair:ask:2", 2003),
+        ] {
+            slot_nonces.insert(slot.to_string(), nonce);
+            slot_inputs.insert(slot.to_string(), "1".to_string());
+        }
+        let mut slot_deadlines = deadlines_for(&slot_inputs, LIVE_DEADLINE);
+        let drafts = vec![
+            draft(2001, "sell:pair:ask:0", 1),
+            draft(2002, "sell:pair:ask:1", 1),
+            draft(2003, "sell:pair:ask:2", 1),
+        ];
+
+        // The indexer named two of the three slots as spent in one rejection.
+        forget_spent_slot_nonces(
+            &mut slot_nonces,
+            &mut slot_inputs,
+            &mut slot_deadlines,
+            &drafts,
+            &[2001, 2003],
+        );
+
+        // Both spent slots rotate at once; the live one keeps its nonce.
+        assert!(!slot_nonces.contains_key("sell:pair:ask:0"));
+        assert_eq!(slot_nonces.get("sell:pair:ask:1"), Some(&2002));
+        assert!(!slot_nonces.contains_key("sell:pair:ask:2"));
+        assert!(!slot_inputs.contains_key("sell:pair:ask:0"));
+        assert!(!slot_deadlines.contains_key("sell:pair:ask:2"));
     }
 
     #[test]
