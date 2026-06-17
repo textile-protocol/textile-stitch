@@ -287,10 +287,21 @@ pub fn is_underutilized(configured: InputLiquidity, fundable: U256) -> bool {
 }
 
 pub fn available_funded_input(budget: &FundedInputBudget, reusable_input: U256) -> U256 {
+    // A single side can never back more than the wallet's whole deliverable
+    // balance. With a consistent read `committed >= reusable_input` (the orders
+    // we're superseding are part of committed), so funded + reusable - committed
+    // already lands at or below funded. But when the committed-input read is
+    // stale or low — e.g. the indexer briefly timed out and returned a smaller
+    // figure — the subtraction balloons toward funded + reusable, and the bot
+    // drafts a ladder it can't fund. The reactor then rejects the whole batch
+    // ("Order batch is not funded: requires N, maker can deliver N/2"), leaving
+    // the side offline. Cap at `funded` so a bad committed read can't push a
+    // side past what the wallet can actually deliver.
     budget
         .funded
         .saturating_add(reusable_input)
         .saturating_sub(budget.committed)
+        .min(budget.funded)
 }
 
 /// Update the tick budget after a side posts: the old live input is superseded
@@ -329,6 +340,36 @@ mod tests {
         assert_eq!(
             cap_input_liquidity(InputLiquidity::Exact(1_000_000), U256::from(500_000u64)).unwrap(),
             500_000
+        );
+    }
+
+    #[test]
+    fn available_input_subtracts_committed_on_a_consistent_read() {
+        // Healthy read: committed (80) includes the 30 we're reusing, so
+        // 100 + 30 - 80 = 50 is free for this side.
+        let budget = FundedInputBudget {
+            funded: U256::from(100u64),
+            committed: U256::from(80u64),
+        };
+        assert_eq!(
+            available_funded_input(&budget, U256::from(30u64)),
+            U256::from(50u64)
+        );
+    }
+
+    #[test]
+    fn available_input_never_exceeds_funded_on_a_stale_committed_read() {
+        // The indexer read timed out and under-reported committed as 0, so
+        // funded (100) + reusable (100) - committed (0) would be 200 — twice the
+        // wallet's deliverable balance. Capped at funded, the side drafts at most
+        // 100, so the reactor can't reject the batch as "not funded".
+        let budget = FundedInputBudget {
+            funded: U256::from(100u64),
+            committed: U256::ZERO,
+        };
+        assert_eq!(
+            available_funded_input(&budget, U256::from(100u64)),
+            U256::from(100u64)
         );
     }
 
