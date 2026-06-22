@@ -13,7 +13,13 @@ tick_interval_secs = 5
 # Default price feed: used by any pool that doesn't set its own `feed_url`.
 [feed]
 url = "https://your-feed.example/cngn-usdt"
-staleness_secs = 30
+# The cNGN feed serves a Bybit-corrected center that re-samples every 3 min, and
+# its `timestamp` is the sample's observation time (not request time), so it ages
+# between ticks. Keep this above the sample cadence or the bot rejects fresh
+# quotes as stale. 900s matches the feed's own 15-min freshness bound (past which
+# /api/price falls back to a fresh Monierate mid), so the feed, not the bot,
+# enforces staleness.
+staleness_secs = 900
 
 # One block per corridor you serve. Add more [[pools]] for other pairs/chains.
 # Pairs with different prices (cNGN, COPM, …) MUST each set `feed_url` — one
