@@ -1,0 +1,52 @@
+# Textile Stitch — cNGN/USDT on BNB Smart Chain (chain 56), ZERO operator spread.
+#
+# This config makes the bot quote at the live feed mid with no profit margin, so a
+# customer's swap rate equals the audit dashboard's "Our quote (±2bps)":
+#   - the feed center is the single source of truth (/api/price, the Bybit taker mid),
+#   - each side is quoted 1 bps off the mid  = the 1 bps Stitch fee (NOT a margin),
+#   - the reactor's SellFirstFee takes the other ~1 bps on-chain (the "indexer" leg),
+#   => the customer lands at center ± ~2 bps, matching the audit.
+#
+# Set both *_offset_bps to 0 for literally zero (swap = center ± the on-chain fee only).
+#
+# The wallet key is NOT here; export STITCH_PRIVATE_KEY in the environment.
+
+chain_id = 56
+rpc_url = "https://bsc-dataseed.bnbchain.org"            # any BSC mainnet RPC
+indexer_url = "https://api.textilecredit.com"
+permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor = "0xe03261c0436DB575F92F09EdDF3591E2566B7D97"   # SETTLEMENT_V3_FILLER_REACTOR (BSC)
+subgraph_url = "https://api.textilecredit.com/subgraph?chainId={...}"
+tick_interval_secs = 5
+
+# Single source of truth: the live cNGN center the API publishes (now the plain
+# Bybit taker mid — no bias, no clamp, no smoothing). The audit dashboard reads
+# this exact endpoint, so dashboard == feed == what the bot quotes around.
+[feed]
+url = "https://api.textilecredit.com/api/price?pair=cngn-usdt&chainId=56"
+staleness_secs = 900
+
+[[pools]]
+collateral = "0xa8AEA66B361a8d53e8865c62D142167Af28Af058"  # cNGN on BSC (soft asset)
+collateral_decimals = 6                                     # cNGN = 6 dp on BSC
+debt = "0x55d398326f99059fF775485246999027B3197955"        # USDT on BSC (stable)
+debt_decimals = 18                                          # BSC USDT = 18 dp (NOT 6)
+
+# ----- ZERO operator spread. 1 bps per side = the Stitch fee only; no margin. -----
+# Buy low: bid 1 bps below the mid, paying USDT for cNGN.
+buy_offset_bps = 1
+buy_total_liquidity_debt = "max"          # quote all currently funded USDT
+buy_min_slice_debt = "10000000000000000000"   # 10 USDT smallest slice (18 dp)
+buy_max_orders = 40
+
+# Sell high: ask 1 bps above the mid, selling cNGN for USDT. Needs cNGN inventory
+# + a Permit2 approval on cNGN.
+sell_offset_bps = 1
+sell_total_liquidity_collateral = "max"        # quote all currently funded cNGN
+sell_min_slice_debt = "10000000000000000000"   # 10 USDT-equivalent smallest slice (18 dp)
+sell_max_orders = 40
+
+ttl_secs = 120
+# Re-quote when the feed moves >0.03%. Tighter than the default 10 bps so a
+# near-zero-spread quote tracks the feed closely; raise it to cut re-post gas.
+refresh_threshold_bps = 3
