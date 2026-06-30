@@ -9,7 +9,10 @@ use crate::app::StitchApp;
 pub fn show(app: &mut StitchApp, ctx: &egui::Context) {
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.add_space(8.0);
-        ui.heading("Set up Stitch");
+        ui.horizontal(|ui| {
+            crate::app::show_header_icon(ui, &app.icon);
+            ui.heading("Set up Stitch");
+        });
         ui.label("Pick a corridor and add your operator wallet to get started.");
         ui.add_space(16.0);
 

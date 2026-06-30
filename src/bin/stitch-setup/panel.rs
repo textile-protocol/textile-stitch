@@ -11,6 +11,7 @@ pub fn show(app: &mut StitchApp, ctx: &egui::Context) {
     egui::TopBottomPanel::top("header").show(ctx, |ui| {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
+            crate::app::show_header_icon(ui, &app.icon);
             ui.heading("Stitch");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 status_pill(ui, app.status);

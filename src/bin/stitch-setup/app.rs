@@ -40,6 +40,8 @@ pub struct StitchApp {
     pub dry_run: bool,
     pub action_note: Option<String>,
     pub logs: Arc<Mutex<VecDeque<String>>>,
+    /// Textile mark shown in the header (loaded once at startup).
+    pub icon: Option<egui::TextureHandle>,
     child: Option<Child>,
 }
 
@@ -55,7 +57,7 @@ fn default_gui_dir() -> PathBuf {
 }
 
 impl StitchApp {
-    pub fn new() -> Self {
+    pub fn new(icon: Option<egui::TextureHandle>) -> Self {
         let dir = default_gui_dir();
         let paths = setup::config_paths(&dir);
         let configured = setup::is_configured(&dir);
@@ -82,6 +84,7 @@ impl StitchApp {
             dry_run: false,
             action_note: None,
             logs: Arc::new(Mutex::new(VecDeque::new())),
+            icon,
             child: None,
         }
     }
@@ -201,6 +204,22 @@ impl StitchApp {
             }
             Err(e) => self.action_note = Some(format!("Command failed to start: {e}")),
         }
+    }
+}
+
+/// Header icon edge length, in points (roughly the heading's cap height).
+const HEADER_ICON_SIZE: f32 = 22.0;
+
+/// Draw the Textile mark at header size, if it loaded. Uses an explicit display
+/// size (the texture's own 256px size would otherwise render full-size) and
+/// centers it vertically against the heading text.
+pub fn show_header_icon(ui: &mut egui::Ui, icon: &Option<egui::TextureHandle>) {
+    if let Some(tex) = icon {
+        let size = egui::vec2(HEADER_ICON_SIZE, HEADER_ICON_SIZE);
+        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+            tex.id(),
+            size,
+        )));
     }
 }
 

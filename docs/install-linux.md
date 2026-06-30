@@ -3,6 +3,21 @@
 Run Stitch from a release binary and keep it alive under systemd. For a no-terminal
 setup, the [desktop app](../README.md#option-2--desktop-app) also runs on Linux.
 
+To get a menu entry and icon for the desktop app, install the bundled
+`stitch.desktop` and `stitch.png` into your XDG dirs (the launcher's `Icon=stitch`
+resolves from the icon theme):
+
+```bash
+install -Dm644 stitch.png ~/.local/share/icons/hicolor/256x256/apps/stitch.png
+desktop-file-install --dir="$HOME/.local/share/applications" stitch.desktop \
+  || install -Dm644 stitch.desktop ~/.local/share/applications/stitch.desktop
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+gtk-update-icon-cache ~/.local/share/icons/hicolor 2>/dev/null || true
+```
+
+Put `stitch-setup` on your `PATH` (or edit `Exec=` to an absolute path) so the
+launcher can find it.
+
 ## 1. Install the binary
 
 ```bash

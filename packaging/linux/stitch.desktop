@@ -3,5 +3,7 @@ Type=Application
 Name=Stitch
 Comment=Set up and run the Textile Stitch operator bot
 Exec=stitch-setup
+Icon=stitch
 Terminal=false
+StartupWMClass=stitch
 Categories=Finance;Utility;

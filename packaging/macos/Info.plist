@@ -9,6 +9,7 @@
   <key>CFBundleVersion</key>         <string>0.1.0</string>
   <key>CFBundleShortVersionString</key> <string>0.1.0</string>
   <key>CFBundleExecutable</key>      <string>stitch-setup</string>
+  <key>CFBundleIconFile</key>        <string>Stitch</string>
   <key>CFBundlePackageType</key>     <string>APPL</string>
   <key>NSHighResolutionCapable</key> <true/>
 </dict>

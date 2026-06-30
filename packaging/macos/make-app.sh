@@ -23,6 +23,12 @@ else
   echo "warning: stitch bot binary not found at $STITCH_BIN; the app's Start/Approve/Update will be disabled until stitch is on PATH" >&2
 fi
 
+# App icon (referenced by CFBundleIconFile in Info.plist).
+if [ -f "$HERE/Stitch.icns" ]; then
+  mkdir -p "$APP/Contents/Resources"
+  cp "$HERE/Stitch.icns" "$APP/Contents/Resources/Stitch.icns"
+fi
+
 # Ad-hoc code-sign (sign identity "-") so Gatekeeper offers the normal
 # right-click -> Open / "Open Anyway" path instead of rejecting a wholly unsigned
 # download as "damaged". This is NOT a Developer ID signature: a downloaded copy
