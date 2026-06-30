@@ -2,13 +2,29 @@ name: macOS app bundle
 
 # Build a prebuilt, double-clickable Stitch.app and attach it to the release.
 # Kept separate from the cargo-dist-generated release.yml so `dist generate`
-# never clobbers it. The .app is ad-hoc signed (no Apple Developer ID), so a
-# downloaded copy still shows the unidentified-developer prompt: open it once
-# with right-click -> Open, or System Settings -> Privacy & Security -> Open Anyway.
+# never clobbers it.
+#
+# Signing is automatic based on which repo secrets are set:
+#   - No secrets        -> ad-hoc signed (make-app.sh). A downloaded copy still
+#                          needs right-click -> Open / "Open Anyway" the first time.
+#   - Developer ID set  -> signed with your Developer ID Application identity.
+#   - Notary creds set  -> additionally notarized + stapled, so it opens with no
+#                          Gatekeeper prompt at all (requires the Developer ID too).
+# Secrets (all optional): MACOS_CERT_P12 (base64 .p12), MACOS_CERT_PASSWORD,
+# MACOS_NOTARY_API_KEY (base64 App Store Connect .p8), MACOS_NOTARY_API_KEY_ID,
+# MACOS_NOTARY_API_ISSUER.
+#
+# Signing secrets are scoped to the import/notarize steps only — never exposed to
+# `cargo build`, so a compromised dependency build script can't read them.
 on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach Stitch.app.zip to (blank = upload a workflow artifact only)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -18,10 +34,29 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          # When attaching to a release tag, build from that tag's source. A
+          # manual dispatch with `tag` set but the ref left on the default
+          # branch would otherwise build from current main and clobber the
+          # release's Stitch.app.zip. Empty tag (or `release:`) falls back to
+          # the dispatch/release ref.
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # Expose only booleans (not the secret values) for later `if:` gates, so the
+      # secrets themselves never sit in env for the build step.
+      - name: Detect signing configuration
+        id: signing
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_NOTARY_API_KEY: ${{ secrets.MACOS_NOTARY_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${MACOS_CERT_P12:-}" ] && echo "have_cert=true" >> "$GITHUB_OUTPUT" || echo "have_cert=false" >> "$GITHUB_OUTPUT"
+          [ -n "${MACOS_NOTARY_API_KEY:-}" ] && echo "have_notary=true" >> "$GITHUB_OUTPUT" || echo "have_notary=false" >> "$GITHUB_OUTPUT"
 
       - name: Build universal binaries
         run: |
@@ -37,20 +72,79 @@ jobs:
             target/aarch64-apple-darwin/release/stitch-setup \
             target/x86_64-apple-darwin/release/stitch-setup
 
-      - name: Assemble and zip Stitch.app
+      - name: Import Developer ID signing certificate
+        if: ${{ steps.signing.outputs.have_cert == 'true' }}
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
           set -euo pipefail
-          packaging/macos/make-app.sh target/universal/stitch-setup dist target/universal/stitch
-          (cd dist && ditto -c -k --keepParent Stitch.app Stitch.app.zip)
+          KEYCHAIN="$RUNNER_TEMP/stitch-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Put our keychain first in the search list so codesign finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::MACOS_CERT_P12 imported but no 'Developer ID Application' identity was found in it."
+            exit 1
+          fi
+          echo "STITCH_CODESIGN_ID=$IDENTITY" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/cert.p12"
 
+      - name: Assemble Stitch.app
+        # make-app.sh signs with $STITCH_CODESIGN_ID when set (Developer ID),
+        # otherwise ad-hoc ("-").
+        run: packaging/macos/make-app.sh target/universal/stitch-setup dist target/universal/stitch
+
+      - name: Notarize and staple
+        if: ${{ steps.signing.outputs.have_notary == 'true' }}
+        env:
+          MACOS_NOTARY_API_KEY: ${{ secrets.MACOS_NOTARY_API_KEY }}
+          MACOS_NOTARY_API_KEY_ID: ${{ secrets.MACOS_NOTARY_API_KEY_ID }}
+          MACOS_NOTARY_API_ISSUER: ${{ secrets.MACOS_NOTARY_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          # Apple only notarizes Developer ID-signed software. If notary creds are
+          # set but signing fell back to ad-hoc, fail loudly instead of submitting
+          # an ad-hoc app that Apple will reject.
+          if [ -z "${STITCH_CODESIGN_ID:-}" ] || [ "${STITCH_CODESIGN_ID}" = "-" ]; then
+            echo "::error::MACOS_NOTARY_* is set but no Developer ID Application identity is available. Set MACOS_CERT_P12/MACOS_CERT_PASSWORD; Apple only notarizes Developer ID-signed apps."
+            exit 1
+          fi
+          echo "$MACOS_NOTARY_API_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent dist/Stitch.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$MACOS_NOTARY_API_KEY_ID" \
+            --issuer "$MACOS_NOTARY_API_ISSUER" \
+            --wait
+          xcrun stapler staple dist/Stitch.app
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      - name: Zip Stitch.app
+        run: (cd dist && ditto -c -k --keepParent Stitch.app Stitch.app.zip)
+
+      # The release workflow creates the GitHub Release with GITHUB_TOKEN, which
+      # does NOT fire `release: published`, so release.yml dispatches this
+      # workflow with the tag instead. Attach to that tag when we have one;
+      # otherwise (a bare manual run) just publish a workflow artifact.
       - name: Upload Stitch.app.zip to the release
-        if: github.event_name == 'release'
+        if: ${{ github.event_name == 'release' || inputs.tag != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/Stitch.app.zip --clobber
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" dist/Stitch.app.zip --clobber
 
       - name: Upload Stitch.app.zip as a workflow artifact
-        if: github.event_name == 'workflow_dispatch'
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag == '' }}
         uses: actions/upload-artifact@v4
         with:
           name: Stitch.app

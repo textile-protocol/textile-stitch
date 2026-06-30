@@ -29,9 +29,19 @@ fi
 # still shows the unidentified-developer prompt on first launch. Sign the nested
 # binaries before the bundle. Set STITCH_CODESIGN_ID to use a real identity.
 SIGN_ID="${STITCH_CODESIGN_ID:--}"
+# Notarization requires the Hardened Runtime. Enable it for real Developer ID
+# signing; ad-hoc ("-") bundles are never notarized, and hardened runtime can add
+# friction to a locally-built ad-hoc app, so skip it there.
+RUNTIME_OPT=""
+if [ "$SIGN_ID" != "-" ]; then
+  RUNTIME_OPT="--options runtime"
+fi
 if command -v codesign >/dev/null 2>&1; then
-  [ -f "$APP/Contents/MacOS/stitch" ] && codesign --force --sign "$SIGN_ID" "$APP/Contents/MacOS/stitch"
-  codesign --force --sign "$SIGN_ID" "$APP/Contents/MacOS/stitch-setup"
-  codesign --force --sign "$SIGN_ID" "$APP"
+  # shellcheck disable=SC2086  # RUNTIME_OPT is intentionally word-split (may be empty)
+  [ -f "$APP/Contents/MacOS/stitch" ] && codesign --force $RUNTIME_OPT --sign "$SIGN_ID" "$APP/Contents/MacOS/stitch"
+  # shellcheck disable=SC2086
+  codesign --force $RUNTIME_OPT --sign "$SIGN_ID" "$APP/Contents/MacOS/stitch-setup"
+  # shellcheck disable=SC2086
+  codesign --force $RUNTIME_OPT --sign "$SIGN_ID" "$APP"
 fi
 echo "Built $APP"

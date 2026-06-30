@@ -277,6 +277,11 @@ jobs:
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # actions: write is needed for the `gh workflow run` dispatch below; the
+    # job-level block overrides the workflow default (contents: write only).
+    permissions:
+      contents: write
+      actions: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -335,6 +340,34 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+      # The release above is created with GITHUB_TOKEN, so it does NOT fire the
+      # `release: published` event. Trigger the macOS app build explicitly
+      # (workflow_dispatch is exempt from that restriction) so Stitch.app.zip
+      # gets attached to this release.
+      - name: Build and attach the macOS Stitch.app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run macos-app.yml --ref "$TAG" -f tag="$TAG"
+          # `gh workflow run` is fire-and-forget. Locate the run we just dispatched
+          # (it runs on the tag ref, so its head branch is the tag) and wait for it,
+          # so a failed build / signing / notarization / upload turns this release
+          # red instead of leaving it green without Stitch.app.zip.
+          run_id=""
+          for _ in $(seq 1 12); do
+            run_id="$(gh run list --workflow=macos-app.yml --event=workflow_dispatch \
+              --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::dispatched the macOS app build but could not locate its run to wait on"
+            exit 1
+          fi
+          echo "Waiting on macOS app build run $run_id"
+          gh run watch "$run_id" --exit-status
 
   announce:
     needs:
