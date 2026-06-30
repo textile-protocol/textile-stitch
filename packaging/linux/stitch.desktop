@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Stitch
+Comment=Set up and run the Textile Stitch operator bot
+Exec=stitch-setup
+Terminal=false
+Categories=Finance;Utility;

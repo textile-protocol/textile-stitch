@@ -23,6 +23,8 @@ pub enum Command {
     Update,
     /// Print usage and exit.
     Help,
+    /// Interactively create a config in `dir` (or the default dir if None).
+    Init { dir: Option<String> },
 }
 
 /// Parse a command from an argument iterator (already skipping argv[0]).
@@ -34,6 +36,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
     let mut dry_run = false;
     let mut approve = false;
     let mut exact = false;
+    let mut init = false;
+    let mut dir: Option<String> = None;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -45,8 +49,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
             "--config" => config = Some(it.next().ok_or_else(|| anyhow!("--config needs a path"))?),
             "--dry-run" => dry_run = true,
             "--exact" => exact = true,
+            "init" => init = true,
+            "--dir" => dir = Some(it.next().ok_or_else(|| anyhow!("--dir needs a path"))?),
             other => return Err(anyhow!("unknown argument: {other}")),
         }
+    }
+    if init {
+        return Ok(Command::Init { dir });
     }
     let config = config.ok_or_else(|| anyhow!("--config <path> is required"))?;
     if approve {
@@ -170,5 +179,25 @@ mod tests {
     #[test]
     fn config_without_value_is_an_error() {
         assert!(parse_vec(&["--config"]).is_err());
+    }
+
+    #[test]
+    fn init_verb_without_dir() {
+        assert_eq!(parse_vec(&["init"]).unwrap(), Command::Init { dir: None });
+    }
+
+    #[test]
+    fn init_verb_with_dir() {
+        assert_eq!(
+            parse_vec(&["init", "--dir", "/opt/stitch"]).unwrap(),
+            Command::Init {
+                dir: Some("/opt/stitch".into())
+            }
+        );
+    }
+
+    #[test]
+    fn init_does_not_require_config() {
+        assert!(parse_vec(&["init"]).is_ok());
     }
 }

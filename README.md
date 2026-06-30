@@ -1,7 +1,7 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/stitch-readme-header-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="assets/stitch-readme-header-light.png">
-  <img alt="Stitch README header" src="assets/stitch-readme-header-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/assets/stitch-readme-header-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/assets/stitch-readme-header-light.png">
+  <img alt="Stitch README header" src="https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/assets/stitch-readme-header-light.png">
 </picture>
 
 # Stitch
@@ -19,33 +19,28 @@ Stitch does two jobs for each configured pool by default:
 ## Contents
 
 - [Quick Start](#quick-start)
-- [Cloud Deploy](#cloud-deploy)
-- [Manual Install](#manual-install)
+- [Other ways to install](#other-ways-to-install)
 - [How It Works](#how-it-works)
 - [Requirements](#requirements)
 - [Configuration](#configuration)
-- [Running As A Service](#running-as-a-service)
-- [Updating](#updating)
-- [Stopping and Uninstalling](#stopping-and-uninstalling)
 - [Security Notes](#security-notes)
 
 ## Quick Start
 
-The recommended way to install and run Stitch is with an AI coding agent: it
-collects the operator settings, writes the config, runs a dry run, and starts
-live only after you confirm.
+Two easy paths. Pick one.
 
-### Claude Code or Codex (recommended)
+### Option 1 — Install with an AI agent
 
-Install the `stitch` skill once, then just talk to your agent. The skill installs
-Stitch when it's missing and runs it after — start, stop, logs, parameter
-changes, upgrades. Ask your agent to install it:
+The recommended way: your coding agent collects the settings, writes the config,
+runs a dry run, and starts live only after you confirm. Then it handles start,
+stop, logs, parameter changes, and upgrades on request.
 
 - **Claude Code** — paste:
 
   > `curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/.claude/skills/stitch/SKILL.md --create-dirs -o ~/.claude/skills/stitch/SKILL.md` — run that as-is (don't WebFetch the URL). After it succeeds, tell me to run `/stitch`.
 
-  Then run `/stitch`.
+  Then run `/stitch`. With the repo checked out, Claude Code finds the skill
+  automatically.
 
 - **Codex** — paste:
 
@@ -53,15 +48,13 @@ changes, upgrades. Ask your agent to install it:
   > https://github.com/textile-protocol/textile-stitch/tree/main/.codex/skills/stitch
   > After it succeeds, tell me to restart Codex and ask: `Use the stitch skill to install and run Stitch.`
 
-  Codex's skill-installer drops it under `~/.codex/skills`. Restart Codex, then
-  ask: `Use the stitch skill to install and run Stitch.`
+  Restart Codex, then ask: `Use the stitch skill to install and run Stitch.`
 
-With the repo checked out, Claude Code finds the skill automatically.
+<details>
+<summary>Using a different agent?</summary>
 
-### Any other agent
-
-No skill support? Paste this prompt into Claude, GPT, Gemini, or any agent with
-terminal access to the machine where Stitch should run:
+Paste this into Claude, GPT, Gemini, or any agent with terminal access to the
+machine where Stitch should run:
 
 ```text
 Help me install and configure Textile Stitch.
@@ -76,110 +69,40 @@ STITCH_PRIVATE_KEY, run a dry run first, and do not start live operation until I
 confirm.
 ```
 
-For the full copyable prompt, open [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
-For configuration reference, tuning, and troubleshooting, see
-[ADVANCED.md](ADVANCED.md).
+The full copyable prompt is in [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
 
-## Cloud Deploy
+</details>
 
-Stitch can run as an operator-owned cloud bot in your own AWS account. The AWS
-self-hosting stack in [deploy/aws](deploy/aws/README.md) creates a self-contained
-ECS Fargate environment you own and control: one service, one secret, one wallet,
-no public ingress. The bot reaches Textile the same way any external operator
-does, over the public RPC/API/indexer/subgraph URLs in your `stitch.toml`.
+### Option 2 — Desktop app
 
-[![Deploy to AWS](https://img.shields.io/badge/Deploy_to-AWS-FF9900?style=for-the-badge&logo=amazonaws&logoColor=white)](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?templateURL=https%3A%2F%2Ftextile-stitch-deploy.s3.us-east-1.amazonaws.com%2Faws%2Fcloudformation.yaml&stackName=stitch-operator)
+No terminal needed. Download the release for your OS and open the Stitch app:
 
-The button opens CloudFormation in your own AWS account with the Stitch stack
-prefilled. Sign in, pick your region (it defaults to `us-east-1`), review the
-parameters, and create the stack. It comes up stopped by default. Then follow
-[deploy/aws](deploy/aws/README.md) to load the wallet secret, run Permit2
-approvals, and set the service desired count to `1` when you are ready to run
-live.
+- **macOS**: download `Stitch.app.zip` from the release, unzip, and open
+  `Stitch.app`. It's ad-hoc signed but not Apple-notarized, so the first launch
+  needs right-click → Open (or System Settings → Privacy & Security → Open
+  Anyway). You can also run the `stitch-setup` binary from a terminal.
+- **Windows**: double-click `stitch-setup.exe`.
+- **Linux**: run `stitch-setup` (or use the bundled `stitch.desktop` entry).
 
-## Manual Install
+Pick a corridor, paste your operator wallet key, and click Create. The same
+window then runs the bot: Start/Stop, a dry-run toggle, a Permit2 "Approve
+tokens" button, live logs, and an Update button. Closing the window stops the
+bot; for unattended 24/7 running, install it as a service (see the install guides
+below).
 
-Install the latest release:
+## Other ways to install
 
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/textile-protocol/textile-stitch/releases/latest/download/stitch-installer.sh | sh
-```
+For running on a server, in a container, or by hand, see the dedicated guides:
 
-Make sure the install directory is on your `PATH`, then check the binary:
+- [Cloud (AWS Fargate)](docs/install-cloud.md) — operator-owned managed deployment.
+- [Docker](docs/install-docker.md) — prebuilt image or build from source.
+- [Manual install — macOS](docs/install-macos.md)
+- [Manual install — Windows](docs/install-windows.md)
+- [Manual install — Linux](docs/install-linux.md) — includes the systemd service setup.
 
-```bash
-stitch --version
-```
-
-Create a config file. On macOS and foreground Linux installs, keep operator
-support files in `~/Stitch` so they are easy to find.
-
-```bash
-mkdir -p ~/Stitch
-chmod 700 ~/Stitch
-curl -L -o ~/Stitch/stitch.toml \
-  https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
-chmod 600 ~/Stitch/stitch.toml
-```
-
-Store the operator wallet key in a separate key file. Do not put the private key
-in `stitch.toml`.
-
-```bash
-printf 'Enter STITCH_PRIVATE_KEY: '
-stty -echo
-IFS= read -r key
-stty echo
-printf '\n'
-umask 077
-printf '%s\n' "$key" > ~/Stitch/stitch.key
-unset key
-printf 'STITCH_PRIVATE_KEY_FILE=%s\n' "$HOME/Stitch/stitch.key" > ~/Stitch/stitch.env
-chmod 600 ~/Stitch/stitch.key ~/Stitch/stitch.env
-set -a
-. ~/Stitch/stitch.env
-set +a
-```
-
-Approve Permit2 to pull the tokens Stitch quotes. The operator wallet needs a
-one-time approval for each input token (the `debt` token on the buy side, the
-`collateral` token on the sell side). Without it, orders post but silently fail
-to fill, and a live start refuses to run. Preview what's needed, then approve:
-
-```bash
-stitch approve --config ~/Stitch/stitch.toml --dry-run
-stitch approve --config ~/Stitch/stitch.toml
-```
-
-Maximum is the standard market-maker choice: approve once and never re-approve.
-You're approving the canonical Permit2 contract, and the reactor can only pull
-against orders you actually signed.
-
-If you'd rather cap the allowance and your config uses fixed numeric liquidity,
-use `--exact` to approve only that configured amount:
-
-```bash
-stitch approve --config ~/Stitch/stitch.toml --exact
-```
-
-Be aware of the trade-off: an exact allowance is consumed as orders fill, so once
-it's used up Stitch keeps posting orders that **silently fail to fill** until you
-re-approve, and you must re-run `stitch approve` every time you raise your
-configured liquidity. Each approval is one gas-paying transaction per token, and
-the command is idempotent (it skips tokens already approved).
-
-Run once in dry-run mode before posting live orders:
-
-```bash
-stitch --config ~/Stitch/stitch.toml --dry-run
-```
-
-Run live:
-
-```bash
-stitch --config ~/Stitch/stitch.toml
-```
+Server operators can also run `stitch init` (after installing the binary) to
+write `stitch.toml`, `stitch.env`, and an owner-only `stitch.key` for a chosen
+corridor. The per-OS guides cover it.
 
 ## How It Works
 
@@ -213,7 +136,7 @@ You need:
 - the Permit2 and reactor addresses for the target chain;
 - funded token balances for the sides you enable;
 - Permit2 approvals for the tokens Stitch will spend (set up with
-  `stitch approve` — see [Manual Install](#manual-install));
+  `stitch approve` — see your platform's install guide above);
 - a small native balance for gas (approvals and, for closing, `fill()` txs);
 - a subgraph URL for settlement closing.
 
@@ -284,157 +207,6 @@ corridor can't keep the whole wallet after another max side is added. For
 the price-feed orientation, spread options, ladder sizing, and
 settlement-closing fields, see the
 [configuration reference in ADVANCED.md](ADVANCED.md#configuration-reference).
-
-## Running As A Service
-
-On Linux, run Stitch under systemd so it restarts after crashes and reboots.
-System-wide service files use `/etc/stitch-bot`, which keeps service-owned
-config separate from foreground operator files in `~/Stitch`.
-
-Create local config, key, and environment files:
-
-```bash
-curl -L -o stitch.toml \
-  https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/stitch.example.toml
-
-printf 'Enter STITCH_PRIVATE_KEY: '
-stty -echo
-IFS= read -r key
-stty echo
-printf '\n'
-umask 077
-printf '%s\n' "$key" > stitch.key
-unset key
-
-cat > stitch.env <<'EOF'
-RUST_LOG=info
-EOF
-
-curl -L -o stitch.service \
-  https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/deploy/stitch.service
-```
-
-Install files:
-
-```bash
-sudo install -m 0755 "$(command -v stitch)" /usr/local/bin/stitch
-sudo mkdir -p /etc/stitch-bot
-sudo install -m 0644 stitch.toml /etc/stitch-bot/stitch.toml
-sudo install -m 0600 stitch.key /etc/stitch-bot/stitch.key
-sudo install -m 0644 stitch.env /etc/stitch-bot/stitch.env
-sudo install -m 0644 stitch.service /etc/systemd/system/stitch.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now stitch
-```
-
-The service template uses `LoadCredential` so the private key is injected as a
-systemd credential instead of stored in the process environment. Operators who
-manage encrypted systemd credentials can replace it with
-`LoadCredentialEncrypted`.
-
-Approve Permit2 before the first live start (the service won't run until the
-input tokens are approved):
-
-```bash
-sudo STITCH_PRIVATE_KEY_FILE=/etc/stitch-bot/stitch.key \
-  stitch approve --config /etc/stitch-bot/stitch.toml
-```
-
-View logs:
-
-```bash
-journalctl -u stitch -f
-```
-
-Restart after config changes:
-
-```bash
-sudo systemctl restart stitch
-```
-
-## Updating
-
-If Stitch was installed from the release installer, update the binary in place:
-
-```bash
-stitch --update
-```
-
-Then restart the service:
-
-```bash
-sudo systemctl restart stitch
-```
-
-You can also download a new binary or installer from the latest GitHub Release.
-
-## Stopping and Uninstalling
-
-To stop a foreground run, press `Ctrl-C`. Stitch shuts down cleanly on `Ctrl-C`
-or `SIGTERM`, finishing the current tick first, so it never leaves a half-sent
-fill or a dangling order.
-
-To stop a background service or uninstall completely, expand your platform:
-
-<details>
-<summary><strong>Linux (systemd)</strong></summary>
-
-```bash
-# stop
-sudo systemctl stop stitch
-sudo systemctl disable --now stitch   # also stop it restarting on boot
-
-# uninstall
-sudo rm -f /etc/systemd/system/stitch.service
-sudo systemctl daemon-reload
-sudo rm -f "$(command -v stitch)"     # the installed binary
-sudo rm -rf /etc/stitch-bot           # config + env
-```
-
-</details>
-
-<details>
-<summary><strong>macOS (launchd)</strong></summary>
-
-Use the label you installed the LaunchAgent under (the file in
-`~/Library/LaunchAgents/`).
-
-```bash
-# stop
-launchctl bootout gui/$(id -u)/<label>        # older macOS: launchctl unload ~/Library/LaunchAgents/<label>.plist
-
-# uninstall
-rm -f ~/Library/LaunchAgents/<label>.plist
-rm -f "$(command -v stitch)"                   # the installed binary
-rm -rf ~/Stitch                                # config + env
-```
-
-</details>
-
-<details>
-<summary><strong>Windows (PowerShell)</strong></summary>
-
-Use the task or service name you created at install time.
-
-```powershell
-# stop — Task Scheduler:
-schtasks /End /TN "Stitch"
-# or, if you installed it as a service with NSSM:
-nssm stop Stitch
-
-# uninstall — remove the task or service first:
-schtasks /Delete /TN "Stitch" /F                        # Task Scheduler
-nssm remove Stitch confirm                              # or the NSSM service
-Remove-Item -Force (Get-Command stitch).Source          # the installed binary
-Remove-Item -Recurse -Force "$env:USERPROFILE\Stitch"   # config + env
-```
-
-</details>
-
-Removing the binary does **not** revoke on-chain Permit2 approvals. If you
-approved a maximum allowance, it stays on the operator wallet after uninstall.
-To fully wind down, revoke each token's Permit2 approval (set its allowance to
-0) or retire the dedicated operator wallet.
 
 ## Security Notes
 

@@ -231,6 +231,21 @@ target/release/stitch
 Source-built binaries can run normally, but they do not support installer-based
 self-updates.
 
+### Corridor Catalog
+
+The desktop app (`stitch-setup`) and `stitch init` ship pre-filled configs for
+two corridors:
+
+- **cNGN / USDT on BNB Smart Chain** — the NGN stablecoin against USDT on BSC.
+- **BRLA / USDT on Celo** — the BRL stablecoin against USDT on Celo (chain 42220).
+
+Both configs are embedded in the binary and written verbatim when you pick a
+corridor during setup. The wallet key is never stored in the TOML.
+
+If you are running a different corridor, copy `stitch.example.toml` and edit it
+directly. The setup app and `stitch init` are convenience wrappers for the two
+supported corridors; any valid `stitch.toml` works with the bot.
+
 ### Safe Restart Checklist
 
 Before restarting live:

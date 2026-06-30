@@ -7,6 +7,7 @@
 use alloy_primitives::{hex, keccak256, Address, B256};
 use anyhow::Context as _;
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
+use zeroize::Zeroize;
 
 /// Parse a hex private key, tolerating an optional `0x`/`0X` prefix and
 /// surrounding whitespace — the documented key material form is `0x…`.
@@ -18,8 +19,10 @@ pub fn parse_private_key(raw: &str) -> anyhow::Result<SigningKey> {
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
-    let bytes = hex::decode(body).context("private key must be hex")?;
-    SigningKey::from_slice(&bytes).context("invalid private key")
+    let mut bytes = hex::decode(body).context("private key must be hex")?;
+    let key = SigningKey::from_slice(&bytes).context("invalid private key");
+    bytes.zeroize();
+    key
 }
 
 /// Ethereum address of a verifying key (keccak of the uncompressed pubkey).

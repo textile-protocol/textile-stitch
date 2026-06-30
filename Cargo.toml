@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.55"
+version = "0.1.56"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
 license = "AGPL-3.0-or-later"
@@ -15,7 +15,18 @@ path = "src/lib.rs"
 name = "stitch"
 path = "src/main.rs"
 
+[[bin]]
+name = "stitch-setup"
+path = "src/bin/stitch-setup/main.rs"
+required-features = ["gui"]
+
+[features]
+gui = ["dep:eframe", "dep:egui", "dep:rfd"]
+
 [dependencies]
+eframe = { version = "0.28", optional = true }
+egui = { version = "0.28", optional = true }
+rfd = { version = "0.14", optional = true }
 alloy-primitives = { version = "1", features = ["rlp"] }
 alloy-rlp = "0.3"
 k256 = { version = "0.13", features = ["ecdsa"] }
@@ -29,6 +40,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axoupdater = "0.10.0"
+zeroize = "1"
+rpassword = "7"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 hex = "0.4"

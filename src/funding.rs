@@ -203,25 +203,22 @@ pub async fn funded_input_cap(
     pair: &str,
     label: &str,
 ) -> Option<u128> {
-    if !budgets.funded_inputs.contains_key(&token) {
+    if let std::collections::hash_map::Entry::Vacant(e) = budgets.funded_inputs.entry(token) {
         match read_funded_budget(indexer, wallet, chain_id, maker, token, permit2).await {
             Ok(budget) => {
-                budgets.funded_inputs.insert(token, budget);
+                e.insert(budget);
             }
             // `{:#}` prints the context chain ("could not read committed
             // input: <cause>"), preserving which read failed.
-            Err(e) if dry_run => {
-                warn!(pair = %pair, label, error = %format!("{e:#}"), "could not read funded budget; using configured size for dry-run");
-                budgets.funded_inputs.insert(
-                    token,
-                    FundedInputBudget {
-                        funded: fallback_liquidity(configured),
-                        ..FundedInputBudget::default()
-                    },
-                );
+            Err(err) if dry_run => {
+                warn!(pair = %pair, label, error = %format!("{err:#}"), "could not read funded budget; using configured size for dry-run");
+                e.insert(FundedInputBudget {
+                    funded: fallback_liquidity(configured),
+                    ..FundedInputBudget::default()
+                });
             }
-            Err(e) => {
-                warn!(pair = %pair, label, error = %format!("{e:#}"), "could not read funded budget; skipping side");
+            Err(err) => {
+                warn!(pair = %pair, label, error = %format!("{err:#}"), "could not read funded budget; skipping side");
                 return None;
             }
         }

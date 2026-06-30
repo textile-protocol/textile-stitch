@@ -34,6 +34,7 @@ use stitch_bot::maker::{quote_side, QuoteState, Side, SideOutcome, TickCtx};
 use stitch_bot::poster::Poster;
 use stitch_bot::quote::oracle_rate_ray;
 use stitch_bot::rpc::Wallet;
+use stitch_bot::setup;
 use stitch_bot::signer::{address_from_signing_key, parse_private_key};
 use stitch_bot::slots::{load_slot_nonce_state, slot_nonce_state_path};
 use stitch_bot::tick::{is_stale, unix_now};
@@ -84,7 +85,8 @@ fn print_help() {
          STITCH_PRIVATE_KEY_FILE=/path/to/key stitch approve --config <path> [--exact] [--dry-run]\n\n\
          COMMANDS:\n    \
          approve           Approve the config's input tokens to Permit2, then exit.\n                      \
-         Required before going live; uses a max allowance unless --exact.\n\n\
+         Required before going live; uses a max allowance unless --exact.\n    \
+         init              Interactively create stitch.toml/.env/.key, then exit.\n\n\
          OPTIONS:\n    \
          --config <path>   Operator config (TOML). Read fresh on every start.\n    \
          --dry-run         Sign/plan without posting orders or sending tx.\n    \
@@ -231,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Update => run_update().await,
+        Command::Init { dir } => run_init(dir),
         Command::Approve {
             config,
             dry_run,
@@ -267,6 +270,114 @@ async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow:
         info!(approvals_sent = sent, "approvals complete");
     }
     Ok(())
+}
+
+/// `stitch init`: pick a corridor, take the key without echo, write the config.
+fn run_init(dir: Option<String>) -> anyhow::Result<()> {
+    use std::io::Write;
+    use zeroize::Zeroize;
+
+    // Default to the current working directory, not the executable's location:
+    // the install guides tell operators to `cd ~/Stitch && stitch init`, and the
+    // installer puts the binary elsewhere (e.g. ~/.cargo/bin).
+    let target = match dir {
+        Some(d) => std::path::PathBuf::from(d),
+        None => std::env::current_dir().context("could not determine the current directory")?,
+    };
+
+    if setup::has_operator_files(&target) {
+        println!(
+            "{} already has Stitch operator files (overwriting replaces stitch.toml \
+             and the stitch.key private key).",
+            target.display()
+        );
+        print!("Overwrite it? [y/N]: ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Left the existing config untouched.");
+            return Ok(());
+        }
+    }
+
+    let corridors = setup::catalog();
+    println!("\nChoose a corridor:");
+    for (i, c) in corridors.iter().enumerate() {
+        println!("  {}) {} — {}", i + 1, c.display_name, c.network_label);
+    }
+    print!("Enter a number [1]: ");
+    std::io::stdout().flush().ok();
+    let mut choice = String::new();
+    std::io::stdin().read_line(&mut choice)?;
+    let idx = match choice.trim() {
+        "" => 0,
+        s => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1 && *n <= corridors.len())
+            .map(|n| n - 1)
+            .ok_or_else(|| anyhow!("not a valid choice: {s}"))?,
+    };
+    let corridor = &corridors[idx];
+
+    // When stdin is not a TTY (e.g. piped input in smoke-tests), rpassword's
+    // default console path fails. Fall back to reading from stdin directly.
+    // `IsTerminal` is cross-platform, so this builds on Windows too.
+    let mut key = {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            rpassword::prompt_password("\nPaste the operator wallet private key (hidden): ")?
+        } else {
+            print!("\nPaste the operator wallet private key (hidden): ");
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let trimmed = line.trim().to_string();
+            line.zeroize();
+            trimmed
+        }
+    };
+    let parsed =
+        stitch_bot::signer::parse_private_key(&key).context("that private key is not valid hex")?;
+    let operator = address_from_signing_key(&parsed);
+    println!("Operator wallet: {operator:?}");
+
+    let paths = setup::write_config(&target, corridor, &key)?;
+    key.zeroize();
+
+    println!("\nConfig written to {}", paths.dir.display());
+    println!("  {}", paths.toml.display());
+    println!("  {}", paths.env.display());
+    println!("  {} (key, owner-only)", paths.key.display());
+    println!("\nNext steps:");
+    print_next_steps(&paths);
+    Ok(())
+}
+
+/// Print copy-pasteable approve + dry-run commands for the host shell, with the
+/// key/config paths quoted so directories with spaces don't break.
+#[cfg(unix)]
+fn print_next_steps(paths: &setup::ConfigPaths) {
+    // POSIX single-quote. Source stitch.env (it sets STITCH_PRIVATE_KEY_FILE).
+    let q = |s: String| format!("'{}'", s.replace('\'', "'\\''"));
+    let env = q(paths.env.display().to_string());
+    let toml = q(paths.toml.display().to_string());
+    println!("  set -a; . {env}; set +a");
+    println!("  stitch approve --config {toml}");
+    println!("  stitch --config {toml} --dry-run");
+}
+
+/// PowerShell variant: `VAR=value cmd` is POSIX-only and doesn't set an env var
+/// for the child on Windows, so set `$env:` then run. Single-quote for literals.
+#[cfg(windows)]
+fn print_next_steps(paths: &setup::ConfigPaths) {
+    let q = |s: String| format!("'{}'", s.replace('\'', "''"));
+    let key = q(paths.key.display().to_string());
+    let toml = q(paths.toml.display().to_string());
+    println!("  $env:STITCH_PRIVATE_KEY_FILE = {key}");
+    println!("  stitch approve --config {toml}");
+    println!("  stitch --config {toml} --dry-run");
 }
 
 async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {

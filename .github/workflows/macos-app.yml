@@ -1,0 +1,57 @@
+name: macOS app bundle
+
+# Build a prebuilt, double-clickable Stitch.app and attach it to the release.
+# Kept separate from the cargo-dist-generated release.yml so `dist generate`
+# never clobbers it. The .app is ad-hoc signed (no Apple Developer ID), so a
+# downloaded copy still shows the unidentified-developer prompt: open it once
+# with right-click -> Open, or System Settings -> Privacy & Security -> Open Anyway.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-app:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build universal binaries
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --features gui --bin stitch --bin stitch-setup --target "$target"
+          done
+          mkdir -p target/universal
+          lipo -create -output target/universal/stitch \
+            target/aarch64-apple-darwin/release/stitch \
+            target/x86_64-apple-darwin/release/stitch
+          lipo -create -output target/universal/stitch-setup \
+            target/aarch64-apple-darwin/release/stitch-setup \
+            target/x86_64-apple-darwin/release/stitch-setup
+
+      - name: Assemble and zip Stitch.app
+        run: |
+          set -euo pipefail
+          packaging/macos/make-app.sh target/universal/stitch-setup dist target/universal/stitch
+          (cd dist && ditto -c -k --keepParent Stitch.app Stitch.app.zip)
+
+      - name: Upload Stitch.app.zip to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/Stitch.app.zip --clobber
+
+      - name: Upload Stitch.app.zip as a workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stitch.app
+          path: dist/Stitch.app.zip

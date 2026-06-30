@@ -27,6 +27,7 @@ pub mod net;
 pub mod poster;
 pub mod quote;
 pub mod rpc;
+pub mod setup;
 pub mod signer;
 pub mod slots;
 pub mod submit;

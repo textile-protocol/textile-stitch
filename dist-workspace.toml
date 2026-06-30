@@ -15,3 +15,19 @@ targets = [
 install-path = "CARGO_HOME"
 hosting = "github"
 install-updater = false
+# Build stitch-setup (needs the gui feature) alongside the stitch bot binary.
+features = ["gui"]
+# Linux double-click launcher goes in the archive. The macOS app ships prebuilt
+# as Stitch.app.zip via the macos-app.yml workflow, so Info.plist/make-app.sh are
+# build-time inputs, not user-facing archive files.
+include = [
+  "packaging/linux/stitch.desktop",
+]
+
+[dist.dependencies.apt]
+libgtk-3-dev = '*'
+libxcb-render0-dev = '*'
+libxcb-shape0-dev = '*'
+libxcb-xfixes0-dev = '*'
+libxkbcommon-dev = '*'
+libssl-dev = '*'
