@@ -141,7 +141,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
-        run: gh release upload "$TAG" dist/Stitch.app.zip --clobber
+        run: |
+          set -euo pipefail
+          (cd dist && shasum -a 256 Stitch.app.zip > Stitch.app.zip.sha256)
+          gh release upload "$TAG" dist/Stitch.app.zip dist/Stitch.app.zip.sha256 --clobber
+
+      # cargo-dist builds the release body's download table before this workflow
+      # uploads Stitch.app.zip, so add a row for it. Idempotent (skips if present).
+      - name: Add Stitch.app.zip to the release download table
+        if: ${{ github.event_name == 'release' || inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${{ github.repository }}/releases/download/$TAG"
+          row="| [Stitch.app.zip]($base/Stitch.app.zip) | Universal macOS app | [checksum]($base/Stitch.app.zip.sha256) |"
+          body="$(gh release view "$TAG" --json body --jq .body)"
+          if printf '%s' "$body" | grep -qF "Stitch.app.zip"; then
+            echo "Release notes already list Stitch.app.zip; nothing to do."
+            exit 0
+          fi
+          # Insert the row right after the download table header separator
+          # (|----|----|----|) so it becomes the first row of that table; if no
+          # table is found, append a small section instead.
+          updated="$(printf '%s\n' "$body" | awk -v row="$row" '
+            !inserted && /^\|[-: ]+\|[-: ]+\|[-: ]+\|[[:space:]]*$/ { print; print row; inserted=1; next }
+            { print }
+            END { if (!inserted) { print ""; print "### Desktop app (macOS)"; print ""; print row } }
+          ')"
+          printf '%s' "$updated" > "$RUNNER_TEMP/notes.md"
+          gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
 
       - name: Upload Stitch.app.zip as a workflow artifact
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag == '' }}
