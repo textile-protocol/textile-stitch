@@ -155,6 +155,10 @@ impl StitchApp {
                     Reader::Err(s) => Box::new(BufReader::new(s)),
                 };
                 for line in reader.lines().map_while(Result::ok) {
+                    // The bot disables ANSI on a pipe, but an older bot binary may
+                    // still colorize; strip escape codes so the pane and log file
+                    // show clean text instead of literal "\x1b[2m…" sequences.
+                    let line = strip_ansi(&line);
                     if let Some(f) = file.as_mut() {
                         let _ = writeln!(f, "{line}");
                     }
@@ -205,6 +209,31 @@ enum Reader {
     Err(std::process::ChildStderr),
 }
 
+/// Remove ANSI escape sequences (CSI `\x1b[…<letter>`, plus stray `\x1b`) so log
+/// lines render as plain text. egui draws no terminal colors, so colorized output
+/// would otherwise appear as literal `\x1b[2m…` noise.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC: drop a CSI sequence (`[` then params, ended by a letter); a lone
+        // ESC (or any other escape form) is just dropped.
+        if chars.clone().next() == Some('[') {
+            chars.next(); // consume '['
+            for nc in chars.by_ref() {
+                if nc.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 impl eframe::App for StitchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_child();
@@ -217,5 +246,31 @@ impl eframe::App for StitchApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Lifecycle A: closing the window stops the bot.
         self.stop_bot();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_sgr_color_codes() {
+        let raw = "\u{1b}[2m2026\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m stitch: starting";
+        // The space after the timestamp plus the level's leading pad survive (as
+        // they do in real tracing output); only the escape codes are removed.
+        assert_eq!(strip_ansi(raw), "2026  INFO stitch: starting");
+    }
+
+    #[test]
+    fn leaves_plain_text_untouched() {
+        assert_eq!(
+            strip_ansi("posted ask ladder orders=1"),
+            "posted ask ladder orders=1"
+        );
+    }
+
+    #[test]
+    fn drops_a_lone_escape() {
+        assert_eq!(strip_ansi("a\u{1b}b"), "ab");
     }
 }

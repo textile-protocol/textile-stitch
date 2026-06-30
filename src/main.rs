@@ -216,7 +216,12 @@ mod tests {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Only emit ANSI color codes when stdout is a real terminal. When the output
+    // is piped (the desktop app captures it) or redirected to a file/journald,
+    // colors would otherwise show up as literal escape sequences.
+    let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::fmt()
+        .with_ansi(use_ansi)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
