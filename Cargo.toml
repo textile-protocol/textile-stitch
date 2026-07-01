@@ -1,11 +1,14 @@
 [package]
 name = "stitch-bot"
-version = "0.1.62"
+version = "0.1.63"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/textile-protocol/textile-stitch"
 homepage = "https://github.com/textile-protocol/textile-stitch"
+# `stitch` is the bot; `stitch-setup` is an optional GUI helper. Name the default
+# so bare `cargo run` (run-local.mjs, dev habit) isn't ambiguous between the two.
+default-run = "stitch"
 
 [lib]
 name = "stitch_bot"
