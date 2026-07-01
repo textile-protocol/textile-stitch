@@ -7,6 +7,7 @@
 mod app;
 mod icon;
 mod panel;
+mod settings;
 mod theme;
 mod wizard;
 

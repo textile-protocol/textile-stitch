@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
-use stitch_bot::setup::{self, ConfigPaths, Corridor, Status};
+use stitch_bot::setup::{self, ConfigPaths, Corridor, SpreadEdit, Status};
 
 /// Cap the in-memory log so a long run can't grow unbounded.
 const MAX_LOG_LINES: usize = 5000;
@@ -17,6 +17,24 @@ const MAX_LOG_LINES: usize = 5000;
 pub enum View {
     Setup,
     Panel,
+    Settings,
+}
+
+/// Editable state for the Settings screen. Populated from the current config when
+/// the screen opens; `key_input` stays empty unless the operator chooses to swap
+/// the wallet.
+#[derive(Default)]
+pub struct SettingsForm {
+    pub rpc_url: String,
+    pub feed_url: String,
+    pub buy: SpreadEdit,
+    pub sell: SpreadEdit,
+    /// Pools in the config; the screen edits the first and notes when there's more.
+    pub pool_count: usize,
+    /// True once "Change wallet…" is clicked, revealing the private-key field.
+    pub change_wallet: bool,
+    pub key_input: String,
+    pub error: Option<String>,
 }
 
 pub struct StitchApp {
@@ -48,6 +66,9 @@ pub struct StitchApp {
     /// Guards the one-shot update check so it's spawned once, not every frame.
     update_check_started: bool,
     child: Option<Child>,
+
+    /// Settings screen form state (loaded when the screen opens).
+    pub settings: SettingsForm,
 }
 
 /// The GUI's default config folder: ~/Stitch (always user-writable, unlike the
@@ -93,6 +114,142 @@ impl StitchApp {
             available_update: Arc::new(Mutex::new(None)),
             update_check_started: false,
             child: None,
+            settings: SettingsForm::default(),
+        }
+    }
+
+    /// Load the current config into the Settings form and switch to that screen.
+    /// A folder shown in the panel is always configured, so a read failure just
+    /// surfaces as an inline error on an otherwise-empty form.
+    pub fn open_settings(&mut self) {
+        let mut form = SettingsForm::default();
+        match std::fs::read_to_string(&self.paths.toml)
+            .map_err(|e| e.to_string())
+            .and_then(|t| setup::read_settings(&t).map_err(|e| format!("{e:#}")))
+        {
+            Ok(v) => {
+                form.rpc_url = v.rpc_url;
+                form.feed_url = v.feed_url;
+                form.buy = v.buy;
+                form.sell = v.sell;
+                form.pool_count = v.pool_count;
+            }
+            Err(e) => form.error = Some(format!("Couldn't read the current config: {e}")),
+        }
+        self.settings = form;
+        self.view = View::Settings;
+    }
+
+    /// Leave the Settings screen without saving, wiping any pasted key first.
+    pub fn close_settings(&mut self) {
+        use zeroize::Zeroize;
+        self.settings.key_input.zeroize();
+        self.settings = SettingsForm::default();
+        self.view = View::Panel;
+    }
+
+    /// Validate and persist the Settings form: rewrite stitch.toml (comments
+    /// preserved, atomic), optionally swap the wallet key, then restart the bot if
+    /// it was running so the new config takes effect. On any failure nothing is
+    /// left half-applied and the error shows inline; the screen stays open.
+    pub fn save_settings(&mut self, ctx: &egui::Context) {
+        self.settings.error = None;
+        let current = match std::fs::read_to_string(&self.paths.toml) {
+            Ok(t) => t,
+            Err(e) => {
+                self.settings.error = Some(format!("Couldn't read the config: {e}"));
+                return;
+            }
+        };
+        let patch = setup::SettingsPatch {
+            rpc_url: self.settings.rpc_url.clone(),
+            feed_url: self.settings.feed_url.clone(),
+            buy: self.settings.buy.clone(),
+            sell: self.settings.sell.clone(),
+        };
+        let edited = match setup::apply_settings(&current, &patch) {
+            Ok(s) => s,
+            Err(e) => {
+                self.settings.error = Some(format!("{e:#}"));
+                return;
+            }
+        };
+
+        // Wallet swap is opt-in: only when the field was revealed and filled.
+        // Validate the key BEFORE touching disk so an invalid key aborts with
+        // nothing written, rather than leaving the config saved but the key
+        // unchanged (an all-or-nothing save).
+        let new_key = self.settings.change_wallet && !self.settings.key_input.trim().is_empty();
+        if new_key {
+            if let Err(e) = stitch_bot::signer::parse_private_key(self.settings.key_input.trim()) {
+                self.settings.error = Some(format!("The new wallet key is not valid: {e:#}"));
+                return;
+            }
+        }
+
+        if let Err(e) = setup::write_toml_atomic(&self.paths.toml, &edited) {
+            self.settings.error = Some(format!("Couldn't save the config: {e:#}"));
+            return;
+        }
+
+        if new_key {
+            use zeroize::Zeroize;
+            let result = setup::write_key(&self.dir, &self.settings.key_input);
+            self.settings.key_input.zeroize();
+            match result {
+                Ok(addr) => {
+                    self.operator = Some(format!("{addr:?}"));
+                    self.settings.change_wallet = false;
+                }
+                Err(e) => {
+                    // Pre-validated above, so this is an unexpected write failure
+                    // (e.g. permissions); the config is already saved.
+                    self.settings.error = Some(format!(
+                        "Settings saved, but writing the new wallet key failed: {e:#}"
+                    ));
+                    return;
+                }
+            }
+        }
+
+        // Config is read once at start, so a running bot must be bounced to pick
+        // up the change. dry_run is preserved across the restart.
+        if self.status != Status::Stopped {
+            self.stop_bot();
+            self.start_bot(ctx);
+            if self.status == Status::Stopped {
+                // Respawn failed (e.g. the stitch binary went missing). start_bot
+                // recorded why in action_note; keep it visible instead of a
+                // misleading success, so the operator sees the bot is offline.
+                let why = self
+                    .action_note
+                    .take()
+                    .unwrap_or_else(|| "the bot failed to start".into());
+                self.action_note =
+                    Some(format!("Settings saved, but the bot didn't restart. {why}"));
+            } else {
+                self.action_note = Some("Settings saved. Bot restarted.".into());
+            }
+        } else {
+            self.action_note = Some("Settings saved.".into());
+        }
+        self.close_settings();
+    }
+
+    /// Keyboard shortcuts: Cmd/Ctrl+, opens Settings from the panel (the standard
+    /// Preferences chord), Esc backs out of Settings.
+    pub fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let (open, back) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::Comma),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if open && matches!(self.view, View::Panel) {
+            self.open_settings();
+        }
+        if back && matches!(self.view, View::Settings) {
+            self.close_settings();
         }
     }
 
@@ -268,9 +425,11 @@ impl eframe::App for StitchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         crate::theme::apply(ui.ctx());
         self.poll_child();
+        self.handle_shortcuts(ui.ctx());
         match self.view {
             View::Setup => crate::wizard::show(self, ui),
             View::Panel => crate::panel::show(self, ui),
+            View::Settings => crate::settings::show(self, ui),
         }
     }
 

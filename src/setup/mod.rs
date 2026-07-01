@@ -6,6 +6,7 @@
 pub mod catalog;
 pub mod paths;
 pub mod process;
+pub mod settings;
 pub mod writer;
 
 pub use catalog::{catalog, find_corridor, identify_corridor, Corridor};
@@ -15,4 +16,7 @@ pub use paths::{
 pub use process::{
     approve_command, find_stitch_binary, run_command, terminate, update_command, Status,
 };
-pub use writer::{render_env, write_config};
+pub use settings::{
+    apply_settings, read_settings, SettingsPatch, SettingsView, SpreadEdit, SpreadKind,
+};
+pub use writer::{render_env, write_config, write_key, write_toml_atomic};

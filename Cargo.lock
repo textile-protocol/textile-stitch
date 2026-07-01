@@ -4829,7 +4829,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stitch-bot"
-version = "0.1.65"
+version = "0.1.66"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -4850,8 +4850,10 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zeroize",
 ]
 

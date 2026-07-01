@@ -33,6 +33,14 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (bg, fg, label) = status_style(&p, app.status);
                     theme::status_pill(ui, bg, fg, label);
+                    ui.add_space(8.0);
+                    if ui
+                        .button(RichText::new("⚙").size(16.0))
+                        .on_hover_text("Settings (⌘,)")
+                        .clicked()
+                    {
+                        app.open_settings();
+                    }
                 });
             });
 

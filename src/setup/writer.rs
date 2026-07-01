@@ -3,7 +3,7 @@
 //! Write the three operator files (stitch.toml, stitch.env, stitch.key) for a
 //! chosen corridor, with the key file locked down to the current user.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use zeroize::Zeroize;
@@ -62,6 +62,64 @@ pub fn write_config(
     restrict_to_owner(&paths.env)?;
 
     Ok(paths)
+}
+
+/// Rewrite ONLY the key file for an already-set-up folder, owner-only, and return
+/// the operator address the new key controls. Leaves stitch.toml and stitch.env
+/// untouched — the Settings screen uses this to swap the wallet in isolation.
+/// The caller's key string should be zeroized after this returns.
+pub fn write_key(dir: impl AsRef<Path>, key_raw: &str) -> Result<alloy_primitives::Address> {
+    // Validate before touching disk, so a bad paste never truncates a good key.
+    let key = parse_private_key(key_raw).context("the private key is not valid")?;
+    let paths = config_paths(dir.as_ref());
+    std::fs::create_dir_all(&paths.dir)
+        .with_context(|| format!("creating {}", paths.dir.display()))?;
+    let mut key_line = format!("{}\n", key_raw.trim());
+    // Stage-then-rename: an interrupted write must never truncate the operator's
+    // existing, working key — losing it locks them out of signing.
+    write_key_file_atomic(&paths.key, key_line.as_bytes())
+        .with_context(|| format!("writing {}", paths.key.display()))?;
+    key_line.zeroize();
+    Ok(crate::signer::address_from_signing_key(&key))
+}
+
+/// Write the key file atomically: stage the secret in an owner-only sibling temp
+/// file, then rename it over the target. If the write fails, the existing key is
+/// left intact rather than truncated or removed. `write_key_file` already creates
+/// the temp owner-only on both platforms, so the secret is never world-readable.
+fn write_key_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = key_tmp_path(path);
+    write_key_file(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        // Best-effort cleanup so a failed rename doesn't strand the staged key.
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::Error::new(e).context(format!("replacing {}", path.display()))
+    })?;
+    Ok(())
+}
+
+/// The owner-only staging path next to the key file.
+fn key_tmp_path(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(".stitch.key.tmp")
+}
+
+/// Replace a text file atomically: write a sibling temp file, then rename it over
+/// the target so a crash mid-write can't leave a half-written config behind.
+pub fn write_toml_atomic(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("stitch.toml");
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        // Best-effort cleanup so a failed rename doesn't strand the temp file.
+        let _ = std::fs::remove_file(&tmp);
+        format!("replacing {}", path.display())
+    })?;
+    Ok(())
 }
 
 /// Lock a file down so only its owner can read or write it.
@@ -189,6 +247,73 @@ mod tests {
         assert!(
             !config_paths(&dir).toml.exists(),
             "nothing written on bad key"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_key_rewrites_only_the_key_and_returns_the_address() {
+        let dir = unique_dir("rekey");
+        // Seed a full config with a different key first.
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        write_config(&dir, corridor, KEY).unwrap();
+        let toml_before = std::fs::read_to_string(config_paths(&dir).toml).unwrap();
+        let env_before = std::fs::read_to_string(config_paths(&dir).env).unwrap();
+
+        // Anvil/Hardhat account #1.
+        const KEY2: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+        let addr = write_key(&dir, KEY2).unwrap();
+        assert_eq!(
+            format!("{addr:?}").to_lowercase(),
+            "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_paths(&dir).key)
+                .unwrap()
+                .trim(),
+            KEY2
+        );
+        // The other two files are untouched.
+        assert_eq!(
+            std::fs::read_to_string(config_paths(&dir).toml).unwrap(),
+            toml_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_paths(&dir).env).unwrap(),
+            env_before
+        );
+        // The atomic staging file is renamed away, never stranded.
+        assert!(!dir.join(".stitch.key.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_key_rejects_a_bad_key_without_touching_the_file() {
+        let dir = unique_dir("rekey-bad");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        write_config(&dir, corridor, KEY).unwrap();
+        assert!(write_key(&dir, "not-a-key").is_err());
+        // Original key survives a rejected replacement.
+        assert_eq!(
+            std::fs::read_to_string(config_paths(&dir).key)
+                .unwrap()
+                .trim(),
+            KEY
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_toml_atomic_replaces_contents_and_leaves_no_temp_file() {
+        let dir = unique_dir("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stitch.toml");
+        std::fs::write(&path, "old = 1\n").unwrap();
+        write_toml_atomic(&path, "new = 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new = 2\n");
+        assert!(
+            !dir.join(".stitch.toml.tmp").exists(),
+            "temp file must be gone"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

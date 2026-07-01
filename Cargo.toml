@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.65"
+version = "0.1.66"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
 license = "AGPL-3.0-or-later"
@@ -38,6 +38,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
 toml = "0.8"
+toml_edit = "0.22"
+url = "2"
 anyhow = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
