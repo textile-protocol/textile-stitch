@@ -14,6 +14,8 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
     let p = Palette::current(&ctx);
     let running = app.status != Status::Stopped;
 
+    app.check_for_update(&ctx);
+
     egui::Panel::top("header")
         .frame(panel_frame(&p, 14, 12))
         .show(ui, |ui| {
@@ -42,6 +44,14 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
                 meta_card(&mut cols[1], &p, "Folder", &folder);
             });
         });
+
+    if let Some(latest) = app.available_update.lock().unwrap().clone() {
+        egui::Panel::top("update-nudge")
+            .frame(panel_frame(&p, 0, 12))
+            .show(ui, |ui| {
+                update_banner(ui, &p, &latest);
+            });
+    }
 
     egui::Panel::top("controls")
         .frame(panel_frame(&p, 12, 12))
@@ -192,6 +202,31 @@ fn status_style(p: &Palette, status: Status) -> (egui::Color32, egui::Color32, &
     }
 }
 
+/// A warning-tinted strip that tells the operator a newer release is out and
+/// sends them to the download page. The macOS app ships out-of-band, so a
+/// download (not an in-place self-update) is the honest action for everyone.
+fn update_banner(ui: &mut egui::Ui, p: &Palette, latest: &str) {
+    egui::Frame::new()
+        .fill(p.warning_bg)
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(13, 10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("Stitch v{latest} is available."))
+                        .color(p.warning)
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::tinted_button(ui, p.accent, "Download").clicked() {
+                        open_url(stitch_bot::update::RELEASES_PAGE);
+                    }
+                });
+            });
+        });
+}
+
 fn open_folder(dir: &std::path::Path) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(dir).spawn();
@@ -199,4 +234,13 @@ fn open_folder(dir: &std::path::Path) {
     let _ = std::process::Command::new("explorer").arg(dir).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+}
+
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }

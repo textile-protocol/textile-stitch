@@ -42,6 +42,11 @@ pub struct StitchApp {
     pub logs: Arc<Mutex<VecDeque<String>>>,
     /// Textile mark shown in the header (loaded once at startup).
     pub icon: Option<egui::TextureHandle>,
+    /// Newer release version if the background check found one. Shared with the
+    /// worker thread that queries GitHub, hence the Arc/Mutex.
+    pub available_update: Arc<Mutex<Option<String>>>,
+    /// Guards the one-shot update check so it's spawned once, not every frame.
+    update_check_started: bool,
     child: Option<Child>,
 }
 
@@ -85,8 +90,28 @@ impl StitchApp {
             action_note: None,
             logs: Arc::new(Mutex::new(VecDeque::new())),
             icon,
+            available_update: Arc::new(Mutex::new(None)),
+            update_check_started: false,
             child: None,
         }
+    }
+
+    /// Kick off a one-shot, best-effort "is a newer release out?" check on a
+    /// worker thread. Safe to call every frame: it only spawns once. On success
+    /// it stores the version and requests a repaint so the nudge appears.
+    pub fn check_for_update(&mut self, ctx: &egui::Context) {
+        if self.update_check_started {
+            return;
+        }
+        self.update_check_started = true;
+        let slot = self.available_update.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(version) = stitch_bot::update::newer_release_blocking() {
+                *slot.lock().unwrap() = Some(version);
+                ctx.request_repaint();
+            }
+        });
     }
 
     pub fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, line: String) {
