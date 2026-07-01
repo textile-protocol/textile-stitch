@@ -207,22 +207,6 @@ impl StitchApp {
     }
 }
 
-/// Header icon edge length, in points (roughly the heading's cap height).
-const HEADER_ICON_SIZE: f32 = 22.0;
-
-/// Draw the Textile mark at header size, if it loaded. Uses an explicit display
-/// size (the texture's own 256px size would otherwise render full-size) and
-/// centers it vertically against the heading text.
-pub fn show_header_icon(ui: &mut egui::Ui, icon: &Option<egui::TextureHandle>) {
-    if let Some(tex) = icon {
-        let size = egui::vec2(HEADER_ICON_SIZE, HEADER_ICON_SIZE);
-        ui.add(egui::Image::new(egui::load::SizedTexture::new(
-            tex.id(),
-            size,
-        )));
-    }
-}
-
 enum Reader {
     Out(std::process::ChildStdout),
     Err(std::process::ChildStderr),
@@ -254,15 +238,18 @@ fn strip_ansi(input: &str) -> String {
 }
 
 impl eframe::App for StitchApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // eframe 0.35 hands the app a `Ui` for the root viewport rather than a bare
+    // `Context`; the view modules attach their own panels with `show_inside`.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        crate::theme::apply(ui.ctx());
         self.poll_child();
         match self.view {
-            View::Setup => crate::wizard::show(self, ctx),
-            View::Panel => crate::panel::show(self, ctx),
+            View::Setup => crate::wizard::show(self, ui),
+            View::Panel => crate::panel::show(self, ui),
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         // Lifecycle A: closing the window stops the bot.
         self.stop_bot();
     }

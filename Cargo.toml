@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.63"
+version = "0.1.64"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
 license = "AGPL-3.0-or-later"
@@ -27,9 +27,9 @@ required-features = ["gui"]
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:image"]
 
 [dependencies]
-eframe = { version = "0.28", optional = true }
-egui = { version = "0.28", optional = true }
-rfd = { version = "0.14", optional = true }
+eframe = { version = "0.35", optional = true }
+egui = { version = "0.35", optional = true }
+rfd = { version = "0.17", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 alloy-primitives = { version = "1", features = ["rlp"] }
 alloy-rlp = "0.3"

@@ -7,6 +7,7 @@
 mod app;
 mod icon;
 mod panel;
+mod theme;
 mod wizard;
 
 fn main() -> eframe::Result<()> {
@@ -28,6 +29,7 @@ fn main() -> eframe::Result<()> {
         "Stitch",
         options,
         Box::new(|cc| {
+            theme::install_fonts(&cc.egui_ctx);
             let icon = icon::texture(&cc.egui_ctx);
             Ok(Box::new(app::StitchApp::new(icon)))
         }),
