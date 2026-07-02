@@ -381,6 +381,13 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // Per closer pool: position id → unix time we last submitted a fill for it,
     // so a pending tx or lagging subgraph can't trigger a duplicate `fill()`.
     let mut closer_pending: HashMap<Address, HashMap<U256, u64>> = HashMap::new();
+    // Per pool: unix time of the last heartbeat line. A working bot at steady
+    // state posts nothing most ticks (fully committed, or a side has no
+    // inventory), so without this the log looks dead. We emit a line whenever a
+    // side posts, and at least every HEARTBEAT_SECS otherwise, so "it's alive"
+    // and "why a side is quiet" are always visible.
+    let mut last_heartbeat: HashMap<String, u64> = HashMap::new();
+    const HEARTBEAT_SECS: u64 = 60;
     let slot_nonce_state_path = slot_nonce_state_path(&config_path, cfg.chain_id, maker);
     let initial_next_nonce = unix_now().saturating_mul(1000);
     let (next_nonce, slot_nonces, slot_inputs, slot_deadlines) = if dry_run {
@@ -478,6 +485,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                 pool.debt.to_lowercase()
             );
 
+            let mut posted_bid = 0usize;
+            let mut posted_ask = 0usize;
             for side in [Side::Bid, Side::Ask] {
                 let outcome = quote_side(
                     &ctx,
@@ -492,11 +501,28 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     now,
                 )
                 .await;
-                if let SideOutcome::AbortPool = outcome {
+                match outcome {
                     // The nonce ledger could not be persisted; never post on a
                     // stale ledger. Skip the rest of this pool's tick.
-                    continue 'pools;
+                    SideOutcome::AbortPool => continue 'pools,
+                    SideOutcome::Done { posted } => match side {
+                        Side::Bid => posted_bid = posted,
+                        Side::Ask => posted_ask = posted,
+                    },
                 }
+            }
+            // Heartbeat: always on a post, otherwise throttled to HEARTBEAT_SECS
+            // so a healthy-but-idle bot still shows a pulse (and its live price).
+            let last = last_heartbeat.entry(pair.clone()).or_insert(0);
+            if posted_bid + posted_ask > 0 || now.saturating_sub(*last) >= HEARTBEAT_SECS {
+                *last = now;
+                info!(
+                    pair = %pair,
+                    price = quote.price,
+                    bids_posted = posted_bid,
+                    asks_posted = posted_ask,
+                    "tick"
+                );
             }
             // ----- Blue leg: close this pool's in-the-money auction positions. -----
             if let Some(discoverer) = discoverer.as_ref() {

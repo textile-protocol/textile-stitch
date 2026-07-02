@@ -151,12 +151,15 @@ pub struct QuoteState {
     pub slot_deadlines: HashMap<String, u64>,
 }
 
-/// How a side's quote attempt ended. `AbortPool` means the nonce ledger could
-/// not be persisted before posting — the caller must skip the rest of this
-/// pool's tick (never post an order whose nonce isn't on disk).
+/// How a side's quote attempt ended. `Done { posted }` carries how many orders
+/// this side actually posted this tick (0 when it held — nothing to requote, no
+/// funded budget, or no inventory), so the tick loop can surface activity in a
+/// heartbeat. `AbortPool` means the nonce ledger could not be persisted before
+/// posting — the caller must skip the rest of this pool's tick (never post an
+/// order whose nonce isn't on disk).
 #[must_use]
 pub enum SideOutcome {
-    Done,
+    Done { posted: usize },
     AbortPool,
 }
 
@@ -177,7 +180,7 @@ pub async fn quote_side(
     now: u64,
 ) -> SideOutcome {
     let Some(spread) = side.spread(pool) else {
-        return SideOutcome::Done;
+        return SideOutcome::Done { posted: 0 };
     };
     let price = side.price(mid, spread);
     let key_id = side.key_id(pair);
@@ -190,7 +193,7 @@ pub async fn quote_side(
         pool.ttl_secs,
         pool.repost_lead_secs(),
     ) {
-        return SideOutcome::Done;
+        return SideOutcome::Done { posted: 0 };
     }
 
     let reusable_input =
@@ -219,7 +222,7 @@ pub async fn quote_side(
     );
     if drafts.is_empty() {
         // Posting an empty batch was always a no-op; skip the ledger write too.
-        return SideOutcome::Done;
+        return SideOutcome::Done { posted: 0 };
     }
 
     let input_reserved = drafted_input(&drafts);
@@ -284,7 +287,9 @@ pub async fn quote_side(
         info!(pair = %pair, orders = result.posted, "posted {label} ladder");
         state.last_quote.insert(key_id, (price, now));
     }
-    SideOutcome::Done
+    SideOutcome::Done {
+        posted: result.posted,
+    }
 }
 
 /// Order sizes for the side, in the side's input-sizing unit (debt slices for

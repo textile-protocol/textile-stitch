@@ -4,17 +4,36 @@
 //! shared rolling log buffer the reader threads append to.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use stitch_bot::setup::{self, ConfigPaths, Corridor, SignerView, SpreadEdit, Status};
 
 use crate::signerform::SignerForm;
 
-/// Cap the in-memory log so a long run can't grow unbounded.
+/// Cap the in-memory log pane so a long run can't grow the app's memory
+/// unbounded.
 const MAX_LOG_LINES: usize = 5000;
+
+/// Cap the on-disk `stitch.log` to the same window as the pane. The heartbeat
+/// keeps the log ticking, and it also accumulates across every start, so
+/// without this the file would grow without bound.
+const MAX_LOG_FILE_LINES: usize = 5000;
+
+/// Re-trim the log file this often (in lines written) during a long single run,
+/// so it stays bounded between restarts too. Trimming keeps the last
+/// `MAX_LOG_FILE_LINES`, so the ceiling is roughly that plus this interval.
+const LOG_TRIM_EVERY_LINES: usize = 1000;
+
+/// Never read more than this much of the log when trimming. The trim runs on the
+/// GUI start path, and an operator upgrading may already have a multi-GB log (the
+/// unbounded growth this bound exists to fix) — reading it whole would OOM/freeze
+/// the app. 8 MiB comfortably holds `MAX_LOG_FILE_LINES` normal lines, so we only
+/// ever scan the tail. Keep it well above `MAX_LOG_FILE_LINES × typical line`.
+const LOG_TAIL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 
 pub enum View {
     Setup,
@@ -409,6 +428,15 @@ impl StitchApp {
 
     fn spawn_readers(&self, child: &mut Child, ctx: egui::Context) {
         let log_path = self.paths.log.clone();
+        // Bound the file up front: it accumulates across every start, so a fresh
+        // run inherits whatever the last runs left behind.
+        trim_log_file(&log_path, MAX_LOG_FILE_LINES);
+
+        // One writer owns the file so trimming (truncate + rewrite tail) can't
+        // race the append from the other stream. Both reader threads feed it.
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || log_writer(&log_path, rx));
+
         for stream in [
             child.stdout.take().map(Reader::Out),
             child.stderr.take().map(Reader::Err),
@@ -418,13 +446,8 @@ impl StitchApp {
         {
             let logs = self.logs.clone();
             let ctx = ctx.clone();
-            let log_path = log_path.clone();
+            let tx = tx.clone();
             std::thread::spawn(move || {
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                    .ok();
                 let reader: Box<dyn BufRead> = match stream {
                     Reader::Out(s) => Box::new(BufReader::new(s)),
                     Reader::Err(s) => Box::new(BufReader::new(s)),
@@ -434,14 +457,14 @@ impl StitchApp {
                     // still colorize; strip escape codes so the pane and log file
                     // show clean text instead of literal "\x1b[2m…" sequences.
                     let line = strip_ansi(&line);
-                    if let Some(f) = file.as_mut() {
-                        let _ = writeln!(f, "{line}");
-                    }
+                    let _ = tx.send(line.clone());
                     StitchApp::push_log(&logs, line);
                     ctx.request_repaint();
                 }
             });
         }
+        // Drop the original sender so the writer stops once both readers finish.
+        drop(tx);
     }
 
     /// Gracefully stop the bot if it's running. Safe to call when stopped.
@@ -482,6 +505,81 @@ impl StitchApp {
 enum Reader {
     Out(std::process::ChildStdout),
     Err(std::process::ChildStderr),
+}
+
+/// Sole owner of the log file: append each received line, and every
+/// `LOG_TRIM_EVERY_LINES` re-trim to the last `MAX_LOG_FILE_LINES` so a long run
+/// stays bounded. Runs until every sender (the reader threads) has dropped.
+fn log_writer(log_path: &Path, rx: mpsc::Receiver<String>) {
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .ok()
+    };
+    let mut file = open();
+    let mut since_trim = 0usize;
+    for line in rx {
+        if let Some(f) = file.as_mut() {
+            let _ = writeln!(f, "{line}");
+        }
+        since_trim += 1;
+        if since_trim >= LOG_TRIM_EVERY_LINES {
+            since_trim = 0;
+            // Close before rewriting so the truncate isn't fighting our own
+            // append handle, then reopen at the new (trimmed) end.
+            drop(file.take());
+            trim_log_file(log_path, MAX_LOG_FILE_LINES);
+            file = open();
+        }
+    }
+}
+
+/// Rewrite `path` in place keeping only its last `keep` lines. Reads at most the
+/// last `LOG_TAIL_SCAN_BYTES`, so a huge log is bounded in memory rather than
+/// materialized whole. Best-effort: an unreadable file is left untouched.
+fn trim_log_file(path: &Path, keep: usize) {
+    let Some((tail, whole)) = read_tail(path, LOG_TAIL_SCAN_BYTES) else {
+        return;
+    };
+    // If we saw the whole file and it's within the cap, leave it untouched.
+    // When we only scanned the tail, the file is far past the cap by definition,
+    // so always rewrite it down to the last `keep` lines.
+    if whole && tail.bytes().filter(|&b| b == b'\n').count() <= keep {
+        return;
+    }
+    let _ = std::fs::write(path, tail_lines(&tail, keep));
+}
+
+/// Read at most the last `max_bytes` of `path`. Returns the bytes as a string
+/// (lossy, since a tail window can split a UTF-8 char at its start) and whether
+/// that was the whole file. `None` if the file can't be opened/read.
+fn read_tail(path: &Path, max_bytes: u64) -> Option<(String, bool)> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let whole = len <= max_bytes;
+    if !whole {
+        f.seek(SeekFrom::Start(len - max_bytes)).ok()?;
+    }
+    let mut buf = Vec::with_capacity(len.min(max_bytes) as usize);
+    f.take(max_bytes).read_to_end(&mut buf).ok()?;
+    Some((String::from_utf8_lossy(&buf).into_owned(), whole))
+}
+
+/// The last `keep` lines of `contents`, newline-terminated. Pure, so the trim
+/// policy is unit-testable without touching the filesystem.
+fn tail_lines(contents: &str, keep: usize) -> String {
+    if keep == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.len().saturating_sub(keep);
+    let mut out: String = lines[start..].join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 /// Remove ANSI escape sequences (CSI `\x1b[…<letter>`, plus stray `\x1b`) so log
@@ -531,7 +629,65 @@ impl eframe::App for StitchApp {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_ansi;
+    use super::{read_tail, strip_ansi, tail_lines, trim_log_file};
+
+    fn temp_log(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("stitch-log-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn read_tail_windows_a_large_file_from_the_end() {
+        let path = temp_log("readtail");
+        let content = "aaaa\nbbbb\ncccc\ndddd\n"; // 20 bytes
+        std::fs::write(&path, content).unwrap();
+        // Cap below the file size: only the last 10 bytes come back, not whole.
+        let (tail, whole) = read_tail(&path, 10).unwrap();
+        assert!(!whole);
+        assert_eq!(tail, "cccc\ndddd\n");
+        // A cap above the file size returns everything and reports whole.
+        let (all, whole) = read_tail(&path, 1024).unwrap();
+        assert!(whole);
+        assert_eq!(all, content);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn trim_log_file_keeps_the_tail_and_leaves_a_short_log_alone() {
+        let path = temp_log("trim");
+        let big: String = (0..50).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(&path, &big).unwrap();
+        trim_log_file(&path, 10);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.lines().count(), 10);
+        assert!(after.starts_with("line40\n"));
+        assert!(after.ends_with("line49\n"));
+        // Re-trimming a file already within the cap is a no-op.
+        trim_log_file(&path, 10);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tail_keeps_only_the_last_lines_newline_terminated() {
+        let input = "a\nb\nc\nd\ne\n";
+        assert_eq!(tail_lines(input, 2), "d\ne\n");
+    }
+
+    #[test]
+    fn tail_leaves_a_short_log_intact() {
+        // Fewer lines than the cap: every line survives.
+        assert_eq!(tail_lines("a\nb\n", 5), "a\nb\n");
+    }
+
+    #[test]
+    fn tail_of_zero_is_empty() {
+        assert_eq!(tail_lines("a\nb\nc\n", 0), "");
+    }
+
+    #[test]
+    fn tail_handles_a_missing_final_newline() {
+        assert_eq!(tail_lines("a\nb\nc", 2), "b\nc\n");
+    }
 
     #[test]
     fn strips_sgr_color_codes() {
