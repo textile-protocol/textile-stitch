@@ -69,3 +69,39 @@ min_margin_collateral = "0"                   # accept any positive net margin
 max_positions_per_fill = 10                   # close up to N from the FIFO front
 discover_first = 200                          # candidates pulled per tick
 skip_past_window = true                       # leave fully-decayed positions
+
+# ----- Signer / wallet backend. Omit this whole section to use the local
+# hotwallet (the default, unchanged): the bot signs with STITCH_PRIVATE_KEY /
+# STITCH_PRIVATE_KEY_FILE from the environment. Set [signer] to use an MPC wallet
+# instead. All secrets stay in the environment, never in this file. Each side of
+# every signature (the EIP-712 limit orders and the on-chain fill/approve txs)
+# goes through whichever signer you pick here; you pick one backend for the whole
+# bot. See ADVANCED.md for the MPC wallet details and the MPCVault sidecar setup.
+#
+# Local hotwallet (same as omitting [signer]):
+# [signer]
+# provider = "local"
+#
+# Turnkey (TEE-backed MPC, no extra infra, one synchronous API call per
+# signature, runs inside the bot binary). Secrets in the env:
+# TURNKEY_API_PUBLIC_KEY (plain), TURNKEY_API_PRIVATE_KEY /
+# TURNKEY_API_PRIVATE_KEY_FILE (secret).
+# [signer]
+# provider = "turnkey"
+# organization_id  = "<turnkey org id>"
+# sign_with        = "0x<wallet account address or private key id>"
+# operator_address = "0x<the EVM address sign_with resolves to>"
+# api_base_url     = "https://api.turnkey.com"   # optional, this is the default
+# max_concurrent_signs = 8                        # optional
+#
+# MPCVault (needs the client-signer sidecar, one per operator; see ADVANCED.md).
+# Secret in the env: MPCVAULT_API_TOKEN / MPCVAULT_API_TOKEN_FILE.
+# [signer]
+# provider = "mpcvault"
+# api_base_url         = "https://api.mpcvault.com"   # optional, default
+# vault_uuid           = "<mpcvault vault uuid>"
+# client_signer_pubkey = "ssh-ed25519 AAAA... "       # the sidecar's public key
+# operator_address     = "0x<the vault wallet EVM address>"
+# callback_listen_addr = "0.0.0.0:8088"   # optional, default; where the bot serves the approval callback
+# poll_timeout_secs    = 30                # optional
+# max_concurrent_signs = 4                 # optional

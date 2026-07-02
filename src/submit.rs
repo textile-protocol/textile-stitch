@@ -4,11 +4,10 @@
 //! `submitFillerOrder` mutation expects.
 
 use alloy_primitives::{hex, Address};
-use k256::ecdsa::SigningKey;
 use serde::Serialize;
 
 use crate::eip712::permit2_digest;
-use crate::signer::sign_digest;
+use crate::signer::Signer;
 use crate::types::OrderParams;
 
 /// Wire form of a signed operator order (addresses as `0x` strings, amounts as
@@ -30,14 +29,14 @@ pub struct SubmitOrder {
 }
 
 /// Sign the Permit2 witness digest and package the order for the indexer.
-pub fn sign_submission(
+pub async fn sign_submission(
     order: &OrderParams,
     permit2: Address,
     chain_id: u64,
-    key: &SigningKey,
+    signer: &dyn Signer,
 ) -> anyhow::Result<SubmitOrder> {
     let digest = permit2_digest(order, permit2, chain_id);
-    let sig = sign_digest(key, digest)?;
+    let sig = signer.sign_digest(digest).await?;
     Ok(SubmitOrder {
         chain_id,
         client_order_id: None,
@@ -57,16 +56,19 @@ pub fn sign_submission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signer::{address_from_signing_key, recover_address};
+    use crate::signer::{
+        address_from_signing_key, parse_private_key, recover_address, LocalSigner,
+    };
     use alloy_primitives::{address, B256, U256};
 
     const KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const PERMIT2: Address = address!("000000000022d473030f116ddee9f6b43ac78ba3");
 
-    #[test]
-    fn produces_a_signature_that_recovers_to_the_maker() {
-        let key = SigningKey::from_slice(&hex::decode(KEY).unwrap()).unwrap();
+    #[tokio::test]
+    async fn produces_a_signature_that_recovers_to_the_maker() {
+        let key = parse_private_key(KEY).unwrap();
         let maker = address_from_signing_key(&key);
+        let signer = LocalSigner::new(key);
         let order = OrderParams {
             reactor: address!("1111111111111111111111111111111111111111"),
             swapper: maker,
@@ -79,7 +81,9 @@ mod tests {
             recipient: maker,
         };
 
-        let s = sign_submission(&order, PERMIT2, 8453, &key).unwrap();
+        let s = sign_submission(&order, PERMIT2, 8453, &signer)
+            .await
+            .unwrap();
 
         assert_eq!(s.input_amount, "1000000");
         assert_eq!(s.output_amount, "1550000000");

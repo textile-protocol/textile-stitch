@@ -2,20 +2,25 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Signing and posting operator order batches to the indexer.
 
+use std::sync::Arc;
+
 use alloy_primitives::{Address, U256};
-use k256::ecdsa::SigningKey;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::indexer::Indexer;
-use crate::submit::sign_submission;
+use crate::signer::DynSigner;
+use crate::submit::{sign_submission, SubmitOrder};
 use crate::tick::unix_now;
 use crate::types::OrderParams;
 
 /// Signs and posts one operator order to the indexer. Holds the static context
-/// (key, reactor, permit2…) so the per-tick call sites stay small.
+/// (signer, reactor, permit2…) so the per-tick call sites stay small. The signer
+/// is shared (`Arc`) with the blue-leg wallet.
 pub struct Poster<'a> {
     pub indexer: &'a Indexer,
-    pub key: &'a SigningKey,
+    pub signer: DynSigner,
     pub permit2: Address,
     pub chain_id: u64,
     pub maker: Address,
@@ -59,40 +64,38 @@ impl Poster<'_> {
         price: f64,
     ) -> PostResult {
         let deadline = unix_now().saturating_add(ttl_secs);
-        let mut submissions = Vec::new();
 
-        for draft in drafts {
-            if draft.input_amount == U256::ZERO || draft.output_amount == U256::ZERO {
-                warn!(label, "zero-size order; skipping");
-                continue;
-            }
-
-            let order = OrderParams {
-                reactor: self.reactor,
-                swapper: self.maker,
-                nonce: U256::from(draft.nonce),
-                deadline: U256::from(deadline),
-                input_token,
-                input_amount: draft.input_amount,
-                output_token,
-                output_amount: draft.output_amount,
-                recipient: self.maker,
-            };
-            match sign_submission(&order, self.permit2, self.chain_id, self.key) {
-                Ok(mut s) => {
-                    s.client_order_id = draft.client_order_id.clone();
-                    submissions.push(s);
+        // Build the orders to sign, preserving draft order; drop zero-size slices.
+        let jobs: Vec<(OrderParams, Option<String>)> = drafts
+            .iter()
+            .filter_map(|draft| {
+                if draft.input_amount == U256::ZERO || draft.output_amount == U256::ZERO {
+                    warn!(label, "zero-size order; skipping");
+                    return None;
                 }
-                Err(e) => {
-                    warn!(label, error = %e, "signing failed; skipping batch");
-                    return PostResult::default();
-                }
-            }
-        }
+                let order = OrderParams {
+                    reactor: self.reactor,
+                    swapper: self.maker,
+                    nonce: U256::from(draft.nonce),
+                    deadline: U256::from(deadline),
+                    input_token,
+                    input_amount: draft.input_amount,
+                    output_token,
+                    output_amount: draft.output_amount,
+                    recipient: self.maker,
+                };
+                Some((order, draft.client_order_id.clone()))
+            })
+            .collect();
 
-        if submissions.is_empty() {
+        if jobs.is_empty() {
             return PostResult::default();
         }
+
+        let submissions = match self.sign_batch(jobs, label).await {
+            Some(s) if !s.is_empty() => s,
+            _ => return PostResult::default(),
+        };
 
         if self.dry_run {
             for submission in &submissions {
@@ -129,6 +132,58 @@ impl Poster<'_> {
                 }
             }
         }
+    }
+
+    /// Sign all orders concurrently, bounded by the backend's limit, returning
+    /// them in the original `jobs` order. Remote MPC signing is a round trip per
+    /// order, so signing a ladder serially would blow the tick budget. `None`
+    /// means at least one order failed to sign — the caller skips the whole
+    /// (atomically-posted) batch.
+    async fn sign_batch(
+        &self,
+        jobs: Vec<(OrderParams, Option<String>)>,
+        label: &str,
+    ) -> Option<Vec<SubmitOrder>> {
+        let n = jobs.len();
+        let permit2 = self.permit2;
+        let chain_id = self.chain_id;
+        let limit = self.signer.max_concurrent_signs().max(1);
+        let sem = Arc::new(Semaphore::new(limit));
+        let mut set: JoinSet<(usize, Option<String>, anyhow::Result<SubmitOrder>)> = JoinSet::new();
+        for (idx, (order, client_order_id)) in jobs.into_iter().enumerate() {
+            let signer = self.signer.clone();
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .expect("signing semaphore is open");
+                let res = sign_submission(&order, permit2, chain_id, signer.as_ref()).await;
+                (idx, client_order_id, res)
+            });
+        }
+
+        let mut slots: Vec<Option<SubmitOrder>> = (0..n).map(|_| None).collect();
+        while let Some(joined) = set.join_next().await {
+            let (idx, client_order_id, res) = match joined {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(label, error = %e, "sign task failed; skipping batch");
+                    return None;
+                }
+            };
+            match res {
+                Ok(mut s) => {
+                    s.client_order_id = client_order_id;
+                    slots[idx] = Some(s);
+                }
+                Err(e) => {
+                    warn!(label, error = %e, "signing failed; skipping batch");
+                    return None;
+                }
+            }
+        }
+        Some(slots.into_iter().flatten().collect())
     }
 }
 
@@ -200,5 +255,79 @@ mod tests {
         let error = "indexer rejected order batch: [{\"message\":\"Order batch is not funded\"}]";
 
         assert!(spent_nonces_from_error(error).is_empty());
+    }
+
+    use crate::signer::{parse_private_key, LocalSigner, Signer};
+    use alloy_primitives::B256;
+    use async_trait::async_trait;
+
+    const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    fn order_with_nonce(nonce: u64) -> OrderParams {
+        OrderParams {
+            reactor: Address::ZERO,
+            swapper: Address::ZERO,
+            nonce: U256::from(nonce),
+            deadline: U256::from(1u64),
+            input_token: Address::ZERO,
+            input_amount: U256::from(1u64),
+            output_token: Address::ZERO,
+            output_amount: U256::from(1u64),
+            recipient: Address::ZERO,
+        }
+    }
+
+    fn test_poster(indexer: &Indexer, signer: DynSigner) -> Poster<'_> {
+        Poster {
+            indexer,
+            signer,
+            permit2: Address::ZERO,
+            chain_id: 8453,
+            maker: Address::ZERO,
+            reactor: Address::ZERO,
+            dry_run: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_batch_preserves_draft_order() {
+        let indexer = Indexer::new("http://localhost/graphql".to_string());
+        let signer: DynSigner = Arc::new(LocalSigner::new(parse_private_key(TEST_KEY).unwrap()));
+        let poster = test_poster(&indexer, signer);
+
+        let jobs: Vec<(OrderParams, Option<String>)> = (0..8)
+            .map(|i| (order_with_nonce(1000 + i), Some(format!("coid-{i}"))))
+            .collect();
+
+        let signed = poster.sign_batch(jobs, "test").await.expect("all sign");
+        assert_eq!(signed.len(), 8);
+        for (i, s) in signed.iter().enumerate() {
+            assert_eq!(s.nonce, (1000 + i as u64).to_string(), "order preserved");
+            assert_eq!(s.client_order_id, Some(format!("coid-{i}")));
+        }
+    }
+
+    struct FailingSigner;
+
+    #[async_trait]
+    impl Signer for FailingSigner {
+        async fn sign_digest(&self, _digest: B256) -> anyhow::Result<[u8; 65]> {
+            anyhow::bail!("signer unavailable")
+        }
+        fn address(&self) -> Address {
+            Address::ZERO
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_batch_skips_the_whole_batch_on_any_failure() {
+        let indexer = Indexer::new("http://localhost/graphql".to_string());
+        let poster = test_poster(&indexer, Arc::new(FailingSigner));
+        let jobs = vec![
+            (order_with_nonce(1), None),
+            (order_with_nonce(2), None),
+            (order_with_nonce(3), None),
+        ];
+        assert!(poster.sign_batch(jobs, "test").await.is_none());
     }
 }

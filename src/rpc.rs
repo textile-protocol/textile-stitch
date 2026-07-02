@@ -10,11 +10,10 @@
 use std::time::Duration;
 
 use alloy_primitives::{hex, Address, Bytes, B256, U256};
-use k256::ecdsa::SigningKey;
 use serde_json::{json, Value};
 
 use crate::net::http_client;
-use crate::signer::address_from_signing_key;
+use crate::signer::DynSigner;
 use crate::tx::{sign_tx, Eip1559Tx};
 
 /// Default priority fee when the node has no `eth_maxPriorityFeePerGas`: 1 gwei.
@@ -133,19 +132,20 @@ impl Rpc {
 }
 
 /// A signing wallet over an [`Rpc`]: turns calldata into landed transactions.
+/// The signer is shared (`Arc`) with the green-leg poster.
 pub struct Wallet {
     rpc: Rpc,
-    key: SigningKey,
+    signer: DynSigner,
     address: Address,
     chain_id: u64,
 }
 
 impl Wallet {
-    pub fn new(rpc_url: impl Into<String>, key: SigningKey, chain_id: u64) -> Self {
-        let address = address_from_signing_key(&key);
+    pub fn new(rpc_url: impl Into<String>, signer: DynSigner, chain_id: u64) -> Self {
+        let address = signer.address();
         Self {
             rpc: Rpc::new(rpc_url),
-            key,
+            signer,
             address,
             chain_id,
         }
@@ -197,7 +197,7 @@ impl Wallet {
             value,
             data,
         };
-        let signed = sign_tx(&self.key, &tx)?;
+        let signed = sign_tx(self.signer.as_ref(), &tx).await?;
         self.rpc.send_raw(&signed.raw).await
     }
 
@@ -230,7 +230,15 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signer::{parse_private_key, LocalSigner};
     use alloy_primitives::address;
+    use std::sync::Arc;
+
+    const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    fn local_signer() -> DynSigner {
+        Arc::new(LocalSigner::new(parse_private_key(TEST_KEY).unwrap()))
+    }
 
     #[test]
     fn builds_a_jsonrpc_envelope() {
@@ -249,12 +257,7 @@ mod tests {
 
     #[test]
     fn derives_wallet_address_from_key() {
-        let key = SigningKey::from_slice(
-            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
-                .unwrap(),
-        )
-        .unwrap();
-        let w = Wallet::new("http://localhost:8545", key, 31337);
+        let w = Wallet::new("http://localhost:8545", local_signer(), 31337);
         assert_eq!(
             w.address(),
             address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
@@ -270,13 +273,8 @@ mod tests {
     async fn lands_a_value_transfer_on_a_local_chain() {
         let rpc_url =
             std::env::var("FILLER_TEST_RPC").unwrap_or_else(|_| "http://localhost:8545".into());
-        let key = SigningKey::from_slice(
-            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
-                .unwrap(),
-        )
-        .unwrap();
         let chain_id = Rpc::new(&rpc_url).chain_id().await.expect("chain_id");
-        let wallet = Wallet::new(&rpc_url, key, chain_id);
+        let wallet = Wallet::new(&rpc_url, local_signer(), chain_id);
         let to = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8"); // hardhat #1
         let receipt = wallet
             .send_and_wait(to, Bytes::new(), U256::from(1u64), Duration::from_secs(30))

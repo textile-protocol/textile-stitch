@@ -16,6 +16,25 @@
 #
 # Logs:    journalctl -u stitch -f
 # Restart: sudo systemctl restart stitch   (re-reads stitch.toml on start)
+#
+# MPC wallet (Turnkey / MPCVault) instead of the local key:
+#   - Put `[signer]` in stitch.toml (provider = "turnkey" | "mpcvault").
+#   - Load the MPC secret file the same way as stitch.key below, via
+#     LoadCredential + %d. This is required, not optional: with DynamicUser=yes the
+#     service runs as a transient UID that CANNOT read root-owned 0600 files under
+#     /etc, so pointing *_FILE at /etc/stitch-bot/... would fail to load. systemd
+#     stages a credential into %d (the $CREDENTIALS_DIRECTORY) readable by that
+#     user. So drop the stitch.key LoadCredential and STITCH_PRIVATE_KEY_FILE lines
+#     and use, for Turnkey:
+#       LoadCredential=turnkey.key:/etc/stitch-bot/turnkey.key
+#       Environment=TURNKEY_API_PRIVATE_KEY_FILE=%d/turnkey.key
+#     with the non-secret TURNKEY_API_PUBLIC_KEY in stitch.env. For MPCVault:
+#       LoadCredential=mpcvault.token:/etc/stitch-bot/mpcvault.token
+#       Environment=MPCVAULT_API_TOKEN_FILE=%d/mpcvault.token
+#     The source files under /etc stay root-owned 0600; systemd copies them into %d.
+#   - MPCVault also needs the client-signer sidecar container running on the same
+#     host with its callback-url pointed at the bot's callback_listen_addr. See
+#     ADVANCED.md ("MPCVault sidecar").
 
 [Unit]
 Description=Textile filler network operator bot

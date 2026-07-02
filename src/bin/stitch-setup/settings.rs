@@ -27,7 +27,7 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
                     ui.heading("Settings");
                     ui.label(
                         RichText::new(
-                            "Switch corridors, or change the wallet, spreads, and endpoints.",
+                            "Switch corridors, or change the signer, spreads, and endpoints.",
                         )
                         .color(p.text_muted)
                         .size(12.5),
@@ -49,7 +49,7 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
                 .show(ui, |ui| {
                     corridor_card(ui, &p, app);
                     ui.add_space(12.0);
-                    wallet_card(ui, &p, app);
+                    signer_card(ui, &p, app);
                     ui.add_space(12.0);
                     spreads_card(ui, &p, app);
                     ui.add_space(12.0);
@@ -170,45 +170,62 @@ fn corridor_card(ui: &mut egui::Ui, p: &Palette, app: &mut StitchApp) {
     });
 }
 
-/// Operator wallet: current address, with the destructive key swap tucked behind
-/// a deliberate "Change wallet…" click.
-fn wallet_card(ui: &mut egui::Ui, p: &Palette, app: &mut StitchApp) {
+/// Signer: the current backend (hot wallet vs MPC) and operator address, with the
+/// change tucked behind a deliberate "Change signer…" click. Applying rewrites the
+/// `[signer]` section, the secret file, and stitch.env — its own action, separate
+/// from the Save button — and bounces a running bot.
+fn signer_card(ui: &mut egui::Ui, p: &Palette, app: &mut StitchApp) {
+    let ctx = ui.ctx().clone();
     theme::card(p).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
-        theme::field_label(ui, p, "Operator wallet");
+        theme::field_label(ui, p, "Signer");
         ui.add_space(2.0);
+        ui.label(
+            RichText::new(app.settings.signer.kind.display_label())
+                .color(p.text)
+                .size(12.5),
+        );
+        ui.add_space(6.0);
+        theme::field_label(ui, p, "Operator");
         let addr = app.operator.clone().unwrap_or_else(|| "—".into());
-        ui.label(RichText::new(addr).monospace().color(p.text).size(12.5));
+        ui.label(
+            RichText::new(addr)
+                .monospace()
+                .color(p.text_muted)
+                .size(12.0),
+        );
         ui.add_space(8.0);
 
-        if !app.settings.change_wallet {
-            if ui.button("Change wallet…").clicked() {
-                app.settings.change_wallet = true;
+        if !app.settings.change_signer {
+            if ui.button("Change signer…").clicked() {
+                app.settings.change_signer = true;
             }
             return;
         }
 
-        theme::field_label(ui, p, "New private key");
-        ui.add(
-            egui::TextEdit::singleline(&mut app.settings.key_input)
-                .password(true)
-                .hint_text("0x…")
-                .desired_width(f32::INFINITY),
-        );
-        ui.add_space(4.0);
+        crate::signerform::signer_fields(ui, p, &mut app.settings.signer);
+        ui.add_space(2.0);
         ui.label(
             RichText::new(
-                "Replaces stitch.key with the new key. Cancel to keep your current wallet.",
+                "Applying rewrites the signer and its secret, then restarts a running bot.",
             )
             .color(p.text_faint)
             .size(11.0),
         );
         ui.add_space(6.0);
-        if ui.button("Cancel wallet change").clicked() {
-            use zeroize::Zeroize;
-            app.settings.key_input.zeroize();
-            app.settings.change_wallet = false;
-        }
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, p, "Apply signer").clicked() {
+                app.apply_signer_change(&ctx);
+            }
+            if ui.button("Cancel").clicked() {
+                app.settings.signer.zeroize_secrets();
+                app.settings.change_signer = false;
+                if let Ok(toml) = std::fs::read_to_string(&app.paths.toml) {
+                    app.settings.signer =
+                        crate::signerform::SignerForm::from_view(&setup::read_signer(&toml));
+                }
+            }
+        });
     });
 }
 
@@ -243,11 +260,34 @@ fn spread_field(ui: &mut egui::Ui, p: &Palette, label: &str, edit: &mut SpreadEd
         SpreadKind::Abs => "abs",
     };
     theme::field_label(ui, p, &format!("{label} ({unit})"));
-    ui.add(
+    let resp = ui.add(
         egui::TextEdit::singleline(&mut edit.value)
             .hint_text("0")
+            .margin(theme::FIELD_MARGIN)
             .desired_width(f32::INFINITY),
     );
+    // Reject non-numeric input as it's typed/pasted, so a spread can only ever be
+    // a number (bps is parsed as an integer, an absolute offset as a decimal).
+    if resp.changed() {
+        keep_numeric(&mut edit.value, edit.kind);
+    }
+}
+
+/// Strip anything that isn't part of a number: digits only for bps (an integer),
+/// digits plus a single decimal point for an absolute offset (a decimal).
+fn keep_numeric(value: &mut String, kind: SpreadKind) {
+    let allow_dot = matches!(kind, SpreadKind::Abs);
+    let mut seen_dot = false;
+    value.retain(|c| {
+        if c.is_ascii_digit() {
+            true
+        } else if allow_dot && c == '.' && !seen_dot {
+            seen_dot = true;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// RPC and price-feed endpoints.
@@ -258,6 +298,7 @@ fn endpoints_card(ui: &mut egui::Ui, p: &Palette, app: &mut StitchApp) {
         ui.add(
             egui::TextEdit::singleline(&mut app.settings.rpc_url)
                 .hint_text("https://…")
+                .margin(theme::FIELD_MARGIN)
                 .desired_width(f32::INFINITY),
         );
         ui.add_space(10.0);
@@ -265,6 +306,7 @@ fn endpoints_card(ui: &mut egui::Ui, p: &Palette, app: &mut StitchApp) {
         ui.add(
             egui::TextEdit::singleline(&mut app.settings.feed_url)
                 .hint_text("https://…")
+                .margin(theme::FIELD_MARGIN)
                 .desired_width(f32::INFINITY),
         );
     });
@@ -291,4 +333,34 @@ fn notice_card(ui: &mut egui::Ui, fg: egui::Color32, bg: egui::Color32, msg: &st
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new(msg).color(fg).size(12.5));
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keep_numeric;
+    use stitch_bot::setup::SpreadKind;
+
+    #[test]
+    fn bps_keeps_digits_only() {
+        let mut v = "1a2.3 4x".to_string();
+        keep_numeric(&mut v, SpreadKind::Bps);
+        assert_eq!(v, "1234");
+    }
+
+    #[test]
+    fn abs_keeps_digits_and_one_decimal_point() {
+        let mut v = "0.00a1.5".to_string();
+        keep_numeric(&mut v, SpreadKind::Abs);
+        assert_eq!(v, "0.0015", "letters gone, only the first dot kept");
+    }
+
+    #[test]
+    fn empty_and_pure_number_are_unchanged() {
+        let mut v = String::new();
+        keep_numeric(&mut v, SpreadKind::Bps);
+        assert_eq!(v, "");
+        let mut n = "42".to_string();
+        keep_numeric(&mut n, SpreadKind::Bps);
+        assert_eq!(n, "42");
+    }
 }

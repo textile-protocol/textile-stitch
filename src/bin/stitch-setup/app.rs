@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
-use stitch_bot::setup::{self, ConfigPaths, Corridor, SpreadEdit, Status};
+use stitch_bot::setup::{self, ConfigPaths, Corridor, SignerView, SpreadEdit, Status};
+
+use crate::signerform::SignerForm;
 
 /// Cap the in-memory log so a long run can't grow unbounded.
 const MAX_LOG_LINES: usize = 5000;
@@ -31,9 +33,10 @@ pub struct SettingsForm {
     pub sell: SpreadEdit,
     /// Pools in the config; the screen edits the first and notes when there's more.
     pub pool_count: usize,
-    /// True once "Change wallet…" is clicked, revealing the private-key field.
-    pub change_wallet: bool,
-    pub key_input: String,
+    /// True once "Change signer…" is clicked, revealing the signer editor.
+    pub change_signer: bool,
+    /// Signer editor state, prefilled from the current config when the screen opens.
+    pub signer: SignerForm,
     /// True once "Switch corridor…" is clicked, revealing the corridor picker.
     pub switch_corridor: bool,
     /// Catalog index the operator has picked in the switch picker. Defaults to the
@@ -50,7 +53,7 @@ pub struct StitchApp {
 
     // Setup form state.
     pub selected_corridor: usize,
-    pub key_input: String,
+    pub signer_form: SignerForm,
     pub setup_error: Option<String>,
     /// Set when Create was pressed on an already-configured folder; requires a
     /// second, explicit confirmation before overwriting an existing key/config.
@@ -76,6 +79,28 @@ pub struct StitchApp {
     pub settings: SettingsForm,
 }
 
+/// The operator address to show for a config. The configured `[signer]` wins: an
+/// MPC signer carries its own `operator_address`, so reading it first means a
+/// folder switched from hot wallet to MPC (or an MPC folder opened at startup)
+/// shows the MPC address even if a stale stitch.key is still on disk. Only the hot
+/// wallet derives the address from the key file.
+fn operator_for(paths: &ConfigPaths) -> Option<String> {
+    if let Ok(toml) = std::fs::read_to_string(&paths.toml) {
+        match setup::read_signer(&toml) {
+            SignerView::Turnkey {
+                operator_address, ..
+            }
+            | SignerView::Mpcvault {
+                operator_address, ..
+            } => return Some(operator_address),
+            SignerView::Local => {}
+        }
+    }
+    setup::operator_address(&paths.dir)
+        .ok()
+        .map(|a| format!("{a:?}"))
+}
+
 /// The GUI's default config folder: ~/Stitch (always user-writable, unlike the
 /// app bundle the executable may live in). Matches the README's foreground
 /// location.
@@ -96,17 +121,14 @@ impl StitchApp {
             .then(|| std::fs::read_to_string(&paths.toml).ok())
             .flatten()
             .and_then(|t| setup::identify_corridor(&t));
-        let operator = configured
-            .then(|| setup::operator_address(&dir).ok())
-            .flatten()
-            .map(|a| format!("{a:?}"));
+        let operator = configured.then(|| operator_for(&paths)).flatten();
         Self {
             view: if configured { View::Panel } else { View::Setup },
             dir,
             paths,
             stitch_bin: setup::find_stitch_binary(),
             selected_corridor: 0,
-            key_input: String::new(),
+            signer_form: SignerForm::default(),
             setup_error: None,
             pending_overwrite: false,
             corridor,
@@ -131,16 +153,21 @@ impl StitchApp {
             corridor_choice: self.current_corridor_index(),
             ..SettingsForm::default()
         };
-        match std::fs::read_to_string(&self.paths.toml)
-            .map_err(|e| e.to_string())
-            .and_then(|t| setup::read_settings(&t).map_err(|e| format!("{e:#}")))
-        {
-            Ok(v) => {
-                form.rpc_url = v.rpc_url;
-                form.feed_url = v.feed_url;
-                form.buy = v.buy;
-                form.sell = v.sell;
-                form.pool_count = v.pool_count;
+        match std::fs::read_to_string(&self.paths.toml) {
+            Ok(toml) => {
+                match setup::read_settings(&toml) {
+                    Ok(v) => {
+                        form.rpc_url = v.rpc_url;
+                        form.feed_url = v.feed_url;
+                        form.buy = v.buy;
+                        form.sell = v.sell;
+                        form.pool_count = v.pool_count;
+                    }
+                    Err(e) => form.error = Some(format!("Couldn't read the current config: {e:#}")),
+                }
+                // Prefill the signer editor from the current config (secrets stay
+                // blank; the operator re-enters one only when changing signer).
+                form.signer = SignerForm::from_view(&setup::read_signer(&toml));
             }
             Err(e) => form.error = Some(format!("Couldn't read the current config: {e}")),
         }
@@ -148,10 +175,9 @@ impl StitchApp {
         self.view = View::Settings;
     }
 
-    /// Leave the Settings screen without saving, wiping any pasted key first.
+    /// Leave the Settings screen without saving, wiping any pasted secrets first.
     pub fn close_settings(&mut self) {
-        use zeroize::Zeroize;
-        self.settings.key_input.zeroize();
+        self.settings.signer.zeroize_secrets();
         self.settings = SettingsForm::default();
         self.view = View::Panel;
     }
@@ -183,7 +209,7 @@ impl StitchApp {
             self.settings.switch_corridor = false;
             return;
         }
-        if let Err(e) = setup::write_toml_atomic(&self.paths.toml, target.toml_template) {
+        if let Err(e) = setup::switch_corridor_preserving_signer(&self.dir, target.toml_template) {
             self.settings.error = Some(format!("Couldn't switch corridor: {e:#}"));
             return;
         }
@@ -230,41 +256,11 @@ impl StitchApp {
             }
         };
 
-        // Wallet swap is opt-in: only when the field was revealed and filled.
-        // Validate the key BEFORE touching disk so an invalid key aborts with
-        // nothing written, rather than leaving the config saved but the key
-        // unchanged (an all-or-nothing save).
-        let new_key = self.settings.change_wallet && !self.settings.key_input.trim().is_empty();
-        if new_key {
-            if let Err(e) = stitch_bot::signer::parse_private_key(self.settings.key_input.trim()) {
-                self.settings.error = Some(format!("The new wallet key is not valid: {e:#}"));
-                return;
-            }
-        }
-
+        // The signer (wallet vs MPC) is changed on its own, via apply_signer_change,
+        // because it rewrites the secret + env too; this save is endpoints/spreads.
         if let Err(e) = setup::write_toml_atomic(&self.paths.toml, &edited) {
             self.settings.error = Some(format!("Couldn't save the config: {e:#}"));
             return;
-        }
-
-        if new_key {
-            use zeroize::Zeroize;
-            let result = setup::write_key(&self.dir, &self.settings.key_input);
-            self.settings.key_input.zeroize();
-            match result {
-                Ok(addr) => {
-                    self.operator = Some(format!("{addr:?}"));
-                    self.settings.change_wallet = false;
-                }
-                Err(e) => {
-                    // Pre-validated above, so this is an unexpected write failure
-                    // (e.g. permissions); the config is already saved.
-                    self.settings.error = Some(format!(
-                        "Settings saved, but writing the new wallet key failed: {e:#}"
-                    ));
-                    return;
-                }
-            }
         }
 
         // Config is read once at start, so a running bot must be bounced to pick
@@ -340,10 +336,49 @@ impl StitchApp {
         self.corridor = std::fs::read_to_string(&self.paths.toml)
             .ok()
             .and_then(|t| setup::identify_corridor(&t));
-        self.operator = setup::operator_address(&self.dir)
-            .ok()
-            .map(|a| format!("{a:?}"));
+        self.operator = self.read_operator();
         self.view = View::Panel;
+    }
+
+    /// The operator address to show for the current config (see [`operator_for`]).
+    fn read_operator(&self) -> Option<String> {
+        operator_for(&self.paths)
+    }
+
+    /// Apply a signer change from the Settings screen: rewrite the `[signer]`
+    /// section, the secret file, and stitch.env, then bounce the bot if running.
+    /// Leaves everything else untouched. On failure nothing is applied and the
+    /// error shows inline.
+    pub fn apply_signer_change(&mut self, ctx: &egui::Context) {
+        self.settings.error = None;
+        let setup = self.settings.signer.to_setup();
+        if let Err(e) = setup::apply_signer(&self.dir, &setup) {
+            self.settings.error = Some(format!("{e:#}"));
+            return;
+        }
+        self.settings.signer.zeroize_secrets();
+        self.operator = self.read_operator();
+
+        if self.status != Status::Stopped {
+            self.stop_bot();
+            self.start_bot(ctx);
+            if self.status == Status::Stopped {
+                // start_bot recorded why it failed in action_note; keep that
+                // instead of a misleading "restarted" so the operator sees the bot
+                // is offline after switching custody.
+                let why = self
+                    .action_note
+                    .take()
+                    .unwrap_or_else(|| "the bot failed to start".into());
+                self.action_note =
+                    Some(format!("Signer updated, but the bot didn't restart. {why}"));
+            } else {
+                self.action_note = Some("Signer updated. Bot restarted.".into());
+            }
+        } else {
+            self.action_note = Some("Signer updated.".into());
+        }
+        self.close_settings();
     }
 
     /// Spawn the bot (honouring the dry-run toggle), streaming output to `logs`.

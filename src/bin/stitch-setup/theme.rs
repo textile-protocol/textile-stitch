@@ -164,7 +164,8 @@ pub fn apply(ctx: &egui::Context) {
     let s = &mut style.spacing;
     s.item_spacing = egui::vec2(8.0, 8.0);
     s.button_padding = egui::vec2(12.0, 7.0);
-    s.interact_size.y = 30.0;
+    // Taller interactive rows so inputs, pickers and buttons don't feel cramped.
+    s.interact_size.y = 34.0;
     s.icon_width = 18.0;
     s.icon_width_inner = 10.0;
     s.combo_width = 220.0;
@@ -220,6 +221,15 @@ pub fn apply(ctx: &egui::Context) {
 
     ctx.set_style_of(theme, style);
 }
+
+/// Inner padding for single-line text inputs — taller than egui's default so the
+/// fields don't feel cramped. Shared by the setup and settings screens.
+pub const FIELD_MARGIN: Margin = Margin {
+    left: 10,
+    right: 10,
+    top: 11,
+    bottom: 11,
+};
 
 /// A card frame: the surface color, a soft border, rounded corners and inner
 /// padding. Used for meta rows and the log pane.

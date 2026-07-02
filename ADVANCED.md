@@ -139,6 +139,144 @@ skip_past_window = true
 params. Advanced operators can omit the closer fields to run market making only,
 but the recommended setup keeps both jobs enabled.
 
+### MPC Wallet Signers
+
+By default Stitch signs with the local private key (the hotwallet). An optional
+`[signer]` section swaps that for an MPC wallet. Whichever signer is configured
+handles every signature the bot makes: the EIP-712 limit orders and the on-chain
+fill/approve transactions. You pick one backend for the whole bot.
+
+Three options:
+
+- **Local hotwallet** (default): the bot signs with `STITCH_PRIVATE_KEY` /
+  `STITCH_PRIVATE_KEY_FILE`. Omit `[signer]` entirely, or set
+  `provider = "local"`.
+- **Turnkey**: a TEE-backed MPC wallet. Use it when you want MPC custody with no
+  extra infra. It's a single synchronous API call per signature, made from
+  inside the bot binary, so there's no sidecar to run. Each operator uses their
+  own Turnkey org and API key.
+- **MPCVault**: an MPC wallet that runs through a separate `client-signer`
+  sidecar. Use it when your custody is already on MPCVault. It can't be run as
+  one shared service for many operators: MPCVault binds one client-signer per
+  vault and each operator needs their own vault and funds, so it's one sidecar
+  per operator.
+
+Secrets always come from the environment, never the config file (same rule as the
+existing key). Each secret has a `_FILE` variant (a path) that takes precedence
+over the raw value, exactly like `STITCH_PRIVATE_KEY_FILE` vs
+`STITCH_PRIVATE_KEY`.
+
+The operator wallet or vault still needs a little native gas for Permit2
+approvals (`stitch approve`) regardless of the signer.
+
+**Desktop app.** If you use `stitch-setup`, you don't need to edit any of this by
+hand. The first-run wizard and the Settings screen both have a **Signer**
+dropdown (hot wallet / Turnkey / MPCVault) that collects the fields below, writes
+the `[signer]` section, stores each secret in an owner-only file, and points
+`stitch.env` at it. Changing the signer in Settings rewrites all three and
+restarts a running bot. The rest of this section is the reference for CLI and
+server operators editing `stitch.toml` directly. MPCVault still needs its sidecar
+running (below) either way.
+
+Local hotwallet (same as omitting the section):
+
+```toml
+[signer]
+provider = "local"
+```
+
+Env vars: `STITCH_PRIVATE_KEY` / `STITCH_PRIVATE_KEY_FILE` (unchanged).
+
+Turnkey:
+
+```toml
+[signer]
+provider = "turnkey"
+organization_id  = "<turnkey org id>"
+sign_with        = "0x<wallet account address or private key id>"
+operator_address = "0x<the EVM address sign_with resolves to>"
+api_base_url     = "https://api.turnkey.com"   # optional, this is the default
+max_concurrent_signs = 8                        # optional
+```
+
+Env vars: `TURNKEY_API_PUBLIC_KEY` (not secret, plain env), and
+`TURNKEY_API_PRIVATE_KEY` / `TURNKEY_API_PRIVATE_KEY_FILE` (secret).
+
+MPCVault:
+
+```toml
+[signer]
+provider = "mpcvault"
+api_base_url         = "https://api.mpcvault.com"   # optional, default
+vault_uuid           = "<mpcvault vault uuid>"
+client_signer_pubkey = "ssh-ed25519 AAAA... "       # the sidecar's public key
+operator_address     = "0x<the vault wallet EVM address>"
+callback_listen_addr = "0.0.0.0:8088"   # optional, default; where the bot serves the approval callback
+poll_timeout_secs    = 30                # optional
+max_concurrent_signs = 4                 # optional
+```
+
+Env var: `MPCVAULT_API_TOKEN` / `MPCVAULT_API_TOKEN_FILE` (secret).
+
+MPCVault is a two-process setup: the bot plus the sidecar on the same host. The
+bot runs an HTTP "callback approval" server at `callback_listen_addr`; the
+MPCVault `client-signer` Docker container calls that callback to approve each
+signing request.
+
+#### MPCVault sidecar
+
+1. Generate an ed25519 key for the sidecar:
+
+   ```bash
+   ssh-keygen -t ed25519 -C "mpcvault-client-signer" -f ./client-signer-key -N ""
+   ```
+
+   No passphrase. The public key (`client-signer-key.pub`) goes in
+   `client_signer_pubkey` in `stitch.toml`. Register it in the MPCVault console
+   under the vault's Team & policies, then approve the resulting "Key grant
+   access" request in the MPCVault app.
+
+2. Write the sidecar `config.yml`:
+
+   ```yaml
+   http-health:
+     listening-addr: 0.0.0.0:8080
+   vault-uuid: "<vault uuid>"
+   ssh:
+     private-key: |
+       -----BEGIN OPENSSH PRIVATE KEY-----
+       ...contents of client-signer-key...
+       -----END OPENSSH PRIVATE KEY-----
+     password: ""
+   callback-url: "http://<bot host or container>:8088/callback"   # must reach the bot's callback_listen_addr
+   ```
+
+3. Run the sidecar next to the bot:
+
+   ```bash
+   docker run -d --name mpcvault-signer --restart unless-stopped \
+     -p 8080:8080 -v "$(pwd)/config.yml:/config.yml:ro" \
+     ghcr.io/mpcvault/client-signer:latest --config-path=/config.yml
+   ```
+
+4. Make sure the bot's `callback_listen_addr` is reachable from the sidecar
+   container. If both are containers, share a network or use host networking; the
+   `callback-url` must resolve to the bot.
+
+The exact callback request body schema isn't fully documented by MPCVault. The
+bot approves on receipt and logs whether it can correlate the request to an
+in-flight signature. Tighten this later once confirmed against the running
+sidecar.
+
+#### Deployment notes
+
+On AWS Fargate the provided CloudFormation template supports local and Turnkey
+directly: fill the matching keys in the `<BotName>/operator` secret
+(`TURNKEY_API_PUBLIC_KEY`, `TURNKEY_API_PRIVATE_KEY`, or `MPCVAULT_API_TOKEN`).
+MPCVault additionally needs the client-signer sidecar running alongside, which
+suits the EC2/docker-compose or systemd host setup better than the
+single-container Fargate Quick Create.
+
 ## Troubleshooting
 
 ### First Checks

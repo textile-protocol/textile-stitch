@@ -45,6 +45,12 @@ Security rules:
 - Put only STITCH_PRIVATE_KEY_FILE=<key-file-path> in the env file.
 - If both STITCH_PRIVATE_KEY_FILE and STITCH_PRIVATE_KEY are set,
   STITCH_PRIVATE_KEY_FILE takes precedence.
+- For an MPC signer (Turnkey/MPCVault), the same secret-handling rules apply to its
+  credentials: never paste the Turnkey API private key or the MPCVault API token into
+  chat or a question tool, never put them in stitch.toml, logs, or command arguments,
+  collect them via a local hidden terminal prompt, and write them to a file with
+  chmod 600. The Turnkey API public key and the non-secret signer fields (org id,
+  vault uuid, addresses) are not secret and can be handled normally.
 - Use a dedicated operator wallet.
 - Before any live operation, confirm token balances and set up Permit2 approvals
   with `stitch approve` (see the Permit2 approvals step). A live start refuses to
@@ -92,6 +98,17 @@ Operator interview (AskUserQuestion, one question at a time):
 Keep it short — ask ONLY the questions below. Everything else is auto-filled from
 discovery, the example config, my wallet, or the defaults; never ask about it.
 Run after detecting OS/architecture and before writing config.
+
+0. Signer / wallet type — ASK THIS FIRST, before the numbered questions, because it
+   changes which secrets to collect and whether to write a `[signer]` section.
+   "How should Stitch hold its operator key?"
+   - Options (recommended first): Hotwallet (local private key); Turnkey (MPC, no
+     extra infrastructure); MPCVault (MPC, needs a sidecar container).
+   - Hotwallet is the default and simplest. Turnkey and MPCVault keep the key in an
+     MPC wallet so the bot never holds raw key material. If unsure, pick Hotwallet.
+   - Remember the answer. It selects the credential-collection path below and whether
+     to add a `[signer]` section to stitch.toml. MPCVault also requires standing up a
+     client-signer sidecar (see "MPC signer credentials").
 
 1. Chain — which network should Stitch run on?
    - Options (3 max): Base — 8453 (recommended); BNB Smart Chain — 56; Another
@@ -389,10 +406,19 @@ Configuration procedure:
      skip_past_window.
    - Only omit these if I explicitly ask to run market making only.
 
-5. Restrict config file permissions:
+5. Signer section: if I chose Turnkey or MPCVault, add a `[signer]` section to
+   stitch.toml with `provider` and the non-secret fields gathered in the
+   credentials step (Turnkey: organization_id, sign_with, operator_address;
+   MPCVault: vault_uuid, client_signer_pubkey, operator_address,
+   callback_listen_addr). Omit `[signer]` entirely for the hotwallet. Never put any
+   signer secret in the TOML.
+
+6. Restrict config file permissions:
    - Unix: config directory 700, config file 600.
 
-Private key collection (needs a REAL interactive terminal):
+Private key collection (HOTWALLET ONLY; needs a REAL interactive terminal):
+If I chose Turnkey or MPCVault, SKIP this whole private-key step and use "MPC signer
+credentials" below instead. For the hotwallet:
 This step hides input, which needs a real TTY. Most coding agents do NOT have an
 interactive terminal in their own tool sandbox — running the script there just
 hangs or errors with "stty: stdin isn't a terminal" and I never see a prompt.
@@ -476,6 +502,83 @@ Windows PowerShell private-key script:
 
    Write-Host "Wrote $KeyFile and $EnvFile."
 
+MPC signer credentials (Turnkey or MPCVault; use instead of the private key step):
+Collect the non-secret signer fields with AskUserQuestion and put them in the
+`[signer]` section of stitch.toml. Collect the secret(s) the same hidden-terminal /
+saved-script way as the private key above (real TTY, never in chat or arguments),
+write each secret to its own file with chmod 600, and put only the `*_FILE` path (and
+non-secret env) in the env file. Then continue to Permit2 approvals and the dry run
+as usual; `set -a; . env; set +a` loads whatever the env file contains.
+
+Turnkey:
+- Ask for: organization_id, sign_with (wallet account address or private key id),
+  operator_address (the EVM address it resolves to). api_base_url defaults to
+  https://api.turnkey.com.
+- Secret: the API private key. Write it to e.g. ~/Stitch/turnkey-api.key (chmod 600).
+- Env file: `TURNKEY_API_PRIVATE_KEY_FILE=<path>` and `TURNKEY_API_PUBLIC_KEY=<pubkey>`
+  (the public key is not secret). No STITCH_PRIVATE_KEY.
+- stitch.toml: `[signer]` with `provider = "turnkey"` plus organization_id, sign_with,
+  operator_address.
+
+MPCVault (also needs a client-signer sidecar container — this is required infra,
+not optional; the bot cannot sign without it):
+- Ask for: vault_uuid, operator_address (the vault wallet's EVM address),
+  callback_listen_addr (default 0.0.0.0:8088). Do NOT ask for client_signer_pubkey
+  yet — it's generated in step 1 below, then written into stitch.toml.
+- Secret: the MPCVault API token. Write it to e.g. ~/Stitch/mpcvault-api.token
+  (chmod 600). Env file: `MPCVAULT_API_TOKEN_FILE=<path>`. No STITCH_PRIVATE_KEY.
+- Keep the host part of callback_listen_addr as `0.0.0.0` (not 127.0.0.1) so the
+  sidecar container can reach the bot on the host.
+- stitch.toml: `[signer]` with `provider = "mpcvault"` plus vault_uuid,
+  client_signer_pubkey (from step 1), operator_address, callback_listen_addr.
+
+Stand up the client-signer sidecar BEFORE the dry run. It must be running and its
+key-grant approved or every signature fails closed and the dry run can't sign.
+
+  0. Prerequisite — Docker. Confirm `docker version` works and the daemon is
+     running (on Linux, that I can run docker, or use sudo consistently). If Docker
+     is missing, STOP and ask me to install Docker Desktop (macOS/Windows) or the
+     Docker engine (Linux), then resume. Do not attempt MPCVault signing without it.
+  1. Generate the sidecar key (no passphrase):
+     `ssh-keygen -t ed25519 -C "mpcvault-client-signer" -f ~/Stitch/client-signer-key -N ""`
+     then `chmod 600 ~/Stitch/client-signer-key`. Put the contents of
+     `~/Stitch/client-signer-key.pub` into `client_signer_pubkey` in stitch.toml.
+  2. Register that public key in the MPCVault console (vault → Team & policies →
+     New Client Signer), then approve BOTH the vault-setting update and the
+     "Key grant access" request in the MPCVault mobile app. Wait for me to confirm
+     I approved them — the sidecar can't join MPC signing until I do.
+  3. Pick the callback URL the container uses to reach the bot on the host:
+       - macOS / Windows (Docker Desktop): http://host.docker.internal:<port>
+       - Linux: same URL, but add `--add-host=host.docker.internal:host-gateway`
+         to the docker run below (Linux Docker doesn't resolve that name by default).
+     `<port>` is the port from callback_listen_addr (default 8088). The callback
+     flows OUT of the container to the host, so no inbound `-p` mapping is needed
+     for it (the `-p 8080:8080` below is only the sidecar's own health endpoint).
+  4. Write `~/Stitch/mpcvault-signer/config.yml`, then `chmod 600` it (it holds the
+     sidecar private key):
+
+         http-health:
+           listening-addr: 0.0.0.0:8080
+         vault-uuid: "<vault_uuid>"
+         ssh:
+           private-key: |
+             <full contents of ~/Stitch/client-signer-key, indented under this key>
+           password: ""
+         callback-url: "http://host.docker.internal:8088/callback"
+
+  5. Run the sidecar next to the bot (include the `--add-host` line on Linux only):
+     `docker run -d --name mpcvault-signer --restart unless-stopped \`
+     `  --add-host=host.docker.internal:host-gateway \`
+     `  -p 8080:8080 -v ~/Stitch/mpcvault-signer/config.yml:/config.yml:ro \`
+     `  ghcr.io/mpcvault/client-signer:latest --config-path=/config.yml`
+  6. Verify before continuing: `docker ps` shows mpcvault-signer Up, and
+     `docker logs mpcvault-signer` shows it connected with no auth/key-grant errors.
+     A key-grant/permission error means the step-2 approval isn't done — wait for it.
+  7. Boot persistence: `--restart unless-stopped` only helps if Docker starts on
+     boot. For a background/service bot install, enable Docker on boot (Linux:
+     `sudo systemctl enable docker`).
+  See ADVANCED.md ("MPCVault sidecar") for the same steps in reference form.
+
 Permit2 approvals (after the env file exists, before the dry run):
 The operator wallet must approve Permit2 to pull each token Stitch quotes as
 order input — debt on the buy side, collateral on the sell side. Without it,
@@ -483,9 +586,10 @@ orders post but silently fail to fill, and a live start refuses to run. The
 binary handles this; do not ask me to paste token addresses or send raw approve
 transactions.
 
-1. Load STITCH_PRIVATE_KEY_FILE from the env file into the process environment
-   (same as the dry run below — never put the private key itself on the command
-   line).
+1. Load the signer credentials from the env file into the process environment
+   (STITCH_PRIVATE_KEY_FILE for the hotwallet, or the TURNKEY_*/MPCVAULT_* vars for
+   an MPC signer; same as the dry run below). Never put a secret on the command line.
+   For MPCVault, the client-signer sidecar must be running so the bot can sign.
 2. Check what's needed without sending anything:
 
    stitch approve --config "<config-path>" --dry-run
@@ -514,8 +618,10 @@ transactions.
 
 Dry run:
 - Run dry run only after config and env file exist.
-- Load STITCH_PRIVATE_KEY_FILE from the env file into the process environment.
-- Do not print the private key.
+- Load the signer credentials from the env file into the process environment
+  (STITCH_PRIVATE_KEY_FILE for the hotwallet, or TURNKEY_*/MPCVAULT_* for an MPC
+  signer). For MPCVault, make sure the client-signer sidecar is running first.
+- Do not print any secret.
 - Do not pass the private key in command arguments.
 
 Unix and macOS:
@@ -543,6 +649,8 @@ because that can expose secrets through command construction or logs.
 After dry run:
 Show me a short summary:
 - Installed Stitch version.
+- Signer backend: hotwallet, Turnkey, or MPCVault (for MPCVault, confirm the
+  client-signer sidecar is running and reachable at callback_listen_addr).
 - Config path.
 - Env path exists and permissions are restricted, without showing secret
   contents.
@@ -586,6 +694,11 @@ Service setup after confirmation only:
   systemctl daemon-reload and sudo systemctl enable --now stitch.
 - Windows: If I choose Task Scheduler, create a startup task. If I choose a
   Windows service, ask before installing or using NSSM.
+- MPCVault only: a background/service bot also needs the client-signer sidecar
+  running and surviving reboots. The `docker run --restart unless-stopped` from the
+  sidecar step covers restarts as long as Docker starts on boot (Linux: `sudo
+  systemctl enable docker`). Confirm the sidecar is Up before enabling the bot
+  service, and remind me the bot can't sign while the sidecar is down.
 
 Never start any live operation until I explicitly confirm after a successful dry
 run.

@@ -44,14 +44,14 @@ fn which_on_path(exe_name: &str) -> Option<PathBuf> {
         .find(|c| c.exists())
 }
 
-/// `stitch --config <toml> [--dry-run]`, with the key file wired through the env.
+/// `stitch --config <toml> [--dry-run]`, with the signer's env wired through.
 pub fn run_command(stitch_bin: &Path, paths: &ConfigPaths, dry_run: bool) -> Command {
     let mut cmd = Command::new(stitch_bin);
     cmd.arg("--config").arg(&paths.toml);
     if dry_run {
         cmd.arg("--dry-run");
     }
-    cmd.env("STITCH_PRIVATE_KEY_FILE", &paths.key);
+    apply_signer_env(&mut cmd, paths);
     cmd
 }
 
@@ -62,8 +62,50 @@ pub fn approve_command(stitch_bin: &Path, paths: &ConfigPaths, dry_run: bool) ->
     if dry_run {
         cmd.arg("--dry-run");
     }
-    cmd.env("STITCH_PRIVATE_KEY_FILE", &paths.key);
+    apply_signer_env(&mut cmd, paths);
     cmd
+}
+
+/// Wire the signer's credentials into the command's environment. The setup writer
+/// tailors `stitch.env` to the chosen signer (STITCH_PRIVATE_KEY_FILE for the hot
+/// wallet, TURNKEY_*/MPCVAULT_* for MPC), so sourcing that file works for every
+/// backend. Falls back to the local key path if the env file isn't there yet.
+fn apply_signer_env(cmd: &mut Command, paths: &ConfigPaths) {
+    if paths.env.exists() {
+        apply_env_file(cmd, &paths.env);
+    } else {
+        cmd.env("STITCH_PRIVATE_KEY_FILE", &paths.key);
+    }
+}
+
+/// Parse a `stitch.env` (`KEY='value'` shell-single-quoted, or `KEY=value`) and
+/// set each pair on the command. Best-effort: an unreadable file is a no-op.
+fn apply_env_file(cmd: &mut Command, env_path: &Path) {
+    let Ok(contents) = std::fs::read_to_string(env_path) else {
+        return;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if !key.is_empty() {
+            cmd.env(key, unquote_shell(raw.trim()));
+        }
+    }
+}
+
+/// Undo POSIX shell single-quoting (`'a'\''b'` → `a'b`); leave unquoted values as-is.
+fn unquote_shell(s: &str) -> String {
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        s[1..s.len() - 1].replace("'\\''", "'")
+    } else {
+        s.to_string()
+    }
 }
 
 /// `stitch --update` for the update button.
@@ -133,5 +175,45 @@ mod tests {
     fn update_command_passes_update_flag() {
         let cmd = update_command(Path::new("/bin/stitch"));
         assert_eq!(args_of(&cmd), vec!["--update".to_string()]);
+    }
+
+    fn envs_of(cmd: &Command) -> std::collections::HashMap<String, String> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn run_command_sources_mpc_env_from_stitch_env() {
+        let dir = std::env::temp_dir().join(format!("stitch-proc-mpc-{}", std::process::id()));
+        let corridor = crate::setup::catalog::find_corridor("cngn-usdt-bsc").unwrap();
+        let signer = crate::setup::writer::SignerSetup::Mpcvault {
+            vault_uuid: "v".into(),
+            client_signer_pubkey: "k".into(),
+            operator_address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            api_base_url: None,
+            callback_listen_addr: None,
+            api_token: "tok".into(),
+        };
+        let paths = crate::setup::writer::write_config_signer(&dir, corridor, &signer).unwrap();
+        let cmd = run_command(Path::new("/bin/stitch"), &paths, false);
+        let envs = envs_of(&cmd);
+        assert!(envs.contains_key("MPCVAULT_API_TOKEN_FILE"));
+        assert!(!envs.contains_key("STITCH_PRIVATE_KEY_FILE"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_command_falls_back_to_key_env_without_a_stitch_env() {
+        let p = config_paths("/tmp/stitch-proc-missing-env");
+        let cmd = run_command(Path::new("/bin/stitch"), &p, false);
+        assert!(envs_of(&cmd).contains_key("STITCH_PRIVATE_KEY_FILE"));
     }
 }

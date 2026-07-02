@@ -55,7 +55,9 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
 
     if let Some(latest) = app.available_update.lock().unwrap().clone() {
         egui::Panel::top("update-nudge")
-            .frame(panel_frame(&p, 0, 12))
+            // Symmetric top/bottom so the amber box sits balanced inside its panel
+            // (0 top made it hug the top edge), matching the controls panel below.
+            .frame(panel_frame(&p, 12, 12))
             .show(ui, |ui| {
                 update_banner(ui, &p, &latest);
             });

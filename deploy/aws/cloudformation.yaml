@@ -90,9 +90,9 @@ Resources:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub ${BotName}/operator
-      Description: !Sub Private key and TOML config for ${BotName}. Update before starting the ECS service.
+      Description: !Sub Signer credentials and TOML config for ${BotName}. Update before starting the ECS service. Fill STITCH_PRIVATE_KEY for the hotwallet, the TURNKEY_* keys for Turnkey, or MPCVAULT_API_TOKEN for MPCVault (which also needs the client-signer sidecar, see docs). Leave unused fields empty.
       KmsKeyId: !Ref KmsKey
-      SecretString: '{"STITCH_PRIVATE_KEY":"replace-me-before-start","STITCH_CONFIG_TOML":"replace-me-before-start"}'
+      SecretString: '{"STITCH_PRIVATE_KEY":"","STITCH_CONFIG_TOML":"replace-me-before-start","TURNKEY_API_PUBLIC_KEY":"","TURNKEY_API_PRIVATE_KEY":"","MPCVAULT_API_TOKEN":""}'
 
   Vpc:
     Type: AWS::EC2::VPC
@@ -329,6 +329,14 @@ Resources:
               ValueFrom: !Sub '${OperatorSecret}:STITCH_PRIVATE_KEY::'
             - Name: STITCH_CONFIG_TOML
               ValueFrom: !Sub '${OperatorSecret}:STITCH_CONFIG_TOML::'
+            # MPC-wallet credentials. Unused ones are empty strings and ignored
+            # by the bot (it builds only the signer the config selects).
+            - Name: TURNKEY_API_PUBLIC_KEY
+              ValueFrom: !Sub '${OperatorSecret}:TURNKEY_API_PUBLIC_KEY::'
+            - Name: TURNKEY_API_PRIVATE_KEY
+              ValueFrom: !Sub '${OperatorSecret}:TURNKEY_API_PRIVATE_KEY::'
+            - Name: MPCVAULT_API_TOKEN
+              ValueFrom: !Sub '${OperatorSecret}:MPCVAULT_API_TOKEN::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -337,8 +345,10 @@ Resources:
               awslogs-stream-prefix: stitch
           HealthCheck:
             Command:
+              # No stitch.key check: MPC signers (Turnkey/MPCVault) hold no local
+              # key file. The bot validates signer credentials at startup.
               - CMD-SHELL
-              - test -s /home/stitch/run/stitch.toml && test -s /home/stitch/run/stitch.key && kill -0 1
+              - test -s /home/stitch/run/stitch.toml && kill -0 1
             Interval: 30
             Timeout: 5
             Retries: 3

@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.67"
+version = "0.1.68"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
 license = "AGPL-3.0-or-later"
@@ -33,6 +33,9 @@ rfd = { version = "0.17", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 alloy-primitives = { version = "1", features = ["rlp"] }
 alloy-rlp = "0.3"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
 k256 = { version = "0.13", features = ["ecdsa"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -47,6 +50,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axoupdater = "0.10.0"
+turnkey_client = "0.7"
 zeroize = "1"
 rpassword = "7"
 

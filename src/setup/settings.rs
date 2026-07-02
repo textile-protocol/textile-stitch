@@ -74,6 +74,49 @@ pub fn read_settings(toml_str: &str) -> Result<SettingsView> {
     })
 }
 
+/// The current signer, read from a `stitch.toml` for form prefill. Only the
+/// non-secret fields — secrets live in the env/secret file and are re-entered
+/// when the operator changes the signer. No `[signer]` reads as the hot wallet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignerView {
+    Local,
+    Turnkey {
+        organization_id: String,
+        sign_with: String,
+        operator_address: String,
+        api_base_url: String,
+    },
+    Mpcvault {
+        vault_uuid: String,
+        client_signer_pubkey: String,
+        operator_address: String,
+        api_base_url: String,
+        callback_listen_addr: String,
+    },
+}
+
+/// Read the current signer from a `stitch.toml` body. A missing `[signer]` (or an
+/// unparseable config) reads as the hot wallet.
+pub fn read_signer(toml_str: &str) -> SignerView {
+    use crate::signer::SignerConfig;
+    match Config::from_toml(toml_str).ok().and_then(|c| c.signer) {
+        Some(SignerConfig::Turnkey(c)) => SignerView::Turnkey {
+            organization_id: c.organization_id,
+            sign_with: c.sign_with,
+            operator_address: c.operator_address,
+            api_base_url: c.api_base_url,
+        },
+        Some(SignerConfig::Mpcvault(c)) => SignerView::Mpcvault {
+            vault_uuid: c.vault_uuid,
+            client_signer_pubkey: c.client_signer_pubkey,
+            operator_address: c.operator_address,
+            api_base_url: c.api_base_url,
+            callback_listen_addr: c.callback_listen_addr,
+        },
+        _ => SignerView::Local,
+    }
+}
+
 /// Apply the patch onto `toml_str` and return the new TOML text. Preserves
 /// comments/formatting, and re-validates the result before returning so a bad
 /// edit fails here instead of on the next bot start.

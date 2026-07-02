@@ -8,9 +8,87 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use zeroize::Zeroize;
 
+use crate::config::Config;
 use crate::setup::catalog::Corridor;
 use crate::setup::paths::{config_paths, ConfigPaths};
-use crate::signer::parse_private_key;
+use crate::signer::{parse_address, parse_private_key};
+
+/// The signer backend the operator picked. Drives the dropdown in the GUI and
+/// which fields/secrets the wizard collects. `Local` is the hotwallet default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignerKind {
+    #[default]
+    Local,
+    Turnkey,
+    Mpcvault,
+}
+
+impl SignerKind {
+    /// Human label for the dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            SignerKind::Local => "Hot wallet (local key)",
+            SignerKind::Turnkey => "MPC — Turnkey",
+            SignerKind::Mpcvault => "MPC — MPCVault",
+        }
+    }
+
+    /// The MPC backends are new; flag them as experimental so the UI can warn.
+    pub fn experimental(self) -> bool {
+        matches!(self, SignerKind::Turnkey | SignerKind::Mpcvault)
+    }
+
+    /// Label with an `· Experimental` marker appended for experimental backends,
+    /// for the dropdown and the current-signer summary.
+    pub fn display_label(self) -> String {
+        if self.experimental() {
+            format!("{}  ·  Experimental", self.label())
+        } else {
+            self.label().to_string()
+        }
+    }
+
+    pub const ALL: [SignerKind; 3] = [SignerKind::Local, SignerKind::Turnkey, SignerKind::Mpcvault];
+}
+
+/// Everything needed to write a signer: the non-secret fields that go into the
+/// `[signer]` TOML section, plus the secret material that goes to an owner-only
+/// file referenced by `stitch.env` (never into the TOML).
+#[derive(Debug, Clone)]
+pub enum SignerSetup {
+    /// Hot wallet: the raw operator private key (→ stitch.key).
+    Local { key: String },
+    /// Turnkey MPC. The API public key is not secret (→ env inline); the API
+    /// private key is (→ turnkey-api.key).
+    Turnkey {
+        organization_id: String,
+        sign_with: String,
+        operator_address: String,
+        api_base_url: Option<String>,
+        api_public_key: String,
+        api_private_key: String,
+    },
+    /// MPCVault MPC. The API token is secret (→ mpcvault-api.token); the vault
+    /// needs the client-signer sidecar running (documented, not written here).
+    Mpcvault {
+        vault_uuid: String,
+        client_signer_pubkey: String,
+        operator_address: String,
+        api_base_url: Option<String>,
+        callback_listen_addr: Option<String>,
+        api_token: String,
+    },
+}
+
+impl SignerSetup {
+    pub fn kind(&self) -> SignerKind {
+        match self {
+            SignerSetup::Local { .. } => SignerKind::Local,
+            SignerSetup::Turnkey { .. } => SignerKind::Turnkey,
+            SignerSetup::Mpcvault { .. } => SignerKind::Mpcvault,
+        }
+    }
+}
 
 /// The `stitch.env` body: point the bot at the key file and set a sane log level.
 /// The path is shell-single-quoted because the install guides `source` this file,
@@ -28,40 +106,298 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Validate the key, then write stitch.toml (the corridor template), stitch.env,
-/// and stitch.key into `dir`. The key file and env file are restricted to the
-/// owner. Returns the paths written. The caller's key string should be zeroized
-/// after this returns; the copy taken here is wiped before returning.
+/// Hot-wallet convenience: write a config whose signer is the local key. Kept for
+/// the CLI `stitch init` and existing callers; delegates to [`write_config_signer`].
 pub fn write_config(
     dir: impl AsRef<Path>,
     corridor: &Corridor,
     key_raw: &str,
 ) -> Result<ConfigPaths> {
-    // Validate before writing anything, so a bad key never leaves half a config.
-    parse_private_key(key_raw).context("the private key is not valid")?;
+    write_config_signer(
+        dir,
+        corridor,
+        &SignerSetup::Local {
+            key: key_raw.to_string(),
+        },
+    )
+}
+
+/// Validate the signer, then write stitch.toml (the corridor template, plus a
+/// `[signer]` section for MPC backends), stitch.env (pointing at the secret
+/// file(s)), and the secret file itself — all owner-only. Nothing is written if
+/// validation fails, so a bad input never leaves half a config.
+pub fn write_config_signer(
+    dir: impl AsRef<Path>,
+    corridor: &Corridor,
+    signer: &SignerSetup,
+) -> Result<ConfigPaths> {
+    validate_signer(signer)?;
 
     let paths = config_paths(dir.as_ref());
     std::fs::create_dir_all(&paths.dir)
         .with_context(|| format!("creating {}", paths.dir.display()))?;
 
-    std::fs::write(&paths.toml, corridor.toml_template)
-        .with_context(|| format!("writing {}", paths.toml.display()))?;
+    // Hot wallet keeps the template byte-for-byte; MPC backends get a [signer]
+    // section appended (comments elsewhere preserved via toml_edit).
+    let toml = match signer {
+        SignerSetup::Local { .. } => corridor.toml_template.to_string(),
+        _ => render_toml_with_signer(corridor.toml_template, signer)?,
+    };
 
-    std::fs::write(&paths.env, render_env(&paths))
-        .with_context(|| format!("writing {}", paths.env.display()))?;
-
-    // Create the key file owner-only from the start so the raw key is never
-    // momentarily world-readable between write and chmod.
-    let mut key_line = format!("{}\n", key_raw.trim());
-    write_key_file(&paths.key, key_line.as_bytes())
-        .with_context(|| format!("writing {}", paths.key.display()))?;
-    key_line.zeroize();
-
-    // write_key_file already creates the key owner-only on both platforms; only
-    // the env file (no secret) still needs locking down here.
+    // Stage the secret and env first, then commit the toml (which selects the
+    // signer) last — all through atomic replaces. A failure on any earlier write
+    // leaves the old toml still selecting the old, untouched signer, so the config
+    // stays consistent. Drop the old signer's secrets only after everything commits.
+    write_signer_secrets(&paths, signer)?;
+    write_toml_atomic(&paths.env, &render_env_for(&paths, signer))?;
     restrict_to_owner(&paths.env)?;
+    write_toml_atomic(&paths.toml, &toml)?;
+    remove_other_secrets(&paths, signer);
 
     Ok(paths)
+}
+
+/// Change only the signer of an already-set-up folder: rewrite the `[signer]`
+/// section (or remove it for the hot wallet), rewrite stitch.env, and write the
+/// new secret file. Leaves corridor, spreads, and endpoints untouched. Used by
+/// the Settings screen. Re-validates the whole config before touching disk.
+pub fn apply_signer(dir: impl AsRef<Path>, signer: &SignerSetup) -> Result<()> {
+    validate_signer(signer)?;
+    let paths = config_paths(dir.as_ref());
+
+    let current = std::fs::read_to_string(&paths.toml)
+        .with_context(|| format!("reading {}", paths.toml.display()))?;
+    let mut doc: toml_edit::DocumentMut = current
+        .parse()
+        .with_context(|| format!("{} is not valid TOML", paths.toml.display()))?;
+    match signer {
+        SignerSetup::Local { .. } => {
+            doc.as_table_mut().remove("signer");
+        }
+        _ => {
+            doc["signer"] = toml_edit::Item::Table(signer_table(signer));
+        }
+    }
+    let updated = doc.to_string();
+    Config::from_toml(&updated).context("the updated config is not valid")?;
+
+    // Stage the secret and env first, then commit the toml (which selects the
+    // signer) last — all atomic replaces — so a failure on the secret/env write
+    // leaves the old toml still selecting the old, untouched signer. Drop the old
+    // signer's secrets only after everything commits.
+    write_signer_secrets(&paths, signer)?;
+    write_toml_atomic(&paths.env, &render_env_for(&paths, signer))?;
+    restrict_to_owner(&paths.env)?;
+    write_toml_atomic(&paths.toml, &updated)?;
+    remove_other_secrets(&paths, signer);
+    Ok(())
+}
+
+/// Write a new corridor template into stitch.toml while preserving the existing
+/// `[signer]` section, so switching corridor on an MPC config doesn't silently
+/// drop the signer — which would leave stitch.env pointing at MPC credentials
+/// while the config falls back to the hot wallet. The secret file and stitch.env
+/// are unchanged and stay correct. A hot-wallet config (no `[signer]`) gets the
+/// template byte-for-byte, exactly as before.
+pub fn switch_corridor_preserving_signer(dir: impl AsRef<Path>, template: &str) -> Result<()> {
+    let paths = config_paths(dir.as_ref());
+    let existing_signer = std::fs::read_to_string(&paths.toml)
+        .ok()
+        .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|d| d.get("signer").cloned());
+    match existing_signer {
+        None => write_toml_atomic(&paths.toml, template),
+        Some(signer) => {
+            let mut doc: toml_edit::DocumentMut = template
+                .parse()
+                .context("corridor template is not valid TOML")?;
+            doc["signer"] = signer;
+            let updated = doc.to_string();
+            Config::from_toml(&updated).context("the switched config is not valid")?;
+            write_toml_atomic(&paths.toml, &updated)
+        }
+    }
+}
+
+/// Path of the owner-only secret file for a signer, next to stitch.toml.
+fn secret_path(paths: &ConfigPaths, signer: &SignerSetup) -> PathBuf {
+    match signer {
+        SignerSetup::Local { .. } => paths.key.clone(),
+        SignerSetup::Turnkey { .. } => paths.dir.join("turnkey-api.key"),
+        SignerSetup::Mpcvault { .. } => paths.dir.join("mpcvault-api.token"),
+    }
+}
+
+/// Delete the secret files that don't belong to `keep`, so switching signer never
+/// leaves a stale hot-wallet key (or an old MPC token) sitting on disk. Runs after
+/// the new secret is written, so it can't remove the one just created.
+/// Best-effort: a missing file is fine.
+fn remove_other_secrets(paths: &ConfigPaths, keep: &SignerSetup) {
+    let kept = secret_path(paths, keep);
+    for candidate in [
+        paths.key.clone(),
+        paths.dir.join("turnkey-api.key"),
+        paths.dir.join("mpcvault-api.token"),
+    ] {
+        if candidate != kept {
+            let _ = std::fs::remove_file(&candidate);
+        }
+    }
+}
+
+/// stitch.env for a signer: point the bot at the secret file(s) and set the log
+/// level. Turnkey's API public key is not secret, so it goes inline.
+fn render_env_for(paths: &ConfigPaths, signer: &SignerSetup) -> String {
+    let q = |s: &str| shell_single_quote(s);
+    let secret = q(&secret_path(paths, signer).display().to_string());
+    let head = match signer {
+        SignerSetup::Local { .. } => format!("STITCH_PRIVATE_KEY_FILE={secret}\n"),
+        SignerSetup::Turnkey { api_public_key, .. } => format!(
+            "TURNKEY_API_PUBLIC_KEY={}\nTURNKEY_API_PRIVATE_KEY_FILE={secret}\n",
+            q(api_public_key.trim())
+        ),
+        SignerSetup::Mpcvault { .. } => format!("MPCVAULT_API_TOKEN_FILE={secret}\n"),
+    };
+    format!("{head}RUST_LOG=info\n")
+}
+
+/// Write the signer's secret to its owner-only file, atomically (stage owner-only,
+/// then rename over the target). On a mid-write failure the previously working
+/// secret is left intact rather than truncated — losing it locks the operator out
+/// of signing, which matters most on the Settings rotation path.
+fn write_signer_secrets(paths: &ConfigPaths, signer: &SignerSetup) -> Result<()> {
+    let raw = match signer {
+        SignerSetup::Local { key } => key,
+        SignerSetup::Turnkey {
+            api_private_key, ..
+        } => api_private_key,
+        SignerSetup::Mpcvault { api_token, .. } => api_token,
+    };
+    let path = secret_path(paths, signer);
+    let mut line = format!("{}\n", raw.trim());
+    let res = write_key_file_atomic(&path, line.as_bytes())
+        .with_context(|| format!("writing {}", path.display()));
+    line.zeroize();
+    res
+}
+
+/// Render the corridor template with a `[signer]` section appended for an MPC
+/// backend (Local is handled by the caller and never reaches here).
+fn render_toml_with_signer(template: &str, signer: &SignerSetup) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = template
+        .parse()
+        .context("corridor template is not valid TOML")?;
+    doc["signer"] = toml_edit::Item::Table(signer_table(signer));
+    Ok(doc.to_string())
+}
+
+/// The `[signer]` table for an MPC backend. Only non-secret fields; secrets live
+/// in the env/secret file. Optional fields are omitted when blank so the bot
+/// falls back to its defaults.
+fn signer_table(signer: &SignerSetup) -> toml_edit::Table {
+    use toml_edit::value;
+    let mut t = toml_edit::Table::new();
+    let set_opt = |t: &mut toml_edit::Table, k: &str, v: &Option<String>| {
+        if let Some(s) = v {
+            let s = s.trim();
+            if !s.is_empty() {
+                t[k] = value(s);
+            }
+        }
+    };
+    match signer {
+        SignerSetup::Turnkey {
+            organization_id,
+            sign_with,
+            operator_address,
+            api_base_url,
+            ..
+        } => {
+            t["provider"] = value("turnkey");
+            t["organization_id"] = value(organization_id.trim());
+            t["sign_with"] = value(sign_with.trim());
+            t["operator_address"] = value(operator_address.trim());
+            set_opt(&mut t, "api_base_url", api_base_url);
+        }
+        SignerSetup::Mpcvault {
+            vault_uuid,
+            client_signer_pubkey,
+            operator_address,
+            api_base_url,
+            callback_listen_addr,
+            ..
+        } => {
+            t["provider"] = value("mpcvault");
+            t["vault_uuid"] = value(vault_uuid.trim());
+            t["client_signer_pubkey"] = value(client_signer_pubkey.trim());
+            t["operator_address"] = value(operator_address.trim());
+            set_opt(&mut t, "api_base_url", api_base_url);
+            set_opt(&mut t, "callback_listen_addr", callback_listen_addr);
+        }
+        SignerSetup::Local { .. } => {}
+    }
+    t
+}
+
+/// Validate a signer's inputs before any file is touched. MPC backends need their
+/// required non-secret fields plus a valid operator address and a non-empty secret.
+fn validate_signer(signer: &SignerSetup) -> Result<()> {
+    let need = |ok: bool, msg: &str| -> Result<()> {
+        if ok {
+            Ok(())
+        } else {
+            anyhow::bail!(msg.to_string())
+        }
+    };
+    match signer {
+        SignerSetup::Local { key } => {
+            parse_private_key(key).context("the private key is not valid")?;
+        }
+        SignerSetup::Turnkey {
+            organization_id,
+            sign_with,
+            operator_address,
+            api_public_key,
+            api_private_key,
+            ..
+        } => {
+            need(
+                !organization_id.trim().is_empty(),
+                "organization id is required",
+            )?;
+            need(!sign_with.trim().is_empty(), "sign-with is required")?;
+            parse_address(operator_address)
+                .context("operator address is not a valid EVM address")?;
+            need(
+                !api_public_key.trim().is_empty(),
+                "Turnkey API public key is required",
+            )?;
+            need(
+                !api_private_key.trim().is_empty(),
+                "Turnkey API private key is required",
+            )?;
+        }
+        SignerSetup::Mpcvault {
+            vault_uuid,
+            client_signer_pubkey,
+            operator_address,
+            api_token,
+            ..
+        } => {
+            need(!vault_uuid.trim().is_empty(), "vault UUID is required")?;
+            need(
+                !client_signer_pubkey.trim().is_empty(),
+                "client-signer public key is required",
+            )?;
+            parse_address(operator_address)
+                .context("operator address is not a valid EVM address")?;
+            need(
+                !api_token.trim().is_empty(),
+                "MPCVault API token is required",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite ONLY the key file for an already-set-up folder, owner-only, and return
@@ -90,7 +426,7 @@ pub fn write_key(dir: impl AsRef<Path>, key_raw: &str) -> Result<alloy_primitive
 fn write_key_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = key_tmp_path(path);
     write_key_file(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    replace_file(&tmp, path).map_err(|e| {
         // Best-effort cleanup so a failed rename doesn't strand the staged key.
         let _ = std::fs::remove_file(&tmp);
         anyhow::Error::new(e).context(format!("replacing {}", path.display()))
@@ -98,10 +434,15 @@ fn write_key_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The owner-only staging path next to the key file.
+/// The owner-only staging path next to a secret file, derived from its name (e.g.
+/// `.turnkey-api.key.tmp`) so each secret stages to its own temp without collision.
 fn key_tmp_path(path: &Path) -> PathBuf {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(".stitch.key.tmp")
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("stitch.key");
+    dir.join(format!(".{name}.tmp"))
 }
 
 /// Replace a text file atomically: write a sibling temp file, then rename it over
@@ -114,12 +455,29 @@ pub fn write_toml_atomic(path: &Path, contents: &str) -> Result<()> {
         .unwrap_or("stitch.toml");
     let tmp = dir.join(format!(".{name}.tmp"));
     std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| {
+    replace_file(&tmp, path).with_context(|| {
         // Best-effort cleanup so a failed rename doesn't strand the temp file.
         let _ = std::fs::remove_file(&tmp);
         format!("replacing {}", path.display())
     })?;
     Ok(())
+}
+
+/// Rename `tmp` over `path`, replacing any existing file. `std::fs::rename`
+/// replaces atomically on Unix; on Windows it can refuse to overwrite an existing
+/// destination, surfacing an "already exists" error. Only in that specific case do
+/// we remove the destination and retry — the staged content stays safe in `tmp`
+/// throughout. A lock, permission, or other failure is propagated untouched, so we
+/// never delete a working config or key when the retry couldn't have succeeded.
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            std::fs::rename(tmp, path)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Lock a file down so only its owner can read or write it.
@@ -314,6 +672,181 @@ mod tests {
         assert!(
             !dir.join(".stitch.toml.tmp").exists(),
             "temp file must be gone"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A valid checksummed EVM address (Anvil account #0) for MPC operator fields.
+    const OPERATOR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    #[test]
+    fn mpcvault_config_emits_signer_section_and_token_file() {
+        let dir = unique_dir("mpcv");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let signer = SignerSetup::Mpcvault {
+            vault_uuid: "vault-123".into(),
+            client_signer_pubkey: "ssh-ed25519 AAAA".into(),
+            operator_address: OPERATOR.into(),
+            api_base_url: None,
+            callback_listen_addr: None,
+            api_token: "tok-abc".into(),
+        };
+        let paths = write_config_signer(&dir, corridor, &signer).unwrap();
+        let toml = std::fs::read_to_string(&paths.toml).unwrap();
+        assert!(toml.contains("[signer]"));
+        assert!(toml.contains("provider = \"mpcvault\""));
+        assert!(toml.contains("vault_uuid = \"vault-123\""));
+        // The whole config still parses through the real loader.
+        Config::from_toml(&toml).unwrap();
+        // The secret never lands in the TOML; it has its own owner-only file.
+        assert!(!toml.contains("tok-abc"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mpcvault-api.token"))
+                .unwrap()
+                .trim(),
+            "tok-abc"
+        );
+        // The secret is staged then renamed; no per-target temp is left behind.
+        assert!(!dir.join(".mpcvault-api.token.tmp").exists());
+        let env = std::fs::read_to_string(&paths.env).unwrap();
+        assert!(env.contains("MPCVAULT_API_TOKEN_FILE="));
+        assert!(!env.contains("STITCH_PRIVATE_KEY_FILE"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn turnkey_config_puts_public_key_in_env_and_private_in_a_file() {
+        let dir = unique_dir("tk");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let signer = SignerSetup::Turnkey {
+            organization_id: "org-1".into(),
+            sign_with: OPERATOR.into(),
+            operator_address: OPERATOR.into(),
+            api_base_url: None,
+            api_public_key: "PUBKEY".into(),
+            api_private_key: "PRIVKEY".into(),
+        };
+        let paths = write_config_signer(&dir, corridor, &signer).unwrap();
+        let toml = std::fs::read_to_string(&paths.toml).unwrap();
+        assert!(toml.contains("provider = \"turnkey\""));
+        assert!(!toml.contains("PRIVKEY") && !toml.contains("PUBKEY"));
+        let env = std::fs::read_to_string(&paths.env).unwrap();
+        assert!(env.contains("TURNKEY_API_PUBLIC_KEY='PUBKEY'"));
+        assert!(env.contains("TURNKEY_API_PRIVATE_KEY_FILE="));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("turnkey-api.key"))
+                .unwrap()
+                .trim(),
+            "PRIVKEY"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn signer_config_rejects_a_bad_operator_address_before_writing() {
+        let dir = unique_dir("badop");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let signer = SignerSetup::Mpcvault {
+            vault_uuid: "v".into(),
+            client_signer_pubkey: "k".into(),
+            operator_address: "not-an-address".into(),
+            api_base_url: None,
+            callback_listen_addr: None,
+            api_token: "t".into(),
+        };
+        assert!(write_config_signer(&dir, corridor, &signer).is_err());
+        assert!(
+            !config_paths(&dir).toml.exists(),
+            "nothing written on bad input"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_signer_swaps_local_to_mpc_and_back_preserving_corridor() {
+        let dir = unique_dir("swap");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        write_config(&dir, corridor, KEY).unwrap();
+
+        apply_signer(
+            &dir,
+            &SignerSetup::Mpcvault {
+                vault_uuid: "v1".into(),
+                client_signer_pubkey: "k1".into(),
+                operator_address: OPERATOR.into(),
+                api_base_url: None,
+                callback_listen_addr: None,
+                api_token: "tok".into(),
+            },
+        )
+        .unwrap();
+        let toml = std::fs::read_to_string(config_paths(&dir).toml).unwrap();
+        assert!(toml.contains("provider = \"mpcvault\""));
+        assert!(toml.contains("chain_id"), "corridor fields preserved");
+        assert!(std::fs::read_to_string(config_paths(&dir).env)
+            .unwrap()
+            .contains("MPCVAULT_API_TOKEN_FILE="));
+        // Switching to MPC removes the stale hot-wallet key.
+        assert!(
+            !config_paths(&dir).key.exists(),
+            "stale stitch.key removed after switching to MPC"
+        );
+        assert!(dir.join("mpcvault-api.token").exists());
+
+        apply_signer(&dir, &SignerSetup::Local { key: KEY.into() }).unwrap();
+        let toml2 = std::fs::read_to_string(config_paths(&dir).toml).unwrap();
+        assert!(!toml2.contains("[signer]"), "signer removed for hot wallet");
+        assert!(std::fs::read_to_string(config_paths(&dir).env)
+            .unwrap()
+            .contains("STITCH_PRIVATE_KEY_FILE="));
+        // Switching back to the hot wallet removes the MPC token.
+        assert!(config_paths(&dir).key.exists());
+        assert!(
+            !dir.join("mpcvault-api.token").exists(),
+            "stale MPC token removed after switching back"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn switch_corridor_keeps_the_mpc_signer() {
+        let dir = unique_dir("switch-sig");
+        let bsc = find_corridor("cngn-usdt-bsc").unwrap();
+        write_config_signer(
+            &dir,
+            bsc,
+            &SignerSetup::Mpcvault {
+                vault_uuid: "v".into(),
+                client_signer_pubkey: "k".into(),
+                operator_address: OPERATOR.into(),
+                api_base_url: None,
+                callback_listen_addr: None,
+                api_token: "tok".into(),
+            },
+        )
+        .unwrap();
+        let celo = find_corridor("brla-usdt-celo").unwrap();
+        switch_corridor_preserving_signer(&dir, celo.toml_template).unwrap();
+        let toml = std::fs::read_to_string(config_paths(&dir).toml).unwrap();
+        // New corridor took effect (Celo chain id)...
+        assert!(toml.contains("42220"), "switched to the Celo corridor");
+        // ...and the MPC signer survived the switch.
+        assert!(toml.contains("provider = \"mpcvault\""));
+        assert!(toml.contains("vault_uuid = \"v\""));
+        Config::from_toml(&toml).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn switch_corridor_writes_template_verbatim_for_hot_wallet() {
+        let dir = unique_dir("switch-hot");
+        let bsc = find_corridor("cngn-usdt-bsc").unwrap();
+        write_config(&dir, bsc, KEY).unwrap();
+        let celo = find_corridor("brla-usdt-celo").unwrap();
+        switch_corridor_preserving_signer(&dir, celo.toml_template).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(config_paths(&dir).toml).unwrap(),
+            celo.toml_template
         );
         std::fs::remove_dir_all(&dir).ok();
     }

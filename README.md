@@ -111,6 +111,41 @@ limit orders, and posts those signed orders to the Textile indexer. The wallet
 private key is read from `STITCH_PRIVATE_KEY_FILE`, or from `STITCH_PRIVATE_KEY`
 for compatibility. If both are set, `STITCH_PRIVATE_KEY_FILE` takes precedence.
 
+### Signer / wallet backend
+
+By default Stitch signs with the local private key above (the hotwallet). You can
+swap that for an MPC wallet by adding a `[signer]` section to `stitch.toml`.
+Whichever signer you set handles every signature: the EIP-712 limit orders and
+the on-chain fill/approve transactions. Pick one backend for the whole bot.
+Secrets always come from the environment, never the config file, and each has a
+`_FILE` variant (a path) that takes precedence over the raw value, the same as
+`STITCH_PRIVATE_KEY_FILE` vs `STITCH_PRIVATE_KEY`.
+
+The desktop app writes all of this for you: the `stitch-setup` first-run wizard
+and its Settings screen have a **Signer** dropdown (hot wallet / Turnkey /
+MPCVault) that collects the fields below, drops the secret in an owner-only file,
+and points `stitch.env` at it. The manual `[signer]` fields below are for CLI and
+server operators editing `stitch.toml` by hand.
+
+- **Local hotwallet** (default): omit `[signer]`, or set `provider = "local"`.
+  Uses `STITCH_PRIVATE_KEY` / `STITCH_PRIVATE_KEY_FILE`.
+- **Turnkey** (`provider = "turnkey"`): a TEE-backed MPC wallet with no extra
+  infra. One synchronous API call per signature, all inside the bot binary. Each
+  operator uses their own Turnkey org and API key. Config fields:
+  `organization_id`, `sign_with`, `operator_address`, optional `api_base_url` and
+  `max_concurrent_signs`. Env vars: `TURNKEY_API_PUBLIC_KEY` (plain), and
+  `TURNKEY_API_PRIVATE_KEY` / `TURNKEY_API_PRIVATE_KEY_FILE` (secret).
+- **MPCVault** (`provider = "mpcvault"`): an MPC wallet that needs the MPCVault
+  `client-signer` sidecar running next to the bot, one sidecar per operator.
+  Config fields: `vault_uuid`, `client_signer_pubkey`, `operator_address`,
+  optional `api_base_url`, `callback_listen_addr`, `poll_timeout_secs`, and
+  `max_concurrent_signs`. Env var: `MPCVAULT_API_TOKEN` /
+  `MPCVAULT_API_TOKEN_FILE` (secret). See the MPCVault sidecar setup in
+  [ADVANCED.md](ADVANCED.md#mpc-wallet-signers).
+
+The operator wallet still needs a little native gas for Permit2 approvals
+(`stitch approve`) no matter which signer you use.
+
 For market making, each configured pool can have:
 
 - a **buy side**, where Stitch spends the stable/debt asset to buy the

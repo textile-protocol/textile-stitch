@@ -9,9 +9,8 @@
 
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::{Encodable, Header};
-use k256::ecdsa::SigningKey;
 
-use crate::signer::sign_digest;
+use crate::signer::Signer;
 
 /// The fields of an unsigned EIP-1559 transaction (a contract call: `to` is
 /// always present, no contract-creation case).
@@ -86,10 +85,10 @@ pub fn signing_hash(tx: &Eip1559Tx) -> B256 {
     keccak256(buf)
 }
 
-/// Sign `tx` with `key` and return the broadcast-ready transaction.
-pub fn sign_tx(key: &SigningKey, tx: &Eip1559Tx) -> anyhow::Result<SignedTx> {
+/// Sign `tx` with `signer` and return the broadcast-ready transaction.
+pub async fn sign_tx(signer: &dyn Signer, tx: &Eip1559Tx) -> anyhow::Result<SignedTx> {
     let hash = signing_hash(tx);
-    let sig65 = sign_digest(key, hash)?; // r(32) ++ s(32) ++ v(27/28)
+    let sig65 = signer.sign_digest(hash).await?; // r(32) ++ s(32) ++ v(27/28)
     let sig = TxSig {
         // EIP-1559 carries y_parity (0/1), not the legacy {27,28} v.
         y_parity: sig65[64] - 27,
@@ -109,14 +108,19 @@ pub fn sign_tx(key: &SigningKey, tx: &Eip1559Tx) -> anyhow::Result<SignedTx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signer::{address_from_signing_key, recover_address};
+    use crate::signer::{address_from_signing_key, recover_address, sign_digest, LocalSigner};
     use alloy_primitives::{address, hex};
+    use k256::ecdsa::SigningKey;
 
     // Anvil/Hardhat account #0.
     const KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     fn key() -> SigningKey {
         SigningKey::from_slice(&hex::decode(KEY).unwrap()).unwrap()
+    }
+
+    fn signer() -> LocalSigner {
+        LocalSigner::new(key())
     }
 
     fn sample() -> Eip1559Tx {
@@ -139,10 +143,10 @@ mod tests {
         assert!(body[0] >= 0xc0);
     }
 
-    #[test]
-    fn signature_recovers_to_the_sender_over_the_signing_hash() {
+    #[tokio::test]
+    async fn signature_recovers_to_the_sender_over_the_signing_hash() {
         let tx = sample();
-        let signed = sign_tx(&key(), &tx).unwrap();
+        let signed = sign_tx(&signer(), &tx).await.unwrap();
         // The raw tx is the 0x02 typed envelope.
         assert_eq!(signed.raw[0], 0x02);
 
@@ -151,17 +155,17 @@ mod tests {
         // signature is valid for this exact transaction.
         let h = signing_hash(&tx);
         // Re-sign to get r/s/v back in the 65-byte form recover_address wants.
-        let sig65 = crate::signer::sign_digest(&key(), h).unwrap();
+        let sig65 = sign_digest(&key(), h).unwrap();
         assert_eq!(
             recover_address(h, &sig65).unwrap(),
             address_from_signing_key(&key())
         );
     }
 
-    #[test]
-    fn signing_is_deterministic() {
-        let a = sign_tx(&key(), &sample()).unwrap();
-        let b = sign_tx(&key(), &sample()).unwrap();
+    #[tokio::test]
+    async fn signing_is_deterministic() {
+        let a = sign_tx(&signer(), &sample()).await.unwrap();
+        let b = sign_tx(&signer(), &sample()).await.unwrap();
         assert_eq!(a.raw, b.raw);
         assert_eq!(a.hash, b.hash);
     }

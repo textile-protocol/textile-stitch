@@ -40,6 +40,10 @@ pub struct Config {
     /// Re-quote / close cadence.
     pub tick_interval_secs: u64,
     pub feed: FeedConfig,
+    /// Signing backend. Omit for the local key (hotwallet) from the environment;
+    /// set `provider = "turnkey" | "mpcvault"` to sign via an MPC wallet.
+    #[serde(default)]
+    pub signer: Option<crate::signer::SignerConfig>,
     pub pools: Vec<PoolConfig>,
 }
 

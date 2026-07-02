@@ -24,4 +24,22 @@ if [ -n "${STITCH_PRIVATE_KEY:-}" ]; then
   unset STITCH_PRIVATE_KEY
 fi
 
+# MPC-wallet credentials (only one signer is used at a time; whichever the
+# config selects). Each secret env var, if present, is written to a 0600 file and
+# the matching *_FILE var is exported, same as the local key above. The Turnkey
+# public key is not secret, so it stays a plain env var.
+if [ -n "${TURNKEY_API_PRIVATE_KEY:-}" ]; then
+  turnkey_key_path="${runtime_dir}/turnkey-api.key"
+  printf '%s\n' "${TURNKEY_API_PRIVATE_KEY}" > "${turnkey_key_path}"
+  export TURNKEY_API_PRIVATE_KEY_FILE="${turnkey_key_path}"
+  unset TURNKEY_API_PRIVATE_KEY
+fi
+
+if [ -n "${MPCVAULT_API_TOKEN:-}" ]; then
+  mpcvault_token_path="${runtime_dir}/mpcvault-api.token"
+  printf '%s\n' "${MPCVAULT_API_TOKEN}" > "${mpcvault_token_path}"
+  export MPCVAULT_API_TOKEN_FILE="${mpcvault_token_path}"
+  unset MPCVAULT_API_TOKEN
+fi
+
 exec "$@"

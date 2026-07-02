@@ -38,19 +38,30 @@ pub fn default_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// A folder counts as configured once both the config and the key file exist.
+/// A folder counts as configured once the config and a signer secret both exist.
+/// MPC setups have no stitch.key (their secret is turnkey-api.key /
+/// mpcvault-api.token), so requiring stitch.key would wrongly send a valid MPC
+/// operator back through the wizard on reopen.
 pub fn is_configured(dir: impl AsRef<Path>) -> bool {
     let p = config_paths(dir);
-    p.toml.exists() && p.key.exists()
+    p.toml.exists() && has_signer_secret(&p)
+}
+
+/// True if any signer's secret file is present: the hot-wallet stitch.key, or an
+/// MPC api key/token.
+fn has_signer_secret(p: &ConfigPaths) -> bool {
+    p.key.exists()
+        || p.dir.join("turnkey-api.key").exists()
+        || p.dir.join("mpcvault-api.token").exists()
 }
 
 /// True if writing a config into this folder would replace any existing operator
-/// file (stitch.toml, stitch.key, or stitch.env). Used to gate overwrite prompts:
-/// unlike `is_configured` (which needs a complete, runnable setup), this trips on
-/// a lone key or a partial setup so we never clobber a private key silently.
+/// file (stitch.toml, stitch.env, or any signer secret). Used to gate overwrite
+/// prompts: unlike `is_configured` (which needs a complete, runnable setup), this
+/// trips on a lone secret or a partial setup so we never clobber one silently.
 pub fn has_operator_files(dir: impl AsRef<Path>) -> bool {
     let p = config_paths(dir);
-    p.toml.exists() || p.key.exists() || p.env.exists()
+    p.toml.exists() || p.env.exists() || has_signer_secret(&p)
 }
 
 /// Operator address controlled by the key file in this folder.
@@ -95,6 +106,17 @@ mod tests {
         assert!(!is_configured(&dir), "toml alone is not configured");
         std::fs::write(dir.join("stitch.key"), "x").unwrap();
         assert!(is_configured(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_configured_recognizes_an_mpc_only_folder() {
+        let dir = unique_dir("mpc-cfg");
+        std::fs::write(dir.join("stitch.toml"), "x").unwrap();
+        assert!(!is_configured(&dir), "toml alone is not configured");
+        // An MPC setup has no stitch.key; its secret is the api token/key.
+        std::fs::write(dir.join("mpcvault-api.token"), "x").unwrap();
+        assert!(is_configured(&dir), "toml + MPC secret is configured");
         std::fs::remove_dir_all(&dir).ok();
     }
 

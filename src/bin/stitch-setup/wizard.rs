@@ -33,6 +33,9 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
 
         ui.add_space(18.0);
 
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         let corridors = setup::catalog();
         theme::card(&p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -61,13 +64,7 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
             folder_field(ui, &p, app);
 
             ui.add_space(12.0);
-            theme::field_label(ui, &p, "Private key");
-            ui.add(
-                egui::TextEdit::singleline(&mut app.key_input)
-                    .password(true)
-                    .hint_text("0x…")
-                    .desired_width(f32::INFINITY),
-            );
+            crate::signerform::signer_fields(ui, &p, &mut app.signer_form);
         });
 
         ui.add_space(16.0);
@@ -84,7 +81,7 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
         if app.pending_overwrite {
             ui.add_space(12.0);
             notice_card(ui, p.warning, p.warning_bg, &format!(
-                "{} already has a Stitch config. Overwriting replaces stitch.toml and the stitch.key private key.",
+                "{} already has a Stitch config. Overwriting replaces stitch.toml and the stored operator secret.",
                 app.dir.display()
             ));
             ui.add_space(8.0);
@@ -102,6 +99,7 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
             ui.add_space(12.0);
             notice_card(ui, p.danger, p.danger_bg, err);
         }
+            });
     });
 }
 
@@ -149,14 +147,14 @@ fn notice_card(ui: &mut egui::Ui, fg: egui::Color32, bg: egui::Color32, msg: &st
         });
 }
 
-/// Write the chosen corridor's config, wipe the pasted key, and move to the
-/// control panel. On failure the error is shown and the form stays put.
+/// Write the chosen corridor's config for the selected signer, wipe the pasted
+/// secrets, and move to the control panel. On failure the error is shown and the
+/// form stays put.
 fn write_and_advance(app: &mut StitchApp) {
     let corridor = &setup::catalog()[app.selected_corridor];
-    match setup::write_config(&app.dir, corridor, &app.key_input) {
+    match setup::write_config_signer(&app.dir, corridor, &app.signer_form.to_setup()) {
         Ok(_) => {
-            use zeroize::Zeroize;
-            app.key_input.zeroize();
+            app.signer_form.zeroize_secrets();
             app.setup_error = None;
             app.pending_overwrite = false;
             app.refresh_after_setup();

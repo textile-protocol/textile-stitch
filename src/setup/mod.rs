@@ -17,6 +17,10 @@ pub use process::{
     approve_command, find_stitch_binary, run_command, terminate, update_command, Status,
 };
 pub use settings::{
-    apply_settings, read_settings, SettingsPatch, SettingsView, SpreadEdit, SpreadKind,
+    apply_settings, read_settings, read_signer, SettingsPatch, SettingsView, SignerView,
+    SpreadEdit, SpreadKind,
 };
-pub use writer::{render_env, write_config, write_key, write_toml_atomic};
+pub use writer::{
+    apply_signer, render_env, switch_corridor_preserving_signer, write_config, write_config_signer,
+    write_key, write_toml_atomic, SignerKind, SignerSetup,
+};

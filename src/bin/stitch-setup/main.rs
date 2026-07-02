@@ -8,6 +8,7 @@ mod app;
 mod icon;
 mod panel;
 mod settings;
+mod signerform;
 mod theme;
 mod wizard;
 
