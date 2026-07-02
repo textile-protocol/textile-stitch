@@ -75,7 +75,7 @@ The full copyable prompt is in [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
 
 ### Option 2 — Desktop app
 
-No terminal needed. Download the release for your OS and open the Stitch app:
+No terminal needed. [Download the release for your OS](https://github.com/textile-protocol/textile-stitch/releases) and open the Stitch app:
 
 - **macOS**: download `Stitch.app.zip` from the release, unzip, and open
   `Stitch.app`. It's ad-hoc signed but not Apple-notarized, so the first launch
