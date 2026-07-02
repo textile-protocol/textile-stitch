@@ -5,13 +5,15 @@
 
 use std::path::{Path, PathBuf};
 
+use alloy_primitives::{hex, Address};
 use anyhow::{Context, Result};
+use k256::ecdsa::SigningKey;
 use zeroize::Zeroize;
 
 use crate::config::Config;
 use crate::setup::catalog::Corridor;
 use crate::setup::paths::{config_paths, ConfigPaths};
-use crate::signer::{parse_address, parse_private_key};
+use crate::signer::{address_from_signing_key, parse_address, parse_mnemonic, parse_private_key};
 
 /// The signer backend the operator picked. Drives the dropdown in the GUI and
 /// which fields/secrets the wizard collects. `Local` is the hotwallet default.
@@ -51,13 +53,56 @@ impl SignerKind {
     pub const ALL: [SignerKind; 3] = [SignerKind::Local, SignerKind::Turnkey, SignerKind::Mpcvault];
 }
 
+/// How the operator supplied their hot-wallet key. Either a raw private key or a
+/// BIP-39 seed phrase we derive the account-0 key from — either way only the
+/// resulting private key is written to `stitch.key`; the phrase is never persisted
+/// and the runtime signer only ever sees a raw key.
+#[derive(Debug, Clone)]
+pub enum LocalKeyMaterial {
+    /// A raw secp256k1 private key, `0x…` hex.
+    PrivateKey(String),
+    /// A BIP-39 seed phrase; account 0 is derived at [`crate::signer::DEFAULT_DERIVATION_PATH`].
+    SeedPhrase(String),
+}
+
+impl LocalKeyMaterial {
+    /// The signing key this material resolves to. Validates as a side effect: a bad
+    /// hex key or an invalid/mis-typed seed phrase fails here rather than deriving a
+    /// garbage key.
+    fn signing_key(&self) -> Result<SigningKey> {
+        match self {
+            LocalKeyMaterial::PrivateKey(raw) => parse_private_key(raw),
+            LocalKeyMaterial::SeedPhrase(phrase) => parse_mnemonic(phrase),
+        }
+    }
+
+    /// The operator address this material controls, so the setup UI can confirm the
+    /// wallet (especially the derived one) before anything is saved.
+    pub fn operator_address(&self) -> Result<Address> {
+        Ok(address_from_signing_key(&self.signing_key()?))
+    }
+
+    /// The `0x`-prefixed private key to persist to `stitch.key`. Derives from the
+    /// seed phrase when needed, so what lands on disk is always a single raw key.
+    /// The returned string is secret — the caller zeroizes it after the write.
+    fn private_key_hex(&self) -> Result<String> {
+        let key = self.signing_key()?;
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&key.to_bytes());
+        let out = format!("0x{}", hex::encode(bytes));
+        bytes.zeroize();
+        Ok(out)
+    }
+}
+
 /// Everything needed to write a signer: the non-secret fields that go into the
 /// `[signer]` TOML section, plus the secret material that goes to an owner-only
 /// file referenced by `stitch.env` (never into the TOML).
 #[derive(Debug, Clone)]
 pub enum SignerSetup {
-    /// Hot wallet: the raw operator private key (→ stitch.key).
-    Local { key: String },
+    /// Hot wallet: the operator's key material (raw key or seed phrase). The
+    /// derived private key goes to stitch.key; a seed phrase is never persisted.
+    Local { material: LocalKeyMaterial },
     /// Turnkey MPC. The API public key is not secret (→ env inline); the API
     /// private key is (→ turnkey-api.key).
     Turnkey {
@@ -117,7 +162,7 @@ pub fn write_config(
         dir,
         corridor,
         &SignerSetup::Local {
-            key: key_raw.to_string(),
+            material: LocalKeyMaterial::PrivateKey(key_raw.to_string()),
         },
     )
 }
@@ -266,15 +311,16 @@ fn render_env_for(paths: &ConfigPaths, signer: &SignerSetup) -> String {
 /// secret is left intact rather than truncated — losing it locks the operator out
 /// of signing, which matters most on the Settings rotation path.
 fn write_signer_secrets(paths: &ConfigPaths, signer: &SignerSetup) -> Result<()> {
-    let raw = match signer {
-        SignerSetup::Local { key } => key,
+    // The hot wallet persists the derived/parsed private key (never the seed
+    // phrase); the MPC backends persist their API secret verbatim.
+    let mut line = match signer {
+        SignerSetup::Local { material } => format!("{}\n", material.private_key_hex()?),
         SignerSetup::Turnkey {
             api_private_key, ..
-        } => api_private_key,
-        SignerSetup::Mpcvault { api_token, .. } => api_token,
+        } => format!("{}\n", api_private_key.trim()),
+        SignerSetup::Mpcvault { api_token, .. } => format!("{}\n", api_token.trim()),
     };
     let path = secret_path(paths, signer);
-    let mut line = format!("{}\n", raw.trim());
     let res = write_key_file_atomic(&path, line.as_bytes())
         .with_context(|| format!("writing {}", path.display()));
     line.zeroize();
@@ -350,8 +396,10 @@ fn validate_signer(signer: &SignerSetup) -> Result<()> {
         }
     };
     match signer {
-        SignerSetup::Local { key } => {
-            parse_private_key(key).context("the private key is not valid")?;
+        SignerSetup::Local { material } => {
+            // Parses the key or derives from the seed phrase; either failing here
+            // means nothing is written. The underlying error already names which.
+            material.signing_key()?;
         }
         SignerSetup::Turnkey {
             organization_id,
@@ -596,6 +644,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Hardhat/Anvil default mnemonic; its account 0 is exactly KEY above.
+    const MNEMONIC: &str = "test test test test test test test test test test test junk";
+
+    #[test]
+    fn write_config_signer_persists_the_key_derived_from_a_seed_phrase() {
+        let dir = unique_dir("seed");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let signer = SignerSetup::Local {
+            material: LocalKeyMaterial::SeedPhrase(MNEMONIC.into()),
+        };
+        let paths = write_config_signer(&dir, corridor, &signer).unwrap();
+        // stitch.key holds the derived private key, never the phrase itself.
+        let stored = std::fs::read_to_string(&paths.key).unwrap();
+        assert_eq!(stored.trim().to_lowercase(), KEY.to_lowercase());
+        assert!(
+            !stored.contains("test"),
+            "the seed phrase must not be written"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_config_signer_rejects_a_bad_seed_phrase_before_writing() {
+        let dir = unique_dir("seed-bad");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let signer = SignerSetup::Local {
+            material: LocalKeyMaterial::SeedPhrase("not a valid seed phrase".into()),
+        };
+        assert!(write_config_signer(&dir, corridor, &signer).is_err());
+        assert!(
+            !config_paths(&dir).toml.exists(),
+            "nothing written on a bad phrase"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn write_config_rejects_a_bad_key_before_writing() {
         let dir = unique_dir("badkey");
@@ -793,7 +877,13 @@ mod tests {
         );
         assert!(dir.join("mpcvault-api.token").exists());
 
-        apply_signer(&dir, &SignerSetup::Local { key: KEY.into() }).unwrap();
+        apply_signer(
+            &dir,
+            &SignerSetup::Local {
+                material: LocalKeyMaterial::PrivateKey(KEY.into()),
+            },
+        )
+        .unwrap();
         let toml2 = std::fs::read_to_string(config_paths(&dir).toml).unwrap();
         assert!(!toml2.contains("[signer]"), "signer removed for hot wallet");
         assert!(std::fs::read_to_string(config_paths(&dir).env)

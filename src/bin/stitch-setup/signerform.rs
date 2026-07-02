@@ -6,17 +6,30 @@
 //! here and handed to the writer, which stores them in an owner-only file.
 
 use egui::{CornerRadius, Margin, RichText, Stroke};
-use stitch_bot::setup::{SignerKind, SignerSetup, SignerView};
+use stitch_bot::setup::{LocalKeyMaterial, SignerKind, SignerSetup, SignerView};
 
 use crate::theme::{self, Palette};
+
+/// Which way the operator is entering the hot-wallet key: a raw private key, or a
+/// BIP-39 seed phrase we derive the account-0 key from.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum LocalInput {
+    #[default]
+    PrivateKey,
+    SeedPhrase,
+}
 
 /// Editable signer state, mapped to [`SignerSetup`] on save. One struct holds
 /// every provider's fields; only the selected provider's are read.
 #[derive(Default)]
 pub struct SignerForm {
     pub kind: SignerKind,
+    /// Which hot-wallet input is active (private key vs seed phrase).
+    pub local_input: LocalInput,
     /// Hot wallet private key.
     pub key: String,
+    /// Hot wallet BIP-39 seed phrase (derived to a key on save; never stored).
+    pub seed_phrase: String,
     /// The operator/maker EVM address (shared by both MPC providers).
     pub operator_address: String,
     /// Optional API base URL override (blank = provider default).
@@ -82,7 +95,12 @@ impl SignerForm {
         };
         match self.kind {
             SignerKind::Local => SignerSetup::Local {
-                key: self.key.clone(),
+                material: match self.local_input {
+                    LocalInput::PrivateKey => LocalKeyMaterial::PrivateKey(self.key.clone()),
+                    LocalInput::SeedPhrase => {
+                        LocalKeyMaterial::SeedPhrase(self.seed_phrase.clone())
+                    }
+                },
             },
             SignerKind::Turnkey => SignerSetup::Turnkey {
                 organization_id: self.organization_id.clone(),
@@ -107,6 +125,7 @@ impl SignerForm {
     pub fn zeroize_secrets(&mut self) {
         use zeroize::Zeroize;
         self.key.zeroize();
+        self.seed_phrase.zeroize();
         self.api_private_key.zeroize();
         self.api_token.zeroize();
     }
@@ -132,7 +151,29 @@ pub fn signer_fields(ui: &mut egui::Ui, p: &Palette, form: &mut SignerForm) {
 
     match form.kind {
         SignerKind::Local => {
-            secret_field(ui, p, "Private key", &mut form.key, "0x…");
+            // Enter either a raw private key or a seed phrase. A phrase is derived
+            // to the account-0 key (m/44'/60'/0'/0/0, the wallet default); only the
+            // resulting key is stored, never the phrase.
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut form.local_input, LocalInput::PrivateKey, "Private key");
+                ui.selectable_value(&mut form.local_input, LocalInput::SeedPhrase, "Seed phrase");
+            });
+            ui.add_space(8.0);
+            match form.local_input {
+                LocalInput::PrivateKey => {
+                    secret_field(ui, p, "Private key", &mut form.key, "0x…");
+                }
+                LocalInput::SeedPhrase => {
+                    secret_multiline(
+                        ui,
+                        p,
+                        "Seed phrase",
+                        &mut form.seed_phrase,
+                        "12 or 24 words, separated by spaces",
+                    );
+                    derived_wallet_note(ui, p, &form.seed_phrase);
+                }
+            }
         }
         SignerKind::Turnkey => {
             text_field(ui, p, "Organization ID", &mut form.organization_id, "");
@@ -183,6 +224,55 @@ fn secret_field(ui: &mut egui::Ui, p: &Palette, label: &str, value: &mut String,
             .margin(theme::FIELD_MARGIN)
             .desired_width(f32::INFINITY),
     );
+    ui.add_space(8.0);
+}
+
+/// A masked, multi-line secret field — for a seed phrase, which is too long for a
+/// single line. Masked like the key field so it isn't left on screen; the derived
+/// wallet address below is how the operator confirms they typed it right.
+fn secret_multiline(ui: &mut egui::Ui, p: &Palette, label: &str, value: &mut String, hint: &str) {
+    theme::field_label(ui, p, label);
+    ui.add(
+        egui::TextEdit::multiline(value)
+            .password(true)
+            .hint_text(hint)
+            .desired_rows(2)
+            .margin(theme::FIELD_MARGIN)
+            .desired_width(f32::INFINITY),
+    );
+    ui.add_space(6.0);
+}
+
+/// Show the wallet address a seed phrase derives to, so the operator can confirm
+/// it matches their wallet before saving (the phrase itself stays masked). While
+/// the phrase is incomplete or invalid, prompt for the rest rather than erroring.
+fn derived_wallet_note(ui: &mut egui::Ui, p: &Palette, phrase: &str) {
+    if phrase.trim().is_empty() {
+        ui.add_space(2.0);
+        return;
+    }
+    match LocalKeyMaterial::SeedPhrase(phrase.to_string()).operator_address() {
+        Ok(addr) => {
+            ui.label(
+                RichText::new(format!("Wallet  {addr}"))
+                    .monospace()
+                    .color(p.text)
+                    .size(12.0),
+            );
+            ui.label(
+                RichText::new("Confirm this matches account 1 in your wallet before saving.")
+                    .color(p.text_faint)
+                    .size(11.0),
+            );
+        }
+        Err(_) => {
+            ui.label(
+                RichText::new("Enter all 12 or 24 words to see the wallet address.")
+                    .color(p.text_faint)
+                    .size(11.0),
+            );
+        }
+    }
     ui.add_space(8.0);
 }
 

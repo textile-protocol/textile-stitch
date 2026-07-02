@@ -22,5 +22,5 @@ pub use settings::{
 };
 pub use writer::{
     apply_signer, render_env, switch_corridor_preserving_signer, write_config, write_config_signer,
-    write_key, write_toml_atomic, SignerKind, SignerSetup,
+    write_key, write_toml_atomic, LocalKeyMaterial, SignerKind, SignerSetup,
 };

@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.70"
+version = "0.1.71"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
 license = "AGPL-3.0-or-later"
@@ -34,6 +34,9 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 alloy-primitives = { version = "1", features = ["rlp"] }
 alloy-rlp = "0.3"
 async-trait = "0.1"
+# BIP-39/BIP-32 seed-phrase derivation for the hot wallet (same crate ethers/alloy
+# use, so account 0 at m/44'/60'/0'/0/0 matches MetaMask/Rabby/etc.).
+coins-bip39 = "0.12"
 axum = "0.8"
 base64 = "0.22"
 k256 = { version = "0.13", features = ["ecdsa"] }

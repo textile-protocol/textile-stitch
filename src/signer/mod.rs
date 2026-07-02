@@ -165,6 +165,35 @@ pub fn parse_private_key(raw: &str) -> anyhow::Result<SigningKey> {
     key
 }
 
+/// The BIP-44 account-0 path (`m/44'/60'/0'/0/0`). This is what MetaMask, Rabby,
+/// and virtually every Ethereum wallet derive their first address at, so a phrase
+/// imported here resolves to the same address the operator sees in their wallet.
+pub const DEFAULT_DERIVATION_PATH: &str = "m/44'/60'/0'/0/0";
+
+/// Derive the operator signing key from a BIP-39 seed phrase at
+/// [`DEFAULT_DERIVATION_PATH`]. The phrase is validated (wordlist + checksum) by
+/// the parse; a bad word or wrong length fails here rather than deriving a
+/// garbage key. No BIP-39 passphrase (the optional "25th word") is used — that
+/// keeps the derived address matching a default wallet import.
+pub fn parse_mnemonic(phrase: &str) -> anyhow::Result<SigningKey> {
+    use coins_bip39::{English, Mnemonic};
+
+    // Deliberately drop the crate's source error rather than chaining it with
+    // `.context(...)`: `coins_bip39`'s bad-checksum error echoes the supplied
+    // phrase, and callers render failures with `{e:#}` (the whole chain), so
+    // chaining would print a mistyped seed phrase unmasked on screen — one wrong
+    // word is still enough material to brute-force the wallet. Return a clean,
+    // phrase-free message instead.
+    let mnemonic = Mnemonic::<English>::new_from_phrase(phrase.trim()).map_err(|_| {
+        anyhow::anyhow!("seed phrase is not valid — check the words and their order")
+    })?;
+    let xpriv = mnemonic
+        .derive_key(DEFAULT_DERIVATION_PATH, None)
+        .map_err(|_| anyhow::anyhow!("could not derive a key from the seed phrase"))?;
+    let signing_key: &SigningKey = xpriv.as_ref();
+    Ok(signing_key.clone())
+}
+
 /// Ethereum address of a verifying key (keccak of the uncompressed pubkey).
 pub fn address_from_verifying_key(vk: &VerifyingKey) -> Address {
     let point = vk.to_encoded_point(false); // 0x04 ++ X(32) ++ Y(32)
@@ -330,6 +359,56 @@ mod tests {
     fn rejects_a_non_hex_or_empty_key() {
         assert!(parse_private_key("0xzz").is_err());
         assert!(parse_private_key("").is_err());
+    }
+
+    // The Hardhat/Anvil default mnemonic. Its account 0 is exactly `KEY` above, so
+    // a correct m/44'/60'/0'/0/0 derivation must reproduce that key and address.
+    const MNEMONIC: &str = "test test test test test test test test test test test junk";
+
+    #[test]
+    fn derives_the_hardhat_account_zero_from_its_mnemonic() {
+        let from_phrase = parse_mnemonic(MNEMONIC).expect("phrase derives");
+        assert_eq!(
+            address_from_signing_key(&from_phrase),
+            address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+        );
+        // Same key the raw-hex path yields — the seed phrase is just another way in.
+        assert_eq!(from_phrase.to_bytes(), key().to_bytes());
+    }
+
+    #[test]
+    fn mnemonic_tolerates_surrounding_whitespace() {
+        let padded = format!("  {MNEMONIC}\n");
+        assert_eq!(
+            parse_mnemonic(&padded).unwrap().to_bytes(),
+            key().to_bytes()
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_seed_phrase() {
+        // Empty, wrong word count, and a valid-words-but-bad-checksum phrase all
+        // fail rather than deriving a garbage key.
+        assert!(parse_mnemonic("").is_err());
+        assert!(parse_mnemonic("zzz not real bip39 words here").is_err());
+        assert!(
+            parse_mnemonic("test test test test test test test test test test test test").is_err(),
+            "12x 'test' has a bad checksum and must be rejected"
+        );
+    }
+
+    #[test]
+    fn invalid_phrase_error_never_leaks_the_phrase() {
+        // 12 valid words with a bad checksum: coins_bip39's own error echoes the
+        // phrase, and callers render errors with `{e:#}` (the whole chain). The
+        // rendered error must not contain any of the supplied words.
+        let phrase = "test test test test test test test test test test test test";
+        let err = parse_mnemonic(phrase).unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(
+            !shown.contains("test"),
+            "error must not surface the seed phrase, got: {shown}"
+        );
     }
 
     #[test]
