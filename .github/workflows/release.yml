@@ -336,10 +336,24 @@ jobs:
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
+          set -euo pipefail
           # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          TAG="${{ needs.plan.outputs.tag }}"
+          # `gh release create` is not idempotent. If this job is retried after a
+          # later step failed (e.g. a transient API error while waiting on the
+          # macOS build), the release already exists and `create` fails with
+          # "a release with the same tag name already exists", so the run can
+          # never go green on a rerun. Detect an existing release and refresh it
+          # in place instead.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; updating it instead of recreating."
+            gh release edit "$TAG" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
+            gh release upload "$TAG" --clobber artifacts/*
+          else
+            gh release create "$TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          fi
       # The release above is created with GITHUB_TOKEN, so it does NOT fire the
       # `release: published` event. Trigger the macOS app build explicitly
       # (workflow_dispatch is exempt from that restriction) so Stitch.app.zip
@@ -367,7 +381,30 @@ jobs:
             exit 1
           fi
           echo "Waiting on macOS app build run $run_id"
-          gh run watch "$run_id" --exit-status
+          # Don't use `gh run watch --exit-status`: a single transient API error
+          # (e.g. HTTP 503) while polling makes it exit non-zero and fails the
+          # release even though the app build itself is fine. Poll ourselves and
+          # tolerate transient lookup failures; only a real non-success
+          # conclusion (or a timeout) fails the step.
+          conclusion=""
+          for _ in $(seq 1 120); do
+            state="$(gh run view "$run_id" --json status,conclusion \
+              --jq '"\(.status) \(.conclusion // "")"' 2>/dev/null || true)"
+            if [ -z "$state" ]; then
+              sleep 15
+              continue
+            fi
+            if [ "${state%% *}" = "completed" ]; then
+              conclusion="${state#* }"
+              break
+            fi
+            sleep 15
+          done
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::macOS app build $run_id did not succeed (conclusion: ${conclusion:-timed out})"
+            exit 1
+          fi
+          echo "macOS app build $run_id completed successfully"
 
   announce:
     needs:
