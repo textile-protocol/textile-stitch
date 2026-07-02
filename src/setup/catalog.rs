@@ -89,4 +89,17 @@ mod tests {
         assert_eq!(identify_corridor(bsc.toml_template).unwrap().id, bsc.id);
         assert!(find_corridor("does-not-exist").is_none());
     }
+
+    #[test]
+    fn every_corridor_is_identified_from_its_own_template() {
+        // Switching corridor in the desktop app writes a corridor's template
+        // verbatim; the panel then re-identifies it by chain id. Guard that round
+        // trip for every corridor so a switch always yields a config the app can
+        // name.
+        for c in catalog() {
+            let identified = identify_corridor(c.toml_template)
+                .unwrap_or_else(|| panic!("corridor {} not identified from its template", c.id));
+            assert_eq!(identified.id, c.id, "identify mismatch for {}", c.id);
+        }
+    }
 }

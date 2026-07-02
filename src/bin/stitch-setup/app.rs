@@ -34,6 +34,11 @@ pub struct SettingsForm {
     /// True once "Change wallet…" is clicked, revealing the private-key field.
     pub change_wallet: bool,
     pub key_input: String,
+    /// True once "Switch corridor…" is clicked, revealing the corridor picker.
+    pub switch_corridor: bool,
+    /// Catalog index the operator has picked in the switch picker. Defaults to the
+    /// currently-configured corridor when the screen opens.
+    pub corridor_choice: usize,
     pub error: Option<String>,
 }
 
@@ -122,7 +127,10 @@ impl StitchApp {
     /// A folder shown in the panel is always configured, so a read failure just
     /// surfaces as an inline error on an otherwise-empty form.
     pub fn open_settings(&mut self) {
-        let mut form = SettingsForm::default();
+        let mut form = SettingsForm {
+            corridor_choice: self.current_corridor_index(),
+            ..SettingsForm::default()
+        };
         match std::fs::read_to_string(&self.paths.toml)
             .map_err(|e| e.to_string())
             .and_then(|t| setup::read_settings(&t).map_err(|e| format!("{e:#}")))
@@ -146,6 +154,53 @@ impl StitchApp {
         self.settings.key_input.zeroize();
         self.settings = SettingsForm::default();
         self.view = View::Panel;
+    }
+
+    /// The catalog index of the currently-configured corridor, or 0 (the default
+    /// preset) when the config doesn't match a known corridor.
+    pub fn current_corridor_index(&self) -> usize {
+        self.corridor
+            .and_then(|c| setup::catalog().iter().position(|x| x.id == c.id))
+            .unwrap_or(0)
+    }
+
+    /// Replace stitch.toml with a different corridor preset, keeping the operator
+    /// wallet. This is a whole-config swap — the new preset ships its own RPC,
+    /// feed and spreads, so the current corridor's endpoint/spread edits are
+    /// discarded. A running bot is stopped rather than restarted: the new
+    /// corridor's tokens need approving on their chain first, so the operator is
+    /// sent back to the panel to approve and start. On a write failure nothing
+    /// changes and the error shows inline on the settings screen.
+    pub fn switch_corridor(&mut self) {
+        self.settings.error = None;
+        let Some(target) = setup::catalog().get(self.settings.corridor_choice) else {
+            self.settings.error = Some("That corridor is no longer available.".into());
+            return;
+        };
+        // A no-op switch would pointlessly overwrite the config (and any unsaved
+        // field edits) with the same preset; treat it as just closing the picker.
+        if self.corridor.is_some_and(|c| c.id == target.id) {
+            self.settings.switch_corridor = false;
+            return;
+        }
+        if let Err(e) = setup::write_toml_atomic(&self.paths.toml, target.toml_template) {
+            self.settings.error = Some(format!("Couldn't switch corridor: {e:#}"));
+            return;
+        }
+        let was_running = self.status != Status::Stopped;
+        if was_running {
+            self.stop_bot();
+        }
+        self.corridor = Some(target);
+        let where_to = format!("{} · {}", target.display_name, target.network_label);
+        self.action_note = Some(if was_running {
+            format!(
+                "Switched to {where_to}. The bot was stopped — approve tokens for the new corridor, then Start."
+            )
+        } else {
+            format!("Switched to {where_to}. Approve tokens for the new corridor before starting.")
+        });
+        self.close_settings();
     }
 
     /// Validate and persist the Settings form: rewrite stitch.toml (comments
