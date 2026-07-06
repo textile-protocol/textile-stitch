@@ -31,6 +31,7 @@ pub mod setup;
 pub mod signer;
 pub mod slots;
 pub mod submit;
+pub mod taker;
 pub mod tick;
 pub mod tx;
 pub mod types;

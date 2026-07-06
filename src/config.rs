@@ -151,6 +151,23 @@ pub struct PoolConfig {
     /// Re-sign a side when its price moves more than this since its last order.
     pub refresh_threshold_bps: u32,
 
+    // ----- Taker leg (user limit orders). Users rest signed limit orders in
+    // the same book the bot quotes into; when one's price reaches the bot's
+    // own bid/ask it can be filled on-chain via `reactor.executeBatch`. The
+    // side spreads above are the pricing — a user ask fills at or below the
+    // bid, a user bid at or above the ask — so a side without a spread is
+    // never taken. -----
+    /// Fill users' resting limit orders when they cross the bot's own quote.
+    #[serde(default)]
+    pub limit_taker_enabled: Option<bool>,
+    /// Minimum profit per filled order, valued in debt atomic units (a
+    /// gas/dust guard). Default 0 — the side spreads carry the margin.
+    #[serde(default)]
+    pub limit_taker_min_profit_debt: Option<String>,
+    /// Most resting orders to fill in one `executeBatch` (default 10).
+    #[serde(default)]
+    pub limit_taker_max_orders: Option<u32>,
+
     // ----- Settlement closing (auction closer). The default setup fills these;
     // omit `closer_pool` only for market-making-only configs. -----
     /// The SettlementPool to close positions in.
@@ -226,6 +243,12 @@ impl PoolConfig {
             && self.floor_ray.is_some()
             && self.buffer_ray.is_some()
             && self.window_secs.is_some()
+    }
+    /// True when the taker leg is on and at least one side has a spread to
+    /// price fills with.
+    pub fn limit_taker_enabled(&self) -> bool {
+        self.limit_taker_enabled.unwrap_or(false)
+            && (self.buy_spread().is_some() || self.sell_spread().is_some())
     }
 }
 

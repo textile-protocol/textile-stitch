@@ -58,6 +58,15 @@ ttl_secs = 120
                           # ttl/2, so keep ttl_secs >= 2 x this. Defaults to 60.
 refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
 
+# Taker leg: fill users' RESTING LIMIT ORDERS when their price crosses your
+# own quote — a user selling the soft asset fills at or below your bid, a user
+# buying it at or above your ask. Priced by the side spreads above (a side
+# without a spread is never taken), plus the reactor's native fee (read
+# on-chain) and gas. Costs gas per fill; profit lands as inventory.
+limit_taker_enabled = true
+# limit_taker_min_profit_debt = "50000"  # skip fills clearing < 0.05 USDC (6dp)
+# limit_taker_max_orders = 10            # per executeBatch
+
 # ----- Blue leg (auction closer). Set these to also close this pool's
 # positions via pool.fill(); omit them to run this pool green-only. The
 # floor/buffer/window mirror the pool's on-chain auction params. -----

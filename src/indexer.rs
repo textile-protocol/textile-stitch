@@ -15,6 +15,10 @@ submitFillerOrders(input: $input) { id rateRay } }";
 const COMMITTED_INPUT_QUERY: &str =
     "query CommittedInput($chainId: Int!, $maker: String!, $inputToken: String!) { \
 fillerCommittedInput(chainId: $chainId, maker: $maker, inputToken: $inputToken) }";
+const RESTING_LIMIT_ORDERS_QUERY: &str =
+    "query RestingLimitOrders($chainId: Int!, $inputToken: String!, $outputToken: String!) { \
+restingLimitOrders(chainId: $chainId, inputToken: $inputToken, outputToken: $outputToken) { \
+id reactor maker inputToken inputAmount outputToken outputAmount rateRay nonce deadlineSec signature } }";
 
 /// Build the GraphQL request body for one order (pure — easy to assert on).
 pub fn build_submit_request(order: &SubmitOrder) -> Value {
@@ -41,6 +45,21 @@ pub fn build_committed_input_request(chain_id: u64, maker: &str, input_token: &s
             "chainId": chain_id,
             "maker": maker,
             "inputToken": input_token,
+        }
+    })
+}
+
+pub fn build_resting_limit_orders_request(
+    chain_id: u64,
+    input_token: &str,
+    output_token: &str,
+) -> Value {
+    json!({
+        "query": RESTING_LIMIT_ORDERS_QUERY,
+        "variables": {
+            "chainId": chain_id,
+            "inputToken": input_token,
+            "outputToken": output_token,
         }
     })
 }
@@ -134,6 +153,23 @@ impl Indexer {
             .post_graphql(&build_submit_many_request(orders), "order batch")
             .await?;
         Ok(order_ids_at(&resp, "/data/submitFillerOrders"))
+    }
+
+    /// Resting user limit orders (kind=LIMIT) for one corridor direction —
+    /// the taker leg's discovery read. Returns the raw rows; parsing and the
+    /// signature re-verification live in [`crate::taker`].
+    pub async fn resting_limit_orders(
+        &self,
+        chain_id: u64,
+        input_token: &str,
+        output_token: &str,
+    ) -> anyhow::Result<Value> {
+        let body = build_resting_limit_orders_request(chain_id, input_token, output_token);
+        let resp = self.post_graphql(&body, "resting limit orders").await?;
+        Ok(resp
+            .pointer("/data/restingLimitOrders")
+            .cloned()
+            .unwrap_or(Value::Array(vec![])))
     }
 
     pub async fn committed_input(

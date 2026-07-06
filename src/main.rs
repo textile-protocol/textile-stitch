@@ -31,10 +31,12 @@ use stitch_bot::indexer::Indexer;
 use stitch_bot::maker::{quote_side, QuoteState, Side, SideOutcome, TickCtx};
 use stitch_bot::poster::Poster;
 use stitch_bot::quote::oracle_rate_ray;
+use stitch_bot::quote::{ask_price, bid_price};
 use stitch_bot::rpc::Wallet;
 use stitch_bot::setup;
 use stitch_bot::signer::{address_from_signing_key, build_signer};
 use stitch_bot::slots::{load_slot_nonce_state, slot_nonce_state_path};
+use stitch_bot::taker::{resolve_fee_bps, take_pool_once, TakeOutcome, TakerCtx};
 use stitch_bot::tick::{is_stale, unix_now};
 use stitch_bot::update::{run_update, warn_if_outdated};
 
@@ -368,6 +370,29 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         closer_pools, "closer configured"
     );
 
+    // Taker leg: the reactor's native fee is part of every fill's cost, so
+    // read it on-chain once (the controller hard-caps it at 5 bps). If the
+    // read fails the leg stays off for this run — never guess a fee.
+    let taker_pools = cfg.pools.iter().filter(|p| p.limit_taker_enabled()).count();
+    let taker_fee_bps = if taker_pools > 0 {
+        match resolve_fee_bps(&wallet, reactor).await {
+            Ok(fee) => {
+                info!(
+                    taker_pools,
+                    fee_bps = fee,
+                    "limit-order taker leg configured"
+                );
+                Some(fee)
+            }
+            Err(e) => {
+                warn!(error = %e, "could not read the reactor fee; taker leg disabled for this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let poster = Poster {
         indexer: &indexer,
         signer: signer.clone(),
@@ -381,6 +406,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // Per closer pool: position id → unix time we last submitted a fill for it,
     // so a pending tx or lagging subgraph can't trigger a duplicate `fill()`.
     let mut closer_pending: HashMap<Address, HashMap<U256, u64>> = HashMap::new();
+    // Per pair: resting-order id → unix time we last submitted an executeBatch
+    // for it, so a pending fill or indexer lag can't double-take an order.
+    let mut taker_pending: HashMap<String, HashMap<String, u64>> = HashMap::new();
     // Per pool: unix time of the last heartbeat line. A working bot at steady
     // state posts nothing most ticks (fully committed, or a side has no
     // inventory), so without this the log looks dead. We emit a line whenever a
@@ -524,6 +552,63 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     "tick"
                 );
             }
+            // ----- Taker leg: fill users' resting limit orders that crossed our
+            // own quote (a user ask at/below our bid, a user bid at/above our
+            // ask). Same feed tick, same spreads — no separate strategy. -----
+            if let Some(fee_bps) = taker_fee_bps {
+                if pool.limit_taker_enabled() {
+                    let taker_ctx = TakerCtx {
+                        collateral,
+                        debt,
+                        collateral_decimals: pool.collateral_decimals,
+                        debt_decimals: pool.debt_decimals,
+                        bid: pool.buy_spread().map(|s| bid_price(quote.price, s)),
+                        ask: pool.sell_spread().map(|s| ask_price(quote.price, s)),
+                        fee_bps,
+                        min_profit_debt: pool
+                            .limit_taker_min_profit_debt
+                            .as_deref()
+                            .unwrap_or("0")
+                            .parse()
+                            .unwrap_or(U256::ZERO),
+                        max_orders: pool.limit_taker_max_orders.unwrap_or(10) as usize,
+                    };
+                    let pending = taker_pending.entry(pair.clone()).or_default();
+                    for (side, outcome) in take_pool_once(
+                        &wallet,
+                        &indexer,
+                        &taker_ctx,
+                        cfg.chain_id,
+                        permit2,
+                        reactor,
+                        dry_run,
+                        pending,
+                        now,
+                    )
+                    .await
+                    {
+                        match outcome {
+                            Ok(TakeOutcome::Nothing) => {}
+                            Ok(TakeOutcome::Planned { orders, spend }) => info!(
+                                pair = %pair, side, orders, spend = %spend,
+                                "[dry-run] would fill resting limit orders"
+                            ),
+                            Ok(TakeOutcome::Filled {
+                                hash,
+                                orders,
+                                spend,
+                            }) => info!(
+                                pair = %pair, side, hash = %hash, orders, spend = %spend,
+                                "filled resting limit orders"
+                            ),
+                            Err(e) => {
+                                warn!(pair = %pair, side, error = %e, "taker tick failed")
+                            }
+                        }
+                    }
+                }
+            }
+
             // ----- Blue leg: close this pool's in-the-money auction positions. -----
             if let Some(discoverer) = discoverer.as_ref() {
                 if pool.closer_enabled() {
