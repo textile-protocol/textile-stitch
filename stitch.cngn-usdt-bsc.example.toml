@@ -16,7 +16,6 @@ rpc_url = "https://bsc-dataseed.bnbchain.org"            # any BSC mainnet RPC
 indexer_url = "https://api.textilecredit.com"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0xe03261c0436DB575F92F09EdDF3591E2566B7D97"   # SETTLEMENT_V3_FILLER_REACTOR (BSC)
-subgraph_url = "https://api.textilecredit.com/subgraph?chainId={...}"
 tick_interval_secs = 5
 
 # Single source of truth: the live cNGN center the API publishes (now the plain

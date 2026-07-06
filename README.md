@@ -6,15 +6,17 @@
 
 # Stitch
 
-Stitch is the Textile operator bot for filler-network market making and
-settlement closing. It runs as a single binary named `stitch`.
+Stitch is the Textile operator bot for filler-network market making. It runs
+as a single binary named `stitch`.
 
-Stitch does two jobs for each configured pool by default:
+Stitch does one job for each configured pool by default, plus an optional
+second:
 
 - **Market making**: keep live buy and sell quotes for a configured
   soft-asset/stablecoin pair.
-- **Settlement closing**: close eligible settlement auction positions on-chain
-  when the configured margin rules are met.
+- **Limit-order taking** (opt-in): fill traders' resting limit orders on-chain
+  when their price is at or beyond your own quote, priced by the same spreads
+  as your market making.
 
 ## Contents
 
@@ -153,9 +155,14 @@ For market making, each configured pool can have:
 - a **sell side**, where Stitch spends the soft/collateral asset to sell above
   the feed price.
 
-For settlement closing, Stitch can also discover open positions through a
-subgraph and submit `fill()` transactions when a close is profitable under your
-configured margin and auction parameters.
+With `limit_taker_enabled = true` on a pool, Stitch also checks the corridor's
+resting trader limit orders every tick and fills the profitable ones on-chain:
+a trader selling the soft asset fills at or below your bid, a trader buying it
+at or above your ask, so your side spreads carry the margin. Each candidate's
+signature is re-verified locally before anything executes, the protocol's
+taker fee is read from the chain and priced into the decision, and fills cost
+gas. See the
+[limit-order taker reference in ADVANCED.md](ADVANCED.md#limit-order-taker).
 
 Stitch reads the config at startup. After changing `stitch.toml`, restart the
 process.
@@ -172,8 +179,8 @@ You need:
 - funded token balances for the sides you enable;
 - Permit2 approvals for the tokens Stitch will spend (set up with
   `stitch approve` — see your platform's install guide above);
-- a small native balance for gas (approvals and, for closing, `fill()` txs);
-- a subgraph URL for settlement closing.
+- a small native balance for gas (approvals and, for limit-order taking, the
+  on-chain fill transactions).
 
 ## Configuration
 
@@ -184,7 +191,6 @@ configuration looks like this:
 chain_id = 8453
 rpc_url = "https://mainnet.base.org"
 indexer_url = "https://api.textilecredit.com"
-subgraph_url = "https://api.textilecredit.com/subgraph?chainId=8453"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0x0000000000000000000000000000000000000000"
 tick_interval_secs = 5
@@ -211,15 +217,6 @@ sell_max_orders = 40
 
 ttl_secs = 120
 refresh_threshold_bps = 10
-
-closer_pool = "0x0000000000000000000000000000000000000000"
-floor_ray = "500000000000000000000000"
-buffer_ray = "20000000000000000000000000"
-window_secs = 432000
-min_margin_collateral = "0"
-max_positions_per_fill = 10
-discover_first = 200
-skip_past_window = true
 ```
 
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
@@ -239,8 +236,8 @@ When several corridors spend the same token (for example two pools that both
 buy with USDC) and more than one of them is set to `"max"`, Stitch splits the
 token's funded balance into even target shares on every tick, so an existing
 corridor can't keep the whole wallet after another max side is added. For
-the price-feed orientation, spread options, ladder sizing, and
-settlement-closing fields, see the
+the price-feed orientation, spread options, ladder sizing, and the
+limit-order taker, see the
 [configuration reference in ADVANCED.md](ADVANCED.md#configuration-reference).
 
 ## Security Notes

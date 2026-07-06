@@ -34,7 +34,7 @@ pub struct Config {
     /// LimitOrderReactor for this chain.
     pub reactor: String,
     /// Subgraph endpoint for settlement-closing discovery (OPEN positions).
-    /// The default setup sets this; omit only for market-making-only configs.
+    /// Legacy: only configs that still run the closer set this.
     #[serde(default)]
     pub subgraph_url: Option<String>,
     /// Re-quote / close cadence.
@@ -291,14 +291,12 @@ mod tests {
         assert!(!cfg.pools.is_empty());
         let pool = &cfg.pools[0];
         assert_eq!(pool.collateral_decimals, 6);
-        // The example runs both sides of the book.
+        // The example runs both sides of the book...
         assert!(pool.buy_enabled());
         assert!(pool.sell_enabled());
         assert!(cfg.feed.staleness_secs > 0);
-        // ...and the blue leg.
-        assert!(cfg.subgraph_url.is_some());
-        assert!(pool.closer_enabled());
-        assert_eq!(pool.window_secs, Some(432_000));
+        // The taker leg is opt-in: the example documents it commented out.
+        assert!(!pool.limit_taker_enabled());
     }
 
     #[test]

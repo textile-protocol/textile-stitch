@@ -6,8 +6,6 @@ rpc_url = "https://mainnet.base.org"
 indexer_url = "https://api.textilecredit.com"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0xEb5A29F869FF084B3Fce18d3487a38A56feDC59E"  # SETTLEMENT_V3_FILLER_REACTOR (Base)
-# Subgraph for blue-leg discovery (OPEN positions). Omit to run green-leg only.
-subgraph_url = "https://api.textilecredit.com/subgraph?chainId={...}"
 tick_interval_secs = 5
 
 # Default price feed: used by any pool that doesn't set its own `feed_url`.
@@ -58,26 +56,15 @@ ttl_secs = 120
                           # ttl/2, so keep ttl_secs >= 2 x this. Defaults to 60.
 refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
 
-# Taker leg: fill users' RESTING LIMIT ORDERS when their price crosses your
-# own quote — a user selling the soft asset fills at or below your bid, a user
-# buying it at or above your ask. Priced by the side spreads above (a side
-# without a spread is never taken), plus the reactor's native fee (read
-# on-chain) and gas. Costs gas per fill; profit lands as inventory.
-limit_taker_enabled = true
+# Taker leg (off by default): fill users' RESTING LIMIT ORDERS when their
+# price crosses your own quote — a user selling the soft asset fills at or
+# below your bid, a user buying it at or above your ask. Priced by the side
+# spreads above (a side without a spread is never taken), plus the reactor's
+# native fee (read on-chain) and gas. Costs gas per fill; profit lands as
+# inventory. Uncomment to enable:
+# limit_taker_enabled = true
 # limit_taker_min_profit_debt = "50000"  # skip fills clearing < 0.05 USDC (6dp)
 # limit_taker_max_orders = 10            # per executeBatch
-
-# ----- Blue leg (auction closer). Set these to also close this pool's
-# positions via pool.fill(); omit them to run this pool green-only. The
-# floor/buffer/window mirror the pool's on-chain auction params. -----
-closer_pool = "0x0000000000000000000000000000000000000000"  # SettlementPool
-floor_ray = "500000000000000000000000"       # 0.05% opening rate (RAY)
-buffer_ray = "20000000000000000000000000"    # 2% decaying buffer (RAY)
-window_secs = 432000                          # 5-day auction window
-min_margin_collateral = "0"                   # accept any positive net margin
-max_positions_per_fill = 10                   # close up to N from the FIFO front
-discover_first = 200                          # candidates pulled per tick
-skip_past_window = true                       # leave fully-decayed positions
 
 # ----- Signer / wallet backend. Omit this whole section to use the local
 # hotwallet (the default, unchanged): the bot signs with STITCH_PRIVATE_KEY /

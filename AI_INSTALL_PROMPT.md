@@ -132,9 +132,7 @@ Run after detecting OS/architecture and before writing config.
    label, recommended = first listed) so I pick a row instead of typing an
    address. Show at most 3; if there are more, show the first 3 and let me name
    another via the free-form answer. If discovery returned nothing on a real
-   chain, stop; on 31337 use the local-address flow. Both legs run by default, so
-   the pool I pick is also the settlement-closing target — don't ask me whether
-   to enable closing.
+   chain, stop; on 31337 use the local-address flow.
 
 4. Buy spread — how far below the mid should the bid sit?
    - Options: 0.1% (recommended); 0.25%; 0.5%. Or type an absolute like "5 cNGN"
@@ -160,13 +158,6 @@ Auto-fill (never ask):
   (we prefill it per deployment). If it's still the zero address, ask me for the
   deployed reactor address for my chain (free-form) before writing config — never
   write a zero reactor.
-- subgraph_url: set to https://api.textilecredit.com/subgraph?chainId=<my chain
-  id> (the Textile proxy). Both legs run by default, so always set it.
-- Settlement closing (blue leg) runs by default on the chosen pool: closer_pool =
-  the chosen pool address; floor_ray / buffer_ray / window_secs from the pool's
-  floorFee / buffer / window in GraphQL (defaults below if discovery misses);
-  min_margin_collateral 0, max_positions_per_fill 10, discover_first 200,
-  skip_past_window true.
 - Advanced (defaults, never ask): minimum order slice, maximum orders per side,
   tick interval, order TTL, refresh threshold, indexer URL, price feed, Permit2.
 
@@ -181,8 +172,6 @@ Use these defaults unless I provide different values:
 - Permit2 address: 0x000000000022D473030F116dDEE9F6B43aC78BA3
 - Reactor address: from stitch.example.toml (prefilled per deployment); ask only
   if it's still the zero address
-- Subgraph URL: https://api.textilecredit.com/subgraph?chainId=<chain id> (the
-  Textile proxy); never ask
 - Price feed staleness: 30 seconds
 - Tick interval: 5 seconds
 - Token decimals: 6, unless I provide different decimals
@@ -194,16 +183,6 @@ Use these defaults unless I provide different values:
 - Maximum ladder orders per side (advanced, never ask): 40
 - Order TTL: 30 seconds
 - Refresh threshold: 10 bps
-- Settlement closing: enabled by default (both legs)
-- Floor rate (floor_ray): 500000000000000000000000 (0.05%), if discovery didn't
-  supply it
-- Buffer rate (buffer_ray): 20000000000000000000000000 (2%), if discovery didn't
-  supply it
-- Settlement close window: 432000 seconds, if discovery didn't supply it
-- Minimum close margin: 0 (advanced)
-- Max positions per fill: 10 (advanced)
-- Discover first: 200 (advanced)
-- Skip past-window positions: true (advanced)
 - Foreground config directory on macOS/Linux: ~/Stitch
 - Foreground config path on macOS/Linux: ~/Stitch/stitch.toml
 - Foreground env path on macOS/Linux: ~/Stitch/stitch.env
@@ -271,7 +250,6 @@ Preferred — GraphQL (same data as the deposit page):
    - collateral token address = collateralAsset (soft / collateral column on
      the deposit page)
    - debt token address = debtAsset (stable / Supply column on the deposit page)
-   - closer_pool = pool address (closing runs by default)
 
 6. Present a short table: displayName or pair label, chainId, supply/debt
    symbol hint if known, collateralAsset, debtAsset, pool address. Then ask
@@ -282,8 +260,7 @@ Fallback — browse the deposit page:
 - Open https://app.textilecredit.com/s/deposit (or use a browser/scrape tool).
 - Match pools on my chosen chain ID.
 - Columns: Supply ≈ debt/stable token; Collateral ≈ soft/collateral token.
-- Pool detail URLs look like /s/deposit/{chainId}/{poolAddress}; use the pool
-  address from the link or GraphQL when enabling settlement closing.
+- Pool detail URLs look like /s/deposit/{chainId}/{poolAddress}.
 - If the page shows symbols but not addresses, still use the GraphQL path above
   or ask me to confirm after you show the table from a successful query.
 
@@ -296,18 +273,6 @@ addresses.
 Token decimals after discovery:
 - Default 6 for both tokens when symbols look like USDT/USDC-style stables.
 - If unsure, read decimals() from each token contract via the gathered RPC URL.
-
-Settlement closing (runs by default — don't ask whether to enable it):
-- subgraph_url = https://api.textilecredit.com/subgraph?chainId=<my chain id>
-  (the Textile proxy). Never ask me for a subgraph URL.
-- closer_pool = chosen pool address from discovery.
-- floor_ray and buffer_ray from the pool's floorFee and buffer in GraphQL when
-  present; otherwise default to floor_ray = 500000000000000000000000 (0.05%
-  opening rate) and buffer_ray = 20000000000000000000000000 (2% buffer), the
-  current production values.
-- window_secs 432000, min_margin_collateral 0, max_positions_per_fill 10,
-  discover_first 200, skip_past_window true. These are advanced — leave them at
-  the defaults; I can edit the config file if I want to change them.
 
 Release install procedure:
 1. Query the latest GitHub Release metadata:
@@ -398,22 +363,14 @@ Configuration procedure:
    - buy_min_slice_debt / sell_min_slice_debt = the default (advanced), e.g.
      "10000000" for a 10-unit minimum on a 6-decimal token.
 
-4. Settlement closing runs by default:
-   - Set subgraph_url to the Textile proxy
-     (https://api.textilecredit.com/subgraph?chainId=<chain id>).
-   - Include the closer fields: closer_pool, floor_ray, buffer_ray, window_secs,
-     min_margin_collateral, max_positions_per_fill, discover_first,
-     skip_past_window.
-   - Only omit these if I explicitly ask to run market making only.
-
-5. Signer section: if I chose Turnkey or MPCVault, add a `[signer]` section to
+4. Signer section: if I chose Turnkey or MPCVault, add a `[signer]` section to
    stitch.toml with `provider` and the non-secret fields gathered in the
    credentials step (Turnkey: organization_id, sign_with, operator_address;
    MPCVault: vault_uuid, client_signer_pubkey, operator_address,
    callback_listen_addr). Omit `[signer]` entirely for the hotwallet. Never put any
    signer secret in the TOML.
 
-6. Restrict config file permissions:
+5. Restrict config file permissions:
    - Unix: config directory 700, config file 600.
 
 Private key collection (HOTWALLET ONLY; needs a REAL interactive terminal):
@@ -663,14 +620,12 @@ Show me a short summary:
 - Buy and sell spread (the percentage or absolute I picked).
 - Buy-side and sell-side liquidity: "max", plus any dry-run balance or approval
   warnings for those sides.
-- Settlement closing: on by default, with the closer pool and the subgraph proxy.
 - Permit2 approvals: which input tokens are approved, and whether I chose
   maximum or exact.
 - Dry-run result.
 
 Then remind me that advanced parameters (minimum order slice, maximum orders,
-tick interval, TTL, refresh threshold, and the closer's margin / positions /
-discover / skip settings) are at safe defaults, and that I can edit the config
+tick interval, TTL, and refresh threshold) are at safe defaults, and that I can edit the config
 file directly and restart to change any of them.
 
 Then use AskUserQuestion for explicit confirmation before any live or

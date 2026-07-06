@@ -335,7 +335,7 @@ mod tests {
         assert!(out.contains("# 1 bps below mid"));
         // Untouched keys are still there.
         assert!(out.contains("permit2"));
-        assert!(out.contains("closer_pool"));
+        assert!(out.contains("refresh_threshold_bps"));
     }
 
     #[test]

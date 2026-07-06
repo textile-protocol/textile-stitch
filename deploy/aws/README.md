@@ -3,7 +3,7 @@
 This deploy path is for operator-owned Stitch bots. You run it in your own AWS
 account, with your own VPC, secrets, and IAM roles that you own and control. The
 bot talks to Textile the same way any external operator does, through the public
-RPC/API/indexer/subgraph URLs in `stitch.toml`.
+RPC/API/indexer URLs in `stitch.toml`.
 
 ## What The Stack Creates
 

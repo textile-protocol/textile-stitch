@@ -4,7 +4,7 @@ Stitch can run as an operator-owned cloud bot in your own AWS account. The
 self-hosting stack in [deploy/aws](../deploy/aws/README.md) creates a
 self-contained ECS Fargate environment you own and control: one service, one
 secret, one wallet, no public ingress. The bot reaches Textile the same way any
-external operator does, over the public RPC / API / indexer / subgraph URLs in
+external operator does, over the public RPC / API / indexer URLs in
 your `stitch.toml`.
 
 [![Deploy to AWS](https://img.shields.io/badge/Deploy_to-AWS-FF9900?style=for-the-badge&logo=amazonaws&logoColor=white)](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?templateURL=https%3A%2F%2Ftextile-stitch-deploy.s3.us-east-1.amazonaws.com%2Faws%2Fcloudformation.yaml&stackName=stitch-operator)

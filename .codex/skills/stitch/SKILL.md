@@ -7,9 +7,8 @@ metadata:
 
 # Operate Stitch
 
-Stitch is the Textile operator bot (binary `stitch`): per-pool market making plus
-settlement closing. This skill both runs an existing Stitch and installs one that
-isn't set up yet.
+Stitch is the Textile operator bot (binary `stitch`): per-pool market making.
+This skill both runs an existing Stitch and installs one that isn't set up yet.
 
 ## Always start here
 
@@ -124,8 +123,8 @@ Service:
 
 1. Edit the active `stitch.toml`: spreads (`buy_offset_bps` / `sell_offset_bps`),
    liquidity (`buy_total_liquidity_debt` / `sell_total_liquidity_collateral`),
-   ladder, TTL, or the closer fields. Amounts are atomic token units. Full field
-   reference is in `ADVANCED.md`.
+   ladder, or TTL. Amounts are atomic token units. Full field reference is in
+   `ADVANCED.md`.
 2. If you *raised* liquidity and approved an **exact** Permit2 allowance, re-run
    `stitch approve` (below) — otherwise the added depth posts but silently fails
    to fill.

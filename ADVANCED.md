@@ -112,32 +112,56 @@ wallet without raising `*_total_liquidity_*` and the extra inventory never
 reaches the book. Stitch logs
 `wallet can back more than the configured size` (info level) when this happens.
 If you want the book to track the wallet, use `"max"`; keep a fixed size only
-when you deliberately reserve inventory, e.g. debt-token budget for the
-settlement closer, which spends from the same wallet.
+when you deliberately reserve part of the wallet's inventory for something
+else.
 
-### Settlement Closing
+### Limit-Order Taker
 
-Stitch runs settlement closing alongside market making by default. The install
-flow fills the top-level `subgraph_url` and each pool's closer fields from the
-deposit catalog:
+Traders can rest their own limit orders in the same book Stitch quotes into.
+The taker leg fills those orders on-chain when their price is at or beyond
+your own quote: a trader selling the soft asset fills at or below your bid, a
+trader buying it at or above your ask. There is no separate pricing — the
+side spreads above are the margin, so a side without a spread is never taken.
+Off by default; enable per pool:
 
 ```toml
-subgraph_url = "https://api.textilecredit.com/subgraph?chainId=8453"
-
 [[pools]]
-closer_pool = "0x0000000000000000000000000000000000000000"
-floor_ray = "500000000000000000000000"      # 0.05% opening rate (RAY)
-buffer_ray = "20000000000000000000000000"   # 2% decaying buffer (RAY)
-window_secs = 432000
-min_margin_collateral = "0"
-max_positions_per_fill = 10
-discover_first = 200
-skip_past_window = true
+limit_taker_enabled = true
+# limit_taker_min_profit_debt = "50000"  # per-order profit floor, atomic debt units
+# limit_taker_max_orders = 10            # most orders per fill transaction
 ```
 
-`floor_ray` / `buffer_ray` / `window_secs` mirror the pool's on-chain auction
-params. Advanced operators can omit the closer fields to run market making only,
-but the recommended setup keeps both jobs enabled.
+What one tick does when the leg is on:
+
+1. Fetch the corridor's resting trader limit orders from the indexer, both
+   directions.
+2. Re-verify each order locally: the EIP-712 digest is recomputed from the
+   served fields and the signature must recover to the claimed maker, so the
+   indexer is never trusted with fund-moving inputs. Own orders and orders
+   near expiry are skipped.
+3. Price each order against your bid or ask, including the protocol's taker
+   fee — read once from the chain at startup (the fee controller caps it at
+   5 bps). If the fee can't be read, the leg stays off for the run rather
+   than guessing.
+4. Fill the profitable batch (most profitable first, capped by
+   `limit_taker_max_orders` and your live token balance) with one on-chain
+   transaction per direction. A just-filled order is on cooldown for a few
+   minutes so a pending transaction can't double-fill it.
+
+Costs and flows to know:
+
+- **Taking costs gas** — one transaction per batch, plus a one-time ERC20
+  approval of each spent token to the reactor, sent automatically before the
+  first fill. This is a direct reactor allowance, separate from the Permit2
+  approvals that back your quotes.
+- **You pay the taker fee** when filling (on top of the trader's price); the
+  profitability check already accounts for it. `limit_taker_min_profit_debt`
+  adds a per-order floor, valued in atomic debt units, so dust fills don't
+  burn gas for nothing.
+- **Fills spend quoting inventory.** The taker leg spends from the same
+  wallet your ladders quote; a fill shrinks the next ladder like any other
+  balance change, and the received tokens land as inventory.
+- `--dry-run` logs the batches the leg would fill without sending anything.
 
 ### MPC Wallet Signers
 
@@ -327,21 +351,24 @@ Check these in order:
 For the buy side, the wallet spends the pool's `debt` token. For the sell side,
 the wallet spends the pool's `collateral` token.
 
-### Settlement Closing Is Not Running
+### The Taker Leg Is Not Filling
 
-Settlement closing should run in the default setup. If it is not running, first
-confirm both required config groups are present:
+The limit-order taker only acts when everything lines up; silence usually
+means one of these:
 
-- top-level `subgraph_url` is set;
-- the pool has `closer_pool`, `floor_ray`, `buffer_ray`, and `window_secs`.
+1. `limit_taker_enabled = true` is missing on the pool, or the side that
+   would price the fill has no spread configured (the taker prices with your
+   bid/ask; no spread on a side means that direction is never taken).
+2. Startup logged `could not read the reactor fee; taker leg disabled for
+   this run` — the fee read failed, so the leg is off until a restart with a
+   working RPC.
+3. No resting order actually clears your spread after the taker fee, or
+   `limit_taker_min_profit_debt` filters what does.
+4. The wallet's balance of the spent token can't cover the order plus fee.
+5. The order was just filled or attempted — it's on the resubmit cooldown.
 
-Also check:
-
-- the RPC URL is reachable;
-- the wallet has enough debt token to close positions;
-- `max_positions_per_fill` is not too low for your desired batch size;
-- `min_margin_collateral` is not filtering every candidate;
-- `skip_past_window` is not excluding the positions you expected to close.
+`--dry-run` logs `would fill resting limit orders` with the batch it planned,
+which pins down whether the problem is discovery, pricing, or funding.
 
 ### Update Does Not Work
 

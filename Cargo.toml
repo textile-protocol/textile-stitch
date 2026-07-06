@@ -1,8 +1,8 @@
 [package]
 name = "stitch-bot"
-version = "0.1.74"
+version = "0.1.75"
 edition = "2021"
-description = "Stitch — Textile filler-network operator bot; signs UniswapX limit orders and closes settlement auctions."
+description = "Stitch — Textile filler-network operator bot; market-makes the filler order book with signed UniswapX limit orders."
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/textile-protocol/textile-stitch"
 homepage = "https://github.com/textile-protocol/textile-stitch"

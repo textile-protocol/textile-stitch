@@ -9,7 +9,6 @@ rpc_url         = "https://42220.rpc.thirdweb.com/e76584a65c9e8f40c6eed2da4ca465
 indexer_url     = "https://api.textilecredit.com"
 permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
 reactor         = "0xFd993A9A065d628822c4d2D8Bc20e92bED9Ae49f"  # Celo reactor
-subgraph_url    = "https://api.textilecredit.com/subgraph?chainId=42220"
 tick_interval_secs = 5
 
 # Textile's own price endpoint. Returns { price, timestamp } where price is
@@ -40,16 +39,3 @@ sell_max_orders = 40
 
 ttl_secs = 120
 refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
-
-# ----- Blue leg (auction closer) for the BRLA/USDT pool -----
-# Closes forward-direction positions (USDT borrowed against BRLA). The floor/
-# buffer/window mirror the pool's deployed defaults (0.05% floor, 2% buffer,
-# 5-day window); they must match the on-chain pool or the auction mis-prices.
-closer_pool = "0xE50141f7abA12D91866744a8950C9A898411B4A2"  # SETTLEMENT_V3_BRLA_USDT_POOL (Celo)
-floor_ray = "500000000000000000000000"            # 0.05% opening rate (RAY)
-buffer_ray = "20000000000000000000000000"         # 2% decaying buffer (RAY)
-window_secs = 432000                              # 5-day auction window
-min_margin_collateral = "0"                       # accept any positive net margin
-max_positions_per_fill = 10
-discover_first = 200
-skip_past_window = true

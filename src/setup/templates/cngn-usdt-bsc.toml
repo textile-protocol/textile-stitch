@@ -6,7 +6,6 @@ rpc_url         = "https://56.rpc.thirdweb.com/e76584a65c9e8f40c6eed2da4ca46559"
 indexer_url     = "https://api.textilecredit.com"
 permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor         = "0xe03261c0436DB575F92F09EdDF3591E2566B7D97"  # SETTLEMENT_V3_FILLER_REACTOR (BSC)
-subgraph_url    = "https://api.textilecredit.com/subgraph?chainId=56"
 tick_interval_secs = 5
 
 # Textile's own price endpoint. Returns { price, timestamp } where price is
@@ -36,13 +35,3 @@ sell_max_orders = 40
 
 ttl_secs = 120
 refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
-
-# ----- Blue leg (auction closer) for the cNGN/USDT pool -----
-closer_pool = "0xB0CA09c4685371CB48caF48860F2baBb110F75ae"  # SETTLEMENT_V3_CNGN_USDT_POOL
-floor_ray = "500000000000000000000000"            # 0.05% opening rate (RAY)
-buffer_ray = "20000000000000000000000000"         # 2% decaying buffer (RAY)
-window_secs = 432000                              # 5-day auction window
-min_margin_collateral = "0"                       # accept any positive net margin
-max_positions_per_fill = 10
-discover_first = 200
-skip_past_window = true
