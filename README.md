@@ -31,9 +31,26 @@ second:
 
 Two easy paths. Pick one.
 
-### Option 1 — Install with an AI agent
+### Option 1 — Desktop app
 
-The recommended way: your coding agent collects the settings, writes the config,
+No terminal needed. [Download the release for your OS](https://github.com/textile-protocol/textile-stitch/releases) and open the Stitch app:
+
+- **macOS**: download `Stitch.app.zip` from the release, unzip, and open
+  `Stitch.app`. The app is Developer ID-signed and Apple-notarized, so it opens
+  without a Gatekeeper prompt. You can also run the `stitch-setup` binary from a
+  terminal.
+- **Windows**: double-click `stitch-setup.exe`.
+- **Linux**: run `stitch-setup` (or use the bundled `stitch.desktop` entry).
+
+Pick a corridor, paste your operator wallet key, and click Create. The same
+window then runs the bot: Start/Stop, a dry-run toggle, a Permit2 "Approve
+tokens" button, live logs, and an Update button. Closing the window stops the
+bot; for unattended 24/7 running, install it as a service (see the install guides
+below).
+
+### Option 2 — Install with an AI agent
+
+Your coding agent collects the settings, writes the config,
 runs a dry run, and starts live only after you confirm. Then it handles start,
 stop, logs, parameter changes, and upgrades on request.
 
@@ -74,23 +91,6 @@ confirm.
 The full copyable prompt is in [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
 
 </details>
-
-### Option 2 — Desktop app
-
-No terminal needed. [Download the release for your OS](https://github.com/textile-protocol/textile-stitch/releases) and open the Stitch app:
-
-- **macOS**: download `Stitch.app.zip` from the release, unzip, and open
-  `Stitch.app`. The app is Developer ID-signed and Apple-notarized, so it opens
-  without a Gatekeeper prompt. You can also run the `stitch-setup` binary from a
-  terminal.
-- **Windows**: double-click `stitch-setup.exe`.
-- **Linux**: run `stitch-setup` (or use the bundled `stitch.desktop` entry).
-
-Pick a corridor, paste your operator wallet key, and click Create. The same
-window then runs the bot: Start/Stop, a dry-run toggle, a Permit2 "Approve
-tokens" button, live logs, and an Update button. Closing the window stops the
-bot; for unattended 24/7 running, install it as a service (see the install guides
-below).
 
 ## Other ways to install
 
