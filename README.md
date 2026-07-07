@@ -188,15 +188,15 @@ Start from [stitch.example.toml](stitch.example.toml). A minimal default pool
 configuration looks like this:
 
 ```toml
-chain_id = 8453
-rpc_url = "https://mainnet.base.org"
+chain_id = 56
+rpc_url = "https://bsc-rpc.publicnode.com"   # free public RPC; swap for your own if you have one
 indexer_url = "https://api.textilecredit.com"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0x0000000000000000000000000000000000000000"
 tick_interval_secs = 5
 
 [feed]
-url = "https://your-feed.example/cngn-usdc"
+url = "https://your-feed.example/cngn-usdt"
 staleness_secs = 30
 
 [[pools]]

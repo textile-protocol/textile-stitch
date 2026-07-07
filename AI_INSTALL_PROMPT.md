@@ -111,16 +111,18 @@ Run after detecting OS/architecture and before writing config.
      client-signer sidecar (see "MPC signer credentials").
 
 1. Chain — which network should Stitch run on?
-   - Options (3 max): Base — 8453 (recommended); BNB Smart Chain — 56; Another
+   - Options (3 max): BNB Smart Chain — 56 (recommended); Ethereum — 1; Another
      network. If I pick "Another network", ask a follow-up with the rest as
-     options (Ethereum — 1; Celo — 42220; Local Hardhat — 31337 for debugging),
-     and only list a public chain if it's on
-     https://app.textilecredit.com/s/deposit. For anything else I'll type a
-     custom chain ID in the free-form answer.
-   - After I answer, set chain_id and RPC URL: Base -> https://mainnet.base.org,
-     31337 -> http://127.0.0.1:8545. For other chains, ask a follow-up RPC URL
-     question if you don't know the right default. On 31337, skip public catalog
-     discovery and use local pool/token addresses (see discovery section).
+     options (Celo — 42220; Local Hardhat — 31337 for debugging), and only list a
+     public chain if it's on https://app.textilecredit.com/s/deposit. For anything
+     else I'll type a custom chain ID in the free-form answer.
+   - After I answer, set chain_id and RPC URL to a free public endpoint: 56 ->
+     https://bsc-rpc.publicnode.com, 1 -> https://ethereum-rpc.publicnode.com,
+     42220 -> https://celo-rpc.publicnode.com, 31337 -> http://127.0.0.1:8545. For
+     other chains, ask a follow-up RPC URL question if you don't know the right
+     default. Never use a paid or API-key RPC endpoint; a free, well-performing
+     public RPC is always fine. On 31337, skip public catalog discovery and use
+     local pool/token addresses (see discovery section).
 
 2. Run mode — how should Stitch run? Offer the choices for my OS, recommended
    first:
@@ -164,9 +166,10 @@ Auto-fill (never ask):
 Use these defaults unless I provide different values:
 - Binary command name: stitch
 - GitHub repo: textile-protocol/textile-stitch
-- Network: Base
-- Chain ID: 8453
-- RPC URL: https://mainnet.base.org
+- Network: BNB Smart Chain
+- Chain ID: 56
+- RPC URL: https://bsc-rpc.publicnode.com (a free public endpoint; never a paid or
+  API-key RPC)
 - Textile indexer URL: https://api.textilecredit.com
 - Price feed URL: https://api.textilecredit.com/price
 - Permit2 address: 0x000000000022D473030F116dDEE9F6B43aC78BA3
@@ -226,7 +229,7 @@ AskUserQuestion. Then continue to the pool pick (step 3) as usual.
 Preferred — GraphQL (same data as the deposit page):
 1. POST to https://app.textilecredit.com/api/graphql with Content-Type:
    application/json.
-2. Use the chain ID I confirmed in the interview (default 8453 / Base).
+2. Use the chain ID I confirmed in the interview (default 56 / BNB Smart Chain).
 3. Example query:
 
    query SettlementV3PoolsForStitch($chainId: Int!) {
@@ -244,7 +247,7 @@ Preferred — GraphQL (same data as the deposit page):
 
 4. Example request body (replace chainId if I chose another network):
 
-   {"query":"query SettlementV3PoolsForStitch($chainId: Int!) { settlementV3Pools(chainId: $chainId, includeUnlisted: false) { address chainId collateralAsset debtAsset displayName buffer floorFee window } }","variables":{"chainId":8453}}
+   {"query":"query SettlementV3PoolsForStitch($chainId: Int!) { settlementV3Pools(chainId: $chainId, includeUnlisted: false) { address chainId collateralAsset debtAsset displayName buffer floorFee window } }","variables":{"chainId":56}}
 
 5. Map each pool to stitch.toml fields:
    - collateral token address = collateralAsset (soft / collateral column on

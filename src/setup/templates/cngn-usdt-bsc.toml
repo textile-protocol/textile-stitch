@@ -2,7 +2,7 @@
 # The wallet key is NOT here; export STITCH_PRIVATE_KEY (or STITCH_PRIVATE_KEY_FILE).
 
 chain_id        = 56                                    # BNB Smart Chain mainnet
-rpc_url         = "https://56.rpc.thirdweb.com/e76584a65c9e8f40c6eed2da4ca46559"
+rpc_url         = "https://bsc-rpc.publicnode.com"      # free public BSC RPC; swap for your own if you have one
 indexer_url     = "https://api.textilecredit.com"
 permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor         = "0xe03261c0436DB575F92F09EdDF3591E2566B7D97"  # SETTLEMENT_V3_FILLER_REACTOR (BSC)

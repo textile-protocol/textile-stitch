@@ -28,11 +28,25 @@ const CORRIDORS: &[Corridor] = &[
         toml_template: include_str!("templates/cngn-usdt-bsc.toml"),
     },
     Corridor {
-        id: "brla-usdt-celo",
-        display_name: "BRLA / USDT",
+        id: "xaut-usdt-ethereum",
+        display_name: "XAUt / USDT",
+        network_label: "Ethereum",
+        chain_id: 1,
+        toml_template: include_str!("templates/xaut-usdt-ethereum.toml"),
+    },
+    Corridor {
+        id: "wars-usdt-celo",
+        display_name: "wARS / USDT",
         network_label: "Celo",
         chain_id: 42220,
-        toml_template: include_str!("templates/brla-usdt-celo.toml"),
+        toml_template: include_str!("templates/wars-usdt-celo.toml"),
+    },
+    Corridor {
+        id: "wbrl-usdt-celo",
+        display_name: "wBRL / USDT",
+        network_label: "Celo",
+        chain_id: 42220,
+        toml_template: include_str!("templates/wbrl-usdt-celo.toml"),
     },
 ];
 
@@ -46,11 +60,32 @@ pub fn find_corridor(id: &str) -> Option<&'static Corridor> {
     CORRIDORS.iter().find(|c| c.id == id)
 }
 
-/// Best-effort: match a written `stitch.toml` back to a catalog corridor by its
-/// chain id, so the control panel can name an already-configured folder.
+/// Best-effort: match a written `stitch.toml` back to a catalog corridor so the
+/// control panel can name an already-configured folder. Chain id alone is not
+/// enough — a chain can host more than one corridor (e.g. wARS and wBRL on Celo),
+/// so disambiguate on the first pool's collateral (soft) token when we can, and
+/// fall back to the chain-only match for older configs with no matching pool.
 pub fn identify_corridor(toml_str: &str) -> Option<&'static Corridor> {
     let cfg = crate::config::Config::from_toml(toml_str).ok()?;
-    CORRIDORS.iter().find(|c| c.chain_id == cfg.chain_id)
+    let collateral = cfg.pools.first().map(|p| p.collateral.to_lowercase());
+    CORRIDORS
+        .iter()
+        .find(|c| {
+            c.chain_id == cfg.chain_id
+                && collateral
+                    .as_deref()
+                    .zip(corridor_collateral(c))
+                    .is_some_and(|(want, have)| want == have)
+        })
+        .or_else(|| CORRIDORS.iter().find(|c| c.chain_id == cfg.chain_id))
+}
+
+/// The first pool's collateral (soft) token address, lowercased, parsed from a
+/// corridor's own template. Returns `None` if the template can't be parsed (a
+/// guarded invariant — see `every_template_parses_as_a_valid_config`).
+fn corridor_collateral(c: &Corridor) -> Option<String> {
+    let cfg = crate::config::Config::from_toml(c.toml_template).ok()?;
+    cfg.pools.first().map(|p| p.collateral.to_lowercase())
 }
 
 #[cfg(test)]
@@ -88,6 +123,18 @@ mod tests {
         let bsc = find_corridor("cngn-usdt-bsc").expect("bsc corridor exists");
         assert_eq!(identify_corridor(bsc.toml_template).unwrap().id, bsc.id);
         assert!(find_corridor("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn corridors_sharing_a_chain_are_told_apart_by_collateral() {
+        // Celo hosts both wARS/USDT and wBRL/USDT (chain 42220). A chain-only
+        // match would collapse them; identify must key on the collateral token so
+        // the control panel names (and preselects) the right one.
+        let wars = find_corridor("wars-usdt-celo").expect("wars corridor exists");
+        let wbrl = find_corridor("wbrl-usdt-celo").expect("wbrl corridor exists");
+        assert_eq!(wars.chain_id, wbrl.chain_id, "test premise: same chain");
+        assert_eq!(identify_corridor(wars.toml_template).unwrap().id, wars.id);
+        assert_eq!(identify_corridor(wbrl.toml_template).unwrap().id, wbrl.id);
     }
 
     #[test]

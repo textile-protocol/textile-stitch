@@ -915,7 +915,7 @@ mod tests {
             },
         )
         .unwrap();
-        let celo = find_corridor("brla-usdt-celo").unwrap();
+        let celo = find_corridor("wbrl-usdt-celo").unwrap();
         switch_corridor_preserving_signer(&dir, celo.toml_template).unwrap();
         let toml = std::fs::read_to_string(config_paths(&dir).toml).unwrap();
         // New corridor took effect (Celo chain id)...
@@ -932,7 +932,7 @@ mod tests {
         let dir = unique_dir("switch-hot");
         let bsc = find_corridor("cngn-usdt-bsc").unwrap();
         write_config(&dir, bsc, KEY).unwrap();
-        let celo = find_corridor("brla-usdt-celo").unwrap();
+        let celo = find_corridor("wbrl-usdt-celo").unwrap();
         switch_corridor_preserving_signer(&dir, celo.toml_template).unwrap();
         assert_eq!(
             std::fs::read_to_string(config_paths(&dir).toml).unwrap(),
@@ -946,7 +946,7 @@ mod tests {
     fn key_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_dir("perms");
-        let corridor = find_corridor("brla-usdt-celo").unwrap();
+        let corridor = find_corridor("wbrl-usdt-celo").unwrap();
         let paths = write_config(&dir, corridor, KEY).unwrap();
         let mode = std::fs::metadata(&paths.key).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
