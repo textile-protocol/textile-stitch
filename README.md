@@ -80,9 +80,9 @@ The full copyable prompt is in [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
 No terminal needed. [Download the release for your OS](https://github.com/textile-protocol/textile-stitch/releases) and open the Stitch app:
 
 - **macOS**: download `Stitch.app.zip` from the release, unzip, and open
-  `Stitch.app`. It's ad-hoc signed but not Apple-notarized, so the first launch
-  needs right-click → Open (or System Settings → Privacy & Security → Open
-  Anyway). You can also run the `stitch-setup` binary from a terminal.
+  `Stitch.app`. The app is Developer ID-signed and Apple-notarized, so it opens
+  without a Gatekeeper prompt. You can also run the `stitch-setup` binary from a
+  terminal.
 - **Windows**: double-click `stitch-setup.exe`.
 - **Linux**: run `stitch-setup` (or use the bundled `stitch.desktop` entry).
 
