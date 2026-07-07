@@ -28,6 +28,10 @@ on:
         description: "Release tag to attach Stitch.dmg to (blank = upload a workflow artifact only)"
         required: false
         default: ""
+      promote:
+        description: "Set 'true' to clear the pre-release flag and mark the release latest once the DMG is attached"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -179,6 +183,25 @@ jobs:
           ')"
           printf '%s' "$updated" > "$RUNNER_TEMP/notes.md"
           gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+
+      # release.yml creates the release flagged as a pre-release and dispatches
+      # this build with promote=true, so /releases/latest keeps resolving to the
+      # previous release (no 404 on latest/download/Stitch.dmg) until the DMG is
+      # attached just above. Now that it is, clear the pre-release flag and mark
+      # this the latest release — atomically, with the asset already in place.
+      # Only reached on success (a failed build/notarize/upload short-circuits the
+      # job earlier), so a broken build leaves the release a pre-release rather
+      # than a `latest` without its DMG. Skipped for genuine pre-releases
+      # (promote=false) and for bare manual runs (no tag).
+      - name: Promote the release to latest
+        if: ${{ inputs.promote == 'true' && (github.event_name == 'release' || inputs.tag != '') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --prerelease=false --latest=true
+          echo "Promoted $TAG to the latest release with Stitch.dmg attached."
 
       - name: Upload Stitch.dmg as a workflow artifact
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag == '' }}

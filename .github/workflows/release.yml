@@ -367,73 +367,29 @@ jobs:
           fi
       # The release above is created with GITHUB_TOKEN, so it does NOT fire the
       # `release: published` event. Trigger the macOS app build explicitly
-      # (workflow_dispatch is exempt from that restriction) so Stitch.dmg
-      # gets attached to this release.
+      # (workflow_dispatch is exempt from that restriction) so Stitch.dmg gets
+      # built and attached to this release.
+      #
+      # Fire-and-forget on purpose: we do NOT wait for the ~12-minute macOS build
+      # here. Blocking the release job that long serialized releases — the
+      # workflow has `concurrency: cancel-in-progress: false`, so two merges
+      # within that window queued up and GitHub cancelled the one in the middle.
+      # Instead, macos-app.yml attaches the DMG and, when promote=true, clears the
+      # pre-release flag to make this the latest release itself. A failed macOS
+      # build then just leaves the release as a pre-release (never `latest`, so
+      # the latest/download link keeps pointing at the previous release rather
+      # than 404ing) and shows red on the macos-app.yml run.
       - name: Build and attach the macOS Stitch.dmg
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.plan.outputs.tag }}
+          # Promote to `latest` once the DMG lands, unless dist flagged this a
+          # genuine pre-release (those are never meant to become `latest`).
+          PROMOTE: ${{ !fromJson(steps.host.outputs.manifest).announcement_is_prerelease && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          gh workflow run macos-app.yml --ref "$TAG" -f tag="$TAG"
-          # `gh workflow run` is fire-and-forget. Locate the run we just dispatched
-          # (it runs on the tag ref, so its head branch is the tag) and wait for it,
-          # so a failed build / signing / notarization / upload turns this release
-          # red instead of leaving it green without Stitch.dmg.
-          run_id=""
-          for _ in $(seq 1 12); do
-            run_id="$(gh run list --workflow=macos-app.yml --event=workflow_dispatch \
-              --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
-            [ -n "$run_id" ] && break
-            sleep 5
-          done
-          if [ -z "$run_id" ]; then
-            echo "::error::dispatched the macOS app build but could not locate its run to wait on"
-            exit 1
-          fi
-          echo "Waiting on macOS app build run $run_id"
-          # Don't use `gh run watch --exit-status`: a single transient API error
-          # (e.g. HTTP 503) while polling makes it exit non-zero and fails the
-          # release even though the app build itself is fine. Poll ourselves and
-          # tolerate transient lookup failures; only a real non-success
-          # conclusion (or a timeout) fails the step.
-          conclusion=""
-          for _ in $(seq 1 120); do
-            state="$(gh run view "$run_id" --json status,conclusion \
-              --jq '"\(.status) \(.conclusion // "")"' 2>/dev/null || true)"
-            if [ -z "$state" ]; then
-              sleep 15
-              continue
-            fi
-            if [ "${state%% *}" = "completed" ]; then
-              conclusion="${state#* }"
-              break
-            fi
-            sleep 15
-          done
-          if [ "$conclusion" != "success" ]; then
-            echo "::error::macOS app build $run_id did not succeed (conclusion: ${conclusion:-timed out})"
-            exit 1
-          fi
-          echo "macOS app build $run_id completed successfully"
-
-      # The DMG is attached now, so clear the pre-release flag and mark this the
-      # latest release — atomically, with the asset already present, closing the
-      # 404 window on latest/download/Stitch.dmg. Skipped for a genuine
-      # pre-release (dist flagged it one; those are never meant to be `latest`, so
-      # they just stay a pre-release with their DMG attached). `success()` keeps a
-      # release whose macOS build failed from being promoted, and editing via
-      # GITHUB_TOKEN doesn't fire `release: published`, so it won't re-trigger the
-      # macOS build.
-      - name: Promote the release to latest
-        if: ${{ success() && !fromJson(steps.host.outputs.manifest).announcement_is_prerelease }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.plan.outputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release edit "$TAG" --prerelease=false --latest=true
-          echo "Promoted $TAG to the latest release with Stitch.dmg attached."
+          gh workflow run macos-app.yml --ref "$TAG" -f tag="$TAG" -f promote="$PROMOTE"
+          echo "Dispatched the macOS app build for $TAG (promote=$PROMOTE); it attaches the DMG and promotes the release when done."
 
   announce:
     needs:
