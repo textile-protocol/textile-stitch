@@ -331,7 +331,6 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
@@ -341,18 +340,30 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
           TAG="${{ needs.plan.outputs.tag }}"
+          # Always create the release flagged as a pre-release, whatever its final
+          # state should be. GitHub excludes pre-releases (and drafts) from
+          # /releases/latest, so `latest/download/Stitch.dmg` keeps resolving to
+          # the PREVIOUS release until the macOS build attaches the DMG below.
+          # Without this hold, the release becomes `latest` the instant it's
+          # created — minutes before the DMG lands — so that link 404s for the
+          # whole build window. The "Promote the release to latest" step clears
+          # the flag once the DMG is in place. A draft would hide the release
+          # entirely, but draft releases don't create the git tag, and the macOS
+          # build is dispatched against it (`--ref "$TAG"`).
+          #
           # `gh release create` is not idempotent. If this job is retried after a
           # later step failed (e.g. a transient API error while waiting on the
           # macOS build), the release already exists and `create` fails with
           # "a release with the same tag name already exists", so the run can
           # never go green on a rerun. Detect an existing release and refresh it
-          # in place instead.
+          # in place instead — re-asserting --prerelease so a rerun never promotes
+          # it early (promotion happens only in the dedicated step, on success).
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists; updating it instead of recreating."
-            gh release edit "$TAG" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
+            gh release edit "$TAG" --prerelease --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
             gh release upload "$TAG" --clobber artifacts/*
           else
-            gh release create "$TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+            gh release create "$TAG" --target "$RELEASE_COMMIT" --prerelease --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
           fi
       # The release above is created with GITHUB_TOKEN, so it does NOT fire the
       # `release: published` event. Trigger the macOS app build explicitly
@@ -405,6 +416,24 @@ jobs:
             exit 1
           fi
           echo "macOS app build $run_id completed successfully"
+
+      # The DMG is attached now, so clear the pre-release flag and mark this the
+      # latest release — atomically, with the asset already present, closing the
+      # 404 window on latest/download/Stitch.dmg. Skipped for a genuine
+      # pre-release (dist flagged it one; those are never meant to be `latest`, so
+      # they just stay a pre-release with their DMG attached). `success()` keeps a
+      # release whose macOS build failed from being promoted, and editing via
+      # GITHUB_TOKEN doesn't fire `release: published`, so it won't re-trigger the
+      # macOS build.
+      - name: Promote the release to latest
+        if: ${{ success() && !fromJson(steps.host.outputs.manifest).announcement_is_prerelease }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --prerelease=false --latest=true
+          echo "Promoted $TAG to the latest release with Stitch.dmg attached."
 
   announce:
     needs:
