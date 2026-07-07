@@ -11,6 +11,12 @@
   <key>CFBundleExecutable</key>      <string>stitch-setup</string>
   <key>CFBundleIconFile</key>        <string>Stitch</string>
   <key>CFBundlePackageType</key>     <string>APPL</string>
+  <!-- Category shown in Finder's "Kind"/Get Info and Launchpad grouping; not
+       required for Spotlight to index the app, just metadata hygiene. Stitch is
+       a trading/market-making operator tool. -->
+  <key>LSApplicationCategoryType</key> <string>public.app-category.finance</string>
+  <!-- Shown in the About box and Finder Get Info; matches the source SPDX headers. -->
+  <key>NSHumanReadableCopyright</key> <string>Copyright © 2026 Textile, Inc.</string>
   <key>NSHighResolutionCapable</key> <true/>
 </dict>
 </plist>
