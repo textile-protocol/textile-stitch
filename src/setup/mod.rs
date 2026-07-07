@@ -4,6 +4,7 @@
 //! and child-process command builders shared by `stitch init` and the GUI.
 
 pub mod catalog;
+pub mod macos;
 pub mod paths;
 pub mod process;
 pub mod settings;

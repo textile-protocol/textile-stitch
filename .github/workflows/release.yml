@@ -356,9 +356,9 @@ jobs:
           fi
       # The release above is created with GITHUB_TOKEN, so it does NOT fire the
       # `release: published` event. Trigger the macOS app build explicitly
-      # (workflow_dispatch is exempt from that restriction) so Stitch.app.zip
+      # (workflow_dispatch is exempt from that restriction) so Stitch.dmg
       # gets attached to this release.
-      - name: Build and attach the macOS Stitch.app
+      - name: Build and attach the macOS Stitch.dmg
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.plan.outputs.tag }}
@@ -368,7 +368,7 @@ jobs:
           # `gh workflow run` is fire-and-forget. Locate the run we just dispatched
           # (it runs on the tag ref, so its head branch is the tag) and wait for it,
           # so a failed build / signing / notarization / upload turns this release
-          # red instead of leaving it green without Stitch.app.zip.
+          # red instead of leaving it green without Stitch.dmg.
           run_id=""
           for _ in $(seq 1 12); do
             run_id="$(gh run list --workflow=macos-app.yml --event=workflow_dispatch \

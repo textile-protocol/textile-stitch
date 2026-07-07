@@ -6,6 +6,7 @@
 
 mod app;
 mod icon;
+mod install;
 mod panel;
 mod settings;
 mod signerform;

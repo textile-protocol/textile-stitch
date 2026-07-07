@@ -96,6 +96,15 @@ pub struct StitchApp {
 
     /// Settings screen form state (loaded when the screen opens).
     pub settings: SettingsForm,
+
+    /// macOS install location, resolved once at startup. `None` off macOS or when
+    /// not running from a `.app` bundle. Drives the "move to Applications" nudge.
+    pub mac_install: Option<setup::macos::MacInstall>,
+    /// Set once the operator dismisses the move nudge, so it stays hidden for the
+    /// session.
+    pub install_nudge_dismissed: bool,
+    /// Inline error from a failed move attempt, shown in the nudge.
+    pub install_error: Option<String>,
 }
 
 /// The operator address to show for a config. The configured `[signer]` wins: an
@@ -161,6 +170,32 @@ impl StitchApp {
             update_check_started: false,
             child: None,
             settings: SettingsForm::default(),
+            mac_install: setup::macos::detect(),
+            install_nudge_dismissed: false,
+            install_error: None,
+        }
+    }
+
+    /// Copy the app into /Applications and relaunch from there, then close this
+    /// (translocated / out-of-place) instance. Stops the bot first so nothing is
+    /// left supervising from the old location. On failure the app stays put and
+    /// the reason shows inline in the nudge so the operator can drag it by hand.
+    pub fn install_to_applications(&mut self, ctx: &egui::Context) {
+        self.install_error = None;
+        let Some(install) = self.mac_install.clone() else {
+            return;
+        };
+        self.stop_bot();
+        match install.install() {
+            Ok(target) => {
+                setup::macos::open(&target);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                self.install_error = Some(format!(
+                    "{e:#} Drag Stitch into Applications from the download instead."
+                ));
+            }
         }
     }
 
@@ -614,6 +649,9 @@ impl eframe::App for StitchApp {
         crate::theme::apply(ui.ctx());
         self.poll_child();
         self.handle_shortcuts(ui.ctx());
+        // Sits above whichever view renders below, so a misplaced app is flagged
+        // on both the setup wizard and the control panel.
+        crate::install::show_nudge(self, ui);
         match self.view {
             View::Setup => crate::wizard::show(self, ui),
             View::Panel => crate::panel::show(self, ui),

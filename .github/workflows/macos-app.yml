@@ -1,15 +1,18 @@
 name: macOS app bundle
 
-# Build a prebuilt, double-clickable Stitch.app and attach it to the release.
+# Build a prebuilt Stitch.app, wrap it in a drag-to-Applications Stitch.dmg, and
+# attach the image to the release. Shipping a DMG (not a bare zip) gives the
+# native install experience and nudges operators to run Stitch from /Applications
+# — see packaging/macos/make-dmg.sh for why that matters (App Translocation).
 # Kept separate from the cargo-dist-generated release.yml so `dist generate`
 # never clobbers it.
 #
 # Signing is automatic based on which repo secrets are set:
 #   - No secrets        -> ad-hoc signed (make-app.sh). A downloaded copy still
 #                          needs right-click -> Open / "Open Anyway" the first time.
-#   - Developer ID set  -> signed with your Developer ID Application identity.
-#   - Notary creds set  -> additionally notarized + stapled, so it opens with no
-#                          Gatekeeper prompt at all (requires the Developer ID too).
+#   - Developer ID set  -> app and .dmg signed with your Developer ID identity.
+#   - Notary creds set  -> the .dmg is additionally notarized + stapled, so it
+#                          opens with no Gatekeeper prompt (requires Developer ID).
 # Secrets (all optional): MACOS_CERT_P12 (base64 .p12), MACOS_CERT_PASSWORD,
 # MACOS_NOTARY_API_KEY (base64 App Store Connect .p8), MACOS_NOTARY_API_KEY_ID,
 # MACOS_NOTARY_API_ISSUER.
@@ -22,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to attach Stitch.app.zip to (blank = upload a workflow artifact only)"
+        description: "Release tag to attach Stitch.dmg to (blank = upload a workflow artifact only)"
         required: false
         default: ""
 
@@ -38,7 +41,7 @@ jobs:
           # When attaching to a release tag, build from that tag's source. A
           # manual dispatch with `tag` set but the ref left on the default
           # branch would otherwise build from current main and clobber the
-          # release's Stitch.app.zip. Empty tag (or `release:`) falls back to
+          # release's Stitch.dmg. Empty tag (or `release:`) falls back to
           # the dispatch/release ref.
           ref: ${{ inputs.tag || github.ref }}
 
@@ -104,6 +107,11 @@ jobs:
         # otherwise ad-hoc ("-").
         run: packaging/macos/make-app.sh target/universal/stitch-setup dist target/universal/stitch
 
+      - name: Build Stitch.dmg
+        # Wrap the (signed) app in a drag-to-Applications image. make-dmg.sh signs
+        # the .dmg with $STITCH_CODESIGN_ID when it's a real Developer ID.
+        run: packaging/macos/make-dmg.sh dist/Stitch.app dist
+
       - name: Notarize and staple
         if: ${{ steps.signing.outputs.have_notary == 'true' }}
         env:
@@ -114,41 +122,40 @@ jobs:
           set -euo pipefail
           # Apple only notarizes Developer ID-signed software. If notary creds are
           # set but signing fell back to ad-hoc, fail loudly instead of submitting
-          # an ad-hoc app that Apple will reject.
+          # an ad-hoc image that Apple will reject.
           if [ -z "${STITCH_CODESIGN_ID:-}" ] || [ "${STITCH_CODESIGN_ID}" = "-" ]; then
             echo "::error::MACOS_NOTARY_* is set but no Developer ID Application identity is available. Set MACOS_CERT_P12/MACOS_CERT_PASSWORD; Apple only notarizes Developer ID-signed apps."
             exit 1
           fi
           echo "$MACOS_NOTARY_API_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
-          ditto -c -k --keepParent dist/Stitch.app "$RUNNER_TEMP/notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+          # Notarizing the .dmg also notarizes the app inside it (Apple records the
+          # app's cdhash), so one submission covers both. Staple the ticket to the
+          # image so it verifies offline on first open.
+          xcrun notarytool submit dist/Stitch.dmg \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$MACOS_NOTARY_API_KEY_ID" \
             --issuer "$MACOS_NOTARY_API_ISSUER" \
             --wait
-          xcrun stapler staple dist/Stitch.app
+          xcrun stapler staple dist/Stitch.dmg
           rm -f "$RUNNER_TEMP/notary.p8"
-
-      - name: Zip Stitch.app
-        run: (cd dist && ditto -c -k --keepParent Stitch.app Stitch.app.zip)
 
       # The release workflow creates the GitHub Release with GITHUB_TOKEN, which
       # does NOT fire `release: published`, so release.yml dispatches this
       # workflow with the tag instead. Attach to that tag when we have one;
       # otherwise (a bare manual run) just publish a workflow artifact.
-      - name: Upload Stitch.app.zip to the release
+      - name: Upload Stitch.dmg to the release
         if: ${{ github.event_name == 'release' || inputs.tag != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
-          (cd dist && shasum -a 256 Stitch.app.zip > Stitch.app.zip.sha256)
-          gh release upload "$TAG" dist/Stitch.app.zip dist/Stitch.app.zip.sha256 --clobber
+          (cd dist && shasum -a 256 Stitch.dmg > Stitch.dmg.sha256)
+          gh release upload "$TAG" dist/Stitch.dmg dist/Stitch.dmg.sha256 --clobber
 
       # cargo-dist builds the release body's download table before this workflow
-      # uploads Stitch.app.zip, so add a row for it. Idempotent (skips if present).
-      - name: Add Stitch.app.zip to the release download table
+      # uploads Stitch.dmg, so add a row for it. Idempotent (skips if present).
+      - name: Add Stitch.dmg to the release download table
         if: ${{ github.event_name == 'release' || inputs.tag != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -156,10 +163,10 @@ jobs:
         run: |
           set -euo pipefail
           base="https://github.com/${{ github.repository }}/releases/download/$TAG"
-          row="| [Stitch.app.zip]($base/Stitch.app.zip) | Universal macOS app | [checksum]($base/Stitch.app.zip.sha256) |"
+          row="| [Stitch.dmg]($base/Stitch.dmg) | Universal macOS app | [checksum]($base/Stitch.dmg.sha256) |"
           body="$(gh release view "$TAG" --json body --jq .body)"
-          if printf '%s' "$body" | grep -qF "Stitch.app.zip"; then
-            echo "Release notes already list Stitch.app.zip; nothing to do."
+          if printf '%s' "$body" | grep -qF "Stitch.dmg"; then
+            echo "Release notes already list Stitch.dmg; nothing to do."
             exit 0
           fi
           # Insert the row right after the download table header separator
@@ -173,9 +180,9 @@ jobs:
           printf '%s' "$updated" > "$RUNNER_TEMP/notes.md"
           gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
 
-      - name: Upload Stitch.app.zip as a workflow artifact
+      - name: Upload Stitch.dmg as a workflow artifact
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag == '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: Stitch.app
-          path: dist/Stitch.app.zip
+          name: Stitch-dmg
+          path: dist/Stitch.dmg
