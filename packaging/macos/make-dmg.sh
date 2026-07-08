@@ -22,9 +22,9 @@ OUT="$2"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VOL="Stitch"
 DMG="$OUT/Stitch.dmg"
-# Optional custom window background (with the usual "drag here" arrow). Drop a
-# PNG here to brand the install window; without it the image still ships a plain
-# two-icon drag-to-Applications layout.
+# Optional custom window background (with the usual "drag here" arrow). Finder
+# uses this image at native pixel size rather than scaling it, so it must match
+# the 600x400 window below exactly.
 BG="$HERE/dmg-background.png"
 
 [ -d "$APP" ] || { echo "error: app bundle not found at $APP" >&2; exit 1; }
