@@ -35,9 +35,11 @@ impl SignerKind {
         }
     }
 
-    /// The MPC backends are new; flag them as experimental so the UI can warn.
+    /// MPCVault is still experimental (its live client-signer callback flow has
+    /// not been validated against a paid vault), so the UI keeps warning on it.
+    /// Turnkey is production-ready. The local hotwallet was never experimental.
     pub fn experimental(self) -> bool {
-        matches!(self, SignerKind::Turnkey | SignerKind::Mpcvault)
+        matches!(self, SignerKind::Mpcvault)
     }
 
     /// Label with an `· Experimental` marker appended for experimental backends,

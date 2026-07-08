@@ -144,7 +144,7 @@ pub fn signer_fields(ui: &mut egui::Ui, p: &Palette, form: &mut SignerForm) {
         });
     ui.add_space(10.0);
 
-    // MPC backends are new; make the experimental status unmistakable once picked.
+    // An experimental backend (MPCVault) makes its status unmistakable once picked.
     if form.kind.experimental() {
         experimental_notice(ui, p);
     }
@@ -276,8 +276,8 @@ fn derived_wallet_note(ui: &mut egui::Ui, p: &Palette, phrase: &str) {
     ui.add_space(8.0);
 }
 
-/// An "EXPERIMENTAL" pill plus a one-line caution for the new MPC backends, so the
-/// operator knows they may be rough before committing funds to them.
+/// An "EXPERIMENTAL" pill plus a one-line caution for an experimental backend
+/// (MPCVault), so the operator knows it may be rough before committing funds to it.
 fn experimental_notice(ui: &mut egui::Ui, p: &Palette) {
     ui.horizontal(|ui| {
         egui::Frame::new()

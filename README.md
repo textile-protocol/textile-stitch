@@ -137,7 +137,8 @@ server operators editing `stitch.toml` by hand.
   operator uses their own Turnkey org and API key. Config fields:
   `organization_id`, `sign_with`, `operator_address`, optional `api_base_url` and
   `max_concurrent_signs`. Env vars: `TURNKEY_API_PUBLIC_KEY` (plain), and
-  `TURNKEY_API_PRIVATE_KEY` / `TURNKEY_API_PRIVATE_KEY_FILE` (secret).
+  `TURNKEY_API_PRIVATE_KEY` / `TURNKEY_API_PRIVATE_KEY_FILE` (secret). Full setup
+  walkthrough: [TURNKEY.md](TURNKEY.md).
 - **MPCVault** (`provider = "mpcvault"`): an MPC wallet that needs the MPCVault
   `client-signer` sidecar running next to the bot, one sidecar per operator.
   Config fields: `vault_uuid`, `client_signer_pubkey`, `operator_address`,

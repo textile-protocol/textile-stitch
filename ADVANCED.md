@@ -226,6 +226,9 @@ max_concurrent_signs = 8                        # optional
 Env vars: `TURNKEY_API_PUBLIC_KEY` (not secret, plain env), and
 `TURNKEY_API_PRIVATE_KEY` / `TURNKEY_API_PRIVATE_KEY_FILE` (secret).
 
+For the full walkthrough (org, wallet account, API key, and the signing policy),
+see [TURNKEY.md](TURNKEY.md).
+
 MPCVault:
 
 ```toml
