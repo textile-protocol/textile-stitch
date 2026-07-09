@@ -11,8 +11,8 @@ callback HTTP server the bot runs for the sidecar to approve each request. So on
 one host you run the bot **and** the sidecar next to it.
 
 MPCVault signs the raw 32-byte digest the bot computes, the same as Turnkey, so
-signing is chain-agnostic and one vault wallet covers every EVM corridor (Celo,
-Base, Arbitrum, Ethereum). The bot builds the per-chain digest and broadcasts the
+signing is chain-agnostic and one vault wallet covers every EVM corridor (BSC,
+Celo, Ethereum). The bot builds the per-chain digest and broadcasts the
 transaction itself.
 
 > **Paid plan required.** MPCVault gates all API access behind a paid plan. The
