@@ -245,6 +245,9 @@ max_concurrent_signs = 4                 # optional
 
 Env var: `MPCVAULT_API_TOKEN` / `MPCVAULT_API_TOKEN_FILE` (secret).
 
+For the full walkthrough (MPCVault vault, API token, Client Signer, the sidecar,
+and validation), see [MPCVAULT.md](MPCVAULT.md).
+
 MPCVault is a two-process setup: the bot plus the sidecar on the same host. The
 bot runs an HTTP "callback approval" server at `callback_listen_addr`; the
 MPCVault `client-signer` Docker container calls that callback to approve each
@@ -290,10 +293,14 @@ signing request.
    container. If both are containers, share a network or use host networking; the
    `callback-url` must resolve to the bot.
 
-The exact callback request body schema isn't fully documented by MPCVault. The
-bot approves on receipt and logs whether it can correlate the request to an
-in-flight signature. Tighten this later once confirmed against the running
-sidecar.
+The bot's callback fails closed: it approves (HTTP 200) only when the request's
+signed raw-message `content` is a digest the bot currently has in flight, and
+rejects (403) otherwise. It correlates on that signed field specifically, not a
+substring of the body, so a request the bot didn't create can't be signed. The
+callback accepts both the protobuf `SigningRequest` (`application/octet-stream`)
+the client-signer POSTs and JSON. The exact protobuf field numbers should still
+be confirmed against a running sidecar; see [MPCVAULT.md](MPCVAULT.md) for the
+security model and known limitations.
 
 #### Deployment notes
 

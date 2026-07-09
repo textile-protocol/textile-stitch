@@ -144,8 +144,8 @@ server operators editing `stitch.toml` by hand.
   Config fields: `vault_uuid`, `client_signer_pubkey`, `operator_address`,
   optional `api_base_url`, `callback_listen_addr`, `poll_timeout_secs`, and
   `max_concurrent_signs`. Env var: `MPCVAULT_API_TOKEN` /
-  `MPCVAULT_API_TOKEN_FILE` (secret). See the MPCVault sidecar setup in
-  [ADVANCED.md](ADVANCED.md#mpc-wallet-signers).
+  `MPCVAULT_API_TOKEN_FILE` (secret). Full setup walkthrough (vault, API token,
+  Client Signer, sidecar): [MPCVAULT.md](MPCVAULT.md).
 
 The operator wallet still needs a little native gas for Permit2 approvals
 (`stitch approve`) no matter which signer you use.
