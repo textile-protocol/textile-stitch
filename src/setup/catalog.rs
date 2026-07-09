@@ -19,34 +19,37 @@ pub struct Corridor {
     pub toml_template: &'static str,
 }
 
+// Templates live at the crate root (`packages/stitch-bot/templates/`) so GitHub
+// renders them as a browsable folder; `../../` climbs out of `src/setup/` to reach
+// it. They're embedded at compile time, so the built binary needs no files at run.
 const CORRIDORS: &[Corridor] = &[
     Corridor {
         id: "cngn-usdt-bsc",
         display_name: "cNGN / USDT",
         network_label: "BNB Smart Chain",
         chain_id: 56,
-        toml_template: include_str!("templates/cngn-usdt-bsc.toml"),
+        toml_template: include_str!("../../templates/cngn-usdt-bsc.toml"),
     },
     Corridor {
         id: "xaut-usdt-ethereum",
         display_name: "XAUt / USDT",
         network_label: "Ethereum",
         chain_id: 1,
-        toml_template: include_str!("templates/xaut-usdt-ethereum.toml"),
+        toml_template: include_str!("../../templates/xaut-usdt-ethereum.toml"),
     },
     Corridor {
         id: "wars-usdt-celo",
         display_name: "wARS / USDT",
         network_label: "Celo",
         chain_id: 42220,
-        toml_template: include_str!("templates/wars-usdt-celo.toml"),
+        toml_template: include_str!("../../templates/wars-usdt-celo.toml"),
     },
     Corridor {
         id: "wbrl-usdt-celo",
         display_name: "wBRL / USDT",
         network_label: "Celo",
         chain_id: 42220,
-        toml_template: include_str!("templates/wbrl-usdt-celo.toml"),
+        toml_template: include_str!("../../templates/wbrl-usdt-celo.toml"),
     },
 ];
 

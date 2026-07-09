@@ -104,4 +104,4 @@ Removing the binary does **not** revoke on-chain Permit2 approvals. To fully win
 down, revoke each token's Permit2 approval (set its allowance to 0) or retire the
 dedicated operator wallet.
 
-For configuration reference and tuning, see [ADVANCED.md](../ADVANCED.md).
+For configuration reference and tuning, see [ADVANCED.md](ADVANCED.md).

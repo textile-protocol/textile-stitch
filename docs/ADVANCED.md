@@ -1,13 +1,13 @@
 # Stitch Advanced Guide
 
 Configuration reference, tuning, and troubleshooting for operators who need more
-than the [README](README.md) quick start. If you installed with the AI prompt,
+than the [README](../README.md) quick start. If you installed with the AI prompt,
 the primary settings are already filled in — this guide is for understanding and
 changing them.
 
 ## Configuration Reference
 
-Start from [stitch.example.toml](stitch.example.toml). Stitch reads the config at
+Start from [stitch.example.toml](../stitch.example.toml). Stitch reads the config at
 startup, so restart the process after any change.
 
 ### Price Feed
@@ -227,7 +227,7 @@ Env vars: `TURNKEY_API_PUBLIC_KEY` (not secret, plain env), and
 `TURNKEY_API_PRIVATE_KEY` / `TURNKEY_API_PRIVATE_KEY_FILE` (secret).
 
 For the full walkthrough (org, wallet account, API key, and the signing policy),
-see [TURNKEY.md](TURNKEY.md).
+see [Turnkey signer setup](signer-turnkey.md).
 
 MPCVault:
 
@@ -246,7 +246,7 @@ max_concurrent_signs = 4                 # optional
 Env var: `MPCVAULT_API_TOKEN` / `MPCVAULT_API_TOKEN_FILE` (secret).
 
 For the full walkthrough (MPCVault vault, API token, Client Signer, the sidecar,
-and validation), see [MPCVAULT.md](MPCVAULT.md).
+and validation), see [MPCVault signer setup](signer-mpcvault.md).
 
 MPCVault is a two-process setup: the bot plus the sidecar on the same host. The
 bot runs an HTTP "callback approval" server at `callback_listen_addr`; the
@@ -299,7 +299,7 @@ rejects (403) otherwise. It correlates on that signed field specifically, not a
 substring of the body, so a request the bot didn't create can't be signed. The
 callback accepts both the protobuf `SigningRequest` (`application/octet-stream`)
 the client-signer POSTs and JSON. The exact protobuf field numbers should still
-be confirmed against a running sidecar; see [MPCVAULT.md](MPCVAULT.md) for the
+be confirmed against a running sidecar; see [MPCVault signer setup](signer-mpcvault.md) for the
 security model and known limitations.
 
 #### Deployment notes

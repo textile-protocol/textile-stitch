@@ -12,8 +12,7 @@ reactor         = "0x26a1aedaa26affc4fd9f910acfca754a31bc43c6"  # SETTLEMENT_V3_
 tick_interval_secs = 5
 
 # Textile's own price endpoint. Returns { price, timestamp } where price is
-# debt-per-collateral (USDT per XAUt, ~3300). The XAUt market rate behind it
-# refreshes on a ~1-minute Pyth cron, so staleness must clear one missed cycle.
+# debt-per-collateral (USDT per XAUt, ~3300).
 [feed]
 url            = "https://api.textilecredit.com/price?chainId=1&pair=xaut-usdt"
 staleness_secs = 900

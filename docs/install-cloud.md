@@ -21,4 +21,4 @@ Then follow [deploy/aws](../deploy/aws/README.md) to:
 
 For a plain container instead of the managed stack, see
 [install-docker.md](install-docker.md). For configuration reference and tuning,
-see [ADVANCED.md](../ADVANCED.md).
+see [ADVANCED.md](ADVANCED.md).

@@ -15,7 +15,7 @@ This skill both runs an existing Stitch and installs one that isn't set up yet.
 1. **Find the run layout and whether it's installed** — the next section.
 2. **If it's not installed**, don't show the menu. Tell the operator, then with a
    single question confirm they want to install now. On yes, install by reading
-   `AI_INSTALL_PROMPT.md` and following it in full — see
+   `docs/AI_INSTALL_PROMPT.md` and following it in full — see
    [Not installed yet](#not-installed-yet).
 3. **If it's installed**, ask the operator what they want to do, **one question at
    a time**. Never guess the action from a vague request — ask. Wait for each
@@ -58,11 +58,19 @@ binary only means "not installed" for the local layouts — the cloud layout has
 local binary by design, so don't treat a missing `stitch` as not-installed until
 you've ruled out cloud.
 
-Three standard layouts:
+Four standard layouts:
 
 - **Foreground / manual** (macOS, foreground Linux, Windows): config lives in
   `~/Stitch/` (`%USERPROFILE%\Stitch\` on Windows) — `stitch.toml`, `stitch.key`,
   `stitch.env`. Started by hand, logs to its terminal.
+- **Desktop app** (`stitch-setup` — macOS `Stitch.app`, Windows
+  `stitch-setup.exe`, Linux `stitch-setup`): a GUI that writes the config and then
+  supervises the bot in-window — Start/Stop, a dry-run toggle, an "Approve tokens"
+  button, live logs, and Update. It runs `stitch` as a child process, so there's
+  no service and closing the window stops the bot; config lives in the standard
+  `~/Stitch/` dir. If the operator is driving the app, point them at its buttons
+  instead of racing it from the CLI; for unattended 24/7 running they should
+  install one of the service layouts.
 - **Local service**: Linux systemd uses `/etc/stitch-bot/` with the same
   filenames and service name `stitch`. macOS launchd / Windows Task Scheduler run
   the agent or task you installed.
@@ -72,10 +80,12 @@ Three standard layouts:
 
 Detect it: for the local layouts, `stitch --version` plus `systemctl status
 stitch` (Linux), `launchctl list | grep -i stitch` (macOS), or Task Scheduler
-(Windows); for cloud, an ECS service named `<bot>-stitch` in the operator's AWS
-account (the request itself usually tells you — `aws`/ECS talk means cloud).
-Operate against whichever is real. Only if it's a local layout and `stitch` isn't
-on PATH is it genuinely not installed — then see [Not installed yet](#not-installed-yet).
+(Windows); a running desktop app shows up as a `stitch-setup` (or `Stitch`)
+process supervising a `stitch` child. For cloud, an ECS service named
+`<bot>-stitch` in the operator's AWS account (the request itself usually tells you
+— `aws`/ECS talk means cloud). Operate against whichever is real. Only if it's a
+local layout and `stitch` isn't on PATH is it genuinely not installed — then see
+[Not installed yet](#not-installed-yet).
 
 ## Golden rules — every operation
 
@@ -124,7 +134,7 @@ Service:
 1. Edit the active `stitch.toml`: spreads (`buy_offset_bps` / `sell_offset_bps`),
    liquidity (`buy_total_liquidity_debt` / `sell_total_liquidity_collateral`),
    ladder, or TTL. Amounts are atomic token units. Full field reference is in
-   `ADVANCED.md`.
+   `docs/ADVANCED.md`.
 2. If you *raised* liquidity and approved an **exact** Permit2 allowance, re-run
    `stitch approve` (below) — otherwise the added depth posts but silently fails
    to fill.
@@ -214,15 +224,26 @@ Secrets Manager value), and dry-run/pause around any pricing or sizing change.
 ## Not installed yet
 
 If `stitch` isn't on PATH, install it first. Don't reconstruct the steps from
-memory — read `AI_INSTALL_PROMPT.md` and follow it in full (OS/arch detection,
+memory — read `docs/AI_INSTALL_PROMPT.md` and follow it in full (OS/arch detection,
 the operator interview, release install, safe key handling, dry run, and the
-confirmation gate). Prefer a local copy — `AI_INSTALL_PROMPT.md` at the repo root,
-or `packages/stitch-bot/AI_INSTALL_PROMPT.md` in the Textile monorepo — otherwise
+confirmation gate). Prefer a local copy — `docs/AI_INSTALL_PROMPT.md` in the repo,
+or `packages/stitch-bot/docs/AI_INSTALL_PROMPT.md` in the Textile monorepo — otherwise
 fetch the canonical one:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/AI_INSTALL_PROMPT.md
+curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/docs/AI_INSTALL_PROMPT.md
 ```
+
+Two setup paths that don't need you to drive it, if the operator prefers:
+
+- **Desktop app** (no terminal): download the release for their OS and open Stitch
+  — macOS `Stitch.dmg`, Windows `stitch-setup.exe`, Linux `stitch-setup`. Pick a
+  corridor, paste the operator key, click Create; the same window then runs the bot.
+- **`stitch init`** (built-in wizard): `cd ~/Stitch && stitch init` picks a
+  corridor from the catalog (cNGN/USDT on BSC, XAUt/USDT on Ethereum, wARS/USDT and
+  wBRL/USDT on Celo), prompts for the key (hidden), and writes `stitch.toml`,
+  `stitch.env`, and `stitch.key`. It sets up the local-key signer; for Turnkey or
+  MPCVault, edit the toml afterward (see the signer setup guides).
 
 Once it's installed and dry-run-clean, tell the operator to ask
 `Use the stitch skill to run Stitch` to operate it later.

@@ -195,11 +195,17 @@ poll_timeout_secs    = 30                            # optional; per-request HTT
 max_concurrent_signs = 4                             # optional
 ```
 
-Then set the secret in the environment (never in the config file):
+Then set the secret in the environment (never in the config file). Export it so
+`stitch` inherits it, a bare `NAME=value` only sets a variable in your current
+shell and the bot won't see it:
 
+```bash
+export MPCVAULT_API_TOKEN_FILE=/path/to/mpcvault-api.token   # or: export MPCVAULT_API_TOKEN=<token>
 ```
-MPCVAULT_API_TOKEN_FILE=/path/to/mpcvault-api.token   # or MPCVAULT_API_TOKEN=<token>
-```
+
+Equivalently, keep it in a `stitch.env` file and `set -a; source stitch.env; set +a`
+before running, or prefix it onto the command itself
+(`MPCVAULT_API_TOKEN_FILE=... stitch --config ... --dry-run`).
 
 ## Validate with a dry run
 

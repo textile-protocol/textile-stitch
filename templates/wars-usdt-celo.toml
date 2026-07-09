@@ -12,8 +12,7 @@ reactor         = "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"  # SETTLEMENT_V3_
 tick_interval_secs = 5
 
 # Textile's own price endpoint. Returns { price, timestamp } where price is
-# debt-per-collateral (USDT per wARS, ~0.00064). The wARS market rate behind it
-# refreshes on a ~1-minute Bitso cron, so staleness must clear one missed cycle.
+# debt-per-collateral (USDT per wARS, ~0.00064).
 [feed]
 url            = "https://api.textilecredit.com/price?chainId=42220&pair=wars-usdt"
 staleness_secs = 900

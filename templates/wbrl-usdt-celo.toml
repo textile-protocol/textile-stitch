@@ -12,8 +12,7 @@ reactor         = "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"  # SETTLEMENT_V3_
 tick_interval_secs = 5
 
 # Textile's own price endpoint. Returns { price, timestamp } where price is
-# debt-per-collateral (USDT per wBRL, ~0.18). The wBRL market rate behind it
-# refreshes on a ~1-minute cron, so staleness must clear one missed cycle.
+# debt-per-collateral (USDT per wBRL, ~0.18).
 [feed]
 url            = "https://api.textilecredit.com/price?chainId=42220&pair=wbrl-usdt"
 staleness_secs = 900

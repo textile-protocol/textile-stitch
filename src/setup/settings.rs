@@ -268,7 +268,7 @@ fn set_value(table: &mut Table, key: &str, new: Value) {
 mod tests {
     use super::*;
 
-    const TEMPLATE: &str = include_str!("templates/cngn-usdt-bsc.toml");
+    const TEMPLATE: &str = include_str!("../../templates/cngn-usdt-bsc.toml");
 
     fn patch_from(view: &SettingsView) -> SettingsPatch {
         SettingsPatch {

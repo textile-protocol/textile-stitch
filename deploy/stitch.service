@@ -34,7 +34,7 @@
 #     The source files under /etc stay root-owned 0600; systemd copies them into %d.
 #   - MPCVault also needs the client-signer sidecar container running on the same
 #     host with its callback-url pointed at the bot's callback_listen_addr. See
-#     ADVANCED.md ("MPCVault sidecar").
+#     docs/ADVANCED.md ("MPCVault sidecar").
 
 [Unit]
 Description=Textile filler network operator bot

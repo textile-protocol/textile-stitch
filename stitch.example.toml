@@ -72,7 +72,7 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
 # instead. All secrets stay in the environment, never in this file. Each side of
 # every signature (the EIP-712 limit orders and the on-chain fill/approve txs)
 # goes through whichever signer you pick here; you pick one backend for the whole
-# bot. See ADVANCED.md for the MPC wallet details and the MPCVault sidecar setup.
+# bot. See docs/ADVANCED.md for the MPC wallet details and the MPCVault sidecar setup.
 #
 # Local hotwallet (same as omitting [signer]):
 # [signer]
@@ -90,7 +90,7 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
 # api_base_url     = "https://api.turnkey.com"   # optional, this is the default
 # max_concurrent_signs = 8                        # optional
 #
-# MPCVault (needs the client-signer sidecar, one per operator; see ADVANCED.md).
+# MPCVault (needs the client-signer sidecar, one per operator; see docs/ADVANCED.md).
 # Secret in the env: MPCVAULT_API_TOKEN / MPCVAULT_API_TOKEN_FILE.
 # [signer]
 # provider = "mpcvault"

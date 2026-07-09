@@ -1,0 +1,48 @@
+# Run two Stitch bots side by side, each with its own config and wallet key.
+#
+# One container = one bot = one signer = one corridor. To add more, copy a
+# service block, point it at another stitch.<name>.toml + key, and give it a
+# unique container_name.
+#
+# Copy this file to docker-compose.yml (or run it directly with
+# `docker compose -f docker-compose.example.yml ...`) and adjust the paths.
+#
+# Prereqs in this directory (see docs/install-docker.md):
+#   - stitch.bot1.toml, stitch.bot2.toml   copy from stitch.example.toml
+#   - stitch.bot1.key,  stitch.bot2.key    one wallet per bot, chmod 600
+#
+# Approve Permit2 once per bot before the first live start:
+#   docker compose -f docker-compose.example.yml run --rm bot1 \
+#     stitch approve --config /home/stitch/run/stitch.toml
+#
+# Dry run to validate, then go live:
+#   docker compose -f docker-compose.example.yml run --rm bot1 \
+#     stitch --config /home/stitch/run/stitch.toml --dry-run
+#   docker compose -f docker-compose.example.yml up -d
+
+x-stitch: &stitch
+  image: ghcr.io/textile-protocol/textile-stitch:latest
+  # Or build from source in this directory instead of pulling the image:
+  # build: .
+  restart: unless-stopped
+  # SIGTERM (docker stop / compose down) shuts down cleanly after the current
+  # tick. Give it room to finish before the kill.
+  stop_grace_period: 30s
+  environment:
+    RUST_LOG: info
+    STITCH_PRIVATE_KEY_FILE: /home/stitch/run/stitch.key
+
+services:
+  bot1:
+    <<: *stitch
+    container_name: stitch-bot1
+    volumes:
+      - ./stitch.bot1.toml:/home/stitch/run/stitch.toml:ro
+      - ./stitch.bot1.key:/home/stitch/run/stitch.key:ro
+
+  bot2:
+    <<: *stitch
+    container_name: stitch-bot2
+    volumes:
+      - ./stitch.bot2.toml:/home/stitch/run/stitch.toml:ro
+      - ./stitch.bot2.key:/home/stitch/run/stitch.key:ro

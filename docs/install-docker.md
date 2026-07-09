@@ -82,6 +82,25 @@ The default command runs live against `/home/stitch/run/stitch.toml`. Stitch
 shuts down cleanly on `SIGTERM` (what `docker stop` sends), finishing the current
 tick first.
 
+## Run several bots with Docker Compose
+
+Each bot is one container with its own config and wallet key. To run more than
+one, give each its own `stitch.<name>.toml` and key and list them as separate
+services. `docker-compose.example.yml` in the repo root does this for two bots:
+
+```bash
+# From the repo root. Copy the example, or use it directly with -f.
+docker compose -f docker-compose.example.yml run --rm bot1 \
+  stitch approve --config /home/stitch/run/stitch.toml   # once per bot
+docker compose -f docker-compose.example.yml run --rm bot1 \
+  stitch --config /home/stitch/run/stitch.toml --dry-run  # validate
+docker compose -f docker-compose.example.yml up -d         # go live
+```
+
+It expects `stitch.bot1.toml` / `stitch.bot2.toml` (copied from
+`stitch.example.toml`) and `stitch.bot1.key` / `stitch.bot2.key` next to the
+compose file. Copy a service block to add a third bot.
+
 For a managed cloud deployment on AWS ECS Fargate, see
 [install-cloud.md](install-cloud.md). For configuration reference and tuning, see
-[ADVANCED.md](../ADVANCED.md).
+[ADVANCED.md](ADVANCED.md).

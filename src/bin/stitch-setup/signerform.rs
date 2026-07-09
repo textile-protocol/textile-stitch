@@ -330,7 +330,7 @@ fn sidecar_warning(ui: &mut egui::Ui, p: &Palette) {
             ui.add_space(5.0);
             ui.hyperlink_to(
                 "MPCVault sidecar setup guide →",
-                "https://github.com/textile-protocol/textile-stitch/blob/main/ADVANCED.md#mpcvault-sidecar",
+                "https://github.com/textile-protocol/textile-stitch/blob/main/docs/ADVANCED.md#mpcvault-sidecar",
             );
         });
     ui.add_space(10.0);

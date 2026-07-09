@@ -80,8 +80,8 @@ machine where Stitch should run:
 Help me install and configure Textile Stitch.
 
 Read the full install prompt and follow it in full:
-https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/AI_INSTALL_PROMPT.md
-If you can't fetch that URL, read AI_INSTALL_PROMPT.md directly from the
+https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/docs/AI_INSTALL_PROMPT.md
+If you can't fetch that URL, read docs/AI_INSTALL_PROMPT.md directly from the
 textile-protocol/textile-stitch repo (main branch) instead. Don't guess from
 other sources.
 Use recommended defaults where safe, ask for values with no safe default, protect
@@ -89,7 +89,7 @@ STITCH_PRIVATE_KEY, run a dry run first, and do not start live operation until I
 confirm.
 ```
 
-The full copyable prompt is in [AI_INSTALL_PROMPT.md](AI_INSTALL_PROMPT.md).
+The full copyable prompt is in [AI_INSTALL_PROMPT.md](docs/AI_INSTALL_PROMPT.md).
 
 </details>
 
@@ -138,14 +138,14 @@ server operators editing `stitch.toml` by hand.
   `organization_id`, `sign_with`, `operator_address`, optional `api_base_url` and
   `max_concurrent_signs`. Env vars: `TURNKEY_API_PUBLIC_KEY` (plain), and
   `TURNKEY_API_PRIVATE_KEY` / `TURNKEY_API_PRIVATE_KEY_FILE` (secret). Full setup
-  walkthrough: [TURNKEY.md](TURNKEY.md).
+  walkthrough: [Turnkey signer setup](docs/signer-turnkey.md).
 - **MPCVault** (`provider = "mpcvault"`): an MPC wallet that needs the MPCVault
   `client-signer` sidecar running next to the bot, one sidecar per operator.
   Config fields: `vault_uuid`, `client_signer_pubkey`, `operator_address`,
   optional `api_base_url`, `callback_listen_addr`, `poll_timeout_secs`, and
   `max_concurrent_signs`. Env var: `MPCVAULT_API_TOKEN` /
   `MPCVAULT_API_TOKEN_FILE` (secret). Full setup walkthrough (vault, API token,
-  Client Signer, sidecar): [MPCVAULT.md](MPCVAULT.md).
+  Client Signer, sidecar): [MPCVault signer setup](docs/signer-mpcvault.md).
 
 The operator wallet still needs a little native gas for Permit2 approvals
 (`stitch approve`) no matter which signer you use.
@@ -164,7 +164,7 @@ at or above your ask, so your side spreads carry the margin. Each candidate's
 signature is re-verified locally before anything executes, the protocol's
 taker fee is read from the chain and priced into the decision, and fills cost
 gas. See the
-[limit-order taker reference in ADVANCED.md](ADVANCED.md#limit-order-taker).
+[limit-order taker reference in ADVANCED.md](docs/ADVANCED.md#limit-order-taker).
 
 Stitch reads the config at startup. After changing `stitch.toml`, restart the
 process.
@@ -240,7 +240,7 @@ token's funded balance into even target shares on every tick, so an existing
 corridor can't keep the whole wallet after another max side is added. For
 the price-feed orientation, spread options, ladder sizing, and the
 limit-order taker, see the
-[configuration reference in ADVANCED.md](ADVANCED.md#configuration-reference).
+[configuration reference in ADVANCED.md](docs/ADVANCED.md#configuration-reference).
 
 ## Security Notes
 
