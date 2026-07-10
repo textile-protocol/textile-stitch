@@ -37,3 +37,16 @@ sell_max_orders = 40
 
 ttl_secs = 120
 refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
+
+# Inventory-lean quoting (pilot). Shadow computes and logs the lean quotes next
+# to the live ones every tick — no behavior change. Flip lean_enabled = true to
+# quote the live book off the lean prices (and back to false to revert; restart
+# after either change).
+lean_shadow = true
+lean_enabled = false
+# The tightest honest spread in bps: the measured p95 of this feed's error vs
+# live Pyth (XAUt/USD ÷ USDT/USD). 3.0 is the provisional measurement for the
+# 60s /price endpoint above — re-measure before flipping lean_enabled on.
+lean_floor_bps = 3.0
+# lean_base_bps = 1.0   # balanced-zone half-spread (default 1.0)
+# lean_wide_bps = 3.0   # extra widening at the heavy inventory edge (default 3.0)

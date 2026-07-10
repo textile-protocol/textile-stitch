@@ -56,6 +56,22 @@ ttl_secs = 120
                           # ttl/2, so keep ttl_secs >= 2 x this. Defaults to 60.
 refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
 
+# Inventory-lean quoting (off by default): lean both spreads against the
+# wallet's own inventory so the book self-rebalances and never freezes
+# one-sided, while no quote ever crosses fair — every offset is clamped to
+# lean_floor_bps, the measured accuracy of your feed vs live Pyth. Balanced
+# inventory quotes ±lean_base_bps; a heavy book tightens its unloading side
+# toward the floor and widens the other side by up to lean_wide_bps; past 85%
+# in one asset the accumulating side stops quoting. Roll out with
+# lean_shadow = true first (logs the lean quotes next to the live ones, no
+# behavior change), then flip lean_enabled = true. Requires lean_floor_bps —
+# measure it, don't assume it.
+# lean_shadow = true      # step 1: log lean quotes next to the live ones
+# lean_enabled = false    # step 2: quote the live book off the lean prices
+# lean_floor_bps = 3.0    # REQUIRED with lean: p95 feed error vs live Pyth, bps
+# lean_base_bps = 1.0     # balanced-zone half-spread (default 1.0)
+# lean_wide_bps = 3.0     # extra widening at the heavy inventory edge (default 3.0)
+
 # Taker leg (off by default): fill users' RESTING LIMIT ORDERS when their
 # price crosses your own quote — a user selling the soft asset fills at or
 # below your bid, a user buying it at or above your ask. Priced by the side

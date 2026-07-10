@@ -7,6 +7,7 @@ use alloy_primitives::U256;
 use anyhow::Context;
 use serde::Deserialize;
 
+use crate::lean::{LeanMode, LeanParams, DEFAULT_BASE_BPS, DEFAULT_WIDE_BPS};
 use crate::quote::Spread;
 
 /// Default cap for generated ladder slices per side. Keep this low enough that
@@ -168,6 +169,31 @@ pub struct PoolConfig {
     #[serde(default)]
     pub limit_taker_max_orders: Option<u32>,
 
+    // ----- Inventory-lean quoting. Leans both spreads against the wallet's
+    // own inventory so the book self-rebalances and never freezes one-sided,
+    // while no quote ever crosses fair (every offset is clamped to the
+    // measured feed-accuracy floor). See [`crate::lean`]. -----
+    /// Quote the live book off the lean prices. The pilot feature flag —
+    /// revert instantly by setting it back to false and restarting.
+    #[serde(default)]
+    pub lean_enabled: Option<bool>,
+    /// Compute and log the lean quotes next to the live ones each tick; no
+    /// behavior change. The rollout's shadow step. `lean_enabled` wins if both
+    /// are set.
+    #[serde(default)]
+    pub lean_shadow: Option<bool>,
+    /// Balanced-zone half-spread in bps (default 1.0).
+    #[serde(default)]
+    pub lean_base_bps: Option<f64>,
+    /// Extra widening of the accumulating side at the critical inventory edge,
+    /// in bps (default 3.0).
+    #[serde(default)]
+    pub lean_wide_bps: Option<f64>,
+    /// The tightest honest spread in bps: the measured p95 of the feed's error
+    /// vs live Pyth. Measured, not assumed — required when lean is on.
+    #[serde(default)]
+    pub lean_floor_bps: Option<f64>,
+
     // ----- Settlement closing (auction closer). The default setup fills these;
     // omit `closer_pool` only for market-making-only configs. -----
     /// The SettlementPool to close positions in.
@@ -250,6 +276,25 @@ impl PoolConfig {
         self.limit_taker_enabled.unwrap_or(false)
             && (self.buy_spread().is_some() || self.sell_spread().is_some())
     }
+    /// The pool's inventory-lean rollout mode. Live wins over shadow.
+    pub fn lean_mode(&self) -> LeanMode {
+        if self.lean_enabled.unwrap_or(false) {
+            LeanMode::Live
+        } else if self.lean_shadow.unwrap_or(false) {
+            LeanMode::Shadow
+        } else {
+            LeanMode::Off
+        }
+    }
+    /// Lean tunables with defaults applied. `None` only when the required
+    /// measured floor is missing (validation rejects that for lean pools).
+    pub fn lean_params(&self) -> Option<LeanParams> {
+        Some(LeanParams {
+            base_bps: self.lean_base_bps.unwrap_or(DEFAULT_BASE_BPS),
+            wide_bps: self.lean_wide_bps.unwrap_or(DEFAULT_WIDE_BPS),
+            floor_bps: self.lean_floor_bps?,
+        })
+    }
 }
 
 impl Config {
@@ -272,6 +317,30 @@ impl Config {
                     max_orders <= MAX_SUPPORTED_LADDER_ORDERS,
                     "pools[{idx}].sell_max_orders {max_orders} exceeds supported limit {MAX_SUPPORTED_LADDER_ORDERS}"
                 );
+            }
+            if pool.lean_mode() != LeanMode::Off {
+                let floor = pool.lean_floor_bps.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pools[{idx}]: lean quoting needs lean_floor_bps — the measured p95 \
+                         error of the price feed vs live Pyth, in bps (measure it, don't assume)"
+                    )
+                })?;
+                anyhow::ensure!(
+                    floor.is_finite() && floor > 0.0,
+                    "pools[{idx}].lean_floor_bps must be a positive number of bps"
+                );
+                if let Some(base) = pool.lean_base_bps {
+                    anyhow::ensure!(
+                        base.is_finite() && base > 0.0,
+                        "pools[{idx}].lean_base_bps must be a positive number of bps"
+                    );
+                }
+                if let Some(wide) = pool.lean_wide_bps {
+                    anyhow::ensure!(
+                        wide.is_finite() && wide >= 0.0,
+                        "pools[{idx}].lean_wide_bps must be zero or a positive number of bps"
+                    );
+                }
             }
         }
         Ok(())
@@ -392,6 +461,75 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("sell_max_orders"));
         assert!(msg.contains("40"));
+    }
+
+    const LEAN_POOL_BASE: &str = r#"
+        chain_id = 1
+        rpc_url = "http://x"
+        indexer_url = "http://x"
+        permit2 = "0x0000000000000000000000000000000000000000"
+        reactor = "0x0000000000000000000000000000000000000000"
+        tick_interval_secs = 5
+        [feed]
+        url = "http://x"
+        staleness_secs = 30
+        [[pools]]
+        collateral = "0x0000000000000000000000000000000000000001"
+        collateral_decimals = 6
+        debt = "0x0000000000000000000000000000000000000002"
+        debt_decimals = 6
+        buy_offset_bps = 1
+        buy_order_size_debt = "1000000000"
+        sell_offset_bps = 1
+        sell_order_size_collateral = "1000000"
+        ttl_secs = 120
+        refresh_threshold_bps = 10
+    "#;
+
+    #[test]
+    fn lean_defaults_to_off_and_live_wins_over_shadow() {
+        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert_eq!(cfg.pools[0].lean_mode(), LeanMode::Off);
+
+        let toml = format!("{LEAN_POOL_BASE}\nlean_shadow = true\nlean_floor_bps = 3.0\n");
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert_eq!(cfg.pools[0].lean_mode(), LeanMode::Shadow);
+        let p = cfg.pools[0].lean_params().unwrap();
+        assert_eq!(p.base_bps, DEFAULT_BASE_BPS);
+        assert_eq!(p.wide_bps, DEFAULT_WIDE_BPS);
+        assert_eq!(p.floor_bps, 3.0);
+
+        let toml = format!(
+            "{LEAN_POOL_BASE}\nlean_shadow = true\nlean_enabled = true\nlean_floor_bps = 3.0\n"
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert_eq!(cfg.pools[0].lean_mode(), LeanMode::Live);
+    }
+
+    #[test]
+    fn lean_without_a_measured_floor_is_rejected() {
+        let toml = format!("{LEAN_POOL_BASE}\nlean_shadow = true\n");
+        let err = Config::from_toml(&toml).expect_err("floor is required");
+        assert!(err.to_string().contains("lean_floor_bps"));
+
+        let toml = format!("{LEAN_POOL_BASE}\nlean_enabled = true\nlean_floor_bps = 0.0\n");
+        let err = Config::from_toml(&toml).expect_err("zero floor is rejected");
+        assert!(err.to_string().contains("lean_floor_bps"));
+    }
+
+    #[test]
+    fn lean_tunables_must_be_sane_numbers() {
+        let toml = format!(
+            "{LEAN_POOL_BASE}\nlean_shadow = true\nlean_floor_bps = 3.0\nlean_base_bps = -1.0\n"
+        );
+        let err = Config::from_toml(&toml).expect_err("negative base is rejected");
+        assert!(err.to_string().contains("lean_base_bps"));
+
+        let toml = format!(
+            "{LEAN_POOL_BASE}\nlean_shadow = true\nlean_floor_bps = 3.0\nlean_wide_bps = -0.1\n"
+        );
+        let err = Config::from_toml(&toml).expect_err("negative wide is rejected");
+        assert!(err.to_string().contains("lean_wide_bps"));
     }
 
     #[test]

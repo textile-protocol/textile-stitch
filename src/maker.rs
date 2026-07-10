@@ -154,18 +154,31 @@ pub struct QuoteState {
 /// How a side's quote attempt ended. `Done { posted }` carries how many orders
 /// this side actually posted this tick (0 when it held — nothing to requote, no
 /// funded budget, or no inventory), so the tick loop can surface activity in a
-/// heartbeat. `AbortPool` means the nonce ledger could not be persisted before
-/// posting — the caller must skip the rest of this pool's tick (never post an
-/// order whose nonce isn't on disk).
+/// heartbeat; `fills` counts spent nonces observed while posting — each one is
+/// an order of ours that filled on-chain, the tick loop's fill signal (the
+/// inventory lean re-reads balances on it). `AbortPool` means the nonce ledger
+/// could not be persisted before posting — the caller must skip the rest of
+/// this pool's tick (never post an order whose nonce isn't on disk).
 #[must_use]
 pub enum SideOutcome {
-    Done { posted: usize },
+    Done { posted: usize, fills: usize },
     AbortPool,
+}
+
+impl SideOutcome {
+    fn held() -> Self {
+        SideOutcome::Done {
+            posted: 0,
+            fills: 0,
+        }
+    }
 }
 
 /// Quote one side of one pool for this tick. Mirrors the historical inline
 /// flow exactly: requote gate → sizes → drafts → persist ledger → post →
 /// rotate any spent nonce → record posted inputs → account for the replacement.
+/// `price_override` (the inventory lean's live price) replaces the configured
+/// spread's price when set; sizing and everything else are unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn quote_side(
     ctx: &TickCtx<'_>,
@@ -177,12 +190,15 @@ pub async fn quote_side(
     collateral: Address,
     side: Side,
     mid: f64,
+    price_override: Option<f64>,
     now: u64,
 ) -> SideOutcome {
+    // A side without a configured spread is off, override or not — the lean
+    // replaces the price of a running side, it never enables one.
     let Some(spread) = side.spread(pool) else {
-        return SideOutcome::Done { posted: 0 };
+        return SideOutcome::held();
     };
-    let price = side.price(mid, spread);
+    let price = price_override.unwrap_or_else(|| side.price(mid, spread));
     let key_id = side.key_id(pair);
     let label = side.label();
     if !should_requote_now(
@@ -193,7 +209,7 @@ pub async fn quote_side(
         pool.ttl_secs,
         pool.repost_lead_secs(),
     ) {
-        return SideOutcome::Done { posted: 0 };
+        return SideOutcome::held();
     }
 
     let reusable_input =
@@ -222,7 +238,7 @@ pub async fn quote_side(
     );
     if drafts.is_empty() {
         // Posting an empty batch was always a no-op; skip the ledger write too.
-        return SideOutcome::Done { posted: 0 };
+        return SideOutcome::held();
     }
 
     let input_reserved = drafted_input(&drafts);
@@ -289,6 +305,7 @@ pub async fn quote_side(
     }
     SideOutcome::Done {
         posted: result.posted,
+        fills: result.spent_nonces.len(),
     }
 }
 

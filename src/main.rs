@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, Bytes, U256};
 use anyhow::{anyhow, Context};
 use tracing::{info, warn};
 
@@ -22,12 +22,14 @@ use stitch_bot::approve::{run_approvals, unapproved_tokens, ApprovalMode};
 use stitch_bot::banner::print_startup_banner;
 use stitch_bot::cli::{parse, Command};
 use stitch_bot::closer::discover::Discoverer;
+use stitch_bot::closer::executor::encode_balance_of;
 use stitch_bot::closer::runner::{close_pool_once, CloseOutcome, CloserPool};
 use stitch_bot::closer::strategy::{PoolParams, StrategyConfig};
 use stitch_bot::config::{Config, PoolConfig};
 use stitch_bot::feed::{HttpFeed, PriceFeed};
-use stitch_bot::funding::{count_max_sides, TickBudgets};
+use stitch_bot::funding::{count_max_sides, u256_to_u128, TickBudgets};
 use stitch_bot::indexer::Indexer;
+use stitch_bot::lean::{LeanDecision, LeanMode, LeanParams, LeanState};
 use stitch_bot::maker::{quote_side, QuoteState, Side, SideOutcome, TickCtx};
 use stitch_bot::poster::Poster;
 use stitch_bot::quote::oracle_rate_ray;
@@ -73,6 +75,79 @@ fn build_closer_pool(pool: &PoolConfig) -> anyhow::Result<CloserPool> {
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The maker's on-chain inventory for a pair: `(collateral, debt)` wallet
+/// balances, atomic. Signed orders don't move tokens until they fill (Permit2),
+/// so the wallet balance IS the inventory.
+async fn read_inventory(
+    wallet: &stitch_bot::rpc::Wallet,
+    maker: Address,
+    collateral: Address,
+    debt: Address,
+) -> anyhow::Result<(u128, u128)> {
+    let calldata = Bytes::from(encode_balance_of(maker));
+    let coll = wallet
+        .read_uint(collateral, &calldata)
+        .await
+        .context("reading collateral balance")?;
+    let debt_bal = wallet
+        .read_uint(debt, &calldata)
+        .await
+        .context("reading debt balance")?;
+    Ok((
+        u256_to_u128(coll, "collateral balance")?,
+        u256_to_u128(debt_bal, "debt balance")?,
+    ))
+}
+
+/// One log line per tick for a lean pool. Shadow mode prints the lean quotes
+/// next to the live (configured-spread) ones — the rollout's verification
+/// dataset; live mode prints what the book is actually quoting. Either way,
+/// warn loudly if a lean quote ever lands on the wrong side of the fair floor
+/// (impossible by construction — seeing this means a bug or bad params).
+fn log_lean(
+    mode: LeanMode,
+    pair: &str,
+    pool: &PoolConfig,
+    fair: f64,
+    params: &LeanParams,
+    d: &LeanDecision,
+) {
+    let px = |p: Option<f64>| p.map_or_else(|| "pulled".to_string(), |v| format!("{v:.6}"));
+    let bid_bound = fair * (1.0 - params.floor_bps / 10_000.0);
+    let ask_bound = fair * (1.0 + params.floor_bps / 10_000.0);
+    let bid_ok = d.bid.is_none_or(|b| b <= bid_bound * (1.0 + 1e-12));
+    let ask_ok = d.ask.is_none_or(|a| a >= ask_bound * (1.0 - 1e-12));
+    if !bid_ok || !ask_ok {
+        warn!(
+            pair = %pair, fair, bid = %px(d.bid), ask = %px(d.ask),
+            floor_bps = params.floor_bps,
+            "lean quote crossed the fair floor — this must never happen; check lean params"
+        );
+    }
+    let x = d.x.map_or_else(|| "-".to_string(), |x| format!("{x:.3}"));
+    match mode {
+        LeanMode::Shadow => {
+            let fmt = |p: Option<f64>| p.map_or_else(|| "-".to_string(), |v| format!("{v:.6}"));
+            let live_bid = pool.buy_spread().map(|s| bid_price(fair, s));
+            let live_ask = pool.sell_spread().map(|s| ask_price(fair, s));
+            info!(
+                pair = %pair, fair, x = %x,
+                lean_bid = %px(d.bid), lean_ask = %px(d.ask),
+                live_bid = %fmt(live_bid), live_ask = %fmt(live_ask),
+                pulled = d.pulled.unwrap_or(""),
+                "lean shadow"
+            );
+        }
+        LeanMode::Live => info!(
+            pair = %pair, fair, x = %x,
+            bid = %px(d.bid), ask = %px(d.ask),
+            pulled = d.pulled.unwrap_or(""),
+            "lean quote"
+        ),
+        LeanMode::Off => {}
+    }
+}
 
 fn print_help() {
     println!(
@@ -460,6 +535,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // Sides quoting "max" liquidity target an even share of each token's funded
     // balance instead of letting the first corridor keep draining it.
     let max_sides_by_token = count_max_sides(&cfg);
+    // Per pair: the inventory lean's smoothed offsets, share, and jump guard.
+    let mut lean_states: HashMap<String, LeanState> = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(cfg.tick_interval_secs.max(1)));
 
     // Exit cleanly on Ctrl-C / SIGTERM. We only check between ticks, so a signal
@@ -513,9 +590,57 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                 pool.debt.to_lowercase()
             );
 
+            // ----- Inventory lean. Shadow computes and logs next to the live
+            // quotes (no behavior change); Live replaces the maker prices. The
+            // share is re-read on fills and at most once per 60s otherwise. -----
+            let lean = match (pool.lean_mode(), pool.lean_params()) {
+                (LeanMode::Off, _) | (_, None) => None,
+                (mode, Some(params)) => {
+                    let lean_state = lean_states
+                        .entry(pair.clone())
+                        .or_insert_with(|| LeanState::new(&params));
+                    if lean_state.needs_inventory(now) {
+                        match read_inventory(&wallet, maker, collateral, debt).await {
+                            Ok((coll, debt_bal)) => lean_state.set_inventory(
+                                coll,
+                                pool.collateral_decimals,
+                                debt_bal,
+                                pool.debt_decimals,
+                                quote.price,
+                                now,
+                                &params,
+                            ),
+                            Err(e) => warn!(
+                                pair = %pair, error = %format!("{e:#}"),
+                                "could not read inventory; lean keeps its last offsets"
+                            ),
+                        }
+                    }
+                    let decision = lean_state.decide(quote.price, &params);
+                    log_lean(mode, &pair, pool, quote.price, &params, &decision);
+                    Some((mode, decision))
+                }
+            };
+
             let mut posted_bid = 0usize;
             let mut posted_ask = 0usize;
             for side in [Side::Bid, Side::Ask] {
+                let price_override = match lean {
+                    Some((LeanMode::Live, decision)) => {
+                        let lean_price = match side {
+                            Side::Bid => decision.bid,
+                            Side::Ask => decision.ask,
+                        };
+                        match lean_price {
+                            Some(price) => Some(price),
+                            // The lean pulled this side (critical inventory or
+                            // a fair jump): stop reposting and let the live
+                            // orders age out through their TTL.
+                            None => continue,
+                        }
+                    }
+                    _ => None,
+                };
                 let outcome = quote_side(
                     &ctx,
                     &mut state,
@@ -526,6 +651,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     collateral,
                     side,
                     quote.price,
+                    price_override,
                     now,
                 )
                 .await;
@@ -533,10 +659,19 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     // The nonce ledger could not be persisted; never post on a
                     // stale ledger. Skip the rest of this pool's tick.
                     SideOutcome::AbortPool => continue 'pools,
-                    SideOutcome::Done { posted } => match side {
-                        Side::Bid => posted_bid = posted,
-                        Side::Ask => posted_ask = posted,
-                    },
+                    SideOutcome::Done { posted, fills } => {
+                        if fills > 0 {
+                            // Orders of ours filled since the last post: the
+                            // inventory moved, so re-read the share next tick.
+                            if let Some(lean_state) = lean_states.get_mut(&pair) {
+                                lean_state.note_fill(now);
+                            }
+                        }
+                        match side {
+                            Side::Bid => posted_bid = posted,
+                            Side::Ask => posted_ask = posted,
+                        }
+                    }
                 }
             }
             // Heartbeat: always on a post, otherwise throttled to HEARTBEAT_SECS
@@ -557,13 +692,27 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             // ask). Same feed tick, same spreads — no separate strategy. -----
             if let Some(fee_bps) = taker_fee_bps {
                 if pool.limit_taker_enabled() {
+                    // With the lean live, the taker prices off the same lean
+                    // quotes as the maker — one price surface, and a pulled
+                    // side takes nothing. A side without a configured spread
+                    // stays off either way (the lean never enables a side).
+                    let (taker_bid, taker_ask) = match lean {
+                        Some((LeanMode::Live, decision)) => (
+                            pool.buy_spread().and(decision.bid),
+                            pool.sell_spread().and(decision.ask),
+                        ),
+                        _ => (
+                            pool.buy_spread().map(|s| bid_price(quote.price, s)),
+                            pool.sell_spread().map(|s| ask_price(quote.price, s)),
+                        ),
+                    };
                     let taker_ctx = TakerCtx {
                         collateral,
                         debt,
                         collateral_decimals: pool.collateral_decimals,
                         debt_decimals: pool.debt_decimals,
-                        bid: pool.buy_spread().map(|s| bid_price(quote.price, s)),
-                        ask: pool.sell_spread().map(|s| ask_price(quote.price, s)),
+                        bid: taker_bid,
+                        ask: taker_ask,
                         fee_bps,
                         min_profit_debt: pool
                             .limit_taker_min_profit_debt
@@ -597,10 +746,19 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                 hash,
                                 orders,
                                 spend,
-                            }) => info!(
-                                pair = %pair, side, hash = %hash, orders, spend = %spend,
-                                "filled resting limit orders"
-                            ),
+                            }) => {
+                                info!(
+                                    pair = %pair, side, hash = %hash, orders, spend = %spend,
+                                    "filled resting limit orders"
+                                );
+                                // A taker fill spends one wallet asset and
+                                // receives the other — that's an inventory
+                                // move like any maker fill, so the lean
+                                // re-reads the share next tick.
+                                if let Some(lean_state) = lean_states.get_mut(&pair) {
+                                    lean_state.note_fill(now);
+                                }
+                            }
                             Err(e) => {
                                 warn!(pair = %pair, side, error = %e, "taker tick failed")
                             }
@@ -654,10 +812,17 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             hash,
                             positions,
                             debt_in,
-                        }) => info!(
-                            pool = %closer_pool.pool_address, hash = %hash, positions,
-                            debt_in = %debt_in, "closed batch"
-                        ),
+                        }) => {
+                            info!(
+                                pool = %closer_pool.pool_address, hash = %hash, positions,
+                                debt_in = %debt_in, "closed batch"
+                            );
+                            // Closing spends debt and receives collateral from
+                            // the same wallet the lean measures.
+                            if let Some(lean_state) = lean_states.get_mut(&pair) {
+                                lean_state.note_fill(now);
+                            }
+                        }
                         Err(e) => {
                             warn!(pool = %closer_pool.pool_address, error = %e, "close tick failed")
                         }

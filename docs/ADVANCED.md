@@ -163,6 +163,67 @@ Costs and flows to know:
   balance change, and the received tokens land as inventory.
 - `--dry-run` logs the batches the leg would fill without sending anything.
 
+### Inventory-Lean Quoting
+
+A fixed symmetric spread has a failure mode: one side keeps filling until the
+wallet is 100% soft asset (or 100% stable), and the book goes one-sided until
+someone manually rebalances. The lean fixes that by pricing off the wallet's
+own inventory — and only the inventory, never price momentum or recent flow.
+
+The inventory share `x` is the soft asset's value share of the wallet
+(`0` = all stable, `1` = all soft), valued at fair. The quote rule:
+
+- **Balanced (`x` 0.40–0.60):** quote fair ± `lean_base_bps`, both sides.
+- **Soft-heavy (`x` 0.60–0.85):** the ask tightens linearly toward the floor
+  (unload faster) while the bid widens by up to `lean_wide_bps` (accumulate
+  slower). Stable-heavy mirrors it.
+- **Critical (`x` > 0.85 or < 0.15):** the unloading side quotes at the floor;
+  the accumulating side stops quoting. Already-posted orders age out through
+  their TTL — there is no on-chain cancel.
+
+Three hard rules hold regardless of the lean:
+
+1. **No quote ever crosses fair.** Every offset is clamped to
+   `lean_floor_bps`, so every fill is at fair or better by construction.
+2. **The lean can't be whipsawed.** `x` is recomputed on observed fills and at
+   most once per 60s otherwise, and the smoothed offsets move at most 0.5 bps
+   per update.
+3. **A fair jump > 25 bps in one tick pulls both quotes** for that tick;
+   quoting resumes on the next one. (Feed staleness already pulls quoting —
+   see `staleness_secs`.)
+
+`lean_floor_bps` is the tightest honest spread: the p95 of your feed's error
+vs live Pyth (fair = Pyth XAUt/USD ÷ USDT/USD for the gold corridor).
+**Measure it — don't assume it.** Stitch refuses a lean config without it. If
+your feed is a cached endpoint (e.g. the 60s `/price`), the honest floor is
+around 3 bps — likely wider than a sub-1bp fixed spread you may be quoting
+today, which just means that spread was tighter than the feed could support.
+
+Roll out in two steps:
+
+```toml
+[[pools]]
+# Step 1 — shadow: compute and log the lean quotes next to the live ones each
+# tick ("lean shadow" log lines). No behavior change. Run it a couple of days
+# and check every lean quote is on the correct side of fair and the x
+# trajectory is sane.
+lean_shadow = true
+lean_floor_bps = 3.0   # REQUIRED: measured p95 feed error vs live Pyth, bps
+
+# Step 2 — live: quote the book off the lean prices. Flip back to false and
+# restart to revert instantly.
+lean_enabled = false
+
+# Tunables (defaults shown):
+# lean_base_bps = 1.0  # balanced-zone half-spread
+# lean_wide_bps = 3.0  # extra widening at the heavy inventory edge
+```
+
+With the lean live, the taker leg prices off the same lean bid/ask, and a
+pulled side takes nothing. The configured `buy_offset_*` / `sell_offset_*`
+spreads still gate which sides run and are what shadow mode logs as the live
+comparison, but live lean pricing replaces them.
+
 ### MPC Wallet Signers
 
 By default Stitch signs with the local private key (the hotwallet). An optional

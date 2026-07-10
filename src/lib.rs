@@ -22,6 +22,7 @@ pub mod feed;
 pub mod funding;
 pub mod indexer;
 pub mod ladder;
+pub mod lean;
 pub mod maker;
 pub mod net;
 pub mod poster;
