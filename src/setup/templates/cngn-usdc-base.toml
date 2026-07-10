@@ -1,0 +1,39 @@
+# Textile Stitch — cNGN/USDC on Base (chain 8453).
+# The wallet key is NOT here; export STITCH_PRIVATE_KEY (or STITCH_PRIVATE_KEY_FILE).
+#
+# A single [[pools]] block quotes BOTH swap directions: the buy side pays USDC
+# for cNGN (USDC -> cNGN) and the sell side sells cNGN for USDC (cNGN -> USDC).
+
+chain_id        = 8453                                 # Base mainnet
+rpc_url         = "https://base-rpc.publicnode.com"    # free public Base RPC; swap for your own if you have one
+indexer_url     = "https://api.textilecredit.com"
+permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
+reactor         = "0xEb5A29F869FF084B3Fce18d3487a38A56feDC59E"  # SETTLEMENT_V3_FILLER_REACTOR (Base)
+tick_interval_secs = 5
+
+# Textile's own price endpoint. Returns { price, timestamp } where price is
+# debt-per-collateral (USDC per cNGN, e.g. ~0.000728).
+[feed]
+url            = "https://api.textilecredit.com/price?chainId=8453&pair=cngn-usdc"
+staleness_secs = 900
+
+[[pools]]
+collateral = "0x46C85152bFe9f96829aA94755D9f915F9B10EF5F"  # cNGN (soft asset, 6dp)
+collateral_decimals = 6
+debt = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"        # USDC on Base (stable, 6dp)
+debt_decimals = 6
+
+# Buy low: bid below the mid, paying USDC for cNGN. Funds USDC + Permit2 on USDC.
+buy_offset_bps = 1                                # 1 bps below mid
+buy_total_liquidity_debt = "max"                  # quote all funded USDC
+buy_min_slice_debt = "10000000"                   # 10 USDC smallest slice (6dp)
+buy_max_orders = 40
+
+# Sell high: ask above the mid, selling cNGN for USDC. Funds cNGN + Permit2 on cNGN.
+sell_offset_bps = 1                               # 1 bps above mid
+sell_total_liquidity_collateral = "max"           # quote all funded cNGN
+sell_min_slice_debt = "10000000"                  # 10 USDC-equivalent slice (6dp)
+sell_max_orders = 40
+
+ttl_secs = 120
+refresh_threshold_bps = 10                        # re-quote when price moves >0.10%

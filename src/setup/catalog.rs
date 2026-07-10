@@ -28,6 +28,13 @@ const CORRIDORS: &[Corridor] = &[
         toml_template: include_str!("templates/cngn-usdt-bsc.toml"),
     },
     Corridor {
+        id: "cngn-usdc-base",
+        display_name: "cNGN / USDC",
+        network_label: "Base",
+        chain_id: 8453,
+        toml_template: include_str!("templates/cngn-usdc-base.toml"),
+    },
+    Corridor {
         id: "xaut-usdt-ethereum",
         display_name: "XAUt / USDT",
         network_label: "Ethereum",
