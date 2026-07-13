@@ -42,6 +42,13 @@ const CORRIDORS: &[Corridor] = &[
         toml_template: include_str!("templates/xaut-usdt-ethereum.toml"),
     },
     Corridor {
+        id: "weth-usdt-ethereum",
+        display_name: "WETH / USDT",
+        network_label: "Ethereum",
+        chain_id: 1,
+        toml_template: include_str!("templates/weth-usdt-ethereum.toml"),
+    },
+    Corridor {
         id: "wars-usdt-celo",
         display_name: "wARS / USDT",
         network_label: "Celo",

@@ -5192,7 +5192,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stitch-bot"
-version = "0.1.94"
+version = "0.1.95"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",

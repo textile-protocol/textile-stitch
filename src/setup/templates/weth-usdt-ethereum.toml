@@ -1,0 +1,57 @@
+# Textile Stitch — WETH/USDT on Ethereum (chain 1).
+# The wallet key is NOT here; export STITCH_PRIVATE_KEY (or STITCH_PRIVATE_KEY_FILE).
+#
+# A single [[pools]] block quotes BOTH swap directions: the buy side pays USDT
+# for WETH (USDT -> WETH) and the sell side sells WETH for USDT (WETH -> USDT).
+
+chain_id        = 1                                    # Ethereum mainnet
+rpc_url         = "https://ethereum-rpc.publicnode.com" # free public Ethereum RPC; swap for your own if you have one
+indexer_url     = "https://api.textilecredit.com"
+permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
+reactor         = "0x26a1aedaa26affc4fd9f910acfca754a31bc43c6"  # SETTLEMENT_V3_FILLER_REACTOR (Ethereum)
+tick_interval_secs = 5
+
+# Textile's own price endpoint. Returns { price, timestamp } where price is
+# debt-per-collateral (USDT per WETH, ~3000).
+[feed]
+url            = "https://api.textilecredit.com/price?chainId=1&pair=weth-usdt"
+staleness_secs = 900
+
+[[pools]]
+collateral = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH (18dp)
+collateral_decimals = 18
+debt = "0xdAC17F958D2ee523a2206206994597C13D831ec7"        # USDT on Ethereum (stable, 6dp)
+debt_decimals = 6
+
+# ETH is far more volatile than gold or the FX wrappers, and it moves between
+# ticks, so this static spread is deliberately wider than the 1 bps XAUt/FX
+# templates: it has to clear feed latency plus the /price endpoint's error vs
+# the live mid, or a fast move picks the resting side off. Tune to your own feed
+# and RPC latency before funding — and prefer inventory-lean (see the block at
+# the bottom) once you've measured the floor.
+
+# Buy low: bid below the mid, paying USDT for WETH. Funds USDT + Permit2 on USDT.
+buy_offset_bps = 5                                # 5 bps below mid
+buy_total_liquidity_debt = "max"                  # quote all funded USDT
+buy_min_slice_debt = "10000000"                   # 10 USDT smallest slice (6dp)
+buy_max_orders = 40
+
+# Sell high: ask above the mid, selling WETH for USDT. Funds WETH + Permit2 on WETH.
+sell_offset_bps = 5                               # 5 bps above mid
+sell_total_liquidity_collateral = "max"           # quote all funded WETH
+sell_min_slice_debt = "10000000"                  # 10 USDT-equivalent slice (6dp)
+sell_max_orders = 40
+
+ttl_secs = 120
+refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
+
+# Inventory-lean quoting (off by default): lean both spreads against the
+# wallet's own inventory so the book self-rebalances and never freezes
+# one-sided, while no quote ever crosses fair. Recommended for WETH given the
+# volatility, but it REQUIRES lean_floor_bps — the measured p95 of this feed's
+# error vs live Pyth (ETH/USD ÷ USDT/USD). Measure it against the live feed,
+# don't assume it, then roll out with lean_shadow = true before flipping
+# lean_enabled = true. See stitch.example.toml for the full rollout notes.
+# lean_shadow = true
+# lean_enabled = false
+# lean_floor_bps = 3.0
