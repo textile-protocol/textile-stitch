@@ -40,6 +40,10 @@ pub struct SettingsView {
     pub feed_url: String,
     pub buy: SpreadEdit,
     pub sell: SpreadEdit,
+    /// Whether the taker leg is on: fill users' resting limit orders when they
+    /// cross the bot's own quote. The raw configured flag, not the spread-gated
+    /// effective one, so a saved-but-spreadless value round-trips.
+    pub taker_enabled: bool,
     /// How many pools the config has. The screen only edits the first, and warns
     /// when there is more than one.
     pub pool_count: usize,
@@ -53,6 +57,8 @@ pub struct SettingsPatch {
     pub feed_url: String,
     pub buy: SpreadEdit,
     pub sell: SpreadEdit,
+    /// Whether the taker leg should be on for the first pool.
+    pub taker_enabled: bool,
 }
 
 /// Read the current editable values from a `stitch.toml` body. Parses through the
@@ -70,6 +76,7 @@ pub fn read_settings(toml_str: &str) -> Result<SettingsView> {
             .unwrap_or_else(|| cfg.feed.url.clone()),
         buy: spread_edit(pool.buy_offset_bps, pool.buy_offset_abs),
         sell: spread_edit(pool.sell_offset_bps, pool.sell_offset_abs),
+        taker_enabled: pool.limit_taker_enabled.unwrap_or(false),
         pool_count: cfg.pools.len(),
     })
 }
@@ -161,6 +168,7 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
     let pool = first_pool_mut(&mut doc)?;
     apply_spread(pool, "buy", &patch.buy)?;
     apply_spread(pool, "sell", &patch.sell)?;
+    apply_taker(pool, patch.taker_enabled);
 
     let edited = doc.to_string();
     // Guard: never hand back something the bot can't load.
@@ -252,6 +260,19 @@ fn apply_spread(pool: &mut Table, side: &str, edit: &SpreadEdit) -> Result<()> {
     Ok(())
 }
 
+/// Write the taker leg's on/off flag onto the pool. Mirrors the spread logic:
+/// enabling sets `limit_taker_enabled = true`; disabling removes the key so the
+/// file falls back to the opt-in default (off) rather than carrying an explicit
+/// `false`, keeping a taker-off config byte-identical to a template that never
+/// mentioned the leg.
+fn apply_taker(pool: &mut Table, enabled: bool) {
+    if enabled {
+        set_value(pool, "limit_taker_enabled", Value::from(true));
+    } else {
+        pool.remove("limit_taker_enabled");
+    }
+}
+
 /// Set a key's value while preserving its existing decor (the surrounding
 /// whitespace and any inline `# comment`). Inserts a fresh key when it's absent.
 fn set_value(table: &mut Table, key: &str, new: Value) {
@@ -276,6 +297,7 @@ mod tests {
             feed_url: view.feed_url.clone(),
             buy: view.buy.clone(),
             sell: view.sell.clone(),
+            taker_enabled: view.taker_enabled,
         }
     }
 
@@ -424,6 +446,27 @@ mod tests {
         view.sell.value = "-0.0000015".into();
         let err = apply_settings(&src, &patch_from(&view)).unwrap_err();
         assert!(err.to_string().contains("non-negative"));
+    }
+
+    #[test]
+    fn taker_defaults_off_and_toggling_it_round_trips() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        // The shipped template doesn't opt into the taker leg.
+        assert!(!view.taker_enabled);
+
+        // Enabling writes the flag onto the first pool.
+        view.taker_enabled = true;
+        let on = apply_settings(TEMPLATE, &patch_from(&view)).unwrap();
+        assert!(on.contains("limit_taker_enabled = true"));
+        assert!(read_settings(&on).unwrap().taker_enabled);
+
+        // Disabling again removes the key rather than writing `false`, so the file
+        // returns byte-for-byte to the taker-off template.
+        let mut back = read_settings(&on).unwrap();
+        back.taker_enabled = false;
+        let off = apply_settings(&on, &patch_from(&back)).unwrap();
+        assert!(!off.contains("limit_taker_enabled"));
+        assert_eq!(off, TEMPLATE, "toggling off restores the original file");
     }
 
     #[test]

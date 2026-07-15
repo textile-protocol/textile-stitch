@@ -50,6 +50,9 @@ pub struct SettingsForm {
     pub feed_url: String,
     pub buy: SpreadEdit,
     pub sell: SpreadEdit,
+    /// Whether the taker leg is on: fill users' resting limit orders when they
+    /// cross the bot's own quote.
+    pub taker_enabled: bool,
     /// Pools in the config; the screen edits the first and notes when there's more.
     pub pool_count: usize,
     /// True once "Change signer…" is clicked, revealing the signer editor.
@@ -247,6 +250,7 @@ impl StitchApp {
                         form.feed_url = v.feed_url;
                         form.buy = v.buy;
                         form.sell = v.sell;
+                        form.taker_enabled = v.taker_enabled;
                         form.pool_count = v.pool_count;
                     }
                     Err(e) => form.error = Some(format!("Couldn't read the current config: {e:#}")),
@@ -333,6 +337,7 @@ impl StitchApp {
             feed_url: self.settings.feed_url.clone(),
             buy: self.settings.buy.clone(),
             sell: self.settings.sell.clone(),
+            taker_enabled: self.settings.taker_enabled,
         };
         let edited = match setup::apply_settings(&current, &patch) {
             Ok(s) => s,

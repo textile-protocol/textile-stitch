@@ -53,6 +53,8 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
                     ui.add_space(12.0);
                     spreads_card(ui, &p, app);
                     ui.add_space(12.0);
+                    taker_card(ui, &p, app);
+                    ui.add_space(12.0);
                     endpoints_card(ui, &p, app);
 
                     ui.add_space(16.0);
@@ -287,6 +289,37 @@ fn keep_numeric(value: &mut String, kind: SpreadKind) {
         } else {
             false
         }
+    });
+}
+
+/// The taker leg: fill users' resting limit orders when they cross the bot's own
+/// quote. One on/off switch — fills are priced off the buy/sell spreads above, so
+/// there's nothing else to set here. Editable while the bot runs; like the other
+/// fields, it takes effect on the save-and-restart.
+fn taker_card(ui: &mut egui::Ui, p: &Palette, app: &mut StitchApp) {
+    theme::card(p).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        theme::field_label(ui, p, "Taker leg");
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            theme::toggle(ui, p, &mut app.settings.taker_enabled);
+            ui.add_space(8.0);
+            let state = if app.settings.taker_enabled {
+                "On"
+            } else {
+                "Off"
+            };
+            ui.label(RichText::new(state).color(p.text).size(12.5));
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "Fill users' resting limit orders when their price crosses your quote. Fills are \
+                 priced off the buy/sell spreads above, so a side with no spread is never taken.",
+            )
+            .color(p.text_faint)
+            .size(11.0),
+        );
     });
 }
 
