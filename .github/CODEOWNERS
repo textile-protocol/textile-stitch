@@ -1,0 +1,12 @@
+# CODEOWNERS for textile-stitch (public mirror).
+#
+# Source of truth: textile-monorepo at
+# packages/stitch-bot/.github/CODEOWNERS. This file is synced into the public
+# repo by .github/workflows/sync-stitch.yml — do NOT edit it here in the public
+# repo, changes will be overwritten on the next sync.
+#
+# The main branch ruleset requires code-owner review, so every file needs an
+# owner with push access or that requirement can never be satisfied.
+# Swap @bnolens for an org team (e.g. @textile-protocol/stitch) once one exists.
+
+* @bnolens
