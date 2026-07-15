@@ -38,6 +38,112 @@ pub fn default_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The current user's home directory. On Windows the profile is `USERPROFILE`;
+/// `HOME` is only set by shells like Git Bash / MSYS and can point elsewhere, so
+/// it must not win there — otherwise `~/Stitch` would resolve to two different
+/// folders depending on how the app was launched. Elsewhere it's `HOME`.
+pub fn home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME")
+    }
+    .map(PathBuf::from)
+}
+
+/// Per-user directory for Stitch's own app state — currently just the pointer to
+/// the operator's chosen config folder. This is deliberately independent of where
+/// the config itself lives (which the operator can put anywhere via Browse), and
+/// stable across launches: Windows `%APPDATA%\Stitch`, macOS
+/// `~/Library/Application Support/Stitch`, otherwise `$XDG_CONFIG_HOME/stitch` or
+/// `~/.config/stitch`. `None` only if the platform's base dir can't be resolved.
+pub fn app_state_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Stitch"))
+    } else if cfg!(target_os = "macos") {
+        home_dir().map(|h| h.join("Library/Application Support/Stitch"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home_dir().map(|h| h.join(".config")))
+            .map(|c| c.join("stitch"))
+    }
+}
+
+/// Name of the pointer file inside [`app_state_dir`] holding the absolute path of
+/// the operator's chosen config folder.
+const LOCATION_FILE: &str = "config-location";
+
+/// Remember `dir` as the config folder to reopen on the next launch. Best-effort:
+/// a write failure just means the app falls back to its default folder next time,
+/// which is no worse than before this existed. Only the non-secret folder path is
+/// stored here — never any config or key contents.
+pub fn remember_config_dir(dir: impl AsRef<Path>) {
+    if let Some(state) = app_state_dir() {
+        let _ = write_location_to(&state, dir.as_ref());
+    }
+}
+
+/// The config folder remembered from a previous setup, if one was saved. Returns
+/// the raw stored path without checking it still holds a config — the caller
+/// decides whether to fall back (see the GUI's startup, which drops back to the
+/// default folder when this isn't configured).
+pub fn remembered_config_dir() -> Option<PathBuf> {
+    read_location_from(&app_state_dir()?)
+}
+
+/// Write the pointer file under `state_dir`, creating the directory if needed.
+/// Split out from [`remember_config_dir`] so the file format is testable without
+/// depending on the process's real `APPDATA`/`HOME`.
+fn write_location_to(state_dir: &Path, dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    std::fs::write(
+        state_dir.join(LOCATION_FILE),
+        format!("{}\n", dir.display()),
+    )
+}
+
+/// Read the pointer file under `state_dir`. `None` if it's absent or blank, so a
+/// stray empty file never resolves to the current directory.
+fn read_location_from(state_dir: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(state_dir.join(LOCATION_FILE)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Config folders that builds before the `config-location` pointer existed may
+/// have used, but the current [`home_dir`] no longer resolves to. Only Windows is
+/// affected: the old default resolved `~` via `HOME` before `USERPROFILE`, so a
+/// setup made while launching from Git Bash/MSYS (which sets `HOME`) can live
+/// under `HOME/Stitch` even though the new default is `USERPROFILE/Stitch`.
+/// Startup checks these for an existing config before falling back to the wizard,
+/// so an upgrading operator isn't sent back through setup. Empty off Windows, and
+/// empty when `HOME` is unset or already equals the current home.
+pub fn legacy_gui_dirs() -> Vec<PathBuf> {
+    let current = home_dir();
+    legacy_gui_dirs_from(
+        cfg!(windows),
+        std::env::var_os("HOME").map(PathBuf::from),
+        current.as_deref(),
+    )
+}
+
+/// Pure core of [`legacy_gui_dirs`], split out so the migration logic is testable
+/// on any host regardless of the real platform or environment.
+fn legacy_gui_dirs_from(
+    is_windows: bool,
+    home_env: Option<PathBuf>,
+    current_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    if !is_windows {
+        return Vec::new();
+    }
+    match home_env {
+        Some(home) if current_home != Some(home.as_path()) => vec![home.join("Stitch")],
+        _ => Vec::new(),
+    }
+}
+
 /// A folder counts as configured once the config and a signer secret both exist.
 /// MPC setups have no stitch.key (their secret is turnkey-api.key /
 /// mpcvault-api.token), so requiring stitch.key would wrongly send a valid MPC
@@ -87,6 +193,62 @@ mod tests {
         d.push(format!("stitch-paths-{}-{}", std::process::id(), tag));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn remembered_config_dir_round_trips_through_the_pointer_file() {
+        let state = unique_dir("state");
+        // A fresh state dir has no pointer yet.
+        assert!(read_location_from(&state).is_none());
+        // Writing then reading returns the exact folder, even one with spaces.
+        let chosen = PathBuf::from("/Users/First Last/My Stitch");
+        write_location_to(&state, &chosen).unwrap();
+        assert_eq!(read_location_from(&state), Some(chosen));
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn legacy_gui_dirs_finds_the_old_home_location_on_windows() {
+        // Windows, with HOME (set by Git Bash) pointing somewhere other than the
+        // USERPROFILE-based current home: the old HOME/Stitch is a legacy candidate.
+        let dirs = legacy_gui_dirs_from(
+            true,
+            Some(PathBuf::from("C:\\msys\\home\\op")),
+            Some(Path::new("C:\\Users\\op")),
+        );
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("C:\\msys\\home\\op").join("Stitch")]
+        );
+    }
+
+    #[test]
+    fn legacy_gui_dirs_empty_when_home_matches_or_off_windows() {
+        // Off Windows there was never a HOME-vs-USERPROFILE split to migrate.
+        assert!(legacy_gui_dirs_from(
+            false,
+            Some(PathBuf::from("/home/op")),
+            Some(Path::new("/home/op"))
+        )
+        .is_empty());
+        // Windows but HOME already equals the current home: no divergence.
+        assert!(legacy_gui_dirs_from(
+            true,
+            Some(PathBuf::from("C:\\Users\\op")),
+            Some(Path::new("C:\\Users\\op"))
+        )
+        .is_empty());
+        // Windows with HOME unset: nothing to migrate.
+        assert!(legacy_gui_dirs_from(true, None, Some(Path::new("C:\\Users\\op"))).is_empty());
+    }
+
+    #[test]
+    fn read_location_ignores_a_blank_pointer() {
+        // A blank/whitespace file must not resolve to "." — it means "no memory".
+        let state = unique_dir("blank");
+        write_location_to(&state, Path::new("   ")).unwrap();
+        assert!(read_location_from(&state).is_none());
+        std::fs::remove_dir_all(&state).ok();
     }
 
     #[test]

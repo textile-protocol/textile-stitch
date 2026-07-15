@@ -12,7 +12,8 @@ pub mod writer;
 
 pub use catalog::{catalog, find_corridor, identify_corridor, Corridor};
 pub use paths::{
-    config_paths, default_dir, has_operator_files, is_configured, operator_address, ConfigPaths,
+    config_paths, default_dir, has_operator_files, home_dir, is_configured, legacy_gui_dirs,
+    operator_address, remember_config_dir, remembered_config_dir, ConfigPaths,
 };
 pub use process::{
     approve_command, find_stitch_binary, run_command, terminate, update_command, Status,

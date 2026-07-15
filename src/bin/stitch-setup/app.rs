@@ -131,18 +131,50 @@ fn operator_for(paths: &ConfigPaths) -> Option<String> {
 
 /// The GUI's default config folder: ~/Stitch (always user-writable, unlike the
 /// app bundle the executable may live in). Matches the README's foreground
-/// location.
+/// location. Only used when the operator hasn't set up into a custom folder — a
+/// remembered folder wins (see [`StitchApp::new`]).
 fn default_gui_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Stitch")
+    setup::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Stitch")
+}
+
+/// Where to open on launch: the folder the operator set up into last time if it
+/// still holds a config, otherwise the default ~/Stitch. Without the remembered
+/// folder, setting up into any custom directory (via Browse) would send the
+/// operator back through the wizard on every restart, since startup would only
+/// ever check the default.
+fn startup_dir() -> PathBuf {
+    // A remembered folder from a prior setup always wins.
+    if let Some(dir) = setup::remembered_config_dir().filter(|d| setup::is_configured(d)) {
+        return dir;
+    }
+    // Prefer the current documented default (~/Stitch, USERPROFILE-based on
+    // Windows) whenever it already holds a config, so a fresh setup there always
+    // wins over a stale legacy folder — checking legacy first could reopen an old
+    // operator/corridor after the user has already set up the default.
+    let default = default_gui_dir();
+    if setup::is_configured(&default) {
+        return default;
+    }
+    // Only when the default is empty do we fall back to locations older builds
+    // used. Pre-pointer builds resolved ~ via HOME first, so a Windows operator
+    // who launched from Git Bash/MSYS can have a valid config under HOME/Stitch.
+    // Adopt the first legacy location that's actually configured and remember it,
+    // so the migration costs exactly one launch instead of re-running the wizard.
+    if let Some(legacy) = setup::legacy_gui_dirs()
+        .into_iter()
+        .find(|d| setup::is_configured(d))
+    {
+        setup::remember_config_dir(&legacy);
+        return legacy;
+    }
+    default
 }
 
 impl StitchApp {
     pub fn new(icon: Option<egui::TextureHandle>) -> Self {
-        let dir = default_gui_dir();
+        let dir = startup_dir();
         let paths = setup::config_paths(&dir);
         let configured = setup::is_configured(&dir);
         let corridor = configured
@@ -386,6 +418,10 @@ impl StitchApp {
 
     /// Reload panel metadata after a successful setup write.
     pub fn refresh_after_setup(&mut self) {
+        // Remember where this config landed so the next launch reopens straight
+        // into the panel — even when the operator set up into a custom folder
+        // rather than the default ~/Stitch.
+        setup::remember_config_dir(&self.dir);
         self.paths = setup::config_paths(&self.dir);
         self.corridor = std::fs::read_to_string(&self.paths.toml)
             .ok()
