@@ -68,7 +68,31 @@ pub fn show(app: &mut StitchApp, ui: &mut egui::Ui) {
         });
 
         ui.add_space(16.0);
-        if theme::primary_button(ui, &p, "Create configuration").clicked() {
+        if setup::is_configured(&app.dir) {
+            // The operator browsed to a folder that already holds a complete
+            // config — typical when upgrading a custom-folder install from before
+            // the location pointer existed. Offer to adopt it as-is so they don't
+            // have to overwrite their own config (and signer secret) just to get
+            // past the wizard. Replacing it stays possible, but as the secondary
+            // action gated by the same overwrite confirmation below.
+            notice_card(
+                ui,
+                p.accent,
+                p.surface,
+                &format!(
+                    "{} already has a working Stitch configuration.",
+                    app.dir.display()
+                ),
+            );
+            ui.add_space(8.0);
+            if theme::primary_button(ui, &p, "Use this configuration").clicked() {
+                app.adopt_existing();
+            }
+            ui.add_space(8.0);
+            if theme::tinted_button(ui, p.warning, "Set up a new one here instead").clicked() {
+                app.pending_overwrite = true;
+            }
+        } else if theme::primary_button(ui, &p, "Create configuration").clicked() {
             // Don't clobber an existing setup (including its private key) just
             // because the operator browsed to the wrong folder: ask first.
             if setup::has_operator_files(&app.dir) && !app.pending_overwrite {

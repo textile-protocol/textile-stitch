@@ -430,6 +430,23 @@ impl StitchApp {
         self.view = View::Panel;
     }
 
+    /// Adopt the folder the operator browsed to when it already holds a complete
+    /// config, instead of overwriting it. This is the upgrade path for someone who
+    /// set up into a custom folder before the location pointer existed: startup
+    /// can't rediscover an arbitrary old path, so they Browse to it — and without
+    /// this they'd have to run Create, which replaces their stitch.toml and signer
+    /// secret. Here we just remember the folder and load the panel from what's
+    /// already on disk; nothing is written. Any secret typed into the form is wiped
+    /// since it's unused.
+    pub fn adopt_existing(&mut self) {
+        self.signer_form.zeroize_secrets();
+        self.setup_error = None;
+        self.pending_overwrite = false;
+        // refresh_after_setup persists the pointer and loads panel metadata from
+        // the existing files — exactly what adopting needs, minus any write.
+        self.refresh_after_setup();
+    }
+
     /// The operator address to show for the current config (see [`operator_for`]).
     fn read_operator(&self) -> Option<String> {
         operator_for(&self.paths)
