@@ -62,6 +62,13 @@ const CORRIDORS: &[Corridor] = &[
         chain_id: 42220,
         toml_template: include_str!("templates/wbrl-usdt-celo.toml"),
     },
+    Corridor {
+        id: "cngn-usdt-bsc-testnet",
+        display_name: "cNGN / USDT",
+        network_label: "BNB Smart Chain testnet",
+        chain_id: 97,
+        toml_template: include_str!("templates/cngn-usdt-bsc-testnet.toml"),
+    },
 ];
 
 /// All corridors, in display order (first is the recommended default).
