@@ -13,14 +13,16 @@ use std::path::Path;
 use alloy_primitives::{Address, U256};
 use tracing::{info, warn};
 
-use crate::config::{PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
+use crate::config::{parse_min_slice_debt, PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
 use crate::funding::{
-    funded_input_cap, parse_input_liquidity, parse_u128, record_funded_input_replacement,
-    u256_to_u128, InputLiquidity, TickBudgets,
+    funded_input_cap, parse_input_liquidity, record_funded_input_replacement, u256_to_u128,
+    InputLiquidity, TickBudgets,
 };
 use crate::ladder::balanced_ladder;
 use crate::poster::{drafted_input, OrderDraft, Poster};
-use crate::quote::{ask_price, bid_price, buy_amounts_at, sell_amounts_at, Spread};
+use crate::quote::{
+    ask_price, bid_price, buy_amounts_at, collateral_for_debt_ceil_at, sell_amounts_at, Spread,
+};
 use crate::slots::{
     forget_spent_slot_nonces, remember_slot_inputs, reusable_slot_input, save_slot_nonce_state,
     slot_nonce,
@@ -331,7 +333,7 @@ async fn side_sizes(
         let (total_field, min_field) = side.ladder_field_names();
         let (total, min) = match (
             parse_input_liquidity(total_str, total_field),
-            parse_u128(min_str, min_field),
+            parse_min_slice_debt(min_str, min_field),
         ) {
             (Ok(total), Ok(min)) => (total, min),
             (Err(e), _) | (_, Err(e)) => {
@@ -347,25 +349,23 @@ async fn side_sizes(
         // Both ladders slice in debt units. The ask is configured in
         // collateral, so convert the funded collateral total to its debt
         // equivalent at the ask price first.
-        let total_debt = match side {
-            Side::Bid => funded_total,
-            Side::Ask => {
-                let (_, total_debt) = sell_amounts_at(
-                    price,
-                    funded_total,
-                    pool.debt_decimals,
-                    pool.collateral_decimals,
-                );
-                match u256_to_u128(total_debt, "sell total debt equivalent") {
-                    Ok(total_debt) => total_debt,
-                    Err(e) => {
-                        warn!(pair = %pair, error = %e, "invalid sell ladder; skipping ask");
-                        return Vec::new();
-                    }
+        match side {
+            Side::Bid => balanced_ladder(funded_total, min, side.max_orders(pool)),
+            Side::Ask => match ask_ladder_sizes(
+                price,
+                funded_total,
+                min,
+                pool.debt_decimals,
+                pool.collateral_decimals,
+                side.max_orders(pool),
+            ) {
+                Ok(sizes) => sizes,
+                Err(e) => {
+                    warn!(pair = %pair, error = %e, "invalid sell ladder; skipping ask");
+                    Vec::new()
                 }
-            }
-        };
-        balanced_ladder(total_debt, min, side.max_orders(pool))
+            },
+        }
     } else if let Some(size_str) = side.single_size(pool) {
         match parse_input_liquidity(size_str, side.single_size_field_name()) {
             Ok(size) => capped_input(ctx, budgets, pair, side, size, input_token, reusable_input)
@@ -410,6 +410,39 @@ async fn capped_input(
         side.label(),
     )
     .await
+}
+
+/// Ask ladder that remains within funded collateral after each slice
+/// independently rounds its collateral input up.
+///
+/// For `n` slices, the sum of individual ceilings can exceed the ceiling of the
+/// sum by at most `n - 1` collateral atomic units. Increase the reserve until
+/// it covers the rebuilt ladder's actual slice count. The reserve is monotonic
+/// and bounded by `max_orders - 1`, so this reaches a fixed point quickly while
+/// a one-slice ladder still reserves nothing.
+fn ask_ladder_sizes(
+    price: f64,
+    funded_collateral: u128,
+    min_slice: u128,
+    debt_decimals: u8,
+    collateral_decimals: u8,
+    max_orders: usize,
+) -> anyhow::Result<Vec<u128>> {
+    let to_debt = |collateral| {
+        let (_, total_debt) =
+            sell_amounts_at(price, collateral, debt_decimals, collateral_decimals);
+        u256_to_u128(total_debt, "sell total debt equivalent")
+    };
+    let mut rounding_reserve = 0u128;
+    loop {
+        let collateral_budget = funded_collateral.saturating_sub(rounding_reserve);
+        let sizes = balanced_ladder(to_debt(collateral_budget)?, min_slice, max_orders);
+        let required_reserve = sizes.len().saturating_sub(1) as u128;
+        if required_reserve <= rounding_reserve {
+            return Ok(sizes);
+        }
+        rounding_reserve = required_reserve;
+    }
 }
 
 /// Turn sizes into slot-keyed drafts. Each slice gets a stable replacement
@@ -470,8 +503,12 @@ fn draft_amounts(
             pool.collateral_decimals,
         )),
         Side::Ask if laddered => {
-            let (_, collateral_for_debt) =
-                buy_amounts_at(price, size, pool.debt_decimals, pool.collateral_decimals);
+            let collateral_for_debt = collateral_for_debt_ceil_at(
+                price,
+                size,
+                pool.debt_decimals,
+                pool.collateral_decimals,
+            );
             match u256_to_u128(collateral_for_debt, "sell ladder collateral slice") {
                 Ok(collateral_size) => Some(sell_amounts_at(
                     price,
@@ -647,6 +684,100 @@ mod tests {
         assert_eq!(drafts[0].slot_key, "sell:pair:ask:0");
         assert_eq!(drafts[0].input_amount, U256::from(25u64));
         assert_eq!(drafts[0].output_amount, U256::from(50u64));
+    }
+
+    #[test]
+    fn weth_ask_ladder_never_drafts_below_500_usdt_floor() {
+        let mut p = pool();
+        p.collateral_decimals = 18;
+        p.sell_total_liquidity_collateral = Some("1000000000000000000".into());
+        p.sell_min_slice_debt = Some("500000000".into());
+        let mut slot_nonces = HashMap::new();
+        let mut next_nonce = 0u64;
+
+        let drafts = build_drafts(
+            Side::Ask,
+            &p,
+            3_000.123_456,
+            vec![500_000_000],
+            "sell:weth/usdt",
+            &mut slot_nonces,
+            &mut next_nonce,
+            "weth/usdt",
+        );
+
+        assert_eq!(drafts.len(), 1);
+        assert!(drafts[0].output_amount >= U256::from(500_000_000u64));
+    }
+
+    #[test]
+    fn rounded_weth_ask_ladder_stays_within_funded_collateral() {
+        let funded = 1_000_000_000_000_000_000u128;
+        let price = 3_000.123_456;
+        let max_orders = 40;
+        let sizes = ask_ladder_sizes(price, funded, 10_000_000, 6, 18, max_orders).unwrap();
+        let mut p = pool();
+        p.collateral_decimals = 18;
+        p.sell_total_liquidity_collateral = Some("max".into());
+        p.sell_min_slice_debt = Some("10000000".into());
+        p.sell_max_orders = Some(max_orders as u32);
+        let mut slot_nonces = HashMap::new();
+        let mut next_nonce = 0;
+
+        let drafts = build_drafts(
+            Side::Ask,
+            &p,
+            price,
+            sizes,
+            "sell:weth/usdt",
+            &mut slot_nonces,
+            &mut next_nonce,
+            "weth/usdt",
+        );
+        let drafted = drafted_input(&drafts);
+
+        assert_eq!(drafts.len(), max_orders);
+        assert!(drafted <= U256::from(funded));
+        assert!(drafts
+            .iter()
+            .all(|draft| draft.output_amount >= U256::from(10_000_000u64)));
+    }
+
+    #[test]
+    fn exactly_funded_single_ask_slice_reserves_no_rounding_overhead() {
+        let funded = 500_000_000u128;
+        let sizes = ask_ladder_sizes(1.0, funded, 500_000_000, 6, 6, 40).unwrap();
+
+        assert_eq!(sizes, vec![500_000_000]);
+    }
+
+    #[test]
+    fn ask_reserve_converges_when_rebuild_adds_a_slice() {
+        let funded = 752u128;
+        let price = 0.333_333_333;
+        let sizes = ask_ladder_sizes(price, funded, 10, 6, 6, 40).unwrap();
+        let mut p = pool();
+        p.sell_total_liquidity_collateral = Some(funded.to_string());
+        p.sell_min_slice_debt = Some("10".into());
+        p.sell_max_orders = Some(40);
+        let mut slot_nonces = HashMap::new();
+        let mut next_nonce = 0;
+
+        let drafts = build_drafts(
+            Side::Ask,
+            &p,
+            price,
+            sizes,
+            "sell:pair",
+            &mut slot_nonces,
+            &mut next_nonce,
+            "pair",
+        );
+
+        assert!(drafted_input(&drafts) <= U256::from(funded));
+        assert!(drafts
+            .iter()
+            .all(|draft| draft.output_amount >= U256::from(10u64)));
     }
 
     #[test]

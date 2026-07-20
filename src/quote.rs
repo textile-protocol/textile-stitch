@@ -87,6 +87,29 @@ pub fn buy_amounts_at(
     (input, numerator / denominator)
 }
 
+/// Smallest collateral input whose ask output is at least `target_debt_atomic`.
+///
+/// Ask ladders are configured in debt units but funded in collateral. This
+/// conversion rounds collateral up so the final integer-priced ask cannot land
+/// one atomic debt unit below the configured ladder floor.
+pub fn collateral_for_debt_ceil_at(
+    ask: f64,
+    target_debt_atomic: u128,
+    debt_decimals: u8,
+    collateral_decimals: u8,
+) -> U256 {
+    let ask_scaled = (ask * PRICE_SCALE as f64).round() as u128;
+    if ask_scaled == 0 {
+        return U256::ZERO;
+    }
+    // input = ceil(target × PRICE_SCALE × 10^coll / (ask × 10^debt))
+    let numerator =
+        U256::from(target_debt_atomic) * U256::from(PRICE_SCALE) * ten_pow(collateral_decimals);
+    let denominator = U256::from(ask_scaled) * ten_pow(debt_decimals);
+    let quotient = numerator / denominator;
+    quotient + U256::from((numerator % denominator != U256::ZERO) as u8)
+}
+
 /// `(input_collateral_atomic, output_debt_atomic)` for an ASK order at `ask`
 /// (USDT per cNGN): the operator sells `size_collateral_atomic` of collateral
 /// (cNGN) for `size × ask` of debt (USDT). The mirror of [`buy_amounts_at`].
@@ -168,6 +191,20 @@ mod tests {
         let (input, output) = sell_amounts_at(1.0, 1_000_000_000_000_000_000, 6, 18);
         assert_eq!(input, U256::from(1_000_000_000_000_000_000u128));
         assert_eq!(output, U256::from(1_000_000u64));
+    }
+
+    #[test]
+    fn ask_collateral_rounds_up_to_preserve_debt_floor() {
+        let target = 500_000_000u128;
+        let (_, rounded_down) = buy_amounts_at(3_000.123_456, target, 6, 18);
+        let rounded_down = rounded_down.to_string().parse::<u128>().unwrap();
+        let (_, old_output) = sell_amounts_at(3_000.123_456, rounded_down, 6, 18);
+        let collateral = collateral_for_debt_ceil_at(3_000.123_456, target, 6, 18);
+        let collateral = collateral.to_string().parse::<u128>().unwrap();
+        let (_, output) = sell_amounts_at(3_000.123_456, collateral, 6, 18);
+
+        assert_eq!(old_output, U256::from(target - 1));
+        assert!(output >= U256::from(target));
     }
 
     #[test]

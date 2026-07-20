@@ -75,6 +75,20 @@ pub fn parse_liquidity_amount(value: &str, field: &str) -> anyhow::Result<Liquid
         })
 }
 
+/// Parse a ladder floor in atomic debt units.
+///
+/// Unlike total liquidity, a minimum slice cannot use `max` and must fit the
+/// `u128` ladder arithmetic. Rejecting it while loading config prevents a bad
+/// value from disabling one side only after the bot has started.
+pub fn parse_min_slice_debt(value: &str, field: &str) -> anyhow::Result<u128> {
+    let parsed = value
+        .trim()
+        .parse::<u128>()
+        .with_context(|| format!("invalid {field}; use a positive atomic integer"))?;
+    anyhow::ensure!(parsed > 0, "{field} must be greater than zero");
+    Ok(parsed)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolConfig {
     /// The soft/collateral asset of the pair (e.g. cNGN). The bot buys it on the
@@ -306,6 +320,12 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         for (idx, pool) in self.pools.iter().enumerate() {
+            if let Some(min_slice) = pool.buy_min_slice_debt.as_deref() {
+                parse_min_slice_debt(min_slice, &format!("pools[{idx}].buy_min_slice_debt"))?;
+            }
+            if let Some(min_slice) = pool.sell_min_slice_debt.as_deref() {
+                parse_min_slice_debt(min_slice, &format!("pools[{idx}].sell_min_slice_debt"))?;
+            }
             if let Some(max_orders) = pool.buy_max_orders {
                 anyhow::ensure!(
                     max_orders <= MAX_SUPPORTED_LADDER_ORDERS,
@@ -419,6 +439,33 @@ mod tests {
             parse_liquidity_amount("50000000000", "buy_total_liquidity_debt").unwrap(),
             LiquidityAmount::Exact(U256::from(50_000_000_000u64))
         );
+    }
+
+    #[test]
+    fn parses_500_usdt_min_slice_in_atomic_units() {
+        assert_eq!(
+            parse_min_slice_debt("500000000", "buy_min_slice_debt").unwrap(),
+            500_000_000
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_min_slices_while_loading_config() {
+        for (field, value) in [
+            ("buy_min_slice_debt", "not-an-integer"),
+            ("sell_min_slice_debt", "0"),
+            (
+                "buy_min_slice_debt",
+                "340282366920938463463374607431768211456",
+            ),
+        ] {
+            let toml = format!("{LEAN_POOL_BASE}\n{field} = \"{value}\"\n");
+            let err = Config::from_toml(&toml).expect_err("invalid floor must stop startup");
+            assert!(
+                err.to_string().contains(field),
+                "error should name {field}: {err}"
+            );
+        }
     }
 
     #[test]
