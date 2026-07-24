@@ -49,12 +49,38 @@ sell_total_liquidity_collateral = "max"        # quote all currently funded cNGN
 sell_min_slice_debt = "10000000"                # 10 USDC-equivalent smallest slice
 sell_max_orders = 40
 
-ttl_secs = 120
+ttl_secs = 120            # must be > 30 (the indexer's live-deadline margin);
+                          # shorter posts are accepted but never served as
+                          # fillable depth. Volatile pairs (WETH) use ~60.
 # repost_lead_secs = 60   # repost each side this many secs before its order
                           # expires, so the new ladder overlaps the old one and
                           # the book never blanks between reposts. Capped at
                           # ttl/2, so keep ttl_secs >= 2 x this. Defaults to 60.
-refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%
+refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
+                            # 0 (the default when omitted) re-posts every tick,
+                            # keeping the book pinned to the current price —
+                            # posting is off-chain and free. This example keeps
+                            # a deadband because the cNGN feed only re-samples
+                            # every ~3 min anyway; volatile pairs (WETH) should
+                            # use 0, especially with TWAP quoting below.
+
+# TWAP quoting (off by default): center the spread on a short rolling
+# time-weighted average of the feed instead of the instantaneous value. The
+# average moves slowly, so the book stops chasing every tick — a transient
+# spike leaves the quote near the settled mean (the ask sells into the spike
+# above the reverting average and keeps the spread when it snaps back), while
+# a persistent move flows into the average within one window. Wins on noise
+# (spikes that revert), pays a bounded lag on trend; worth it for volatile
+# pairs like WETH, pointless for feeds that are already smoothed (the cNGN
+# center re-samples every 3 min). Pair it with refresh_threshold_bps = 0 so
+# the quote stays pinned to the smoothed center. Tuning knobs: a longer window
+# filters more noise but lags real moves more; the side spreads set what each
+# fill earns around the center.
+# twap_window_secs = 60         # ~1 min for ETH; ~1-5 min is the usual range
+# twap_max_deviation_bps = 50   # never post a side more than this through the
+                                # instantaneous feed (ask below spot / bid
+                                # above it) while the center lags a move that
+                                # persists. Default 50.
 
 # Inventory-lean quoting (off by default): lean both spreads against the
 # wallet's own inventory so the book self-rebalances and never freezes

@@ -24,6 +24,24 @@ pub const MAX_LIQUIDITY_SENTINEL: &str = "max";
 /// keep `ttl_secs ≥ 2 × repost_lead_secs` to get the full lead.
 pub const DEFAULT_REPOST_LEAD_SECS: u64 = 60;
 
+/// Seconds the indexer (and stitch's own slot-reuse credit) subtract from an
+/// order's deadline before serving it as live. Matches
+/// `FILLER_ORDER_DEADLINE_MARGIN_SECS` / `REUSABLE_DEADLINE_MARGIN_SECS`.
+/// `ttl_secs` must be strictly greater than this, or posted orders are accepted
+/// but immediately excluded from the live book and never fillable.
+pub const LIVE_ORDER_DEADLINE_MARGIN_SECS: u64 = 30;
+
+/// Default cap on how far a TWAP-centered quote may post through the
+/// instantaneous feed, in bps (see `quote::SpotDeviationGuard`). Wide enough
+/// to keep selling into ordinary transient spikes (the strategy's win), tight
+/// enough that a persistent trend can't pick the lagging side off by more
+/// than this per fill while the average converges.
+pub const DEFAULT_TWAP_MAX_DEVIATION_BPS: u32 = 50;
+
+/// Exclusive upper bound on `twap_max_deviation_bps`. At 10_000 bps the ask
+/// floor collapses to ≤ 0 and the guard silently disables itself.
+pub const MAX_TWAP_MAX_DEVIATION_BPS: u32 = 10_000;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub chain_id: u64,
@@ -163,8 +181,31 @@ pub struct PoolConfig {
     /// Capped at half the TTL. Defaults to `DEFAULT_REPOST_LEAD_SECS`.
     #[serde(default)]
     pub repost_lead_secs: Option<u64>,
-    /// Re-sign a side when its price moves more than this since its last order.
+    /// Re-sign a side only when its price moves more than this since its last
+    /// order (plus the TTL-driven age repost either way). 0 — the default —
+    /// re-quotes every tick, keeping the book pinned to the current price:
+    /// posting is off-chain and free, and a deadband lets quotes drift stale
+    /// on slow moves. Set it above 0 only to cut signing/RPC churn (e.g. a
+    /// rate-limited MPC signer).
+    #[serde(default)]
     pub refresh_threshold_bps: u32,
+
+    // ----- TWAP quoting. Center the spread on a short rolling time-weighted
+    // average of the feed instead of the instantaneous value, so the book
+    // stops chasing every tick: transient spikes get sold into above the
+    // reverting mean instead of picking off a chased quote. See
+    // [`crate::twap`]. -----
+    /// Rolling TWAP window in seconds (~60-300 is sensible). Omit to quote
+    /// off the instantaneous feed (the historical behavior). Longer filters
+    /// more noise but lags real moves more.
+    #[serde(default)]
+    pub twap_window_secs: Option<u64>,
+    /// With TWAP on: never post a side more than this many bps through the
+    /// instantaneous feed (ask below spot / bid above spot), bounding what a
+    /// persistent trend can extract from the lagging center. Defaults to
+    /// `DEFAULT_TWAP_MAX_DEVIATION_BPS`.
+    #[serde(default)]
+    pub twap_max_deviation_bps: Option<u32>,
 
     // ----- Taker leg (user limit orders). Users rest signed limit orders in
     // the same book the bot quotes into; when one's price reaches the bot's
@@ -290,6 +331,15 @@ impl PoolConfig {
         self.limit_taker_enabled.unwrap_or(false)
             && (self.buy_spread().is_some() || self.sell_spread().is_some())
     }
+    /// The TWAP window when TWAP quoting is on for this pool.
+    pub fn twap_window(&self) -> Option<u64> {
+        self.twap_window_secs.filter(|w| *w > 0)
+    }
+    /// The spot-deviation cap for TWAP-centered quotes, with the default.
+    pub fn twap_deviation_bps(&self) -> u32 {
+        self.twap_max_deviation_bps
+            .unwrap_or(DEFAULT_TWAP_MAX_DEVIATION_BPS)
+    }
     /// The pool's inventory-lean rollout mode. Live wins over shadow.
     pub fn lean_mode(&self) -> LeanMode {
         if self.lean_enabled.unwrap_or(false) {
@@ -320,6 +370,14 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         for (idx, pool) in self.pools.iter().enumerate() {
+            anyhow::ensure!(
+                pool.ttl_secs > LIVE_ORDER_DEADLINE_MARGIN_SECS,
+                "pools[{idx}].ttl_secs ({}) must be greater than the live-order deadline \
+                 margin ({LIVE_ORDER_DEADLINE_MARGIN_SECS}s) — the indexer and stitch's own \
+                 slot reuse only serve orders whose deadline is later than chain time plus \
+                 that margin, so a shorter TTL posts orders that never appear as fillable depth",
+                pool.ttl_secs
+            );
             if let Some(min_slice) = pool.buy_min_slice_debt.as_deref() {
                 parse_min_slice_debt(min_slice, &format!("pools[{idx}].buy_min_slice_debt"))?;
             }
@@ -336,6 +394,30 @@ impl Config {
                 anyhow::ensure!(
                     max_orders <= MAX_SUPPORTED_LADDER_ORDERS,
                     "pools[{idx}].sell_max_orders {max_orders} exceeds supported limit {MAX_SUPPORTED_LADDER_ORDERS}"
+                );
+            }
+            if let Some(window) = pool.twap_window_secs {
+                anyhow::ensure!(
+                    window > 0,
+                    "pools[{idx}].twap_window_secs must be positive; omit it to quote off the \
+                     instantaneous feed"
+                );
+            }
+            if let Some(dev) = pool.twap_max_deviation_bps {
+                anyhow::ensure!(
+                    pool.twap_window_secs.is_some(),
+                    "pools[{idx}].twap_max_deviation_bps only applies with twap_window_secs set"
+                );
+                anyhow::ensure!(
+                    dev > 0,
+                    "pools[{idx}].twap_max_deviation_bps must be positive — 0 would pin every \
+                     quote to the instantaneous feed and disable the TWAP center entirely"
+                );
+                anyhow::ensure!(
+                    dev < MAX_TWAP_MAX_DEVIATION_BPS,
+                    "pools[{idx}].twap_max_deviation_bps ({dev}) must be < {MAX_TWAP_MAX_DEVIATION_BPS} \
+                     — at 10000 bps the ask floor collapses to ≤ 0 and the spot-deviation guard \
+                     silently disables itself"
                 );
             }
             if pool.lean_mode() != LeanMode::Off {
@@ -413,7 +495,7 @@ mod tests {
             sell_total_liquidity_collateral = "30000000000000000000000"
             sell_min_slice_debt = "10000000"
             sell_max_orders = 40
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
         "#;
         let cfg = Config::from_toml(toml).expect("config parses");
@@ -493,7 +575,7 @@ mod tests {
             sell_total_liquidity_collateral = "30000000000000000000000"
             sell_min_slice_debt = "10000000"
             sell_max_orders = 40
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
         "#;
         let err = Config::from_toml(toml).expect_err("oversized buy cap is rejected");
@@ -532,6 +614,80 @@ mod tests {
         ttl_secs = 120
         refresh_threshold_bps = 10
     "#;
+
+    #[test]
+    fn refresh_threshold_defaults_to_requoting_every_tick() {
+        let toml = LEAN_POOL_BASE.replace("refresh_threshold_bps = 10", "");
+        let cfg = Config::from_toml(&toml).expect("threshold is optional");
+        assert_eq!(cfg.pools[0].refresh_threshold_bps, 0);
+    }
+
+    #[test]
+    fn twap_defaults_to_off_with_a_default_deviation_cap() {
+        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert_eq!(cfg.pools[0].twap_window(), None);
+        assert_eq!(
+            cfg.pools[0].twap_deviation_bps(),
+            DEFAULT_TWAP_MAX_DEVIATION_BPS
+        );
+    }
+
+    #[test]
+    fn twap_window_and_deviation_parse_together() {
+        let toml =
+            format!("{LEAN_POOL_BASE}\ntwap_window_secs = 180\ntwap_max_deviation_bps = 80\n");
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert_eq!(cfg.pools[0].twap_window(), Some(180));
+        assert_eq!(cfg.pools[0].twap_deviation_bps(), 80);
+    }
+
+    #[test]
+    fn a_zero_twap_window_is_rejected() {
+        let toml = format!("{LEAN_POOL_BASE}\ntwap_window_secs = 0\n");
+        let err = Config::from_toml(&toml).expect_err("zero window is rejected");
+        assert!(err.to_string().contains("twap_window_secs"));
+    }
+
+    #[test]
+    fn a_twap_deviation_without_a_window_is_rejected() {
+        let toml = format!("{LEAN_POOL_BASE}\ntwap_max_deviation_bps = 50\n");
+        let err = Config::from_toml(&toml).expect_err("deviation needs the window");
+        assert!(err.to_string().contains("twap_window_secs"));
+    }
+
+    #[test]
+    fn a_zero_twap_deviation_is_rejected() {
+        let toml =
+            format!("{LEAN_POOL_BASE}\ntwap_window_secs = 180\ntwap_max_deviation_bps = 0\n");
+        let err = Config::from_toml(&toml).expect_err("zero deviation is rejected");
+        assert!(err.to_string().contains("twap_max_deviation_bps"));
+    }
+
+    #[test]
+    fn a_twap_deviation_at_or_above_10000_bps_is_rejected() {
+        // 10000 bps collapses ask_floor to ≤ 0 and silently disables the guard.
+        let toml =
+            format!("{LEAN_POOL_BASE}\ntwap_window_secs = 60\ntwap_max_deviation_bps = 10000\n");
+        let err = Config::from_toml(&toml).expect_err("10000 bps deviation is rejected");
+        assert!(err.to_string().contains("twap_max_deviation_bps"));
+    }
+
+    #[test]
+    fn a_ttl_at_or_below_the_live_deadline_margin_is_rejected() {
+        // The indexer only serves orders with deadline > chain_time + 30s.
+        // ttl == 30 posts orders that are immediately invisible; ttl == 15
+        // (the short-ETH temptation) is the same footgun.
+        for ttl in [0_u64, 15, LIVE_ORDER_DEADLINE_MARGIN_SECS] {
+            let toml = LEAN_POOL_BASE.replace("ttl_secs = 120", &format!("ttl_secs = {ttl}"));
+            let err =
+                Config::from_toml(&toml).expect_err(&format!("ttl_secs = {ttl} must be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ttl_secs") && msg.contains("deadline margin"),
+                "unexpected error for ttl={ttl}: {msg}"
+            );
+        }
+    }
 
     #[test]
     fn lean_defaults_to_off_and_live_wins_over_shadow() {
@@ -598,7 +754,7 @@ mod tests {
             debt_decimals = 6
             buy_offset_bps = 150
             buy_order_size_debt = "1000000000"
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
         "#;
         let cfg = Config::from_toml(toml).expect("buy-only config parses");

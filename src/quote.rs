@@ -67,6 +67,47 @@ pub fn ask_price(mid: f64, spread: Spread) -> f64 {
     }
 }
 
+/// Per-tick guard on TWAP-centered quotes: never post a side more than the
+/// configured deviation *through* the instantaneous feed. A smoothed center
+/// deliberately lags spot — that is the whole point (sell into spikes above
+/// the reverting mean) — but on a move that persists, an unguarded ask keeps
+/// selling further and further below the market, every tick, until the
+/// average catches up. The guard bounds that: the ask never posts more than
+/// the deviation below spot, the bid never more than it above, so a trend's
+/// worst case is a known, tuned cost instead of the full move.
+///
+/// The clamp is one-sided per side and can only move a quote AWAY from being
+/// picked off (ask up, bid down). A glitched feed print therefore can't drag
+/// a quote toward it: a bad high print lifts the ask (unfillable, harmless)
+/// and leaves the bid on the smoothed center; a bad low print mirrors that.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpotDeviationGuard {
+    /// Lowest allowed ask: `spot × (1 − deviation)`.
+    pub ask_floor: f64,
+    /// Highest allowed bid: `spot × (1 + deviation)`.
+    pub bid_cap: f64,
+}
+
+impl SpotDeviationGuard {
+    pub fn new(spot: f64, max_deviation_bps: u32) -> Self {
+        let dev = f64::from(max_deviation_bps) / 10_000.0;
+        Self {
+            ask_floor: spot * (1.0 - dev),
+            bid_cap: spot * (1.0 + dev),
+        }
+    }
+
+    /// The bid, clamped down to at most `deviation` above spot.
+    pub fn clamp_bid(&self, bid: f64) -> f64 {
+        bid.min(self.bid_cap)
+    }
+
+    /// The ask, clamped up to at least `deviation` below spot.
+    pub fn clamp_ask(&self, ask: f64) -> f64 {
+        ask.max(self.ask_floor)
+    }
+}
+
 /// `(input_debt_atomic, output_collateral_atomic)` for a BUY order at `bid`
 /// (USDT per cNGN): the operator pays `size_debt_atomic` of debt (USDT) and
 /// buys `size / bid` of collateral (cNGN).
@@ -225,6 +266,54 @@ mod tests {
         assert!(bid < mid && mid < ask);
         assert!((bid - 1.0 / 1384.0).abs() < 1e-15);
         assert!((ask - 1.0 / 1380.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn guard_is_inactive_while_the_twap_center_tracks_spot() {
+        // Spot 3000, center 3001 (well within a 50 bps deviation): both sides
+        // quote off the smoothed center untouched.
+        let g = SpotDeviationGuard::new(3_000.0, 50);
+        let bid = bid_price(3_001.0, Spread::Bps(5));
+        let ask = ask_price(3_001.0, Spread::Bps(5));
+        assert_eq!(g.clamp_bid(bid), bid);
+        assert_eq!(g.clamp_ask(ask), ask);
+    }
+
+    #[test]
+    fn guard_lifts_a_lagging_ask_on_a_persistent_up_move() {
+        // Spot ran to 3060 (+200 bps) while the center still says 3000: the
+        // raw ask (3001.5) would sell ~190 bps below the market every tick.
+        // The guard trails it at 50 bps below spot instead.
+        let g = SpotDeviationGuard::new(3_060.0, 50);
+        let ask = ask_price(3_000.0, Spread::Bps(5));
+        let clamped = g.clamp_ask(ask);
+        assert!((clamped - 3_060.0 * 0.995).abs() < 1e-9);
+        assert!(clamped > ask);
+        // The bid keeps the smoothed center — deep below spot, it only fills
+        // if the move fully reverts, which is the reversion win.
+        let bid = bid_price(3_000.0, Spread::Bps(5));
+        assert_eq!(g.clamp_bid(bid), bid);
+    }
+
+    #[test]
+    fn guard_drops_a_lagging_bid_on_a_persistent_down_move() {
+        let g = SpotDeviationGuard::new(2_940.0, 50);
+        let bid = bid_price(3_000.0, Spread::Bps(5));
+        let clamped = g.clamp_bid(bid);
+        assert!((clamped - 2_940.0 * 1.005).abs() < 1e-9);
+        assert!(clamped < bid);
+        let ask = ask_price(3_000.0, Spread::Bps(5));
+        assert_eq!(g.clamp_ask(ask), ask);
+    }
+
+    #[test]
+    fn guard_still_sells_into_a_spike_inside_the_deviation() {
+        // The strategy's win: spot spikes +40 bps, the center holds. The ask
+        // (center + 5 bps) is ~35 bps below spot — inside the 50 bps budget,
+        // so it stays and sells into the spike above the reverting mean.
+        let g = SpotDeviationGuard::new(3_000.0 * 1.004, 50);
+        let ask = ask_price(3_000.0, Spread::Bps(5));
+        assert_eq!(g.clamp_ask(ask), ask);
     }
 
     #[test]

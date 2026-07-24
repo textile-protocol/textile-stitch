@@ -21,7 +21,8 @@ use crate::funding::{
 use crate::ladder::balanced_ladder;
 use crate::poster::{drafted_input, OrderDraft, Poster};
 use crate::quote::{
-    ask_price, bid_price, buy_amounts_at, collateral_for_debt_ceil_at, sell_amounts_at, Spread,
+    ask_price, bid_price, buy_amounts_at, collateral_for_debt_ceil_at, sell_amounts_at,
+    SpotDeviationGuard, Spread,
 };
 use crate::slots::{
     forget_spent_slot_nonces, remember_slot_inputs, reusable_slot_input, save_slot_nonce_state,
@@ -78,6 +79,18 @@ impl Side {
         match self {
             Side::Bid => bid_price(mid, spread),
             Side::Ask => ask_price(mid, spread),
+        }
+    }
+
+    /// Clamp this side's price to the spot-deviation guard (TWAP quoting):
+    /// the bid is capped from above, the ask floored from below, so a lagging
+    /// smoothed center can never post more than the configured deviation
+    /// through the instantaneous feed. `None` (TWAP off) passes through.
+    pub fn guarded_price(self, price: f64, guard: Option<SpotDeviationGuard>) -> f64 {
+        match (self, guard) {
+            (Side::Bid, Some(g)) => g.clamp_bid(price),
+            (Side::Ask, Some(g)) => g.clamp_ask(price),
+            (_, None) => price,
         }
     }
 
@@ -180,7 +193,9 @@ impl SideOutcome {
 /// flow exactly: requote gate → sizes → drafts → persist ledger → post →
 /// rotate any spent nonce → record posted inputs → account for the replacement.
 /// `price_override` (the inventory lean's live price) replaces the configured
-/// spread's price when set; sizing and everything else are unchanged.
+/// spread's price when set; sizing and everything else are unchanged. `guard`
+/// (TWAP quoting's spot-deviation bound) clamps whichever price is in effect,
+/// so the lean and the configured spread go through the same protection.
 #[allow(clippy::too_many_arguments)]
 pub async fn quote_side(
     ctx: &TickCtx<'_>,
@@ -193,6 +208,7 @@ pub async fn quote_side(
     side: Side,
     mid: f64,
     price_override: Option<f64>,
+    guard: Option<SpotDeviationGuard>,
     now: u64,
 ) -> SideOutcome {
     // A side without a configured spread is off, override or not — the lean
@@ -200,7 +216,10 @@ pub async fn quote_side(
     let Some(spread) = side.spread(pool) else {
         return SideOutcome::held();
     };
-    let price = price_override.unwrap_or_else(|| side.price(mid, spread));
+    let price = side.guarded_price(
+        price_override.unwrap_or_else(|| side.price(mid, spread)),
+        guard,
+    );
     let key_id = side.key_id(pair);
     let label = side.label();
     if !should_requote_now(
@@ -585,6 +604,20 @@ mod tests {
     fn side_token_orientation_mirrors_bid_and_ask() {
         assert_eq!(Side::Bid.tokens(DEBT, COLLATERAL), (DEBT, COLLATERAL));
         assert_eq!(Side::Ask.tokens(DEBT, COLLATERAL), (COLLATERAL, DEBT));
+    }
+
+    #[test]
+    fn guarded_price_clamps_each_side_toward_safety_only() {
+        // Spot 3060, center lagging at 3000, 50 bps deviation budget.
+        let guard = Some(SpotDeviationGuard::new(3_060.0, 50));
+        // The lagging ask is lifted to trail 50 bps below spot...
+        let lifted = Side::Ask.guarded_price(3_001.5, guard);
+        assert!((lifted - 3_060.0 * 0.995).abs() < 1e-9);
+        // ...while the bid (already deep below spot) is untouched.
+        assert_eq!(Side::Bid.guarded_price(2_998.5, guard), 2_998.5);
+        // No guard (TWAP off) passes prices through.
+        assert_eq!(Side::Ask.guarded_price(3_001.5, None), 3_001.5);
+        assert_eq!(Side::Bid.guarded_price(2_998.5, None), 2_998.5);
     }
 
     #[test]

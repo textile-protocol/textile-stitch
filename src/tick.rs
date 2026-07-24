@@ -18,8 +18,18 @@ pub fn is_stale(feed_ts: u64, now: u64, staleness_secs: u64) -> bool {
     now.saturating_sub(feed_ts) > staleness_secs
 }
 
+/// True if a feed price can be quoted off: finite and strictly positive.
+/// Zero, negative, NaN, and infinite prices are feed malfunctions — the tick
+/// loop skips the pool on them (going dark, like a stale feed) rather than
+/// letting them reach the maker or the TWAP.
+pub fn is_price_usable(price: f64) -> bool {
+    price.is_finite() && price > 0.0
+}
+
 /// True if we should sign a fresh order: no prior bid, or the bid moved at
-/// least `threshold_bps` since the last one.
+/// least `threshold_bps` since the last one. A zero threshold re-quotes every
+/// tick (any move, including none, clears it) — the default: posting is
+/// off-chain and free, and a deadband only lets quotes drift stale.
 pub fn should_requote(last_bid: Option<f64>, new_bid: f64, threshold_bps: u32) -> bool {
     match last_bid {
         None => true,
@@ -83,12 +93,34 @@ mod tests {
     }
 
     #[test]
+    fn only_finite_positive_prices_are_usable() {
+        assert!(is_price_usable(3_000.0));
+        assert!(is_price_usable(f64::MIN_POSITIVE));
+        // A fresh timestamp can still carry a malfunctioning price; each of
+        // these must take the pool dark, not reach the maker or the TWAP.
+        assert!(!is_price_usable(0.0));
+        assert!(!is_price_usable(-5.0));
+        assert!(!is_price_usable(f64::NAN));
+        assert!(!is_price_usable(f64::INFINITY));
+        assert!(!is_price_usable(f64::NEG_INFINITY));
+    }
+
+    #[test]
     fn requotes_on_first_quote_and_big_moves() {
         assert!(should_requote(None, 1.0, 10));
         // 0.05% move, threshold 0.10% → no.
         assert!(!should_requote(Some(1.0), 1.0005, 10));
         // 0.20% move, threshold 0.10% → yes.
         assert!(should_requote(Some(1.0), 1.002, 10));
+    }
+
+    #[test]
+    fn a_zero_threshold_requotes_every_tick_even_flat() {
+        // The no-deadband mode: the quote re-posts each tick, pinned to the
+        // current center, instead of drifting stale between 10 bps moves.
+        assert!(should_requote(Some(1.0), 1.0, 0));
+        assert!(should_requote(Some(1.0), 1.0000001, 0));
+        assert!(should_requote_now(Some((1.0, 0)), 1.0, 0, 1, 120, 60));
     }
 
     #[test]

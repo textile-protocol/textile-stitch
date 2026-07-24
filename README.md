@@ -238,8 +238,10 @@ When several corridors spend the same token (for example two pools that both
 buy with USDC) and more than one of them is set to `"max"`, Stitch splits the
 token's funded balance into even target shares on every tick, so an existing
 corridor can't keep the whole wallet after another max side is added. For
-the price-feed orientation, spread options, ladder sizing, and the
-limit-order taker, see the
+the price-feed orientation, spread options, TWAP quoting (centering the
+spread on a rolling average of the feed instead of the instantaneous value —
+recommended for volatile pairs like WETH), ladder sizing, and the limit-order
+taker, see the
 [configuration reference in ADVANCED.md](docs/ADVANCED.md#configuration-reference).
 
 ## Security Notes

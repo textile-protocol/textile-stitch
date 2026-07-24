@@ -301,7 +301,7 @@ mod tests {
             collateral_decimals = 6
             debt = "{DEBT}"
             debt_decimals = 6
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
             {pool_body}
         "#
@@ -369,7 +369,7 @@ mod tests {
             collateral_decimals = 6
             debt = "{DEBT}"
             debt_decimals = 6
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
             buy_offset_bps = 150
             buy_order_size_debt = "1000000000"
@@ -378,7 +378,7 @@ mod tests {
             collateral_decimals = 6
             debt = "{DEBT}"
             debt_decimals = 6
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
             buy_offset_bps = 150
             buy_order_size_debt = "2000000000"
@@ -466,7 +466,7 @@ mod tests {
             collateral_decimals = 6
             debt = "{DEBT}"
             debt_decimals = 6
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
             buy_offset_bps = 150
             buy_total_liquidity_debt = "max"
@@ -476,7 +476,7 @@ mod tests {
             collateral_decimals = 6
             debt = "{DEBT}"
             debt_decimals = 6
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
             buy_offset_bps = 150
             buy_order_size_debt = "2000000000"

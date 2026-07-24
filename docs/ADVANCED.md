@@ -58,6 +58,72 @@ sell_offset_abs = 5.0
 
 If both are set for a side, basis points win.
 
+### TWAP Quoting (Smoothed Center)
+
+By default each quote centers on the feed's instantaneous value. For a
+volatile pair like WETH that means the book chases every tick: when the price
+spikes for a few seconds and reverts, the quote either chases the spike (and
+buys the top) or sits stale (and the resting side gets picked off). Setting
+`twap_window_secs` centers the spread on a short rolling time-weighted average
+of the feed instead:
+
+```toml
+twap_window_secs = 60         # ~1 min rolling TWAP; omit to quote off spot
+# twap_max_deviation_bps = 50 # optional guard, default 50 — see below
+refresh_threshold_bps = 0     # no deadband: stay pinned to the smoothed center
+```
+
+The average moves slowly, so a transient spike leaves the quote near the
+settled mean: the ask sells *into* the spike above the reverting average and
+keeps the spread when it snaps back. A move that persists flows into the
+average, and the center fully converges within one window. The trade is
+explicit — TWAP wins on noise (spikes that revert) and pays a lag on trend
+(moves that persist) — so it's worth it exactly when short-term price action
+is more noise than trend. Two knobs to tune:
+
+- **The window** (`twap_window_secs`, ~60–300s is sensible): longer filters
+  more noise but lags real moves more.
+- **The spread** (`buy_offset_bps` / `sell_offset_bps`): what each fill earns
+  around the center.
+
+The TWAP weights each feed observation by how long it was actually live
+(last observation carried forward), so it is correct for both a fast feed
+(fresh sample every tick) and a slow one (the cNGN center re-samples every
+~3 min — though for a feed that smoothed already, a TWAP on top adds little).
+A feed gap longer than `staleness_secs` resets the average rather than
+carrying a price across an outage the bot refused to quote through.
+
+**The deviation guard.** The lag on trend needs a bound: with the book
+re-posting every tick, an unguarded ask would keep selling further and further
+below a market that keeps rising until the average catches up.
+`twap_max_deviation_bps` (default 50) trails each side at most that far
+through the instantaneous feed — the ask never posts more than the deviation
+below spot, the bid never more than it above. The clamp only ever moves a
+quote *away* from being picked off (ask up, bid down), which also makes it
+glitch-safe: a single bad feed print lifts the ask out of reach (unfillable,
+harmless) instead of dragging the bid toward the glitch. Inside the deviation
+budget nothing is clamped, so ordinary spikes still get sold into.
+
+**Drop the deadband with TWAP.** `refresh_threshold_bps` exists to skip
+re-signing when the price barely moved, but a TWAP center *always* barely
+moves — a deadband on top of it holds the book stale between threshold
+crossings, which is the exact failure TWAP is meant to fix. Set it to 0 (or
+remove it; 0 is the default) so the book re-posts every `tick_interval_secs`,
+pinned to the current center. Posting is off-chain and free. The costs of
+every-tick reposting are local: one balance/allowance read per side per tick
+against your RPC, and one signature per live order per tick — a full 40-slice
+ladder on both sides is 80 signatures per tick, instant for the local
+hotwallet but a round trip each for an MPC signer (raise
+`max_concurrent_signs`, or lengthen `tick_interval_secs`, if your signing
+backend rate-limits).
+
+TWAP composes with the inventory lean: the lean's fair price becomes the
+smoothed center, and the deviation guard clamps the lean's quotes the same as
+the configured spreads. The auction closer deliberately keeps pricing off the
+instantaneous feed — it values a one-shot on-chain fill at execution time,
+where the current price is the right mark; the TWAP smooths standing quotes
+that rest in the book waiting to be picked off.
+
 ### Liquidity And Order Sizing
 
 Stitch can post one order per side or a ladder of smaller orders:
@@ -417,7 +483,8 @@ Check these in order:
 6. The spread is not so wide that your orders are outside the expected fill
    range.
 7. `refresh_threshold_bps` has not prevented an unchanged quote from being
-   reposted.
+   reposted (0 — the default — re-posts every tick; see
+   [TWAP Quoting](#twap-quoting-smoothed-center)).
 
 For the buy side, the wallet spends the pool's `debt` token. For the sell side,
 the wallet spends the pool's `collateral` token.

@@ -33,13 +33,14 @@ use stitch_bot::lean::{LeanDecision, LeanMode, LeanParams, LeanState};
 use stitch_bot::maker::{quote_side, QuoteState, Side, SideOutcome, TickCtx};
 use stitch_bot::poster::Poster;
 use stitch_bot::quote::oracle_rate_ray;
-use stitch_bot::quote::{ask_price, bid_price};
+use stitch_bot::quote::{ask_price, bid_price, SpotDeviationGuard};
 use stitch_bot::rpc::Wallet;
 use stitch_bot::setup;
 use stitch_bot::signer::{address_from_signing_key, build_signer};
 use stitch_bot::slots::{load_slot_nonce_state, slot_nonce_state_path};
 use stitch_bot::taker::{resolve_fee_bps, take_pool_once, TakeOutcome, TakerCtx};
-use stitch_bot::tick::{is_stale, unix_now};
+use stitch_bot::tick::{is_price_usable, is_stale, unix_now};
+use stitch_bot::twap::Twap;
 use stitch_bot::update::{run_update, warn_if_outdated};
 
 /// Build the blue-leg close target from a pool's config (assumes `closer_enabled`).
@@ -537,6 +538,30 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     let max_sides_by_token = count_max_sides(&cfg);
     // Per pair: the inventory lean's smoothed offsets, share, and jump guard.
     let mut lean_states: HashMap<String, LeanState> = HashMap::new();
+    // Per pool index: the rolling TWAP the maker/taker center on when
+    // configured. Keyed by index (not token pair) so two [[pools]] blocks that
+    // share a pair — or override feed_url differently — each keep their own
+    // history and window instead of silently sharing one Twap.
+    let mut twaps: HashMap<usize, Twap> = HashMap::new();
+    for pool in &cfg.pools {
+        if let Some(window) = pool.twap_window() {
+            info!(
+                collateral = %pool.collateral,
+                window_secs = window,
+                max_deviation_bps = pool.twap_deviation_bps(),
+                "TWAP quoting on: spreads center on the rolling feed average"
+            );
+            if pool.refresh_threshold_bps > 0 {
+                warn!(
+                    collateral = %pool.collateral,
+                    refresh_threshold_bps = pool.refresh_threshold_bps,
+                    "a re-quote deadband on a slow-moving TWAP center lets quotes sit stale \
+                     between threshold crossings; set refresh_threshold_bps = 0 (or remove it) \
+                     to keep the book pinned to the smoothed center"
+                );
+            }
+        }
+    }
     let mut interval = tokio::time::interval(Duration::from_secs(cfg.tick_interval_secs.max(1)));
 
     // Exit cleanly on Ctrl-C / SIGTERM. We only check between ticks, so a signal
@@ -553,10 +578,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             }
             _ = interval.tick() => {}
         }
-        let now = unix_now();
         let mut budgets = TickBudgets::new(max_sides_by_token.clone());
 
-        'pools: for pool in &cfg.pools {
+        'pools: for (pool_idx, pool) in cfg.pools.iter().enumerate() {
             // Each pool prices off its own feed (or the bot-level default).
             let feed_url = pool.feed_url.as_deref().unwrap_or(cfg.feed.url.as_str());
             let quote = match feeds
@@ -571,8 +595,22 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     continue;
                 }
             };
+            // Read the clock per pool, AFTER the awaited fetch — not once at
+            // tick start. Earlier pools' signing/posting awaits (or the fetch
+            // itself) can stall past the TWAP window; a tick-start `now` would
+            // understate that gap, defeat the TWAP's bot-observation-gap
+            // reset, and place the averaging window in the pre-stall past.
+            let now = unix_now();
             if is_stale(quote.timestamp, now, cfg.feed.staleness_secs) {
                 warn!(feed = %feed_url, feed_ts = quote.timestamp, now, "stale feed; skipping pool");
+                continue;
+            }
+            // A fresh timestamp with a garbage price (zero, negative, NaN) is
+            // as untradeable as a stale one: go dark for the pool instead of
+            // letting the maker, taker, closer — or a TWAP carrying an old
+            // valid sample — keep quoting through the malfunction.
+            if !is_price_usable(quote.price) {
+                warn!(feed = %feed_url, price = quote.price, "unusable feed price; skipping pool");
                 continue;
             }
 
@@ -590,6 +628,32 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                 pool.debt.to_lowercase()
             );
 
+            // ----- Price surface. `spot` is this tick's feed value; `mid` is
+            // the center the maker, taker, and lean quote off — the rolling
+            // TWAP when configured, so the book holds near the settled mean
+            // instead of chasing every tick. The guard bounds how far a
+            // lagging center may post through spot on a persistent move. -----
+            let spot = quote.price;
+            let (mid, guard) = match pool.twap_window() {
+                Some(window) => {
+                    let twap = twaps
+                        .entry(pool_idx)
+                        .or_insert_with(|| Twap::new(window, cfg.feed.staleness_secs));
+                    if let Some(reason) = twap.observe(quote.timestamp, spot, now) {
+                        // A reset drops the TWAP back to spot: the smoothing is
+                        // gone until the window refills. Never silent — an
+                        // operator watching a flapping feed or a slept laptop
+                        // needs to know the fade behavior isn't live.
+                        warn!(pair = %pair, reason, "TWAP history reset — quoting off spot until the window refills");
+                    }
+                    (
+                        twap.value(now).unwrap_or(spot),
+                        Some(SpotDeviationGuard::new(spot, pool.twap_deviation_bps())),
+                    )
+                }
+                None => (spot, None),
+            };
+
             // ----- Inventory lean. Shadow computes and logs next to the live
             // quotes (no behavior change); Live replaces the maker prices. The
             // share is re-read on fills and at most once per 60s otherwise. -----
@@ -606,7 +670,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                                 pool.collateral_decimals,
                                 debt_bal,
                                 pool.debt_decimals,
-                                quote.price,
+                                mid,
                                 now,
                                 &params,
                             ),
@@ -616,8 +680,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             ),
                         }
                     }
-                    let decision = lean_state.decide(quote.price, &params);
-                    log_lean(mode, &pair, pool, quote.price, &params, &decision);
+                    let decision = lean_state.decide(mid, &params);
+                    log_lean(mode, &pair, pool, mid, &params, &decision);
                     Some((mode, decision))
                 }
             };
@@ -650,8 +714,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     debt,
                     collateral,
                     side,
-                    quote.price,
+                    mid,
                     price_override,
+                    guard,
                     now,
                 )
                 .await;
@@ -681,7 +746,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                 *last = now;
                 info!(
                     pair = %pair,
-                    price = quote.price,
+                    price = spot,
+                    mid,
                     bids_posted = posted_bid,
                     asks_posted = posted_ask,
                     "tick"
@@ -696,16 +762,20 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     // quotes as the maker — one price surface, and a pulled
                     // side takes nothing. A side without a configured spread
                     // stays off either way (the lean never enables a side).
+                    // The same TWAP center and spot-deviation guard apply, so
+                    // the maker's book and the taker's fills never disagree.
                     let (taker_bid, taker_ask) = match lean {
                         Some((LeanMode::Live, decision)) => (
                             pool.buy_spread().and(decision.bid),
                             pool.sell_spread().and(decision.ask),
                         ),
                         _ => (
-                            pool.buy_spread().map(|s| bid_price(quote.price, s)),
-                            pool.sell_spread().map(|s| ask_price(quote.price, s)),
+                            pool.buy_spread().map(|s| bid_price(mid, s)),
+                            pool.sell_spread().map(|s| ask_price(mid, s)),
                         ),
                     };
+                    let taker_bid = taker_bid.map(|p| Side::Bid.guarded_price(p, guard));
+                    let taker_ask = taker_ask.map(|p| Side::Ask.guarded_price(p, guard));
                     let taker_ctx = TakerCtx {
                         collateral,
                         debt,
@@ -778,6 +848,11 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         }
                     };
                     let strategy = StrategyConfig {
+                        // Deliberately the instantaneous feed, not the TWAP
+                        // mid: the closer values a one-shot on-chain fill at
+                        // execution time, where the current price is the
+                        // right mark. The TWAP smooths standing quotes that
+                        // rest in the book waiting to be picked off.
                         oracle_rate_ray: oracle_rate_ray(
                             quote.price,
                             pool.debt_decimals,

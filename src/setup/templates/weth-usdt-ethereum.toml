@@ -29,6 +29,12 @@ debt_decimals = 6
 # the live mid, or a fast move picks the resting side off. Tune to your own feed
 # and RPC latency before funding — and prefer inventory-lean (see the block at
 # the bottom) once you've measured the floor.
+#
+# This template also centers the spread on a 3-minute rolling TWAP of the feed
+# (twap_window_secs below) instead of the instantaneous value, so the book
+# stops chasing every tick: transient spikes get sold into above the reverting
+# mean instead of picking off a chased quote. See "TWAP Quoting" in
+# docs/ADVANCED.md for how to tune the window and the deviation guard.
 
 # Buy low: bid below the mid, paying USDT for WETH. Funds USDT + Permit2 on USDT.
 buy_offset_bps = 5                                # 5 bps below mid
@@ -42,8 +48,37 @@ sell_total_liquidity_collateral = "max"           # quote all funded WETH
 sell_min_slice_debt = "10000000"                  # 10 USDT-equivalent slice (6dp)
 sell_max_orders = 40
 
-ttl_secs = 120
-refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
+ttl_secs = 60                                     # SHORT on ETH: a resting order can't
+                                                  # be cancelled, only expired — so the TTL
+                                                  # is the real staleness window. Must clear
+                                                  # the indexer's 30s live-deadline margin
+                                                  # (shorter posts are accepted but never
+                                                  # served as fillable depth); 60s leaves
+                                                  # ~30s of visible life and still caps how
+                                                  # far a stale signature can sit through a
+                                                  # move (was 120).
+refresh_threshold_bps = 0                         # no deadband: re-post every tick,
+                                                  # pinned to the current TWAP center
+                                                  # (posting is off-chain and free)
+
+# Center the spread on a rolling time-weighted average of the feed instead of
+# the instantaneous value. The average moves slowly, so a transient ETH spike
+# leaves the quote near the settled mean — the ask sells into the spike above
+# the reverting average and keeps the spread when it snaps back — while a
+# persistent move flows into the average within one window. Two knobs:
+# a longer window filters more noise but lags real moves more; the spread
+# (above) is what each fill earns around the center.
+twap_window_secs = 60                             # ~1 min rolling TWAP. The reverting
+                                                  # noise this harvests lives at the
+                                                  # seconds-to-a-minute scale; a shorter
+                                                  # window still fades those spikes but
+                                                  # lags a real trend far less (~15 bps vs
+                                                  # ~50 bps for a 3-min window), which is
+                                                  # what sets the odds of the volatility bet.
+# On a move that persists, the lagging center would keep a stale side posted
+# through the market every tick; the guard trails it at most this far through
+# the instantaneous feed (ask below spot / bid above spot). Default 50.
+# twap_max_deviation_bps = 50
 
 # Inventory-lean quoting (off by default): lean both spreads against the
 # wallet's own inventory so the book self-rebalances and never freezes

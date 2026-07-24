@@ -614,7 +614,7 @@ mod tests {
             collateral_decimals = 6
             debt = "0x00000000000000000000000000000000000000dd"
             debt_decimals = 6
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
             buy_offset_bps = 150
             buy_total_liquidity_debt = "max"
@@ -627,7 +627,7 @@ mod tests {
             collateral_decimals = 6
             debt = "0x00000000000000000000000000000000000000dd"
             debt_decimals = 6
-            ttl_secs = 30
+            ttl_secs = 60
             refresh_threshold_bps = 10
             buy_offset_bps = 150
             buy_total_liquidity_debt = "max"

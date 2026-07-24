@@ -34,6 +34,7 @@ pub mod slots;
 pub mod submit;
 pub mod taker;
 pub mod tick;
+pub mod twap;
 pub mod tx;
 pub mod types;
 pub mod update;
