@@ -1,0 +1,110 @@
+# The Stitch admin panel, reachable only over your tailnet.
+#
+# Two services: a Tailscale sidecar that joins the tailnet and terminates TLS,
+# and the panel itself sharing that sidecar's network namespace. The panel binds
+# 127.0.0.1 inside that namespace, so the only path to it is through
+# `tailscale serve` — there is no published port on the host at all.
+#
+# Setup, once:
+#   1. Mint a reusable, ephemeral-off auth key in the Tailscale admin console and
+#      put it in .env as TS_AUTHKEY.
+#   2. Put your tailnet login in .env as PANEL_USERS (comma-separated for a team).
+#   3. Create the bots root:  sudo mkdir -p /srv/stitch/bots
+#   4. docker compose -f docker-compose.panel.yml up -d --build
+#   5. Open https://stitch-panel.<your-tailnet>.ts.net
+#
+# If you don't want Tailscale, see docs/install-panel.md for the password-only
+# variant. Don't publish this port to the internet: reaching the panel means
+# reaching the Docker socket, which means owning the host.
+
+services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: stitch-panel-tailscale
+    # Becomes the MagicDNS name, so the panel lives at
+    # https://stitch-panel.<tailnet>.ts.net once serve is up.
+    hostname: stitch-panel
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in .env — mint one in the Tailscale admin console}
+      TS_STATE_DIR: /var/lib/tailscale
+      # Declarative `tailscale serve`: TLS on 443 with a MagicDNS cert, proxied
+      # to the panel on loopback. Editing this file and recreating the container
+      # is the whole configuration surface.
+      TS_SERVE_CONFIG: /config/serve.json
+      # Kernel networking via /dev/net/tun. Userspace mode also works but is
+      # slower and needs no capabilities, if your host won't give up the device.
+      TS_USERSPACE: "false"
+      # Deliberately untagged. A tag has to exist in your tailnet policy file
+      # first, and `tailscale up` fails outright if it doesn't — a bad first-run
+      # experience for a hardening step. docs/install-panel.md covers tagging the
+      # panel node once you're past setup.
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./deploy/panel-serve.json:/config/serve.json:ro
+    devices:
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+
+  panel:
+    build:
+      context: .
+      dockerfile: Dockerfile.panel
+    # Tag the built image explicitly. Left off, Compose names it after the project —
+    # `<directory>-panel` — so the tag changes with wherever the repo was cloned. The
+    # panel excludes itself from the fleet by the Docker socket it mounts rather than
+    # by name, so this is tidiness rather than the safety net, but an image whose name
+    # depends on a path is worth not having.
+    #
+    # To pull the published image instead of building, set this to
+    # ghcr.io/textile-protocol/textile-stitch-panel:latest and drop the `build:` above.
+    image: ${PANEL_IMAGE:-stitch-panel}
+    container_name: stitch-panel
+    # No ports, no network of its own: the panel is only reachable through the
+    # sidecar. This is the security model, not a convenience.
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+    environment:
+      RUST_LOG: info
+      # Loopback inside the sidecar's namespace. `tailscale serve` proxies here.
+      STITCH_PANEL_BIND: 127.0.0.1:8420
+      # Where the panel sees bot configs, and where the *host* sees the same
+      # directory. Both are needed: the panel writes through the first path and
+      # tells Docker to bind-mount the second into each bot.
+      STITCH_PANEL_BOTS_DIR: /data/bots
+      STITCH_PANEL_HOST_BOTS_DIR: ${PANEL_BOTS_DIR:-/srv/stitch/bots}
+      # Who may drive it.
+      STITCH_PANEL_TAILNET_USERS: ${PANEL_USERS:?set PANEL_USERS in .env — your tailnet login, e.g. you@example.com}
+      # Believe the Tailscale-User-Login header. Correct *here* and only here:
+      # `network_mode: service:tailscale` above means this loopback is the
+      # sidecar's, so `tailscale serve` is the only thing that can reach the
+      # listener and it sets the header itself. Run the panel on the host instead
+      # and its loopback is the host's, shared with every local process — any of
+      # which could then send an allowlisted login and own the Docker socket. So
+      # the panel never infers this from its bind address; it has to be said.
+      STITCH_PANEL_TRUST_IDENTITY_HEADER: "1"
+      # Optional fallback for when you're not going through `tailscale serve`.
+      # Generate with: docker compose -f docker-compose.panel.yml run --rm panel hash-password
+      STITCH_PANEL_PASSWORD_HASH: ${PANEL_PASSWORD_HASH:-}
+      # Image new bots run. Pin a tag in production so a restart can't change
+      # the bot binary under you.
+      STITCH_PANEL_BOT_IMAGE: ${STITCH_BOT_IMAGE:-ghcr.io/textile-protocol/textile-stitch:latest}
+    volumes:
+      # Root-equivalent by design: creating and configuring bot containers is
+      # the panel's entire job.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Must be the same host path as STITCH_PANEL_HOST_BOTS_DIR, or the bots the
+      # panel creates will mount an empty directory.
+      - ${PANEL_BOTS_DIR:-/srv/stitch/bots}:/data/bots
+    restart: unless-stopped
+    # Long enough for an in-flight settings save to finish writing and restart
+    # the bot it was editing.
+    stop_grace_period: 30s
+
+volumes:
+  # Keeps the tailnet node identity across restarts, so the panel doesn't show
+  # up as a new machine (and a new hostname) every deploy.
+  tailscale-state:

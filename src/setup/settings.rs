@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Read and edit the handful of `stitch.toml` values the desktop Settings screen
-//! exposes (RPC URL, price-feed URL, and the first pool's buy/sell spreads).
+//! Read and edit the `stitch.toml` values the Settings surfaces expose: endpoints,
+//! per-pool spreads, ladder sizing, order lifetime and the tick cadence.
 //!
-//! Edits go through `toml_edit` so the template's comments and layout survive a
-//! save, and every edit is re-validated through `Config::from_toml` before it is
-//! handed back — a bad value fails here, so the caller never writes a broken file.
-//! The operator wallet is NOT here: it lives in `stitch.key`, edited via
-//! `writer::write_key`.
+//! Shared by the desktop Settings screen and the web admin panel, so both edit
+//! configs through one implementation. Edits go through `toml_edit` so the
+//! template's comments and layout survive a save, and every edit is re-validated
+//! through `Config::from_toml` before it is handed back — a bad value fails here,
+//! so the caller never writes a broken file. The operator wallet is NOT here: it
+//! lives in `stitch.key`, edited via `writer::write_key`.
+//!
+//! Amounts stay strings end to end. They are atomic-unit `u128`/`U256` values, so
+//! parsing them into a float to render or edit would lose precision on large
+//! inventories; the view carries the token decimals instead and lets the caller
+//! format.
 
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-use crate::config::Config;
+use crate::config::{parse_liquidity_amount, parse_min_slice_debt, Config};
 
 /// How a side's spread is expressed in the config. Editing preserves whichever
 /// form the operator's config already uses rather than switching representation.
@@ -33,6 +39,36 @@ pub struct SpreadEdit {
     pub value: String,
 }
 
+/// How one side's ladder is sized. Every value is an atomic-unit integer rendered
+/// as text, empty when the config doesn't set it.
+///
+/// The bot picks the ladder (`total_liquidity` + `min_slice_debt`) over the flat
+/// `order_size` when both are present, so all three are surfaced rather than
+/// collapsed — an operator editing sizing needs to see which one is actually in
+/// effect.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SideSizing {
+    /// Total liquidity to quote as a balanced ladder. Accepts the literal `max`,
+    /// meaning "quote everything funded".
+    pub total_liquidity: String,
+    /// Smallest ladder slice, in atomic debt units on both sides.
+    pub min_slice_debt: String,
+    /// Flat size per order, used only when the ladder pair isn't set.
+    pub order_size: String,
+    /// Cap on live slices for this side. Empty means the bot's own default.
+    pub max_orders: String,
+}
+
+/// The token pair a pool trades, so a caller can format atomic amounts and label
+/// the sizing fields with the right asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolPair {
+    pub collateral: String,
+    pub collateral_decimals: u8,
+    pub debt: String,
+    pub debt_decimals: u8,
+}
+
 /// The current editable settings, read from a `stitch.toml` for form prefill.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsView {
@@ -44,32 +80,82 @@ pub struct SettingsView {
     /// cross the bot's own quote. The raw configured flag, not the spread-gated
     /// effective one, so a saved-but-spreadless value round-trips.
     pub taker_enabled: bool,
-    /// How many pools the config has. The screen only edits the first, and warns
-    /// when there is more than one.
+    /// Which pool the pool-scoped fields above were read from.
+    pub pool_index: usize,
+    /// How many pools the config has. A caller editing one pool warns when there
+    /// is more than one.
     pub pool_count: usize,
+    pub pair: PoolPair,
+    pub buy_sizing: SideSizing,
+    pub sell_sizing: SideSizing,
+    /// Order lifetime for this pool, in seconds.
+    pub ttl_secs: u64,
+    /// How often the bot re-quotes, in seconds. Bot-wide, not per pool.
+    pub tick_interval_secs: u64,
 }
 
-/// The desired new state of the four editable fields. Applied onto the existing
-/// TOML text; the wallet key is handled separately.
-#[derive(Debug, Clone)]
+impl SettingsView {
+    /// A patch that would write these values back unchanged. The starting point
+    /// for a form: mutate the fields the operator edited and leave the rest.
+    pub fn to_patch(&self) -> SettingsPatch {
+        SettingsPatch {
+            pool_index: self.pool_index,
+            rpc_url: self.rpc_url.clone(),
+            feed_url: self.feed_url.clone(),
+            buy: self.buy.clone(),
+            sell: self.sell.clone(),
+            taker_enabled: self.taker_enabled,
+            buy_sizing: Some(self.buy_sizing.clone()),
+            sell_sizing: Some(self.sell_sizing.clone()),
+            ttl_secs: Some(self.ttl_secs),
+            tick_interval_secs: Some(self.tick_interval_secs),
+        }
+    }
+}
+
+/// The desired new state of the editable fields, applied onto the existing TOML
+/// text. The wallet key is handled separately.
+///
+/// The optional fields distinguish "set this to that" from "don't touch it", so a
+/// caller that only edits spreads can leave sizing alone without having to know
+/// its current value.
+#[derive(Debug, Clone, Default)]
 pub struct SettingsPatch {
+    /// Which pool the pool-scoped fields apply to. Defaults to the first.
+    pub pool_index: usize,
     pub rpc_url: String,
     pub feed_url: String,
     pub buy: SpreadEdit,
     pub sell: SpreadEdit,
-    /// Whether the taker leg should be on for the first pool.
+    /// Whether the taker leg should be on for this pool.
     pub taker_enabled: bool,
+    pub buy_sizing: Option<SideSizing>,
+    pub sell_sizing: Option<SideSizing>,
+    pub ttl_secs: Option<u64>,
+    pub tick_interval_secs: Option<u64>,
 }
 
-/// Read the current editable values from a `stitch.toml` body. Parses through the
-/// real `Config` so an unreadable file surfaces the same error the bot would hit.
+/// Read the first pool's editable values from a `stitch.toml` body.
 pub fn read_settings(toml_str: &str) -> Result<SettingsView> {
+    read_settings_at(toml_str, 0)
+}
+
+/// Read one pool's editable values from a `stitch.toml` body. Parses through the
+/// real `Config` so an unreadable file surfaces the same error the bot would hit.
+pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsView> {
     let cfg = Config::from_toml(toml_str)?;
-    let pool = cfg.pools.first().context("config has no [[pools]] entry")?;
+    let pool_count = cfg.pools.len();
+    let pool = cfg.pools.get(pool_index).with_context(|| {
+        if pool_count == 0 {
+            "config has no [[pools]] entry".to_string()
+        } else {
+            format!("config has {pool_count} pools, so there is no pool {pool_index}")
+        }
+    })?;
     Ok(SettingsView {
         rpc_url: cfg.rpc_url.clone(),
-        // The bot prefers the first pool's feed_url override over [feed].url
-        // (see main.rs), so surface the endpoint that's actually effective.
+        // The bot prefers a pool's feed_url override over [feed].url (see
+        // main.rs), so surface the endpoint that's actually effective.
         feed_url: pool
             .feed_url
             .clone()
@@ -77,8 +163,39 @@ pub fn read_settings(toml_str: &str) -> Result<SettingsView> {
         buy: spread_edit(pool.buy_offset_bps, pool.buy_offset_abs),
         sell: spread_edit(pool.sell_offset_bps, pool.sell_offset_abs),
         taker_enabled: pool.limit_taker_enabled.unwrap_or(false),
-        pool_count: cfg.pools.len(),
+        pool_index,
+        pool_count,
+        pair: PoolPair {
+            collateral: pool.collateral.clone(),
+            collateral_decimals: pool.collateral_decimals,
+            debt: pool.debt.clone(),
+            debt_decimals: pool.debt_decimals,
+        },
+        buy_sizing: SideSizing {
+            total_liquidity: opt_str(&pool.buy_total_liquidity_debt),
+            min_slice_debt: opt_str(&pool.buy_min_slice_debt),
+            order_size: opt_str(&pool.buy_order_size_debt),
+            max_orders: opt_num(pool.buy_max_orders),
+        },
+        sell_sizing: SideSizing {
+            total_liquidity: opt_str(&pool.sell_total_liquidity_collateral),
+            // The sell floor is expressed in debt units too — the bot converts
+            // each generated slice into collateral at the live ask price.
+            min_slice_debt: opt_str(&pool.sell_min_slice_debt),
+            order_size: opt_str(&pool.sell_order_size_collateral),
+            max_orders: opt_num(pool.sell_max_orders),
+        },
+        ttl_secs: pool.ttl_secs,
+        tick_interval_secs: cfg.tick_interval_secs,
     })
+}
+
+fn opt_str(v: &Option<String>) -> String {
+    v.clone().unwrap_or_default()
+}
+
+fn opt_num(v: Option<u32>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
 }
 
 /// The current signer, read from a `stitch.toml` for form prefill. Only the
@@ -102,26 +219,56 @@ pub enum SignerView {
     },
 }
 
-/// Read the current signer from a `stitch.toml` body. A missing `[signer]` (or an
-/// unparseable config) reads as the hot wallet.
-pub fn read_signer(toml_str: &str) -> SignerView {
+/// Read the current signer from a `stitch.toml` body.
+///
+/// Reads the `[signer]` table on its own, deliberately *not* through
+/// [`Config::from_toml`]. That validates every field, so keying the signer off it
+/// meant one bad `rpc_url` — or any unrelated typo anywhere in the file — reported a
+/// Turnkey bot as a hot wallet. Downstream that isn't cosmetic: the compose export
+/// would mount `stitch.key` and set `STITCH_PRIVATE_KEY_FILE` for a bot whose secret
+/// is `turnkey-api.key`, so an operator who restored that file and then fixed the
+/// TOML would still have a service that can't start.
+///
+/// `Ok(Local)` means the config really does select the hot wallet: no `[signer]`
+/// table, or `provider = "local"`. `Err` means the body isn't TOML at all, or its
+/// `[signer]` table is malformed — the signer is genuinely unknown, and a caller
+/// about to bake it into a file or a container has to say so rather than guess.
+pub fn try_read_signer(toml_str: &str) -> Result<SignerView> {
     use crate::signer::SignerConfig;
-    match Config::from_toml(toml_str).ok().and_then(|c| c.signer) {
-        Some(SignerConfig::Turnkey(c)) => SignerView::Turnkey {
+    let doc: toml::Value = toml::from_str(toml_str).context("parsing stitch.toml")?;
+    let Some(table) = doc.get("signer") else {
+        return Ok(SignerView::Local);
+    };
+    let signer: SignerConfig = table
+        .clone()
+        .try_into()
+        .context("parsing the [signer] table")?;
+    Ok(match signer {
+        SignerConfig::Turnkey(c) => SignerView::Turnkey {
             organization_id: c.organization_id,
             sign_with: c.sign_with,
             operator_address: c.operator_address,
             api_base_url: c.api_base_url,
         },
-        Some(SignerConfig::Mpcvault(c)) => SignerView::Mpcvault {
+        SignerConfig::Mpcvault(c) => SignerView::Mpcvault {
             vault_uuid: c.vault_uuid,
             client_signer_pubkey: c.client_signer_pubkey,
             operator_address: c.operator_address,
             api_base_url: c.api_base_url,
             callback_listen_addr: c.callback_listen_addr,
         },
-        _ => SignerView::Local,
-    }
+        SignerConfig::Local => SignerView::Local,
+    })
+}
+
+/// As [`try_read_signer`], reading an unparseable config as the hot wallet.
+///
+/// Only for showing an operator a form they are about to correct — the desktop app
+/// loads whatever is on disk, however broken, so the signer picker has to render
+/// something. Anything that writes the answer somewhere durable uses
+/// [`try_read_signer`] and fails loudly instead.
+pub fn read_signer(toml_str: &str) -> SignerView {
+    try_read_signer(toml_str).unwrap_or(SignerView::Local)
 }
 
 /// Apply the patch onto `toml_str` and return the new TOML text. Preserves
@@ -144,44 +291,202 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
         Value::from(patch.rpc_url.trim()),
     );
 
-    // Write the feed URL where the bot actually reads it: the first pool's
-    // feed_url override when it has one, otherwise the bot-level [feed].url.
-    // Editing [feed].url while a pool overrides it would look effective but be
-    // ignored on restart.
-    let pool_overrides_feed = doc
-        .get("pools")
-        .and_then(Item::as_array_of_tables)
-        .and_then(|arr| arr.get(0))
-        .is_some_and(|p| p.contains_key("feed_url"));
-
-    if pool_overrides_feed {
-        let pool = first_pool_mut(&mut doc)?;
-        set_value(pool, "feed_url", Value::from(patch.feed_url.trim()));
-    } else {
-        let feed = doc
-            .get_mut("feed")
-            .and_then(Item::as_table_mut)
-            .context("config has no [feed] table")?;
-        set_value(feed, "url", Value::from(patch.feed_url.trim()));
+    if let Some(secs) = patch.tick_interval_secs {
+        anyhow::ensure!(secs > 0, "the tick interval must be at least 1 second");
+        set_value(
+            doc.as_table_mut(),
+            "tick_interval_secs",
+            Value::from(i64::try_from(secs).context("tick interval is too large")?),
+        );
     }
 
-    let pool = first_pool_mut(&mut doc)?;
+    let index = patch.pool_index;
+
+    write_feed_url(&mut doc, index, patch.feed_url.trim())?;
+
+    let pool = pool_mut(&mut doc, index)?;
     apply_spread(pool, "buy", &patch.buy)?;
     apply_spread(pool, "sell", &patch.sell)?;
     apply_taker(pool, patch.taker_enabled);
+    if let Some(sizing) = &patch.buy_sizing {
+        apply_sizing(pool, Side::Buy, sizing)?;
+    }
+    if let Some(sizing) = &patch.sell_sizing {
+        apply_sizing(pool, Side::Sell, sizing)?;
+    }
+    if let Some(secs) = patch.ttl_secs {
+        set_value(
+            pool,
+            "ttl_secs",
+            Value::from(i64::try_from(secs).context("order lifetime is too large")?),
+        );
+    }
 
     let edited = doc.to_string();
-    // Guard: never hand back something the bot can't load.
+    // Guard: never hand back something the bot can't load. This is also what
+    // enforces the cross-field rules — TTL above the live-order deadline margin,
+    // ladder caps, positive slices — so they don't need restating here.
     Config::from_toml(&edited).context("the edited config is not valid")?;
     Ok(edited)
 }
 
-/// The first `[[pools]]` table, mutably. Errors if the config has no pools.
-fn first_pool_mut(doc: &mut DocumentMut) -> Result<&mut Table> {
-    doc.get_mut("pools")
+/// Write the feed URL where the bot will actually read it for *this* pool, and
+/// nowhere else.
+///
+/// The bot resolves a pool's feed as `pool.feed_url.unwrap_or(feed.url)`, so
+/// there are three cases:
+///
+/// - The pool already overrides it: write the override. Touching `[feed].url`
+///   would look effective and be ignored on restart.
+/// - One pool, no override: write `[feed].url`. That's the shared value and the
+///   only pool reading it, so an override would be noise.
+/// - Several pools, no override: give this pool its own override. The settings
+///   page is pool-scoped, and writing `[feed].url` would silently repoint every
+///   other pool without an override — pools that can be quoting different pairs
+///   entirely.
+///
+/// The last case only kicks in when the value actually changes. Every save sends
+/// the whole form, so writing unconditionally would sprinkle overrides onto pools
+/// the operator never edited and quietly cut them off from the shared fallback.
+fn write_feed_url(doc: &mut DocumentMut, index: usize, url: &str) -> Result<()> {
+    let pools = doc.get("pools").and_then(Item::as_array_of_tables);
+    let overrides_feed = pools
+        .and_then(|arr| arr.get(index))
+        .is_some_and(|p| p.contains_key("feed_url"));
+    let several_pools = pools.is_some_and(|arr| arr.len() > 1);
+    let shared = doc
+        .get("feed")
+        .and_then(|f| f.get("url"))
+        .and_then(Item::as_str)
+        .unwrap_or_default();
+
+    if overrides_feed || (several_pools && url != shared) {
+        let pool = pool_mut(doc, index)?;
+        set_value(pool, "feed_url", Value::from(url));
+        return Ok(());
+    }
+
+    let feed = doc
+        .get_mut("feed")
+        .and_then(Item::as_table_mut)
+        .context("config has no [feed] table")?;
+    set_value(feed, "url", Value::from(url));
+    Ok(())
+}
+
+/// Which side of the book a sizing edit applies to. The two sides use different
+/// key names for the same concept, so this carries the mapping in one place.
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    Buy,
+    Sell,
+}
+
+impl Side {
+    /// Key holding total ladder liquidity. Sized in debt on the buy side and in
+    /// collateral on the sell side, hence the differing suffixes.
+    fn total_liquidity_key(self) -> &'static str {
+        match self {
+            Side::Buy => "buy_total_liquidity_debt",
+            Side::Sell => "sell_total_liquidity_collateral",
+        }
+    }
+
+    /// Key holding the flat per-order size.
+    fn order_size_key(self) -> &'static str {
+        match self {
+            Side::Buy => "buy_order_size_debt",
+            Side::Sell => "sell_order_size_collateral",
+        }
+    }
+
+    /// Key holding the smallest slice. Both sides express this in debt units.
+    fn min_slice_key(self) -> &'static str {
+        match self {
+            Side::Buy => "buy_min_slice_debt",
+            Side::Sell => "sell_min_slice_debt",
+        }
+    }
+
+    fn max_orders_key(self) -> &'static str {
+        match self {
+            Side::Buy => "buy_max_orders",
+            Side::Sell => "sell_max_orders",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        }
+    }
+}
+
+/// Write one side's sizing back onto the pool. Amounts stay strings in the TOML —
+/// they're atomic `U256`/`u128` values that would lose precision as TOML integers
+/// beyond 2^63, and the shipped templates already quote them.
+///
+/// Each field is validated with the same parser the bot loads it through, so an
+/// operator gets the failure at save time and not on the next start.
+fn apply_sizing(pool: &mut Table, side: Side, sizing: &SideSizing) -> Result<()> {
+    let total = sizing.total_liquidity.trim();
+    if total.is_empty() {
+        pool.remove(side.total_liquidity_key());
+    } else {
+        parse_liquidity_amount(total, side.total_liquidity_key())?;
+        set_value(pool, side.total_liquidity_key(), Value::from(total));
+    }
+
+    let min_slice = sizing.min_slice_debt.trim();
+    if min_slice.is_empty() {
+        pool.remove(side.min_slice_key());
+    } else {
+        parse_min_slice_debt(min_slice, side.min_slice_key())?;
+        set_value(pool, side.min_slice_key(), Value::from(min_slice));
+    }
+
+    let order_size = sizing.order_size.trim();
+    if order_size.is_empty() {
+        pool.remove(side.order_size_key());
+    } else {
+        order_size
+            .parse::<alloy_primitives::U256>()
+            .with_context(|| {
+                format!(
+                    "{} order size must be a whole number of atomic units",
+                    side.label()
+                )
+            })?;
+        set_value(pool, side.order_size_key(), Value::from(order_size));
+    }
+
+    let max_orders = sizing.max_orders.trim();
+    if max_orders.is_empty() {
+        // Removing it falls back to the bot's own ladder cap rather than pinning
+        // an explicit number the operator didn't choose.
+        pool.remove(side.max_orders_key());
+    } else {
+        let n: u32 = max_orders
+            .parse()
+            .with_context(|| format!("{} max orders must be a whole number", side.label()))?;
+        anyhow::ensure!(n > 0, "{} max orders must be at least 1", side.label());
+        set_value(pool, side.max_orders_key(), Value::from(i64::from(n)));
+    }
+    Ok(())
+}
+
+/// One `[[pools]]` table, mutably. Errors if the index is out of range, naming the
+/// count so the caller can say something useful.
+fn pool_mut(doc: &mut DocumentMut, index: usize) -> Result<&mut Table> {
+    let pools = doc
+        .get_mut("pools")
         .and_then(Item::as_array_of_tables_mut)
-        .and_then(|arr| arr.get_mut(0))
-        .context("config has no [[pools]] entry")
+        .context("config has no [[pools]] entry")?;
+    let count = pools.len();
+    pools
+        .get_mut(index)
+        .with_context(|| format!("config has {count} pools, so there is no pool {index}"))
 }
 
 /// Reject an endpoint that would leave the bot unable to reach its RPC or feed.
@@ -292,13 +597,68 @@ mod tests {
     const TEMPLATE: &str = include_str!("templates/cngn-usdt-bsc.toml");
 
     fn patch_from(view: &SettingsView) -> SettingsPatch {
-        SettingsPatch {
-            rpc_url: view.rpc_url.clone(),
-            feed_url: view.feed_url.clone(),
-            buy: view.buy.clone(),
-            sell: view.sell.clone(),
-            taker_enabled: view.taker_enabled,
-        }
+        view.to_patch()
+    }
+
+    const TURNKEY_SIGNER: &str = "\n[signer]\nprovider = \"turnkey\"\n\
+         organization_id = \"org-1\"\n\
+         sign_with = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n\
+         operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n";
+
+    #[test]
+    fn the_signer_survives_an_invalid_field_elsewhere_in_the_config() {
+        // Reading it through `Config::from_toml` meant any unrelated typo reported a
+        // Turnkey bot as a hot wallet, and callers then mounted `stitch.key` and set
+        // STITCH_PRIVATE_KEY_FILE for a bot whose secret is `turnkey-api.key`. The
+        // signer table stands alone, so it's read alone.
+        let broken = format!(
+            "{}{TURNKEY_SIGNER}",
+            TEMPLATE.replace("tick_interval_secs = 5", "tick_interval_secs = \"soon\"")
+        );
+        assert!(
+            Config::from_toml(&broken).is_err(),
+            "the premise: the loader rejects this config"
+        );
+        assert!(matches!(
+            try_read_signer(&broken).unwrap(),
+            SignerView::Turnkey { .. }
+        ));
+    }
+
+    #[test]
+    fn a_config_with_no_signer_table_really_is_the_hot_wallet() {
+        // The legitimate Local case, which has to stay distinguishable from "couldn't
+        // tell" now that the latter is an error.
+        assert!(matches!(
+            try_read_signer(TEMPLATE).unwrap(),
+            SignerView::Local
+        ));
+        assert!(matches!(
+            try_read_signer("[signer]\nprovider = \"local\"\n").unwrap(),
+            SignerView::Local
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_signer_is_an_error_not_a_guess() {
+        // Unparseable TOML, and a signer table that names a provider without its
+        // required fields. Both mean "unknown", and a caller about to write mounts and
+        // env into a file has to be told rather than handed the hot wallet.
+        assert!(try_read_signer("this is not [ toml").is_err());
+        assert!(try_read_signer("[signer]\nprovider = \"turnkey\"\n").is_err());
+        // The lenient wrapper is still lenient, for the desktop form.
+        assert!(matches!(
+            read_signer("this is not [ toml"),
+            SignerView::Local
+        ));
+    }
+
+    /// A config with two pools, for the pool-indexing tests.
+    fn two_pool_config() -> String {
+        let pool_start = TEMPLATE.find("[[pools]]").unwrap();
+        // The second pool differs so the tests can tell them apart.
+        let second = TEMPLATE[pool_start..].replace("buy_offset_bps = 1", "buy_offset_bps = 25");
+        format!("{TEMPLATE}\n{second}")
     }
 
     #[test]
@@ -324,6 +684,46 @@ mod tests {
             }
         );
         assert_eq!(v.pool_count, 1);
+    }
+
+    #[test]
+    fn an_unset_optional_field_leaves_the_file_alone() {
+        // The contract the desktop Settings screen relies on: a caller that only edits
+        // spreads leaves sizing, lifetime and cadence unset, and those keep whatever is
+        // in the file. Building the patch from a view captured when a screen *opened*
+        // instead writes stale values back over anything that changed since — which,
+        // now that the admin panel edits the same stitch.toml, is a live concern.
+        let before = read_settings(TEMPLATE).unwrap();
+        // Something else edits the file: a longer order lifetime and a slower tick.
+        let externally_changed = TEMPLATE
+            .replace("ttl_secs = 120", "ttl_secs = 600")
+            .replace("tick_interval_secs = 5", "tick_interval_secs = 30");
+
+        // A spread-only save, with the optional fields left unset.
+        let patch = SettingsPatch {
+            pool_index: 0,
+            rpc_url: before.rpc_url.clone(),
+            feed_url: before.feed_url.clone(),
+            buy: before.buy.clone(),
+            sell: before.sell.clone(),
+            taker_enabled: true,
+            ..SettingsPatch::default()
+        };
+        let after = read_settings(&apply_settings(&externally_changed, &patch).unwrap()).unwrap();
+        assert_eq!(after.ttl_secs, 600, "the external lifetime must survive");
+        assert_eq!(
+            after.tick_interval_secs, 30,
+            "the external cadence must survive"
+        );
+        assert!(after.taker_enabled, "and the edit still lands");
+
+        // For contrast: the same save built from the stale view reverts both, which is
+        // the bug this guards.
+        let stale = before.to_patch();
+        let reverted =
+            read_settings(&apply_settings(&externally_changed, &stale).unwrap()).unwrap();
+        assert_eq!(reverted.ttl_secs, 120);
+        assert_eq!(reverted.tick_interval_secs, 5);
     }
 
     #[test]
@@ -421,6 +821,51 @@ mod tests {
     }
 
     #[test]
+    fn a_feed_edit_on_one_pool_leaves_the_others_on_the_old_feed() {
+        // The settings page is pool-scoped. Writing the shared [feed].url would
+        // repoint every other pool without an override — and a second pool can be
+        // quoting a different pair entirely, so it would start pricing off the
+        // wrong feed without anyone touching it.
+        let src = two_pool_config();
+        let mut view = read_settings_at(&src, 1).unwrap();
+        view.feed_url = "https://feed.example.com/second".into();
+        let out = apply_settings(&src, &patch_from(&view)).unwrap();
+
+        assert_eq!(
+            read_settings_at(&out, 1).unwrap().feed_url,
+            "https://feed.example.com/second"
+        );
+        assert_eq!(
+            read_settings_at(&out, 0).unwrap().feed_url,
+            read_settings_at(&src, 0).unwrap().feed_url,
+            "the untouched pool must keep the feed it had"
+        );
+    }
+
+    #[test]
+    fn saving_a_pool_without_touching_the_feed_adds_no_override() {
+        // Every save sends the whole form. Writing an override each time would
+        // sprinkle them onto pools nobody edited and cut them off from the shared
+        // [feed].url for good.
+        let src = two_pool_config();
+        let mut view = read_settings_at(&src, 1).unwrap();
+        view.buy.value = "7".into();
+        let out = apply_settings(&src, &patch_from(&view)).unwrap();
+        assert!(!out.contains("feed_url"), "{out}");
+
+        // A single-pool config keeps writing the shared value: it's the only
+        // reader, so an override would be noise.
+        let mut only = read_settings(TEMPLATE).unwrap();
+        only.feed_url = "https://feed.example.com/solo".into();
+        let out = apply_settings(TEMPLATE, &patch_from(&only)).unwrap();
+        assert!(!out.contains("feed_url"), "{out}");
+        assert_eq!(
+            read_settings(&out).unwrap().feed_url,
+            "https://feed.example.com/solo"
+        );
+    }
+
+    #[test]
     fn clearing_a_prefilled_spread_removes_it_rather_than_leaving_it_stale() {
         let mut view = read_settings(TEMPLATE).unwrap();
         assert_eq!(view.buy.value, "1"); // template preloads a buy spread
@@ -484,5 +929,167 @@ mod tests {
         let mut view = read_settings(TEMPLATE).unwrap();
         view.buy.value = "99999999999".into();
         assert!(apply_settings(TEMPLATE, &patch_from(&view)).is_err());
+    }
+
+    #[test]
+    fn a_view_round_trips_the_pair_lifetime_and_cadence() {
+        let v = read_settings(TEMPLATE).unwrap();
+        assert_eq!(v.pool_index, 0);
+        assert_eq!(v.pair.debt_decimals, 18, "USDT on BSC is 18 decimals");
+        assert!(v.ttl_secs > 0);
+        assert!(v.tick_interval_secs > 0);
+        // A no-op save of everything, sizing included, still leaves the file alone.
+        let out = apply_settings(TEMPLATE, &v.to_patch()).unwrap();
+        assert_eq!(
+            out, TEMPLATE,
+            "a full no-op patch must not perturb the file"
+        );
+    }
+
+    #[test]
+    fn ladder_sizing_round_trips_as_quoted_atomic_strings() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        let mut sizing = view.buy_sizing.clone();
+        // A value well past 2^63, which would be corrupted if written as a TOML
+        // integer instead of a string.
+        sizing.total_liquidity = "123456789012345678901234567890".into();
+        sizing.min_slice_debt = "10000000".into();
+        sizing.max_orders = "12".into();
+        view.buy_sizing = sizing;
+
+        let out = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert_eq!(
+            back.buy_sizing.total_liquidity, "123456789012345678901234567890",
+            "a large atomic amount must survive verbatim"
+        );
+        assert_eq!(back.buy_sizing.min_slice_debt, "10000000");
+        assert_eq!(back.buy_sizing.max_orders, "12");
+    }
+
+    #[test]
+    fn the_max_liquidity_sentinel_is_accepted() {
+        // "max" means quote everything funded; it must not be rejected as
+        // non-numeric.
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.buy_sizing.total_liquidity = "max".into();
+        view.buy_sizing.min_slice_debt = "10000000".into();
+        let out = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+        assert_eq!(
+            read_settings(&out).unwrap().buy_sizing.total_liquidity,
+            "max"
+        );
+    }
+
+    #[test]
+    fn bad_sizing_values_are_rejected_with_the_field_named() {
+        let base = read_settings(TEMPLATE).unwrap();
+
+        let mut view = base.clone();
+        view.buy_sizing.total_liquidity = "lots".into();
+        let err = apply_settings(TEMPLATE, &view.to_patch()).unwrap_err();
+        assert!(err.to_string().contains("buy_total_liquidity_debt"));
+
+        // A zero floor would silently disable the side mid-flight.
+        let mut view = base.clone();
+        view.buy_sizing.min_slice_debt = "0".into();
+        let err = apply_settings(TEMPLATE, &view.to_patch()).unwrap_err();
+        assert!(err.to_string().contains("greater than zero"));
+
+        let mut view = base.clone();
+        view.sell_sizing.max_orders = "0".into();
+        let err = apply_settings(TEMPLATE, &view.to_patch()).unwrap_err();
+        assert!(err.to_string().contains("at least 1"));
+
+        let mut view = base;
+        view.buy_sizing.order_size = "1.5".into();
+        let err = apply_settings(TEMPLATE, &view.to_patch()).unwrap_err();
+        assert!(err.to_string().contains("atomic units"));
+    }
+
+    #[test]
+    fn clearing_a_sizing_field_removes_it_rather_than_zeroing_it() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.buy_sizing.max_orders = "9".into();
+        let with = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+        assert!(with.contains("buy_max_orders"));
+
+        let mut back = read_settings(&with).unwrap();
+        back.buy_sizing.max_orders = "  ".into();
+        let without = apply_settings(&with, &back.to_patch()).unwrap();
+        assert!(
+            !without.contains("buy_max_orders"),
+            "clearing must fall back to the bot default, not pin an explicit value"
+        );
+    }
+
+    #[test]
+    fn a_ttl_below_the_deadline_margin_is_rejected_by_the_real_loader() {
+        // The bot needs the TTL to exceed its live-order deadline margin. The
+        // patch doesn't restate that rule; the config loader enforces it.
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.ttl_secs = 1;
+        assert!(apply_settings(TEMPLATE, &view.to_patch()).is_err());
+    }
+
+    #[test]
+    fn a_zero_tick_interval_is_rejected() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.tick_interval_secs = 0;
+        let err = apply_settings(TEMPLATE, &view.to_patch()).unwrap_err();
+        assert!(err.to_string().contains("at least 1 second"));
+    }
+
+    #[test]
+    fn a_patch_with_no_sizing_leaves_the_existing_sizing_alone() {
+        // This is what lets the desktop screen save spreads without knowing the
+        // sizing values, and the panel send a partial edit.
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.buy_sizing.min_slice_debt = "5000000".into();
+        let seeded = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+
+        let mut patch = read_settings(&seeded).unwrap().to_patch();
+        patch.buy_sizing = None;
+        patch.sell_sizing = None;
+        patch.ttl_secs = None;
+        patch.tick_interval_secs = None;
+        patch.buy.value = "44".into();
+
+        let out = apply_settings(&seeded, &patch).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert_eq!(back.buy.value, "44", "the edited field changed");
+        assert_eq!(
+            back.buy_sizing.min_slice_debt, "5000000",
+            "an unsent field must be left as it was"
+        );
+    }
+
+    #[test]
+    fn pool_indexing_reads_and_writes_the_right_pool() {
+        let src = two_pool_config();
+        let first = read_settings_at(&src, 0).unwrap();
+        let second = read_settings_at(&src, 1).unwrap();
+        assert_eq!(first.pool_count, 2);
+        assert_eq!(first.buy.value, "1");
+        assert_eq!(second.buy.value, "25");
+
+        // Editing pool 1 must not touch pool 0.
+        let mut patch = second.to_patch();
+        patch.buy.value = "77".into();
+        let out = apply_settings(&src, &patch).unwrap();
+        assert_eq!(read_settings_at(&out, 0).unwrap().buy.value, "1");
+        assert_eq!(read_settings_at(&out, 1).unwrap().buy.value, "77");
+    }
+
+    #[test]
+    fn an_out_of_range_pool_says_how_many_there_are() {
+        let src = two_pool_config();
+        let err = read_settings_at(&src, 5).unwrap_err();
+        assert!(err.to_string().contains("2 pools"));
+
+        let mut patch = read_settings(&src).unwrap().to_patch();
+        patch.pool_index = 5;
+        let err = apply_settings(&src, &patch).unwrap_err();
+        assert!(err.to_string().contains("2 pools"));
     }
 }

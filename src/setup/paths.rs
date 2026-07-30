@@ -172,16 +172,27 @@ pub fn has_operator_files(dir: impl AsRef<Path>) -> bool {
 
 /// Operator address controlled by the key file in this folder.
 pub fn operator_address(dir: impl AsRef<Path>) -> anyhow::Result<alloy_primitives::Address> {
+    operator_address_from_key(&config_paths(dir).key)
+}
+
+/// Operator address derived from an explicit key file path.
+///
+/// The flat layout names keys per bot (`stitch.bot1.key`), so callers that know
+/// the config path resolve the sibling key and pass it here rather than assuming
+/// the canonical `stitch.key` in the parent directory.
+pub fn operator_address_from_key(
+    key: impl AsRef<Path>,
+) -> anyhow::Result<alloy_primitives::Address> {
     use zeroize::Zeroize;
-    let p = config_paths(dir);
+    let key = key.as_ref();
     let mut raw =
-        std::fs::read_to_string(&p.key).with_context(|| format!("reading {}", p.key.display()))?;
+        std::fs::read_to_string(key).with_context(|| format!("reading {}", key.display()))?;
     // Wipe the on-heap key copy after deriving the address. The GUI may stay open
     // supervising the bot, so this string must not linger for a process dump.
-    let key = crate::signer::parse_private_key(&raw);
+    let parsed = crate::signer::parse_private_key(&raw);
     raw.zeroize();
-    let key = key?;
-    Ok(crate::signer::address_from_signing_key(&key))
+    let parsed = parsed?;
+    Ok(crate::signer::address_from_signing_key(&parsed))
 }
 
 #[cfg(test)]
@@ -308,6 +319,10 @@ mod tests {
             format!("{addr:?}").to_lowercase(),
             "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
         );
+        // Same derivation when the caller already resolved the path — used by
+        // the panel for flat-layout bots whose key isn't named stitch.key.
+        let from_path = operator_address_from_key(dir.join("stitch.key")).unwrap();
+        assert_eq!(addr, from_path);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

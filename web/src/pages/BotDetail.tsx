@@ -1,0 +1,435 @@
+import { useCallback, useEffect, useState } from 'react'
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { ApiError, api } from '../api'
+import {
+  Banner,
+  Button,
+  Card,
+  ErrorState,
+  Loading,
+  StatePill,
+  Tag,
+  Warnings,
+} from '../components/ui'
+import ComposeExportLink from '../components/ComposeExportLink'
+import LogViewer from '../components/LogViewer'
+import OneShotRunner from '../components/OneShotRunner'
+import RawConfigEditor from '../components/RawConfigEditor'
+import SettingsForm from '../components/SettingsForm'
+import { formatTimestamp, shortAddress, shortImage } from '../format'
+import type { Bot, MigrationResult } from '../types'
+
+const TABS = ['settings', 'config', 'logs', 'tools'] as const
+type Tab = (typeof TABS)[number]
+
+const TAB_LABEL: Record<Tab, string> = {
+  settings: 'Settings',
+  config: 'Raw config',
+  logs: 'Logs',
+  tools: 'Tools',
+}
+
+export default function BotDetail() {
+  const { name = '' } = useParams()
+  const navigate = useNavigate()
+  const [bot, setBot] = useState<Bot | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  // The wizard redirects here with what it just did, so its confirmation survives
+  // the navigation.
+  const handoff = (useLocation().state as { note?: string } | null)?.note ?? null
+  const [note, setNote] = useState<string | null>(handoff)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [tab, setTab] = useState<Tab>('settings')
+
+  const load = useCallback(async () => {
+    try {
+      setBot(await api.bot(name))
+      setError(null)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    }
+  }, [name])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  async function act(what: 'start' | 'stop' | 'restart' | 'recreate') {
+    if (
+      what === 'recreate' &&
+      !window.confirm(
+        `Recreate ${name}'s container? It's replaced with a fresh one on the current image, using the same config directory.`,
+      )
+    ) {
+      return
+    }
+    setBusy(what)
+    setError(null)
+    try {
+      const res = await api[what](name)
+      setBot(res.bot)
+      setNote(res.message)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function remove() {
+    const deleteConfig = window.confirm(
+      `Remove ${name}'s container.\n\nOK also deletes its config directory, including the private key. Cancel keeps the files so you can recreate the bot later.`,
+    )
+    if (
+      !window.confirm(
+        deleteConfig
+          ? `Last check: delete ${name}'s container AND its config and key? This cannot be undone.`
+          : `Remove ${name}'s container and keep its config directory?`,
+      )
+    ) {
+      return
+    }
+    setBusy('remove')
+    try {
+      const res = await api.remove(name, deleteConfig)
+      navigate('/', { state: { note: res.message } })
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+      setBusy(null)
+    }
+  }
+
+  if (!bot && error) return <ErrorState error={error} onRetry={() => void load()} />
+  if (!bot) return <Loading what={name} />
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <Link to="/" className="text-sm text-muted hover:text-ink">
+          ← Fleet
+        </Link>
+        <h1 className="text-xl font-bold">{bot.name}</h1>
+        <StatePill state={bot.state} status={bot.status} />
+        {bot.config?.corridorLabel && (
+          <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
+        )}
+      </div>
+
+      {error && (
+        <Banner tone="danger" onDismiss={() => setError(null)}>
+          {error}
+        </Banner>
+      )}
+      {note && (
+        <Banner tone="success" onDismiss={() => setNote(null)}>
+          {note}
+        </Banner>
+      )}
+
+      <Card>
+        <div className="flex flex-wrap items-center gap-2">
+          {bot.container ? (
+            <>
+              {bot.canStop ? (
+                <Button
+                  busy={busy === 'stop'}
+                  onClick={() => void act('stop')}
+                  title="Sends SIGTERM and waits, so the bot finishes its tick and cancels cleanly"
+                >
+                  Stop
+                </Button>
+              ) : (
+                <Button busy={busy === 'start'} onClick={() => void act('start')}>
+                  Start
+                </Button>
+              )}
+              {/* See Fleet.tsx: Restart needs a live process, exactly like Stop. */}
+              <Button
+                busy={busy === 'restart'}
+                disabled={!bot.canStop}
+                onClick={() => void act('restart')}
+                title={
+                  bot.canStop
+                    ? 'Stop and start it again, with the full tick grace period'
+                    : `${bot.name} is ${bot.state} — there is nothing to restart. Use Start.`
+                }
+              >
+                Restart
+              </Button>
+              <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
+                Recreate
+              </Button>
+            </>
+          ) : (
+            <>
+              <Tag>no container</Tag>
+              {/*
+                Config is on disk but no container: the wizard failed mid-create, or
+                someone removed the container and kept the files. Recreate is the
+                only recovery — Add Bot conflicts with the existing directory.
+              */}
+              <Button
+                busy={busy === 'recreate'}
+                onClick={() => void act('recreate')}
+                title="Build a container from the config already on disk"
+              >
+                Recreate
+              </Button>
+            </>
+          )}
+          <Button
+            variant="danger"
+            busy={busy === 'remove'}
+            className="ml-auto"
+            onClick={() => void remove()}
+          >
+            Remove
+          </Button>
+        </div>
+
+        <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+          <Detail label="Origin">{bot.origin}</Detail>
+          <Detail label="Layout">{bot.layout}</Detail>
+          <Detail label="Image">{shortImage(bot.image)}</Detail>
+          <Detail label="Created">{formatTimestamp(bot.createdUnix)}</Detail>
+          <Detail label="Chain">{bot.config ? bot.config.chainId : '—'}</Detail>
+          <Detail label="Pools">{bot.config ? bot.config.pools : '—'}</Detail>
+          <Detail label="Signer">{bot.config?.signer ?? '—'}</Detail>
+          <Detail label="Operator">
+            {bot.config?.operatorAddress ? (
+              <span title={bot.config.operatorAddress}>
+                {shortAddress(bot.config.operatorAddress)}
+              </span>
+            ) : (
+              '—'
+            )}
+          </Detail>
+        </dl>
+      </Card>
+
+      {bot.warnings.length > 0 && (
+        <Card title="Warnings">
+          <Warnings warnings={bot.warnings} />
+        </Card>
+      )}
+
+      <MigrationPrompt bot={bot} onMigrated={setBot} />
+
+      <nav className="flex gap-1 border-b border-line-soft">
+        {TABS.map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`-mb-px border-b-2 px-3 py-2 text-sm font-bold transition ${
+              tab === t
+                ? 'border-accent text-ink'
+                : 'border-transparent text-muted hover:text-ink'
+            }`}
+          >
+            {TAB_LABEL[t]}
+          </button>
+        ))}
+      </nav>
+
+      {tab === 'settings' &&
+        (bot.editable ? (
+          <SettingsForm
+            bot={bot}
+            onSaved={(message) => {
+              setNote(message)
+              void load()
+            }}
+          />
+        ) : (
+          <Banner tone="warning">
+            The panel can see this bot but won't write its config. The warnings above
+            say why.
+          </Banner>
+        ))}
+
+      {tab === 'config' && (
+        <Card>
+          <RawConfigEditor
+            bot={bot.name}
+            running={bot.running}
+            onSaved={(message) => {
+              setNote(message)
+              void load()
+            }}
+          />
+        </Card>
+      )}
+
+      {tab === 'logs' && (
+        <Card title="Logs">
+          <LogViewer bot={bot.name} />
+        </Card>
+      )}
+
+      {tab === 'tools' && (
+        <Card title="One-off runs">
+          <OneShotRunner
+            bot={bot.name}
+            canApprove={bot.canApprove}
+            approveBlockedReason={bot.approveBlockedReason}
+          />
+        </Card>
+      )}
+    </div>
+  )
+}
+
+function Detail({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <dt className="text-xs uppercase tracking-wide text-faint">{label}</dt>
+      <dd className="mt-0.5">{children}</dd>
+    </div>
+  )
+}
+
+/**
+ * The layout fix.
+ *
+ * A bot whose compose file mounts only the two config files keeps its slot-nonce
+ * ledger inside the container, so recreating it starts nonces over and the next
+ * orders it signs collide with ones already on the book. Migrating moves the files
+ * into a per-bot directory that stays on the host.
+ */
+function MigrationPrompt({
+  bot,
+  onMigrated,
+}: {
+  bot: Bot
+  onMigrated: (bot: Bot) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [result, setResult] = useState<MigrationResult | null>(null)
+  // Set when the server refused because it couldn't read the ledger, which is the
+  // only situation where the accept-the-loss button should exist at all.
+  const [ledgerReadFailed, setLedgerReadFailed] = useState(false)
+
+  if (result) {
+    return (
+      <Card title="Layout migrated">
+        <div className="space-y-3">
+          <Banner tone={result.ledgerLoss ? 'warning' : 'success'}>
+            {result.message}
+          </Banner>
+          {result.ledgerLoss && <Banner tone="warning">{result.ledgerLoss}</Banner>}
+          <p className="text-sm text-muted">
+            Moved {result.movedFiles.join(', ') || 'nothing'}
+            {result.ledgersRecovered.length > 0 &&
+              `; recovered ${result.ledgersRecovered.join(', ')}`}
+            . {result.started ? 'The bot is running again.' : 'The bot is stopped.'}
+          </p>
+        </div>
+      </Card>
+    )
+  }
+
+  if (bot.layout !== 'flat-files') return null
+
+  return (
+    <Card title="This bot's nonce ledger isn't on the host">
+      <div className="space-y-3">
+        <p className="text-sm text-muted">
+          Its compose service mounts <code>stitch.toml</code> and the key as
+          individual files, so the slot-nonce ledger lives inside the container.
+          Recreating or upgrading the container throws that ledger away, and the bot
+          restarts its nonces — orders still resting on the book then collide with
+          the new ones.
+        </p>
+        <p className="text-sm text-muted">
+          Migrating stops the bot, moves its config and key into a directory under
+          the panel's bots root, copies the existing ledger out of the container, and
+          starts it again on the same image. Expect a gap in quoting of a few
+          seconds.
+        </p>
+
+        {!bot.canMigrate && bot.migrateBlockedReason && (
+          <Banner tone="warning">{bot.migrateBlockedReason}</Banner>
+        )}
+        {error && <Banner tone="danger">{error}</Banner>}
+
+        <Button
+          variant="primary"
+          busy={busy}
+          disabled={!bot.canMigrate}
+          onClick={async () => {
+            if (
+              !window.confirm(
+                `Migrate ${bot.name} to the per-bot directory layout? It stops and restarts once.`,
+              )
+            ) {
+              return
+            }
+            setBusy(true)
+            setError(null)
+            try {
+              const res = await api.migrate(bot.name)
+              setResult(res)
+              onMigrated(res.bot)
+            } catch (e) {
+              setError(e instanceof ApiError ? e.message : String(e))
+              // The server rolled back and left the bot as it was, so a retry is
+              // free. Offer it inline rather than making the operator guess.
+              setLedgerReadFailed(
+                e instanceof ApiError && e.message.includes('accept ledger loss'),
+              )
+            } finally {
+              setBusy(false)
+            }
+          }}
+        >
+          Migrate this bot
+        </Button>
+
+        {/*
+          Only after a failed read, and only as a second, separate click: the first
+          attempt already rolled back, so the ledger is still in the container and a
+          retry is the right move for anything transient. This is for the case that
+          never will read — a custom image with no run directory, or one too large to
+          pull through the archive API.
+        */}
+        {ledgerReadFailed && (
+          <Button
+            busy={busy}
+            onClick={async () => {
+              if (
+                !window.confirm(
+                  `Migrate ${bot.name} without its nonce ledger? Any orders it has live right now stay on the book until they expire — it won't be able to replace them.`,
+                )
+              ) {
+                return
+              }
+              setBusy(true)
+              setError(null)
+              try {
+                const res = await api.migrate(bot.name, true)
+                setResult(res)
+                onMigrated(res.bot)
+              } catch (e) {
+                setError(e instanceof ApiError ? e.message : String(e))
+              } finally {
+                setBusy(false)
+              }
+            }}
+          >
+            Migrate without the ledger
+          </Button>
+        )}
+
+        <p className="text-xs text-faint">
+          Your compose file still describes the old layout. Update it from{' '}
+          <ComposeExportLink className="underline">
+            the generated compose export
+          </ComposeExportLink>{' '}
+          once you're done migrating, or compose will recreate the old mounts on the
+          next <code>up</code>.
+        </p>
+      </div>
+    </Card>
+  )
+}

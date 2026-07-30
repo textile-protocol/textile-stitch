@@ -35,7 +35,9 @@ Check:
 - `price` is debt per collateral (stable per soft).
 - `timestamp` is a Unix timestamp, and its age is less than `staleness_secs`.
 - Each pool with a different price has its own `feed_url`; one shared feed can't
-  price cNGN, COPM, and KES at once.
+  price cNGN, COPM, and KES at once. The editors write it that way too: change a
+  pool's feed in the desktop app or the admin panel and, on a multi-pool config,
+  you get a `feed_url` override on that pool instead of a new `[feed].url`.
 
 If the feed is stale, Stitch skips quoting that pool rather than posting orders
 at an old price.

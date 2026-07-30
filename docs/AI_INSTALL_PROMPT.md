@@ -9,6 +9,10 @@ downloads the release installer to disk first (so `stitch --update` keeps workin
 and documents a checksum-verified archive fallback when an agent will not run any
 installer script.
 
+This installs **one** bot on the machine the agent has a terminal on. For several
+bots on one Docker host, install the admin panel instead
+([install-panel.md](install-panel.md)) and add bots from its wizard.
+
 ```text
 You are helping me install and configure Textile Stitch, the operator bot at:
 https://github.com/textile-protocol/textile-stitch

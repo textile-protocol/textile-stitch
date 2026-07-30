@@ -55,6 +55,10 @@ pub struct SettingsForm {
     pub taker_enabled: bool,
     /// Pools in the config; the screen edits the first and notes when there's more.
     pub pool_count: usize,
+    /// The values as loaded, kept so a save can carry the fields this screen
+    /// doesn't show (ladder sizing, order lifetime, tick cadence) through
+    /// untouched instead of clearing them.
+    pub loaded: Option<setup::SettingsView>,
     /// True once "Change signer…" is clicked, revealing the signer editor.
     pub change_signer: bool,
     /// Signer editor state, prefilled from the current config when the screen opens.
@@ -246,12 +250,13 @@ impl StitchApp {
             Ok(toml) => {
                 match setup::read_settings(&toml) {
                     Ok(v) => {
-                        form.rpc_url = v.rpc_url;
-                        form.feed_url = v.feed_url;
-                        form.buy = v.buy;
-                        form.sell = v.sell;
+                        form.rpc_url = v.rpc_url.clone();
+                        form.feed_url = v.feed_url.clone();
+                        form.buy = v.buy.clone();
+                        form.sell = v.sell.clone();
                         form.taker_enabled = v.taker_enabled;
                         form.pool_count = v.pool_count;
+                        form.loaded = Some(v);
                     }
                     Err(e) => form.error = Some(format!("Couldn't read the current config: {e:#}")),
                 }
@@ -332,12 +337,28 @@ impl StitchApp {
                 return;
             }
         };
+        // Only the fields this form edits. Sizing, order lifetime and tick cadence are
+        // left unset, which `SettingsPatch` defines as "don't touch" — so they keep
+        // whatever is in the file at the moment of the write.
+        //
+        // This used to start from `self.settings.loaded.to_patch()`, which sets those
+        // four to the values read when the screen *opened*. Saving an unrelated
+        // spread then wrote them back and silently reverted anything that had changed
+        // the file since — and now that the admin panel edits the same `stitch.toml`,
+        // "something else changed it" stopped being hypothetical.
         let patch = setup::SettingsPatch {
+            pool_index: self
+                .settings
+                .loaded
+                .as_ref()
+                .map(|view| view.pool_index)
+                .unwrap_or(0),
             rpc_url: self.settings.rpc_url.clone(),
             feed_url: self.settings.feed_url.clone(),
             buy: self.settings.buy.clone(),
             sell: self.settings.sell.clone(),
             taker_enabled: self.settings.taker_enabled,
+            ..setup::SettingsPatch::default()
         };
         let edited = match setup::apply_settings(&current, &patch) {
             Ok(s) => s,

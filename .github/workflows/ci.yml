@@ -36,3 +36,38 @@ jobs:
         with:
           name: stitch-linux-x86_64-${{ github.sha }}
           path: target/release/stitch
+
+  # The admin panel is behind a cargo feature, so the job above never compiles it.
+  # Its own job keeps the bot's CI fast while still gating the panel's tests and
+  # the frontend typecheck.
+  panel:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: panel
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Typecheck and bundle first: cargo embeds whatever is in web/dist, so
+      # building the frontend here also proves the embed path works.
+      - name: Build the frontend
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Run panel tests
+        run: cargo test --features panel
+
+      - name: Build the panel binary
+        run: cargo build --release --features panel --bin stitch-panel

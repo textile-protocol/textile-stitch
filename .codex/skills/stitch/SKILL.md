@@ -33,7 +33,8 @@ the operator can type anything else.
 
 First question — "What do you want to do with Stitch?":
 
-- **Start / resume live** → [Start](#start) (cloud: [AWS cloud](#aws-cloud-ecs-fargate))
+- **Start / resume live** → [Start](#start) (cloud: [AWS cloud](#aws-cloud-ecs-fargate),
+  Docker fleet: [Docker fleet](#docker-fleet))
 - **Stop / pause** → [Stop](#stop)
 - **Inspect or change it** — status/logs, parameters, approvals, or upgrade
 
@@ -58,7 +59,7 @@ binary only means "not installed" for the local layouts — the cloud layout has
 local binary by design, so don't treat a missing `stitch` as not-installed until
 you've ruled out cloud.
 
-Four standard layouts:
+Five standard layouts:
 
 - **Foreground / manual** (macOS, foreground Linux, Windows): config lives in
   `~/Stitch/` (`%USERPROFILE%\Stitch\` on Windows) — `stitch.toml`, `stitch.key`,
@@ -77,15 +78,21 @@ Four standard layouts:
 - **AWS cloud** (ECS Fargate): the operator-owned `deploy/aws` stack. No local
   binary — Stitch runs as a one-task ECS service, key + config live in Secrets
   Manager. See [AWS cloud](#aws-cloud-ecs-fargate) below.
+- **Docker fleet**: several bots as containers on one host, one container per bot,
+  each with its own config dir and key. Either driven by hand with
+  `docker compose`, or through `stitch-panel` — a web UI on the same host that
+  manages the same containers. See [Docker fleet](#docker-fleet) below.
 
 Detect it: for the local layouts, `stitch --version` plus `systemctl status
 stitch` (Linux), `launchctl list | grep -i stitch` (macOS), or Task Scheduler
 (Windows); a running desktop app shows up as a `stitch-setup` (or `Stitch`)
-process supervising a `stitch` child. For cloud, an ECS service named
-`<bot>-stitch` in the operator's AWS account (the request itself usually tells you
-— `aws`/ECS talk means cloud). Operate against whichever is real. Only if it's a
-local layout and `stitch` isn't on PATH is it genuinely not installed — then see
-[Not installed yet](#not-installed-yet).
+process supervising a `stitch` child. For a Docker fleet,
+`docker ps --filter ancestor=ghcr.io/textile-protocol/textile-stitch` lists the
+bots, and a `stitch-panel` container means the panel is in play. For cloud, an ECS
+service named `<bot>-stitch` in the operator's AWS account (the request itself
+usually tells you — `aws`/ECS talk means cloud). Operate against whichever is
+real. Only if it's a local layout and `stitch` isn't on PATH is it genuinely not
+installed — then see [Not installed yet](#not-installed-yet).
 
 ## Golden rules — every operation
 
@@ -221,6 +228,51 @@ you deployed under (default `stitch-operator`; the README example uses
 Same golden rules apply: never put the key in a file or on a command line (it's a
 Secrets Manager value), and dry-run/pause around any pricing or sizing change.
 
+## Docker fleet
+
+Several bots on one host, one container each. Two ways it's driven, and it matters
+which:
+
+- **`stitch-panel` is running** (`docker ps` shows a `stitch-panel` container). The
+  operator has a web UI at `https://<host>.<tailnet>.ts.net` that does start/stop,
+  settings, approvals, dry runs and logs. **Point them at it instead of doing it
+  from the CLI.** Racing the panel isn't dangerous, but it's confusing: the panel
+  shows container state live, so an operator watching it will see you fight them.
+  Everything the panel does is also reachable over its API if they'd rather you
+  drive: `GET /api/bots`, `POST /api/bots/<name>/{start,stop,restart}`,
+  `PATCH /api/bots/<name>/settings`. The full guide is `docs/install-panel.md`.
+  If you're restoring a host from the panel's compose export
+  (`GET /api/compose-export`), note that bots which were stopped when it was
+  exported carry `profiles: [stopped]` and won't come up on a plain
+  `docker compose up -d` — that's deliberate, so don't "fix" it. Start one with
+  `docker compose --profile stopped up -d <bot-name>` if the operator asks.
+- **Compose only.** Operate the compose file directly, per bot:
+
+  ```bash
+  docker compose ps                       # which bots exist and their state
+  docker compose logs -f <service>        # tail one bot
+  docker compose stop <service>           # SIGTERM, finishes the tick
+  docker compose restart <service>        # after any stitch.toml edit
+  docker compose run --rm <service> stitch approve --config /home/stitch/run/stitch.toml
+  docker compose run --rm <service> stitch --config /home/stitch/run/stitch.toml --dry-run
+  ```
+
+Each bot's config is the `stitch.toml` bind-mounted into it. Find it with
+`docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' <container>`
+rather than guessing which `stitch.<name>.toml` belongs to which service. Edit
+that file on the host, then restart just that container — the usual dry-run rule
+applies for pricing or sizing changes.
+
+**One trap worth knowing.** If a bot's compose service mounts `stitch.toml` and
+the key as two individual files rather than mounting a whole directory, the Permit2
+slot-nonce ledger lives on the container filesystem and is destroyed by
+`docker compose up -d --force-recreate` or an image bump. The bot then restarts its
+nonce sequence and the orders it signs collide with ones still resting on the book.
+Tell the operator before you recreate anything in that layout. The panel detects it
+and offers a one-click migration; by hand it means moving the two files into a
+per-bot directory and mounting that directory read-write, with the config and key
+remounted read-only on top.
+
 ## Not installed yet
 
 If `stitch` isn't on PATH, install it first. Don't reconstruct the steps from
@@ -239,6 +291,10 @@ Two setup paths that don't need you to drive it, if the operator prefers:
 - **Desktop app** (no terminal): download the release for their OS and open Stitch
   — macOS `Stitch.dmg`, Windows `stitch-setup.exe`, Linux `stitch-setup`. Pick a
   corridor, paste the operator key, click Create; the same window then runs the bot.
+- **Admin panel** (several bots on one Docker host): `docs/install-panel.md` brings
+  up `stitch-panel` behind Tailscale, and the operator adds bots from a wizard in
+  the browser. This is the right answer when they say "I want to run more than one
+  bot" or already have a compose file they're tired of editing.
 - **`stitch init`** (built-in wizard): `cd ~/Stitch && stitch init` picks a
   corridor from the catalog (cNGN/USDT on BSC, XAUt/USDT on Ethereum, wARS/USDT and
   wBRL/USDT on Celo), prompts for the key (hidden), and writes `stitch.toml`,

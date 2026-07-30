@@ -25,6 +25,8 @@ pub mod ladder;
 pub mod lean;
 pub mod maker;
 pub mod net;
+#[cfg(feature = "panel")]
+pub mod panel;
 pub mod poster;
 pub mod quote;
 pub mod rpc;

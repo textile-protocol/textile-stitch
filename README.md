@@ -29,7 +29,12 @@ second:
 
 ## Quick Start
 
-Two easy paths. Pick one.
+Two paths. Pick one:
+
+1. **[Desktop app](#option-1--desktop-app)** — one machine, a window you watch.
+   No terminal.
+2. **[Docker with the admin panel](#option-2--docker-with-the-admin-panel)** — a
+   server, or several bots. One command, then a web UI.
 
 ### Option 1 — Desktop app
 
@@ -46,10 +51,50 @@ No terminal needed. [Download the release for your OS](https://github.com/textil
 Pick a corridor, paste your operator wallet key, and click Create. The same
 window then runs the bot: Start/Stop, a dry-run toggle, a Permit2 "Approve
 tokens" button, live logs, and an Update button. Closing the window stops the
-bot; for unattended 24/7 running, install it as a service (see the install guides
-below).
+bot; for unattended 24/7 running, use Option 2 below or install it as a service
+(see the [manual guides](#other-ways-to-install)).
 
-### Option 2 — Install with an AI agent
+### Option 2 — Docker, with the admin panel
+
+For a server, or for running more than one bot. One command on any Docker host:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
+```
+
+It asks for a Tailscale auth key and which tailnet logins may drive the panel,
+then starts it. You get a web UI for the whole fleet — add a bot with a wizard,
+start and stop it, edit settings, approve allowances, tail logs — reachable only
+from your own tailnet, with no port published on the host.
+
+You need Docker with Compose v2, and a Tailscale account (the free tier is
+enough). Nothing is compiled: it runs the published image.
+
+Then open the URL it prints, click **Add a bot**, pick a corridor, paste your
+operator wallet key, and approve the router allowance from the bot's page before
+starting it.
+
+Already running bots from your own `docker-compose.yml`? Point the panel at that
+directory and it adopts them as they are — nothing is restarted or rewritten.
+
+Everything else — password login instead of Tailscale, your own reverse proxy,
+building from source, running the panel on a host you don't want on a tailnet —
+is in [install-panel.md](docs/install-panel.md). You shouldn't need it for the
+above.
+
+## Other ways to install
+
+- [Install with an AI agent](#install-with-an-ai-agent) — your coding agent does
+  the whole setup and then operates the bot on request.
+- [Cloud (AWS Fargate)](docs/install-cloud.md) — operator-owned managed deployment.
+- [Docker](docs/install-docker.md) — the bot image on its own, without the panel.
+- [Admin panel](docs/install-panel.md) — the advanced and manual routes for
+  Option 2 above.
+- [Manual install — macOS](docs/install-macos.md)
+- [Manual install — Windows](docs/install-windows.md)
+- [Manual install — Linux](docs/install-linux.md) — includes the systemd service setup.
+
+### Install with an AI agent
 
 Your coding agent collects the settings, writes the config,
 runs a dry run, and starts live only after you confirm. Then it handles start,
@@ -93,19 +138,8 @@ The full copyable prompt is in [AI_INSTALL_PROMPT.md](docs/AI_INSTALL_PROMPT.md)
 
 </details>
 
-## Other ways to install
-
-For running on a server, in a container, or by hand, see the dedicated guides:
-
-- [Cloud (AWS Fargate)](docs/install-cloud.md) — operator-owned managed deployment.
-- [Docker](docs/install-docker.md) — prebuilt image or build from source.
-- [Manual install — macOS](docs/install-macos.md)
-- [Manual install — Windows](docs/install-windows.md)
-- [Manual install — Linux](docs/install-linux.md) — includes the systemd service setup.
-
-Server operators can also run `stitch init` (after installing the binary) to
-write `stitch.toml`, `stitch.env`, and an owner-only `stitch.key` for a chosen
-corridor. The per-OS guides cover it.
+Running the binary directly? `stitch init` writes `stitch.toml`, `stitch.env` and
+an owner-only `stitch.key` for a chosen corridor. The per-OS guides cover it.
 
 ## How It Works
 

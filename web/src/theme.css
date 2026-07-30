@@ -1,0 +1,88 @@
+@import 'tailwindcss';
+
+/* Textile's design tokens, the same --tx-* values the web app defines and the
+   desktop app ports onto egui in src/bin/stitch-setup/theme.rs. Kept as CSS
+   variables rather than hard-coded Tailwind colours so the three surfaces stay
+   recognisably one product. */
+:root {
+  --tx-bg-primary: #fbfaf7;
+  --tx-bg-secondary: #ffffff;
+  --tx-bg-hover: #f1eee8;
+  --tx-bg-active: #e9e5dd;
+  --tx-text-primary: #15181c;
+  --tx-text-secondary: rgb(21 24 28 / 0.6);
+  --tx-text-tertiary: rgb(21 24 28 / 0.45);
+  --tx-border-secondary: rgb(21 24 28 / 0.18);
+  --tx-border-tertiary: rgb(21 24 28 / 0.1);
+  --tx-accent: #9c2eb0;
+  --tx-accent-tint: rgb(236 104 248 / 0.08);
+  --tx-on-accent: #ffffff;
+  --tx-text-success: #3b6d11;
+  --tx-bg-success: #ecf4df;
+  --tx-text-warning: #ba7517;
+  --tx-bg-warning: #fbf0dc;
+  --tx-text-danger: #b03a2e;
+  --tx-bg-danger: #f7e7e4;
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --tx-bg-primary: #33363e;
+  --tx-bg-secondary: #2a2d34;
+  --tx-bg-hover: #30333b;
+  --tx-bg-active: #22242a;
+  --tx-text-primary: #f5f4ed;
+  --tx-text-secondary: rgb(255 255 255 / 0.65);
+  --tx-text-tertiary: rgb(255 255 255 / 0.45);
+  --tx-border-secondary: rgb(255 255 255 / 0.22);
+  --tx-border-tertiary: rgb(255 255 255 / 0.12);
+  --tx-accent: #ec68f8;
+  --tx-accent-tint: rgb(236 104 248 / 0.16);
+  --tx-on-accent: #15181c;
+  --tx-text-success: #97c459;
+  --tx-bg-success: #173404;
+  --tx-text-warning: #ef9f27;
+  --tx-bg-warning: #412402;
+  --tx-text-danger: #ef8a7a;
+  --tx-bg-danger: #3a1a15;
+  color-scheme: dark;
+}
+
+/* Expose the tokens to Tailwind so `bg-surface`, `text-muted`, `border-line`
+   and friends work as ordinary utilities. */
+@theme inline {
+  --color-canvas: var(--tx-bg-primary);
+  --color-surface: var(--tx-bg-secondary);
+  --color-hover: var(--tx-bg-hover);
+  --color-active: var(--tx-bg-active);
+  --color-ink: var(--tx-text-primary);
+  --color-muted: var(--tx-text-secondary);
+  --color-faint: var(--tx-text-tertiary);
+  --color-line: var(--tx-border-secondary);
+  --color-line-soft: var(--tx-border-tertiary);
+  --color-accent: var(--tx-accent);
+  --color-accent-tint: var(--tx-accent-tint);
+  --color-on-accent: var(--tx-on-accent);
+  --color-success: var(--tx-text-success);
+  --color-success-bg: var(--tx-bg-success);
+  --color-warning: var(--tx-text-warning);
+  --color-warning-bg: var(--tx-bg-warning);
+  --color-danger: var(--tx-text-danger);
+  --color-danger-bg: var(--tx-bg-danger);
+  --font-sans: Lato, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+
+body {
+  margin: 0;
+  background: var(--tx-bg-primary);
+  color: var(--tx-text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Focus rings on the accent, visible in both themes. */
+:focus-visible {
+  outline: 2px solid var(--tx-accent);
+  outline-offset: 2px;
+}

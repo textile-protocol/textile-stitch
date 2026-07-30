@@ -1,0 +1,59 @@
+# The fleet admin panel. Separate from the bot image on purpose: the bot has no
+# business carrying a Docker client or a web UI, and the panel has no business
+# being on the critical path of a `cargo build` for operators who build from
+# source.
+#
+# Two build stages, one runtime. The node stage produces web/dist, which
+# rust-embed compiles into the binary — so the runtime image is the binary plus
+# CA certificates, with no static file tree that can drift out of sync with it.
+
+FROM node:22-bookworm-slim AS web
+
+WORKDIR /web
+# Dependencies first, so a change to a component doesn't reinstall node_modules.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY web/ ./
+# `npm run build` typechecks before it bundles, so a type error fails the image
+# build rather than shipping a broken UI.
+RUN npm run build
+
+
+FROM rust:1-bookworm AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY --from=web /web/dist ./web/dist
+
+RUN cargo build --locked --release --features panel --bin stitch-panel
+
+
+FROM debian:bookworm-slim
+
+# ca-certificates is for outbound HTTPS (RPC and price feeds during a dry run).
+# The Docker Engine API is reached over the mounted unix socket, so there is no
+# Docker CLI here and nothing to configure.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/stitch-panel /usr/local/bin/stitch-panel
+RUN chmod 0755 /usr/local/bin/stitch-panel
+
+# Runs as root, deliberately and not as a shrug: the panel's whole job needs the
+# Docker socket, and socket access is root-equivalent on the host regardless of
+# the uid inside this container. A non-root user here would need the host's
+# docker gid baked in at build time — different on every host, and no real
+# boundary once it can create privileged containers anyway. The boundary that
+# matters is who can reach the panel's port, which is why it binds to loopback
+# behind Tailscale.
+ENV STITCH_PANEL_BIND=127.0.0.1:8420 \
+    STITCH_PANEL_BOTS_DIR=/data/bots
+
+WORKDIR /data
+
+# Bare invocation serves; `hash-password` is the only subcommand. No CMD, so
+# `docker run <image> hash-password` works without overriding an entrypoint.
+ENTRYPOINT ["/usr/local/bin/stitch-panel"]

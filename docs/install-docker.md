@@ -101,6 +101,31 @@ It expects `stitch.bot1.toml` / `stitch.bot2.toml` (copied from
 `stitch.example.toml`) and `stitch.bot1.key` / `stitch.bot2.key` next to the
 compose file. Copy a service block to add a third bot.
 
+Two things about this layout to know before your fleet grows:
+
+- Mounting the two config files individually leaves everything else the bot
+  writes — including the Permit2 slot-nonce ledger — on the container's
+  filesystem, so recreating the container loses it and the bot restarts its nonce
+  sequence, colliding with orders still resting on the book. Give each bot its own
+  directory and mount the whole thing read-write instead, remounting the config and
+  key read-only on top:
+
+  ```yaml
+  volumes:
+    - ./bots/bot1:/home/stitch/run
+    - ./bots/bot1/stitch.toml:/home/stitch/run/stitch.toml:ro
+    - ./bots/bot1/stitch.key:/home/stitch/run/stitch.key:ro
+  ```
+
+  The container runs as uid 1000 and has to own that directory:
+  `chown -R 1000 ./bots/bot1` after you create it. The entrypoint locks the run
+  directory down to `0700` before it writes anything, which a non-owner can't do,
+  so a root-owned directory means the container exits at startup.
+- Past two or three bots, editing YAML over SSH stops being fun. The
+  [admin panel](install-panel.md) is a web UI for the same fleet: add, start, stop,
+  configure, tail logs, run approvals. It adopts the containers this compose file
+  already started, without restarting them.
+
 For a managed cloud deployment on AWS ECS Fargate, see
 [install-cloud.md](install-cloud.md). For configuration reference and tuning, see
 [ADVANCED.md](ADVANCED.md).

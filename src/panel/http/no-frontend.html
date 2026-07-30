@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Stitch panel — no frontend built</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #0b0f14;
+        color: #e6edf3;
+        font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      }
+      main { max-width: 34rem; padding: 2rem; }
+      h1 { font-size: 1.25rem; margin: 0 0 0.75rem; }
+      code {
+        background: #161b22;
+        padding: 0.15rem 0.35rem;
+        border-radius: 4px;
+        font-size: 0.9em;
+      }
+      pre {
+        background: #161b22;
+        padding: 0.9rem 1rem;
+        border-radius: 8px;
+        overflow-x: auto;
+      }
+      p { color: #9aa7b4; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>This panel was built without its frontend.</h1>
+      <p>
+        The API is up — <code>/api/health</code> answers — but no built assets were
+        embedded, so there is no UI to serve. The published Docker image builds the
+        frontend for you; a local <code>cargo build</code> does not.
+      </p>
+      <pre>cd packages/stitch-bot/web
+npm install
+npm run build
+cargo build --features panel --bin stitch-panel</pre>
+      <p>Then restart the panel.</p>
+    </main>
+  </body>
+</html>
