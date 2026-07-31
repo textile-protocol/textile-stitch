@@ -144,3 +144,26 @@ export interface ExitEvent {
   ok: boolean
   action: string
 }
+
+/** Result of GET /api/updates — registry digest check for bots + the panel itself. */
+export interface ImageUpdateInfo {
+  /** Image reference the update would pull (e.g. …:latest). */
+  targetImage: string
+  /** Image the container is on now, when known. */
+  currentImage: string | null
+  updateAvailable: boolean
+  /** Why no update can be offered (local-only image, registry unreachable, …). */
+  reason: string | null
+}
+
+export interface BotUpdateInfo {
+  name: string
+  currentImage: string | null
+  updateAvailable: boolean
+}
+
+export interface UpdatesStatus {
+  bot: ImageUpdateInfo
+  panel: ImageUpdateInfo
+  bots: BotUpdateInfo[]
+}

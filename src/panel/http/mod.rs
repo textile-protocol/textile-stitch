@@ -19,6 +19,7 @@ pub mod logs;
 pub mod origin;
 pub mod session;
 pub mod settings;
+pub mod updates;
 pub mod wizard;
 
 use std::sync::Arc;
@@ -258,16 +259,20 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/stop", post(bots::stop))
         .route("/api/bots/{name}/restart", post(bots::restart))
         .route("/api/bots/{name}/recreate", post(bots::recreate))
+        .route("/api/bots/{name}/update", post(bots::update))
         .route("/api/bots/{name}/migrate", post(bots::migrate_layout))
         .route("/api/bots/{name}/settings", get(settings::show))
         .route("/api/bots/{name}/settings", patch(settings::update))
         .route("/api/bots/{name}/config", get(settings::raw))
         .route("/api/bots/{name}/config", put(settings::save_raw))
         .route("/api/bots/{name}/signer", put(bots::change_signer))
+        .route("/api/bots/{name}/corridor", post(bots::switch_corridor))
         .route("/api/bots/{name}/logs", get(logs::tail))
         .route("/api/bots/{name}/approve", post(logs::approve))
         .route("/api/bots/{name}/dry-run", post(logs::dry_run))
         .route("/api/compose-export", get(bots::compose_export))
+        .route("/api/updates", get(updates::status))
+        .route("/api/panel/update", post(updates::update_panel))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -363,10 +368,23 @@ pub(crate) mod testkit {
 
     /// An app with a fake Docker, a fresh bots root, and a live session.
     pub fn harness(tag: &str) -> Harness {
+        harness_with_bot_image(tag, "ghcr.io/textile-protocol/textile-stitch:test")
+    }
+
+    /// Same as [`harness`], with a caller-chosen `STITCH_PANEL_BOT_IMAGE`.
+    pub fn harness_with_bot_image(tag: &str, bot_image: &str) -> Harness {
+        harness_with(tag, bot_image, None)
+    }
+
+    /// Same as [`harness`], with optional overrides for bot image and docker socket.
+    pub fn harness_with(tag: &str, bot_image: &str, docker_socket: Option<&str>) -> Harness {
         let root = temp_root(tag);
         let docker = Arc::new(FakeDocker::new());
         let mut cfg = PanelConfig::for_test(root.clone(), root.clone());
-        cfg.bot_image = "ghcr.io/textile-protocol/textile-stitch:test".into();
+        cfg.bot_image = bot_image.into();
+        if let Some(sock) = docker_socket {
+            cfg.docker_socket = PathBuf::from(sock);
+        }
         let state = AppState::new(cfg, docker.clone()).with_container_files(docker.clone());
         let token = state.sessions.create();
         Harness {

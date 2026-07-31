@@ -24,6 +24,7 @@ pub mod inventory;
 pub mod migrate;
 pub mod naming;
 pub mod provision;
+pub mod updates;
 
 pub use config::{AuthMode, PanelConfig};
 pub use docker::{DockerApi, STOP_GRACE_SECS};

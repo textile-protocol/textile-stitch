@@ -11,17 +11,16 @@ import {
   Select,
   Toggle,
 } from './ui'
-import { formatAtomic, formatSeconds, shortAddress } from '../format'
-import type { Bot, Settings, Sizing, Spread } from '../types'
+import ChangeSigner from './ChangeSigner'
+import { shortAddress } from '../format'
+import type { Bot, Corridor, Settings, Spread } from '../types'
 
 /**
- * The structured settings form.
+ * Structured settings matching the desktop Stitch app: corridor, signer, spreads,
+ * taker leg, and endpoints. Sizing / TTL / tick stay on the Raw config tab.
  *
- * Sends only the fields the operator touched, because the API takes a partial
- * patch — that way a form that doesn't show a field can't clear it. Amounts are
- * edited as the atomic-unit integers the config stores, with the human-readable
- * value shown underneath rather than substituted for it: rounding an inventory
- * into a float and back is how you post an order for the wrong size.
+ * Sends only the fields the operator touched — a partial patch means a concurrent
+ * raw edit only loses what this form actually changed.
  */
 export default function SettingsForm({
   bot,
@@ -30,19 +29,21 @@ export default function SettingsForm({
   bot: Bot
   onSaved: (message: string) => void
 }) {
-  const [pool, setPool] = useState(0)
   const [loaded, setLoaded] = useState<Settings | null>(null)
   const [draft, setDraft] = useState<Settings | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
+  // Reload when the bot's corridor changes (switch replaces stitch.toml wholesale).
+  const corridorId = bot.config?.corridorId ?? ''
   useEffect(() => {
     let cancelled = false
     setLoaded(null)
     setLoadError(null)
+    // Desktop edits pool 0 only; multi-pool configs keep other pools via raw TOML.
     api
-      .settings(bot.name, pool)
+      .settings(bot.name, 0)
       .then((s) => {
         if (cancelled) return
         setLoaded(s)
@@ -54,7 +55,7 @@ export default function SettingsForm({
     return () => {
       cancelled = true
     }
-  }, [bot.name, pool])
+  }, [bot.name, corridorId])
 
   if (loadError) return <ErrorState error={loadError} />
   if (!loaded || !draft) return <Loading what="the settings" />
@@ -67,7 +68,7 @@ export default function SettingsForm({
     setBusy(true)
     setError(null)
     try {
-      const res = await api.saveSettings(bot.name, changedFields(loaded!, draft!, pool))
+      const res = await api.saveSettings(bot.name, changedFields(loaded!, draft!))
       setLoaded(res.settings)
       setDraft(res.settings)
       onSaved(res.message)
@@ -80,41 +81,16 @@ export default function SettingsForm({
 
   return (
     <div className="space-y-4">
-      {loaded.poolCount > 1 && (
-        <Card title="Pool">
-          <Field
-            label="Editing pool"
-            hint={`This config has ${loaded.poolCount} pools. The fields below apply to the one selected here; tick cadence is bot-wide.`}
-          >
-            <Select value={pool} onChange={(e) => setPool(Number(e.target.value))}>
-              {Array.from({ length: loaded.poolCount }, (_, i) => (
-                <option key={i} value={i}>
-                  Pool {i + 1}
-                </option>
-              ))}
-            </Select>
-          </Field>
-        </Card>
-      )}
+      <CorridorCard bot={bot} onSwitched={onSaved} />
 
-      <Card title="Endpoints">
-        <div className="space-y-4">
-          <Field label="RPC URL" hint="Where the bot reads chain state and sends transactions.">
-            <Input
-              value={draft.rpcUrl}
-              onChange={(e) => set('rpcUrl', e.target.value)}
-              disabled={!loaded.editable}
-            />
-          </Field>
-          <Field label="Price feed URL">
-            <Input
-              value={draft.feedUrl}
-              onChange={(e) => set('feedUrl', e.target.value)}
-              disabled={!loaded.editable}
-            />
-          </Field>
-        </div>
-      </Card>
+      <ChangeSigner bot={bot.name} onChanged={onSaved} />
+
+      {loaded.poolCount > 1 && (
+        <Banner tone="warning">
+          This config has {loaded.poolCount} pools. The fields below edit pool 1
+          only — change the others in Raw config.
+        </Banner>
+      )}
 
       <Card
         title="Spreads"
@@ -140,68 +116,36 @@ export default function SettingsForm({
             onChange={(v) => set('sell', v)}
           />
         </div>
-        <div className="mt-4">
-          <Toggle
-            checked={draft.takerEnabled}
-            disabled={!loaded.editable}
-            onChange={(v) => set('takerEnabled', v)}
-            label="Take resting orders that cross this bot's quote"
-          />
-        </div>
       </Card>
 
-      <Card title="Sizing">
-        <div className="grid gap-6 sm:grid-cols-2">
-          <SizingFields
-            title="Buy side"
-            unit={`sized in debt · ${loaded.pair.debtDecimals} decimals`}
-            decimals={loaded.pair.debtDecimals}
-            debtDecimals={loaded.pair.debtDecimals}
-            value={draft.buySizing}
-            disabled={!loaded.editable}
-            onChange={(v) => set('buySizing', v)}
-          />
-          <SizingFields
-            title="Sell side"
-            unit={`sized in collateral · ${loaded.pair.collateralDecimals} decimals`}
-            decimals={loaded.pair.collateralDecimals}
-            debtDecimals={loaded.pair.debtDecimals}
-            value={draft.sellSizing}
-            disabled={!loaded.editable}
-            onChange={(v) => set('sellSizing', v)}
-          />
-        </div>
-        <p className="mt-4 text-xs text-faint">
-          With a total and a minimum slice set, the bot quotes a ladder and ignores
-          the flat order size. Leave the ladder pair empty to quote one order per
-          side instead. <code>max</code> in a total means "everything funded".
+      <Card title="Taker leg">
+        <Toggle
+          checked={draft.takerEnabled}
+          disabled={!loaded.editable}
+          onChange={(v) => set('takerEnabled', v)}
+          label="Take resting orders that cross this bot's quote"
+        />
+        <p className="mt-2 text-xs text-faint">
+          Fill users' resting limit orders when their price crosses your quote.
+          Fills are priced off the buy/sell spreads above, so a side with no
+          spread is never taken.
         </p>
       </Card>
 
-      <Card title="Timing">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field
-            label="Order lifetime (seconds)"
-            hint={`${formatSeconds(draft.ttlSecs)} — orders this bot signs stay fillable this long, even after it stops.`}
-          >
+      <Card title="Endpoints">
+        <div className="space-y-4">
+          <Field label="RPC URL" hint="Where the bot reads chain state and sends transactions.">
             <Input
-              type="number"
-              min={1}
-              value={draft.ttlSecs}
+              value={draft.rpcUrl}
+              onChange={(e) => set('rpcUrl', e.target.value)}
               disabled={!loaded.editable}
-              onChange={(e) => set('ttlSecs', Number(e.target.value))}
             />
           </Field>
-          <Field
-            label="Tick interval (seconds)"
-            hint={`${formatSeconds(draft.tickIntervalSecs)} between re-quotes. Applies to the whole bot, not just this pool.`}
-          >
+          <Field label="Price feed URL">
             <Input
-              type="number"
-              min={1}
-              value={draft.tickIntervalSecs}
+              value={draft.feedUrl}
+              onChange={(e) => set('feedUrl', e.target.value)}
               disabled={!loaded.editable}
-              onChange={(e) => set('tickIntervalSecs', Number(e.target.value))}
             />
           </Field>
         </div>
@@ -233,6 +177,118 @@ export default function SettingsForm({
   )
 }
 
+/**
+ * Current corridor with a deliberate "Switch corridor…" affordance. Switching
+ * replaces stitch.toml with the preset (signer preserved) and stops a running bot.
+ */
+function CorridorCard({
+  bot,
+  onSwitched,
+}: {
+  bot: Bot
+  onSwitched: (message: string) => void
+}) {
+  const [corridors, setCorridors] = useState<Corridor[] | null>(null)
+  const [switching, setSwitching] = useState(false)
+  const [choice, setChoice] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .corridors()
+      .then((r) => {
+        if (!cancelled) setCorridors(r.corridors)
+      })
+      .catch(() => {
+        if (!cancelled) setCorridors([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const current =
+    bot.config?.corridorLabel ??
+    (bot.config?.corridorId ? bot.config.corridorId : 'Custom corridor')
+
+  async function apply() {
+    if (
+      !window.confirm(
+        `Switch ${bot.name} to a different corridor?\n\nThis replaces stitch.toml with the preset (your signer is kept). A running bot is stopped — approve tokens for the new corridor before starting.`,
+      )
+    ) {
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await api.switchCorridor(bot.name, choice)
+      setSwitching(false)
+      onSwitched(res.message)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Card title="Corridor">
+      <p className="text-sm text-ink">{current}</p>
+      {corridors && corridors.length >= 2 && !switching && (
+        <div className="mt-3">
+          <Button
+            onClick={() => {
+              setChoice(bot.config?.corridorId ?? corridors[0]!.id)
+              setSwitching(true)
+              setError(null)
+            }}
+          >
+            Switch corridor…
+          </Button>
+        </div>
+      )}
+      {switching && corridors && (
+        <div className="mt-3 space-y-3">
+          <Field
+            label="Switch to"
+            hint="Replaces this bot's config with the corridor preset. Spreads and endpoints reset; the signer stays."
+          >
+            <Select value={choice} onChange={(e) => setChoice(e.target.value)}>
+              {corridors.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.displayName} — {c.networkLabel}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          {error && <Banner tone="danger">{error}</Banner>}
+          <div className="flex gap-2">
+            <Button
+              variant="primary"
+              busy={busy}
+              disabled={!choice || choice === bot.config?.corridorId}
+              onClick={() => void apply()}
+            >
+              Switch corridor
+            </Button>
+            <Button
+              onClick={() => {
+                setSwitching(false)
+                setError(null)
+              }}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+    </Card>
+  )
+}
+
 function SpreadField({
   label,
   hint,
@@ -246,102 +302,23 @@ function SpreadField({
   disabled: boolean
   onChange: (v: Spread) => void
 }) {
+  const unit = value.kind === 'bps' ? 'bps' : 'abs'
   return (
-    <Field label={label} hint={hint}>
-      <div className="flex gap-2">
-        <Input
-          value={value.value}
-          disabled={disabled}
-          placeholder={value.kind === 'bps' ? '25' : '0.0015'}
-          onChange={(e) => onChange({ ...value, value: e.target.value })}
-        />
-        <Select
-          value={value.kind}
-          disabled={disabled}
-          className="w-28"
-          onChange={(e) => onChange({ ...value, kind: e.target.value as Spread['kind'] })}
-        >
-          <option value="bps">bps</option>
-          <option value="abs">absolute</option>
-        </Select>
-      </div>
+    <Field label={`${label} (${unit})`} hint={hint}>
+      <Input
+        value={value.value}
+        disabled={disabled}
+        placeholder={value.kind === 'bps' ? '25' : '0.0015'}
+        onChange={(e) => onChange({ ...value, value: e.target.value })}
+      />
     </Field>
   )
 }
 
-function SizingFields({
-  title,
-  unit,
-  decimals,
-  debtDecimals,
-  value,
-  disabled,
-  onChange,
-}: {
-  title: string
-  unit: string
-  /** Decimals of this side's own token: debt when buying, collateral when selling. */
-  decimals: number
-  /** Debt decimals, which is what the minimum slice is always denominated in. */
-  debtDecimals: number
-  value: Sizing
-  disabled: boolean
-  onChange: (v: Sizing) => void
-}) {
-  // `maxOrders` is a count, so it has no scale and gets no converted hint.
-  const rows: [keyof Sizing, string, number | null][] = [
-    ['totalLiquidity', 'Total ladder liquidity', decimals],
-    ['minSliceDebt', 'Smallest slice (debt units)', debtDecimals],
-    ['orderSize', 'Flat order size', decimals],
-    ['maxOrders', 'Maximum live orders', null],
-  ]
-  return (
-    <div className="space-y-3">
-      <h3 className="text-sm font-bold">
-        {title} <span className="font-normal text-faint">{unit}</span>
-      </h3>
-      {rows.map(([key, label, scale]) => (
-        <Field
-          key={key}
-          label={label}
-          hint={
-            scale === null || value[key].trim() === ''
-              ? undefined
-              : `= ${formatAtomic(value[key], scale)}`
-          }
-        >
-          <Input
-            value={value[key]}
-            disabled={disabled}
-            inputMode="numeric"
-            placeholder="unset"
-            onChange={(e) => onChange({ ...value, [key]: e.target.value })}
-          />
-        </Field>
-      ))}
-    </div>
-  )
-}
-
-/**
- * Only the fields that actually changed, plus the pool they apply to.
- *
- * Sending the whole view back would work, but a partial patch means a concurrent
- * edit through the raw editor only loses the fields this form actually touched.
- */
-function changedFields(loaded: Settings, draft: Settings, pool: number): unknown {
-  const patch: Record<string, unknown> = { pool }
-  const keys: (keyof Settings)[] = [
-    'rpcUrl',
-    'feedUrl',
-    'buy',
-    'sell',
-    'takerEnabled',
-    'buySizing',
-    'sellSizing',
-    'ttlSecs',
-    'tickIntervalSecs',
-  ]
+/** Only the desktop field set, plus the pool index the API needs. */
+function changedFields(loaded: Settings, draft: Settings): unknown {
+  const patch: Record<string, unknown> = { pool: 0 }
+  const keys: (keyof Settings)[] = ['rpcUrl', 'feedUrl', 'buy', 'sell', 'takerEnabled']
   for (const key of keys) {
     if (JSON.stringify(loaded[key]) !== JSON.stringify(draft[key])) {
       patch[key] = draft[key]

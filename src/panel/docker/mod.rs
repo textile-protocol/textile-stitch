@@ -23,7 +23,7 @@ mod bollard_api;
 pub use bollard_api::BollardDocker;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -134,6 +134,45 @@ pub struct MountInfo {
     pub rw: bool,
 }
 
+/// Host path to bind into the panel self-update helper for the Docker socket.
+///
+/// `STITCH_PANEL_DOCKER_SOCKET` is where the panel *opens* the socket inside its
+/// own container. `docker create` bind sources are resolved on the Docker host,
+/// so a remap like `/var/run/docker.sock:/docker.sock` must mount the host
+/// source (`/var/run/docker.sock`), not the in-container destination. Directory
+/// binds are the same story: `/var/run:/docker-run` with the socket at
+/// `/docker-run/docker.sock` must become `/var/run/docker.sock` on the host.
+/// When no mount matches (panel running on the host), the configured path is
+/// already a host path and is returned unchanged.
+pub fn host_docker_socket_bind(
+    mounts: &[MountInfo],
+    in_container_socket: &std::path::Path,
+) -> PathBuf {
+    if let Some(source) = mounts
+        .iter()
+        .find(|m| m.destination.as_path() == in_container_socket)
+        .map(|m| m.source.clone())
+        .filter(|s| !s.as_os_str().is_empty())
+    {
+        return source;
+    }
+    // Socket lives under a directory mount (e.g. /var/run → /docker-run).
+    // Prefer the longest destination prefix when several mounts could match.
+    mounts
+        .iter()
+        .filter(|m| !m.source.as_os_str().is_empty())
+        .filter_map(|m| {
+            in_container_socket
+                .strip_prefix(&m.destination)
+                .ok()
+                .filter(|rel| !rel.as_os_str().is_empty())
+                .map(|rel| (m.destination.as_os_str().len(), m.source.join(rel)))
+        })
+        .max_by_key(|(dest_len, _)| *dest_len)
+        .map(|(_, host)| host)
+        .unwrap_or_else(|| in_container_socket.to_path_buf())
+}
+
 /// A container as the panel needs to see it.
 #[derive(Debug, Clone)]
 pub struct ContainerInfo {
@@ -141,6 +180,9 @@ pub struct ContainerInfo {
     /// Name without the API's leading slash.
     pub name: String,
     pub image: String,
+    /// Content-addressed image id (`sha256:…`) when the daemon reported one.
+    /// Used to compare a running container against a registry digest for updates.
+    pub image_id: String,
     pub state: ContainerState,
     /// The daemon's human-readable status, e.g. "Up 3 hours".
     pub status: String,
@@ -298,6 +340,40 @@ pub trait DockerApi: Send + Sync {
     /// replaces a container, *before* the old one is removed, so a registry that
     /// can't be reached leaves the bot standing instead of deleted.
     async fn ensure_image(&self, image: &str, refresh: bool) -> Result<()>;
+
+    /// Pull `image` from the registry and require the pull to succeed.
+    ///
+    /// Unlike [`Self::ensure_image`] with `refresh: true`, a failed pull is
+    /// always an error — never fall back to a pre-existing local copy. Panel
+    /// self-update uses this so a GHCR outage after `/api/updates` reported a
+    /// newer digest cannot arm a swap onto a stale cached `:latest`.
+    async fn require_fresh_image(&self, image: &str) -> Result<()>;
+
+    /// Repo digests (`repo@sha256:…`) for a local image, empty when it isn't on
+    /// the host. Used to compare a running container against a registry tag
+    /// without pulling on every status poll.
+    async fn local_image_digests(&self, image: &str) -> Result<Vec<String>>;
+
+    /// Schedule replacing a live container with `new_image`, preserving its
+    /// create config (env, binds, network mode, restart policy).
+    ///
+    /// Used for panel self-update: the panel process lives inside the container
+    /// being replaced, so the swap is armed here and finished by a short-lived
+    /// helper after this method returns. Callers should answer the HTTP client
+    /// before the helper stops them.
+    ///
+    /// `docker_socket` is the path the panel opens inside its own namespace
+    /// (`STITCH_PANEL_DOCKER_SOCKET`). Implementations must resolve that to a
+    /// *host* bind source via the panel container's mounts before creating the
+    /// helper — a remap like `/var/run/docker.sock:/docker.sock` would otherwise
+    /// mount a non-existent host path. Hardcoding `/var/run/docker.sock` would
+    /// miss installs that set a custom socket path.
+    async fn schedule_image_swap(
+        &self,
+        name: &str,
+        new_image: &str,
+        docker_socket: &std::path::Path,
+    ) -> Result<()>;
 
     async fn create(&self, spec: &CreateSpec) -> Result<String>;
 
@@ -470,6 +546,54 @@ mod tests {
         let spec = BindSpec::rw("/host/bot:a", "/home/stitch/run");
         let err = spec.to_bind_string().unwrap_err();
         assert!(err.to_string().contains("colon"));
+    }
+
+    #[test]
+    fn helper_socket_bind_uses_the_host_source_of_a_remapped_mount() {
+        let mounts = [MountInfo {
+            source: PathBuf::from("/var/run/docker.sock"),
+            destination: PathBuf::from("/docker.sock"),
+            rw: true,
+        }];
+        assert_eq!(
+            host_docker_socket_bind(&mounts, Path::new("/docker.sock")),
+            PathBuf::from("/var/run/docker.sock")
+        );
+        // No matching mount (panel on the host): configured path is already host-side.
+        assert_eq!(
+            host_docker_socket_bind(&[], Path::new("/var/run/docker.sock")),
+            PathBuf::from("/var/run/docker.sock")
+        );
+    }
+
+    #[test]
+    fn helper_socket_bind_resolves_sockets_under_a_directory_mount() {
+        let mounts = [MountInfo {
+            source: PathBuf::from("/var/run"),
+            destination: PathBuf::from("/docker-run"),
+            rw: true,
+        }];
+        assert_eq!(
+            host_docker_socket_bind(&mounts, Path::new("/docker-run/docker.sock")),
+            PathBuf::from("/var/run/docker.sock")
+        );
+        // Exact file mount still wins over a parent directory mount.
+        let nested = [
+            MountInfo {
+                source: PathBuf::from("/var/run"),
+                destination: PathBuf::from("/docker-run"),
+                rw: true,
+            },
+            MountInfo {
+                source: PathBuf::from("/run/docker.sock"),
+                destination: PathBuf::from("/docker-run/docker.sock"),
+                rw: true,
+            },
+        ];
+        assert_eq!(
+            host_docker_socket_bind(&nested, Path::new("/docker-run/docker.sock")),
+            PathBuf::from("/run/docker.sock")
+        );
     }
 
     #[test]

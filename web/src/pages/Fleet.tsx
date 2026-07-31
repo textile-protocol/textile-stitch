@@ -12,13 +12,14 @@ import {
   Tag,
 } from '../components/ui'
 import { shortAddress, shortImage } from '../format'
-import type { Bot, Fleet as FleetData } from '../types'
+import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
 const POLL_MS = 5000
 
 export default function Fleet() {
   const [data, setData] = useState<FleetData | null>(null)
+  const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   // A bot that was just removed or created redirects here with what happened, so
@@ -35,19 +36,47 @@ export default function Fleet() {
     }
   }, [])
 
+  const loadUpdates = useCallback(async () => {
+    try {
+      setUpdates(await api.updates())
+    } catch {
+      setUpdates(null)
+    }
+  }, [])
+
   useEffect(() => {
     void load()
+    void loadUpdates()
     const timer = setInterval(() => void load(), POLL_MS)
     return () => clearInterval(timer)
-  }, [load])
+  }, [load, loadUpdates])
 
-  async function act(name: string, what: 'start' | 'stop' | 'restart') {
+  async function act(name: string, what: 'start' | 'stop' | 'restart' | 'update') {
+    if (what === 'update') {
+      const bot = data?.bots.find((b) => b.name === name)
+      // Recreate drops an in-container nonce ledger. Flat-layout bots must migrate
+      // first — the detail page already says so; don't offer a quieter path here.
+      if (bot && (bot.canMigrate || bot.layout === 'flat-files')) {
+        setError(
+          `${name} still uses the flat layout. Open it and migrate before updating, or recreating loses the slot-nonce ledger and live orders can collide.`,
+        )
+        return
+      }
+      if (
+        !window.confirm(
+          `Update ${name} to ${updates?.bot.targetImage ?? 'the panel bot image'}?\n\nThe container is recreated (brief gap in quoting). Config and key stay.`,
+        )
+      ) {
+        return
+      }
+    }
     setBusy(`${name}:${what}`)
     setNote(null)
     try {
-      const res = await api[what](name)
+      const res = what === 'update' ? await api.updateBot(name) : await api[what](name)
       if (res.message) setNote(res.message)
       await load()
+      await loadUpdates()
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -57,6 +86,10 @@ export default function Fleet() {
 
   if (!data && error) return <ErrorState error={error} onRetry={() => void load()} />
   if (!data) return <Loading what="the fleet" />
+
+  const behind = new Set(
+    (updates?.bots ?? []).filter((b) => b.updateAvailable).map((b) => b.name),
+  )
 
   return (
     <div className="space-y-4">
@@ -71,6 +104,12 @@ export default function Fleet() {
 
       {error && <Banner tone="danger" onDismiss={() => setError(null)}>{error}</Banner>}
       {note && <Banner tone="info" onDismiss={() => setNote(null)}>{note}</Banner>}
+      {behind.size > 0 && (
+        <Banner tone="info">
+          {behind.size} {behind.size === 1 ? 'bot has' : 'bots have'} a stitch image update
+          available. Open a bot and click Update, or use Update on the row.
+        </Banner>
+      )}
 
       {data.bots.length === 0 ? (
         <Empty title="No bots on this host yet">
@@ -84,7 +123,14 @@ export default function Fleet() {
         <ul className="space-y-3">
           {data.bots.map((bot) => (
             <li key={bot.name}>
-              <BotRow bot={bot} busy={busy} onAct={act} />
+              <BotRow
+                bot={bot}
+                busy={busy}
+                updateAvailable={
+                  behind.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
+                }
+                onAct={act}
+              />
             </li>
           ))}
         </ul>
@@ -101,11 +147,13 @@ export default function Fleet() {
 function BotRow({
   bot,
   busy,
+  updateAvailable,
   onAct,
 }: {
   bot: Bot
   busy: string | null
-  onAct: (name: string, what: 'start' | 'stop' | 'restart') => void
+  updateAvailable: boolean
+  onAct: (name: string, what: 'start' | 'stop' | 'restart' | 'update') => void
 }) {
   const blocking = bot.warnings.filter((w) => w.blocksEditing)
   const advisory = bot.warnings.filter((w) => !w.blocksEditing)
@@ -120,6 +168,7 @@ function BotRow({
         {bot.config?.corridorLabel && (
           <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
         )}
+        {updateAvailable && <Tag>update available</Tag>}
         <div className="ml-auto flex items-center gap-2">
           {bot.container ? (
             <>
@@ -156,6 +205,15 @@ function BotRow({
               >
                 Restart
               </Button>
+              {updateAvailable && (
+                <Button
+                  variant="primary"
+                  busy={busy === `${bot.name}:update`}
+                  onClick={() => onAct(bot.name, 'update')}
+                >
+                  Update
+                </Button>
+              )}
             </>
           ) : (
             <Tag>no container</Tag>

@@ -331,7 +331,8 @@ it; the compose export is there for when you want to go back.
 | Permit2 approve | `docker compose run --rm bot1 stitch approve …` | Approve allowances, output streamed |
 | Dry run | same, with `--dry-run` | Dry run button |
 | Logs | `docker compose logs -f bot1` | live tail with level colouring |
-| Upgrade a bot | edit the image tag, `up -d` | Recreate, on the panel's configured image |
+| Upgrade a bot | edit the image tag, `up -d` | **Update** when a newer digest is available (pulls `STITCH_PANEL_BOT_IMAGE` and recreates that bot). **Recreate** still rebuilds on the configured image for recovery. |
+| Upgrade the panel | `docker compose pull && up -d` | **Update panel** in the header when a newer `textile-stitch-panel` digest is published |
 
 **Approve needs the operator wallet to itself.** It runs in a throwaway container
 with its own copy of the key, and it broadcasts. So does a bot's taker or closer
@@ -497,6 +498,26 @@ Check you're browsing the `ts.net` URL rather than an IP, that your device isn't
 tagged, and that your login is spelled exactly as it appears in the Tailscale
 console.
 
+## Image updates
+
+The panel checks the registry (GHCR) for newer digests of the configured bot
+image and of its own panel image. Results are cached for about 15 minutes; pass
+`?refresh=1` on `/api/updates` (or use the UI after an update) to force a recheck.
+
+- **Per-bot Update** pulls `STITCH_PANEL_BOT_IMAGE` and recreates that bot only.
+  Config and key stay on disk. Expect a brief gap in quoting. If the bot still
+  uses the flat layout, migrate first so the nonce ledger isn't lost on recreate.
+- **Recreate** is the same Docker action without the "you're behind" nudge — use
+  it for recovery (missing container, stuck state).
+- **Update panel** pulls a newer `textile-stitch-panel` image (pinned `sha-*`
+  tags resolve to `:latest` of the same repo) and schedules a self-recreate via a
+  short-lived helper on the Docker socket. The UI disconnects briefly; bots keep
+  running. Local-only images (`stitch-panel` with no registry path) can't
+  self-update — rebuild or set `PANEL_IMAGE` to the published GHCR image.
+
+Offline or private registries that reject anonymous pulls soft-fail: the UI
+simply doesn't show an update, rather than erroring the fleet page.
+
 ## Hardening, once it works
 
 - **Tag the panel node.** Define a tag in your tailnet policy file, then set
@@ -504,7 +525,8 @@ console.
   sidecar. Tagged nodes don't expire keys, and ACLs can restrict who reaches the
   panel at the network level as well as at the allowlist.
 - **Pin the bot image.** `STITCH_PANEL_BOT_IMAGE` to a `sha-*` tag, so a restart
-  can't change the bot binary under you.
+  can't change the bot binary under you. The Update button still offers a move to
+  a newer publish when one appears.
 - **Restrict at the ACL level too.** The allowlist is the panel's own check;
   a tailnet ACL means an unlisted device can't even open a connection.
 - **Don't use Funnel.** It strips identity headers and publishes the panel to the

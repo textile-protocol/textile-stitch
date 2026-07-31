@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::logs;
 use super::{ApiError, AppState};
 use crate::panel::docker::{ContainerState, STOP_GRACE_SECS};
-use crate::panel::inventory::{Bot, ConfigSummary, Fleet, WalletId, Warning};
+use crate::panel::inventory::{Bot, ConfigSummary, Fleet, Layout, WalletId, Warning};
 use crate::panel::{compose, migrate, provision};
 use crate::setup::{self, SignerSetup};
 
@@ -536,13 +536,117 @@ pub async fn remove(
     Ok(Json(serde_json::json!({ "message": message })).into_response())
 }
 
+/// Pull a refreshable bot image and recreate this bot on it.
+///
+/// Unlike recovery [`recreate`] (which always uses `STITCH_PANEL_BOT_IMAGE` as
+/// written), Update resolves pinned `sha-*` tags and digests to the repository's
+/// `:latest` — same rule as panel self-update — so a pin can still pick up a
+/// newer publish. Mutable tags keep their tag.
+pub async fn update(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let image = crate::panel::updates::update_target_image(&state.cfg.bot_image)
+        .unwrap_or_else(|| state.cfg.bot_image.clone());
+    // Strict pull: Update must not fall back to a stale cached tag the way
+    // recovery Recreate does when an unauthenticated refresh fails.
+    recreate_on_image(state, name, image, true).await
+}
+
+/// Replace stitch.toml with a corridor preset, keeping the signer. Stops a
+/// running bot (same as the desktop settings screen) so the operator approves
+/// tokens for the new corridor before starting again.
+pub async fn switch_corridor(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<CorridorBody>,
+) -> Result<Response, ApiError> {
+    let (_config, bot) = lock_config(&name, &state).await?;
+    super::require_editable(&bot)?;
+    // The mounted file, not `dir/stitch.toml`. Flat-layout bots use
+    // `stitch.<bot>.toml`; writing the standard name would leave the container
+    // still mounting the old corridor.
+    let toml_path = bot
+        .config_panel_path
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict(format!("{name} has no editable config path")))?;
+
+    let corridor = setup::find_corridor(&body.corridor_id).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "there is no corridor called \"{}\". Ask /api/corridors for the list.",
+            body.corridor_id
+        ))
+    })?;
+
+    if bot.config.as_ref().and_then(|c| c.corridor_id.as_deref()) == Some(corridor.id) {
+        return Err(ApiError::bad_request(format!(
+            "{name} is already on the {} corridor",
+            corridor.display_name
+        )));
+    }
+
+    // Stop *before* rewriting the config. Writing first and then failing the
+    // stop leaves disk on the new corridor while the live process still quotes
+    // the old one — and a retry then hits "already on" without another stop.
+    //
+    // Key off "has a non-terminal container", not `wants_to_be_up`. A paused
+    // bot isn't "up" for Start/Stop labeling, but it still holds the old
+    // corridor in memory — rewriting disk then `docker unpause` resumes the
+    // stale process. Same stop path recreate uses for any non-terminal state.
+    let was_live = bot.container_name.is_some() && !bot.state.is_terminal();
+    if was_live {
+        if let Some(container) = &bot.container_name {
+            // Graceful stop only — the container stays so Start brings it back.
+            stop_before_destroying(&state, &bot, container).await?;
+        }
+    }
+
+    setup::switch_corridor_file(toml_path, corridor.toml_template)
+        .map_err(|e| ApiError::bad_request(format!("couldn't switch corridor: {e:#}")))?;
+
+    crate::panel::updates::clear_cache();
+
+    let where_to = format!("{} on {}", corridor.display_name, corridor.network_label);
+    let message = if was_live {
+        format!(
+            "Switched to {where_to}. The bot was stopped — approve tokens for the new corridor, then Start."
+        )
+    } else {
+        format!("Switched to {where_to}. Approve tokens for the new corridor before starting.")
+    };
+    action_response(&state, &name, Some(message)).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorridorBody {
+    pub corridor_id: String,
+}
+
 /// Recreate a bot's container from its config on disk, in the panel's layout.
 ///
 /// This is how a bot whose container was removed comes back, and how an operator
-/// picks up a new image tag.
+/// picks up a new image tag. Uses `STITCH_PANEL_BOT_IMAGE` as configured (pins
+/// stay pins). Prefer [`update`] when the goal is "pull a newer publish".
 pub async fn recreate(
     State(state): State<AppState>,
     Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let image = state.cfg.bot_image.clone();
+    recreate_on_image(state, name, image, false).await
+}
+
+/// Recreate onto a specific image reference (configured pin, or an Update target).
+///
+/// When `require_fresh` is set (Update), the registry pull must succeed — never
+/// fall back to a local copy. Recovery Recreate keeps the softer
+/// [`DockerApi::ensure_image`] refresh path so a private image pulled by hand
+/// still comes back when the daemon can't re-authenticate.
+async fn recreate_on_image(
+    state: AppState,
+    name: String,
+    image: String,
+    require_fresh: bool,
 ) -> Result<Response, ApiError> {
     // Config lock held across the whole recreate: the signer is read from the config
     // dir and the wallet is claimed from it, so a save that moved the config mid-recreate
@@ -564,6 +668,35 @@ pub async fn recreate(
             state.cfg.bots_dir.display()
         )));
     }
+    // Update recreates without migrating. Flat layout keeps the slot-nonce ledger
+    // inside the container, so a recreate drops it and live orders can collide.
+    // The UI already hides the button; refuse the API too (stale clients / curl).
+    if require_fresh && bot.layout == Layout::FlatFiles {
+        return Err(ApiError::conflict(format!(
+            "{name} still uses the flat file layout. Migrate it to the per-bot directory \
+             layout first — Update recreates the container and would drop the in-container \
+             nonce ledger."
+        )));
+    }
+    // Same gate as /api/updates: wrong repo or tag channel (fork, :canary vs
+    // :latest) must not be recreated onto STITCH_PANEL_BOT_IMAGE via Update.
+    // Recreate still uses the configured image for recovery — that path is explicit.
+    if require_fresh {
+        if let Some(current) = bot.image.as_deref() {
+            if !crate::panel::updates::bot_eligible_for_configured_update(
+                current,
+                &state.cfg.bot_image,
+            ) {
+                return Err(ApiError::conflict(format!(
+                    "{name} runs {current}, which is not on the update channel for {}. Update \
+                     only refreshes bots already on STITCH_PANEL_BOT_IMAGE (sha-* pins may \
+                     move to :latest) — recreate it from your own compose file, or change \
+                     STITCH_PANEL_BOT_IMAGE.",
+                    state.cfg.bot_image
+                )));
+            }
+        }
+    }
 
     // `wants_to_be_up`, not `is_running`: a bot Docker is restarting is one the
     // operator means to have up, and Recreate is often how they install the image
@@ -579,15 +712,25 @@ pub async fn recreate(
         None
     };
 
-    recreate_container(&state, &name, &bot, &dir, restart_after, wallet).await?;
+    recreate_container(
+        &state,
+        &name,
+        &bot,
+        &dir,
+        &image,
+        require_fresh,
+        restart_after,
+        wallet,
+    )
+    .await?;
 
-    tracing::info!(bot = %name, image = %state.cfg.bot_image, "recreated");
+    crate::panel::updates::clear_cache();
+    tracing::info!(bot = %name, %image, "recreated");
     action_response(
         &state,
         &name,
         Some(format!(
-            "{name} was recreated on {}{}.",
-            state.cfg.bot_image,
+            "{name} was recreated on {image}{}.",
             if restart_after {
                 " and started"
             } else {
@@ -600,40 +743,48 @@ pub async fn recreate(
 
 /// Rebuild a bot's container from the config on disk *now*, in the panel's layout.
 ///
-/// Shared by Recreate and the signer-change flow (which writes the new signer to disk
-/// first, then calls this to rebuild the container with the matching runtime). The
-/// caller holds the config lock and the wallet claim(s) across it. Everything that can
-/// fail — reading the signer, the mount preflight, pulling the image — happens before
-/// the old container is destroyed, so a failure leaves the config directory intact and
-/// the operator something to retry from.
+/// Shared by Recreate and Update. The caller holds the config lock and the wallet
+/// claim(s) across it. Everything that can fail — reading the signer, the mount
+/// preflight, pulling the image — happens before the old container is destroyed, so
+/// a failure leaves the config directory intact and the operator something to retry
+/// from.
 async fn recreate_container(
     state: &AppState,
     name: &str,
     bot: &Bot,
     dir: &std::path::Path,
+    image: &str,
+    require_fresh: bool,
     restart_after: bool,
     claim: Option<logs::WalletClaim>,
 ) -> Result<(), ApiError> {
     let signer = provision::signer_runtime(dir)?;
     let corridor = bot.config.as_ref().and_then(|c| c.corridor_id.clone());
-    // The configured image, not the one it's running: recreate is the action that
-    // exists to pick up a new one. Everything else preserves what the bot runs.
-    let spec = provision::bot_container_spec(
-        &state.cfg,
-        name,
-        &state.cfg.bot_image,
-        &signer,
-        corridor.as_deref(),
-    );
+    // The image the caller chose (configured pin for Recreate, refreshable
+    // target for Update), not the one the bot is running.
+    let spec = provision::bot_container_spec(&state.cfg, name, image, &signer, corridor.as_deref());
     provision::check_file_mounts(&spec.binds, &state.cfg).map_err(ApiError::conflict)?;
-    state.docker.ensure_image(&spec.image, true).await?;
+    if require_fresh {
+        state
+            .docker
+            .require_fresh_image(&spec.image)
+            .await
+            .map_err(|e| {
+                ApiError::internal(&e.context(format!(
+                    "pulling {image} for an Update — the bot was left on its current container \
+                     rather than recreating onto a possibly stale local copy"
+                )))
+            })?;
+    } else {
+        state.docker.ensure_image(&spec.image, true).await?;
+    }
 
     if let Some(container) = &bot.container_name {
         stop_before_destroying(state, bot, container).await?;
         state.docker.remove(container, true).await?;
     }
 
-    // The old container is gone by now. `ensure_image` above proves the image exists,
+    // The old container is gone by now. The image check above proves the image exists,
     // which is the failure this ordering was designed around — but a create can still
     // fail on a bad bind or a daemon that goes away, and there is no un-remove. So the
     // error says what state the bot is actually in, because "recreate failed" on its
@@ -2083,6 +2234,356 @@ mod tests {
         assert!(
             h.root.join("bot1/stitch.toml").exists(),
             "the config must have moved into the per-bot layout"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_corridor_rewrites_toml_and_stops_a_running_bot() {
+        let h = harness("switch-corridor");
+        seed_panel_bot(&h, "bot-a");
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/corridor",
+                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("Switched to"), "{body}");
+        assert!(body.contains("stopped"), "{body}");
+
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(
+            setup::identify_corridor(&toml).is_some_and(|c| c.id == "wbrl-usdt-celo"),
+            "config should now be the wBRL corridor"
+        );
+        assert_eq!(
+            h.docker.state_of("stitch-bot-a"),
+            Some(ContainerState::Exited),
+            "a running bot must be stopped after a corridor switch"
+        );
+        // Stop must precede the write: if Docker refuses the stop, stitch.toml
+        // stays on the old corridor so a retry can try again.
+        let calls = h.docker.calls();
+        let stop_at = calls
+            .iter()
+            .position(|c| matches!(c, Call::Stop { name, .. } if name == "stitch-bot-a"));
+        assert!(stop_at.is_some(), "expected a stop call, got {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_stop_leaves_the_corridor_unchanged() {
+        let h = harness("switch-corridor-stopfail");
+        seed_panel_bot(&h, "bot-a");
+        h.docker.fail_stop("daemon refused the stop");
+
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/corridor",
+                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(
+            before, after,
+            "a refused stop must not leave disk on the new corridor"
+        );
+        assert!(
+            setup::identify_corridor(&after).is_some_and(|c| c.id == "cngn-usdt-bsc"),
+            "still on the original corridor"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_to_the_same_corridor_is_refused() {
+        let h = harness("switch-same-corridor");
+        seed_panel_bot(&h, "bot-a");
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/corridor",
+                serde_json::json!({ "corridorId": "cngn-usdt-bsc" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("already on"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn switching_corridor_rewrites_the_flat_layout_filename() {
+        // Flat-layout bots mount `stitch.<bot>.toml`, not `stitch.toml`. Writing
+        // the standard name would report success while Start still loads the old
+        // corridor from the mounted file.
+        let h = harness("switch-flat-corridor");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        let toml = h.root.join("stitch.bot1.toml");
+        std::fs::write(&toml, corridor.toml_template).unwrap();
+        std::fs::write(
+            h.root.join("stitch.bot1.key"),
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let mut c = container("stitch-bot1", ContainerState::Exited);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
+        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot1/corridor",
+                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let after = std::fs::read_to_string(&toml).unwrap();
+        assert!(
+            setup::identify_corridor(&after).is_some_and(|c| c.id == "wbrl-usdt-celo"),
+            "mounted flat-layout file must be the one rewritten: {after}"
+        );
+        assert!(
+            !h.root.join("stitch.toml").exists(),
+            "must not invent a sibling stitch.toml the container never mounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_corridor_stops_a_paused_bot_before_rewriting() {
+        // Paused isn't "up" for Start/Stop labeling, but the frozen process still
+        // has the old corridor. Skipping the stop would rewrite disk while an
+        // unpause later resumes the stale process.
+        let h = harness("switch-paused-corridor");
+        seed_panel_bot_in_state(&h, "bot-a", ContainerState::Paused);
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/corridor",
+                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("was stopped"),
+            "operator must hear the pause was cleared: {body}"
+        );
+        assert!(
+            h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Stop { name, .. } if name == "stitch-bot-a")),
+            "paused bot must be stopped before the TOML rewrite: {:?}",
+            h.docker.calls()
+        );
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_ne!(before, after, "corridor rewrite should have landed");
+        assert!(
+            setup::identify_corridor(&after).is_some_and(|c| c.id == "wbrl-usdt-celo"),
+            "disk should be on the new corridor"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_recreates_on_the_panel_bot_image_with_a_refresh() {
+        let h = harness("bot-update");
+        seed_panel_bot(&h, "bot-a");
+        // Same tag channel as STITCH_PANEL_BOT_IMAGE (:test); a different tag
+        // would be refused as off-channel. Stale digest is what Update refreshes.
+        h.docker
+            .set_container_image("stitch-bot-a", h.state.cfg.bot_image.as_str());
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("recreated"), "{body}");
+        assert!(
+            h.docker.calls().iter().any(|c| matches!(
+                c,
+                Call::EnsureImage { image, refresh: true }
+                    if image == &h.state.cfg.bot_image
+            )),
+            "update must refresh the panel bot image, got {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_resolves_a_sha_pin_to_latest_instead_of_recreating_on_the_pin() {
+        // Recreate keeps the configured pin. Update must not: a sha-* pin that
+        // /api/updates reports as behind would otherwise recreate onto the same
+        // old digest forever.
+        let h = super::super::testkit::harness_with_bot_image(
+            "bot-update-sha-pin",
+            "ghcr.io/textile-protocol/textile-stitch:sha-deadbeef",
+        );
+        seed_panel_bot(&h, "bot-a");
+        h.docker.set_container_image(
+            "stitch-bot-a",
+            "ghcr.io/textile-protocol/textile-stitch:sha-deadbeef",
+        );
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = "ghcr.io/textile-protocol/textile-stitch:latest";
+        assert!(
+            body.contains(expected),
+            "response should name the resolved target: {body}"
+        );
+        assert!(
+            h.docker.calls().iter().any(|c| matches!(
+                c,
+                Call::EnsureImage { image, refresh: true } if image == expected
+            )),
+            "update must pull :latest for a sha-* pin, got {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_refuses_when_the_fresh_pull_fails() {
+        // Same contract as panel self-update: a pull failure must not destroy the
+        // bot and recreate it onto a stale cached tag.
+        let h = harness("bot-update-pull-fail");
+        seed_panel_bot(&h, "bot-a");
+        // Default fake image is :latest; harness bot_image is :test — put the
+        // bot on-channel so we exercise the pull failure, not the channel gate.
+        h.docker
+            .set_container_image("stitch-bot-a", h.state.cfg.bot_image.as_str());
+        h.docker.fail_image("manifest unknown / rate limited");
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body.contains("stale local copy") || body.contains("pulling"),
+            "{body}"
+        );
+        assert_eq!(
+            h.docker.state_of("stitch-bot-a"),
+            Some(ContainerState::Running),
+            "failed Update must leave the live container alone"
+        );
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Remove { .. })),
+            "must not remove before a successful fresh pull: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_custom_image_bot() {
+        // /api/updates already hides these; the endpoint must too so a stale UI
+        // or curl can't silently swap a fork onto the panel default.
+        let h = harness("bot-update-custom-image");
+        seed_panel_bot(&h, "bot-a");
+        h.docker
+            .set_container_image("stitch-bot-a", "ghcr.io/acme/stitch-fork:v9");
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains("not on the update channel") || body.contains("stitch-fork"),
+            "{body}"
+        );
+        assert_eq!(
+            h.docker.state_of("stitch-bot-a"),
+            Some(ContainerState::Running)
+        );
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Remove { .. })),
+            "must not recreate a custom-image bot via Update: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_same_repo_alternate_tag() {
+        // :canary shares the repo with :latest but is a different channel.
+        let h = harness("bot-update-canary");
+        seed_panel_bot(&h, "bot-a");
+        h.docker.set_container_image(
+            "stitch-bot-a",
+            "ghcr.io/textile-protocol/textile-stitch:canary",
+        );
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("not on the update channel"), "{body}");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Remove { .. })),
+            "must not move a canary bot onto :latest via Update: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_flat_layout_bot() {
+        // Flat layout keeps the nonce ledger in the container. Update recreates
+        // without migrating, so the API must refuse even when the UI is bypassed.
+        // Mount individual files from the panel bot dir so the recreate path's
+        // `bot_dir` check would otherwise pass.
+        let h = harness("bot-update-flat");
+        let dir = h.root.join("bot1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        std::fs::write(dir.join("stitch.toml"), corridor.toml_template).unwrap();
+        std::fs::write(dir.join("stitch.key"), super::super::testkit::TEST_KEY).unwrap();
+        let mut c = container("stitch-bot1", ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
+        // Flat mounts (file-by-file) from the panel bot directory.
+        c.mounts = vec![
+            crate::panel::docker::MountInfo {
+                source: dir.join("stitch.toml"),
+                destination: std::path::PathBuf::from("/home/stitch/run/stitch.toml"),
+                rw: false,
+            },
+            crate::panel::docker::MountInfo {
+                source: dir.join("stitch.key"),
+                destination: std::path::PathBuf::from("/home/stitch/run/stitch.key"),
+                rw: false,
+            },
+        ];
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot1/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains("flat file layout") || body.contains("Migrate"),
+            "{body}"
+        );
+        assert_eq!(
+            h.docker.state_of("stitch-bot1"),
+            Some(ContainerState::Running),
+            "flat-layout Update must leave the container alone"
+        );
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Remove { .. })),
+            "must not remove a flat-layout bot on Update: {:?}",
+            h.docker.calls()
         );
     }
 }

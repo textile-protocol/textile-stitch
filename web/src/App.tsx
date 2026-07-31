@@ -8,7 +8,8 @@ import Login from './pages/Login'
 import Fleet from './pages/Fleet'
 import AddBot from './pages/AddBot'
 import BotDetail from './pages/BotDetail'
-import type { SessionInfo } from './types'
+import { shortImage } from './format'
+import type { SessionInfo, UpdatesStatus } from './types'
 
 /** Persisted so the operator's choice survives a reload. */
 const THEME_KEY = 'stitch-panel-theme'
@@ -92,6 +93,69 @@ function Header({
   onSignedOut: () => void
 }) {
   const { pathname } = useLocation()
+  const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
+  const [panelBusy, setPanelBusy] = useState(false)
+  const [panelNote, setPanelNote] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .updates()
+      .then((u) => {
+        if (!cancelled) setUpdates(u)
+      })
+      .catch(() => {
+        if (!cancelled) setUpdates(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  async function updatePanel() {
+    const target = updates?.panel.targetImage
+    if (
+      !window.confirm(
+        `Update the panel itself to ${target ?? 'the latest image'}?\n\nThe UI will disconnect briefly while the container is recreated. Bots keep running.`,
+      )
+    ) {
+      return
+    }
+    setPanelBusy(true)
+    setPanelNote('Pulling the new panel image and scheduling restart…')
+    try {
+      const res = await api.updatePanel()
+      setPanelNote(res.message)
+      // The helper sleeps ~2s then stop/rm/rename/start. Prefer seeing a failed
+      // poll (the restart gap), but a lightweight panel can finish the swap
+      // between two 2s polls — every session() then succeeds and sawDown never
+      // flips. After a short grace, accept a healthy session as "back".
+      const started = Date.now()
+      const graceMs = 8_000
+      let sawDown = false
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 2000))
+        try {
+          await api.session()
+          if (!sawDown && Date.now() - started < graceMs) {
+            setPanelNote('Waiting for the panel to restart…')
+            continue
+          }
+          setPanelNote('Panel is back on the new image.')
+          setUpdates(await api.updates(true))
+          setPanelBusy(false)
+          return
+        } catch {
+          sawDown = true
+          setPanelNote('Panel is restarting…')
+        }
+      }
+      setPanelNote('Still waiting for the panel — reload the page in a moment.')
+    } catch (e) {
+      setPanelNote(e instanceof ApiError ? e.message : String(e))
+      setPanelBusy(false)
+    }
+  }
 
   return (
     <header className="border-b border-line-soft bg-surface">
@@ -116,6 +180,16 @@ function Header({
           </NavLink>
         </nav>
         <div className="ml-auto flex items-center gap-3 text-sm">
+          {updates?.panel.updateAvailable && (
+            <Button
+              variant="primary"
+              busy={panelBusy}
+              onClick={() => void updatePanel()}
+              title={`Update panel to ${shortImage(updates.panel.targetImage)}`}
+            >
+              Update panel
+            </Button>
+          )}
           <ComposeExportLink
             className="text-muted underline decoration-line hover:text-ink disabled:opacity-60"
             title="A generated compose file for the whole fleet, for disaster recovery"
@@ -145,6 +219,9 @@ function Header({
           )}
         </div>
       </div>
+      {panelNote && (
+        <div className="mx-auto max-w-5xl px-6 pb-3 text-xs text-muted">{panelNote}</div>
+      )}
     </header>
   )
 }

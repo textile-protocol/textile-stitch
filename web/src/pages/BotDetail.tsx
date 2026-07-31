@@ -11,14 +11,13 @@ import {
   Tag,
   Warnings,
 } from '../components/ui'
-import ChangeSigner from '../components/ChangeSigner'
 import ComposeExportLink from '../components/ComposeExportLink'
 import LogViewer from '../components/LogViewer'
 import OneShotRunner from '../components/OneShotRunner'
 import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
 import { formatTimestamp, shortAddress, shortImage } from '../format'
-import type { Bot, MigrationResult } from '../types'
+import type { Bot, MigrationResult, UpdatesStatus } from '../types'
 
 const TABS = ['settings', 'config', 'logs', 'tools'] as const
 type Tab = (typeof TABS)[number]
@@ -41,6 +40,7 @@ export default function BotDetail() {
   const [note, setNote] = useState<string | null>(handoff)
   const [busy, setBusy] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('settings')
+  const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -51,11 +51,24 @@ export default function BotDetail() {
     }
   }, [name])
 
+  const loadUpdates = useCallback(async () => {
+    try {
+      setUpdates(await api.updates())
+    } catch {
+      // Offline registry checks are soft — don't drown the detail page.
+      setUpdates(null)
+    }
+  }, [])
+
   useEffect(() => {
     void load()
-  }, [load])
+    void loadUpdates()
+  }, [load, loadUpdates])
 
-  async function act(what: 'start' | 'stop' | 'restart' | 'recreate') {
+  const botUpdate = updates?.bots.find((b) => b.name === name)
+  const updateAvailable = botUpdate?.updateAvailable ?? false
+
+  async function act(what: 'start' | 'stop' | 'restart' | 'recreate' | 'update') {
     if (
       what === 'recreate' &&
       !window.confirm(
@@ -64,12 +77,28 @@ export default function BotDetail() {
     ) {
       return
     }
+    if (what === 'update') {
+      if (bot?.canMigrate || bot?.layout === 'flat-files') {
+        setError(
+          `${name} still uses the flat layout. Migrate first so the nonce ledger isn't lost on recreate.`,
+        )
+        return
+      }
+      if (
+        !window.confirm(
+          `Update ${name} to ${updates?.bot.targetImage ?? 'the panel bot image'}?\n\nThe container is recreated (brief gap in quoting). Config and key stay.`,
+        )
+      ) {
+        return
+      }
+    }
     setBusy(what)
     setError(null)
     try {
-      const res = await api[what](name)
+      const res = what === 'update' ? await api.updateBot(name) : await api[what](name)
       setBot(res.bot)
       setNote(res.message)
+      void loadUpdates()
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -114,7 +143,22 @@ export default function BotDetail() {
         {bot.config?.corridorLabel && (
           <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
         )}
+        {updateAvailable && <Tag>update available</Tag>}
       </div>
+
+      {updateAvailable &&
+        (bot.canMigrate || bot.layout === 'flat-files' ? (
+          <Banner tone="warning">
+            A newer stitch image is available ({shortImage(updates?.bot.targetImage ?? null)}
+            ), but this bot still uses the flat layout. Migrate first so updating
+            doesn't lose the slot-nonce ledger.
+          </Banner>
+        ) : (
+          <Banner tone="info">
+            A newer stitch image is available ({shortImage(updates?.bot.targetImage ?? null)}
+            ). Update recreates this bot on that image; config stays on disk.
+          </Banner>
+        ))}
 
       {error && (
         <Banner tone="danger" onDismiss={() => setError(null)}>
@@ -160,6 +204,16 @@ export default function BotDetail() {
               <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
                 Recreate
               </Button>
+              {updateAvailable && !bot.canMigrate && bot.layout !== 'flat-files' && (
+                <Button
+                  variant="primary"
+                  busy={busy === 'update'}
+                  onClick={() => void act('update')}
+                  title={`Pull ${updates?.bot.targetImage} and recreate this bot on it`}
+                >
+                  Update
+                </Button>
+              )}
             </>
           ) : (
             <>
@@ -249,27 +303,16 @@ export default function BotDetail() {
         ))}
 
       {tab === 'config' && (
-        <div className="space-y-4">
-          <Card>
-            <RawConfigEditor
-              bot={bot.name}
-              running={bot.running}
-              onSaved={(message) => {
-                setNote(message)
-                void load()
-              }}
-            />
-          </Card>
-          {bot.editable && (
-            <ChangeSigner
-              bot={bot.name}
-              onChanged={(message) => {
-                setNote(message)
-                void load()
-              }}
-            />
-          )}
-        </div>
+        <Card>
+          <RawConfigEditor
+            bot={bot.name}
+            running={bot.running}
+            onSaved={(message) => {
+              setNote(message)
+              void load()
+            }}
+          />
+        </Card>
       )}
 
       {tab === 'logs' && (

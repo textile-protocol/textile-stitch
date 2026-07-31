@@ -144,6 +144,9 @@ impl DockerApi for BollardDocker {
             // that same anonymous pull. Failing here would strand a bot on an image
             // that is right there on the host, so warn and use it. With nothing local
             // there is nothing to fall back to, so the pull error stands.
+            //
+            // Panel self-update must NOT use this fallback — see
+            // [`DockerApi::require_fresh_image`].
             Err(e) if present => {
                 tracing::warn!(
                     "couldn't refresh {image}, using the copy already on the host: {e:#}"
@@ -152,6 +155,138 @@ impl DockerApi for BollardDocker {
             }
             Err(e) => Err(e),
         }
+    }
+
+    async fn require_fresh_image(&self, image: &str) -> Result<()> {
+        self.pull_image(image).await.with_context(|| {
+            format!("pulling {image} — refusing to continue on a possibly stale local copy")
+        })
+    }
+
+    async fn local_image_digests(&self, image: &str) -> Result<Vec<String>> {
+        match self.docker.inspect_image(image).await {
+            Ok(info) => Ok(info.repo_digests.unwrap_or_default()),
+            // Not on the host yet — an empty list means "nothing to match against",
+            // which the update check treats as unknown rather than "behind".
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    async fn schedule_image_swap(
+        &self,
+        name: &str,
+        new_image: &str,
+        docker_socket: &Path,
+    ) -> Result<()> {
+        // Strict pull — never fall back to a cached local tag. ensure_image's
+        // refresh path tolerates pull failure when a local copy exists (bot
+        // Recreate), but self-update must not restart the panel onto a stale
+        // `:latest` after GHCR/auth/rate-limit failures.
+        self.require_fresh_image(new_image).await?;
+
+        let inspect = self
+            .docker
+            .inspect_container(name, None)
+            .await
+            .with_context(|| format!("inspecting {name} for a self-update"))?;
+        let config = inspect
+            .config
+            .context("the container has no Config — cannot clone it for an update")?;
+        let host_config = inspect.host_config.unwrap_or_default();
+
+        let next = format!("{name}-next");
+        // A leftover from a previous failed swap must not block this one.
+        let _ = self
+            .docker
+            .remove_container(
+                &next,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+
+        let body = ContainerCreateBody {
+            image: Some(new_image.to_string()),
+            env: config.env.clone(),
+            cmd: config.cmd.clone(),
+            entrypoint: config.entrypoint.clone(),
+            working_dir: config.working_dir.clone(),
+            user: config.user.clone(),
+            labels: config.labels.clone(),
+            // HostConfig.port_bindings alone is not enough — Docker only publishes
+            // a host port when the create Config also exposes the container port.
+            // The password-only install snippet binds 127.0.0.1:8420:8420; dropping
+            // exposed_ports here would leave the UI unreachable after self-update.
+            exposed_ports: config.exposed_ports.clone(),
+            host_config: Some(host_config),
+            stop_timeout: config.stop_timeout.or(Some(STOP_GRACE_SECS)),
+            ..Default::default()
+        };
+        let options = CreateContainerOptionsBuilder::default().name(&next).build();
+        self.docker
+            .create_container(Some(options), body)
+            .await
+            .with_context(|| format!("creating the replacement container {next}"))?;
+
+        // The panel process lives inside `name`. Stopping it from here would kill
+        // the task mid-swap, so a short-lived helper on the docker socket finishes
+        // the rename after we return. CreateContainer bind sources are host paths:
+        // resolve STITCH_PANEL_DOCKER_SOCKET (in-container) through this container's
+        // mounts to the host source, then mount that onto the helper's default path.
+        let mounts: Vec<crate::panel::docker::MountInfo> = inspect
+            .mounts
+            .as_ref()
+            .map(|m| m.iter().map(to_mount_info).collect())
+            .unwrap_or_default();
+        let host_socket = crate::panel::docker::host_docker_socket_bind(&mounts, docker_socket);
+        let socket = host_socket
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("docker socket path is not valid UTF-8"))?;
+        anyhow::ensure!(
+            !socket.contains(':'),
+            "docker socket path {socket} contains a colon, which Docker cannot express in a bind mount"
+        );
+        const HELPER_IMAGE: &str = "docker:27-cli";
+        self.ensure_image(HELPER_IMAGE, false).await?;
+        let script = format!(
+            "sleep 2 && docker stop -t 30 {name} && docker rm -f {name} && \
+             docker rename {next} {name} && docker start {name}"
+        );
+        let helper_name = format!("{name}-updater");
+        let _ = self
+            .docker
+            .remove_container(
+                &helper_name,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+        let helper_body = ContainerCreateBody {
+            image: Some(HELPER_IMAGE.into()),
+            cmd: Some(vec!["sh".into(), "-c".into(), script]),
+            host_config: Some(HostConfig {
+                binds: Some(vec![format!("{socket}:/var/run/docker.sock")]),
+                auto_remove: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let helper_opts = CreateContainerOptionsBuilder::default()
+            .name(&helper_name)
+            .build();
+        let helper = self
+            .docker
+            .create_container(Some(helper_opts), helper_body)
+            .await
+            .context("creating the panel self-update helper")?;
+        self.docker
+            .start_container(&helper.id, None)
+            .await
+            .context("starting the panel self-update helper")?;
+        tracing::info!(
+            container = %name,
+            new_image,
+            "armed panel image swap; helper will recreate the container shortly"
+        );
+        Ok(())
     }
 
     async fn create(&self, spec: &CreateSpec) -> Result<String> {
@@ -632,6 +767,7 @@ fn to_container_info(s: &ContainerSummary) -> ContainerInfo {
             .map(|n| n.trim_start_matches('/').to_string())
             .unwrap_or_default(),
         image: s.image.clone().unwrap_or_default(),
+        image_id: s.image_id.clone().unwrap_or_default(),
         state: s
             .state
             .as_ref()

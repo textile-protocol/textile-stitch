@@ -254,6 +254,10 @@ pub struct Bot {
     /// The daemon's human-readable status, e.g. "Up 3 hours".
     pub status: String,
     pub image: Option<String>,
+    /// Content-addressed image id (`sha256:…`) of the running container, when
+    /// known. Update detection keys off this rather than a mutable tag, so
+    /// pulling `:latest` for one bot doesn't make its siblings look current.
+    pub image_id: Option<String>,
     pub created_unix: Option<i64>,
     /// Host path of `stitch.toml`, as the daemon reports it.
     pub config_host_path: Option<PathBuf>,
@@ -562,6 +566,7 @@ fn bot_from_container(c: &ContainerInfo, cfg: &PanelConfig) -> Bot {
         state: c.state,
         status: c.status.clone(),
         image: Some(c.image.clone()),
+        image_id: (!c.image_id.is_empty()).then(|| c.image_id.clone()),
         created_unix: Some(c.created_unix),
         config_host_path,
         config_panel_path,
@@ -610,6 +615,7 @@ fn bot_from_config_dir(name: &str, cfg: &PanelConfig) -> Bot {
         state: ContainerState::Unknown,
         status: "no container".to_string(),
         image: None,
+        image_id: None,
         created_unix: None,
         config_host_path: Some(cfg.host_bot_dir(name).join("stitch.toml")),
         config_panel_path: Some(panel_path),

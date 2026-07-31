@@ -14,6 +14,7 @@ import type {
   SaveResult,
   SessionInfo,
   Settings,
+  UpdatesStatus,
 } from './types'
 
 export class ApiError extends Error {
@@ -144,6 +145,8 @@ export const api = {
   stop: (name: string) => act(name, 'stop'),
   restart: (name: string) => act(name, 'restart'),
   recreate: (name: string) => act(name, 'recreate'),
+  /** Pull the panel bot image and recreate this bot on it. */
+  updateBot: (name: string) => act(name, 'update'),
 
   // `acceptLedgerLoss` is for the second attempt only. The first rolls back when
   // the old container's nonce ledger can't be read, so a transient daemon error
@@ -187,6 +190,26 @@ export const api = {
       `/api/bots/${encodeURIComponent(name)}/signer`,
       { method: 'PUT', body: JSON.stringify(signer) },
     ),
+
+  /** Replace stitch.toml with a corridor preset; keeps the signer; stops if running. */
+  switchCorridor: (name: string, corridorId: string) =>
+    request<{ bot: Bot; message: string }>(
+      `/api/bots/${encodeURIComponent(name)}/corridor`,
+      { method: 'POST', body: JSON.stringify({ corridorId }) },
+    ),
+
+  /** Registry digest check: which bots (and the panel) are behind. */
+  updates: (refresh = false) =>
+    request<UpdatesStatus>(`/api/updates${refresh ? '?refresh=1' : ''}`),
+
+  /**
+   * Pull a newer panel image and schedule a self-recreate. Returns 202; the UI
+   * should poll `/api/session` until the panel is back.
+   */
+  updatePanel: () =>
+    request<{ message: string; targetImage: string }>('/api/panel/update', {
+      method: 'POST',
+    }),
 
   /** URL of the SSE log stream, for `EventSource`. */
   logsUrl: (name: string, tail = 500) =>

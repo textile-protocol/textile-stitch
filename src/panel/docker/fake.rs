@@ -31,6 +31,12 @@ pub enum Call {
         image: String,
         refresh: bool,
     },
+    LocalImageDigests(String),
+    ScheduleImageSwap {
+        name: String,
+        new_image: String,
+        docker_socket: String,
+    },
     Create(String),
     Start(String),
     Stop {
@@ -115,6 +121,10 @@ struct FakeState {
     /// a handler that re-reads the fleet after acting needs its first read to succeed
     /// and a later one to fail. `None` never fails.
     list_calls_left: Option<usize>,
+    /// Digests `local_image_digests` returns for a given image reference.
+    image_digests: HashMap<String, Vec<String>>,
+    /// When set, `schedule_image_swap` fails with this message.
+    swap_error: Option<String>,
 }
 
 impl FakeDocker {
@@ -181,6 +191,20 @@ impl FakeDocker {
     /// Make the image pre-flight fail, as an unreachable registry would.
     pub fn fail_image(&self, message: &str) {
         self.state.lock().unwrap().image_error = Some(message.to_string());
+    }
+
+    /// Seed the digests a local image reports, for update-detection tests.
+    pub fn set_image_digests(&self, image: &str, digests: Vec<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .image_digests
+            .insert(image.to_string(), digests);
+    }
+
+    /// Make `schedule_image_swap` fail.
+    pub fn fail_swap(&self, message: &str) {
+        self.state.lock().unwrap().swap_error = Some(message.to_string());
     }
 
     /// Let the next `allowed` calls to `list_all` succeed, then fail every one after.
@@ -271,6 +295,51 @@ impl DockerApi for FakeDocker {
         }
     }
 
+    async fn require_fresh_image(&self, image: &str) -> Result<()> {
+        // Same failure surface as a hard pull — the fake has no local-fallback
+        // path to model separately.
+        self.ensure_image(image, true).await
+    }
+
+    async fn local_image_digests(&self, image: &str) -> Result<Vec<String>> {
+        let mut st = self.state.lock().unwrap();
+        st.calls.push(Call::LocalImageDigests(image.to_string()));
+        Ok(st.image_digests.get(image).cloned().unwrap_or_default())
+    }
+
+    async fn schedule_image_swap(
+        &self,
+        name: &str,
+        new_image: &str,
+        docker_socket: &std::path::Path,
+    ) -> Result<()> {
+        // Mirror production: strict pull before arming the swap.
+        self.require_fresh_image(new_image).await?;
+        let mut st = self.state.lock().unwrap();
+        let host_socket = st
+            .containers
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| crate::panel::docker::host_docker_socket_bind(&c.mounts, docker_socket))
+            .unwrap_or_else(|| docker_socket.to_path_buf());
+        st.calls.push(Call::ScheduleImageSwap {
+            name: name.to_string(),
+            new_image: new_image.to_string(),
+            docker_socket: host_socket.display().to_string(),
+        });
+        if let Some(msg) = st.swap_error.clone() {
+            bail!(msg);
+        }
+        // Stand in for a successful swap: the container is now on the new image.
+        if let Some(c) = st.containers.iter_mut().find(|c| c.name == name) {
+            c.image = new_image.to_string();
+            c.image_id = format!("sha256:swapped-{new_image}");
+        } else {
+            bail!("No such container: {name}");
+        }
+        Ok(())
+    }
+
     async fn create(&self, spec: &CreateSpec) -> Result<String> {
         let mut st = self.state.lock().unwrap();
         Self::check_failure(&mut st)?;
@@ -289,6 +358,7 @@ impl DockerApi for FakeDocker {
             id: id.clone(),
             name: spec.name.clone(),
             image: spec.image.clone(),
+            image_id: format!("sha256:fake-{}", spec.name),
             state: ContainerState::Created,
             status: "Created".to_string(),
             created_unix: 0,
@@ -442,6 +512,7 @@ pub fn container(name: &str, state: ContainerState) -> ContainerInfo {
         id: format!("id-{name}"),
         name: name.to_string(),
         image: "ghcr.io/textile-protocol/textile-stitch:latest".to_string(),
+        image_id: format!("sha256:id-{name}"),
         state,
         status: state.as_str().to_string(),
         created_unix: 1_700_000_000,
