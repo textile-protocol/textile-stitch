@@ -91,7 +91,8 @@ pub enum SignerRequest {
 }
 
 impl SignerRequest {
-    fn into_setup(self) -> Result<SignerSetup, ApiError> {
+    /// The validated backend + secret material. Shared with the signer-change route.
+    pub(crate) fn into_setup(self) -> Result<SignerSetup, ApiError> {
         match self {
             SignerRequest::Local {
                 private_key,
@@ -279,35 +280,46 @@ pub async fn create(
     // Starting a brand-new bot is a launch like any other, and its signer is one the
     // caller just supplied — quite possibly the same key an approval is running
     // against, or that another bot already quotes with. So it goes through the same
-    // reservation and fleet check as Start, rather than calling Docker directly.
-    //
-    // The bot is re-read first because the wallet comes from the config that was just
-    // written; there was nothing to discover before the create.
-    let (bot, fleet) = state.bot_and_fleet(&name).await?;
+    // config-lock / read / claim / start sequence as the Start handler, not a bare
+    // `docker.start`: a concurrent raw save could move the wallet between the read and
+    // the start, leaving the container signing from a wallet nothing claimed.
     let mut started = false;
     let mut start_error = None;
     if body.start {
-        match bots::reserve_for_launch(&bot, &state).await {
-            Ok(_wallet) => match state.docker.start(&spec.name).await {
+        let (_config, bot) = bots::lock_config(&name, &state).await?;
+        match bots::claim_for_launch(&bot, &state).await {
+            Ok(wallet) => match state.docker.start(&spec.name).await {
                 Ok(()) => started = true,
-                Err(e) => start_error = Some(format!("{e:#}")),
+                // The start can fail after the daemon already brought the container up on
+                // the claimed wallet; settle it (stop, then release the claim, or hold it
+                // until the stop lands) so a sibling can't launch on a live-but-unclaimed
+                // wallet — the same guard the Start handler uses.
+                Err(e) => {
+                    let settled = bots::settle_ambiguous_launch(
+                        &state,
+                        &spec.name,
+                        wallet,
+                        ApiError::internal(&e),
+                    )
+                    .await;
+                    start_error = Some(settled.message.clone());
+                }
             },
             // The bot exists and its config is right; only the start is refused. Told
             // rather than failed, because undoing the create would be worse than
             // leaving a stopped bot the operator can start in a moment.
             Err(e) => start_error = Some(e.message.clone()),
         }
+        // `_config` and the claim are held across `docker.start`, then dropped here.
     }
     if let Some(reason) = &start_error {
         tracing::warn!(bot = %name, "created but not started: {reason}");
     }
     tracing::info!(bot = %name, corridor = %corridor.id, started, "created");
 
-    let (bot, fleet) = match start_error {
-        // State changed under us: re-read so the response shows the running bot.
-        None if started => state.bot_and_fleet(&name).await?,
-        _ => (bot, fleet),
-    };
+    // Re-read for the response — the wallet comes from the config just written, and the
+    // state changed if the start took.
+    let (bot, fleet) = state.bot_and_fleet(&name).await?;
     Ok((
         axum::http::StatusCode::CREATED,
         Json(serde_json::json!({
@@ -464,8 +476,8 @@ mod tests {
             .expect("a hot wallet has an address");
         let _approval = h
             .state
-            .reservations
-            .reserve(wallet)
+            .wallet_locks
+            .try_claim(wallet)
             .expect("nothing else holds it");
 
         let (status, body) = h

@@ -23,12 +23,32 @@ export default function LogViewer({ bot }: { bot: string }) {
   const [paused, setPaused] = useState(false)
   const [follow, setFollow] = useState(true)
   const bottom = useRef<HTMLDivElement>(null)
+  // Which bot the buffer currently holds, so a switch to another bot clears and
+  // replays instead of appending onto the previous bot's lines.
+  const streamedBot = useRef<string | null>(null)
+  // Whether the last effect run left us paused. A resume — the only case that should
+  // skip the replay — is this flipping back off for the same bot.
+  const wasPaused = useRef(false)
 
   useEffect(() => {
-    if (paused) return
+    if (paused) {
+      wasPaused.current = true
+      return
+    }
     setError(null)
+    const differentBot = streamedBot.current !== bot
+    // Replay the tail on every attach except a genuine resume: pausing keeps the lines
+    // on screen, so resuming the same bot must not replay the last REPLAY of them again
+    // (it would duplicate the overlap and evict older lines from the bounded buffer). A
+    // resume is specifically the pause toggle flipping back off for the same bot —
+    // *not* a bot switch, and not React StrictMode's dev remount, which re-runs this
+    // effect with paused still false and must still replay or the viewer opens empty.
+    const resuming = wasPaused.current && !differentBot
+    wasPaused.current = false
+    if (differentBot) setLines([])
+    streamedBot.current = bot
     const stream = streamSse(
-      api.logsUrl(bot, REPLAY),
+      api.logsUrl(bot, resuming ? 0 : REPLAY),
       { method: 'GET' },
       {
         onEvent: (event, data) => {

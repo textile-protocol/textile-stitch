@@ -11,7 +11,7 @@
 //! this module bounds the *rate* nothing, deliberately — a bot that floods its log
 //! is a bot the operator needs to see flooding.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -224,7 +224,7 @@ fn can_transact(bot: &Bot) -> bool {
 /// chain, and either of those bots can spend the nonce this approval wants.
 ///
 /// This covers bots. It cannot cover a second *approval*, which isn't in the fleet
-/// yet when the check runs — [`WalletReservations`] does that.
+/// yet when the check runs — [`WalletLocks`] does that.
 pub fn approve_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
     if can_transact(bot) {
         anyhow::bail!(
@@ -258,15 +258,25 @@ pub fn no_live_sibling_on_the_wallet(bot: &Bot, fleet: &Fleet) -> anyhow::Result
     let Some(wallet) = bot.wallet() else {
         return Ok(());
     };
+    no_live_sibling_on_wallet_id(&bot.name, &wallet, fleet)
+}
+
+/// As [`no_live_sibling_on_the_wallet`], but keyed on a wallet directly rather than a
+/// bot's current one. A settings save that changes a bot's wallet has to check the
+/// wallet it is *moving to*, which isn't the one its on-disk `Bot` still reports.
+pub fn no_live_sibling_on_wallet_id(
+    name: &str,
+    wallet: &WalletId,
+    fleet: &Fleet,
+) -> anyhow::Result<()> {
     match fleet.bots().iter().find(|other| {
-        other.name != bot.name && other.wallet().as_ref() == Some(&wallet) && can_transact(other)
+        other.name != name && other.wallet().as_ref() == Some(wallet) && can_transact(other)
     }) {
         None => Ok(()),
         Some(other) => anyhow::bail!(
-            "{} shares its operator wallet ({wallet}) with {}, which is {} and can broadcast from \
-             it. Both would read the same pending nonce and one transaction would be lost. Stop \
-             {} first.",
-            bot.name,
+            "{name} shares its operator wallet ({wallet}) with {}, which is {} and can broadcast \
+             from it. Both would read the same pending nonce and one transaction would be lost. \
+             Stop {} first.",
             other.name,
             other.state.as_str(),
             other.name
@@ -283,88 +293,105 @@ pub fn already_transacting(bot: &Bot) -> bool {
     can_transact(bot)
 }
 
-/// The wallets currently reserved by something that can broadcast from them.
+/// Exclusive claims on operator wallets, so no two processes the panel launches
+/// sign from one `(chain, address)` at the same time.
 ///
-/// One protocol for both sides of the same race. An approval and a bot launch are
-/// both "a process is about to sign with this key", and checking one against the
-/// other is not enough: a check that reads the set and then acts has a window, and
-/// two requests can each pass their own check inside the other's window. So neither
-/// side checks — both *reserve*, under this lock, before doing anything.
+/// One `(chain, address)` pair owns one nonce sequence. `stitch approve`, a bot's
+/// taker or closer leg, and a settings restart all build a transaction the same
+/// way — read the pending nonce, sign, send — and two of them on one wallet can pick
+/// the same nonce, so one transaction replaces or rejects the other. What's lost is
+/// an approval, or a fill a bot had already priced. So every action about to put a
+/// signer on a wallet takes that wallet's claim first and holds it across the whole
+/// action, rather than checking a flag and then acting with a gap in between.
 ///
-/// [`approve_check`] is still needed on top, because the fleet can also change while
-/// a reservation is being taken. The approve path therefore re-reads the fleet
-/// *after* reserving: at that point nothing else can start a bot on this wallet, so
-/// what it sees stays true for the run.
+/// A `tokio::sync::Mutex` per wallet, not a set of flags: the claim is *held* across
+/// `.await` points — a Docker restart, or the life of an approval container — and a
+/// real lock is what carries the exclusion across a suspension point. `try_lock`
+/// rather than `lock().await`: an approval holds its wallet for as long as its
+/// container runs, and a launch handler must refuse rather than block an HTTP request
+/// for minutes. "Something is already signing on this wallet, wait" is the honest
+/// answer, not a stall.
 ///
-/// Reservations outlive the request that took them by different amounts. A launch
-/// holds one across its Docker call and drops it. An approval hands its guard to the
-/// Docker layer, because the container keeps signing after the stream is gone — see
-/// [`DockerApi::run_one_shot`](crate::panel::docker::DockerApi::run_one_shot).
+/// A running bot the panel didn't launch in this process holds no claim, so the
+/// claim alone can't see an already-live sibling on the same wallet. Callers pair it
+/// with a fleet check — [`no_live_sibling_on_the_wallet`] — taken *under* the claim,
+/// so nothing can start on the wallet between the answer and the action.
 ///
-/// In-process only, and that's the honest scope: one panel per Docker host, so
-/// there is nothing else to coordinate with. Two panels on one wallet is already a
+/// The wallet a claim is keyed on must come from the same authoritative read that
+/// drives the action: a claim taken from a stale snapshot names the wallet the bot is
+/// *leaving* while the container launches from the file as it is now. The map never
+/// evicts — bounded by the number of distinct wallets the host has seen, which is the
+/// number of bots on it.
+///
+/// In-process only, and that's the honest scope: one panel per Docker host, so there
+/// is nothing else to coordinate with. Two panels on one wallet is already a
 /// configuration nobody should be running.
 #[derive(Debug, Default)]
-pub struct WalletReservations {
-    live: Mutex<HashSet<WalletId>>,
+pub struct WalletLocks {
+    live: Mutex<HashMap<WalletId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-impl WalletReservations {
+impl WalletLocks {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Reserve the wallet, or return `None` because something else has it.
-    ///
-    /// Insert-if-absent under one lock, so this is the atomic step both sides share.
-    pub fn reserve(self: &Arc<Self>, wallet: WalletId) -> Option<WalletGuard> {
+    /// The lock for one wallet, created on first use.
+    fn for_wallet(&self, wallet: &WalletId) -> Arc<tokio::sync::Mutex<()>> {
         let mut live = self.lock();
-        if !live.insert(wallet.clone()) {
-            return None;
-        }
-        Some(WalletGuard {
-            owner: Arc::clone(self),
+        Arc::clone(live.entry(wallet.clone()).or_default())
+    }
+
+    /// Claim the wallet exclusively, or `None` because something else holds it.
+    ///
+    /// Non-blocking on purpose: a held claim can outlive an HTTP request by the life
+    /// of a container, and waiting on that would hang the handler.
+    pub fn try_claim(&self, wallet: WalletId) -> Option<WalletClaim> {
+        let lock = self.for_wallet(&wallet);
+        lock.try_lock_owned().ok().map(|guard| WalletClaim {
             wallet,
+            _guard: guard,
         })
     }
 
-    /// Reserve a bot's wallet, or `Some(None)` when it hasn't got an identifiable
+    /// Claim a bot's wallet, or `Some(None)` when it hasn't got an identifiable
     /// one — nothing can be signed with a wallet the panel can't name, so there is no
     /// nonce to contend for. `None` means something else holds it.
-    pub fn reserve_for(self: &Arc<Self>, bot: &Bot) -> Option<Option<WalletGuard>> {
+    pub fn try_claim_for(&self, bot: &Bot) -> Option<Option<WalletClaim>> {
         match bot.wallet() {
             None => Some(None),
-            Some(wallet) => self.reserve(wallet).map(Some),
+            Some(wallet) => self.try_claim(wallet).map(Some),
         }
     }
 
     /// Whether anything holds this wallet. Advisory only — for telling the UI why a
     /// button is disabled. Never for deciding whether to act: that has to be
-    /// [`Self::reserve`], or the check and the act have a gap between them.
-    pub fn is_reserved(&self, wallet: &WalletId) -> bool {
-        self.lock().contains(wallet)
+    /// [`Self::try_claim`], or the check and the act have a gap between them.
+    pub fn is_claimed(&self, wallet: &WalletId) -> bool {
+        self.for_wallet(wallet).try_lock().is_err()
     }
 
-    /// A poisoned lock means another thread panicked mid-update. The set holds
-    /// independent keys with no cross-entry invariant, so recovering is safe and
+    /// A poisoned lock means another thread panicked mid-update. The map holds
+    /// independent locks with no cross-entry invariant, so recovering is safe and
     /// better than taking the panel down.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<WalletId>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<WalletId, Arc<tokio::sync::Mutex<()>>>> {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-/// Holds one wallet until dropped. What "until dropped" means is the caller's
-/// choice: the length of a Docker call for a launch, or the life of a container for
-/// an approval.
+/// Holds one wallet's claim until dropped. What "until dropped" means is the
+/// caller's choice: the length of a Docker call for a launch, or the life of a
+/// container for an approval, which hands the claim to the Docker layer.
 #[derive(Debug)]
-pub struct WalletGuard {
-    owner: Arc<WalletReservations>,
+pub struct WalletClaim {
     wallet: WalletId,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
-impl Drop for WalletGuard {
-    fn drop(&mut self) {
-        self.owner.lock().remove(&self.wallet);
+impl WalletClaim {
+    /// The wallet this claim holds.
+    pub fn wallet(&self) -> &WalletId {
+        &self.wallet
     }
 }
 
@@ -384,38 +411,83 @@ pub async fn dry_run(
     one_shot(state, &name, OneShot::DryRun).await
 }
 
+/// Claim the operator wallet for an approval, pinned to the config it launches from.
+///
+/// The approval signs `ERC20.approve` from the operator wallet, so it holds that
+/// wallet to itself for the run. The subtle bug this closes: the wallet was claimed
+/// from one read of the config and the container launched from another, so a raw save
+/// that moved the bot onto a different wallet in between left the claim naming the
+/// wallet the bot was leaving while a signer started on the new one.
+///
+/// So claim from the first read, then re-read under the claim. Nothing else can start
+/// on the claimed wallet now, so the fleet check ([`approve_check`]) stays true for
+/// the run. If the config still names the wallet we hold, launch from that fresh read.
+/// If a save moved it in between, drop the claim and take it again from the fresh
+/// wallet — bounded to two rounds, because a second move would need another save to
+/// land in the gap between two reads, and refusing beats spinning.
+///
+/// Returns the bot the caller must launch from (rebound to the read the claim was
+/// taken against) and the claim, or `None` when the bot has no identifiable wallet —
+/// nothing can be signed with it, so the run fails on its own for want of a key.
+async fn reserve_approval(
+    state: &AppState,
+    name: &str,
+    mut bot: Bot,
+) -> Result<(Bot, Option<WalletClaim>), ApiError> {
+    for _ in 0..2 {
+        let Some(wallet) = bot.wallet() else {
+            return Ok((bot, None));
+        };
+        let claim = state
+            .wallet_locks
+            .try_claim(wallet.clone())
+            .ok_or_else(|| {
+                ApiError::conflict(format!(
+                "{}'s operator wallet is busy — an approval is running against it, or a bot on it \
+                 is being started. Wait for that to finish: two processes would read the same \
+                 pending nonce and one transaction would be dropped.",
+                bot.name
+            ))
+            })?;
+        let (fresh, fleet) = state.bot_and_fleet(name).await?;
+        // The config moved between the read we claimed from and this one: the claim
+        // names the wallet the bot is leaving. Drop it and re-derive from the fresh
+        // read rather than launch a signer on a wallet nothing is guarding.
+        if fresh.wallet().as_ref() != Some(&wallet) {
+            drop(claim);
+            bot = fresh;
+            continue;
+        }
+        approve_check(&fresh, &fleet).map_err(ApiError::conflict)?;
+        return Ok((fresh, Some(claim)));
+    }
+    Err(ApiError::conflict(format!(
+        "{name}'s config kept changing while the approval was starting — a settings save is \
+         probably in flight. Try again once it has finished."
+    )))
+}
+
 /// Run a throwaway container with the bot's own config and stream its output.
 async fn one_shot(state: AppState, name: &str, which: OneShot) -> Result<Response, ApiError> {
     let (bot, _fleet) = state.bot_and_fleet(name).await?;
     super::require_editable(&bot)?;
-    // A dry run signs nothing and sends nothing, so none of this applies to it.
-    //
-    // The approval broadcasts, so it needs the wallet to itself. Reserve *first* and
-    // check the fleet after: the reservation is what stops another request launching
-    // a bot on this wallet, so a fleet read taken before it could already be stale by
-    // the time the container starts. Reserved first, then re-read, then acted on.
-    let claim = match which {
-        OneShot::DryRun => None,
-        OneShot::Approve => match bot.wallet() {
-            // No identifiable wallet means nothing can be signed with it — the run
-            // will fail on its own for want of a key.
-            None => None,
-            Some(wallet) => {
-                let guard = state.reservations.reserve(wallet).ok_or_else(|| {
-                    ApiError::conflict(format!(
-                        "{}'s operator wallet is busy — an approval is running against it, or a \
-                         bot on it is being started. Wait for that to finish: two processes would \
-                         read the same pending nonce and one transaction would be dropped.",
-                        bot.name
-                    ))
-                })?;
-                // Now that nothing else can launch on this wallet, what the fleet says
-                // about it stays true for the run.
-                let (bot, fleet) = state.bot_and_fleet(name).await?;
-                approve_check(&bot, &fleet).map_err(ApiError::conflict)?;
-                Some(guard)
-            }
-        },
+    // A dry run signs nothing and sends nothing, so none of this applies to it. An
+    // approval broadcasts, so it takes the wallet to itself — and the wallet it holds
+    // and the config the container loads have to stay the same, right through to the
+    // container's start. That start is deferred until the SSE stream is polled, after
+    // this handler returns, so `reserve_approval` verifying the wallet here isn't enough
+    // on its own: a save could still move the file before the container reads it. So hold
+    // the config lock from the claim until the container has started — `start_hold`
+    // carries it to the Docker layer, which drops it the instant the container is up.
+    // `bot` is rebound to the read the claim was taken against.
+    let (bot, claim, start_hold) = match which {
+        OneShot::DryRun => (bot, None, None),
+        OneShot::Approve => {
+            let (config_guard, bot) = super::bots::lock_config(name, &state).await?;
+            let (bot, claim) = reserve_approval(&state, name, bot).await?;
+            let start_hold = config_guard.map(|g| Arc::new(g) as crate::panel::docker::Keepalive);
+            (bot, claim, start_hold)
+        }
     };
     let config = bot
         .config_panel_path
@@ -454,20 +526,23 @@ async fn one_shot(state: AppState, name: &str, which: OneShot) -> Result<Respons
     // is released after the reap, so an operator who clicks "Stop watching" can't free
     // it for a second approval while the first is still broadcasting.
     let keepalive = claim.map(|c| Arc::new(c) as crate::panel::docker::Keepalive);
-    let stream = state.docker.run_one_shot(spec, keepalive).map(move |item| {
-        Ok::<Event, Infallible>(match item {
-            Ok(RunEvent::Line(line)) => json_event("line", &LineBody::from(line)),
-            Ok(RunEvent::Exited { code }) => json_event(
-                "exit",
-                &serde_json::json!({
-                    "code": code,
-                    "ok": code == 0,
-                    "action": which.as_str(),
-                }),
-            ),
-            Err(e) => json_event("error", &serde_json::json!({ "message": format!("{e:#}") })),
-        })
-    });
+    let stream = state
+        .docker
+        .run_one_shot(spec, keepalive, start_hold)
+        .map(move |item| {
+            Ok::<Event, Infallible>(match item {
+                Ok(RunEvent::Line(line)) => json_event("line", &LineBody::from(line)),
+                Ok(RunEvent::Exited { code }) => json_event(
+                    "exit",
+                    &serde_json::json!({
+                        "code": code,
+                        "ok": code == 0,
+                        "action": which.as_str(),
+                    }),
+                ),
+                Err(e) => json_event("error", &serde_json::json!({ "message": format!("{e:#}") })),
+            })
+        });
 
     Ok(sse(stream))
 }
@@ -817,19 +892,21 @@ mod tests {
         // requests would otherwise both pass it and both start signing. The claim is
         // held by a guard rather than released at the end of the handler, because the
         // container outlives the request that started it.
-        let approvals = Arc::new(WalletReservations::new());
+        let approvals = Arc::new(WalletLocks::new());
         let wallet = WalletId {
             chain_id: 56,
             address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".into(),
         };
-        let held = approvals.reserve(wallet.clone()).expect("first claim wins");
+        let held = approvals
+            .try_claim(wallet.clone())
+            .expect("first claim wins");
         assert!(
-            approvals.reserve(wallet.clone()).is_none(),
+            approvals.try_claim(wallet.clone()).is_none(),
             "a second approval on the same wallet must be refused"
         );
         // A different wallet is unaffected.
         assert!(approvals
-            .reserve(WalletId {
+            .try_claim(WalletId {
                 chain_id: 1,
                 address: wallet.address.clone(),
             })
@@ -839,7 +916,7 @@ mod tests {
         // ends or the operator navigates away.
         drop(held);
         assert!(
-            approvals.reserve(wallet).is_some(),
+            approvals.try_claim(wallet).is_some(),
             "the slot must be released"
         );
     }
@@ -866,7 +943,7 @@ mod tests {
         let bot = h.state.bot("bot-a").await.unwrap();
         let wallet = bot.wallet().expect("a hot wallet has an address");
         assert!(
-            h.state.reservations.is_reserved(&wallet),
+            h.state.wallet_locks.is_claimed(&wallet),
             "the claim must survive the stream ending"
         );
         // A second approval is refused for as long as that holds.
@@ -878,7 +955,7 @@ mod tests {
 
         // Reaped: the keepalive goes, and so does the claim.
         h.docker.release_one_shot_keepalive();
-        assert!(!h.state.reservations.is_reserved(&wallet));
+        assert!(!h.state.wallet_locks.is_claimed(&wallet));
     }
 
     #[tokio::test]
@@ -896,8 +973,8 @@ mod tests {
         // A launch holds it: the approval is refused.
         let launch = h
             .state
-            .reservations
-            .reserve(wallet.clone())
+            .wallet_locks
+            .try_claim(wallet.clone())
             .expect("free to start with");
         let (status, body) = h
             .post_json("/api/bots/bot-a/approve", serde_json::json!({}))
@@ -910,8 +987,8 @@ mod tests {
         // protocol rather than two checks that happen to agree.
         let approval = h
             .state
-            .reservations
-            .reserve(wallet)
+            .wallet_locks
+            .try_claim(wallet)
             .expect("released again");
         let (status, body) = h
             .post_json("/api/bots/bot-a/start", serde_json::json!({}))
@@ -933,7 +1010,7 @@ mod tests {
         h.post_json("/api/bots/bot-a/dry-run", serde_json::json!({}))
             .await;
         let bot = h.state.bot("bot-a").await.unwrap();
-        assert!(!h.state.reservations.is_reserved(&bot.wallet().unwrap()));
+        assert!(!h.state.wallet_locks.is_claimed(&bot.wallet().unwrap()));
     }
 
     #[tokio::test]

@@ -100,12 +100,21 @@ struct FakeState {
     /// case worth testing is a daemon that has gone away mid-migration — the
     /// rollback's restart then fails too, and the operator has to be told.
     start_error: Option<String>,
+    /// When set, every `stop` fails with this. Sticky, so a settle after an ambiguous
+    /// start can't confirm the container is gone — the case where the wallet claim has
+    /// to be held rather than released.
+    stop_error: Option<String>,
     /// Files `read_dir` serves, as if they were inside a container.
     container_files: Vec<(String, Vec<u8>)>,
     /// When set, every `ensure_image` fails with this — an unreachable registry
     /// or an image that doesn't exist. Sticky rather than one-shot, because the
     /// point of these tests is that nothing downstream of it runs at all.
     image_error: Option<String>,
+    /// Allow this many `list_all` calls, then fail every one after — a daemon that
+    /// goes unreachable partway through a handler. A count rather than a flag because
+    /// a handler that re-reads the fleet after acting needs its first read to succeed
+    /// and a later one to fail. `None` never fails.
+    list_calls_left: Option<usize>,
 }
 
 impl FakeDocker {
@@ -164,9 +173,20 @@ impl FakeDocker {
         self.state.lock().unwrap().start_error = Some(message.to_string());
     }
 
+    /// Make every `stop` fail, so a settle can't confirm a container is gone.
+    pub fn fail_stop(&self, message: &str) {
+        self.state.lock().unwrap().stop_error = Some(message.to_string());
+    }
+
     /// Make the image pre-flight fail, as an unreachable registry would.
     pub fn fail_image(&self, message: &str) {
         self.state.lock().unwrap().image_error = Some(message.to_string());
+    }
+
+    /// Let the next `allowed` calls to `list_all` succeed, then fail every one after.
+    /// Stands in for the daemon going unreachable partway through a handler.
+    pub fn fail_list_after(&self, allowed: usize) {
+        self.state.lock().unwrap().list_calls_left = Some(allowed);
     }
 
     /// Park the next one-shot's keepalive instead of letting it go when the stream
@@ -229,7 +249,14 @@ impl FakeDocker {
 #[async_trait]
 impl DockerApi for FakeDocker {
     async fn list_all(&self) -> Result<Vec<ContainerInfo>> {
-        Ok(self.state.lock().unwrap().containers.clone())
+        let mut st = self.state.lock().unwrap();
+        if let Some(left) = st.list_calls_left {
+            if left == 0 {
+                bail!("the Docker daemon is not reachable");
+            }
+            st.list_calls_left = Some(left - 1);
+        }
+        Ok(st.containers.clone())
     }
 
     async fn ensure_image(&self, image: &str, refresh: bool) -> Result<()> {
@@ -288,6 +315,9 @@ impl DockerApi for FakeDocker {
             name: name.to_string(),
             grace_secs,
         });
+        if let Some(msg) = st.stop_error.clone() {
+            bail!(msg);
+        }
         set_state(&mut st, name, ContainerState::Exited, "Exited (0)")
     }
 
@@ -329,7 +359,16 @@ impl DockerApi for FakeDocker {
         Box::pin(stream::iter(lines.into_iter().map(Ok)))
     }
 
-    fn run_one_shot(&self, spec: CreateSpec, keepalive: Option<Keepalive>) -> RunStream {
+    fn run_one_shot(
+        &self,
+        spec: CreateSpec,
+        keepalive: Option<Keepalive>,
+        hold_until_started: Option<Keepalive>,
+    ) -> RunStream {
+        // The fake starts the container synchronously, so the caller's "hold until
+        // started" claim is released the moment this returns — it isn't captured into
+        // the stream the way `keepalive` is.
+        drop(hold_until_started);
         let mut st = self.state.lock().unwrap();
         st.calls.push(Call::OneShot {
             name: spec.name.clone(),
@@ -531,7 +570,7 @@ mod tests {
         let d = FakeDocker::new().with_log_lines(vec![out("approving"), out("done")]);
         d.set_one_shot_exit(3);
         let events: Vec<_> = d
-            .run_one_shot(spec("stitch-approve-bot-a"), None)
+            .run_one_shot(spec("stitch-approve-bot-a"), None, None)
             .collect::<Vec<_>>()
             .await
             .into_iter()

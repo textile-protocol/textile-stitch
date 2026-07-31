@@ -99,11 +99,19 @@ say 'Docker and Compose v2 are ready.'
 
 # ------------------------------------------------------------------- inputs ---
 step 'Where to install'
-PANEL_DIR="$(need "${PANEL_DIR:-}" 'Directory for the compose file and .env' PANEL_DIR)"
-[ -n "$PANEL_DIR" ] || PANEL_DIR="$DEFAULT_DIR"
-case "$PANEL_DIR" in
-  '') PANEL_DIR="$DEFAULT_DIR" ;;
-esac
+# PANEL_DIR is optional and defaults to $DEFAULT_DIR, so it must never be a `need`:
+# `need` dies when a value is unset and there is no TTY, which would break an
+# unattended install that set the required keys but left this one to default. Same
+# shape as PANEL_BOTS_DIR below — prompt with the default when there's a terminal,
+# take the default when there isn't.
+PANEL_DIR="${PANEL_DIR:-}"
+if [ -z "$PANEL_DIR" ]; then
+  if have_tty; then
+    PANEL_DIR="$(ask 'Directory for the compose file and .env' "$DEFAULT_DIR")"
+  else
+    PANEL_DIR="$DEFAULT_DIR"
+  fi
+fi
 
 PANEL_BOTS_DIR="${PANEL_BOTS_DIR:-}"
 if [ -z "$PANEL_BOTS_DIR" ]; then

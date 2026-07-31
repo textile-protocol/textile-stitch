@@ -180,6 +180,14 @@ export const api = {
       body: JSON.stringify({ toml }),
     }),
 
+  // Switch the signer backend: writes the new config + secret and recreates the
+  // container. The raw editor can't do this — the secret lives outside the TOML.
+  changeSigner: (name: string, signer: unknown) =>
+    request<{ bot: Bot; message: string }>(
+      `/api/bots/${encodeURIComponent(name)}/signer`,
+      { method: 'PUT', body: JSON.stringify(signer) },
+    ),
+
   /** URL of the SSE log stream, for `EventSource`. */
   logsUrl: (name: string, tail = 500) =>
     `/api/bots/${encodeURIComponent(name)}/logs?tail=${tail}&follow=true`,

@@ -209,9 +209,111 @@ pub fn write_config_signer(
 /// new secret file. Leaves corridor, spreads, and endpoints untouched. Used by
 /// the Settings screen. Re-validates the whole config before touching disk.
 pub fn apply_signer(dir: impl AsRef<Path>, signer: &SignerSetup) -> Result<()> {
-    validate_signer(signer)?;
     let paths = config_paths(dir.as_ref());
+    let updated = prepared_signer_toml(&paths, signer)?;
 
+    // Snapshot the whole set before touching any of it. Each write is atomic on its own,
+    // but the set isn't: a same-backend credential rotation overwrites the existing secret
+    // *in place*, so a later failure (the env chmod, the toml write) would leave a
+    // half-applied signer — e.g. a new private key paired with the old public-key env —
+    // with no way back. And `change_signer` has already removed the old container by the
+    // time it calls this, so a partial write strands the operator with no container and no
+    // intact signer. On any failure, roll the whole set back to the old signer.
+    let backup = SignerBackup::capture(&[
+        secret_path(&paths, signer),
+        paths.env.clone(),
+        paths.toml.clone(),
+    ])?;
+
+    // Stage the secret and env first, then commit the toml (which selects the signer)
+    // last — all atomic replaces.
+    let write = (|| -> Result<()> {
+        write_signer_secrets(&paths, signer)?;
+        write_toml_atomic(&paths.env, &render_env_for(&paths, signer))?;
+        restrict_to_owner(&paths.env)?;
+        write_toml_atomic(&paths.toml, &updated)?;
+        Ok(())
+    })();
+
+    if let Err(e) = write {
+        backup.restore();
+        return Err(e);
+    }
+    // Everything committed. Drop the old signer's now-unreferenced secrets.
+    remove_other_secrets(&paths, signer);
+    Ok(())
+}
+
+/// A snapshot of the files [`apply_signer`] is about to replace, so a failure partway
+/// through can put the old signer back intact. `None` content means the file didn't
+/// exist (a fresh bot), so restoring it means removing whatever was staged.
+struct SignerBackup {
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+impl SignerBackup {
+    fn capture(paths: &[PathBuf]) -> Result<Self> {
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let content = match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(anyhow::Error::new(e))
+                        .with_context(|| format!("snapshotting {}", path.display()))
+                }
+            };
+            files.push((path.clone(), content));
+        }
+        Ok(Self { files })
+    }
+
+    /// Best-effort: put each file back to its captured content, or remove one that didn't
+    /// exist. Logs and keeps going on error — there's nothing better to do mid-rollback,
+    /// and a clear log beats aborting the rollback half done.
+    fn restore(&self) {
+        for (path, content) in &self.files {
+            let res = match content {
+                Some(bytes) => write_key_file_atomic(path, bytes),
+                None => std::fs::remove_file(path).or_else(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => Ok(()),
+                    _ => Err(anyhow::Error::new(e)),
+                }),
+            };
+            if let Err(e) = res {
+                tracing::error!(
+                    "couldn't roll {} back after a failed signer change: {e:#}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SignerBackup {
+    fn drop(&mut self) {
+        // The secret file's captured bytes are sensitive — don't leave them in freed heap.
+        for (_, content) in &mut self.files {
+            if let Some(bytes) = content {
+                bytes.zeroize();
+            }
+        }
+    }
+}
+
+/// Confirm a signer change would succeed, without writing anything: validate the
+/// credentials and check that applying them to the config on disk still parses. The
+/// panel's Change signer flow calls this *before* it removes the live container, so a
+/// bad key — or a config that's invalid on disk — is caught while the bot is still up
+/// rather than after it's been destroyed.
+pub fn validate_signer_change(dir: impl AsRef<Path>, signer: &SignerSetup) -> Result<()> {
+    prepared_signer_toml(&config_paths(dir.as_ref()), signer).map(|_| ())
+}
+
+/// The validated TOML a signer change would write: validate the credentials, apply the
+/// signer to the config on disk, and confirm the result parses. No side effects.
+fn prepared_signer_toml(paths: &ConfigPaths, signer: &SignerSetup) -> Result<String> {
+    validate_signer(signer)?;
     let current = std::fs::read_to_string(&paths.toml)
         .with_context(|| format!("reading {}", paths.toml.display()))?;
     let mut doc: toml_edit::DocumentMut = current
@@ -227,17 +329,7 @@ pub fn apply_signer(dir: impl AsRef<Path>, signer: &SignerSetup) -> Result<()> {
     }
     let updated = doc.to_string();
     Config::from_toml(&updated).context("the updated config is not valid")?;
-
-    // Stage the secret and env first, then commit the toml (which selects the
-    // signer) last — all atomic replaces — so a failure on the secret/env write
-    // leaves the old toml still selecting the old, untouched signer. Drop the old
-    // signer's secrets only after everything commits.
-    write_signer_secrets(&paths, signer)?;
-    write_toml_atomic(&paths.env, &render_env_for(&paths, signer))?;
-    restrict_to_owner(&paths.env)?;
-    write_toml_atomic(&paths.toml, &updated)?;
-    remove_other_secrets(&paths, signer);
-    Ok(())
+    Ok(updated)
 }
 
 /// Write a new corridor template into stitch.toml while preserving the existing
@@ -273,6 +365,23 @@ fn secret_path(paths: &ConfigPaths, signer: &SignerSetup) -> PathBuf {
         SignerSetup::Turnkey { .. } => paths.dir.join("turnkey-api.key"),
         SignerSetup::Mpcvault { .. } => paths.dir.join("mpcvault-api.token"),
     }
+}
+
+/// The files [`apply_signer`] writes, as names relative to `dir`: `stitch.toml`,
+/// `stitch.env`, and the backend's secret. Derived from the same mapping the writer
+/// uses, so it can't drift. A signer change hands *exactly* these to the bot's uid — not
+/// the whole directory — so a migrated bot's hand-placed backup or other retained file
+/// keeps its ownership instead of being swept into the bot's reach.
+pub fn signer_files(dir: impl AsRef<Path>, signer: &SignerSetup) -> Vec<String> {
+    let paths = config_paths(dir.as_ref());
+    [
+        paths.toml.clone(),
+        paths.env.clone(),
+        secret_path(&paths, signer),
+    ]
+    .iter()
+    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    .collect()
 }
 
 /// Delete the secret files that don't belong to `keep`, so switching signer never
@@ -844,6 +953,98 @@ mod tests {
         assert!(
             !config_paths(&dir).toml.exists(),
             "nothing written on bad input"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn signer_files_lists_exactly_the_written_files_per_backend() {
+        // The signer change hands over only these — never the whole directory — so the
+        // set must match what `apply_signer` writes for each backend and nothing else.
+        let dir = std::path::Path::new("/tmp/whatever");
+        let local = signer_files(
+            dir,
+            &SignerSetup::Local {
+                material: LocalKeyMaterial::PrivateKey(KEY.into()),
+            },
+        );
+        assert_eq!(local, vec!["stitch.toml", "stitch.env", "stitch.key"]);
+
+        let turnkey = signer_files(
+            dir,
+            &SignerSetup::Turnkey {
+                organization_id: "org".into(),
+                sign_with: OPERATOR.into(),
+                operator_address: OPERATOR.into(),
+                api_public_key: "pub".into(),
+                api_private_key: "priv".into(),
+                api_base_url: None,
+            },
+        );
+        assert_eq!(
+            turnkey,
+            vec!["stitch.toml", "stitch.env", "turnkey-api.key"]
+        );
+
+        let mpc = signer_files(
+            dir,
+            &SignerSetup::Mpcvault {
+                vault_uuid: "v".into(),
+                client_signer_pubkey: "k".into(),
+                operator_address: OPERATOR.into(),
+                api_base_url: None,
+                callback_listen_addr: None,
+                api_token: "t".into(),
+            },
+        );
+        assert_eq!(mpc, vec!["stitch.toml", "stitch.env", "mpcvault-api.token"]);
+    }
+
+    #[test]
+    fn apply_signer_rolls_back_the_whole_set_when_a_write_fails() {
+        // Same-backend credential rotation overwrites the secret in place, so a failure
+        // after that write must not leave a half-applied signer (e.g. new private key,
+        // old public-key env). Force the final toml write to fail and assert the secret,
+        // env, and toml are all back to the previous signer.
+        let dir = unique_dir("rollback");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let turnkey = |org: &str, priv_key: &str, pub_key: &str| SignerSetup::Turnkey {
+            organization_id: org.into(),
+            sign_with: OPERATOR.into(),
+            operator_address: OPERATOR.into(),
+            api_base_url: None,
+            api_public_key: pub_key.into(),
+            api_private_key: priv_key.into(),
+        };
+        write_config_signer(&dir, corridor, &turnkey("ORG_A", "PRIV_A", "PUB_A")).unwrap();
+        let paths = config_paths(&dir);
+        let secret = dir.join("turnkey-api.key");
+        let old_secret = std::fs::read(&secret).unwrap();
+        let old_env = std::fs::read(&paths.env).unwrap();
+        let old_toml = std::fs::read(&paths.toml).unwrap();
+
+        // Occupy the toml write's temp path with a directory: the secret and env writes
+        // land, but the final toml commit can't stage, so the write fails partway.
+        std::fs::create_dir(dir.join(".stitch.toml.tmp")).unwrap();
+
+        let err = apply_signer(&dir, &turnkey("ORG_B", "PRIV_B", "PUB_B")).unwrap_err();
+        assert!(format!("{err:#}").contains("stitch.toml"), "{err:#}");
+
+        // The whole set is back to the old signer — no half-applied credentials.
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            old_secret,
+            "secret rolled back"
+        );
+        assert_eq!(
+            std::fs::read(&paths.env).unwrap(),
+            old_env,
+            "env rolled back"
+        );
+        assert_eq!(
+            std::fs::read(&paths.toml).unwrap(),
+            old_toml,
+            "toml rolled back"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

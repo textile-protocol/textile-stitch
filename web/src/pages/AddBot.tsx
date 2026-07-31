@@ -9,13 +9,16 @@ import {
   Field,
   Input,
   Loading,
-  Select,
   Toggle,
 } from '../components/ui'
+import {
+  SignerFields,
+  buildSigner,
+  emptySigner,
+  isSignerComplete,
+  type SignerState,
+} from '../components/SignerFields'
 import type { Corridor } from '../types'
-
-type SignerKind = 'local' | 'turnkey' | 'mpcvault'
-type KeyForm = 'privateKey' | 'seedPhrase'
 
 /**
  * The add-bot wizard: corridor, then name, then signer.
@@ -32,10 +35,7 @@ export default function AddBot() {
   const [step, setStep] = useState(0)
   const [corridorId, setCorridorId] = useState('')
   const [name, setName] = useState('')
-  const [signerKind, setSignerKind] = useState<SignerKind>('local')
-  const [keyForm, setKeyForm] = useState<KeyForm>('privateKey')
-  const [secret, setSecret] = useState('')
-  const [mpc, setMpc] = useState<Record<string, string>>({})
+  const [signer, setSigner] = useState<SignerState>(emptySigner)
   const [start, setStart] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -64,11 +64,10 @@ export default function AddBot() {
         name: name.trim(),
         corridorId,
         start,
-        signer: buildSigner(signerKind, keyForm, secret, mpc),
+        signer: buildSigner(signer),
       })
       // Clear the secret from component state the moment it's no longer needed.
-      setSecret('')
-      setMpc({})
+      setSigner(emptySigner)
       navigate(`/bots/${encodeURIComponent(res.bot.name)}`, {
         state: { note: res.message },
       })
@@ -159,73 +158,7 @@ export default function AddBot() {
       {step === 2 && (
         <Card title="How does it sign?">
           <div className="space-y-4">
-            <Field label="Signer">
-              <Select
-                value={signerKind}
-                onChange={(e) => setSignerKind(e.target.value as SignerKind)}
-              >
-                <option value="local">Hot wallet (local key)</option>
-                <option value="turnkey">MPC — Turnkey</option>
-                <option value="mpcvault">MPC — MPCVault · Experimental</option>
-              </Select>
-            </Field>
-
-            {signerKind === 'local' && (
-              <>
-                <Field label="Key material">
-                  <Select
-                    value={keyForm}
-                    onChange={(e) => setKeyForm(e.target.value as KeyForm)}
-                  >
-                    <option value="privateKey">Private key</option>
-                    <option value="seedPhrase">Seed phrase</option>
-                  </Select>
-                </Field>
-                <Field
-                  label={keyForm === 'privateKey' ? 'Private key' : 'Seed phrase'}
-                  hint="Written to an owner-only file on the host and mounted read-only into the bot. The panel never reads it back."
-                >
-                  <Input
-                    type="password"
-                    value={secret}
-                    autoComplete="off"
-                    spellCheck={false}
-                    placeholder={keyForm === 'privateKey' ? '0x…' : 'twelve words…'}
-                    onChange={(e) => setSecret(e.target.value)}
-                  />
-                </Field>
-              </>
-            )}
-
-            {signerKind === 'turnkey' && (
-              <MpcFields
-                values={mpc}
-                onChange={setMpc}
-                fields={[
-                  ['organizationId', 'Organization ID', false],
-                  ['signWith', 'Sign with (wallet or private key id)', false],
-                  ['operatorAddress', 'Operator address', false],
-                  ['apiBaseUrl', 'API base URL (optional)', false],
-                  ['apiPublicKey', 'API public key', false],
-                  ['apiPrivateKey', 'API private key', true],
-                ]}
-              />
-            )}
-
-            {signerKind === 'mpcvault' && (
-              <MpcFields
-                values={mpc}
-                onChange={setMpc}
-                fields={[
-                  ['vaultUuid', 'Vault UUID', false],
-                  ['clientSignerPubkey', 'Client-signer public key', false],
-                  ['operatorAddress', 'Operator address', false],
-                  ['apiBaseUrl', 'API base URL (optional)', false],
-                  ['callbackListenAddr', 'Callback listen address (optional)', false],
-                  ['apiToken', 'API token', true],
-                ]}
-              />
-            )}
+            <SignerFields value={signer} onChange={setSigner} />
 
             <Toggle
               checked={start}
@@ -248,7 +181,7 @@ export default function AddBot() {
                 variant="primary"
                 busy={busy}
                 onClick={() => void submit()}
-                disabled={!isSignerComplete(signerKind, secret, mpc)}
+                disabled={!isSignerComplete(signer)}
               >
                 Create
               </Button>
@@ -256,32 +189,6 @@ export default function AddBot() {
           </div>
         </Card>
       )}
-    </div>
-  )
-}
-
-function MpcFields({
-  values,
-  onChange,
-  fields,
-}: {
-  values: Record<string, string>
-  onChange: (v: Record<string, string>) => void
-  fields: [key: string, label: string, secret: boolean][]
-}) {
-  return (
-    <div className="space-y-3">
-      {fields.map(([key, label, isSecret]) => (
-        <Field key={key} label={label}>
-          <Input
-            type={isSecret ? 'password' : 'text'}
-            autoComplete="off"
-            spellCheck={false}
-            value={values[key] ?? ''}
-            onChange={(e) => onChange({ ...values, [key]: e.target.value })}
-          />
-        </Field>
-      ))}
     </div>
   )
 }
@@ -304,38 +211,4 @@ function Steps({ current, labels }: { current: number; labels: string[] }) {
       ))}
     </ol>
   )
-}
-
-/** Only the fields the chosen backend actually needs. */
-function isSignerComplete(
-  kind: SignerKind,
-  secret: string,
-  mpc: Record<string, string>,
-): boolean {
-  const filled = (k: string) => (mpc[k] ?? '').trim().length > 0
-  switch (kind) {
-    case 'local':
-      return secret.trim().length > 0
-    case 'turnkey':
-      return (
-        ['organizationId', 'signWith', 'operatorAddress', 'apiPublicKey', 'apiPrivateKey']
-          .every(filled)
-      )
-    case 'mpcvault':
-      return ['vaultUuid', 'clientSignerPubkey', 'operatorAddress', 'apiToken'].every(
-        filled,
-      )
-  }
-}
-
-function buildSigner(
-  kind: SignerKind,
-  keyForm: KeyForm,
-  secret: string,
-  mpc: Record<string, string>,
-): unknown {
-  if (kind === 'local') {
-    return { kind, [keyForm]: secret.trim() }
-  }
-  return { kind, ...mpc }
 }

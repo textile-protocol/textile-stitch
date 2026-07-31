@@ -11,6 +11,7 @@ import {
   Tag,
   Warnings,
 } from '../components/ui'
+import ChangeSigner from '../components/ChangeSigner'
 import ComposeExportLink from '../components/ComposeExportLink'
 import LogViewer from '../components/LogViewer'
 import OneShotRunner from '../components/OneShotRunner'
@@ -248,16 +249,27 @@ export default function BotDetail() {
         ))}
 
       {tab === 'config' && (
-        <Card>
-          <RawConfigEditor
-            bot={bot.name}
-            running={bot.running}
-            onSaved={(message) => {
-              setNote(message)
-              void load()
-            }}
-          />
-        </Card>
+        <div className="space-y-4">
+          <Card>
+            <RawConfigEditor
+              bot={bot.name}
+              running={bot.running}
+              onSaved={(message) => {
+                setNote(message)
+                void load()
+              }}
+            />
+          </Card>
+          {bot.editable && (
+            <ChangeSigner
+              bot={bot.name}
+              onChanged={(message) => {
+                setNote(message)
+                void load()
+              }}
+            />
+          )}
+        </div>
       )}
 
       {tab === 'logs' && (

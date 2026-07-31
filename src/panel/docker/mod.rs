@@ -328,7 +328,69 @@ pub trait DockerApi: Send + Sync {
     ///
     /// Opaque on purpose: the Docker layer has no business knowing what it's
     /// holding, only that it drops it last.
-    fn run_one_shot(&self, spec: CreateSpec, keepalive: Option<Keepalive>) -> RunStream;
+    ///
+    /// `hold_until_started` is the mirror image: held only until the container has
+    /// *started*, then dropped. The approve route parks the config lock there, because
+    /// the container loads its config from the mounted file at start — so the file must
+    /// not be moved by a settings save between the caller's wallet claim and the start,
+    /// or the container could sign from a wallet nothing claimed. Once started, the
+    /// config is loaded and the lock can go.
+    fn run_one_shot(
+        &self,
+        spec: CreateSpec,
+        keepalive: Option<Keepalive>,
+        hold_until_started: Option<Keepalive>,
+    ) -> RunStream;
+}
+
+/// Hold `held` until `container` is confirmed stopped or gone, in a background task.
+///
+/// The safety valve for an *ambiguous* Docker response: a launch, restart, or live-change
+/// whose start/restart returned an error the connection may have dropped *after* Docker
+/// acted, so the container could be running its allowance preflight on a wallet the caller
+/// claimed. Releasing that claim then would let a sibling collide on the pending nonce. So
+/// the claim (whatever `held` is — a wallet claim, or a pair of them) is handed here and
+/// kept alive until the container is terminal or absent, retrying the stop with backoff.
+///
+/// Keys off the container's liveness via `list_all`, not a successful `stop`: Docker
+/// reports an already-stopped or removed container as an error, so an operator who cleans
+/// up by hand still releases the claim. Indefinite by design — a daemon that never returns
+/// keeps the wallet blocked, which is loud and safe over a silent nonce race.
+pub fn hold_until_stopped<H: Send + 'static>(
+    docker: std::sync::Arc<dyn DockerApi>,
+    container: String,
+    held: H,
+) {
+    tokio::spawn(async move {
+        let _held = held;
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            if let Ok(containers) = docker.list_all().await {
+                if !containers
+                    .iter()
+                    .any(|c| c.name == container && !c.state.is_terminal())
+                {
+                    tracing::info!(
+                        "{container} is no longer live; releasing the claim held for it"
+                    );
+                    break;
+                }
+            }
+            match docker.stop(&container, STOP_GRACE_SECS).await {
+                Ok(()) => {
+                    tracing::info!("stopped {container}; releasing the claim held for it");
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "still can't stop {container} to release a held claim, retrying in {backoff:?}: {e:#}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

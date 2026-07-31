@@ -21,10 +21,11 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use super::logs::{self, WalletClaim};
 use super::{require_editable, ApiError, AppState};
 use crate::config::Config;
 use crate::panel::docker::STOP_GRACE_SECS;
-use crate::panel::inventory::Bot;
+use crate::panel::inventory::{Bot, WalletId};
 use crate::setup::{
     self, PoolPair, SettingsPatch, SettingsView, SideSizing, SpreadEdit, SpreadKind,
 };
@@ -305,12 +306,16 @@ pub async fn update(
     UrlPath(name): UrlPath<String>,
     Json(body): Json<SettingsUpdate>,
 ) -> Result<Response, ApiError> {
-    let bot = state.bot(&name).await?;
+    // Lock and re-read *under the lock* via `lock_config`. Locking a path read before the
+    // lock is a race: a migration can win the lock first and move the authoritative config
+    // to the per-bot layout, leaving our `path` pointing at the flat file it orphaned — the
+    // write would then succeed against a dead file and report success while the live config
+    // never changed. `lock_config` re-reads under the lock and re-locks the moved path, so
+    // `bot`/`path` below are the ones the save actually writes. Held across read → patch →
+    // write, so a concurrent save can't read the same starting text and overwrite this
+    // one's edit with a complete file of its own.
+    let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
     let path = config_path(&bot)?;
-    // Held across read → patch → write, so a concurrent save can't read the same
-    // starting text and overwrite this one's edit with a complete file of its own.
-    let lock = state.config_locks.for_path(&path);
-    let _saving = lock.lock().await;
     let current_toml = read_toml(&path)?;
 
     let pool = body.pool.unwrap_or(0);
@@ -344,18 +349,31 @@ pub struct RawUpdate {
     pub toml: String,
 }
 
+/// Which signer backend a config selects, as a word for an error message. The
+/// backend is what fixes a container's secret mount and environment at create time,
+/// so a change in *this* — not the address or org within a backend — is what a
+/// running container can't honour without being rebuilt.
+fn signer_provider(signer: &setup::SignerView) -> &'static str {
+    match signer {
+        setup::SignerView::Local => "local (hot wallet)",
+        setup::SignerView::Turnkey { .. } => "Turnkey",
+        setup::SignerView::Mpcvault { .. } => "MPCVault",
+    }
+}
+
 /// Replace a bot's config wholesale, after validating it the way the bot would.
 pub async fn save_raw(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
     Json(body): Json<RawUpdate>,
 ) -> Result<Response, ApiError> {
-    let bot = state.bot(&name).await?;
+    // Same lock discipline as the structured save: `lock_config` locks and re-reads under
+    // the lock, re-locking the moved path if a migration ran while we waited — otherwise a
+    // raw whole-file write could land on a flat file migration orphaned. A raw write can
+    // clobber a partial patch just as easily as the other way round, which is why it takes
+    // the same per-config lock.
+    let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
     let path = config_path(&bot)?;
-    // Same lock as the structured save: a raw write is a whole-file write, so it can
-    // clobber a partial patch just as easily as the other way round.
-    let lock = state.config_locks.for_path(&path);
-    let _saving = lock.lock().await;
     // The same parse the bot does at startup. Rejecting here is the whole point of
     // the escape hatch being server-validated rather than a blind file write.
     Config::from_toml(&body.toml).map_err(|e| {
@@ -363,6 +381,26 @@ pub async fn save_raw(
             "that config isn't valid, and the bot would fail to start on it: {e:#}"
         ))
     })?;
+
+    // A raw edit can't change the signer backend (`[signer].provider`). The backend's
+    // secret (`turnkey-api.key`, `mpcvault-api.token`) and the Turnkey public key live
+    // *outside* the TOML, and swapping it needs a container rebuilt with different mounts
+    // and env — none of which a raw TOML write can supply. Reject the change and point at
+    // the Change signer flow (`PUT /api/bots/{name}/signer`), which takes the credentials,
+    // writes them atomically, and recreates the container.
+    let current = read_toml(&path)?;
+    let old = setup::try_read_signer(&current).map_err(|e| ApiError::internal(&e))?;
+    let new = setup::try_read_signer(&body.toml).map_err(ApiError::bad_request)?;
+    let (from, to) = (signer_provider(&old), signer_provider(&new));
+    if from != to {
+        return Err(ApiError::conflict(format!(
+            "this changes {name}'s signer backend from {from} to {to}, which a raw config save \
+             can't do: the {to} backend needs its own secret file and environment, which don't \
+             live in the TOML. Use Change signer instead — it takes the credentials, writes them, \
+             and rebuilds the container with the matching runtime."
+        )));
+    }
+
     save_and_restart(&state, &bot, &path, &body.toml, 0).await
 }
 
@@ -377,52 +415,131 @@ async fn save_and_restart(
     toml: &str,
     pool: usize,
 ) -> Result<Response, ApiError> {
-    setup::write_toml_atomic(path, toml).map_err(|e| ApiError::internal(&e))?;
-    tracing::info!(bot = %bot.name, path = %path.display(), "config saved");
+    // Re-discover the bot *under the config lock the caller holds*, before anything
+    // else. `bot` was read by the handler before it took that lock, so two overlapping
+    // saves for one running bot both start from the same pre-lock snapshot: if the first
+    // moves it from wallet A to B and restarts, the second still thinks it is on A. The
+    // live process is on B by the time the second save runs, so a claim on A guards the
+    // wrong wallet. Reading here — serialized behind the lock — gets the wallet the
+    // running process is actually on.
+    //
+    // If that read fails, abort: nothing is written and nothing is restarted. Falling
+    // back to the stale pre-lock snapshot and writing anyway would claim the wallet the
+    // live process already left while moving the config to a third — the live process
+    // left unguarded. A save that can't first establish which wallet is live can't be
+    // made safe, so it doesn't happen at all.
+    let pre_save = state.bot(&bot.name).await.map_err(|e| {
+        ApiError::new(
+            e.status,
+            format!(
+                "couldn't re-read {} to save it safely ({}), so nothing was written. Try again \
+                 once the Docker daemon is reachable.",
+                bot.name, e.message
+            ),
+        )
+    })?;
 
-    // Only a bot that was running gets bounced. `docker restart` on a stopped or
-    // never-started container starts it, which would turn "I tweaked a spread"
-    // into "I put a bot on the book" — including for a bot straight out of the
-    // wizard, which deliberately isn't started until the allowance is approved.
+    // The lock is on one specific path. If a migration moved the authoritative config to
+    // the per-bot layout while the caller waited for the lock, `pre_save` names the moved
+    // path but `path` still points at the flat file migration orphaned — writing there
+    // would succeed against a dead file and report success while the live config never
+    // changed. Callers lock via `lock_config`, which re-locks the moved path, so this
+    // never fires in practice; it's a hard stop against a stale path reaching the write.
+    if pre_save.config_panel_path.as_deref() != Some(path) {
+        return Err(ApiError::conflict(format!(
+            "{}'s config moved on disk while the save was waiting — a migration to the per-bot \
+             layout likely ran. Nothing was written; reload and try again.",
+            pre_save.name
+        )));
+    }
+
+    // Classify the change. A change to transacting-ness (taker/closer) or the wallet
+    // (chain or operator address) is *safety-relevant*: the launch paths read the config
+    // on disk to decide whether a restart would put a second signer on a wallet, so
+    // persisting such a change without restarting leaves the on-disk config lying about
+    // the live process — a later Start/Restart then trusts it and starts the second
+    // signer. So a safety-relevant change to a *live* bot is all-or-nothing: applied only
+    // if the restart is safe right now, else refused without writing. Everything else
+    // (spreads, URLs, sizing) doesn't move what the safety checks read, so it can save
+    // without a restart as before.
     //
-    // The restart is reported, not asserted. A bot that saved but didn't come back
-    // is exactly the case an operator must not be lied to about.
-    //
-    // And it's a bot launch like any other, so it takes the same wallet reservation.
-    // The save that got here may have enabled a taker or a closer, which turns a
-    // maker an approval was legitimately running alongside into one that broadcasts.
-    // Without this the exclusion the docs promise for Restart has a side door.
-    //
-    // Re-discovered from disk first, because `bot` describes the config as it was
-    // *before* the write. A raw-config save can change `chain_id` or an MPC operator
-    // address, so the stale view names the wallet the bot is leaving — reserving that
-    // one and restarting into another is a lock on the wrong door.
-    let restarting = state.bot(&bot.name).await.unwrap_or_else(|_| bot.clone());
-    let (restarted, restart_error) = match restarting.container_name.as_deref() {
-        Some(container) if restarting.state.is_running() => {
-            match state.reservations.reserve_for(&restarting) {
-                // Held across the restart, then dropped with `_wallet`.
-                Some(_wallet) => match state.docker.restart(container, STOP_GRACE_SECS).await {
-                    Ok(()) => (true, None),
-                    Err(e) => {
-                        tracing::error!(bot = %bot.name, "config saved but the restart failed: {e:#}");
-                        (false, Some(format!("{e:#}")))
-                    }
-                },
-                None => {
-                    tracing::warn!(bot = %bot.name, "config saved but the wallet is busy");
-                    (
-                        false,
-                        Some(
-                            "an approval is running against its operator wallet, so restarting it \
-                             now would put two signers on the same nonce"
-                                .to_string(),
-                        ),
-                    )
-                }
-            }
+    // `summarise` derives the would-be identity from the incoming TOML plus the key
+    // beside the config on disk — which a settings save never touches — so a local bot's
+    // operator address is correct without reconstructing it.
+    let would_be = crate::panel::inventory::summarise(toml, path).map_err(ApiError::bad_request)?;
+    let would_be_wallet = would_be.operator_address.as_ref().map(|address| WalletId {
+        chain_id: would_be.chain_id,
+        address: address.to_lowercase(),
+    });
+    let was_transacting = pre_save
+        .config
+        .as_ref()
+        .is_some_and(|c| c.sends_transactions);
+    let safety_relevant =
+        would_be.sends_transactions != was_transacting || would_be_wallet != pre_save.wallet();
+
+    if safety_relevant {
+        if pre_save.state.is_running() {
+            // All-or-nothing: check the claims and the fleet, then write+restart or refuse
+            // without writing — nothing that can't be applied lands on disk.
+            return apply_live_change(state, &pre_save, path, toml, would_be_wallet, pool).await;
         }
-        _ => (false, None),
+        if !pre_save.state.is_terminal() && pre_save.container_name.is_some() {
+            // Paused or restarting: the process holds the old config in memory and can't
+            // take a clean restart, so this change can't be applied — and leaving it on
+            // disk would let a later start trust it and put a second signer on the wallet.
+            return Err(ApiError::conflict(format!(
+                "{name} is {}, so changing its taker/closer or its wallet can't be applied right \
+                 now — it can't take a clean restart, and leaving the change on disk would let a \
+                 later start trust it. Stop or unpause {name} first, then save.",
+                pre_save.state.as_str(),
+                name = pre_save.name
+            )));
+        }
+        // Terminal or no container: not a live signer, so persisting is safe. Falls
+        // through to the plain write path below.
+    }
+
+    // Claim the wallet the bot is on *before* the write. Discovery reads the config
+    // file, so writing it moves the fleet's idea of which wallet this bot uses while
+    // the running container is still on the old one. Holding the pre-write wallet
+    // across the write and the restart stops a concurrent approval or launch grabbing
+    // it, seeing no live sibling (the fleet now reports the *new* wallet), and starting
+    // a second signer next to the old process. `Some(None)` — no identifiable wallet —
+    // is nothing to guard; `None` — busy — is handled by `restart_after_save`.
+    let old_claim = state.wallet_locks.try_claim_for(&pre_save);
+
+    setup::write_toml_atomic(path, toml).map_err(|e| ApiError::internal(&e))?;
+    tracing::info!(bot = %pre_save.name, path = %path.display(), "config saved");
+
+    // Re-discover again from disk before deciding anything about the restart: `pre_save`
+    // describes the config as it was *before* the write, and a raw save can change
+    // `chain_id` or an MPC operator address. A failed re-read is a *skipped* restart, not
+    // a restart from the stale identity — the daemon being unreachable is the usual
+    // cause, and the restart would fail for the same reason. `restarting` is the
+    // post-write bot the message block below reasons about; the `pre_save.clone()`
+    // placeholder on failure is never inspected, because `restart_error` is `Some` and
+    // the first message arm wins.
+    let (restarting, (restarted, restart_error)) = match state.bot(&pre_save.name).await {
+        Ok(rediscovered) => {
+            let outcome = restart_after_save(state, &pre_save, &rediscovered, old_claim).await;
+            (rediscovered, outcome)
+        }
+        Err(e) => {
+            tracing::error!(bot = %pre_save.name, "config saved but re-reading the bot failed: {}", e.message);
+            (
+                pre_save.clone(),
+                (
+                    false,
+                    Some(format!(
+                        "the panel couldn't re-read {} from disk to restart it safely ({}), so it \
+                         was left running the old config. Restart it yourself once the daemon is \
+                         reachable.",
+                        pre_save.name, e.message
+                    )),
+                ),
+            )
+        }
     };
 
     let fresh = read_toml(path)?;
@@ -431,12 +548,12 @@ async fn save_and_restart(
         Some(e) => format!(
             "The config was saved, but restarting {} failed: {e}. It is still running the old \
              config — restart it yourself to apply the change.",
-            bot.name
+            pre_save.name
         ),
         None if restarted => format!(
             "Saved and restarted {}. Orders it signed under the old settings stay on the book \
              until they expire.",
-            bot.name
+            pre_save.name
         ),
         // A container that is neither running nor terminal — paused, above all — still
         // holds a process, and that process has the *old* settings in memory. Stitch
@@ -453,18 +570,18 @@ async fn save_and_restart(
             format!(
                 "Saved, but {} is {} so it was not restarted, and it is still running the old \
                  settings. Stitch only reads its config at startup: restart it to apply this.",
-                bot.name,
+                pre_save.name,
                 restarting.state.as_str()
             )
         }
-        None if bot.container_name.is_some() => format!(
+        None if restarting.container_name.is_some() => format!(
             "Saved. {} isn't running, so there was nothing to restart — it picks the new config \
              up when you start it.",
-            bot.name
+            pre_save.name
         ),
         None => format!(
             "Saved. {} has no container, so there was nothing to restart.",
-            bot.name
+            pre_save.name
         ),
     };
 
@@ -475,6 +592,274 @@ async fn save_and_restart(
         "message": message,
     }))
     .into_response())
+}
+
+/// Apply a safety-relevant change to a *running* bot, all-or-nothing.
+///
+/// A change to transacting-ness or the wallet can't be persisted without restarting, or
+/// the config on disk starts lying to the launch paths about the live process. So the
+/// checks happen *before* the write: claim the pre-write wallet and the wallet the change
+/// selects, confirm no live sibling on the new wallet, and only then write and restart.
+/// Any check that fails refuses the whole save — nothing is written — so a change that
+/// can't be applied never lands on disk.
+///
+/// `new_wallet` is the wallet the incoming config selects (`None` when it has no
+/// identifiable one). `pre_save` is the still-running bot.
+async fn apply_live_change(
+    state: &AppState,
+    pre_save: &Bot,
+    path: &std::path::Path,
+    toml: &str,
+    new_wallet: Option<WalletId>,
+    pool: usize,
+) -> Result<Response, ApiError> {
+    let container = pre_save.container_name.as_deref().ok_or_else(|| {
+        ApiError::conflict(format!("{} has no container to restart", pre_save.name))
+    })?;
+
+    // The pre-write wallet is held until the old process is gone; the wallet the change
+    // selects is claimed for the process the restart brings up. One claim when they match.
+    let old_claim = match state.wallet_locks.try_claim_for(pre_save) {
+        Some(held) => held,
+        None => {
+            return Err(ApiError::conflict(format!(
+                "{}'s operator wallet is busy — an approval or launch is running against it. \
+                 Nothing was saved; wait for that to finish and try again.",
+                pre_save.name
+            )));
+        }
+    };
+    let _new_claim = match &new_wallet {
+        None => None,
+        Some(w) if old_claim.as_ref().map(WalletClaim::wallet) == Some(w) => None,
+        Some(w) => match state.wallet_locks.try_claim(w.clone()) {
+            Some(claim) => Some(claim),
+            None => {
+                return Err(ApiError::conflict(
+                    "the operator wallet this change selects is busy — an approval or launch is \
+                     running against it. Nothing was saved; wait and try again.",
+                ));
+            }
+        },
+    };
+
+    // The fleet half: refuse if a live sibling already transacts on the wallet the change
+    // selects. Skip only when the overlap already exists — the running process is itself
+    // transacting on that same wallet — because then the restart doesn't introduce it
+    // (same rule as `restart_after_save`).
+    let overlap_exists = logs::already_transacting(pre_save) && pre_save.wallet() == new_wallet;
+    if !overlap_exists {
+        if let Some(wallet) = &new_wallet {
+            let fleet = state.fleet().await?;
+            logs::no_live_sibling_on_wallet_id(&pre_save.name, wallet, &fleet)
+                .map_err(ApiError::conflict)?;
+        }
+    }
+
+    // Safe: commit and restart, both claims held across it.
+    let old_toml = read_toml(path)?;
+    setup::write_toml_atomic(path, toml).map_err(|e| ApiError::internal(&e))?;
+    tracing::info!(bot = %pre_save.name, "config saved (live change), restarting");
+
+    let response = |restarted: bool, restart_error: serde_json::Value, message: String| {
+        let view =
+            setup::read_settings_at(&read_toml(path)?, pool).map_err(ApiError::bad_request)?;
+        Ok(Json(serde_json::json!({
+            "settings": SettingsBody::from_view(&view, true),
+            "restarted": restarted,
+            "restartError": restart_error,
+            "message": message,
+        }))
+        .into_response())
+    };
+
+    let e = match state.docker.restart(container, STOP_GRACE_SECS).await {
+        Ok(()) => {
+            return response(
+                true,
+                serde_json::Value::Null,
+                format!(
+                    "Saved and restarted {}. Orders it signed under the old settings stay on the \
+                     book until they expire.",
+                    pre_save.name
+                ),
+            );
+        }
+        Err(e) => e,
+    };
+
+    // A failed restart is *ambiguous*: Docker may have started the replacement on the new
+    // wallet before the error (a lost response), so the live process could be on either
+    // config. Confirm it's gone before trusting the file — stop it first, *then* roll back.
+    // Stopping first means no signer is live when the file goes back to the old wallet.
+    tracing::error!(bot = %pre_save.name, "live change restart failed, stopping before rollback: {e:#}");
+    let name = &pre_save.name;
+    if let Err(se) = state.docker.stop(container, STOP_GRACE_SECS).await {
+        // Can't confirm the process is gone, and touching the file could make it disagree
+        // with a live new-wallet process. Hold both wallets until the container is stopped.
+        tracing::error!(bot = %name, "couldn't stop the bot after a failed restart: {se:#}");
+        crate::panel::docker::hold_until_stopped(
+            state.docker.clone(),
+            container.to_string(),
+            (old_claim, _new_claim),
+        );
+        return response(
+            false,
+            serde_json::json!(format!("{e:#}")),
+            format!(
+                "{e:#}. {name} couldn't be stopped either, so its operator wallets are held \
+                 blocked until it can be. Recover the Docker daemon, then stop and fix {name} by \
+                 hand."
+            ),
+        );
+    }
+
+    // The process is gone. Roll the file back to the old config so a later Start resumes
+    // the old, guarded wallet — but if that write fails, the bot is stopped safely (nothing
+    // signs) with the *new* config on disk, and the message has to say so, not claim a
+    // rollback that didn't happen.
+    let message = match setup::write_toml_atomic(path, &old_toml) {
+        Ok(()) => format!(
+            "The change wasn't applied: restarting {name} failed ({e:#}), so it was stopped and \
+             reverted to its old config. Start it to resume."
+        ),
+        Err(re) => {
+            tracing::error!(bot = %name, "couldn't roll the config back after stopping: {re:#}");
+            format!(
+                "The change wasn't applied cleanly: restarting {name} failed ({e:#}) and its \
+                 config couldn't be reverted, so {name} was stopped with the *new* config on disk. \
+                 Fix or revert it, then start {name}."
+            )
+        }
+    };
+    response(false, serde_json::json!(format!("{e:#}")), message)
+}
+
+/// Bounce the container after a save, holding the wallet across the restart.
+///
+/// A restart is a bot launch like any other — the save may have enabled a taker or a
+/// closer, turning a maker an approval was legitimately running alongside into one
+/// that broadcasts — so it goes through the same claim-and-check protocol as
+/// [`claim_for_launch`](super::bots::claim_for_launch), with one difference: a raw
+/// save can move the bot onto a *different* wallet, so this is a transaction over two
+/// of them. The pre-write wallet (`old_claim`) is held until the old container is
+/// gone; the wallet the save selected is claimed for the process the restart brings
+/// up. When they're the same wallet, one claim covers both.
+///
+/// Returns `(restarted, restart_error)`. Everything that stops the restart — a busy
+/// wallet, a live sibling on the wallet the save selected, a Docker failure — is
+/// reported, never asserted: a bot that saved but didn't come back is exactly the case
+/// an operator must not be lied to about.
+///
+/// `pre_save` is the bot as it was *before* the write — the config the container is
+/// still running — and `restarting` is the re-read post-write bot: the wallet and
+/// target config the restart will bring up. The two differ in exactly the way that
+/// matters here, so each is used for its own half (see the sibling check below).
+/// `old_claim` is [`WalletLocks::try_claim_for`](super::logs::WalletLocks::try_claim_for)
+/// on the pre-write bot: `None` = the pre-write wallet was busy, `Some(None)` = it had
+/// no identifiable wallet, `Some(Some)` = held.
+async fn restart_after_save(
+    state: &AppState,
+    pre_save: &Bot,
+    restarting: &Bot,
+    old_claim: Option<Option<WalletClaim>>,
+) -> (bool, Option<String>) {
+    // Only a running bot gets bounced. `docker restart` on a stopped or never-started
+    // container *starts* it, which would turn "I tweaked a spread" into "I put a bot on
+    // the book" — including a bot straight out of the wizard, deliberately left stopped
+    // until its allowance is approved. A bot that isn't running signs nothing, so the
+    // save just lands on disk and any pre-write claim drops here.
+    let Some(container) = restarting.container_name.as_deref() else {
+        return (false, None);
+    };
+    if !restarting.state.is_running() {
+        return (false, None);
+    }
+
+    // Running, so the restart puts a signer back on the wallet and the pre-write wallet
+    // has to be held across it (see the call site). Busy means something else is already
+    // signing on it, so restarting now would put two signers on the same nonce.
+    let old_claim = match old_claim {
+        Some(held) => held,
+        None => {
+            tracing::warn!(bot = %restarting.name, "config saved but the pre-save wallet is busy");
+            return (
+                false,
+                Some(
+                    "an approval or launch is running against its operator wallet, so restarting \
+                     it now would put two signers on the same nonce. It is still on the old config."
+                        .to_string(),
+                ),
+            );
+        }
+    };
+
+    // Claim the wallet the save selected too, unless it's the same one already held.
+    // Held alongside `old_claim` across the restart, then both drop on return.
+    let new_wallet = restarting.wallet();
+    let _new_claim = match &new_wallet {
+        None => None,
+        Some(w) if old_claim.as_ref().map(WalletClaim::wallet) == Some(w) => None,
+        Some(w) => match state.wallet_locks.try_claim(w.clone()) {
+            Some(claim) => Some(claim),
+            None => {
+                tracing::warn!(bot = %restarting.name, "config saved but the selected wallet is busy");
+                return (
+                    false,
+                    Some(
+                        "an approval is running against the operator wallet this save selected, so \
+                         restarting into it would put two signers on the same nonce. It is still on \
+                         the old config."
+                            .to_string(),
+                    ),
+                );
+            }
+        },
+    };
+
+    // The fleet half: a running sibling on the same wallet holds no claim, so the lock
+    // reads free while its taker spends nonces. Skip it only when the overlap already
+    // exists — refusing a restart that would fix it helps nobody. But "already exists"
+    // is a question about the process that is *running now*, i.e. `pre_save`, not the
+    // config the restart will bring up. Deciding it from `restarting` gets it backwards
+    // both ways: a save that turns a taker *off* leaves `restarting` maker-only and
+    // would wrongly refuse the restart that removes the overlap, and a save that turns a
+    // taker *on* makes `restarting` transacting and would wrongly skip the check even
+    // though the live process is maker-only and the restart introduces a second signer.
+    // The overlap pre-exists only if the running process is already transacting on the
+    // very wallet the restart targets — a raw save can move the wallet too, and a
+    // transactor on the wallet it is *leaving* pre-exists nothing on the new one.
+    let overlap_already_exists = logs::already_transacting(pre_save)
+        && pre_save.wallet().as_ref() == restarting.wallet().as_ref();
+    if !overlap_already_exists {
+        match state.fleet().await {
+            Ok(fleet) => {
+                if let Err(e) = logs::no_live_sibling_on_the_wallet(restarting, &fleet) {
+                    tracing::warn!(bot = %restarting.name, "config saved but a live sibling shares the wallet");
+                    return (false, Some(format!("{e:#} It is still on the old config.")));
+                }
+            }
+            Err(e) => {
+                return (
+                    false,
+                    Some(format!(
+                        "the config was saved, but the panel couldn't check the fleet before \
+                         restarting ({}), so it left the bot on the old config. Restart it \
+                         yourself once the daemon is reachable.",
+                        e.message
+                    )),
+                );
+            }
+        }
+    }
+
+    match state.docker.restart(container, STOP_GRACE_SECS).await {
+        Ok(()) => (true, None),
+        Err(e) => {
+            tracing::error!(bot = %restarting.name, "config saved but the restart failed: {e:#}");
+            (false, Some(format!("{e:#}")))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -499,6 +884,15 @@ mod tests {
         c.labels.insert(LABEL_BOT.to_string(), name.to_string());
         c.mounts = dir_layout_mounts(&h.root.join(name).display().to_string());
         h.docker.add_container(c);
+    }
+
+    /// A running bot whose taker leg is on, so its own process broadcasts from the
+    /// operator wallet. Every seed shares `TEST_KEY`, so two of these share a wallet.
+    fn seed_transacting(h: &Harness, name: &str, state: ContainerState) {
+        seed_in_state(h, name, state);
+        let config = h.root.join(name).join("stitch.toml");
+        let toml = std::fs::read_to_string(&config).unwrap() + "\nlimit_taker_enabled = true\n";
+        std::fs::write(&config, toml).unwrap();
     }
 
     #[tokio::test]
@@ -569,8 +963,14 @@ mod tests {
         ] {
             let h = harness("settings-no-start");
             seed_in_state(&h, "bot-a", state);
+            // A non-safety edit (a spread/feed change): it saves without a restart on any
+            // non-running bot. (A taker/wallet change on a *paused* bot is refused — see
+            // `enabling_a_taker_on_a_paused_bot_is_refused_without_writing`.)
             let (status, body) = h
-                .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": true }))
+                .patch_json(
+                    "/api/bots/bot-a/settings",
+                    json!({ "feedUrl": "https://feed.example" }),
+                )
                 .await;
             assert_eq!(status, StatusCode::OK, "{state:?}: {body}");
             let v = Harness::parse(&body);
@@ -589,7 +989,10 @@ mod tests {
                 "{state:?}: {body}"
             );
             // The save itself must still have happened.
-            assert_eq!(v["settings"]["takerEnabled"], true, "{state:?}");
+            assert_eq!(
+                v["settings"]["feedUrl"], "https://feed.example",
+                "{state:?}"
+            );
             // And nothing touched the container.
             assert!(
                 h.docker.calls().iter().all(|c| !matches!(
@@ -603,54 +1006,171 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_restart_is_reported_and_the_save_still_stands() {
-        // The dishonest version of this reports success and leaves the operator
-        // believing a spread change took effect.
+    async fn a_failed_restart_is_reported_and_a_non_safety_save_still_stands() {
+        // The dishonest version reports success and leaves the operator believing a spread
+        // change took effect. A non-safety edit (feed URL) doesn't move the wallet, so a
+        // failed restart leaves it saved-but-not-restarted — honestly reported.
         let h = harness("settings-restart-fail");
         seed(&h, "bot-a");
         h.docker.fail_next("daemon is unreachable");
         let (status, body) = h
-            .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": true }))
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "feedUrl": "https://feed.example" }),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
         assert_eq!(v["restarted"], false);
         assert!(v["restartError"].as_str().unwrap().contains("unreachable"));
-        assert!(v["message"].as_str().unwrap().contains("old config"));
-        // The file really was written.
+        // The file stands — a non-safety change on disk still matches the live process.
         let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert!(toml.contains("limit_taker_enabled = true"));
+        assert!(toml.contains("feed.example"));
     }
 
     #[tokio::test]
-    async fn a_save_does_not_restart_into_an_approval_holding_the_wallet() {
-        // The side door: an approval is legitimately allowed alongside a running
-        // maker-only bot, and a save that switches the taker on turns that bot into one
-        // that broadcasts. Restarting it here would put two signers on one nonce while
-        // bypassing the exclusion the Restart button promises.
+    async fn wallets_held_after_an_unrecoverable_live_change_release_once_stopped() {
+        // The last-resort path: when a live change can't be applied, rolled back, or the
+        // process stopped inline, the wallet claims are handed to a background task that
+        // holds them blocked until the container is confirmed stopped, then releases them.
+        let h = harness("hold-wallets");
+        seed(&h, "bot-a");
+        let wallet = h.state.bot("bot-a").await.unwrap().wallet().unwrap();
+        let claim = h
+            .state
+            .wallet_locks
+            .try_claim(wallet.clone())
+            .expect("nothing else holds it");
+        assert!(h.state.wallet_locks.is_claimed(&wallet));
+
+        crate::panel::docker::hold_until_stopped(
+            h.state.docker.clone(),
+            "stitch-bot-a".to_string(),
+            (Some(claim), None::<crate::panel::http::logs::WalletClaim>),
+        );
+        // The task stops the container and only then releases the wallets.
+        for _ in 0..50 {
+            if !h.state.wallet_locks.is_claimed(&wallet) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !h.state.wallet_locks.is_claimed(&wallet),
+            "the wallet must be released once the container is stopped"
+        );
+        assert!(
+            h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Stop { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn held_wallets_release_when_the_container_is_already_gone() {
+        // If an operator recovers by stopping or removing the container by hand, Docker
+        // reports a further `stop` as an error — so the task must key off the container's
+        // liveness, not a successful `stop`, or it holds the wallets forever.
+        let h = harness("hold-wallets-gone");
+        seed_in_state(&h, "bot-a", ContainerState::Exited); // already terminal
+        let wallet = h.state.bot("bot-a").await.unwrap().wallet().unwrap();
+        let claim = h
+            .state
+            .wallet_locks
+            .try_claim(wallet.clone())
+            .expect("nothing else holds it");
+        h.docker.fail_next("no such container"); // a stop attempt would error
+
+        crate::panel::docker::hold_until_stopped(
+            h.state.docker.clone(),
+            "stitch-bot-a".to_string(),
+            (Some(claim), None::<crate::panel::http::logs::WalletClaim>),
+        );
+        for _ in 0..50 {
+            if !h.state.wallet_locks.is_claimed(&wallet) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !h.state.wallet_locks.is_claimed(&wallet),
+            "the wallets must release once the container is no longer live"
+        );
+        // It released via the liveness check, without a successful stop.
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Stop { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_restart_rolls_back_a_safety_relevant_change() {
+        // A taker enable is safety-relevant, so it's all-or-nothing: the checks pass and it
+        // commits and restarts — but a failed restart is ambiguous (Docker may have started
+        // the new config before a lost response), so the bot is *stopped* to confirm no
+        // signer is live, then the file is reverted to the old config.
+        let h = harness("settings-restart-rollback");
+        seed(&h, "bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        h.docker.fail_next("daemon is unreachable"); // only the restart fails; the stop succeeds
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": true }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["restarted"], false);
+        assert!(
+            v["message"].as_str().unwrap().contains("reverted"),
+            "{body}"
+        );
+        // Stopped first — the process is confirmed gone before the file goes back.
+        assert!(
+            h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Stop { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+        // The taker-on config was rolled back — the file matches the live process again.
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(
+            before, after,
+            "the change must be rolled back on a failed restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_that_enables_a_taker_is_refused_while_an_approval_holds_the_wallet() {
+        // The side door: an approval is legitimately allowed alongside a running maker-only
+        // bot, and a save that switches the taker on turns that bot into one that broadcasts.
+        // Applying it would put two signers on one nonce. All-or-nothing: the change is
+        // refused and *not written*, so it can't be trusted by a later start either.
         let h = harness("settings-approval");
         seed(&h, "bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
         let bot = h.state.bot("bot-a").await.unwrap();
         let _approval = h
             .state
-            .reservations
-            .reserve(bot.wallet().unwrap())
+            .wallet_locks
+            .try_claim(bot.wallet().unwrap())
             .expect("nothing else holds it");
 
         let (status, body) = h
             .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": true }))
             .await;
-        // The save stands — the file is the operator's intent and it's already valid.
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let v = Harness::parse(&body);
-        assert_eq!(v["restarted"], false);
-        assert!(
-            v["restartError"].as_str().unwrap().contains("approval"),
-            "{body}"
-        );
-        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert!(toml.contains("limit_taker_enabled = true"));
-        // And nothing was bounced.
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("busy"), "{body}");
+        // Nothing written, nothing bounced.
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(before, after, "the change must not be persisted");
         assert!(
             !h.docker
                 .calls()
@@ -662,40 +1182,336 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_reservation_follows_the_wallet_the_save_selects() {
-        // The `Bot` this function is handed describes the config as it was *before* the
-        // write. A raw-config save can move the bot to another chain — or another MPC
-        // operator address — so reserving from the stale view locks the wallet the bot
-        // is leaving and restarts into an unguarded one.
+    async fn a_wallet_changing_save_is_refused_when_the_new_wallet_is_busy() {
+        // A raw save can move the bot to another chain — a wallet change. The claim on the
+        // wallet it is moving *to* is the one that counts, taken before the write. When
+        // something holds that wallet, the all-or-nothing path refuses without writing.
         let h = harness("settings-new-wallet");
         seed(&h, "bot-a");
-        let before = h.state.bot("bot-a").await.unwrap();
-        let old_wallet = before.wallet().expect("a hot wallet has an address");
+        let before_toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        let old_wallet = h
+            .state
+            .bot("bot-a")
+            .await
+            .unwrap()
+            .wallet()
+            .expect("a hot wallet has an address");
 
-        // An approval owns the wallet the *new* config will select: same key, chain 1.
+        // Something owns the wallet the *new* config selects: same key, chain 1.
         let new_wallet = crate::panel::inventory::WalletId {
             chain_id: 1,
             address: old_wallet.address.clone(),
         };
-        let _approval = h
+        let _busy = h
             .state
-            .reservations
-            .reserve(new_wallet)
+            .wallet_locks
+            .try_claim(new_wallet)
             .expect("nothing else holds it");
 
-        // Save a raw config that switches the chain.
-        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml"))
-            .unwrap()
-            .replace("chain_id        = 56", "chain_id = 1");
+        let toml = before_toml.replace("chain_id        = 56", "chain_id = 1");
         let (status, body) = h
             .put_json("/api/bots/bot-a/config", json!({ "toml": toml }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("busy"), "{body}");
+        // Nothing written, nothing bounced.
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(before_toml, after, "the change must not be persisted");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_is_refused_when_a_live_sibling_shares_the_wallet() {
+        // The settings restart used to reserve the wallet without the fleet half of the
+        // check the launch paths do. So a save that restarted a bot onto a wallet a live
+        // transacting sibling already spends nonces from would put a second signer on
+        // that nonce sequence — the sibling holds no reservation, so the set reads free.
+        let h = harness("settings-sibling");
+        seed(&h, "bot-a"); // maker-only, running
+        seed_transacting(&h, "bot-b", ContainerState::Running); // live taker, same wallet
+
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "feedUrl": "https://feed.example" }),
+            )
+            .await;
+        // The file is the operator's intent and it's valid, so it's saved.
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["restarted"], false, "{body}");
+        assert!(
+            v["restartError"]
+                .as_str()
+                .unwrap()
+                .contains("shares its operator wallet"),
+            "{body}"
+        );
+        // bot-a must not have been bounced into the overlap.
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_a_taker_next_to_a_live_sibling_is_refused() {
+        // The running process is maker-only, so it shares the wallet with a live taker
+        // sibling harmlessly. Turning its own taker on and restarting would put a second
+        // signer on that nonce sequence. The overlap-already-exists test has to read the
+        // *pre-save* process (maker-only) here, not the post-save config (transacting),
+        // or the check is skipped and the second signer is allowed in.
+        let h = harness("settings-enable-taker");
+        seed(&h, "bot-a"); // maker-only, running
+        seed_transacting(&h, "bot-b", ContainerState::Running); // live taker, same wallet
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": true }))
+            .await;
+        // All-or-nothing: refused, and — the crux of Thread 7 — *not written*, so a later
+        // Restart can't read a taker-on config the live process isn't running and bypass
+        // the sibling check.
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("shares its operator wallet"), "{body}");
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(before, after, "the taker-on config must not be persisted");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_a_taker_on_a_paused_bot_is_refused_without_writing() {
+        // A paused process holds the old config and can't take a clean restart, so a
+        // taker change can't be applied — and leaving it on disk would let a later Start
+        // trust it. All-or-nothing refuses it.
+        let h = harness("settings-paused-taker");
+        seed_in_state(&h, "bot-a", ContainerState::Paused);
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": true }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("paused"), "{body}");
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(before, after, "the change must not be persisted");
+    }
+
+    #[tokio::test]
+    async fn disabling_a_taker_next_to_a_live_sibling_is_allowed() {
+        // The mirror case: the running process is a live taker sharing the wallet with a
+        // live sibling — the overlap already exists. Turning this bot's taker off and
+        // restarting *removes* its half of it, so refusing the restart helps nobody.
+        // Deciding from the post-save config (now maker-only) would wrongly run the
+        // sibling check and refuse; the pre-save process is the transactor, so the
+        // overlap pre-exists and the check is skipped.
+        let h = harness("settings-disable-taker");
+        seed_transacting(&h, "bot-a", ContainerState::Running); // live taker, running
+        seed_transacting(&h, "bot-b", ContainerState::Running); // live sibling, same wallet
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": false }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["restarted"], true, "{body}");
+        assert!(v["restartError"].is_null(), "{body}");
+        assert!(
+            h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_does_not_restart_when_the_post_write_re_read_fails() {
+        // The write moves what discovery reports, so the restart has to reason about the
+        // config on disk *now*. When the *post-write* re-read fails — the daemon dropped
+        // out after the write — the old code fell back to the stale snapshot and restarted
+        // from it, which could reserve one wallet and launch another. It must skip the
+        // restart and say so instead, leaving the edit on disk.
+        let h = harness("settings-reread-fail");
+        seed(&h, "bot-a");
+        // A non-safety edit (feed URL) goes through the write-then-restart path, which is
+        // the one with a post-write re-read. `lock_config` re-reads twice (lock, then
+        // verify) (#0, #1) and the pre-write re-read (#2) succeed; the post-write re-read
+        // (#3) fails, standing in for the daemon dropping out after the write.
+        h.docker.fail_list_after(3);
+
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "feedUrl": "https://feed.example" }),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
         assert_eq!(v["restarted"], false, "{body}");
         assert!(
-            v["restartError"].as_str().unwrap().contains("approval"),
-            "the new wallet's reservation has to be the one that counts: {body}"
+            v["restartError"].as_str().unwrap().contains("re-read"),
+            "{body}"
+        );
+        // The edit still landed on disk.
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(toml.contains("feed.example"));
+        // But nothing was restarted from the stale identity.
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_aborts_when_the_pre_write_discovery_fails() {
+        // If the under-lock re-read that establishes which wallet is *live* fails, the
+        // save can't be made safe: writing anyway would claim a wallet read before the
+        // lock — stale under an overlapping save — while moving the config to a third,
+        // leaving the live process unguarded. So the whole save aborts: nothing written,
+        // nothing restarted.
+        let h = harness("settings-prewrite-fail");
+        seed(&h, "bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        // Handler entry (#0) succeeds; the pre-write re-read (#1) fails.
+        h.docker.fail_list_after(1);
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": true }))
+            .await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "the save must not report success: {body}"
+        );
+        // Nothing was written or restarted.
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(before, after, "the config must be left untouched");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_raw_save_that_switches_the_signer_backend_is_rejected() {
+        // A raw TOML edit can't switch the signer backend: the new backend's secret file
+        // and env live outside the TOML, and swapping it needs a container rebuilt with
+        // different mounts. So the raw editor rejects it and points at Change signer.
+        let h = harness("settings-signer-switch");
+        seed(&h, "bot-a"); // local hot wallet, running
+
+        // A valid Turnkey config to paste into the raw editor. Built through the writer
+        // so it parses the way the bot would.
+        let tk_dir = h.root.join("turnkey-src");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        setup::write_config_signer(
+            &tk_dir,
+            corridor,
+            &setup::SignerSetup::Turnkey {
+                organization_id: "org-1".into(),
+                sign_with: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+                operator_address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+                api_base_url: None,
+                api_public_key: "PUBKEY".into(),
+                api_private_key: "PRIVKEY".into(),
+            },
+        )
+        .unwrap();
+        let turnkey_toml = std::fs::read_to_string(tk_dir.join("stitch.toml")).unwrap();
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .put_json("/api/bots/bot-a/config", json!({ "toml": turnkey_toml }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Change signer"), "{body}");
+        // Nothing written, nothing bounced.
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(before, after, "the raw signer switch must not be persisted");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pre_save_claim_follows_the_config_on_disk_not_a_stale_read() {
+        // The handler reads the bot before it takes the config lock, so two overlapping
+        // saves for one running bot both start from the same pre-lock snapshot. If the
+        // first moves the bot to a new wallet and restarts, the second still holds the old
+        // snapshot — the live process is already on the new wallet, so a claim taken from
+        // the snapshot guards the wallet it left. `save_and_restart` must re-read under the
+        // lock and claim the wallet the config on disk actually names.
+        let h = harness("settings-concurrent-claim");
+        seed(&h, "bot-a"); // running, chain 56
+        let stale = h.state.bot("bot-a").await.unwrap();
+        let stale_wallet = stale.wallet().expect("a hot wallet has an address");
+        assert_eq!(stale_wallet.chain_id, 56);
+
+        // Stand in for a concurrent save that already moved the bot to chain 1 on disk.
+        let path = h.root.join("bot-a/stitch.toml");
+        let moved = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("chain_id        = 56", "chain_id = 1");
+        std::fs::write(&path, &moved).unwrap();
+        let live_wallet = crate::panel::inventory::WalletId {
+            chain_id: 1,
+            address: stale_wallet.address.clone(),
+        };
+
+        // Something already holds the wallet the live process is on now (chain 1).
+        let _busy = h
+            .state
+            .wallet_locks
+            .try_claim(live_wallet)
+            .expect("nothing else holds it");
+
+        // Save starting from the stale chain-56 snapshot. The claim must land on the
+        // chain-1 wallet the file now names, find it busy, and skip the restart. Deriving
+        // it from the stale snapshot would claim the unheld chain-56 wallet and restart.
+        let resp = super::save_and_restart(&h.state, &stale, &path, &moved, 0)
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["restarted"], false, "{v}");
+        assert!(
+            v["restartError"].as_str().unwrap().contains("wallet"),
+            "{v}"
         );
         assert!(
             !h.docker
@@ -705,6 +1521,31 @@ mod tests {
             "{:?}",
             h.docker.calls()
         );
+    }
+
+    #[tokio::test]
+    async fn a_save_whose_locked_path_no_longer_names_the_config_is_refused() {
+        // The migration race: a save reads a flat path, then blocks on the config lock
+        // while a migration wins it and moves the config to the per-bot layout. When the
+        // save resumes, the re-read bot names the new path but the caller's `path` still
+        // points at the flat file migration orphaned. Writing there would silently succeed
+        // against a dead file and report success — so the save must refuse instead.
+        let h = harness("settings-stale-path");
+        seed(&h, "bot-a"); // config lives at bot-a/stitch.toml
+        let bot = h.state.bot("bot-a").await.unwrap();
+        let real = h.root.join("bot-a/stitch.toml");
+        let before = std::fs::read_to_string(&real).unwrap();
+        // A stale path pointing at a flat-layout file the bot is not on.
+        let stale_path = h.root.join("stitch.bot-a.toml");
+
+        let err = super::save_and_restart(&h.state, &bot, &stale_path, "feed_url = \"x\"\n", 0)
+            .await
+            .expect_err("a save against a path the config no longer sits on must be refused");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.message.contains("moved on disk"), "{}", err.message);
+        // Nothing was written: the real config is untouched and the orphan wasn't created.
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), before);
+        assert!(!stale_path.exists(), "the stale path must not be written");
     }
 
     #[tokio::test]
@@ -716,8 +1557,14 @@ mod tests {
         let h = harness("settings-paused");
         seed_in_state(&h, "bot-a", ContainerState::Paused);
 
+        // A non-safety edit (feed URL): it saves, but a paused process keeps its old
+        // config, so it's told the save isn't applied yet. (A taker/wallet change on a
+        // paused bot is refused instead — see the paused-taker test above.)
         let (status, body) = h
-            .patch_json("/api/bots/bot-a/settings", json!({ "takerEnabled": true }))
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "feedUrl": "https://feed.example" }),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
@@ -741,7 +1588,7 @@ mod tests {
         );
         // The save itself still stands.
         let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert!(toml.contains("limit_taker_enabled = true"));
+        assert!(toml.contains("feed.example"));
     }
 
     #[tokio::test]

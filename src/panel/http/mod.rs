@@ -47,10 +47,11 @@ pub struct AppState {
     /// do it should still serve every other route.
     pub files: Option<Arc<dyn ContainerFiles>>,
     pub sessions: Arc<Sessions>,
-    /// Operator wallets reserved by something that can broadcast from them — an
-    /// approval run, or a bot launch. One protocol for both, so the two can't slip
-    /// past each other's checks. See [`logs::WalletReservations`].
-    pub reservations: Arc<logs::WalletReservations>,
+    /// Exclusive claims on operator wallets, held across any action that puts a
+    /// signer on one — an approval run, a bot launch, a settings restart. One lock
+    /// per wallet, so the paths can't slip past each other's checks. See
+    /// [`logs::WalletLocks`].
+    pub wallet_locks: Arc<logs::WalletLocks>,
     /// Permits for password verification. `/api/login` answers before the caller has
     /// a credential, and each check costs 19 MiB and a blocking thread, so the one
     /// public route that does real work is the one that needs a ceiling.
@@ -67,7 +68,7 @@ impl AppState {
             docker,
             files: None,
             sessions: Arc::new(Sessions::new()),
-            reservations: Arc::new(logs::WalletReservations::new()),
+            wallet_locks: Arc::new(logs::WalletLocks::new()),
             login_permits: Arc::new(tokio::sync::Semaphore::new(
                 auth::MAX_CONCURRENT_VERIFICATIONS,
             )),
@@ -262,6 +263,7 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/settings", patch(settings::update))
         .route("/api/bots/{name}/config", get(settings::raw))
         .route("/api/bots/{name}/config", put(settings::save_raw))
+        .route("/api/bots/{name}/signer", put(bots::change_signer))
         .route("/api/bots/{name}/logs", get(logs::tail))
         .route("/api/bots/{name}/approve", post(logs::approve))
         .route("/api/bots/{name}/dry-run", post(logs::dry_run))

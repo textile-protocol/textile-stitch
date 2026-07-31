@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -77,29 +78,12 @@ impl BollardDocker {
             .context("the Docker daemon did not respond")?;
         Ok(())
     }
-}
 
-#[async_trait]
-impl DockerApi for BollardDocker {
-    async fn list_all(&self) -> Result<Vec<ContainerInfo>> {
-        let options = ListContainersOptionsBuilder::default().all(true).build();
-        let summaries = self
-            .docker
-            .list_containers(Some(options))
-            .await
-            .context("listing containers")?;
-        Ok(summaries.iter().map(to_container_info).collect())
-    }
-
-    async fn ensure_image(&self, image: &str, refresh: bool) -> Result<()> {
-        // Present already and nobody asked for a refresh: don't touch the network.
-        // A host that pulled once keeps working offline, and a pinned `sha-*` tag
-        // can't have changed anyway. Recreate passes `refresh` so a mutable tag
-        // like `:latest` actually picks up a new release.
-        if !refresh && self.docker.inspect_image(image).await.is_ok() {
-            return Ok(());
-        }
-
+    /// Pull an image and confirm it actually landed.
+    ///
+    /// Separate from [`DockerApi::ensure_image`] so the fast path and the
+    /// fall-back-to-local decision live there and this only does the network work.
+    async fn pull_image(&self, image: &str) -> Result<()> {
         let (name, tag) = split_image_ref(image);
         let mut options = CreateImageOptionsBuilder::default().from_image(name);
         if let Some(tag) = tag {
@@ -125,6 +109,49 @@ impl DockerApi for BollardDocker {
             .await
             .with_context(|| format!("{image} is still not present after pulling it"))?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl DockerApi for BollardDocker {
+    async fn list_all(&self) -> Result<Vec<ContainerInfo>> {
+        let options = ListContainersOptionsBuilder::default().all(true).build();
+        let summaries = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .context("listing containers")?;
+        Ok(summaries.iter().map(to_container_info).collect())
+    }
+
+    async fn ensure_image(&self, image: &str, refresh: bool) -> Result<()> {
+        // Present already and nobody asked for a refresh: don't touch the network.
+        // A host that pulled once keeps working offline, and a pinned `sha-*` tag
+        // can't have changed anyway. Recreate passes `refresh` so a mutable tag
+        // like `:latest` actually picks up a new release.
+        let present = self.docker.inspect_image(image).await.is_ok();
+        if present && !refresh {
+            return Ok(());
+        }
+
+        match self.pull_image(image).await {
+            Ok(()) => Ok(()),
+            // A refresh that can't pull but already has the image locally runs the
+            // local copy. Recreate sets `refresh` so a mutable tag picks up a release,
+            // but an operator may have pulled a private image by hand with credentials
+            // the daemon can't supply on its own unauthenticated pull — the suggested
+            // `docker pull` workaround can't help, because the next attempt just repeats
+            // that same anonymous pull. Failing here would strand a bot on an image
+            // that is right there on the host, so warn and use it. With nothing local
+            // there is nothing to fall back to, so the pull error stands.
+            Err(e) if present => {
+                tracing::warn!(
+                    "couldn't refresh {image}, using the copy already on the host: {e:#}"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn create(&self, spec: &CreateSpec) -> Result<String> {
@@ -227,21 +254,27 @@ impl DockerApi for BollardDocker {
         }))
     }
 
-    fn run_one_shot(&self, spec: CreateSpec, keepalive: Option<Keepalive>) -> RunStream {
+    fn run_one_shot(
+        &self,
+        spec: CreateSpec,
+        keepalive: Option<Keepalive>,
+        hold_until_started: Option<Keepalive>,
+    ) -> RunStream {
         // The daemon handle wraps a connection pool and is cheap to clone, so
         // the returned stream can own one and outlive this call.
         let this = Self {
             docker: self.docker.clone(),
         };
         Box::pin(
-            stream::once(async move { this.one_shot(spec, keepalive).await }).flat_map(|result| {
-                match result {
-                    Ok(s) => s,
-                    // Setup failed before any output: surface the reason as the single
-                    // item so the caller sees it instead of an empty stream.
-                    Err(e) => Box::pin(stream::once(async move { Err(e) })) as RunStream,
-                }
-            }),
+            stream::once(async move { this.one_shot(spec, keepalive, hold_until_started).await })
+                .flat_map(|result| {
+                    match result {
+                        Ok(s) => s,
+                        // Setup failed before any output: surface the reason as the single
+                        // item so the caller sees it instead of an empty stream.
+                        Err(e) => Box::pin(stream::once(async move { Err(e) })) as RunStream,
+                    }
+                }),
         )
     }
 }
@@ -249,7 +282,12 @@ impl DockerApi for BollardDocker {
 impl BollardDocker {
     /// Create and start a throwaway container, returning a stream of its output
     /// terminated by its exit code. The container is reaped once it exits.
-    async fn one_shot(&self, spec: CreateSpec, keepalive: Option<Keepalive>) -> Result<RunStream> {
+    async fn one_shot(
+        &self,
+        spec: CreateSpec,
+        keepalive: Option<Keepalive>,
+        hold_until_started: Option<Keepalive>,
+    ) -> Result<RunStream> {
         let name = spec.name.clone();
         // An approve or dry run can be the first thing an operator does on a host,
         // before any bot container exists, so the image may not be cached yet.
@@ -269,10 +307,16 @@ impl BollardDocker {
         // container going away. Whichever path reaps it drops the keepalive after
         // the removal, so a caller holding a resource against "this container is
         // still running" gets exactly that.
+        // The config hold rides in the guard too, not as a bare local: if the start below
+        // is cancelled (the SSE request is dropped) after Docker has actually started the
+        // container, dropping the local would release the config lock while the container
+        // is live and about to load its config — a save could move it in between. In the
+        // guard, the reap path releases it only once the container is confirmed gone.
         let guard = Arc::new(ReapOnDrop {
             docker: self.docker.clone(),
             name: Mutex::new(Some(name.clone())),
             keepalive: Mutex::new(keepalive),
+            config_hold: Mutex::new(hold_until_started),
         });
 
         // Attach to logs before starting, so nothing emitted between create and
@@ -287,6 +331,10 @@ impl BollardDocker {
         // A failure here returns through `?`, which drops the guard and takes the
         // created container with it.
         self.start(&name).await?;
+        // Started: the container has loaded its config from the mounted file, so a save
+        // that moves it now can't affect this run. Release the config lock the caller
+        // parked here — holding it past the start would block saves for the whole run.
+        guard.release_config();
 
         let docker = self.docker.clone();
         // Both halves of the stream hold the guard, so the container is reaped
@@ -299,15 +347,14 @@ impl BollardDocker {
         // behind on the host.
         let exit = stream::once(async move {
             let code = wait_for_exit(&docker, &name).await?;
-            let options = RemoveContainerOptionsBuilder::default().force(true).build();
             // Reaping is untidy to fail but must not turn a completed run into a
             // reported failure — the operator already has the output and the code.
-            let removed = docker.remove_container(&name, Some(options)).await;
-            // Disarm only on a removal that actually worked. A failure leaves the
-            // container up, so `Drop` still owes it another attempt — and until one
-            // succeeds the keepalive stays held rather than freeing a resource while
-            // the process it guards is still running.
-            if removed.is_ok() {
+            //
+            // Disarm only when the container is actually gone. A failure leaves it up,
+            // so `Drop` still owes it another attempt — and until one succeeds the
+            // keepalive stays held rather than freeing an operator's wallet while the
+            // process it guards is still running.
+            if let Reaped::Gone = reap_once(&docker, &name).await {
                 exit_guard.disarm();
             }
             Ok(RunEvent::Exited { code })
@@ -321,6 +368,37 @@ impl BollardDocker {
             })
             .chain(exit),
         ))
+    }
+}
+
+/// How long to wait before the first reap retry, and the ceiling the backoff grows
+/// to. Generous because the failures this rides out — a daemon restarting, a host
+/// under load — resolve on the scale of seconds to minutes, not milliseconds, and a
+/// tight loop would just spin.
+const REAP_RETRY_MIN: Duration = Duration::from_secs(1);
+const REAP_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// The outcome of one attempt to reap a one-shot container.
+enum Reaped {
+    /// Removed, or already gone. Either way nothing is running under that name.
+    Gone,
+    /// The daemon refused or was unreachable. The container may still be up.
+    Failed(bollard::errors::Error),
+}
+
+/// Force-remove a one-shot container once, classifying the result.
+///
+/// A 404 is [`Reaped::Gone`], not a failure: the container is already gone, whether a
+/// previous attempt removed it before the transport error or an operator did it by
+/// hand. Treating it as success is what lets a manual cleanup release a held wallet.
+async fn reap_once(docker: &Docker, name: &str) -> Reaped {
+    let options = RemoveContainerOptionsBuilder::default().force(true).build();
+    match docker.remove_container(name, Some(options)).await {
+        Ok(()) => Reaped::Gone,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Reaped::Gone,
+        Err(e) => Reaped::Failed(e),
     }
 }
 
@@ -339,10 +417,17 @@ struct ReapOnDrop {
     /// [`Self::disarm`] on the normal path, or by the reap task in [`Drop`] — in
     /// both cases only once a removal has succeeded.
     keepalive: Mutex<Option<Keepalive>>,
+    /// Held only until the container has *started* (and so loaded its config), then
+    /// released by [`Self::release_config`] — the approve route parks the config lock
+    /// here so a save can't move the mounted config before the container reads it. If
+    /// the run is abandoned before the start is confirmed it's released by the reap
+    /// path instead, only once the container is gone, so a cancelled-mid-start container
+    /// that Docker did bring up is never left unguarded.
+    config_hold: Mutex<Option<Keepalive>>,
 }
 
 impl ReapOnDrop {
-    /// The container is gone: stop tracking it and let the keepalive go.
+    /// The container is gone: stop tracking it and let everything held go.
     fn disarm(&self) {
         if let Ok(mut name) = self.name.lock() {
             *name = None;
@@ -352,6 +437,14 @@ impl ReapOnDrop {
 
     fn release(&self) {
         if let Ok(mut held) = self.keepalive.lock() {
+            *held = None;
+        }
+        self.release_config();
+    }
+
+    /// The container has started (or is gone): drop the config lock.
+    fn release_config(&self) {
+        if let Ok(mut held) = self.config_hold.lock() {
             *held = None;
         }
     }
@@ -370,21 +463,44 @@ impl Drop for ReapOnDrop {
             return;
         };
         let docker = self.docker.clone();
-        // Moved into the task, so it is dropped when the removal finishes rather
+        // Moved into the task, so both are dropped when the removal finishes rather
         // than when this `drop` returns. That difference is the whole point: the
-        // stream is already gone by now, but the container is not.
+        // stream is already gone by now, but the container is not. The config hold
+        // is usually already released (the start confirmed), but if the run was
+        // cancelled mid-start it's still held here and must not be freed until the
+        // container — which Docker may have started — is confirmed gone.
         let keepalive = self.keepalive.lock().ok().and_then(|mut h| h.take());
+        let config_hold = self.config_hold.lock().ok().and_then(|mut h| h.take());
         handle.spawn(async move {
-            let options = RemoveContainerOptionsBuilder::default().force(true).build();
-            match docker.remove_container(&name, Some(options)).await {
-                Ok(()) => tracing::info!("reaped {name}: nobody was listening to it any more"),
-                // The keepalive is dropped either way when this task ends: another
-                // retry loop here could hold an operator's wallet forever on a
-                // daemon that never answers. The warning is what tells them a
-                // container may still be up.
-                Err(e) => tracing::warn!("couldn't reap the abandoned one-shot {name}: {e}"),
+            // Retry with backoff until the container is confirmed gone, and release
+            // the keepalive — an operator's wallet claim, for an abandoned approval —
+            // only then. A one attempt that fails leaves the container up: dropping the
+            // wallet there is exactly the race this guards against, letting a second
+            // approval or a bot launch pick the same nonce while the first is still
+            // signing. So hold the wallet and keep trying. A daemon down for hours
+            // keeps the wallet blocked for hours, which is the deliberate trade — a
+            // blocked wallet is loud (every approve and launch on it refuses and says
+            // why) while a dropped nonce is silent. A 404 counts as gone, so an operator
+            // who removes the container by hand unblocks the wallet without a restart.
+            // The name carries a per-run suffix, so a retry can never reap a newer run.
+            let mut backoff = REAP_RETRY_MIN;
+            loop {
+                match reap_once(&docker, &name).await {
+                    Reaped::Gone => {
+                        tracing::info!("reaped {name}: nobody was listening to it any more");
+                        break;
+                    }
+                    Reaped::Failed(e) => {
+                        tracing::warn!(
+                            "couldn't reap the abandoned one-shot {name}, retrying in {backoff:?}: {e}"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(REAP_RETRY_MAX);
+                    }
+                }
             }
             drop(keepalive);
+            drop(config_hold);
         });
     }
 }

@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use super::logs;
 use super::{ApiError, AppState};
-use crate::panel::docker::STOP_GRACE_SECS;
-use crate::panel::inventory::{Bot, ConfigSummary, Fleet, Warning};
+use crate::panel::docker::{ContainerState, STOP_GRACE_SECS};
+use crate::panel::inventory::{Bot, ConfigSummary, Fleet, WalletId, Warning};
 use crate::panel::{compose, migrate, provision};
+use crate::setup::{self, SignerSetup};
 
 /// One bot, as the UI sees it.
 #[derive(Debug, Serialize)]
@@ -183,14 +184,18 @@ async fn action_response(
     .into_response())
 }
 
-/// Reserve this bot's operator wallet for the duration of a launch.
+/// Claim this bot's operator wallet for the duration of a launch.
 ///
 /// Same protocol as the approve route, deliberately — see
-/// [`WalletReservations`](super::logs::WalletReservations). A launch and an approval
-/// are both "a process is about to sign with this key", and a check that reads a flag
-/// and then calls Docker leaves a window the other side can pass through. So this
-/// takes the reservation and holds it across the Docker call, rather than asking
-/// whether anyone else has it.
+/// [`WalletLocks`](super::logs::WalletLocks). A launch and an approval are both "a
+/// process is about to sign with this key", and a check that reads a flag and then
+/// calls Docker leaves a window the other side can pass through. So this takes the
+/// wallet's claim and holds it across the Docker call, rather than asking whether
+/// anyone else has it.
+///
+/// `bot` must be read from the authoritative config — the file the container will
+/// launch from — so the wallet claimed is the wallet that will sign. A stale snapshot
+/// claims the wallet the bot is leaving.
 ///
 /// Returned rather than dropped: the caller has to keep it alive until the container
 /// is actually up, or the gap reopens.
@@ -198,11 +203,11 @@ async fn action_response(
 /// Unconditional on the config, unlike `approve_check`'s taker/closer test: *every*
 /// bot runs the allowance preflight at live start, so starting any bot on that wallet
 /// broadcasts, maker-only or not.
-pub async fn reserve_for_launch(
+pub async fn claim_for_launch(
     bot: &Bot,
     state: &AppState,
-) -> Result<Option<logs::WalletGuard>, ApiError> {
-    let guard = state.reservations.reserve_for(bot).ok_or_else(|| {
+) -> Result<Option<logs::WalletClaim>, ApiError> {
+    let claim = state.wallet_locks.try_claim_for(bot).ok_or_else(|| {
         ApiError::conflict(format!(
             "{}'s operator wallet is busy — an approval is running against it, or another bot on \
              it is being launched. Starting now means two processes reading the same pending \
@@ -211,10 +216,10 @@ pub async fn reserve_for_launch(
         ))
     })?;
 
-    // The reservation covers other *launches*, not bots that are already up: a running
-    // bot holds no reservation, so the set says "free" while its taker spends nonces.
-    // The fleet is the other half of the question, and it's asked after the reservation
-    // so nothing can start on this wallet between the answer and the action.
+    // The claim covers other *launches*, not bots that are already up: a running bot
+    // holds no claim, so the lock says "free" while its taker spends nonces. The fleet
+    // is the other half of the question, and it's asked after the claim is held so
+    // nothing can start on this wallet between the answer and the action.
     //
     // Only when this bot isn't already a live transactor. If it is, the overlap exists
     // already and refusing the restart or recreate that might fix it helps nobody.
@@ -222,19 +227,152 @@ pub async fn reserve_for_launch(
         let fleet = state.fleet().await?;
         logs::no_live_sibling_on_the_wallet(bot, &fleet).map_err(ApiError::conflict)?;
     }
-    Ok(guard)
+    Ok(claim)
+}
+
+/// The config lock a launch holds, or `None` when the bot has no panel-writable
+/// config — nothing a save could move out from under it. Held until the container has
+/// started; dropping it early reopens the window.
+pub type ConfigGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
+
+/// Take the config lock and re-read the bot under it, so everything that follows acts
+/// on the config the container will actually load — not one a concurrent settings save
+/// is about to change. The same lock settings saves hold across their write, so a
+/// launch and a save on one bot serialize.
+pub async fn lock_config(name: &str, state: &AppState) -> Result<(ConfigGuard, Bot), ApiError> {
+    let mut bot = state.bot(name).await?;
+    // A flat-layout migration moves a bot's config to a new path, so the path read here
+    // can be obsolete by the time the lock is granted: we'd hold the *old* path's lock
+    // while a save on the *new* path changed the wallet. So after re-reading under the
+    // lock, confirm the bot is still on the path we locked; if a migration moved it,
+    // drop the lock and take the new one. Bounded — a migration doesn't repeat rapidly.
+    for _ in 0..3 {
+        let Some(path) = bot.config_panel_path.clone() else {
+            return Ok((None, bot));
+        };
+        let guard = state.config_locks.for_path(&path).lock_owned().await;
+        // Re-read under the lock: any save that was mid-flight has finished, so this is
+        // the config the container will launch from.
+        let fresh = state.bot(name).await?;
+        if fresh.config_panel_path.as_deref() == Some(path.as_path()) {
+            return Ok((Some(guard), fresh));
+        }
+        // The config moved out from under the lock — take the new path's lock instead.
+        drop(guard);
+        bot = fresh;
+    }
+    Err(ApiError::conflict(format!(
+        "{name}'s config path kept moving while it was being locked — a migration is probably in \
+         flight. Try again once it has finished."
+    )))
+}
+
+/// What a launch holds: the bot it will act on (re-read under the config lock), the
+/// wallet claim, and the config lock itself, all for the read → claim → launch sequence
+/// a launch needs to be atomic against a settings save. Without it a raw save can move
+/// the config from wallet A to B between the read and `docker.start`, so the claim
+/// guards A while the container loads B and an approval or sibling on B starts alongside
+/// it. Hold `_config` across the Docker launch — drop it only once the container has
+/// started.
+pub struct LaunchGuard {
+    pub bot: Bot,
+    pub claim: Option<logs::WalletClaim>,
+    _config: ConfigGuard,
+}
+
+pub async fn lock_and_claim_for_launch(
+    name: &str,
+    state: &AppState,
+) -> Result<LaunchGuard, ApiError> {
+    let (config, bot) = lock_config(name, state).await?;
+    let claim = claim_for_launch(&bot, state).await?;
+    Ok(LaunchGuard {
+        bot,
+        claim,
+        _config: config,
+    })
+}
+
+/// Make an ambiguous start/restart error safe before releasing the launch's claim.
+///
+/// A `docker start`/`restart` can return an error the connection dropped *after* Docker
+/// acted, so the container may already be running its allowance preflight on the wallet
+/// this launch claimed — and for a maker-only config the fleet check doesn't treat that
+/// live bot as transacting, so releasing the claim would let a sibling collide on the
+/// pending nonce. So confirm the container is gone (stop it) before letting the claim go;
+/// if the stop fails, hand the claim to a task that holds the wallet until it is. Returns
+/// the original error. The launch's config lock is safe to release (the container has
+/// started or not) — only the wallet claim needs settling.
+pub(crate) async fn settle_ambiguous_launch<H: Send + 'static>(
+    state: &AppState,
+    container: &str,
+    held: Option<H>,
+    err: ApiError,
+) -> ApiError {
+    let Some(held) = held else {
+        return err; // no identifiable wallet was claimed — nothing to guard.
+    };
+    match state.docker.stop(container, STOP_GRACE_SECS).await {
+        Ok(()) => err, // confirmed gone; the claim drops here, safe.
+        Err(se) => {
+            tracing::error!(
+                "couldn't stop {container} after an ambiguous start error; holding its wallet until it's gone: {se:#}"
+            );
+            crate::panel::docker::hold_until_stopped(
+                state.docker.clone(),
+                container.to_string(),
+                held,
+            );
+            err
+        }
+    }
 }
 
 pub async fn start(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
-    let bot = state.bot(&name).await?;
-    super::require_actionable(&bot)?;
-    let container = bot.require_container().map_err(ApiError::conflict)?;
-    // Held across the start, not checked before it.
-    let _wallet = reserve_for_launch(&bot, &state).await?;
-    state.docker.start(container).await?;
+    // Config lock + wallet claim held across the start, so a save can't move the config
+    // out from under the claim between here and `docker.start`.
+    let launch = lock_and_claim_for_launch(&name, &state).await?;
+    super::require_actionable(&launch.bot)?;
+    // Start only has work to do on a stopped container. If the bot is already up — two
+    // Start requests raced and the config lock let the second re-read it *after* the
+    // first started it, or a stale UI click lost that race — `docker start` is at best a
+    // no-op and on some daemons an error. Treating that expected rejection as an
+    // ambiguous launch would hand a healthy, just-started container to `settle`, which
+    // stops it. So report the already-live bot instead of touching Docker. Only the
+    // genuinely-live states short-circuit: `created`/`exited`/`dead` stay real Start
+    // targets, and `unknown` (a config-only bot with no container) falls through to
+    // `require_container` so it gets the proper "no container" error, not "already up".
+    if matches!(
+        launch.bot.state,
+        ContainerState::Running | ContainerState::Restarting | ContainerState::Paused
+    ) {
+        return action_response(
+            &state,
+            &name,
+            Some(format!(
+                "{name} is already {} — nothing to start.",
+                launch.bot.state.as_str()
+            )),
+        )
+        .await;
+    }
+    let container = launch
+        .bot
+        .require_container()
+        .map_err(ApiError::conflict)?
+        .to_string();
+    if let Err(e) = state.docker.start(&container).await {
+        return Err(settle_ambiguous_launch(
+            &state,
+            &container,
+            launch.claim,
+            ApiError::internal(&e),
+        )
+        .await);
+    }
     tracing::info!(bot = %name, "started");
     action_response(&state, &name, None).await
 }
@@ -271,18 +409,29 @@ pub async fn restart(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
-    let bot = state.bot(&name).await?;
-    super::require_actionable(&bot)?;
-    let container = bot.require_container().map_err(ApiError::conflict)?;
-    if bot.state.is_terminal() {
+    let launch = lock_and_claim_for_launch(&name, &state).await?;
+    super::require_actionable(&launch.bot)?;
+    if launch.bot.state.is_terminal() {
         return Err(ApiError::conflict(format!(
             "{name} is {} — there is nothing to restart, and `docker restart` on a stopped \
              container starts it. Use Start if you mean to put it back on the book.",
-            bot.state.as_str()
+            launch.bot.state.as_str()
         )));
     }
-    let _wallet = reserve_for_launch(&bot, &state).await?;
-    state.docker.restart(container, STOP_GRACE_SECS).await?;
+    let container = launch
+        .bot
+        .require_container()
+        .map_err(ApiError::conflict)?
+        .to_string();
+    if let Err(e) = state.docker.restart(&container, STOP_GRACE_SECS).await {
+        return Err(settle_ambiguous_launch(
+            &state,
+            &container,
+            launch.claim,
+            ApiError::internal(&e),
+        )
+        .await);
+    }
     tracing::info!(bot = %name, "restarted");
     action_response(&state, &name, None).await
 }
@@ -395,7 +544,11 @@ pub async fn recreate(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
-    let bot = state.bot(&name).await?;
+    // Config lock held across the whole recreate: the signer is read from the config
+    // dir and the wallet is claimed from it, so a save that moved the config mid-recreate
+    // would launch a container whose signer and claim disagree. `_config` lives to the
+    // end of the handler.
+    let (_config, bot) = lock_config(&name, &state).await?;
     super::require_editable(&bot)?;
     let dir = bot
         .config_dir()
@@ -419,24 +572,55 @@ pub async fn recreate(
     let restart_after = bot.state.wants_to_be_up();
     // Recreate starts the replacement, so it's a bot-launching action like Start. The
     // reservation is held for the rest of the handler — the create and the start both
-    // sit inside it.
-    let _wallet = if restart_after {
-        reserve_for_launch(&bot, &state).await?
+    // sit inside it — and passed into the launch so an ambiguous start settles it.
+    let wallet = if restart_after {
+        claim_for_launch(&bot, &state).await?
     } else {
         None
     };
 
-    // Everything that can fail happens before the old container is destroyed:
-    // reading the signer out of the config, and getting the image onto the host.
-    // Removing first and only then discovering the image can't be pulled would
-    // leave the operator with no bot and nothing to bring back.
-    let signer = provision::signer_runtime(&dir)?;
+    recreate_container(&state, &name, &bot, &dir, restart_after, wallet).await?;
+
+    tracing::info!(bot = %name, image = %state.cfg.bot_image, "recreated");
+    action_response(
+        &state,
+        &name,
+        Some(format!(
+            "{name} was recreated on {}{}.",
+            state.cfg.bot_image,
+            if restart_after {
+                " and started"
+            } else {
+                " and left stopped, because it wasn't up before"
+            }
+        )),
+    )
+    .await
+}
+
+/// Rebuild a bot's container from the config on disk *now*, in the panel's layout.
+///
+/// Shared by Recreate and the signer-change flow (which writes the new signer to disk
+/// first, then calls this to rebuild the container with the matching runtime). The
+/// caller holds the config lock and the wallet claim(s) across it. Everything that can
+/// fail — reading the signer, the mount preflight, pulling the image — happens before
+/// the old container is destroyed, so a failure leaves the config directory intact and
+/// the operator something to retry from.
+async fn recreate_container(
+    state: &AppState,
+    name: &str,
+    bot: &Bot,
+    dir: &std::path::Path,
+    restart_after: bool,
+    claim: Option<logs::WalletClaim>,
+) -> Result<(), ApiError> {
+    let signer = provision::signer_runtime(dir)?;
     let corridor = bot.config.as_ref().and_then(|c| c.corridor_id.clone());
     // The configured image, not the one it's running: recreate is the action that
     // exists to pick up a new one. Everything else preserves what the bot runs.
     let spec = provision::bot_container_spec(
         &state.cfg,
-        &name,
+        name,
         &state.cfg.bot_image,
         &signer,
         corridor.as_deref(),
@@ -445,7 +629,7 @@ pub async fn recreate(
     state.docker.ensure_image(&spec.image, true).await?;
 
     if let Some(container) = &bot.container_name {
-        stop_before_destroying(&state, &bot, container).await?;
+        stop_before_destroying(state, bot, container).await?;
         state.docker.remove(container, true).await?;
     }
 
@@ -461,24 +645,215 @@ pub async fn recreate(
         )))
     })?;
     if restart_after {
-        state.docker.start(&spec.name).await.map_err(|e| {
-            ApiError::internal(&e.context(format!(
+        if let Err(e) = state.docker.start(&spec.name).await {
+            // Start can return an error after the daemon already brought the container
+            // up (the reply dropped mid-flight). Releasing the wallet claim now would let
+            // a sibling launch on the same wallet while this one is quietly live, so
+            // settle it: stop the container and only then let the claim go, or hold it
+            // until the stop lands.
+            let err = ApiError::internal(&e.context(format!(
                 "starting {name} after recreating it. The new container exists and holds the                  right config, so Start will bring it up once the cause is fixed."
-            )))
-        })?;
+            )));
+            return Err(settle_ambiguous_launch(state, &spec.name, claim, err).await);
+        }
+    }
+    Ok(())
+}
+
+/// The operator wallet a signer selects. The corridor and chain don't change on a
+/// signer swap — only the operator address does — so the new wallet is that address on
+/// the bot's current chain. Formatted the way discovery formats it (lowercased 0x-hex),
+/// so a claim on it matches what the fleet reports for the same account.
+fn new_signer_wallet(bot: &Bot, setup: &SignerSetup) -> Result<Option<WalletId>, ApiError> {
+    let Some(chain_id) = bot.config.as_ref().map(|c| c.chain_id) else {
+        return Ok(None);
+    };
+    let address = match setup {
+        SignerSetup::Local { material } => {
+            let addr = material.operator_address().map_err(ApiError::bad_request)?;
+            format!("{addr:?}").to_lowercase()
+        }
+        SignerSetup::Turnkey {
+            operator_address, ..
+        }
+        | SignerSetup::Mpcvault {
+            operator_address, ..
+        } => operator_address.trim().to_lowercase(),
+    };
+    Ok(Some(WalletId { chain_id, address }))
+}
+
+/// Switch a bot's signer backend, then rebuild its container with the new runtime.
+///
+/// The raw config editor can't do this: the backend's secret (`turnkey-api.key`,
+/// `mpcvault-api.token`) and the Turnkey public key live outside the TOML, and swapping
+/// the backend needs a container rebuilt with different mounts and env. So this takes the
+/// credentials, writes config + secret + env atomically (`apply_signer`), and recreates
+/// the container.
+///
+/// Wallet-safe and all-or-nothing: the new signer selects a new operator wallet, so the
+/// old (still-running) wallet and the new one are both claimed and the fleet checked
+/// *before* anything is written. A change that would collide refuses without touching
+/// disk — no window where discovery reports the new wallet while the old process still
+/// signs the old one.
+pub async fn change_signer(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<super::wizard::SignerRequest>,
+) -> Result<Response, ApiError> {
+    let signer = body.into_setup()?;
+
+    // Config lock across the whole change (write + recreate), held to the end.
+    let (_config, bot) = lock_config(&name, &state).await?;
+    super::require_editable(&bot)?;
+    let dir = bot
+        .config_dir()
+        .ok_or_else(|| ApiError::conflict(format!("{name} has no config directory")))?;
+    if dir != state.cfg.bot_dir(&name) {
+        return Err(ApiError::conflict(format!(
+            "{name}'s config is at {}, not under {}. Migrate it to the per-bot directory layout \
+             first, then change its signer.",
+            dir.display(),
+            state.cfg.bots_dir.display()
+        )));
     }
 
-    tracing::info!(bot = %name, image = %spec.image, "recreated");
+    // The recreate starts a signer only if the bot was up; a stopped bot's recreate
+    // leaves it stopped, and nothing signs until a later Start (which guards itself). So
+    // the wallets are guarded only when a signer will actually come up.
+    let restart_after = bot.state.wants_to_be_up();
+    let new_wallet = new_signer_wallet(&bot, &signer)?;
+    let _guards = if restart_after {
+        // Old wallet (the running process) held until the old container is gone; the new
+        // wallet claimed for the process the recreate brings up. One claim when they match.
+        let old = state.wallet_locks.try_claim_for(&bot).ok_or_else(|| {
+            ApiError::conflict(format!(
+                "{name}'s current operator wallet is busy — an approval or launch is running \
+                 against it. Nothing was changed; wait and try again."
+            ))
+        })?;
+        let new = match &new_wallet {
+            None => None,
+            Some(w) if old.as_ref().map(logs::WalletClaim::wallet) == Some(w) => None,
+            Some(w) => Some(state.wallet_locks.try_claim(w.clone()).ok_or_else(|| {
+                ApiError::conflict(
+                    "the operator wallet the new signer selects is busy — an approval or launch \
+                     is running against it. Nothing was changed; wait and try again."
+                        .to_string(),
+                )
+            })?),
+        };
+        // A live sibling on the new wallet means the recreate would start a second signer
+        // on it. Skip only when this bot is itself already transacting on that same wallet.
+        let overlap_exists = logs::already_transacting(&bot) && bot.wallet() == new_wallet;
+        if !overlap_exists {
+            if let Some(w) = &new_wallet {
+                let fleet = state.fleet().await?;
+                logs::no_live_sibling_on_wallet_id(&name, w, &fleet).map_err(ApiError::conflict)?;
+            }
+        }
+        (Some(old), new)
+    } else {
+        (None, None)
+    };
+
+    // Ordering is the whole safety argument. Discovery reads the config file, so the
+    // instant `apply_signer` commits, the fleet reports the *new* wallet — while the old
+    // container is still signing from the *old* one. So don't commit the new identity
+    // until the old process is gone: preflight the image, remove the old container, and
+    // only then write the new config and build the replacement. A failure before the
+    // remove leaves the old config selecting the old, still-guarded wallet; a failure
+    // after it leaves no process signing at all. Either way the old wallet is never left
+    // live-but-unreported once this handler drops its claims.
+    //
+    // Validate the change first, while the bot is still up: `apply_signer` parses and
+    // validates the config on disk, and a bad key — or a config that's invalid on disk,
+    // which inventory still marks editable — would otherwise fail only *after* the live
+    // container was destroyed, leaving the operator with no bot.
+    setup::validate_signer_change(&dir, &signer).map_err(ApiError::bad_request)?;
+    // The bot's *own* image, not the panel-wide default. A migrated or pinned bot can run
+    // a custom image, and a signer change only asks to swap the signer — recreating it on
+    // `cfg.bot_image` would silently switch the trading binary too. `image_of` keeps the
+    // running image when the bot has one and falls back to the default otherwise.
+    //
+    // `refresh: false`: don't pull. A mutable tag like `:latest` would pull a newer digest
+    // behind the same reference, so refreshing here would deploy a new trading binary off
+    // the back of a signer change. Refreshing the image is Recreate's job; this reuses the
+    // copy already on the host, only pulling if it's missing entirely.
+    let image = provision::image_of(&bot, &state.cfg);
+    state.docker.ensure_image(&image, false).await?;
+    if let Some(container) = &bot.container_name {
+        stop_before_destroying(&state, &bot, container).await?;
+        state.docker.remove(container, true).await?;
+    }
+
+    // The old process is gone. Write the new config + secret + env atomically, then hand
+    // the new files to the bot's UID — `apply_signer` writes them root-owned `0600`, and
+    // a bot running as another UID can't read its own key, so without this the
+    // replacement exits on startup (the wizard does the same after writing a signer).
+    setup::apply_signer(&dir, &signer).map_err(|e| {
+        ApiError::internal(&e.context(format!(
+            "applying {name}'s new signer. The config was rolled back to the previous signer, but \
+             its container was already removed — use Recreate to bring it back up."
+        )))
+    })?;
+    // Hand over only the files this change wrote — stitch.toml, stitch.env, and the new
+    // signer secret — not the whole directory. A migrated bot's directory can hold an
+    // operator-owned backup or other retained file (migration deliberately preserves
+    // them); sweeping every entry to the bot's uid would give the bot access to data it
+    // has no business with, permanently. This mirrors migration's selective handoff.
+    provision::hand_over_paths_to_bot(&dir, &setup::signer_files(&dir, &signer), state.cfg.bot_uid)
+        .map_err(|e| {
+            ApiError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{e:#}"),
+            )
+        })?;
+
+    let runtime = provision::signer_runtime(&dir)?;
+    let spec = provision::bot_container_spec(
+        &state.cfg,
+        &name,
+        &image,
+        &runtime,
+        bot.config
+            .as_ref()
+            .and_then(|c| c.corridor_id.clone())
+            .as_deref(),
+    );
+    provision::check_file_mounts(&spec.binds, &state.cfg).map_err(ApiError::conflict)?;
+    state.docker.create(&spec).await.map_err(|e| {
+        ApiError::internal(&e.context(format!(
+            "creating {name}'s replacement container after switching its signer. Its config is on \
+             disk with the new backend, so Recreate brings it up once the cause is fixed."
+        )))
+    })?;
+    if restart_after {
+        if let Err(e) = state.docker.start(&spec.name).await {
+            // The start can report failure after the daemon already brought the new
+            // container up on the new wallet; releasing the claims now would let a sibling
+            // launch on that wallet. Settle it — stop the container, then let the guards go
+            // (or hold them until the stop lands). Hand over the whole guard tuple: the new
+            // wallet is the one that's live, and whichever guard covers it must be held.
+            let err = ApiError::internal(&e.context(format!(
+                "starting {name} after switching its signer. The new container exists with the new \
+                 backend, so Start brings it up once the cause is fixed."
+            )));
+            let held = (_guards.0.is_some() || _guards.1.is_some()).then_some(_guards);
+            return Err(settle_ambiguous_launch(&state, &spec.name, held, err).await);
+        }
+    }
+
+    tracing::info!(bot = %name, "signer changed and container recreated");
     action_response(
         &state,
         &name,
         Some(format!(
-            "{name} was recreated on {}{}.",
-            spec.image,
+            "{name}'s signer backend was switched and its container recreated{}.",
             if restart_after {
                 " and started"
             } else {
-                " and left stopped, because it wasn't up before"
+                " (left stopped, because it wasn't up before)"
             }
         )),
     )
@@ -491,13 +866,31 @@ pub async fn migrate_layout(
     Path(name): Path<String>,
     Query(query): Query<MigrateQuery>,
 ) -> Result<Response, ApiError> {
-    let bot = state.bot(&name).await?;
+    // Config lock across the whole migration: it moves the config file and brings the
+    // bot back up, so a save racing it would write to a file being moved out from under
+    // it. Held to the end of the handler.
+    let (_config, bot) = lock_config(&name, &state).await?;
     super::require_actionable(&bot)?;
     migrate::check(&bot, &state.cfg).map_err(ApiError::conflict)?;
     // Migration brings a live bot back up at the end, so it launches one too. Held
     // for the whole migration, which is the window that matters.
     let _wallet = if bot.state.wants_to_be_up() {
-        reserve_for_launch(&bot, &state).await?
+        claim_for_launch(&bot, &state).await?
+    } else {
+        None
+    };
+
+    // `lock_config` above holds the *source* path's lock — the flat/legacy config the bot
+    // runs from now. Migration writes the config into the per-bot layout path and builds
+    // the replacement container there, but nothing yet guards that *target* path. A
+    // concurrent action keyed on it — a `wizard::create` for the same name, a save, a
+    // launch — could write or start at the target while the move is mid-flight. So take
+    // the target lock too, held to the end, unless the bot already sits on it (then the
+    // source lock already covers it and re-locking the same mutex from this task would
+    // deadlock).
+    let target = state.cfg.bot_dir(&name).join("stitch.toml");
+    let _target_lock = if bot.config_panel_path.as_deref() != Some(target.as_path()) {
+        Some(state.config_locks.for_path(&target).lock_owned().await)
     } else {
         None
     };
@@ -583,6 +976,39 @@ mod tests {
         c.labels.insert(LABEL_BOT.to_string(), name.to_string());
         c.mounts = dir_layout_mounts(&h.root.join(name).display().to_string());
         h.docker.add_container(c);
+    }
+
+    #[tokio::test]
+    async fn a_launch_holds_the_config_lock_so_a_save_serialises_behind_it() {
+        // The race the launch paths used to have: a raw save could move the config from
+        // one wallet to another between the handler's read and `docker.start`, so the
+        // claim guarded the wallet the bot was leaving. Holding the config lock — the
+        // same one settings saves take across their write — across read → claim → launch
+        // closes it: a save can't run until the launch has started the container.
+        let h = harness("launch-holds-lock");
+        seed_panel_bot(&h, "bot-a");
+        let path = h
+            .state
+            .bot("bot-a")
+            .await
+            .unwrap()
+            .config_panel_path
+            .unwrap();
+
+        let launch = super::lock_and_claim_for_launch("bot-a", &h.state)
+            .await
+            .unwrap();
+        // While the launch is in flight, a save can't take the config lock.
+        assert!(
+            h.state.config_locks.for_path(&path).try_lock().is_err(),
+            "the launch must hold the config lock so a concurrent save waits"
+        );
+        drop(launch);
+        // And it's released once the launch is done.
+        assert!(
+            h.state.config_locks.for_path(&path).try_lock().is_ok(),
+            "the config lock must be released after the launch"
+        );
     }
 
     #[tokio::test]
@@ -847,7 +1273,9 @@ mod tests {
     #[tokio::test]
     async fn a_daemon_failure_on_start_is_reported_not_swallowed() {
         let h = harness("start-fail");
-        seed_panel_bot(&h, "bot-a");
+        // Stopped, so Start actually reaches `docker start` — a running bot short-circuits
+        // before it, since starting an already-live container is a no-op.
+        seed_panel_bot_in_state(&h, "bot-a", ContainerState::Exited);
         h.docker.fail_next("no space left on device");
         let (status, body) = h
             .post_json("/api/bots/bot-a/start", serde_json::json!({}))
@@ -960,6 +1388,158 @@ mod tests {
             kinds.contains(&"ledgerNotPersisted".to_string()),
             "{kinds:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn changing_the_signer_backend_writes_the_secret_and_recreates() {
+        let h = harness("change-signer");
+        seed_panel_bot(&h, "bot-a"); // local hot wallet, running
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/signer",
+                serde_json::json!({
+                    "kind": "turnkey",
+                    "organizationId": "org-1",
+                    "signWith": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                    "operatorAddress": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                    "apiPublicKey": "PUBKEY",
+                    "apiPrivateKey": "PRIVKEY",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The config now selects Turnkey and the backend's secret was written to disk —
+        // the thing a raw TOML edit could never do.
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(toml.contains("provider = \"turnkey\""), "{toml}");
+        assert!(h.root.join("bot-a/turnkey-api.key").exists());
+        // And the container was rebuilt with the new runtime: old removed, new created
+        // and (since it was up) started.
+        let calls = h.docker.calls();
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Remove { .. })),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Create(_))),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Start(_))),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_signer_is_refused_when_a_live_sibling_shares_the_new_wallet() {
+        // The new signer's operator address is the wallet the rebuilt bot will sign from.
+        // A live sibling already transacting on it means the recreate would start a second
+        // signer there — refused, and nothing written or rebuilt.
+        let h = harness("change-signer-sibling");
+        seed_panel_bot(&h, "bot-a"); // local, running, maker-only
+        let addr = h
+            .state
+            .bot("bot-a")
+            .await
+            .unwrap()
+            .wallet()
+            .unwrap()
+            .address;
+        // A live taker sibling on the wallet the new signer will select (same address).
+        seed_transacting(&h, "bot-b", ContainerState::Running);
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/signer",
+                serde_json::json!({
+                    "kind": "turnkey",
+                    "organizationId": "org-1",
+                    "signWith": addr,
+                    "operatorAddress": addr,
+                    "apiPublicKey": "PUBKEY",
+                    "apiPrivateKey": "PRIVKEY",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("shares its operator wallet"), "{body}");
+        // Nothing written, nothing rebuilt.
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(before, after, "the switch must not be persisted");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Create(_))),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_config_does_not_destroy_the_bot_on_a_signer_change() {
+        // `apply_signer` validates the config on disk, so a bot whose TOML is invalid (but
+        // still exposed as editable) must be caught *before* its live container is removed
+        // — otherwise the operator is left with no bot and a validation error.
+        let h = harness("change-signer-badconfig");
+        seed_panel_bot(&h, "bot-a"); // running, valid config
+        std::fs::write(h.root.join("bot-a/stitch.toml"), "not valid = = toml").unwrap();
+
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/signer",
+                serde_json::json!({
+                    "kind": "turnkey",
+                    "organizationId": "org-1",
+                    "signWith": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                    "operatorAddress": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                    "apiPublicKey": "PUBKEY",
+                    "apiPrivateKey": "PRIVKEY",
+                }),
+            )
+            .await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        // The live container must not have been removed.
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Remove { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_signer_is_refused_for_a_flat_layout_bot() {
+        // Recreate — and so a signer change — needs the panel's per-bot layout to rebuild
+        // with the right mounts. A flat-layout bot is pointed at Migrate first.
+        let h = harness("change-signer-flat");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        std::fs::write(h.root.join("stitch.bot1.toml"), corridor.toml_template).unwrap();
+        std::fs::write(
+            h.root.join("stitch.bot1.key"),
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let mut c = container("stitch-bot1", ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
+        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot1/signer",
+                serde_json::json!({
+                    "kind": "local",
+                    "privateKey": super::super::testkit::TEST_KEY,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("per-bot directory layout"), "{body}");
     }
 
     #[tokio::test]
@@ -1082,8 +1662,8 @@ mod tests {
         let wallet = bot.wallet().expect("a hot wallet has an address");
         let _claim = h
             .state
-            .reservations
-            .reserve(wallet)
+            .wallet_locks
+            .try_claim(wallet)
             .expect("nothing else holds it");
 
         for action in ["start", "recreate"] {
@@ -1163,8 +1743,8 @@ mod tests {
         let bot = h.state.bot("bot-a").await.expect("seeded");
         let _claim = h
             .state
-            .reservations
-            .reserve(bot.wallet().unwrap())
+            .wallet_locks
+            .try_claim(bot.wallet().unwrap())
             .expect("nothing else holds it");
 
         let (status, body) = h
@@ -1274,5 +1854,235 @@ mod tests {
         assert!(body.contains("bot-a"), "{body}");
         // Never the key material, even though the export names the key file.
         assert!(!body.contains(super::super::testkit::TEST_KEY));
+    }
+
+    #[tokio::test]
+    async fn settle_stops_the_container_and_releases_the_claim_when_the_stop_lands() {
+        // The common ambiguous case: `start` reported an error but the daemon may have
+        // brought the container up on the claimed wallet. Settling stops it, and once the
+        // stop confirms it's gone the claim is safe to drop.
+        let h = harness("settle-release");
+        seed_panel_bot(&h, "bot-a");
+        let wallet = h.state.bot("bot-a").await.unwrap().wallet().unwrap();
+        let claim = h
+            .state
+            .wallet_locks
+            .try_claim(wallet.clone())
+            .expect("nothing else holds it");
+
+        let _err = super::settle_ambiguous_launch(
+            &h.state,
+            "stitch-bot-a",
+            Some(claim),
+            super::ApiError::conflict("boom"),
+        )
+        .await;
+
+        assert!(
+            !h.state.wallet_locks.is_claimed(&wallet),
+            "a confirmed stop releases the claim"
+        );
+        assert!(
+            h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Stop { .. })),
+            "settle must stop the possibly-live container: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_holds_the_claim_when_the_container_cannot_be_stopped() {
+        // If the stop can't confirm the container is gone, releasing the claim would let a
+        // sibling launch on the same wallet while this one may still be live. So the claim
+        // is handed to the hold task and stays held until a stop lands.
+        let h = harness("settle-hold");
+        seed_panel_bot(&h, "bot-a"); // running, so the hold task sees it live
+        let wallet = h.state.bot("bot-a").await.unwrap().wallet().unwrap();
+        let claim = h
+            .state
+            .wallet_locks
+            .try_claim(wallet.clone())
+            .expect("nothing else holds it");
+        h.docker.fail_stop("daemon unreachable");
+
+        let _err = super::settle_ambiguous_launch(
+            &h.state,
+            "stitch-bot-a",
+            Some(claim),
+            super::ApiError::conflict("boom"),
+        )
+        .await;
+
+        // The stop failed and the container still reads live, so the claim is held.
+        assert!(
+            h.state.wallet_locks.is_claimed(&wallet),
+            "a claim can't be released until the container is confirmed stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_start_settles_the_wallet_rather_than_leaking_it() {
+        // End to end through the Start handler: a `start` that errors must not leave the
+        // container potentially live on a released wallet — the handler settles it.
+        let h = harness("start-settle");
+        seed_panel_bot_in_state(&h, "bot-a", ContainerState::Exited);
+        h.docker.fail_start("daemon dropped the connection");
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "the start error must surface: {body}"
+        );
+        assert!(
+            h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Stop { .. })),
+            "an ambiguous start must be settled with a stop: {:?}",
+            h.docker.calls()
+        );
+        // The stop confirmed it gone, so the wallet is free for the next attempt.
+        let wallet = h.state.bot("bot-a").await.unwrap().wallet().unwrap();
+        assert!(
+            !h.state.wallet_locks.is_claimed(&wallet),
+            "the claim must be released once the stop confirms the container is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_signer_preserves_the_bots_own_image() {
+        // A migrated or pinned bot runs its own image, not the panel-wide default. A
+        // signer change only asks to swap the signer, so it must recreate on the same
+        // image — otherwise it silently switches the trading binary. The seeded container
+        // runs `:latest` while the harness default is `:test`, so a recreate on the
+        // default would show up here.
+        let h = harness("change-signer-image");
+        seed_panel_bot(&h, "bot-a"); // container image ...:latest
+        let seeded_image = "ghcr.io/textile-protocol/textile-stitch:latest";
+        assert_ne!(
+            h.state.cfg.bot_image, seeded_image,
+            "the test only proves preservation if the default differs from the bot's image"
+        );
+
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/signer",
+                serde_json::json!({
+                    "kind": "turnkey",
+                    "organizationId": "org-1",
+                    "signWith": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                    "operatorAddress": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                    "apiPublicKey": "PUBKEY",
+                    "apiPrivateKey": "PRIVKEY",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let created = h.docker.create_specs();
+        let spec = created.last().expect("a replacement container was created");
+        assert_eq!(
+            spec.image, seeded_image,
+            "the recreate must keep the bot's own image, not the panel default"
+        );
+        // And it didn't refresh: pulling a mutable tag like `:latest` off a signer change
+        // would deploy a newer trading binary. Refreshing the image is Recreate's job.
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::EnsureImage { refresh: true, .. })),
+            "a signer change must not refresh the image: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_an_already_running_bot_is_a_no_op_not_a_shutdown() {
+        // The overlapping-Start race: the config lock serializes two Starts, so the
+        // second re-reads the bot as already running. `docker start` on a live container
+        // can return an error, and treating that as an ambiguous launch would hand the
+        // healthy container to settle, which stops it. Start must short-circuit on a
+        // non-terminal state instead of touching Docker at all.
+        let h = harness("start-already-running");
+        seed_panel_bot(&h, "bot-a"); // running
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Start(_) | Call::Stop { .. })),
+            "a running bot must be neither started nor stopped by Start: {:?}",
+            h.docker.calls()
+        );
+        assert_eq!(
+            h.docker.state_of("stitch-bot-a"),
+            Some(ContainerState::Running),
+            "the live container must be left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_waits_on_the_target_layout_lock() {
+        // The migration moves the config into the per-bot layout path and builds the
+        // replacement there. A concurrent action keyed on that target path (a create, a
+        // save, a launch) must not run while the move is mid-flight, so the migration
+        // holds the target lock too — not just the source path's.
+        let h = harness("migrate-target-lock");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        std::fs::write(h.root.join("stitch.bot1.toml"), corridor.toml_template).unwrap();
+        std::fs::write(
+            h.root.join("stitch.bot1.key"),
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let mut c = container("stitch-bot1", ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
+        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
+        h.docker.add_container(c);
+
+        // Stand in for a concurrent op holding the target path's lock.
+        let target = h.state.cfg.bot_dir("bot1").join("stitch.toml");
+        let held = h.state.config_locks.for_path(&target).lock_owned().await;
+
+        let state = h.state.clone();
+        let task = tokio::spawn(async move {
+            super::migrate_layout(
+                axum::extract::State(state),
+                axum::extract::Path("bot1".to_string()),
+                axum::extract::Query(super::MigrateQuery::default()),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message)
+        });
+
+        // With the target lock held, the migration can't proceed.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the migration must wait on the target layout lock"
+        );
+
+        // Release it and the migration completes.
+        drop(held);
+        let result = task.await.expect("migration task panicked");
+        assert!(result.is_ok(), "migration should succeed: {result:?}");
+        assert!(
+            h.root.join("bot1/stitch.toml").exists(),
+            "the config must have moved into the per-bot layout"
+        );
     }
 }
