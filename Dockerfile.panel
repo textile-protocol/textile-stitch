@@ -1,4 +1,4 @@
-# The fleet admin panel. Separate from the bot image on purpose: the bot has no
+# Stitch (web UI). Separate from the bot image on purpose: the bot has no
 # business carrying a Docker client or a web UI, and the panel has no business
 # being on the critical path of a `cargo build` for operators who build from
 # source.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! The self-hosted fleet admin panel: add, remove, start, stop and configure
+//! The Stitch web UI backend: add, remove, start, stop and configure
 //! Stitch bots on one Docker host from a browser.
 //!
 //! The panel is a control plane, not a second implementation of the bot. Every

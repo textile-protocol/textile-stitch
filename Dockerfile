@@ -10,7 +10,7 @@ FROM debian:bookworm-slim
 
 # The uid is pinned, not left to useradd's next-free choice: the bot's config
 # directory is bind-mounted from the host, so whoever creates it there — an
-# operator, or the admin panel — has to know which uid must own it.
+# operator, or Stitch — has to know which uid must own it.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/* \

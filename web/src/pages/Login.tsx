@@ -41,7 +41,7 @@ export default function Login({
     <div className="grid min-h-screen place-items-center px-6">
       <div className="w-full max-w-sm space-y-4">
         <h1 className="text-center text-lg font-bold">
-          Stitch <span className="text-muted">panel</span>
+          Stitch
         </h1>
 
         {session.passwordLogin ? (

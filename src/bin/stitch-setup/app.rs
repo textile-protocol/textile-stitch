@@ -344,7 +344,7 @@ impl StitchApp {
         // This used to start from `self.settings.loaded.to_patch()`, which sets those
         // four to the values read when the screen *opened*. Saving an unrelated
         // spread then wrote them back and silently reverted anything that had changed
-        // the file since — and now that the admin panel edits the same `stitch.toml`,
+        // the file since — and now that Stitch edits the same `stitch.toml`,
         // "something else changed it" stopped being hypothetical.
         let patch = setup::SettingsPatch {
             pool_index: self

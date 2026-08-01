@@ -10,7 +10,7 @@ and documents a checksum-verified archive fallback when an agent will not run an
 installer script.
 
 This installs **one** bot on the machine the agent has a terminal on. For several
-bots on one Docker host, install the admin panel instead
+bots on one Docker host, install Stitch instead
 ([install-panel.md](install-panel.md)) and add bots from its wizard.
 
 ```text

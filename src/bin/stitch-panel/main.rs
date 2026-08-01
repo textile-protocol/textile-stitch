@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! `stitch-panel` — the self-hosted fleet admin panel.
+//! `stitch-panel` — the process behind the Stitch web UI.
 //!
 //! One process per Docker host. It manages bots by writing config files and
 //! driving the Docker Engine API; there is no database, because the container list
@@ -39,10 +39,10 @@ fn main() -> Result<()> {
 }
 
 const USAGE: &str = "\
-stitch-panel — self-hosted admin panel for a fleet of Stitch bots
+stitch-panel — Stitch web UI for a fleet of bots
 
 USAGE:
-    stitch-panel                 run the panel
+    stitch-panel                 run Stitch
     stitch-panel hash-password   read a password from the terminal and print its
                                  argon2 hash, for STITCH_PANEL_PASSWORD_HASH.
                                  Reads stdin instead when piped, for scripts.

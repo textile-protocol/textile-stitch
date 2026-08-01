@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { ApiError, api, setUnauthorizedHandler } from './api'
-import ComposeExportLink from './components/ComposeExportLink'
+import OverflowMenu from './components/OverflowMenu'
 import TextileIcon from './components/TextileIcon'
 import { Button, Loading } from './components/ui'
 import Login from './pages/Login'
@@ -53,7 +53,7 @@ export default function App() {
   if (!session) {
     return (
       <Centered>
-        <Loading what="the panel" />
+        <Loading what="Stitch" />
       </Centered>
     )
   }
@@ -159,68 +159,44 @@ function Header({
 
   return (
     <header className="border-b border-line-soft bg-surface">
-      <div className="mx-auto flex max-w-5xl items-center gap-4 px-6 py-3">
-        <Link to="/" className="flex items-center gap-2 font-bold">
+      <div className="mx-auto flex max-w-5xl items-center gap-2 px-4 py-3 sm:gap-4 sm:px-6">
+        <Link to="/" className="flex min-w-0 items-center gap-2 font-bold">
           <TextileIcon className="h-5 w-5 shrink-0" />
-          {/*
-            One span, so the icon and the wordmark are the only two flex items and
-            `gap-2` applies between them and not between "Stitch" and "panel" — a
-            bare text node beside the span would become its own flex item.
-          */}
-          <span>
-            Stitch <span className="text-muted">panel</span>
-          </span>
+          <span className="truncate">Stitch</span>
         </Link>
-        <nav className="flex items-center gap-1 text-sm">
+        <nav className="flex shrink-0 items-center gap-1 text-sm">
           <NavLink to="/" current={pathname === '/'}>
             Fleet
           </NavLink>
-          <NavLink to="/add" current={pathname === '/add'}>
-            Add a bot
-          </NavLink>
         </nav>
-        <div className="ml-auto flex items-center gap-3 text-sm">
+        <div className="ml-auto flex shrink-0 items-center gap-1 sm:gap-2">
           {updates?.panel.updateAvailable && (
             <Button
               variant="primary"
               busy={panelBusy}
               onClick={() => void updatePanel()}
               title={`Update panel to ${shortImage(updates.panel.targetImage)}`}
+              className="max-sm:px-2 max-sm:text-xs"
             >
-              Update panel
+              <span className="sm:hidden">Update</span>
+              <span className="hidden sm:inline">Update panel</span>
             </Button>
           )}
-          <ComposeExportLink
-            className="text-muted underline decoration-line hover:text-ink disabled:opacity-60"
-            title="A generated compose file for the whole fleet, for disaster recovery"
-          >
-            Export compose
-          </ComposeExportLink>
           <button
+            type="button"
             onClick={() => onTheme(theme === 'dark' ? 'light' : 'dark')}
-            className="text-muted hover:text-ink"
+            className="inline-flex size-9 items-center justify-center rounded-lg text-muted hover:bg-hover hover:text-ink"
             aria-label="Switch theme"
           >
             {theme === 'dark' ? '☾' : '☀'}
           </button>
-          <span className="text-faint" title="Signed in as">
-            {session.identity}
-          </span>
-          {session.passwordLogin && (
-            <Button
-              variant="ghost"
-              onClick={async () => {
-                await api.logout()
-                onSignedOut()
-              }}
-            >
-              Sign out
-            </Button>
-          )}
+          <OverflowMenu session={session} onSignedOut={onSignedOut} />
         </div>
       </div>
       {panelNote && (
-        <div className="mx-auto max-w-5xl px-6 pb-3 text-xs text-muted">{panelNote}</div>
+        <div className="mx-auto max-w-5xl px-4 pb-3 text-xs text-muted sm:px-6">
+          {panelNote}
+        </div>
       )}
     </header>
   )

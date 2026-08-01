@@ -1,6 +1,6 @@
 name: Container (panel)
 
-# The admin panel image. Separate from the bot image so a frontend change doesn't
+# The Stitch (web UI) image. Separate from the bot image so a frontend change doesn't
 # rebuild and republish the bot, and so a broken panel build can never hold up a
 # bot release.
 

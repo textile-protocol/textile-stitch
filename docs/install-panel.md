@@ -1,16 +1,18 @@
-# Install — admin panel
+# Install — Stitch
 
-`stitch-panel` is a web UI for running several bots on one Docker host. Add a
-bot with a wizard, start and stop it, edit its settings, watch its logs, run
-Permit2 approvals — instead of SSHing in and hand-editing
-`docker-compose.yml`.
+Stitch is the web UI for running several bots on one Docker host. Add a bot with
+a wizard, start and stop it, edit its settings, watch its logs, run Permit2
+approvals — instead of SSHing in and hand-editing `docker-compose.yml`.
 
-One panel per host. It has no database: the container list plus the config
+The product name in the browser is **Stitch**. The binary, container, and image
+are still named `stitch-panel` — that's the process underneath.
+
+One Stitch per host. It has no database: the container list plus the config
 directories on disk are the whole state, so anything you do by hand still shows
-up in the UI, and you can walk away from the panel at any time and go back to
+up in the UI, and you can walk away from Stitch at any time and go back to
 compose.
 
-**It is root on the host.** The panel drives the Docker socket, which is
+**It is root on the host.** Stitch drives the Docker socket, which is
 root-equivalent, and it can read every bot's config. Anyone who reaches it owns
 the machine and the market-maker wallets. There is no version of this that is
 merely somewhat privileged, so the whole install is built around not exposing it:
@@ -30,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/mai
 ```
 
 That is the whole install. It checks Docker, asks for a Tailscale auth key and
-the tailnet logins allowed to drive the panel, writes an owner-only `.env`, and
+the tailnet logins allowed to drive Stitch, writes an owner-only `.env`, and
 starts the two containers from the published image. No checkout, no build.
 
 To run it unattended, set the answers in the environment and it won't prompt:
@@ -50,7 +52,7 @@ TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
 | `PANEL_IMAGE` | published `:latest` | Pin a `sha-*` tag in production. |
 
 Re-running it is safe: an existing `.env` is left alone, so it doubles as
-"pull the current image and bring the panel back up".
+"pull the current image and bring Stitch back up".
 
 **The rest of this page is the manual route.** You only need it to change
 something the installer doesn't ask about — password-only login, your own reverse
@@ -282,7 +284,7 @@ Do the bots one at a time and watch the log tail after each.
 
 **Update your compose file afterwards.** The old file still describes the old
 mounts, so the next `docker compose up -d` would recreate the pre-migration
-container. Grab a fresh one from **Export compose** in the panel header (or
+container. Grab a fresh one from **Export compose** in the Stitch menu (or
 `GET /api/compose-export`), which describes the fleet as it is now — both adopted
 and panel-created bots.
 
@@ -324,7 +326,7 @@ it; the compose export is there for when you want to go back.
 
 ## What changes about the manual workflow
 
-| Task | Before | With the panel |
+| Task | Before | With Stitch |
 |------|--------|----------------|
 | Add a bot | copy a service block, write a toml, chmod the key | wizard: corridor, name, key |
 | Change a spread | ssh, edit toml, `docker compose restart` | edit the field, Save (restarts for you) |

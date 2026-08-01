@@ -3,7 +3,7 @@
 //! Read and edit the `stitch.toml` values the Settings surfaces expose: endpoints,
 //! per-pool spreads, ladder sizing, order lifetime and the tick cadence.
 //!
-//! Shared by the desktop Settings screen and the web admin panel, so both edit
+//! Shared by the desktop Settings screen and Stitch, so both edit
 //! configs through one implementation. Edits go through `toml_edit` so the
 //! template's comments and layout survive a save, and every edit is re-validated
 //! through `Config::from_toml` before it is handed back — a bad value fails here,
@@ -692,7 +692,7 @@ mod tests {
         // spreads leaves sizing, lifetime and cadence unset, and those keep whatever is
         // in the file. Building the patch from a view captured when a screen *opened*
         // instead writes stale values back over anything that changed since — which,
-        // now that the admin panel edits the same stitch.toml, is a live concern.
+        // now that Stitch edits the same stitch.toml, is a live concern.
         let before = read_settings(TEMPLATE).unwrap();
         // Something else edits the file: a longer order lifetime and a slower tick.
         let externally_changed = TEMPLATE

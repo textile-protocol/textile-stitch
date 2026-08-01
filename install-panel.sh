@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 Textile, Inc.
 #
-# One-command install for the Stitch admin panel: a web UI for running a fleet of
+# One-command install for Stitch: a web UI for running a fleet of
 # bots on one Docker host, reachable only over your tailnet.
 #
 #   curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh

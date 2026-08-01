@@ -122,7 +122,7 @@ Two things about this layout to know before your fleet grows:
   directory down to `0700` before it writes anything, which a non-owner can't do,
   so a root-owned directory means the container exits at startup.
 - Past two or three bots, editing YAML over SSH stops being fun. The
-  [admin panel](install-panel.md) is a web UI for the same fleet: add, start, stop,
+  [Stitch web UI](install-panel.md) is for the same fleet: add, start, stop,
   configure, tail logs, run approvals. It adopts the containers this compose file
   already started, without restarting them.
 

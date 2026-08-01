@@ -33,7 +33,7 @@ Two paths. Pick one:
 
 1. **[Desktop app](#option-1--desktop-app)** — one machine, a window you watch.
    No terminal.
-2. **[Docker with the admin panel](#option-2--docker-with-the-admin-panel)** — a
+2. **[Docker with Stitch](#option-2--docker-with-stitch)** — a
    server, or several bots. One command, then a web UI.
 
 ### Option 1 — Desktop app
@@ -54,7 +54,7 @@ tokens" button, live logs, and an Update button. Closing the window stops the
 bot; for unattended 24/7 running, use Option 2 below or install it as a service
 (see the [manual guides](#other-ways-to-install)).
 
-### Option 2 — Docker, with the admin panel
+### Option 2 — Docker, with Stitch
 
 For a server, or for running more than one bot. One command on any Docker host:
 
@@ -62,7 +62,7 @@ For a server, or for running more than one bot. One command on any Docker host:
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
 ```
 
-It asks for a Tailscale auth key and which tailnet logins may drive the panel,
+It asks for a Tailscale auth key and which tailnet logins may drive Stitch,
 then starts it. You get a web UI for the whole fleet — add a bot with a wizard,
 start and stop it, edit settings, approve allowances, tail logs — reachable only
 from your own tailnet, with no port published on the host.
@@ -74,11 +74,11 @@ Then open the URL it prints, click **Add a bot**, pick a corridor, paste your
 operator wallet key, and approve the router allowance from the bot's page before
 starting it.
 
-Already running bots from your own `docker-compose.yml`? Point the panel at that
+Already running bots from your own `docker-compose.yml`? Point Stitch at that
 directory and it adopts them as they are — nothing is restarted or rewritten.
 
 Everything else — password login instead of Tailscale, your own reverse proxy,
-building from source, running the panel on a host you don't want on a tailnet —
+building from source, running Stitch on a host you don't want on a tailnet —
 is in [install-panel.md](docs/install-panel.md). You shouldn't need it for the
 above.
 
@@ -87,8 +87,8 @@ above.
 - [Install with an AI agent](#install-with-an-ai-agent) — your coding agent does
   the whole setup and then operates the bot on request.
 - [Cloud (AWS Fargate)](docs/install-cloud.md) — operator-owned managed deployment.
-- [Docker](docs/install-docker.md) — the bot image on its own, without the panel.
-- [Admin panel](docs/install-panel.md) — the advanced and manual routes for
+- [Docker](docs/install-docker.md) — the bot image on its own, without Stitch.
+- [Stitch (web)](docs/install-panel.md) — the advanced and manual routes for
   Option 2 above.
 - [Manual install — macOS](docs/install-macos.md)
 - [Manual install — Windows](docs/install-windows.md)

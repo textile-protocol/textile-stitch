@@ -1,7 +1,7 @@
-# The Stitch admin panel, reachable only over your tailnet.
+# Stitch (web UI), reachable only over your tailnet.
 #
 # Two services: a Tailscale sidecar that joins the tailnet and terminates TLS,
-# and the panel itself sharing that sidecar's network namespace. The panel binds
+# and stitch-panel itself sharing that sidecar's network namespace. The panel binds
 # 127.0.0.1 inside that namespace, so the only path to it is through
 # `tailscale serve` — there is no published port on the host at all.
 #

@@ -80,15 +80,15 @@ Five standard layouts:
   Manager. See [AWS cloud](#aws-cloud-ecs-fargate) below.
 - **Docker fleet**: several bots as containers on one host, one container per bot,
   each with its own config dir and key. Either driven by hand with
-  `docker compose`, or through `stitch-panel` — a web UI on the same host that
-  manages the same containers. See [Docker fleet](#docker-fleet) below.
+  `docker compose`, or through Stitch (`stitch-panel`) — a web UI on the same
+  host that manages the same containers. See [Docker fleet](#docker-fleet) below.
 
 Detect it: for the local layouts, `stitch --version` plus `systemctl status
 stitch` (Linux), `launchctl list | grep -i stitch` (macOS), or Task Scheduler
 (Windows); a running desktop app shows up as a `stitch-setup` (or `Stitch`)
 process supervising a `stitch` child. For a Docker fleet,
 `docker ps --filter ancestor=ghcr.io/textile-protocol/textile-stitch` lists the
-bots, and a `stitch-panel` container means the panel is in play. For cloud, an ECS
+bots, and a `stitch-panel` container means Stitch is in play. For cloud, an ECS
 service named `<bot>-stitch` in the operator's AWS account (the request itself
 usually tells you — `aws`/ECS talk means cloud). Operate against whichever is
 real. Only if it's a local layout and `stitch` isn't on PATH is it genuinely not
@@ -233,15 +233,15 @@ Secrets Manager value), and dry-run/pause around any pricing or sizing change.
 Several bots on one host, one container each. Two ways it's driven, and it matters
 which:
 
-- **`stitch-panel` is running** (`docker ps` shows a `stitch-panel` container). The
+- **Stitch is running** (`docker ps` shows a `stitch-panel` container). The
   operator has a web UI at `https://<host>.<tailnet>.ts.net` that does start/stop,
   settings, approvals, dry runs and logs. **Point them at it instead of doing it
-  from the CLI.** Racing the panel isn't dangerous, but it's confusing: the panel
+  from the CLI.** Racing Stitch isn't dangerous, but it's confusing: Stitch
   shows container state live, so an operator watching it will see you fight them.
-  Everything the panel does is also reachable over its API if they'd rather you
+  Everything Stitch does is also reachable over its API if they'd rather you
   drive: `GET /api/bots`, `POST /api/bots/<name>/{start,stop,restart}`,
   `PATCH /api/bots/<name>/settings`. The full guide is `docs/install-panel.md`.
-  If you're restoring a host from the panel's compose export
+  If you're restoring a host from Stitch's compose export
   (`GET /api/compose-export`), note that bots which were stopped when it was
   exported carry `profiles: [stopped]` and won't come up on a plain
   `docker compose up -d` — that's deliberate, so don't "fix" it. Start one with
@@ -291,7 +291,7 @@ Two setup paths that don't need you to drive it, if the operator prefers:
 - **Desktop app** (no terminal): download the release for their OS and open Stitch
   — macOS `Stitch.dmg`, Windows `stitch-setup.exe`, Linux `stitch-setup`. Pick a
   corridor, paste the operator key, click Create; the same window then runs the bot.
-- **Admin panel** (several bots on one Docker host): `docs/install-panel.md` brings
+- **Stitch** (several bots on one Docker host): `docs/install-panel.md` brings
   up `stitch-panel` behind Tailscale, and the operator adds bots from a wizard in
   the browser. This is the right answer when they say "I want to run more than one
   bot" or already have a compose file they're tired of editing.

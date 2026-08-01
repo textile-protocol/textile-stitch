@@ -1,8 +1,8 @@
-# stitch-panel frontend
+# Stitch frontend
 
-Vite + React + Tailwind. The build output in `dist/` is compiled into the
-`stitch-panel` binary by `rust-embed`, so the panel ships as one file with no
-static directory to keep in sync.
+Vite + React + Tailwind for the Stitch web UI. The build output in `dist/` is
+compiled into the `stitch-panel` binary by `rust-embed`, so Stitch ships as one
+file with no static directory to keep in sync.
 
 Not a yarn workspace of the monorepo, on purpose: it's built in a node stage of
 `Dockerfile.panel` and nothing in `web/` or `api/` imports it. `cargo build` for
