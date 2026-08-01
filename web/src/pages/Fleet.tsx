@@ -137,8 +137,9 @@ export default function Fleet() {
       )}
 
       <p className="text-xs text-faint">
-        New bots run <code>{shortImage(data.botImage)}</code>. Configs live in{' '}
-        <code>{data.botsDir}</code>.
+        New bots run{' '}
+        <code title={data.botImage}>{shortImage(data.botImage)}</code>. Configs
+        live in <code>{data.botsDir}</code>.
       </p>
     </div>
   )
@@ -236,7 +237,9 @@ function BotRow({
           </Tag>
         )}
         {bot.config && <Tag>{bot.config.signer}</Tag>}
-        <span className="ml-auto">{shortImage(bot.image)}</span>
+        <span className="ml-auto font-mono" title={bot.image ?? undefined}>
+          {shortImage(bot.image)}
+        </span>
       </div>
 
       {(blocking.length > 0 || advisory.length > 0) && (

@@ -245,7 +245,11 @@ export default function BotDetail() {
         <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
           <Detail label="Origin">{bot.origin}</Detail>
           <Detail label="Layout">{bot.layout}</Detail>
-          <Detail label="Image">{shortImage(bot.image)}</Detail>
+          <Detail label="Image">
+            <span className="font-mono" title={bot.image ?? undefined}>
+              {shortImage(bot.image)}
+            </span>
+          </Detail>
           <Detail label="Created">{formatTimestamp(bot.createdUnix)}</Detail>
           <Detail label="Chain">{bot.config ? bot.config.chainId : '—'}</Detail>
           <Detail label="Pools">{bot.config ? bot.config.pools : '—'}</Detail>

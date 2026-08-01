@@ -66,9 +66,33 @@ export function shortAddress(address: string): string {
     : address
 }
 
-/** An image reference with its registry path dropped, keeping the tag. */
+/**
+ * An image reference short enough for a fleet row or detail cell.
+ *
+ * Drops the registry path, then centre-truncates a content digest so a bare
+ * `sha256:…` (or `name@sha256:…`) does not shove the rest of the layout off
+ * screen. Tagged refs like `textile-stitch:latest` stay as-is.
+ */
 export function shortImage(image: string | null): string {
   if (!image) return '—'
   const lastSlash = image.lastIndexOf('/')
-  return lastSlash === -1 ? image : image.slice(lastSlash + 1)
+  const name = lastSlash === -1 ? image : image.slice(lastSlash + 1)
+  return shortenDigest(name)
+}
+
+/** `sha256:ce1d74…2fef60` — keeps the prefix and enough hex to tell digests apart. */
+function shortenDigest(ref: string): string {
+  const at = ref.lastIndexOf('@')
+  if (at !== -1) {
+    const name = ref.slice(0, at)
+    const digest = ref.slice(at + 1)
+    return `${name}@${shortenSha256(digest)}`
+  }
+  return shortenSha256(ref)
+}
+
+function shortenSha256(value: string): string {
+  const hex = value.startsWith('sha256:') ? value.slice('sha256:'.length) : null
+  if (hex === null || hex.length <= 12) return value
+  return `sha256:${hex.slice(0, 6)}…${hex.slice(-6)}`
 }
