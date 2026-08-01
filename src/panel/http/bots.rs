@@ -872,8 +872,9 @@ async fn recreate_on_image(
             ) {
                 return Err(ApiError::conflict(format!(
                     "{name} runs {current}, which is not on the update channel for {}. Update \
-                     only refreshes bots already on STITCH_PANEL_BOT_IMAGE (sha-* pins may \
-                     move to :latest) — recreate it from your own compose file, or change \
+                     only refreshes bots on STITCH_PANEL_BOT_IMAGE's repository and tag \
+                     channel (same-repo sha-* / digest pins may move to the resolved \
+                     target) — recreate it from your own compose file, or change \
                      STITCH_PANEL_BOT_IMAGE.",
                     state.cfg.bot_image
                 )));
@@ -2862,6 +2863,65 @@ mod tests {
                 Call::EnsureImage { image, refresh: true } if image == expected
             )),
             "update must pull :latest for a sha-* pin, got {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_allows_a_sha_pinned_bot_when_the_panel_targets_latest() {
+        // Production often pins bots at create time while STITCH_PANEL_BOT_IMAGE
+        // is `:latest` (or later moves there). Those bots must still be able to
+        // leave the pin via Update — not get a channel-gate conflict.
+        let h = super::super::testkit::harness_with_bot_image(
+            "bot-update-sha-on-latest",
+            "ghcr.io/textile-protocol/textile-stitch:latest",
+        );
+        seed_panel_bot(&h, "bot-a");
+        h.docker.set_container_image(
+            "stitch-bot-a",
+            "ghcr.io/textile-protocol/textile-stitch:sha-oldc0de",
+        );
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = "ghcr.io/textile-protocol/textile-stitch:latest";
+        assert!(
+            h.docker.calls().iter().any(|c| matches!(
+                c,
+                Call::EnsureImage { image, refresh: true } if image == expected
+            )),
+            "sha-pinned bot must Update onto the panel's :latest channel, got {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_allows_a_bot_on_a_different_sha_pin_than_the_panel() {
+        // Panel env advanced to a new sha-* pin; existing bots still run the old
+        // one. Update resolves pins to :latest, so they must not be stuck.
+        let h = super::super::testkit::harness_with_bot_image(
+            "bot-update-other-sha",
+            "ghcr.io/textile-protocol/textile-stitch:sha-newpin00",
+        );
+        seed_panel_bot(&h, "bot-a");
+        h.docker.set_container_image(
+            "stitch-bot-a",
+            "ghcr.io/textile-protocol/textile-stitch:sha-oldpin00",
+        );
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            h.docker.calls().iter().any(|c| matches!(
+                c,
+                Call::EnsureImage { image, refresh: true }
+                    if image == "ghcr.io/textile-protocol/textile-stitch:latest"
+            )),
+            "old sha pin must still Update to :latest, got {:?}",
             h.docker.calls()
         );
     }

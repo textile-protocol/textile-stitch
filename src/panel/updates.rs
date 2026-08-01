@@ -91,9 +91,12 @@ pub fn same_image_repository(a: &str, b: &str) -> bool {
 /// Whether a running bot image is on `STITCH_PANEL_BOT_IMAGE`'s update channel.
 ///
 /// Same repository is not enough: a bot on `:canary` must not be Updated onto
-/// `:latest` just because they share a repo. Mutable tags must match. An
-/// explicit `sha-*` / digest pin may Update onto the resolved `:latest` target,
-/// and bots already on that resolved target stay eligible for later releases
+/// `:latest` just because they share a repo. Mutable tags must match.
+///
+/// An explicit `sha-*` / digest pin on the *bot* may always Update onto the
+/// configured channel's target — operators pin for reproducibility, then use
+/// Update to leave the pin. When the *configured* image is itself a pin, bots
+/// already on the resolved `:latest` target stay eligible for later releases
 /// (otherwise a successful pin→latest Update would leave them "off channel"
 /// forever while the env still names the pin).
 pub fn bot_eligible_for_configured_update(current: &str, configured: &str) -> bool {
@@ -101,24 +104,21 @@ pub fn bot_eligible_for_configured_update(current: &str, configured: &str) -> bo
         return false;
     }
     let cur = parse_image_ref(current);
+    // Any same-repo sha-* / digest pin can leave the pin via Update, whether
+    // STITCH_PANEL_BOT_IMAGE is `:latest`, another pin, or a mutable channel.
+    if cur.tag.starts_with("sha-") || current.contains('@') {
+        return true;
+    }
     let cfg = parse_image_ref(configured);
     let cfg_is_pin = cfg.tag.starts_with("sha-") || configured.contains('@');
     if cfg_is_pin {
-        let on_pin = if configured.contains('@') {
-            current == configured
-        } else {
-            cur.tag == cfg.tag
-        };
-        if on_pin {
-            return true;
-        }
         // Already moved to the resolved update target (:latest). Exact ref only —
-        // digest refs parse with a synthetic `latest` tag, so tag equality would
-        // treat any same-repo `@sha256:…` as on-channel.
+        // digest refs are handled above as pins (a synthetic `latest` tag would
+        // otherwise treat any same-repo `@sha256:…` as on-channel).
         return update_target_image(configured).is_some_and(|target| current == target);
     }
-    // Mutable channel: already on that tag (not a digest-only ref of another build).
-    !current.contains('@') && cur.tag == cfg.tag
+    // Mutable channel: already on that tag.
+    cur.tag == cfg.tag
 }
 
 /// True when `remote` (a `sha256:…` digest) is not among the local RepoDigests.
@@ -481,6 +481,7 @@ mod tests {
         let latest = "ghcr.io/textile-protocol/textile-stitch:latest";
         let canary = "ghcr.io/textile-protocol/textile-stitch:canary";
         let pin = "ghcr.io/textile-protocol/textile-stitch:sha-deadbeef";
+        let other_pin = "ghcr.io/textile-protocol/textile-stitch:sha-cafebabe";
         let digest_pin = "ghcr.io/textile-protocol/textile-stitch@sha256:aaaa";
         assert!(bot_eligible_for_configured_update(latest, latest));
         assert!(!bot_eligible_for_configured_update(canary, latest));
@@ -492,14 +493,19 @@ mod tests {
             "ghcr.io/acme/stitch-fork:v9",
             latest
         ));
-        // A different digest must not look "already on :latest" via synthetic tags.
-        assert!(!bot_eligible_for_configured_update(
+        // Bots still on a sha-* / digest pin must be able to Update onto the
+        // panel's mutable channel (the common "panel is :latest, bot is sha-…"
+        // case) — and onto :latest when the env itself still names a pin.
+        assert!(bot_eligible_for_configured_update(pin, latest));
+        assert!(bot_eligible_for_configured_update(digest_pin, latest));
+        assert!(bot_eligible_for_configured_update(other_pin, pin));
+        assert!(bot_eligible_for_configured_update(
             "ghcr.io/textile-protocol/textile-stitch@sha256:other",
             pin
         ));
         assert!(bot_eligible_for_configured_update(digest_pin, digest_pin));
         assert!(bot_eligible_for_configured_update(latest, digest_pin));
-        assert!(!bot_eligible_for_configured_update(
+        assert!(bot_eligible_for_configured_update(
             "ghcr.io/textile-protocol/textile-stitch@sha256:bbbb",
             digest_pin
         ));
