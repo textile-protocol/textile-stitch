@@ -56,19 +56,20 @@ bot; for unattended 24/7 running, use Option 2 below or install it as a service
 
 ### Option 2 — Docker, with Stitch
 
-For a server, or for running more than one bot. One command on any Docker host:
+For a server, a laptop with Docker, or more than one bot. One command on any
+Docker host:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
 ```
 
-It asks for a Tailscale auth key and which tailnet logins may drive Stitch,
-then starts it. You get a web UI for the whole fleet — add a bot with a wizard,
-start and stop it, edit settings, approve allowances, tail logs — reachable only
-from your own tailnet, with no port published on the host.
+It asks whether you're installing on a **local computer** (password login at
+`http://127.0.0.1:8420`) or a **server** (Tailscale, so you can open it from
+your other devices). Then it starts the web UI. Add a bot with a wizard, start
+and stop it, edit settings, approve allowances, tail logs — all in the browser.
 
-You need Docker with Compose v2, and a Tailscale account (the free tier is
-enough). Nothing is compiled: it runs the published image.
+You need Docker with Compose v2. Server mode also needs a Tailscale account
+(the free tier is enough). Nothing is compiled: it runs the published image.
 
 Then open the URL it prints, click **Add a bot**, pick a corridor, paste your
 operator wallet key, and approve the router allowance from the bot's page before
@@ -77,15 +78,13 @@ starting it.
 Already running bots from your own `docker-compose.yml`? Point Stitch at that
 directory and it adopts them as they are — nothing is restarted or rewritten.
 
-Everything else — password login instead of Tailscale, your own reverse proxy,
-building from source, running Stitch on a host you don't want on a tailnet —
-is in [install-panel.md](docs/install-panel.md). You shouldn't need it for the
-above.
+Everything else — custom reverse proxy, building from source — is in
+[install-panel.md](docs/install-panel.md). You shouldn't need it for the above.
 
 ## Other ways to install
 
-- [Install with an AI agent](#install-with-an-ai-agent) — your coding agent does
-  the whole setup and then operates the bot on request.
+- [Install with an AI agent](#install-with-an-ai-agent) — your coding agent
+  installs the panel; you finish bot setup in the web UI.
 - [Cloud (AWS Fargate)](docs/install-cloud.md) — operator-owned managed deployment.
 - [Docker](docs/install-docker.md) — the bot image on its own, without Stitch.
 - [Stitch (web)](docs/install-panel.md) — the advanced and manual routes for
@@ -96,9 +95,9 @@ above.
 
 ### Install with an AI agent
 
-Your coding agent collects the settings, writes the config,
-runs a dry run, and starts live only after you confirm. Then it handles start,
-stop, logs, parameter changes, and upgrades on request.
+Your coding agent installs the Stitch panel and opens the web UI. You finish
+setup in the browser (add a bot, wallet, approvals, dry run, start). Later the
+agent can help operate an existing install on request.
 
 - **Claude Code** — paste:
 
@@ -111,9 +110,9 @@ stop, logs, parameter changes, and upgrades on request.
 
   > Install the stitch skill from
   > https://github.com/textile-protocol/textile-stitch/tree/main/.codex/skills/stitch
-  > After it succeeds, tell me to restart Codex and ask: `Use the stitch skill to install and run Stitch.`
+  > After it succeeds, tell me to restart Codex and ask: `Use the stitch skill to install Stitch.`
 
-  Restart Codex, then ask: `Use the stitch skill to install and run Stitch.`
+  Restart Codex, then ask: `Use the stitch skill to install Stitch.`
 
 <details>
 <summary>Using a different agent?</summary>
@@ -122,24 +121,25 @@ Paste this into Claude, GPT, Gemini, or any agent with terminal access to the
 machine where Stitch should run:
 
 ```text
-Help me install and configure Textile Stitch.
+Help me install Textile Stitch (the web UI panel only).
 
 Read the full install prompt and follow it in full:
 https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/docs/AI_INSTALL_PROMPT.md
 If you can't fetch that URL, read docs/AI_INSTALL_PROMPT.md directly from the
 textile-protocol/textile-stitch repo (main branch) instead. Don't guess from
 other sources.
-Use recommended defaults where safe, ask for values with no safe default, protect
-STITCH_PRIVATE_KEY, run a dry run first, and do not start live operation until I
-confirm.
+Ask whether I'm installing on a local computer (password) or a server
+(Tailscale), install the panel, open the web app, and stop. I configure bots
+in the browser myself.
 ```
 
 The full copyable prompt is in [AI_INSTALL_PROMPT.md](docs/AI_INSTALL_PROMPT.md).
 
 </details>
 
-Running the binary directly? `stitch init` writes `stitch.toml`, `stitch.env` and
-an owner-only `stitch.key` for a chosen corridor. The per-OS guides cover it.
+Running the binary directly without the panel? `stitch init` writes `stitch.toml`,
+`stitch.env` and an owner-only `stitch.key` for a chosen corridor. The per-OS
+guides cover it.
 
 ## How It Works
 

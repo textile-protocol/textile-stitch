@@ -2,23 +2,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 Textile, Inc.
 #
-# One-command install for Stitch: a web UI for running a fleet of
-# bots on one Docker host, reachable only over your tailnet.
+# One-command install for Stitch: a web UI for running a fleet of bots on one
+# Docker host. Bot config, wallets, and live runs happen in the browser afterward.
 #
 #   curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
 #
-# What it does: checks Docker, asks for a Tailscale auth key and the tailnet
-# login(s) allowed to drive the panel, writes an owner-only .env, and brings up the
-# two containers from the published image. No repo checkout and no build.
+# Two modes:
+#   - local computer → password login on http://127.0.0.1:8420 (loopback only)
+#   - server         → Tailscale sidecar, no host port published
 #
-# It installs the *recommended* deployment and nothing else — the panel behind a
-# Tailscale sidecar, with no port published on the host. Password-only, a custom
-# reverse proxy, or building from source are all in docs/install-panel.md; this
-# script deliberately doesn't try to cover them, because a flag for each is how an
-# installer stops being one command.
-#
-# Non-interactive: set TS_AUTHKEY and PANEL_USERS (and optionally PANEL_BOTS_DIR,
-# PANEL_DIR, PANEL_IMAGE, PANEL_PASSWORD) in the environment and it won't prompt.
+# Non-interactive: set PANEL_MODE=local|server plus the mode's credentials
+# (local: PANEL_PASSWORD; server: TS_AUTHKEY and PANEL_USERS). Optionally set
+# PANEL_BOTS_DIR, PANEL_DIR, PANEL_IMAGE.
 
 set -eu
 
@@ -30,7 +25,8 @@ REPO_RAW="${STITCH_REPO_RAW:-https://raw.githubusercontent.com/textile-protocol/
 REF="${STITCH_REF:-main}"
 DEFAULT_IMAGE="ghcr.io/textile-protocol/textile-stitch-panel:latest"
 DEFAULT_DIR="${HOME}/stitch-panel"
-DEFAULT_BOTS_DIR="/srv/stitch/bots"
+DEFAULT_BOTS_DIR_SERVER="/srv/stitch/bots"
+DEFAULT_BOTS_DIR_LOCAL="${HOME}/stitch-bots"
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -88,6 +84,14 @@ fetch() { # url dest
   fi
 }
 
+normalize_mode() { # raw -> local|server
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    local|laptop|desktop|computer) printf 'local' ;;
+    server|tailscale|ts) printf 'server' ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---------------------------------------------------------------- preflight ---
 step 'Checking Docker'
 command -v docker >/dev/null 2>&1 || die 'Docker is not installed. See https://docs.docker.com/get-docker/'
@@ -101,9 +105,7 @@ say 'Docker and Compose v2 are ready.'
 step 'Where to install'
 # PANEL_DIR is optional and defaults to $DEFAULT_DIR, so it must never be a `need`:
 # `need` dies when a value is unset and there is no TTY, which would break an
-# unattended install that set the required keys but left this one to default. Same
-# shape as PANEL_BOTS_DIR below — prompt with the default when there's a terminal,
-# take the default when there isn't.
+# unattended install that set the required keys but left this one to default.
 PANEL_DIR="${PANEL_DIR:-}"
 if [ -z "$PANEL_DIR" ]; then
   if have_tty; then
@@ -111,6 +113,45 @@ if [ -z "$PANEL_DIR" ]; then
   else
     PANEL_DIR="$DEFAULT_DIR"
   fi
+fi
+
+env_file="$PANEL_DIR/.env"
+compose_mode=''
+if [ -f "$env_file" ]; then
+  step 'Existing install found'
+  say "$env_file already exists, so its settings are kept as they are."
+  say 'Delete it first if you want to be asked again.'
+  reuse_env=yes
+  # Infer mode from what the previous install wrote so we pull the matching compose.
+  if grep -q '^TS_AUTHKEY=' "$env_file" 2>/dev/null; then
+    compose_mode=server
+  else
+    compose_mode=local
+  fi
+else
+  reuse_env=no
+fi
+
+if [ "$reuse_env" = no ]; then
+  # PANEL_MODE=local|server, or ask. Local = password on loopback; server = Tailscale.
+  PANEL_MODE_RAW="${PANEL_MODE:-}"
+  if [ -z "$PANEL_MODE_RAW" ]; then
+    if have_tty; then
+      say 'Local computer: password login at http://127.0.0.1:8420 (this machine only).'
+      say 'Server: Tailscale, so you can open Stitch from your other devices securely.'
+      say ''
+      PANEL_MODE_RAW="$(ask 'Install on a local computer or a server? (local/server)' 'local')"
+    else
+      die 'PANEL_MODE is not set and there is no terminal to ask on. Set PANEL_MODE=local or PANEL_MODE=server and re-run.'
+    fi
+  fi
+  compose_mode="$(normalize_mode "$PANEL_MODE_RAW")" ||
+    die "PANEL_MODE must be 'local' or 'server' (got '$PANEL_MODE_RAW')"
+fi
+
+DEFAULT_BOTS_DIR="$DEFAULT_BOTS_DIR_SERVER"
+if [ "$compose_mode" = local ]; then
+  DEFAULT_BOTS_DIR="$DEFAULT_BOTS_DIR_LOCAL"
 fi
 
 PANEL_BOTS_DIR="${PANEL_BOTS_DIR:-}"
@@ -122,17 +163,7 @@ if [ -z "$PANEL_BOTS_DIR" ]; then
   fi
 fi
 
-env_file="$PANEL_DIR/.env"
-if [ -f "$env_file" ]; then
-  step 'Existing install found'
-  say "$env_file already exists, so its settings are kept as they are."
-  say 'Delete it first if you want to be asked again.'
-  reuse_env=yes
-else
-  reuse_env=no
-fi
-
-if [ "$reuse_env" = no ]; then
+if [ "$reuse_env" = no ] && [ "$compose_mode" = server ]; then
   step 'Tailscale'
   # Only explain what we are about to ask for. With both values already in the
   # environment this is an unattended run, and a wall of guidance is just noise.
@@ -166,16 +197,27 @@ fi
 
 PANEL_IMAGE="${PANEL_IMAGE:-$DEFAULT_IMAGE}"
 
+if [ "$compose_mode" = local ]; then
+  COMPOSE_FILE=docker-compose.panel.local.yml
+else
+  COMPOSE_FILE=docker-compose.panel.yml
+fi
+
 # ------------------------------------------------------------------- layout ---
-step "Installing into $PANEL_DIR"
-mkdir -p "$PANEL_DIR/deploy"
+step "Installing into $PANEL_DIR ($compose_mode)"
+mkdir -p "$PANEL_DIR"
 
 # The compose file is downloaded rather than written here on purpose: it is the
 # same file the repo ships, so this installer can never drift from the deployment
 # it is supposed to be installing.
-fetch "$REPO_RAW/$REF/docker-compose.panel.yml" "$PANEL_DIR/docker-compose.panel.yml"
-fetch "$REPO_RAW/$REF/deploy/panel-serve.json" "$PANEL_DIR/deploy/panel-serve.json"
-say 'Compose file and tailscale serve config in place.'
+fetch "$REPO_RAW/$REF/$COMPOSE_FILE" "$PANEL_DIR/$COMPOSE_FILE"
+if [ "$compose_mode" = server ]; then
+  mkdir -p "$PANEL_DIR/deploy"
+  fetch "$REPO_RAW/$REF/deploy/panel-serve.json" "$PANEL_DIR/deploy/panel-serve.json"
+  say 'Compose file and tailscale serve config in place.'
+else
+  say 'Local compose file in place.'
+fi
 
 step "Creating the bots root at $PANEL_BOTS_DIR"
 if mkdir -p "$PANEL_BOTS_DIR" 2>/dev/null; then
@@ -191,73 +233,106 @@ fi
 if [ "$reuse_env" = no ]; then
   step 'Writing .env'
   # Written through a temp file in the same directory so a failure part-way leaves
-  # no half-written file holding a real auth key.
+  # no half-written file holding a real auth key or password hash.
   tmp_env="$PANEL_DIR/.env.tmp.$$"
   {
-    printf '# Written by install-panel.sh. Holds a Tailscale auth key: keep it 0600.\n'
-    printf 'TS_AUTHKEY=%s\n' "$TS_AUTHKEY"
-    printf 'PANEL_USERS=%s\n' "$PANEL_USERS"
+    printf '# Written by install-panel.sh. Keep it 0600.\n'
+    printf 'PANEL_MODE=%s\n' "$compose_mode"
     printf 'PANEL_BOTS_DIR=%s\n' "$PANEL_BOTS_DIR"
     printf 'PANEL_IMAGE=%s\n' "$PANEL_IMAGE"
+    if [ "$compose_mode" = server ]; then
+      printf 'TS_AUTHKEY=%s\n' "$TS_AUTHKEY"
+      printf 'PANEL_USERS=%s\n' "$PANEL_USERS"
+    fi
   } >"$tmp_env"
   mv "$tmp_env" "$env_file"
   chmod 600 "$env_file"
   say "Wrote $env_file (0600)."
 fi
 
-# ---------------------------------------------------------- optional password --
-# A password is a fallback credential, not the main one: Tailscale omits identity
-# headers for tagged nodes and for Funnel, and without a password those cases have
-# no way in. Hashed by the panel image itself, piped over stdin so the plaintext
-# never reaches a command line where `ps` could read it.
+# --------------------------------------------------------------- password ----
+# Hashed by the panel image itself, piped over stdin so the plaintext never
+# reaches a command line where `ps` could read it.
 add_password() {
   _pw="$1"
+  _label="${2:-password}"
   _hash="$(printf '%s\n' "$_pw" | docker run --rm -i "$PANEL_IMAGE" hash-password 2>/dev/null)" ||
     die 'hashing the password failed'
   [ -n "$_hash" ] || die 'the panel returned an empty password hash'
   # Single-quoted: an argon2 hash is full of $ that compose would otherwise read
   # as variable interpolation.
+  # Drop any previous hash line so re-running with PANEL_PASSWORD replaces it.
+  if grep -q '^PANEL_PASSWORD_HASH=' "$env_file" 2>/dev/null; then
+    tmp_env="$PANEL_DIR/.env.tmp.$$"
+    grep -v '^PANEL_PASSWORD_HASH=' "$env_file" >"$tmp_env"
+    mv "$tmp_env" "$env_file"
+    chmod 600 "$env_file"
+  fi
   printf "PANEL_PASSWORD_HASH='%s'\n" "$_hash" >>"$env_file"
-  say 'Added a password fallback.'
+  say "Added $_label."
 }
 
 step "Pulling $PANEL_IMAGE"
 docker pull "$PANEL_IMAGE" >/dev/null || die "couldn't pull $PANEL_IMAGE"
 say 'Pulled.'
 
-if [ -n "${PANEL_PASSWORD:-}" ]; then
-  step 'Adding the password fallback'
-  add_password "$PANEL_PASSWORD"
-elif [ "$reuse_env" = no ] && have_tty; then
-  step 'Password fallback (optional)'
-  say 'Useful if you browse from a tagged Tailscale node, which gets no identity'
-  say 'header. Press Enter to skip.'
-  _pw="$(ask_secret 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
-  if [ -n "$_pw" ]; then add_password "$_pw"; else say 'Skipped.'; fi
+if [ "$compose_mode" = local ]; then
+  # Password is required: it's the only way in.
+  if ! grep -q '^PANEL_PASSWORD_HASH=' "$env_file" 2>/dev/null; then
+    step 'Panel password'
+    if [ -z "${PANEL_PASSWORD:-}" ]; then
+      say 'This install is loopback-only. You log in with a password you choose now.'
+    fi
+    PANEL_PASSWORD="$(need "${PANEL_PASSWORD:-}" 'Panel password (12+ characters, not shown)' PANEL_PASSWORD secret)"
+    [ -n "$PANEL_PASSWORD" ] || die 'a panel password is required for a local install'
+    add_password "$PANEL_PASSWORD" 'panel password'
+  elif [ -n "${PANEL_PASSWORD:-}" ]; then
+    step 'Updating the panel password'
+    add_password "$PANEL_PASSWORD" 'panel password'
+  fi
+else
+  # Optional fallback for tagged Tailscale nodes / Funnel edge cases.
+  if [ -n "${PANEL_PASSWORD:-}" ]; then
+    step 'Adding the password fallback'
+    add_password "$PANEL_PASSWORD" 'password fallback'
+  elif [ "$reuse_env" = no ] && have_tty; then
+    step 'Password fallback (optional)'
+    say 'Useful if you browse from a tagged Tailscale node, which gets no identity'
+    say 'header. Press Enter to skip.'
+    _pw="$(ask_secret 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
+    if [ -n "$_pw" ]; then add_password "$_pw" 'password fallback'; else say 'Skipped.'; fi
+  fi
 fi
 
 # ---------------------------------------------------------------------- up ----
 step 'Starting the panel'
 cd "$PANEL_DIR"
 # --no-build because the image is already pulled: this deployment has no source
-# tree, so the `build:` section in the compose file must not be reached.
-docker compose -f docker-compose.panel.yml up -d --no-build
+# tree, so a `build:` section in the compose file must not be reached.
+docker compose -f "$COMPOSE_FILE" up -d --no-build
 
 step 'Done'
-# Best-effort: ask the sidecar what name it ended up with, so the operator gets a
-# URL rather than a pattern to fill in. Never fatal — the panel is already up.
-host=''
-if host_json="$(docker compose -f docker-compose.panel.yml exec -T tailscale tailscale status --json 2>/dev/null)"; then
-  host="$(printf '%s' "$host_json" | tr ',' '\n' | grep -m1 '"DNSName"' | sed 's/.*"DNSName":"//; s/\.".*//; s/\.$//')"
-fi
-if [ -n "$host" ]; then
-  say "Open https://$host"
+if [ "$compose_mode" = local ]; then
+  say 'Open http://127.0.0.1:8420 and log in with the password you set.'
 else
-  say 'Open https://stitch-panel.<your-tailnet>.ts.net'
-  say '(run `tailscale status` on any tailnet device if you are not sure of the name)'
+  # Best-effort: ask the sidecar what name it ended up with, so the operator gets a
+  # URL rather than a pattern to fill in. Never fatal — the panel is already up.
+  host=''
+  if host_json="$(docker compose -f "$COMPOSE_FILE" exec -T tailscale tailscale status --json 2>/dev/null)"; then
+    host="$(printf '%s' "$host_json" | tr ',' '\n' | grep -m1 '"DNSName"' | sed 's/.*"DNSName":"//; s/\.".*//; s/\.$//')"
+  fi
+  if [ -n "$host" ]; then
+    say "Open https://$host"
+  else
+    say 'Open https://stitch-panel.<your-tailnet>.ts.net'
+    say '(run `tailscale status` on any tailnet device if you are not sure of the name)'
+  fi
 fi
 say ''
-say "Logs:    cd $PANEL_DIR && docker compose -f docker-compose.panel.yml logs -f panel"
-say "Stop:    cd $PANEL_DIR && docker compose -f docker-compose.panel.yml down"
-say 'Advanced setups (password-only, your own reverse proxy, building from source):'
+say 'In the web UI: Add a bot, pick a corridor, paste your operator wallet key,'
+say 'approve tokens, then start. The installer does not configure bots for you.'
+say ''
+say "Logs:    cd $PANEL_DIR && docker compose -f $COMPOSE_FILE logs -f panel"
+say "Stop:    cd $PANEL_DIR && docker compose -f $COMPOSE_FILE down"
+say 'Advanced setups (custom reverse proxy, building from source):'
 say 'https://github.com/textile-protocol/textile-stitch/blob/main/docs/install-panel.md'

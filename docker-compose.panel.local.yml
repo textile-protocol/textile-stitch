@@ -1,0 +1,37 @@
+# Stitch (web UI) on a local computer — password login, loopback only.
+#
+# No Tailscale sidecar. The panel publishes 127.0.0.1:8420 on the host, so only
+# processes on this machine can reach it. Reaching the panel means reaching the
+# Docker socket; do not publish this port beyond loopback.
+#
+# Setup (or use install-panel.sh and pick "local computer"):
+#   1. Put a password in .env as PANEL_PASSWORD (12+ chars). The installer hashes
+#      it into PANEL_PASSWORD_HASH for you.
+#   2. Create the bots root (default ~/stitch-bots on a laptop).
+#   3. docker compose -f docker-compose.panel.local.yml up -d --no-build
+#   4. Open http://127.0.0.1:8420 and log in with the password.
+#
+# For a server reachable from your other devices, use docker-compose.panel.yml
+# (Tailscale) instead — see docs/install-panel.md.
+
+services:
+  panel:
+    image: ${PANEL_IMAGE:-ghcr.io/textile-protocol/textile-stitch-panel:latest}
+    container_name: stitch-panel
+    ports:
+      - "127.0.0.1:8420:8420"
+    environment:
+      RUST_LOG: info
+      # Inside the container; the host mapping above pins it to loopback.
+      STITCH_PANEL_BIND: 0.0.0.0:8420
+      STITCH_PANEL_ALLOW_INSECURE_BIND: "1"
+      STITCH_PANEL_BOTS_DIR: /data/bots
+      STITCH_PANEL_HOST_BOTS_DIR: ${PANEL_BOTS_DIR:?set PANEL_BOTS_DIR in .env}
+      # Password is the only credential on this path — no identity header.
+      STITCH_PANEL_PASSWORD_HASH: ${PANEL_PASSWORD_HASH:?set PANEL_PASSWORD_HASH in .env}
+      STITCH_PANEL_BOT_IMAGE: ${STITCH_BOT_IMAGE:-ghcr.io/textile-protocol/textile-stitch:latest}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PANEL_BOTS_DIR}:/data/bots
+    restart: unless-stopped
+    stop_grace_period: 30s

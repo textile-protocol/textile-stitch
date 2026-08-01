@@ -13,9 +13,9 @@
 #   4. docker compose -f docker-compose.panel.yml up -d --build
 #   5. Open https://stitch-panel.<your-tailnet>.ts.net
 #
-# If you don't want Tailscale, see docs/install-panel.md for the password-only
-# variant. Don't publish this port to the internet: reaching the panel means
-# reaching the Docker socket, which means owning the host.
+# Local computer (password on loopback): use docker-compose.panel.local.yml, or
+# install-panel.sh with PANEL_MODE=local. Don't publish the panel beyond
+# loopback/Tailscale: reaching it means reaching the Docker socket.
 
 services:
   tailscale:

@@ -16,14 +16,15 @@ compose.
 root-equivalent, and it can read every bot's config. Anyone who reaches it owns
 the machine and the market-maker wallets. There is no version of this that is
 merely somewhat privileged, so the whole install is built around not exposing it:
-loopback bind, Tailscale in front, and a refusal to start on a routable address
-unless you override it explicitly.
+loopback bind on a local computer, Tailscale in front on a server, and a refusal
+to start on a routable address unless you override it explicitly.
 
 ## Requirements
 
 - Docker with Compose v2 (`docker compose version`).
-- A Tailscale account, for the recommended setup. Free tier is enough.
-- A directory on the host for bot configs. `/srv/stitch/bots` in these examples.
+- A Tailscale account, for server installs. Free tier is enough.
+- A directory on the host for bot configs (`~/stitch-bots` locally, or
+  `/srv/stitch/bots` on a server).
 
 ## Install it
 
@@ -31,32 +32,39 @@ unless you override it explicitly.
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
 ```
 
-That is the whole install. It checks Docker, asks for a Tailscale auth key and
-the tailnet logins allowed to drive Stitch, writes an owner-only `.env`, and
-starts the two containers from the published image. No checkout, no build.
+That is the whole install. It checks Docker, asks whether this is a **local
+computer** (password on `http://127.0.0.1:8420`) or a **server** (Tailscale),
+writes an owner-only `.env`, and starts the published image. No checkout, no
+build. You add bots in the web UI afterward.
 
 To run it unattended, set the answers in the environment and it won't prompt:
 
 ```bash
-TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
+# Local computer — password login on loopback
+PANEL_MODE=local PANEL_PASSWORD='choose-a-long-password' \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
+
+# Server — Tailscale
+PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
 ```
 
 | Variable | Default | What |
 |----------|---------|------|
-| `TS_AUTHKEY` | asked | Tailscale auth key. Reusable, not ephemeral. |
-| `PANEL_USERS` | asked | Comma-separated tailnet logins allowed in. |
-| `PANEL_BOTS_DIR` | `/srv/stitch/bots` | Where bot configs live on the host. |
+| `PANEL_MODE` | asked | `local` (password) or `server` (Tailscale). |
+| `PANEL_PASSWORD` | asked on local | Required for local; optional fallback on server. |
+| `TS_AUTHKEY` | asked on server | Tailscale auth key. Reusable, not ephemeral. |
+| `PANEL_USERS` | asked on server | Comma-separated tailnet logins allowed in. |
+| `PANEL_BOTS_DIR` | `~/stitch-bots` / `/srv/stitch/bots` | Where bot configs live on the host. |
 | `PANEL_DIR` | `~/stitch-panel` | Where the compose file and `.env` go. |
-| `PANEL_PASSWORD` | none | Optional password fallback, hashed for you. |
 | `PANEL_IMAGE` | published `:latest` | Pin a `sha-*` tag in production. |
 
 Re-running it is safe: an existing `.env` is left alone, so it doubles as
 "pull the current image and bring Stitch back up".
 
 **The rest of this page is the manual route.** You only need it to change
-something the installer doesn't ask about — password-only login, your own reverse
-proxy, building from source, or wiring the compose file into an existing stack.
+something the installer doesn't ask about — your own reverse proxy, building
+from source, or wiring the compose file into an existing stack.
 
 ## Manual: Tailscale-only
 
@@ -166,8 +174,11 @@ unaffected.
 
 ## Without Tailscale
 
-If you already have an authenticated reverse proxy, skip the sidecar and run the
-panel on its own, published only to loopback:
+The installer already covers a local password install via
+`docker-compose.panel.local.yml` (`PANEL_MODE=local`). Use the snippet below
+only if you already have an authenticated reverse proxy, or you're wiring the
+panel into an existing stack by hand — skip the sidecar and publish only to
+loopback:
 
 ```yaml
 services:

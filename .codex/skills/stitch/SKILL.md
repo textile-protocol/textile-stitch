@@ -1,25 +1,30 @@
 ---
 name: stitch
-description: Operate Stitch, the Textile operator bot — start, stop, restart, check status, tail logs, upgrade, change pool parameters (spreads, liquidity), and manage Permit2 approvals. Falls back to install if Stitch isn't set up yet. Use when asked to "start/stop/restart stitch", "run the bot", "check the bot", "stitch logs", "upgrade stitch", "change the spread/liquidity", or "install stitch".
+description: Operate Stitch, the Textile operator bot — start, stop, restart, check status, tail logs, upgrade, change pool parameters (spreads, liquidity), and manage Permit2 approvals. Falls back to installing the Stitch panel (web UI) if nothing is set up yet. Use when asked to "start/stop/restart stitch", "run the bot", "check the bot", "stitch logs", "upgrade stitch", "change the spread/liquidity", or "install stitch".
 metadata:
   short-description: Operate the Stitch operator bot
 ---
 
 # Operate Stitch
 
-Stitch is the Textile operator bot (binary `stitch`): per-pool market making.
-This skill both runs an existing Stitch and installs one that isn't set up yet.
+Stitch is the Textile operator bot: per-pool market making. New installs use the
+**Stitch panel** (Docker web UI). This skill operates an existing layout and, if
+nothing is set up yet, installs the panel only — bot config happens in the browser.
 
 ## Always start here
 
 1. **Find the run layout and whether it's installed** — the next section.
 2. **If it's not installed**, don't show the menu. Tell the operator, then with a
-   single question confirm they want to install now. On yes, install by reading
-   `docs/AI_INSTALL_PROMPT.md` and following it in full — see
+   single question confirm they want to install the Stitch panel now. On yes,
+   install by reading `docs/AI_INSTALL_PROMPT.md` and following it in full — see
    [Not installed yet](#not-installed-yet).
-3. **If it's installed**, ask the operator what they want to do, **one question at
-   a time**. Never guess the action from a vague request — ask. Wait for each
-   answer before the next question or any command.
+3. **If the Stitch panel is installed**, prefer pointing the operator at the web
+   UI for add/start/stop/settings/approvals/logs. Only drive the API or Docker
+   CLI if they ask you to do it from the terminal.
+4. **If another layout is installed** (desktop app, local service, compose-only,
+   cloud), ask what they want to do, **one question at a time**. Never guess the
+   action from a vague request — ask. Wait for each answer before the next
+   question or any command.
 
 Question-tool rules (same as the install prompt): use `request_user_input` in Plan
 mode — one question per call, multiple choice, most-likely option first; it adds a
@@ -54,45 +59,33 @@ detected, honoring the golden rules throughout.
 
 ## First: find the install and how it runs
 
-Figure out which layout is in use *before* doing anything. A missing local
-binary only means "not installed" for the local layouts — the cloud layout has no
-local binary by design, so don't treat a missing `stitch` as not-installed until
-you've ruled out cloud.
+Figure out which layout is in use *before* doing anything. Check for the panel
+first — that is the default install path now. A missing local `stitch` binary
+does **not** mean "not installed" if `stitch-panel` is running, and the cloud
+layout has no local binary by design.
 
-Five standard layouts:
+Layouts, in the order to check:
 
-- **Foreground / manual** (macOS, foreground Linux, Windows): config lives in
-  `~/Stitch/` (`%USERPROFILE%\Stitch\` on Windows) — `stitch.toml`, `stitch.key`,
-  `stitch.env`. Started by hand, logs to its terminal.
+- **Stitch panel** (`stitch-panel` container, often with a Tailscale sidecar):
+  web UI for one or many bots on a Docker host. Local installs use password login
+  at `http://127.0.0.1:8420`; server installs use Tailscale
+  (`https://stitch-panel.<tailnet>.ts.net`). See [Docker fleet](#docker-fleet).
+- **Docker fleet without panel**: bot containers only, driven with
+  `docker compose`. See [Docker fleet](#docker-fleet).
 - **Desktop app** (`stitch-setup` — macOS `Stitch.app`, Windows
-  `stitch-setup.exe`, Linux `stitch-setup`): a GUI that writes the config and then
-  supervises the bot in-window — Start/Stop, a dry-run toggle, an "Approve tokens"
-  button, live logs, and Update. It runs `stitch` as a child process, so there's
-  no service and closing the window stops the bot; config lives in the standard
-  `~/Stitch/` dir. If the operator is driving the app, point them at its buttons
-  instead of racing it from the CLI; for unattended 24/7 running they should
-  install one of the service layouts.
-- **Local service**: Linux systemd uses `/etc/stitch-bot/` with the same
-  filenames and service name `stitch`. macOS launchd / Windows Task Scheduler run
-  the agent or task you installed.
-- **AWS cloud** (ECS Fargate): the operator-owned `deploy/aws` stack. No local
-  binary — Stitch runs as a one-task ECS service, key + config live in Secrets
-  Manager. See [AWS cloud](#aws-cloud-ecs-fargate) below.
-- **Docker fleet**: several bots as containers on one host, one container per bot,
-  each with its own config dir and key. Either driven by hand with
-  `docker compose`, or through Stitch (`stitch-panel`) — a web UI on the same
-  host that manages the same containers. See [Docker fleet](#docker-fleet) below.
+  `stitch-setup.exe`, Linux `stitch-setup`): GUI that supervises one bot in-window.
+- **Foreground / manual** or **local service**: `~/Stitch/` (or
+  `/etc/stitch-bot/` on Linux systemd) with `stitch.toml` / key / env.
+- **AWS cloud** (ECS Fargate): operator-owned `deploy/aws` stack. See
+  [AWS cloud](#aws-cloud-ecs-fargate).
 
-Detect it: for the local layouts, `stitch --version` plus `systemctl status
-stitch` (Linux), `launchctl list | grep -i stitch` (macOS), or Task Scheduler
-(Windows); a running desktop app shows up as a `stitch-setup` (or `Stitch`)
-process supervising a `stitch` child. For a Docker fleet,
-`docker ps --filter ancestor=ghcr.io/textile-protocol/textile-stitch` lists the
-bots, and a `stitch-panel` container means Stitch is in play. For cloud, an ECS
-service named `<bot>-stitch` in the operator's AWS account (the request itself
-usually tells you — `aws`/ECS talk means cloud). Operate against whichever is
-real. Only if it's a local layout and `stitch` isn't on PATH is it genuinely not
-installed — then see [Not installed yet](#not-installed-yet).
+Detect it: `docker ps --filter name=stitch-panel` (or image
+`textile-stitch-panel`) means the panel is installed. Bot containers show under
+`ghcr.io/textile-protocol/textile-stitch`. Local layouts: `stitch --version`,
+`systemctl status stitch`, `launchctl list | grep -i stitch`, or a running
+`stitch-setup`/`Stitch` process. Cloud: ECS service `<bot>-stitch`. Only if none
+of those exist is it genuinely not installed — then see
+[Not installed yet](#not-installed-yet).
 
 ## Golden rules — every operation
 
@@ -275,31 +268,29 @@ remounted read-only on top.
 
 ## Not installed yet
 
-If `stitch` isn't on PATH, install it first. Don't reconstruct the steps from
-memory — read `docs/AI_INSTALL_PROMPT.md` and follow it in full (OS/arch detection,
-the operator interview, release install, safe key handling, dry run, and the
-confirmation gate). Prefer a local copy — `docs/AI_INSTALL_PROMPT.md` in the repo,
-or `packages/stitch-bot/docs/AI_INSTALL_PROMPT.md` in the Textile monorepo — otherwise
-fetch the canonical one:
+If nothing above is present, install the **Stitch panel** (web UI). Don't
+reconstruct the steps from memory — read `docs/AI_INSTALL_PROMPT.md` and follow
+it in full. That prompt asks whether this is a local computer (password) or a
+server (Tailscale), runs `install-panel.sh` from disk, opens the web app, and
+stops. Bot config stays in the browser.
+
+Prefer a local copy — `docs/AI_INSTALL_PROMPT.md` in the repo, or
+`packages/stitch-bot/docs/AI_INSTALL_PROMPT.md` in the Textile monorepo —
+otherwise fetch the canonical one:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/docs/AI_INSTALL_PROMPT.md
 ```
 
-Two setup paths that don't need you to drive it, if the operator prefers:
+Other paths only if the operator explicitly prefers them (do not offer these as
+the default install):
 
 - **Desktop app** (no terminal): download the release for their OS and open Stitch
-  — macOS `Stitch.dmg`, Windows `stitch-setup.exe`, Linux `stitch-setup`. Pick a
-  corridor, paste the operator key, click Create; the same window then runs the bot.
-- **Stitch** (several bots on one Docker host): `docs/install-panel.md` brings
-  up `stitch-panel` behind Tailscale, and the operator adds bots from a wizard in
-  the browser. This is the right answer when they say "I want to run more than one
-  bot" or already have a compose file they're tired of editing.
-- **`stitch init`** (built-in wizard): `cd ~/Stitch && stitch init` picks a
-  corridor from the catalog (cNGN/USDT on BSC, XAUt/USDT on Ethereum, wARS/USDT and
-  wBRL/USDT on Celo), prompts for the key (hidden), and writes `stitch.toml`,
-  `stitch.env`, and `stitch.key`. It sets up the local-key signer; for Turnkey or
-  MPCVault, edit the toml afterward (see the signer setup guides).
+  — macOS `Stitch.dmg`, Windows `stitch-setup.exe`, Linux `stitch-setup`.
+- **Manual / CLI**: the per-OS guides under `docs/install-*.md`, or `stitch init`
+  for a single foreground bot.
 
-Once it's installed and dry-run-clean, tell the operator to ask
-`Use the stitch skill to run Stitch` to operate it later.
+Once the panel is up, tell the operator to finish in the web UI (Add a bot →
+corridor → wallet → approve → dry run → start). Ask
+`Use the stitch skill to run Stitch` later only if they want terminal help
+against an existing layout.
