@@ -85,7 +85,9 @@ services:
       # and its loopback is the host's, shared with every local process — any of
       # which could then send an allowlisted login and own the Docker socket. So
       # the panel never infers this from its bind address; it has to be said.
+      # Both flags are required: TRUST alone is refused at startup.
       STITCH_PANEL_TRUST_IDENTITY_HEADER: "1"
+      STITCH_PANEL_IDENTITY_PROXY_ONLY: "1"
       # Optional fallback for when you're not going through `tailscale serve`.
       # Generate with: docker compose -f docker-compose.panel.yml run --rm panel hash-password
       STITCH_PANEL_PASSWORD_HASH: ${PANEL_PASSWORD_HASH:-}

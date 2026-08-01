@@ -116,7 +116,7 @@ provider         = "turnkey"
 organization_id  = "<turnkey org id>"
 sign_with        = "0x<wallet account address or private key id>"
 operator_address = "0x<the EVM address sign_with resolves to>"
-api_base_url     = "https://api.turnkey.com"   # optional, this is the default
+api_base_url     = "https://api.turnkey.com"   # optional default; only api.turnkey.com unless STITCH_ALLOW_CUSTOM_SIGNER_API=1
 max_concurrent_signs = 8                        # optional
 ```
 

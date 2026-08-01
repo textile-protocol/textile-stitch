@@ -40,7 +40,7 @@ jobs:
   build-app:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           # When attaching to a release tag, build from that tag's source. A
           # manual dispatch with `tag` set but the ref left on the default
@@ -49,8 +49,9 @@ jobs:
           # the dispatch/release ref.
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       # Expose only booleans (not the secret values) for later `if:` gates, so the
@@ -205,7 +206,7 @@ jobs:
 
       - name: Upload Stitch.dmg as a workflow artifact
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag == '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: Stitch-dmg
           path: dist/Stitch.dmg

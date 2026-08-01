@@ -290,7 +290,7 @@ digest` in the log.
 | `vault_uuid` | yes | — | the vault holding the operator wallet |
 | `client_signer_pubkey` | yes | — | the sidecar's ssh ed25519 public key |
 | `operator_address` | yes | — | the vault wallet's EVM address |
-| `api_base_url` | no | `https://api.mpcvault.com` | override only if MPCVault gives you a different endpoint |
+| `api_base_url` | no | `https://api.mpcvault.com` | only `api.mpcvault.com` is allowed; set `STITCH_ALLOW_CUSTOM_SIGNER_API=1` to override (sends `X-Mtoken` to that host) |
 | `callback_listen_addr` | no | `0.0.0.0:8088` | where the bot serves the approval callback |
 | `poll_timeout_secs` | no | `30` | per-request HTTP timeout, clamped to a 5s minimum |
 | `max_concurrent_signs` | no | `4` | how many signatures the poster requests at once |

@@ -39,6 +39,7 @@ pub struct TurnkeySigner {
 impl TurnkeySigner {
     /// Build from config + the API key pair in the environment.
     pub fn from_config(cfg: &TurnkeyConfig) -> anyhow::Result<Self> {
+        super::validate_signer_api_base_url("turnkey", &cfg.api_base_url)?;
         let api_key = load_api_key()?;
         let client = TurnkeyClient::builder()
             .api_key(api_key)

@@ -133,6 +133,62 @@ fn default_turnkey_base_url() -> String {
 fn default_mpcvault_base_url() -> String {
     "https://api.mpcvault.com".to_string()
 }
+
+/// Official signer API hosts. Anything else would let a hostile `api_base_url`
+/// exfiltrate bearer tokens (MPCVault `X-Mtoken`) or stamp traffic to an
+/// attacker. Override only with `STITCH_ALLOW_CUSTOM_SIGNER_API=1`.
+const TURNKEY_API_HOSTS: &[&str] = &["api.turnkey.com"];
+const MPCVAULT_API_HOSTS: &[&str] = &["api.mpcvault.com"];
+
+/// Refuse a signer `api_base_url` that isn't on the provider allowlist.
+///
+/// Called from config validation and again when building the backend, so a raw
+/// panel edit and a hand-written TOML both hit the same gate.
+pub fn validate_signer_api_base_url(provider: &str, raw: &str) -> anyhow::Result<()> {
+    let allowed = match provider {
+        "turnkey" => TURNKEY_API_HOSTS,
+        "mpcvault" => MPCVAULT_API_HOSTS,
+        _ => return Ok(()),
+    };
+    let parsed = url::Url::parse(raw.trim())
+        .with_context(|| format!("[signer].api_base_url must be a valid URL, got {raw:?}"))?;
+    anyhow::ensure!(
+        parsed.scheme() == "https",
+        "[signer].api_base_url must be https (got {})",
+        parsed.scheme()
+    );
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .with_context(|| format!("[signer].api_base_url must include a host, got {raw:?}"))?;
+    if allowed.iter().any(|h| host.eq_ignore_ascii_case(h)) {
+        return Ok(());
+    }
+    if custom_signer_api_allowed() {
+        tracing::warn!(
+            provider,
+            host,
+            "allowing non-default signer api_base_url because STITCH_ALLOW_CUSTOM_SIGNER_API=1"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "[signer].api_base_url host {host:?} is not an official {provider} API host \
+         (allowed: {}). Pointing this at an attacker-controlled URL can leak signer \
+         credentials. Use the default, or set STITCH_ALLOW_CUSTOM_SIGNER_API=1 if you \
+         really mean to override it.",
+        allowed.join(", ")
+    );
+}
+
+fn custom_signer_api_allowed() -> bool {
+    matches!(
+        std::env::var("STITCH_ALLOW_CUSTOM_SIGNER_API")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true")
+    )
+}
 fn default_callback_listen_addr() -> String {
     "0.0.0.0:8088".to_string()
 }
@@ -338,6 +394,24 @@ mod tests {
         assert_eq!(
             address_from_signing_key(&key()),
             address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+        );
+    }
+
+    #[test]
+    fn official_signer_api_hosts_are_accepted() {
+        validate_signer_api_base_url("mpcvault", "https://api.mpcvault.com").unwrap();
+        validate_signer_api_base_url("mpcvault", "https://api.mpcvault.com/").unwrap();
+        validate_signer_api_base_url("turnkey", "https://api.turnkey.com").unwrap();
+    }
+
+    #[test]
+    fn hostile_signer_api_hosts_are_rejected() {
+        let err = validate_signer_api_base_url("mpcvault", "https://evil.example/v1")
+            .expect_err("attacker host must be refused");
+        assert!(format!("{err:#}").contains("evil.example"), "{err:#}");
+        assert!(
+            validate_signer_api_base_url("turnkey", "http://api.turnkey.com").is_err(),
+            "http must be refused"
         );
     }
 

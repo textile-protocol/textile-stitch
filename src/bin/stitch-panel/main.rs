@@ -58,9 +58,13 @@ The panel is configured entirely from the environment:
     STITCH_PANEL_PASSWORD_HASH      argon2 hash for password login
     STITCH_PANEL_ALLOW_INSECURE_BIND=1   permit a routable bind (you own the risk)
     STITCH_PANEL_TRUST_IDENTITY_HEADER=1 believe Tailscale-User-Login. Required for
-                                         tailnet-login auth, and only correct when
-                                         an authenticated proxy is the only thing
-                                         that can reach the listener.
+                                         tailnet-login auth; also requires
+                                         STITCH_PANEL_IDENTITY_PROXY_ONLY=1.
+    STITCH_PANEL_IDENTITY_PROXY_ONLY=1   attest that an authenticated reverse proxy
+                                         is the sole peer on the listener (sets and
+                                         strips the identity header). Required with
+                                         TRUST_IDENTITY_HEADER; set by the shipped
+                                         Tailscale sidecar compose file.
 ";
 
 /// Print an argon2 hash for a password typed at the terminal.

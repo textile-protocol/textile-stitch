@@ -28,6 +28,28 @@ to start on a routable address unless you override it explicitly.
 
 ## Install it
 
+**Recommended — pin a release and verify the installer checksum:**
+
+```bash
+TAG=vX.Y.Z   # from https://github.com/textile-protocol/textile-stitch/releases
+curl -fsSL "https://raw.githubusercontent.com/textile-protocol/textile-stitch/${TAG}/install-panel.sh" -o install-panel.sh
+curl -fsSL "https://github.com/textile-protocol/textile-stitch/releases/download/${TAG}/install-panel.sh.sha256" -o install-panel.sh.sha256
+sha256sum -c install-panel.sh.sha256
+STITCH_REF="$TAG" \
+  PANEL_IMAGE="ghcr.io/textile-protocol/textile-stitch-panel:sha-<commit>" \
+  STITCH_REQUIRE_PINNED=1 \
+  PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
+  sh install-panel.sh
+```
+
+`PANEL_IMAGE` should be a `sha-*` tag or `@sha256:…` digest from
+[GHCR](https://github.com/textile-protocol/textile-stitch/pkgs/container/textile-stitch-panel).
+Set `STITCH_COMPOSE_SHA256` from the release's `docker-compose.panel.yml.sha256`
+asset when you want the fetched compose file integrity-checked too.
+
+**Quick path** (image defaults to `:latest`, so compose is fetched from `main`
+to stay aligned; pin both `STITCH_REF` and `PANEL_IMAGE` for a release install):
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
 ```
@@ -37,7 +59,10 @@ computer** (password on `http://127.0.0.1:8420`) or a **server** (Tailscale),
 writes an owner-only `.env`, and starts the published image. No checkout, no
 build. You add bots in the web UI afterward.
 
-To run it unattended, set the answers in the environment and it won't prompt:
+To run it unattended, set the answers in the environment and it won't prompt.
+Omit `STITCH_REF` here so compose stays on `main` with the default `:latest`
+image; for a release install, pin both `STITCH_REF` and `PANEL_IMAGE` as in the
+recommended block above.
 
 ```bash
 # Local computer — password login on loopback
@@ -57,7 +82,10 @@ PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
 | `PANEL_USERS` | asked on server | Comma-separated tailnet logins allowed in. |
 | `PANEL_BOTS_DIR` | `~/stitch-bots` / `/srv/stitch/bots` | Where bot configs live on the host. |
 | `PANEL_DIR` | `~/stitch-panel` | Where the compose file and `.env` go. |
-| `PANEL_IMAGE` | published `:latest` | Pin a `sha-*` tag in production. |
+| `PANEL_IMAGE` | published `:latest` | Pin a `sha-*` tag or digest in production. |
+| `STITCH_REF` | `main` when image is `:latest`; else latest release tag | Git ref for compose + serve config. |
+| `STITCH_COMPOSE_SHA256` | unset | Expected SHA-256 of `docker-compose.panel.yml`. |
+| `STITCH_REQUIRE_PINNED` | off | Require explicit immutable `STITCH_REF` (`vX.Y.Z` / 40-char SHA) and `PANEL_IMAGE` (`sha-*` / `@sha256:…`). |
 
 Re-running it is safe: an existing `.env` is left alone, so it doubles as
 "pull the current image and bring Stitch back up".
@@ -115,9 +143,9 @@ live.
 
 That header is only an identity because `tailscale serve` is the one thing that
 can reach the listener: the panel shares the sidecar's network namespace, so its
-`127.0.0.1` is the sidecar's, not the host's. `docker-compose.panel.yml` says so
-with `STITCH_PANEL_TRUST_IDENTITY_HEADER=1`, and the panel believes the header
-only because of that variable.
+`127.0.0.1` is the sidecar's, not the host's. `docker-compose.panel.yml` sets both
+`STITCH_PANEL_TRUST_IDENTITY_HEADER=1` and `STITCH_PANEL_IDENTITY_PROXY_ONLY=1`,
+and the panel believes the header only when both are set.
 
 It won't work it out from the bind address, because the address can't tell the two
 deployments apart. Run the same binary directly on the host and `127.0.0.1` is the
@@ -127,9 +155,11 @@ handed to an account that had nothing. Binding straight to your tailnet address 
 the same problem one layer out: peers reach that listener directly, with no proxy
 in between to overwrite what they sent.
 
-So set the variable only where an authenticated proxy is genuinely the only route
-in. Everywhere else, use the password fallback. (A routable bind is separately
-refused unless you also set `STITCH_PANEL_ALLOW_INSECURE_BIND=1`.)
+So set both variables only where an authenticated proxy is genuinely the only
+route in. TRUST alone is refused at startup — the second flag is your attestation
+that the proxy-only property holds. Everywhere else, use the password fallback.
+(A routable bind is separately refused unless you also set
+`STITCH_PANEL_ALLOW_INSECURE_BIND=1`.)
 
 Two cases where the header doesn't arrive:
 
@@ -207,9 +237,9 @@ why the insecure-bind override is needed: the panel can't see your host's port
 mapping, only its own listener.
 
 If your proxy authenticates users and sets `Tailscale-User-Login` itself, add
-`STITCH_PANEL_TRUST_IDENTITY_HEADER=1` and the tailnet allowlist. Only do that if
-your proxy strips the inbound header first *and* nothing can bypass the proxy to
-reach the panel's port directly.
+`STITCH_PANEL_TRUST_IDENTITY_HEADER=1`, `STITCH_PANEL_IDENTITY_PROXY_ONLY=1`, and
+the tailnet allowlist. Only do that if your proxy strips the inbound header first
+*and* nothing can bypass the proxy to reach the panel's port directly.
 
 ## Adopting an existing compose fleet
 
@@ -441,7 +471,8 @@ Everything is read from the environment at startup. Nothing is stored.
 | `STITCH_PANEL_TAILNET_USERS` | — | Comma-separated tailnet login allowlist. |
 | `STITCH_PANEL_PASSWORD_HASH` | — | argon2 hash from `stitch-panel hash-password`. |
 | `STITCH_PANEL_ALLOW_INSECURE_BIND` | off | Permit a routable bind. You own the consequences. |
-| `STITCH_PANEL_TRUST_IDENTITY_HEADER` | off | Believe `Tailscale-User-Login`. Required for tailnet-login auth, never inferred from the bind. Set it only where an authenticated proxy that strips the inbound header is the only route to the listener — the sidecar layout in `docker-compose.panel.yml` sets it for you. |
+| `STITCH_PANEL_TRUST_IDENTITY_HEADER` | off | Believe `Tailscale-User-Login`. Required for tailnet-login auth, never inferred from the bind. Also requires `STITCH_PANEL_IDENTITY_PROXY_ONLY=1`. |
+| `STITCH_PANEL_IDENTITY_PROXY_ONLY` | off | Attest that an authenticated reverse proxy is the sole peer on the listener (sets and strips the identity header). Required with `TRUST_IDENTITY_HEADER`. The sidecar layout in `docker-compose.panel.yml` sets both for you. |
 | `RUST_LOG` | `info` | Log verbosity. |
 
 At least one of `STITCH_PANEL_TAILNET_USERS` and `STITCH_PANEL_PASSWORD_HASH` must
@@ -471,11 +502,17 @@ prints the count; the fleet page prints the directory it read.
 exists but read the message first.
 
 **"nothing has told it the `Tailscale-User-Login` header is trustworthy"** — you
-set `STITCH_PANEL_TAILNET_USERS` without `STITCH_PANEL_TRUST_IDENTITY_HEADER=1`, so
-every request would be rejected and the panel says so at startup instead. If you're
-running the sidecar layout from `docker-compose.panel.yml` you already have it;
-otherwise decide whether an authenticated proxy really is the only way to reach the
-port, and use the password fallback if it isn't.
+set `STITCH_PANEL_TAILNET_USERS` without both trust flags, so every request would
+be rejected and the panel says so at startup instead. If you're running the
+sidecar layout from `docker-compose.panel.yml` you already have both; otherwise
+decide whether an authenticated proxy really is the only way to reach the port,
+and use the password fallback if it isn't.
+
+**"`STITCH_PANEL_IDENTITY_PROXY_ONLY` is not"** — you set
+`STITCH_PANEL_TRUST_IDENTITY_HEADER=1` without the proxy-only attestation. TRUST
+alone is refused on purpose: on the host's loopback that header is forgeable.
+Either add `STITCH_PANEL_IDENTITY_PROXY_ONLY=1` for a real proxy-only deploy, or
+drop TRUST and use a password.
 
 **A bot's config "isn't readable" or "is outside the bots root"** — an adopted bot
 whose `stitch.toml` lives somewhere the panel can't see. Either bind-mount that

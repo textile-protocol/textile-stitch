@@ -85,7 +85,8 @@ pub struct PanelConfig {
     pub auth: AuthMode,
     /// Whether `Tailscale-User-Login` on an incoming request may be believed.
     ///
-    /// Set from `STITCH_PANEL_TRUST_IDENTITY_HEADER` and nothing else — see
+    /// Set only when both `STITCH_PANEL_TRUST_IDENTITY_HEADER` and
+    /// `STITCH_PANEL_IDENTITY_PROXY_ONLY` are opted in — see
     /// [`trust_identity_header`]. Off means the header isn't even read, because a
     /// client-supplied one would let anyone who can reach the listener and knows
     /// an operator's email drive the Docker socket.
@@ -123,7 +124,7 @@ impl PanelConfig {
         check_bind_address(bind.ip(), insecure)?;
 
         let auth = auth_from_env()?;
-        let trust_identity_header = trust_identity_header();
+        let trust_identity_header = trust_identity_header()?;
         if !trust_identity_header && auth.password_hash().is_none() {
             bail!(
                 "the panel is configured to authenticate by tailnet login, but nothing has \
@@ -132,8 +133,9 @@ impl PanelConfig {
                  proxy is the sole thing that can reach the listener — bind alone doesn't \
                  prove it, because a panel running on the host shares the host's loopback \
                  with every local process. Run it the way docker-compose.panel.yml does \
-                 (in the Tailscale sidecar's network namespace) and set \
-                 STITCH_PANEL_TRUST_IDENTITY_HEADER=1, or set STITCH_PANEL_PASSWORD_HASH \
+                 (in the Tailscale sidecar's network namespace) and set both \
+                 STITCH_PANEL_TRUST_IDENTITY_HEADER=1 and \
+                 STITCH_PANEL_IDENTITY_PROXY_ONLY=1, or set STITCH_PANEL_PASSWORD_HASH \
                  and log in with a password instead."
             );
         }
@@ -269,11 +271,46 @@ fn allow_insecure_bind() -> bool {
 ///   `Tailscale-User-Login: <an allowlisted login>` and drive the Docker socket —
 ///   root on the machine, from an account that had none.
 ///
-/// The bind address can't tell those two apart, so it isn't asked. The operator
-/// who knows which one they built sets `STITCH_PANEL_TRUST_IDENTITY_HEADER=1`, and
-/// `docker-compose.panel.yml` sets it for the sidecar layout where it holds.
-fn trust_identity_header() -> bool {
-    flag("STITCH_PANEL_TRUST_IDENTITY_HEADER")
+/// The bind address can't tell those two apart, so it isn't asked. Trust needs
+/// two explicit opt-ins:
+///
+/// 1. `STITCH_PANEL_TRUST_IDENTITY_HEADER=1` — believe the header at all.
+/// 2. `STITCH_PANEL_IDENTITY_PROXY_ONLY=1` — operator attestation that an
+///    authenticated reverse proxy is the *sole* peer on the listener (sets the
+///    header itself and strips any client-supplied value).
+///
+/// `docker-compose.panel.yml` sets both for the sidecar layout where that
+/// attestation holds. Host installs must use password auth instead.
+fn trust_identity_header() -> Result<bool> {
+    resolve_trust_identity_header(
+        flag("STITCH_PANEL_TRUST_IDENTITY_HEADER"),
+        flag("STITCH_PANEL_IDENTITY_PROXY_ONLY"),
+    )
+}
+
+/// Pure form of [`trust_identity_header`] for tests and the env reader.
+pub(crate) fn resolve_trust_identity_header(
+    trust: bool,
+    proxy_only_attestation: bool,
+) -> Result<bool> {
+    if !trust {
+        return Ok(false);
+    }
+    if !proxy_only_attestation {
+        bail!(
+            "STITCH_PANEL_TRUST_IDENTITY_HEADER=1 is set, but \
+             STITCH_PANEL_IDENTITY_PROXY_ONLY is not. Believing \
+             `Tailscale-User-Login` without an authenticated proxy as the sole \
+             peer on the listener hands the Docker socket to anyone who can \
+             reach the panel and spell an allowlisted login — including every \
+             local process when the panel shares the host's loopback. \
+             Set STITCH_PANEL_IDENTITY_PROXY_ONLY=1 only for the shipped \
+             Tailscale sidecar layout (`network_mode: service:tailscale`) or an \
+             equivalent proxy-only deployment, or drop TRUST_IDENTITY_HEADER and \
+             use STITCH_PANEL_PASSWORD_HASH instead."
+        );
+    }
+    Ok(true)
 }
 
 fn flag(key: &str) -> bool {
@@ -428,12 +465,27 @@ mod tests {
         // anything about who can reach the listener: a panel in the host's network
         // namespace shares 127.0.0.1 with every local process, and a tailnet bind
         // is dialled directly by every peer with no proxy in between to overwrite
-        // the header. Trust comes from STITCH_PANEL_TRUST_IDENTITY_HEADER, which
-        // is why `trust_identity_header` takes no arguments at all.
+        // the header. Trust comes from the two explicit identity-header flags,
+        // which is why `trust_identity_header` takes no bind-address arguments.
         for addr in ["127.0.0.1", "::1", "100.101.102.103", "fd7a:115c:a1e0::1"] {
             let ip: IpAddr = addr.parse().unwrap();
             assert!(check_bind_address(ip, false).is_ok(), "{addr} should bind");
         }
+    }
+
+    #[test]
+    fn trusting_the_identity_header_requires_proxy_only_attestation() {
+        // TRUST alone used to be enough, which is the host-loopback footgun:
+        // any local process could spoof Tailscale-User-Login. The second flag is
+        // the operator saying "an authenticated proxy is the sole peer".
+        assert!(!resolve_trust_identity_header(false, false).unwrap());
+        assert!(!resolve_trust_identity_header(false, true).unwrap());
+        let err = resolve_trust_identity_header(true, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("STITCH_PANEL_IDENTITY_PROXY_ONLY"),
+            "{err:#}"
+        );
+        assert!(resolve_trust_identity_header(true, true).unwrap());
     }
 
     #[test]

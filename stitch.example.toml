@@ -129,14 +129,14 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # organization_id  = "<turnkey org id>"
 # sign_with        = "0x<wallet account address or private key id>"
 # operator_address = "0x<the EVM address sign_with resolves to>"
-# api_base_url     = "https://api.turnkey.com"   # optional, this is the default
+# api_base_url     = "https://api.turnkey.com"   # optional, default (only official hosts allowed unless STITCH_ALLOW_CUSTOM_SIGNER_API=1)
 # max_concurrent_signs = 8                        # optional
 #
 # MPCVault (needs the client-signer sidecar, one per operator; see docs/ADVANCED.md).
 # Secret in the env: MPCVAULT_API_TOKEN / MPCVAULT_API_TOKEN_FILE.
 # [signer]
 # provider = "mpcvault"
-# api_base_url         = "https://api.mpcvault.com"   # optional, default
+# api_base_url         = "https://api.mpcvault.com"   # optional, default (only official hosts allowed unless STITCH_ALLOW_CUSTOM_SIGNER_API=1)
 # vault_uuid           = "<mpcvault vault uuid>"
 # client_signer_pubkey = "ssh-ed25519 AAAA... "       # the sidecar's public key
 # operator_address     = "0x<the vault wallet EVM address>"

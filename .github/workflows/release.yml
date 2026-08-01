@@ -25,6 +25,9 @@ on:
       - 'Cargo.toml'
       - 'deploy/**'
       - 'dist-workspace.toml'
+      - 'docker-compose.panel.local.yml'
+      - 'docker-compose.panel.yml'
+      - 'install-panel.sh'
       - 'src/**'
       - 'stitch.example.toml'
       - 'tests/**'
@@ -36,6 +39,9 @@ on:
       - 'Cargo.toml'
       - 'deploy/**'
       - 'dist-workspace.toml'
+      - 'docker-compose.panel.local.yml'
+      - 'docker-compose.panel.yml'
+      - 'install-panel.sh'
       - 'src/**'
       - 'stitch.example.toml'
       - 'tests/**'
@@ -57,15 +63,20 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        # Checksum-pinned installer — do not pipe an unverified script into sh.
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: |
+          set -euo pipefail
+          url="https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh"
+          expect="b657cf8c04a8b7bc28f39d220f7e6dd11bbd2bdb072c552262bd9ccf597261b5"
+          curl --proto '=https' --tlsv1.2 -fsSL "$url" -o /tmp/cargo-dist-installer.sh
+          echo "$expect  /tmp/cargo-dist-installer.sh" | sha256sum -c -
+          sh /tmp/cargo-dist-installer.sh
       - id: release
         name: Resolve release tag
         shell: bash
@@ -90,7 +101,7 @@ jobs:
             echo "publishing=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Cache dist
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
@@ -112,7 +123,7 @@ jobs:
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
@@ -146,22 +157,46 @@ jobs:
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install Rust non-interactively if not already installed
         if: ${{ matrix.container }}
         run: |
+          set -euo pipefail
           if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            # Pin rustup-init by versioned archive URL + digest. The rolling
+            # /rustup/dist/… URL changes when rustup ships; archive/1.29.0 stays
+            # put. Bump RUSTUP_VERSION and both digests together.
+            RUSTUP_VERSION=1.29.0
+            arch="$(uname -m)"
+            case "$arch" in
+              x86_64)
+                triple="x86_64-unknown-linux-gnu"
+                expect="4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10"
+                ;;
+              aarch64|arm64)
+                triple="aarch64-unknown-linux-gnu"
+                expect="9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792"
+                ;;
+              *)
+                echo "unsupported arch for pinned rustup-init: $arch" >&2
+                exit 1
+                ;;
+            esac
+            url="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${triple}/rustup-init"
+            curl --proto '=https' --tlsv1.2 -fsSL "$url" -o /tmp/rustup-init
+            echo "$expect  /tmp/rustup-init" | sha256sum -c -
+            chmod +x /tmp/rustup-init
+            /tmp/rustup-init -y --no-modify-path
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -211,7 +246,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           compression-level: 0
@@ -229,19 +264,19 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -272,7 +307,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: artifacts-build-global
           compression-level: 0
@@ -298,19 +333,19 @@ jobs:
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Fetch artifacts from scratch-storage
       - name: Fetch artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -323,14 +358,14 @@ jobs:
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
       # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           pattern: artifacts-*
           path: artifacts
@@ -375,6 +410,20 @@ jobs:
           else
             gh release create "$TAG" --target "$RELEASE_COMMIT" --prerelease --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
           fi
+      - name: Upload install-panel integrity checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Operators verify these before `sh install-panel.sh` (see docs/install-panel.md).
+          sha256sum install-panel.sh | awk '{print $1 "  install-panel.sh"}' > install-panel.sh.sha256
+          sha256sum docker-compose.panel.yml | awk '{print $1 "  docker-compose.panel.yml"}' > docker-compose.panel.yml.sha256
+          sha256sum docker-compose.panel.local.yml | awk '{print $1 "  docker-compose.panel.local.yml"}' > docker-compose.panel.local.yml.sha256
+          gh release upload "$TAG" --clobber \
+            install-panel.sh.sha256 \
+            docker-compose.panel.yml.sha256 \
+            docker-compose.panel.local.yml.sha256
       # The release above is created with GITHUB_TOKEN, so it does NOT fire the
       # `release: published` event. Trigger the macOS app build explicitly
       # (workflow_dispatch is exempt from that restriction) so Stitch.dmg gets
@@ -413,7 +462,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
           submodules: recursive

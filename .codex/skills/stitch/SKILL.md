@@ -198,17 +198,19 @@ you deployed under (default `stitch-operator`; the README example uses
 
 - **Change parameters**: the config is the `STITCH_CONFIG_TOML` field of a JSON
   secret that *also* holds `STITCH_PRIVATE_KEY`, and `put-secret-value` replaces
-  the **whole** value — so read the current secret and swap only that one field,
-  or you'll wipe the key and the next task start fails. Pause to `0`, then merge:
+  the **whole** value — so you must merge, not overwrite. Pause to `0`, then run
+  the merge helper (it never prints `SecretString`, so the hot wallet key stays
+  out of the agent transcript):
 
   ```bash
-  cur="$(aws secretsmanager get-secret-value --secret-id "$secret_arn" --query SecretString --output text)"
-  aws secretsmanager put-secret-value --secret-id "$secret_arn" \
-    --secret-string "$(jq -n --argjson cur "$cur" --rawfile cfg stitch.toml '$cur + {STITCH_CONFIG_TOML: $cfg}')"
+  # From a checkout of textile-stitch / packages/stitch-bot:
+  scripts/merge-stitch-secret-config.sh "$secret_arn" stitch.toml
   ```
 
-  Then resume to `1`. Keep `DesiredCount=0` while changing config or rotating keys.
-  `$secret_arn` is the stack's `SecretArn` output (see `deploy/aws/README.md`).
+  Do **not** `get-secret-value` the blob into a shell variable, and do not `echo`
+  or `jq` it into chat. Then resume to `1`. Keep `DesiredCount=0` while changing
+  config or rotating keys. `$secret_arn` is the stack's `SecretArn` output (see
+  `deploy/aws/README.md`).
 
 - **Approvals**: a one-off ECS task with an `approve` command override (not
   `systemctl`/local). See the `aws ecs run-task` block in `deploy/aws/README.md`;

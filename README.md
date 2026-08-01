@@ -60,6 +60,7 @@ For a server, a laptop with Docker, or more than one bot. One command on any
 Docker host:
 
 ```bash
+# Prefer a release tag + checksum (see docs/install-panel.md). Quick path:
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
 ```
 

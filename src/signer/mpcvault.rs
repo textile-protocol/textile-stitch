@@ -102,6 +102,7 @@ impl MpcVaultSigner {
     /// Build from config + the API token in the env, and start the callback
     /// approval server the client-signer sidecar calls.
     pub async fn from_config(cfg: &MpcVaultConfig) -> anyhow::Result<Self> {
+        super::validate_signer_api_base_url("mpcvault", &cfg.api_base_url)?;
         let api_token =
             read_env_secret(API_TOKEN_FILE_ENV, API_TOKEN_ENV).context("MPCVault API token")?;
         let operator_address = parse_address(&cfg.operator_address)?;

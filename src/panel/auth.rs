@@ -8,9 +8,9 @@
 //! - **Identity header.** `tailscale serve` sets `Tailscale-User-Login` on every
 //!   proxied request. It is only an identity when that proxy is the sole thing
 //!   that can reach the listener, which is a property of the deployment rather
-//!   than of anything the panel can see — so it is believed only when
-//!   `STITCH_PANEL_TRUST_IDENTITY_HEADER` says so, and ignored outright
-//!   otherwise. See [`PanelConfig`](super::PanelConfig).
+//!   than of anything the panel can see — so it is believed only when both
+//!   `STITCH_PANEL_TRUST_IDENTITY_HEADER` and `STITCH_PANEL_IDENTITY_PROXY_ONLY`
+//!   are set, and ignored outright otherwise. See [`PanelConfig`](super::PanelConfig).
 //! - **Password.** An argon2id hash in the environment, exchanged for a session
 //!   cookie. For operators who don't front the panel with `tailscale serve`.
 //!

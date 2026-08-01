@@ -445,6 +445,17 @@ impl Config {
                 }
             }
         }
+        if let Some(signer) = &self.signer {
+            match signer {
+                crate::signer::SignerConfig::Turnkey(c) => {
+                    crate::signer::validate_signer_api_base_url("turnkey", &c.api_base_url)?;
+                }
+                crate::signer::SignerConfig::Mpcvault(c) => {
+                    crate::signer::validate_signer_api_base_url("mpcvault", &c.api_base_url)?;
+                }
+                crate::signer::SignerConfig::Local => {}
+            }
+        }
         Ok(())
     }
 }
