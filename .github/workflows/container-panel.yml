@@ -155,10 +155,15 @@ jobs:
             find . -type f -print >&2 || true
             exit 1
           fi
+          # printf '%s@sha256:%s ' IMAGE d1 d2 mis-pairs args (IMAGE@sha256:d1
+          # then d2@sha256:empty). One printf call per digest file.
           # shellcheck disable=SC2046
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '%s@sha256:%s ' "$REGISTRY_IMAGE" *)
+            $(for digest in *; do
+                [ -f "$digest" ] || continue
+                printf '%s@sha256:%s ' "$REGISTRY_IMAGE" "$digest"
+              done)
 
       - name: Verify multi-arch manifest
         run: |
