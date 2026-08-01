@@ -99,6 +99,8 @@ export interface Settings {
   buySizing: Sizing
   sellSizing: Sizing
   ttlSecs: number
+  /** Re-quote when price moves more than this (bps). 0 = every tick. */
+  refreshThresholdBps: number
   tickIntervalSecs: number
   /** Empty = quote off the instantaneous feed. */
   twapWindowSecs: string

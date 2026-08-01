@@ -135,6 +135,7 @@ pub struct SettingsBody {
     pub buy_sizing: SizingBody,
     pub sell_sizing: SizingBody,
     pub ttl_secs: u64,
+    pub refresh_threshold_bps: u32,
     pub tick_interval_secs: u64,
     /// Rolling TWAP window in seconds. Empty = quote off the instantaneous feed.
     pub twap_window_secs: String,
@@ -164,6 +165,7 @@ impl SettingsBody {
             buy_sizing: SizingBody::from(&v.buy_sizing),
             sell_sizing: SizingBody::from(&v.sell_sizing),
             ttl_secs: v.ttl_secs,
+            refresh_threshold_bps: v.refresh_threshold_bps,
             tick_interval_secs: v.tick_interval_secs,
             twap_window_secs: v.twap_window_secs.clone(),
             twap_max_deviation_bps: v.twap_max_deviation_bps.clone(),
@@ -276,6 +278,8 @@ pub struct SettingsUpdate {
     #[serde(default)]
     pub ttl_secs: Option<u64>,
     #[serde(default)]
+    pub refresh_threshold_bps: Option<u32>,
+    #[serde(default)]
     pub tick_interval_secs: Option<u64>,
     #[serde(default)]
     pub twap_window_secs: Option<String>,
@@ -323,6 +327,9 @@ impl SettingsUpdate {
         }
         if let Some(v) = self.ttl_secs {
             patch.ttl_secs = Some(v);
+        }
+        if let Some(v) = self.refresh_threshold_bps {
+            patch.refresh_threshold_bps = Some(v);
         }
         if let Some(v) = self.tick_interval_secs {
             patch.tick_interval_secs = Some(v);
@@ -971,6 +978,33 @@ mod tests {
         assert_eq!(v["editable"], true);
         assert_eq!(v["pair"]["collateral"].as_str().unwrap().len(), 42);
         assert!(v["ttlSecs"].as_u64().unwrap() > 0);
+        // Present even when the operator hasn't touched it — templates set it.
+        assert!(v["refreshThresholdBps"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn ttl_and_refresh_threshold_round_trip_through_settings() {
+        let h = harness("settings-ttl-refresh");
+        seed(&h, "bot-a");
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "ttlSecs": 90, "refreshThresholdBps": 0 }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["ttlSecs"], 90);
+        assert_eq!(v["settings"]["refreshThresholdBps"], 0);
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "ttlSecs": 20 }))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("ttl") || body.contains("lifetime") || body.contains("deadline"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -993,6 +1027,10 @@ mod tests {
         assert_eq!(v["settings"]["rpcUrl"], before["rpcUrl"]);
         assert_eq!(v["settings"]["sell"], before["sell"]);
         assert_eq!(v["settings"]["ttlSecs"], before["ttlSecs"]);
+        assert_eq!(
+            v["settings"]["refreshThresholdBps"],
+            before["refreshThresholdBps"]
+        );
         assert_eq!(v["settings"]["buySizing"], before["buySizing"]);
         assert_eq!(v["settings"]["twapWindowSecs"], before["twapWindowSecs"]);
     }

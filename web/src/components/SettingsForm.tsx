@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { ApiError, api } from '../api'
 import {
   Banner,
@@ -17,8 +17,9 @@ import type { Bot, Corridor, Settings, Spread } from '../types'
 
 /**
  * Structured settings matching the desktop Stitch app: corridor, signer, spreads,
- * taker leg, endpoints, plus an experimental TWAP / inventory-lean section.
- * Sizing / TTL / tick stay on the Raw config tab.
+ * taker leg, endpoints, plus a collapsed Experimental card for opt-in knobs
+ * (TWAP / inventory-lean today; more subsections can land beside it).
+ * Sizing / tick stay on the Raw config tab.
  *
  * Sends only the fields the operator touched — a partial patch means a concurrent
  * raw edit only loses what this form actually changed.
@@ -108,21 +109,59 @@ export default function SettingsForm({
           </span>
         }
       >
-        <div className="grid gap-4 sm:grid-cols-2">
-          <SpreadField
-            label="Buy spread"
-            hint="How far below the mid the bot bids."
-            value={draft.buy}
-            disabled={!loaded.editable}
-            onChange={(v) => set('buy', v)}
-          />
-          <SpreadField
-            label="Sell spread"
-            hint="How far above the mid the bot asks."
-            value={draft.sell}
-            disabled={!loaded.editable}
-            onChange={(v) => set('sell', v)}
-          />
+        <div className="space-y-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <SpreadField
+              label="Buy spread"
+              hint="How far below the mid the bot bids."
+              value={draft.buy}
+              disabled={!loaded.editable}
+              onChange={(v) => set('buy', v)}
+            />
+            <SpreadField
+              label="Sell spread"
+              hint="How far above the mid the bot asks."
+              value={draft.sell}
+              disabled={!loaded.editable}
+              onChange={(v) => set('sell', v)}
+            />
+          </div>
+          <div className="grid gap-4 border-t border-line-soft pt-4 sm:grid-cols-2">
+            <Field
+              label="Order lifetime (seconds)"
+              hint="How long each resting order stays live. Must be greater than 30 — shorter orders never show as fillable depth. Volatile pairs often use ~60."
+            >
+              <Input
+                type="number"
+                min={31}
+                step={1}
+                value={draft.ttlSecs}
+                disabled={!loaded.editable}
+                onChange={(e) => {
+                  const n = e.target.valueAsNumber
+                  if (Number.isFinite(n) && n >= 0) set('ttlSecs', Math.trunc(n))
+                }}
+              />
+            </Field>
+            <Field
+              label="Refresh threshold (bps)"
+              hint="Re-quote a side when its price moves more than this. 0 re-posts every tick (usual with TWAP). A small deadband cuts signing churn on slow feeds."
+            >
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                value={draft.refreshThresholdBps}
+                disabled={!loaded.editable}
+                onChange={(e) => {
+                  const n = e.target.valueAsNumber
+                  if (Number.isFinite(n) && n >= 0) {
+                    set('refreshThresholdBps', Math.trunc(n))
+                  }
+                }}
+              />
+            </Field>
+          </div>
         </div>
       </Card>
 
@@ -330,9 +369,9 @@ function SpreadField({
 }
 
 /**
- * TWAP + inventory-lean knobs. Optional — leave blank to keep the bot on spot
- * quoting / lean off. Validation lives in the bot's config loader; a bad combo
- * fails the save rather than the next start.
+ * Opt-in knobs that aren't part of the everyday settings surface. Closed by
+ * default so the main form stays short; each feature group is its own
+ * subsection so later experiments can drop in beside TWAP / lean.
  */
 function ExperimentalCard({
   draft,
@@ -343,109 +382,160 @@ function ExperimentalCard({
   editable: boolean
   onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void
 }) {
+  const [open, setOpen] = useState(false)
   const leanOn = draft.leanEnabled || draft.leanShadow
   return (
-    <Card
-      title={
-        <span className="flex items-center gap-2">
-          <span>Experimental</span>
-          <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-muted">
-            TWAP / lean
-          </span>
+    <Card>
+      <button
+        type="button"
+        className={`-m-1 flex w-full items-center gap-2 rounded-lg p-1 text-left hover:bg-hover ${open ? 'mb-4' : ''}`}
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span
+          aria-hidden
+          className={`inline-block text-xs text-muted transition-transform ${open ? 'rotate-90' : ''}`}
+        >
+          ▸
         </span>
-      }
-    >
-      <p className="mb-4 text-xs text-faint">
-        Optional. Center quotes on a rolling TWAP and/or lean spreads against the
-        wallet&apos;s own inventory. Useful on volatile pairs; leave blank unless
-        you want them.
-      </p>
-      <div className="space-y-4">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field
-            label="TWAP window (seconds)"
-            hint="Rolling average of the feed. Empty = quote the instantaneous mid."
-          >
-            <Input
-              value={draft.twapWindowSecs}
-              placeholder="e.g. 60"
-              disabled={!editable}
-              onChange={(e) => {
-                const next = e.target.value
-                onChange('twapWindowSecs', next)
-                // Deviation only applies with a window. Clearing the window while
-                // leaving a populated deviation fails the loader; clear both so
-                // "turn TWAP off" is one field and one save.
-                if (next.trim() === '' && draft.twapMaxDeviationBps.trim() !== '') {
-                  onChange('twapMaxDeviationBps', '')
-                }
-              }}
-            />
-          </Field>
-          <Field
-            label="TWAP max deviation (bps)"
-            hint="Never post a side more than this through spot. Empty = 50. Only applies with a TWAP window."
-          >
-            <Input
-              value={draft.twapMaxDeviationBps}
-              placeholder="50"
-              disabled={!editable || draft.twapWindowSecs.trim() === ''}
-              onChange={(e) => onChange('twapMaxDeviationBps', e.target.value)}
-            />
-          </Field>
-        </div>
+        <h2 className="text-base font-bold">Experimental</h2>
+        <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-muted">
+          optional
+        </span>
+      </button>
+      {open && (
+        <div className="space-y-6">
+          <p className="text-xs text-faint">
+            Features here are opt-in and may change. Leave them alone unless you
+            know you want them.
+          </p>
 
-        <div className="space-y-3 border-t border-line-soft pt-4">
-          <Toggle
-            checked={draft.leanShadow}
-            disabled={!editable}
-            onChange={(v) => onChange('leanShadow', v)}
-            label="Lean shadow — log lean quotes next to the live ones (no behavior change)"
-          />
-          <Toggle
-            checked={draft.leanEnabled}
-            disabled={!editable}
-            onChange={(v) => onChange('leanEnabled', v)}
-            label="Lean enabled — quote the live book off inventory-lean prices"
-          />
-          {leanOn && (
-            <Banner tone="warning">
-              Lean needs a measured <code>lean_floor_bps</code> (p95 feed error vs
-              live Pyth). Measure it first; don&apos;t assume a number.
-            </Banner>
-          )}
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Field
-              label="Lean floor (bps)"
-              hint="Required when lean is on. Measured p95 feed error."
-            >
-              <Input
-                value={draft.leanFloorBps}
-                placeholder="e.g. 3.0"
-                disabled={!editable}
-                onChange={(e) => onChange('leanFloorBps', e.target.value)}
-              />
-            </Field>
-            <Field label="Lean base (bps)" hint="Balanced-zone half-spread. Empty = 1.0.">
-              <Input
-                value={draft.leanBaseBps}
-                placeholder="1.0"
-                disabled={!editable}
-                onChange={(e) => onChange('leanBaseBps', e.target.value)}
-              />
-            </Field>
-            <Field label="Lean wide (bps)" hint="Extra widening at the heavy edge. Empty = 3.0.">
-              <Input
-                value={draft.leanWideBps}
-                placeholder="3.0"
-                disabled={!editable}
-                onChange={(e) => onChange('leanWideBps', e.target.value)}
-              />
-            </Field>
-          </div>
+          <ExperimentalSubsection
+            title="TWAP / lean"
+            description="Center quotes on a rolling TWAP and/or lean spreads against the wallet's own inventory. Useful on volatile pairs; leave blank unless you want them."
+          >
+            <div className="space-y-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field
+                  label="TWAP window (seconds)"
+                  hint="Rolling average of the feed. Empty = quote the instantaneous mid."
+                >
+                  <Input
+                    value={draft.twapWindowSecs}
+                    placeholder="e.g. 60"
+                    disabled={!editable}
+                    onChange={(e) => {
+                      const next = e.target.value
+                      onChange('twapWindowSecs', next)
+                      // Deviation only applies with a window. Clearing the window while
+                      // leaving a populated deviation fails the loader; clear both so
+                      // "turn TWAP off" is one field and one save.
+                      if (
+                        next.trim() === '' &&
+                        draft.twapMaxDeviationBps.trim() !== ''
+                      ) {
+                        onChange('twapMaxDeviationBps', '')
+                      }
+                    }}
+                  />
+                </Field>
+                <Field
+                  label="TWAP max deviation (bps)"
+                  hint="Never post a side more than this through spot. Empty = 50. Only applies with a TWAP window."
+                >
+                  <Input
+                    value={draft.twapMaxDeviationBps}
+                    placeholder="50"
+                    disabled={!editable || draft.twapWindowSecs.trim() === ''}
+                    onChange={(e) =>
+                      onChange('twapMaxDeviationBps', e.target.value)
+                    }
+                  />
+                </Field>
+              </div>
+
+              <div className="space-y-3 border-t border-line-soft pt-4">
+                <Toggle
+                  checked={draft.leanShadow}
+                  disabled={!editable}
+                  onChange={(v) => onChange('leanShadow', v)}
+                  label="Lean shadow — log lean quotes next to the live ones (no behavior change)"
+                />
+                <Toggle
+                  checked={draft.leanEnabled}
+                  disabled={!editable}
+                  onChange={(v) => onChange('leanEnabled', v)}
+                  label="Lean enabled — quote the live book off inventory-lean prices"
+                />
+                {leanOn && (
+                  <Banner tone="warning">
+                    Lean needs a measured <code>lean_floor_bps</code> (p95 feed
+                    error vs live Pyth). Measure it first; don&apos;t assume a
+                    number.
+                  </Banner>
+                )}
+                <div className="grid gap-4 sm:grid-cols-3">
+                  <Field
+                    label="Lean floor (bps)"
+                    hint="Required when lean is on. Measured p95 feed error."
+                  >
+                    <Input
+                      value={draft.leanFloorBps}
+                      placeholder="e.g. 3.0"
+                      disabled={!editable}
+                      onChange={(e) => onChange('leanFloorBps', e.target.value)}
+                    />
+                  </Field>
+                  <Field
+                    label="Lean base (bps)"
+                    hint="Balanced-zone half-spread. Empty = 1.0."
+                  >
+                    <Input
+                      value={draft.leanBaseBps}
+                      placeholder="1.0"
+                      disabled={!editable}
+                      onChange={(e) => onChange('leanBaseBps', e.target.value)}
+                    />
+                  </Field>
+                  <Field
+                    label="Lean wide (bps)"
+                    hint="Extra widening at the heavy edge. Empty = 3.0."
+                  >
+                    <Input
+                      value={draft.leanWideBps}
+                      placeholder="3.0"
+                      disabled={!editable}
+                      onChange={(e) => onChange('leanWideBps', e.target.value)}
+                    />
+                  </Field>
+                </div>
+              </div>
+            </div>
+          </ExperimentalSubsection>
         </div>
-      </div>
+      )}
     </Card>
+  )
+}
+
+/** One feature group inside the Experimental card. Add siblings for new experiments. */
+function ExperimentalSubsection({
+  title,
+  description,
+  children,
+}: {
+  title: string
+  description: string
+  children: ReactNode
+}) {
+  return (
+    <section className="space-y-3 border-t border-line-soft pt-4 first:border-t-0 first:pt-0">
+      <header className="space-y-1">
+        <h3 className="text-sm font-bold">{title}</h3>
+        <p className="text-xs text-faint">{description}</p>
+      </header>
+      {children}
+    </section>
   )
 }
 
@@ -458,6 +548,8 @@ function changedFields(loaded: Settings, draft: Settings): unknown {
     'buy',
     'sell',
     'takerEnabled',
+    'ttlSecs',
+    'refreshThresholdBps',
     'twapWindowSecs',
     'twapMaxDeviationBps',
     'leanEnabled',

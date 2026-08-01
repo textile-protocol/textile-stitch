@@ -89,8 +89,12 @@ pub struct SettingsView {
     pub pair: PoolPair,
     pub buy_sizing: SideSizing,
     pub sell_sizing: SideSizing,
-    /// Order lifetime for this pool, in seconds.
+    /// Order lifetime for this pool, in seconds. Must exceed the live-order
+    /// deadline margin (`LIVE_ORDER_DEADLINE_MARGIN_SECS`).
     pub ttl_secs: u64,
+    /// Re-sign a side only when its price moves more than this (bps) since its
+    /// last order. 0 re-quotes every tick.
+    pub refresh_threshold_bps: u32,
     /// How often the bot re-quotes, in seconds. Bot-wide, not per pool.
     pub tick_interval_secs: u64,
     // ----- Experimental (TWAP + inventory lean). Empty strings mean "unset" —
@@ -125,6 +129,7 @@ impl SettingsView {
             buy_sizing: Some(self.buy_sizing.clone()),
             sell_sizing: Some(self.sell_sizing.clone()),
             ttl_secs: Some(self.ttl_secs),
+            refresh_threshold_bps: Some(self.refresh_threshold_bps),
             tick_interval_secs: Some(self.tick_interval_secs),
             twap_window_secs: Some(self.twap_window_secs.clone()),
             twap_max_deviation_bps: Some(self.twap_max_deviation_bps.clone()),
@@ -156,6 +161,7 @@ pub struct SettingsPatch {
     pub buy_sizing: Option<SideSizing>,
     pub sell_sizing: Option<SideSizing>,
     pub ttl_secs: Option<u64>,
+    pub refresh_threshold_bps: Option<u32>,
     pub tick_interval_secs: Option<u64>,
     pub twap_window_secs: Option<String>,
     pub twap_max_deviation_bps: Option<String>,
@@ -217,6 +223,7 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
             max_orders: opt_num(pool.sell_max_orders),
         },
         ttl_secs: pool.ttl_secs,
+        refresh_threshold_bps: pool.refresh_threshold_bps,
         tick_interval_secs: cfg.tick_interval_secs,
         twap_window_secs: opt_num_u64(pool.twap_window_secs),
         twap_max_deviation_bps: opt_num(pool.twap_max_deviation_bps),
@@ -361,11 +368,22 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
         apply_sizing(pool, Side::Sell, sizing)?;
     }
     if let Some(secs) = patch.ttl_secs {
+        // Restate the loader rule so a bad TTL fails with an operator-facing
+        // message before we rewrite the file and hit Config::from_toml.
+        anyhow::ensure!(
+            secs > crate::config::LIVE_ORDER_DEADLINE_MARGIN_SECS,
+            "order lifetime (ttl_secs) must be greater than {} seconds — shorter \
+             orders are accepted on-chain but never served as fillable depth",
+            crate::config::LIVE_ORDER_DEADLINE_MARGIN_SECS
+        );
         set_value(
             pool,
             "ttl_secs",
             Value::from(i64::try_from(secs).context("order lifetime is too large")?),
         );
+    }
+    if let Some(bps) = patch.refresh_threshold_bps {
+        set_value(pool, "refresh_threshold_bps", Value::from(i64::from(bps)));
     }
     if let Some(raw) = &patch.twap_window_secs {
         apply_optional_u64(pool, "twap_window_secs", raw, "TWAP window")?;
@@ -1152,12 +1170,28 @@ mod tests {
     }
 
     #[test]
-    fn a_ttl_below_the_deadline_margin_is_rejected_by_the_real_loader() {
-        // The bot needs the TTL to exceed its live-order deadline margin. The
-        // patch doesn't restate that rule; the config loader enforces it.
+    fn a_ttl_below_the_deadline_margin_is_rejected() {
         let mut view = read_settings(TEMPLATE).unwrap();
         view.ttl_secs = 1;
-        assert!(apply_settings(TEMPLATE, &view.to_patch()).is_err());
+        let err = apply_settings(TEMPLATE, &view.to_patch()).unwrap_err();
+        assert!(
+            err.to_string().contains("ttl_secs") || err.to_string().contains("order lifetime"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn refresh_threshold_bps_round_trips() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.refresh_threshold_bps = 25;
+        let out = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert_eq!(back.refresh_threshold_bps, 25);
+
+        // 0 is valid: re-quote every tick (and what TWAP corridors usually want).
+        view.refresh_threshold_bps = 0;
+        let out = apply_settings(&out, &view.to_patch()).unwrap();
+        assert_eq!(read_settings(&out).unwrap().refresh_threshold_bps, 0);
     }
 
     #[test]
@@ -1180,6 +1214,7 @@ mod tests {
         patch.buy_sizing = None;
         patch.sell_sizing = None;
         patch.ttl_secs = None;
+        patch.refresh_threshold_bps = None;
         patch.tick_interval_secs = None;
         patch.buy.value = "44".into();
 
