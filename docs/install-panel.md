@@ -22,7 +22,12 @@ to start on a routable address unless you override it explicitly.
 ## Requirements
 
 - Docker with Compose v2 (`docker compose version`).
-- A Tailscale account, for server installs. Free tier is enough.
+- A host that can pull `linux/amd64` or `linux/arm64`. Published panel and bot
+  images are multi-arch, so the same `:latest` / `sha-*` tag works on Apple
+  Silicon Macs (arm64) and on Linux servers (amd64). Docker picks the matching
+  variant; do not pin `platform:` in compose.
+- A Tailscale account, for **server** installs (Linux hosts). Free tier is
+  enough. On a Mac, use **local** mode instead — password on loopback.
 - A directory on the host for bot configs (`~/stitch-bots` locally, or
   `/srv/stitch/bots` on a server).
 
@@ -34,13 +39,18 @@ to start on a routable address unless you override it explicitly.
 TAG=vX.Y.Z   # from https://github.com/textile-protocol/textile-stitch/releases
 curl -fsSL "https://raw.githubusercontent.com/textile-protocol/textile-stitch/${TAG}/install-panel.sh" -o install-panel.sh
 curl -fsSL "https://github.com/textile-protocol/textile-stitch/releases/download/${TAG}/install-panel.sh.sha256" -o install-panel.sh.sha256
-sha256sum -c install-panel.sh.sha256
+# Linux: sha256sum -c install-panel.sh.sha256
+# macOS: shasum -a 256 -c install-panel.sh.sha256
+sha256sum -c install-panel.sh.sha256 2>/dev/null || shasum -a 256 -c install-panel.sh.sha256
 STITCH_REF="$TAG" \
   PANEL_IMAGE="ghcr.io/textile-protocol/textile-stitch-panel:sha-<commit>" \
   STITCH_REQUIRE_PINNED=1 \
   PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
   sh install-panel.sh
 ```
+
+On a Mac laptop, use `PANEL_MODE=local` (and `PANEL_PASSWORD=…`) instead of the
+Tailscale server variables above.
 
 `PANEL_IMAGE` should be a `sha-*` tag or `@sha256:…` digest from
 [GHCR](https://github.com/textile-protocol/textile-stitch/pkgs/container/textile-stitch-panel).
@@ -65,11 +75,11 @@ image; for a release install, pin both `STITCH_REF` and `PANEL_IMAGE` as in the
 recommended block above.
 
 ```bash
-# Local computer — password login on loopback
+# Local computer (Mac or Linux laptop) — password login on loopback
 PANEL_MODE=local PANEL_PASSWORD='choose-a-long-password' \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
 
-# Server — Tailscale
+# Linux server — Tailscale (not the usual path on a Mac)
 PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
 ```

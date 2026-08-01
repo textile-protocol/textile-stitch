@@ -55,8 +55,10 @@ Ask ONLY this before installing:
    - Options: Local computer (recommended) — password login at
      http://127.0.0.1:8420 on this machine only; Server — Tailscale, so you can
      open Stitch from your other devices on the tailnet.
-   - Local computer → password auth, loopback bind. No Tailscale.
-   - Server → Tailscale sidecar, no host port published.
+   - Local computer → password auth, loopback bind. No Tailscale. Use this on
+     macOS (Apple Silicon or Intel) and on Linux laptops.
+   - Server → Tailscale sidecar on a Linux Docker host, no host port published.
+     Prefer local on a Mac; server mode expects Linux (/dev/net/tun).
    - Remember the answer. It selects PANEL_MODE=local or PANEL_MODE=server for
      the installer.
 

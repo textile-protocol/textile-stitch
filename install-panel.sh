@@ -281,6 +281,18 @@ if [ "$reuse_env" = no ]; then
     die "PANEL_MODE must be 'local' or 'server' (got '$PANEL_MODE_RAW')"
 fi
 
+# Server compose mounts /dev/net/tun and expects a Linux Docker host. macOS can
+# still run local mode (password on loopback); Tailscale-on-Docker-Desktop is
+# the awkward path, so nudge Mac operators toward local without blocking them.
+if [ "$compose_mode" = server ]; then
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin)
+      warn 'server mode is aimed at Linux hosts (Tailscale sidecar + /dev/net/tun).'
+      warn 'On a Mac, prefer local mode: password login at http://127.0.0.1:8420.'
+      ;;
+  esac
+fi
+
 DEFAULT_BOTS_DIR="$DEFAULT_BOTS_DIR_SERVER"
 if [ "$compose_mode" = local ]; then
   DEFAULT_BOTS_DIR="$DEFAULT_BOTS_DIR_LOCAL"
@@ -472,7 +484,15 @@ add_password() {
 }
 
 step "Pulling $PANEL_IMAGE"
-docker pull "$PANEL_IMAGE" >/dev/null || die "couldn't pull $PANEL_IMAGE"
+if ! docker pull "$PANEL_IMAGE" >/dev/null; then
+  _arch="$(uname -m 2>/dev/null || true)"
+  case "$_arch" in
+    arm64|aarch64)
+      die "couldn't pull $PANEL_IMAGE — no linux/arm64 image in that tag's manifest. Apple Silicon / ARM hosts need a multi-arch panel image (amd64+arm64). Re-run after the published image includes arm64, or build from source: https://github.com/textile-protocol/textile-stitch/blob/main/docs/install-panel.md"
+      ;;
+  esac
+  die "couldn't pull $PANEL_IMAGE"
+fi
 say 'Pulled.'
 
 if [ "$compose_mode" = local ]; then
