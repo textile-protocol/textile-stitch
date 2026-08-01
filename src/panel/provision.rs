@@ -318,13 +318,24 @@ pub fn hand_over_to_bot(_dir: &Path, _uid: u32) -> Result<()> {
 /// directory: a `stitch.key` sitting next to `stitch.bot1.toml` belongs to some
 /// other bot, and preferring it would sign with the wrong wallet.
 pub fn find_beside(config: &Path, canonical: &str) -> Option<PathBuf> {
-    let dir = config.parent()?;
-    let derived = derived_name(config, canonical).map(|name| dir.join(name));
-    if let Some(path) = derived.filter(|p| p.exists()) {
+    if let Some(path) = find_beside_derived(config, canonical) {
         return Some(path);
     }
+    let dir = config.parent()?;
     let direct = dir.join(canonical);
     direct.exists().then_some(direct)
+}
+
+/// Like [`find_beside`], but never falls back to the bare canonical name.
+///
+/// Deleting a flat-layout bot must use this: after the derived key is gone,
+/// [`find_beside`]'s fallback would pick up a neighbour's `stitch.key` /
+/// `turnkey-api.key` in the shared bots directory and wipe the wrong secret.
+pub fn find_beside_derived(config: &Path, canonical: &str) -> Option<PathBuf> {
+    let dir = config.parent()?;
+    let name = derived_name(config, canonical)?;
+    let path = dir.join(name);
+    path.exists().then_some(path)
 }
 
 /// `stitch.bot1.toml` + `stitch.key` -> `stitch.bot1.key`.

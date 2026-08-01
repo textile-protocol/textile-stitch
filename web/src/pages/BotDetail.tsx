@@ -107,19 +107,26 @@ export default function BotDetail() {
   }
 
   async function remove() {
-    const deleteConfig = window.confirm(
-      `Remove ${name}'s container.\n\nOK also deletes its config directory, including the private key. Cancel keeps the files so you can recreate the bot later.`,
-    )
-    if (
-      !window.confirm(
-        deleteConfig
-          ? `Last check: delete ${name}'s container AND its config and key? This cannot be undone.`
-          : `Remove ${name}'s container and keep its config directory?`,
+    // Cancel aborts. The old first dialog treated Cancel as "keep config", so a
+    // config-only bot (or anyone who Cancelled intending to bail) got a no-op.
+    let deleteConfig: boolean
+    if (bot?.container) {
+      if (!window.confirm(`Remove ${name}'s container?`)) return
+      deleteConfig = window.confirm(
+        `Also delete ${name}'s config and private key?\n\nOK deletes them (cannot be undone). Cancel keeps the files so you can recreate the bot later.`,
       )
-    ) {
-      return
+    } else {
+      if (
+        !window.confirm(
+          `Delete ${name}'s config and private key? There is no container. This cannot be undone.`,
+        )
+      ) {
+        return
+      }
+      deleteConfig = true
     }
     setBusy('remove')
+    setError(null)
     try {
       const res = await api.remove(name, deleteConfig)
       navigate('/', { state: { note: res.message } })

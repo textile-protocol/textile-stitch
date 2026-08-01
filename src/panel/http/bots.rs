@@ -503,41 +503,220 @@ pub async fn remove(
     Path(name): Path<String>,
     Query(query): Query<RemoveQuery>,
 ) -> Result<Response, ApiError> {
-    let bot = state.bot(&name).await?;
+    // Need the fleet when deleteConfig is set: another Compose service can mount
+    // the same directory under a different name, and wiping it would erase that
+    // sibling's key while its container is still live.
+    let (bot, fleet) = state.bot_and_fleet(&name).await?;
     super::require_actionable(&bot)?;
+
+    // A config-only row with "keep the files" is a no-op that used to report
+    // success ("container is gone") and leave the bot on the fleet page.
+    if bot.container_name.is_none() && !query.delete_config {
+        return Err(ApiError::bad_request(format!(
+            "{name} has no container. Confirm deleting its config if you want it gone from the fleet."
+        )));
+    }
+
+    if query.delete_config {
+        refuse_shared_config_delete(&bot, &fleet, &state.cfg)?;
+    }
+
+    let had_container = bot.container_name.is_some();
     if let Some(container) = &bot.container_name {
         stop_before_destroying(&state, &bot, container).await?;
         state.docker.remove(container, true).await?;
     }
 
-    let mut message = format!("{name}'s container is gone. Its config is still on disk.");
-    if query.delete_config {
-        let dir = state.cfg.bot_dir(&name);
-        // Only ever inside the bots root: an adopted bot's config can live
-        // anywhere on the host, and the panel is not going to recursively delete
-        // a directory it doesn't own.
-        if dir.is_dir() {
-            std::fs::remove_dir_all(&dir).map_err(|e| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+    let message = if query.delete_config {
+        match delete_bot_config(&bot, &state.cfg)? {
+            ConfigDelete::Removed => {
+                if had_container {
+                    format!("{name} and its config are gone.")
+                } else {
+                    format!("{name}'s config is gone.")
+                }
+            }
+            ConfigDelete::NotOwned => {
+                if had_container {
                     format!(
-                        "the container was removed, but deleting {} failed: {e}",
-                        dir.display()
-                    ),
-                )
-            })?;
-            message = format!("{name} and its config directory are gone.");
-        } else {
-            message = format!(
-                "{name}'s container is gone. Its config isn't under {}, so the panel left it \
-                 alone — delete it by hand if you meant to.",
-                state.cfg.bots_dir.display()
-            );
+                        "{name}'s container is gone. Its config isn't under {}, so the panel left \
+                         it alone — delete it by hand if you meant to.",
+                        state.cfg.bots_dir.display()
+                    )
+                } else {
+                    format!(
+                        "{name}'s config isn't under {}, so the panel left it alone — delete it \
+                         by hand if you meant to.",
+                        state.cfg.bots_dir.display()
+                    )
+                }
+            }
         }
-    }
+    } else {
+        format!("{name}'s container is gone. Its config is still on disk.")
+    };
 
     tracing::info!(bot = %name, delete_config = query.delete_config, "removed");
     Ok(Json(serde_json::json!({ "message": message })).into_response())
+}
+
+/// Outcome of trying to wipe a bot's on-disk config from the panel's bots root.
+enum ConfigDelete {
+    Removed,
+    /// Config lives outside the mounted bots root (or isn't known). Never delete
+    /// a path the panel doesn't own.
+    NotOwned,
+}
+
+/// Delete the config the panel can see for this bot — the mounted path, not
+/// `bots/<name>/` assumed from the routing name.
+///
+/// Compose services are often named differently from the directory they mount
+/// (`foo` → `bots/custom-dir`), and flat-layout bots store `stitch.<name>.toml`
+/// loose in the bots root. Both used to be left behind by Remove.
+fn delete_bot_config(bot: &Bot, cfg: &crate::panel::PanelConfig) -> Result<ConfigDelete, ApiError> {
+    let Some(config_path) = bot.config_panel_path.as_ref() else {
+        return Ok(ConfigDelete::NotOwned);
+    };
+    if !config_path.starts_with(&cfg.bots_dir) {
+        return Ok(ConfigDelete::NotOwned);
+    }
+
+    match bot.layout {
+        Layout::FlatFiles => {
+            delete_flat_config_files(config_path)?;
+            Ok(ConfigDelete::Removed)
+        }
+        Layout::Directory | Layout::Unknown => {
+            let Some(dir) = config_path.parent() else {
+                return Ok(ConfigDelete::NotOwned);
+            };
+            // Flat files and a mis-resolved path can put stitch.toml directly in
+            // the bots root — never `rm -rf` that whole tree.
+            if dir == cfg.bots_dir.as_path() {
+                delete_flat_config_files(config_path)?;
+                return Ok(ConfigDelete::Removed);
+            }
+            if !dir.starts_with(&cfg.bots_dir) {
+                return Ok(ConfigDelete::NotOwned);
+            }
+            std::fs::remove_dir_all(dir).map_err(|e| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("deleting {} failed: {e}", dir.display()),
+                )
+            })?;
+            Ok(ConfigDelete::Removed)
+        }
+    }
+}
+
+/// Refuse deleteConfig when another fleet bot still claims the same config path
+/// (or a path inside the directory we are about to `rm -rf`).
+///
+/// Inventory only flags duplicate *names*. Two Compose services can mount one
+/// directory under different service names; wiping that directory for either
+/// would erase the other's signer key while its container stays live.
+fn refuse_shared_config_delete(
+    bot: &Bot,
+    fleet: &Fleet,
+    cfg: &crate::panel::PanelConfig,
+) -> Result<(), ApiError> {
+    let Some(path) = bot.config_panel_path.as_ref() else {
+        return Ok(());
+    };
+    if !path.starts_with(&cfg.bots_dir) {
+        return Ok(());
+    }
+    let wipe_dir = match bot.layout {
+        Layout::FlatFiles => None,
+        Layout::Directory | Layout::Unknown => match path.parent() {
+            // File-only wipe when the config sits directly in the bots root —
+            // same as delete_bot_config — so siblings sharing that root are fine.
+            Some(dir) if dir == cfg.bots_dir.as_path() => None,
+            Some(dir) => Some(dir),
+            None => None,
+        },
+    };
+
+    let sibling = fleet.bots().iter().find(|other| {
+        if other.name == bot.name {
+            return false;
+        }
+        // A config-only row for the same directory is the same files under a
+        // different name (compose service `foo` mounting `bots/custom-dir`),
+        // not a second live bot. Only a container still using the path is a
+        // reason to refuse.
+        if other.container_name.is_none() {
+            return false;
+        }
+        let Some(other_path) = other.config_panel_path.as_ref() else {
+            return false;
+        };
+        if other_path == path {
+            return true;
+        }
+        match wipe_dir {
+            Some(dir) => other_path.starts_with(dir),
+            None => false,
+        }
+    });
+
+    if let Some(other) = sibling {
+        return Err(ApiError::conflict(format!(
+            "{} shares its config with {}, so the panel won't delete the files while that \
+             bot is still on the fleet. Remove {} first, or remove {} without deleting config.",
+            bot.name, other.name, other.name, bot.name
+        )));
+    }
+    Ok(())
+}
+
+/// Wipe a flat-layout bot's toml, its signer secret, and a per-bot env file.
+///
+/// The secret is resolved the same way mounts are: this bot's signer → one
+/// canonical name → [`provision::find_beside`] (derived first, then that
+/// backend's fallback). Never walk every backend — after the derived key is
+/// gone, a Turnkey fallback would delete a neighbour's `turnkey-api.key`.
+/// `stitch.env` stays derived-only so a shared bare `stitch.env` is left alone.
+fn delete_flat_config_files(config_path: &std::path::Path) -> Result<(), ApiError> {
+    let mut to_delete = std::collections::BTreeSet::new();
+    match provision::signer_runtime_at(config_path) {
+        Ok(rt) => {
+            if let Some(path) = provision::find_beside(config_path, &rt.secret_file) {
+                to_delete.insert(path);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                config = %config_path.display(),
+                error = %e,
+                "couldn't read signer for config delete; trying derived hot-wallet key only"
+            );
+            if let Some(path) = provision::find_beside_derived(config_path, "stitch.key") {
+                to_delete.insert(path);
+            }
+        }
+    }
+    if let Some(path) = provision::find_beside_derived(config_path, "stitch.env") {
+        to_delete.insert(path);
+    }
+
+    for path in &to_delete {
+        if let Err(e) = std::fs::remove_file(path) {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("deleting {} failed: {e}", path.display()),
+            ));
+        }
+    }
+    std::fs::remove_file(config_path).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("deleting {} failed: {e}", config_path.display()),
+        )
+    })?;
+    Ok(())
 }
 
 /// Pull a refreshable bot image and recreate this bot on it.
@@ -1527,6 +1706,228 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("delete it by hand"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn delete_config_follows_the_mounted_directory_not_the_bot_name() {
+        // Compose service `foo` mounting `bots/custom-dir` — the old path used
+        // bots/foo and left the real config behind.
+        let h = harness("delete-compose-path");
+        write_bot(&h.root, "custom-dir");
+        let mut c = container("stitch-foo", ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "foo".to_string());
+        c.mounts = dir_layout_mounts(&h.root.join("custom-dir").display().to_string());
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .send(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/bots/foo?deleteConfig=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!h.docker.exists("stitch-foo"));
+        assert!(
+            !h.root.join("custom-dir").exists(),
+            "mounted config dir must be deleted"
+        );
+        assert!(
+            !h.root.join("foo").exists(),
+            "must not invent bots/foo from the service name"
+        );
+        assert!(body.contains("gone"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn delete_config_removes_flat_layout_files() {
+        let h = harness("delete-flat");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        let toml = h.root.join("stitch.bot1.toml");
+        let key = h.root.join("stitch.bot1.key");
+        std::fs::write(&toml, corridor.toml_template).unwrap();
+        std::fs::write(&key, super::super::testkit::TEST_KEY).unwrap();
+        let mut c = container("stitch-bot1", ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
+        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .send(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/bots/bot1?deleteConfig=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!h.docker.exists("stitch-bot1"));
+        assert!(!toml.exists(), "flat toml must be deleted");
+        assert!(!key.exists(), "flat key must be deleted");
+        // The bots root itself must survive — only the bot's files go.
+        assert!(h.root.is_dir());
+    }
+
+    #[tokio::test]
+    async fn delete_config_removes_a_config_only_bot() {
+        let h = harness("delete-config-only");
+        write_bot(&h.root, "bot-a");
+        let (status, body) = h
+            .send(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/bots/bot-a?deleteConfig=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!h.root.join("bot-a").exists());
+        assert!(body.contains("config is gone"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn delete_without_config_flag_refuses_a_config_only_bot() {
+        // Otherwise Remove reported success and left the row on the fleet page.
+        let h = harness("delete-config-only-noop");
+        write_bot(&h.root, "bot-a");
+        let (status, body) = h
+            .send(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/bots/bot-a")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("no container"), "{body}");
+        assert!(h.root.join("bot-a/stitch.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_flat_does_not_wipe_a_neighbours_canonical_secret() {
+        // A hot-wallet bot must not delete a Turnkey secret that lives next to
+        // it under the bare canonical name — that belongs to another bot.
+        let h = harness("delete-flat-neighbour");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        std::fs::write(h.root.join("stitch.bot1.toml"), corridor.toml_template).unwrap();
+        std::fs::write(
+            h.root.join("stitch.bot1.key"),
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let neighbour_secret = h.root.join("turnkey-api.key");
+        std::fs::write(&neighbour_secret, "neighbour-secret").unwrap();
+        let mut c = container("stitch-bot1", ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
+        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .send(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/bots/bot1?deleteConfig=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!h.root.join("stitch.bot1.toml").exists());
+        assert!(!h.root.join("stitch.bot1.key").exists());
+        assert!(
+            neighbour_secret.exists(),
+            "neighbour's canonical secret must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&neighbour_secret).unwrap(),
+            "neighbour-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_flat_removes_a_turnkey_bots_canonical_secret() {
+        // Compose often keeps turnkey-api.key at the bare name beside
+        // stitch.<bot>.toml. Derived-only delete would leave the credential.
+        let h = harness("delete-flat-turnkey");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        let toml = h.root.join("stitch.bot1.toml");
+        let mut body = corridor.toml_template.to_string();
+        body.push_str(
+            "\n[signer]\nprovider = \"turnkey\"\n\
+             organization_id = \"org-1\"\n\
+             sign_with = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n\
+             operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n",
+        );
+        std::fs::write(&toml, body).unwrap();
+        let secret = h.root.join("turnkey-api.key");
+        std::fs::write(&secret, "turnkey-secret").unwrap();
+        let mut c = container("stitch-bot1", ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
+        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
+        // Flat mounts assume stitch.bot1.key; point the secret mount at the
+        // canonical Turnkey file this bot actually uses.
+        c.mounts[1].source = secret.clone();
+        h.docker.add_container(c);
+
+        let (status, resp) = h
+            .send(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/bots/bot1?deleteConfig=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert!(!toml.exists());
+        assert!(
+            !secret.exists(),
+            "this bot's canonical Turnkey secret must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_config_refuses_when_another_bot_shares_the_directory() {
+        let h = harness("delete-shared-dir");
+        write_bot(&h.root, "shared");
+        for (cname, service) in [("stitch-alpha", "alpha"), ("stitch-beta", "beta")] {
+            let mut c = container(cname, ContainerState::Running);
+            c.labels
+                .insert(LABEL_COMPOSE_SERVICE.to_string(), service.to_string());
+            c.mounts = dir_layout_mounts(&h.root.join("shared").display().to_string());
+            h.docker.add_container(c);
+        }
+
+        let (status, body) = h
+            .send(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/bots/alpha?deleteConfig=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("shares its config"), "{body}");
+        assert!(body.contains("beta"), "{body}");
+        assert!(
+            h.docker.exists("stitch-alpha"),
+            "refused delete must not remove the container"
+        );
+        assert!(h.docker.exists("stitch-beta"));
+        assert!(
+            h.root.join("shared/stitch.toml").exists(),
+            "shared config must survive"
+        );
     }
 
     #[tokio::test]
