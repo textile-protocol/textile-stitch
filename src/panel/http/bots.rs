@@ -142,12 +142,16 @@ struct FleetBody {
 
 pub async fn list(State(state): State<AppState>) -> Result<Response, ApiError> {
     let fleet = state.fleet().await?;
+    // Discovery already yields name order (BTreeMap), but sort here too so the
+    // fleet page stays alphabetical even if that ever changes.
+    let mut bots: Vec<BotBody> = fleet
+        .bots()
+        .iter()
+        .map(|b| to_body(b, &state, &fleet))
+        .collect();
+    bots.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(FleetBody {
-        bots: fleet
-            .bots()
-            .iter()
-            .map(|b| to_body(b, &state, &fleet))
-            .collect(),
+        bots,
         bot_image: state.cfg.bot_image.clone(),
         bots_dir: state.cfg.bots_dir.display().to_string(),
     })
@@ -1205,6 +1209,24 @@ mod tests {
         let v = Harness::parse(&body);
         assert!(v["bots"].as_array().unwrap().is_empty());
         assert!(v["botImage"].as_str().unwrap().contains("textile-stitch"));
+    }
+
+    #[tokio::test]
+    async fn the_fleet_list_is_alphabetical_by_bot_name() {
+        let h = harness("fleet-alpha");
+        write_bot(&h.root, "zeta");
+        write_bot(&h.root, "alpha");
+        write_bot(&h.root, "mid");
+        let (status, body) = h.get("/api/bots").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed = Harness::parse(&body);
+        let names: Vec<_> = parsed["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
 
     #[tokio::test]

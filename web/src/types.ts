@@ -100,6 +100,15 @@ export interface Settings {
   sellSizing: Sizing
   ttlSecs: number
   tickIntervalSecs: number
+  /** Empty = quote off the instantaneous feed. */
+  twapWindowSecs: string
+  /** Empty = bot default (50) when TWAP is on. */
+  twapMaxDeviationBps: string
+  leanEnabled: boolean
+  leanShadow: boolean
+  leanFloorBps: string
+  leanBaseBps: string
+  leanWideBps: string
   editable: boolean
 }
 

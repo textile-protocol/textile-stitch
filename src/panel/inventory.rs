@@ -1307,6 +1307,18 @@ mod tests {
     }
 
     #[test]
+    fn the_fleet_lists_bots_alphabetically_by_name() {
+        let (cfg, root) = test_cfg("alpha");
+        seed_bot_dir(&root, "zeta");
+        seed_bot_dir(&root, "alpha");
+        seed_bot_dir(&root, "mid");
+        let fleet = discover(&[], &cfg);
+        let names: Vec<_> = fleet.bots().iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_missing_bots_root_yields_an_empty_fleet_rather_than_an_error() {
         let cfg = PanelConfig::for_test("/definitely/not/here", "/definitely/not/here");
         assert!(discover(&[], &cfg).is_empty());

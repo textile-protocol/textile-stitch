@@ -18,6 +18,7 @@ import {
   isSignerComplete,
   type SignerState,
 } from '../components/SignerFields'
+import SignerConflictWarning from '../components/SignerConflictWarning'
 import type { Corridor } from '../types'
 
 /**
@@ -57,6 +58,28 @@ export default function AddBot() {
   const corridor = corridors.find((c) => c.id === corridorId)
 
   async function submit() {
+    // Re-check right before create so a fleet change between typing and click
+    // still gets a confirm. Soft warning only — the API does not refuse.
+    if (corridor) {
+      try {
+        const check = await api.checkSigner({
+          chainId: corridor.chainId,
+          signer: buildSigner(signer),
+        })
+        if (check.conflicts.length > 0) {
+          const names = check.conflicts.map((c) => c.name).join(', ')
+          if (
+            !window.confirm(
+              `Another bot already uses this wallet on chain ${corridor.chainId}: ${names}.\n\nSharing one wallet across bots on the same chain races nonces and will cause issues. Create anyway?`,
+            )
+          ) {
+            return
+          }
+        }
+      } catch {
+        // Create will surface a bad key; don't block on a check failure.
+      }
+    }
     setBusy(true)
     setError(null)
     try {
@@ -159,6 +182,11 @@ export default function AddBot() {
         <Card title="How does it sign?">
           <div className="space-y-4">
             <SignerFields value={signer} onChange={setSigner} />
+
+            <SignerConflictWarning
+              chainId={corridor?.chainId}
+              signer={signer}
+            />
 
             <Toggle
               checked={start}

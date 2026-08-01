@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
 //! Read and edit the `stitch.toml` values the Settings surfaces expose: endpoints,
-//! per-pool spreads, ladder sizing, order lifetime and the tick cadence.
+//! per-pool spreads, ladder sizing, order lifetime, the tick cadence, and the
+//! experimental TWAP / inventory-lean knobs (optional).
 //!
 //! Shared by the desktop Settings screen and Stitch, so both edit
 //! configs through one implementation. Edits go through `toml_edit` so the
@@ -92,6 +93,22 @@ pub struct SettingsView {
     pub ttl_secs: u64,
     /// How often the bot re-quotes, in seconds. Bot-wide, not per pool.
     pub tick_interval_secs: u64,
+    // ----- Experimental (TWAP + inventory lean). Empty strings mean "unset" —
+    // omit the key so the bot uses its defaults / spot quoting. -----
+    /// Rolling TWAP window in seconds. Empty = quote off the instantaneous feed.
+    pub twap_window_secs: String,
+    /// Spot-deviation guard in bps while TWAP is on. Empty = bot default (50).
+    pub twap_max_deviation_bps: String,
+    /// Quote the live book off inventory-lean prices.
+    pub lean_enabled: bool,
+    /// Log lean quotes next to the live ones; no behavior change.
+    pub lean_shadow: bool,
+    /// Measured p95 feed error vs live Pyth, in bps. Required when lean is on.
+    pub lean_floor_bps: String,
+    /// Balanced-zone half-spread in bps. Empty = bot default (1.0).
+    pub lean_base_bps: String,
+    /// Extra widening at the heavy inventory edge, in bps. Empty = bot default (3.0).
+    pub lean_wide_bps: String,
 }
 
 impl SettingsView {
@@ -109,6 +126,13 @@ impl SettingsView {
             sell_sizing: Some(self.sell_sizing.clone()),
             ttl_secs: Some(self.ttl_secs),
             tick_interval_secs: Some(self.tick_interval_secs),
+            twap_window_secs: Some(self.twap_window_secs.clone()),
+            twap_max_deviation_bps: Some(self.twap_max_deviation_bps.clone()),
+            lean_enabled: Some(self.lean_enabled),
+            lean_shadow: Some(self.lean_shadow),
+            lean_floor_bps: Some(self.lean_floor_bps.clone()),
+            lean_base_bps: Some(self.lean_base_bps.clone()),
+            lean_wide_bps: Some(self.lean_wide_bps.clone()),
         }
     }
 }
@@ -133,6 +157,13 @@ pub struct SettingsPatch {
     pub sell_sizing: Option<SideSizing>,
     pub ttl_secs: Option<u64>,
     pub tick_interval_secs: Option<u64>,
+    pub twap_window_secs: Option<String>,
+    pub twap_max_deviation_bps: Option<String>,
+    pub lean_enabled: Option<bool>,
+    pub lean_shadow: Option<bool>,
+    pub lean_floor_bps: Option<String>,
+    pub lean_base_bps: Option<String>,
+    pub lean_wide_bps: Option<String>,
 }
 
 /// Read the first pool's editable values from a `stitch.toml` body.
@@ -187,6 +218,13 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
         },
         ttl_secs: pool.ttl_secs,
         tick_interval_secs: cfg.tick_interval_secs,
+        twap_window_secs: opt_num_u64(pool.twap_window_secs),
+        twap_max_deviation_bps: opt_num(pool.twap_max_deviation_bps),
+        lean_enabled: pool.lean_enabled.unwrap_or(false),
+        lean_shadow: pool.lean_shadow.unwrap_or(false),
+        lean_floor_bps: opt_f64(pool.lean_floor_bps),
+        lean_base_bps: opt_f64(pool.lean_base_bps),
+        lean_wide_bps: opt_f64(pool.lean_wide_bps),
     })
 }
 
@@ -195,6 +233,14 @@ fn opt_str(v: &Option<String>) -> String {
 }
 
 fn opt_num(v: Option<u32>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+fn opt_num_u64(v: Option<u64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+fn opt_f64(v: Option<f64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_default()
 }
 
@@ -321,11 +367,33 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
             Value::from(i64::try_from(secs).context("order lifetime is too large")?),
         );
     }
+    if let Some(raw) = &patch.twap_window_secs {
+        apply_optional_u64(pool, "twap_window_secs", raw, "TWAP window")?;
+    }
+    if let Some(raw) = &patch.twap_max_deviation_bps {
+        apply_optional_u32(pool, "twap_max_deviation_bps", raw, "TWAP max deviation")?;
+    }
+    if let Some(enabled) = patch.lean_enabled {
+        apply_bool_flag(pool, "lean_enabled", enabled);
+    }
+    if let Some(shadow) = patch.lean_shadow {
+        apply_bool_flag(pool, "lean_shadow", shadow);
+    }
+    if let Some(raw) = &patch.lean_floor_bps {
+        apply_optional_f64(pool, "lean_floor_bps", raw, "lean floor")?;
+    }
+    if let Some(raw) = &patch.lean_base_bps {
+        apply_optional_f64(pool, "lean_base_bps", raw, "lean base")?;
+    }
+    if let Some(raw) = &patch.lean_wide_bps {
+        apply_optional_f64(pool, "lean_wide_bps", raw, "lean wide")?;
+    }
 
     let edited = doc.to_string();
     // Guard: never hand back something the bot can't load. This is also what
     // enforces the cross-field rules — TTL above the live-order deadline margin,
-    // ladder caps, positive slices — so they don't need restating here.
+    // ladder caps, positive slices, TWAP/lean constraints — so they don't need
+    // restating here.
     Config::from_toml(&edited).context("the edited config is not valid")?;
     Ok(edited)
 }
@@ -571,11 +639,71 @@ fn apply_spread(pool: &mut Table, side: &str, edit: &SpreadEdit) -> Result<()> {
 /// `false`, keeping a taker-off config byte-identical to a template that never
 /// mentioned the leg.
 fn apply_taker(pool: &mut Table, enabled: bool) {
+    apply_bool_flag(pool, "limit_taker_enabled", enabled);
+}
+
+/// Opt-in boolean flag: write `true`, or remove the key when off so a template
+/// that never mentioned the flag stays byte-identical after a round-trip.
+fn apply_bool_flag(pool: &mut Table, key: &str, enabled: bool) {
     if enabled {
-        set_value(pool, "limit_taker_enabled", Value::from(true));
+        set_value(pool, key, Value::from(true));
     } else {
-        pool.remove("limit_taker_enabled");
+        pool.remove(key);
     }
+}
+
+/// Optional integer key. Empty clears it (bot default / unset); non-empty must
+/// parse as a positive whole number — the real loader re-checks cross-field rules.
+fn apply_optional_u64(pool: &mut Table, key: &str, raw: &str, label: &str) -> Result<()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        pool.remove(key);
+        return Ok(());
+    }
+    let n: u64 = raw
+        .parse()
+        .with_context(|| format!("{label} must be a whole number of seconds"))?;
+    anyhow::ensure!(n > 0, "{label} must be positive");
+    set_value(
+        pool,
+        key,
+        Value::from(i64::try_from(n).context(format!("{label} is too large"))?),
+    );
+    Ok(())
+}
+
+fn apply_optional_u32(pool: &mut Table, key: &str, raw: &str, label: &str) -> Result<()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        pool.remove(key);
+        return Ok(());
+    }
+    let n: u32 = raw
+        .parse()
+        .with_context(|| format!("{label} must be a whole number of basis points"))?;
+    anyhow::ensure!(n > 0, "{label} must be positive");
+    set_value(pool, key, Value::from(i64::from(n)));
+    Ok(())
+}
+
+/// Optional floating bps value. Empty clears the key; non-empty must be finite
+/// and non-negative. Cross-field rules (lean needs a positive floor, etc.) stay
+/// with `Config::from_toml`.
+fn apply_optional_f64(pool: &mut Table, key: &str, raw: &str, label: &str) -> Result<()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        pool.remove(key);
+        return Ok(());
+    }
+    let n: f64 = raw
+        .parse()
+        .with_context(|| format!("{label} must be a number of basis points"))?;
+    anyhow::ensure!(
+        n.is_finite() && n >= 0.0,
+        "{label} must be a non-negative number of basis points"
+    );
+    set_value(pool, key, Value::from(n));
+    Ok(())
 }
 
 /// Set a key's value while preserving its existing decor (the surrounding
@@ -1091,5 +1219,93 @@ mod tests {
         patch.pool_index = 5;
         let err = apply_settings(&src, &patch).unwrap_err();
         assert!(err.to_string().contains("2 pools"));
+    }
+
+    #[test]
+    fn twap_and_lean_round_trip_through_the_settings_view() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        assert!(view.twap_window_secs.is_empty());
+        assert!(!view.lean_enabled);
+
+        view.twap_window_secs = "60".into();
+        view.twap_max_deviation_bps = "50".into();
+        view.lean_shadow = true;
+        view.lean_floor_bps = "3.0".into();
+        view.lean_base_bps = "1.0".into();
+        view.lean_wide_bps = "3.0".into();
+
+        let out = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert_eq!(back.twap_window_secs, "60");
+        assert_eq!(back.twap_max_deviation_bps, "50");
+        assert!(back.lean_shadow);
+        assert!(!back.lean_enabled);
+        assert_eq!(back.lean_floor_bps, "3");
+        assert_eq!(back.lean_base_bps, "1");
+        assert_eq!(back.lean_wide_bps, "3");
+
+        // Enabling lean without a floor is refused by the real loader.
+        let mut bad = back.clone();
+        bad.lean_enabled = true;
+        bad.lean_floor_bps.clear();
+        assert!(apply_settings(&out, &bad.to_patch()).is_err());
+
+        // Clearing TWAP while leaving the deviation set is refused — the guard
+        // only applies with a window. Also clear the deviation to actually drop
+        // TWAP; a partial clear must not leave a half-configured pool.
+        let mut cleared = back;
+        cleared.twap_window_secs.clear();
+        let err = apply_settings(&out, &cleared.to_patch()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("twap_max_deviation_bps"),
+            "expected deviation-without-window refusal, got: {msg}"
+        );
+        cleared.twap_max_deviation_bps.clear();
+        let dropped = apply_settings(&out, &cleared.to_patch()).unwrap();
+        assert!(!dropped.contains("twap_window_secs"));
+        assert!(!dropped.contains("twap_max_deviation_bps"));
+    }
+
+    #[test]
+    fn clearing_experimental_fields_removes_them() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.twap_window_secs = "60".into();
+        view.lean_shadow = true;
+        view.lean_floor_bps = "3".into();
+        let with = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+        assert!(with.contains("twap_window_secs"));
+        assert!(with.contains("lean_shadow"));
+
+        let mut back = read_settings(&with).unwrap();
+        back.twap_window_secs.clear();
+        back.lean_shadow = false;
+        back.lean_floor_bps.clear();
+        let without = apply_settings(&with, &back.to_patch()).unwrap();
+        assert!(!without.contains("twap_window_secs"), "{without}");
+        assert!(!without.contains("lean_shadow"), "{without}");
+        assert!(!without.contains("lean_floor_bps"), "{without}");
+    }
+
+    #[test]
+    fn a_spread_only_patch_leaves_experimental_fields_alone() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.twap_window_secs = "120".into();
+        let seeded = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+
+        let mut patch = read_settings(&seeded).unwrap().to_patch();
+        patch.twap_window_secs = None;
+        patch.twap_max_deviation_bps = None;
+        patch.lean_enabled = None;
+        patch.lean_shadow = None;
+        patch.lean_floor_bps = None;
+        patch.lean_base_bps = None;
+        patch.lean_wide_bps = None;
+        patch.buy.value = "11".into();
+
+        let out = apply_settings(&seeded, &patch).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert_eq!(back.buy.value, "11");
+        assert_eq!(back.twap_window_secs, "120");
     }
 }

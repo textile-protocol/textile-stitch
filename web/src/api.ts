@@ -141,6 +141,27 @@ export const api = {
   createBot: (body: unknown) =>
     request<{ bot: Bot; message: string }>('/api/bots', json(body)),
 
+  /**
+   * Dry-run: which other bots already use this signer on this chain. Used to warn
+   * before create / change-signer — sharing a wallet races nonces.
+   */
+  checkSigner: (body: {
+    chainId: number
+    signer: unknown
+    excludeBot?: string
+  }) =>
+    request<{
+      operatorAddress: string
+      chainId: number
+      conflicts: {
+        name: string
+        chainId: number | null
+        operatorAddress: string | null
+        /** Live with taker/closer on — Start / change-signer-while-up will refuse. */
+        blocksLiveSwitch: boolean
+      }[]
+    }>('/api/signer/check', json(body)),
+
   start: (name: string) => act(name, 'start'),
   stop: (name: string) => act(name, 'stop'),
   restart: (name: string) => act(name, 'restart'),

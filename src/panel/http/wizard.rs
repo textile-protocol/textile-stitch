@@ -154,6 +154,83 @@ fn blank_to_none(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// The operator address a signer selects, lowercased the way discovery formats it.
+fn operator_address_of(setup: &SignerSetup) -> Result<String, ApiError> {
+    match setup {
+        SignerSetup::Local { material } => {
+            let addr = material.operator_address().map_err(ApiError::bad_request)?;
+            Ok(format!("{addr:?}").to_lowercase())
+        }
+        SignerSetup::Turnkey {
+            operator_address, ..
+        }
+        | SignerSetup::Mpcvault {
+            operator_address, ..
+        } => Ok(operator_address.trim().to_lowercase()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignerCheckRequest {
+    /// Chain the new bot (or the bot being re-signed) will trade on.
+    pub chain_id: u64,
+    pub signer: SignerRequest,
+    /// When re-signing an existing bot, exclude it — it already uses this wallet.
+    #[serde(default)]
+    pub exclude_bot: Option<String>,
+}
+
+/// Dry-run: which other bots in the fleet already use this wallet on this chain.
+///
+/// Sharing one operator wallet across two bots on the same chain is unsafe (nonce
+/// collisions, competing quotes). The UI warns before create / change-signer.
+/// Config writes are still allowed when the conflict is soft, but a *live*
+/// sibling with taker/closer on (`blocksLiveSwitch`) makes change-signer /
+/// Start refuse — the response marks those so the UI doesn't offer a confirm
+/// that can only 409.
+pub async fn check_signer(
+    State(state): State<AppState>,
+    Json(body): Json<SignerCheckRequest>,
+) -> Result<Response, ApiError> {
+    let setup = body.signer.into_setup()?;
+    let address = operator_address_of(&setup)?;
+    let wallet = crate::panel::inventory::WalletId {
+        chain_id: body.chain_id,
+        address: address.clone(),
+    };
+    let exclude = body
+        .exclude_bot
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let fleet = state.fleet().await?;
+    let conflicts: Vec<serde_json::Value> = fleet
+        .bots()
+        .iter()
+        .filter(|b| exclude != Some(b.name.as_str()))
+        .filter(|b| b.wallet().as_ref() == Some(&wallet))
+        .map(|b| {
+            // Same predicate change_signer / Start use via no_live_sibling_on_wallet_id.
+            let blocks_live_switch = super::logs::already_transacting(b);
+            serde_json::json!({
+                "name": b.name,
+                "chainId": b.config.as_ref().map(|c| c.chain_id),
+                "operatorAddress": b.config.as_ref().and_then(|c| c.operator_address.clone()),
+                "blocksLiveSwitch": blocks_live_switch,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "operatorAddress": address,
+        "chainId": body.chain_id,
+        "conflicts": conflicts,
+    }))
+    .into_response())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateRequest {
@@ -368,6 +445,107 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[[pools]]"));
+    }
+
+    #[tokio::test]
+    async fn signer_check_warns_when_another_bot_shares_the_wallet_on_the_chain() {
+        let h = harness("signer-check");
+        // Existing bot on BSC with TEST_KEY.
+        h.post_json(
+            "/api/bots",
+            json!({
+                "name": "bot-a",
+                "corridorId": "cngn-usdt-bsc",
+                "signer": local(TEST_KEY),
+            }),
+        )
+        .await;
+
+        // Same key + same chain → conflict.
+        let (status, body) = h
+            .post_json(
+                "/api/signer/check",
+                json!({
+                    "chainId": 56,
+                    "signer": local(TEST_KEY),
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(v["conflicts"][0]["name"], "bot-a");
+        // Fresh create is stopped / maker-only — soft conflict, not a live-switch block.
+        assert_eq!(v["conflicts"][0]["blocksLiveSwitch"], false);
+        assert!(!body.contains(TEST_KEY));
+
+        // Same key on a different chain is fine.
+        let (status, body) = h
+            .post_json(
+                "/api/signer/check",
+                json!({
+                    "chainId": 1,
+                    "signer": local(TEST_KEY),
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(Harness::parse(&body)["conflicts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // Re-signing bot-a itself excludes it.
+        let (status, body) = h
+            .post_json(
+                "/api/signer/check",
+                json!({
+                    "chainId": 56,
+                    "signer": local(TEST_KEY),
+                    "excludeBot": "bot-a",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(Harness::parse(&body)["conflicts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn signer_check_marks_a_live_transacting_sibling_as_blocking() {
+        // change_signer refuses a restart onto a wallet a live taker already spends.
+        // The check has to surface that so the UI doesn't offer "Switch anyway".
+        let h = harness("signer-check-block");
+        h.post_json(
+            "/api/bots",
+            json!({
+                "name": "bot-a",
+                "corridorId": "cngn-usdt-bsc",
+                "signer": local(TEST_KEY),
+                "start": true,
+            }),
+        )
+        .await;
+        // Turn the taker on and keep it running — that's what can_transact keys on.
+        let path = h.root.join("bot-a/stitch.toml");
+        let toml = std::fs::read_to_string(&path).unwrap() + "\nlimit_taker_enabled = true\n";
+        std::fs::write(&path, toml).unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/signer/check",
+                json!({
+                    "chainId": 56,
+                    "signer": local(TEST_KEY),
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(v["conflicts"][0]["blocksLiveSwitch"], true, "{body}");
     }
 
     #[tokio::test]

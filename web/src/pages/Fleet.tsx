@@ -121,7 +121,9 @@ export default function Fleet() {
         </Empty>
       ) : (
         <ul className="space-y-3">
-          {data.bots.map((bot) => (
+          {[...data.bots]
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map((bot) => (
             <li key={bot.name}>
               <BotRow
                 bot={bot}

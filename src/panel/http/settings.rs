@@ -136,6 +136,15 @@ pub struct SettingsBody {
     pub sell_sizing: SizingBody,
     pub ttl_secs: u64,
     pub tick_interval_secs: u64,
+    /// Rolling TWAP window in seconds. Empty = quote off the instantaneous feed.
+    pub twap_window_secs: String,
+    /// Spot-deviation guard in bps. Empty = bot default when TWAP is on.
+    pub twap_max_deviation_bps: String,
+    pub lean_enabled: bool,
+    pub lean_shadow: bool,
+    pub lean_floor_bps: String,
+    pub lean_base_bps: String,
+    pub lean_wide_bps: String,
     /// Whether saving will be accepted. False for a bot whose config the panel can
     /// see but not write.
     pub editable: bool,
@@ -156,6 +165,13 @@ impl SettingsBody {
             sell_sizing: SizingBody::from(&v.sell_sizing),
             ttl_secs: v.ttl_secs,
             tick_interval_secs: v.tick_interval_secs,
+            twap_window_secs: v.twap_window_secs.clone(),
+            twap_max_deviation_bps: v.twap_max_deviation_bps.clone(),
+            lean_enabled: v.lean_enabled,
+            lean_shadow: v.lean_shadow,
+            lean_floor_bps: v.lean_floor_bps.clone(),
+            lean_base_bps: v.lean_base_bps.clone(),
+            lean_wide_bps: v.lean_wide_bps.clone(),
             editable,
         }
     }
@@ -261,6 +277,20 @@ pub struct SettingsUpdate {
     pub ttl_secs: Option<u64>,
     #[serde(default)]
     pub tick_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub twap_window_secs: Option<String>,
+    #[serde(default)]
+    pub twap_max_deviation_bps: Option<String>,
+    #[serde(default)]
+    pub lean_enabled: Option<bool>,
+    #[serde(default)]
+    pub lean_shadow: Option<bool>,
+    #[serde(default)]
+    pub lean_floor_bps: Option<String>,
+    #[serde(default)]
+    pub lean_base_bps: Option<String>,
+    #[serde(default)]
+    pub lean_wide_bps: Option<String>,
 }
 
 impl SettingsUpdate {
@@ -297,6 +327,38 @@ impl SettingsUpdate {
         if let Some(v) = self.tick_interval_secs {
             patch.tick_interval_secs = Some(v);
         }
+        // A partial UI patch must leave untouched experimental fields alone —
+        // otherwise a spread-only save would rewrite them from a stale form.
+        // So start from a "don't touch" patch for those and only fold in what
+        // the request named.
+        patch.twap_window_secs = None;
+        patch.twap_max_deviation_bps = None;
+        patch.lean_enabled = None;
+        patch.lean_shadow = None;
+        patch.lean_floor_bps = None;
+        patch.lean_base_bps = None;
+        patch.lean_wide_bps = None;
+        if let Some(v) = &self.twap_window_secs {
+            patch.twap_window_secs = Some(v.trim().to_string());
+        }
+        if let Some(v) = &self.twap_max_deviation_bps {
+            patch.twap_max_deviation_bps = Some(v.trim().to_string());
+        }
+        if let Some(v) = self.lean_enabled {
+            patch.lean_enabled = Some(v);
+        }
+        if let Some(v) = self.lean_shadow {
+            patch.lean_shadow = Some(v);
+        }
+        if let Some(v) = &self.lean_floor_bps {
+            patch.lean_floor_bps = Some(v.trim().to_string());
+        }
+        if let Some(v) = &self.lean_base_bps {
+            patch.lean_base_bps = Some(v.trim().to_string());
+        }
+        if let Some(v) = &self.lean_wide_bps {
+            patch.lean_wide_bps = Some(v.trim().to_string());
+        }
         Ok(patch)
     }
 }
@@ -322,8 +384,10 @@ pub async fn update(
     let current = setup::read_settings_at(&current_toml, pool).map_err(ApiError::bad_request)?;
     let patch = body.onto(&current)?;
     // `apply_settings` re-validates through the real loader, so an invalid value
-    // fails here and nothing is written.
-    let edited = setup::apply_settings(&current_toml, &patch).map_err(ApiError::bad_request)?;
+    // fails here and nothing is written. Use the full anyhow chain — the outer
+    // "edited config is not valid" alone doesn't name the field that failed.
+    let edited = setup::apply_settings(&current_toml, &patch)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
     save_and_restart(&state, &bot, &path, &edited, pool).await
 }
@@ -930,6 +994,40 @@ mod tests {
         assert_eq!(v["settings"]["sell"], before["sell"]);
         assert_eq!(v["settings"]["ttlSecs"], before["ttlSecs"]);
         assert_eq!(v["settings"]["buySizing"], before["buySizing"]);
+        assert_eq!(v["settings"]["twapWindowSecs"], before["twapWindowSecs"]);
+    }
+
+    #[tokio::test]
+    async fn experimental_twap_and_lean_round_trip_through_settings() {
+        let h = harness("settings-experimental");
+        seed(&h, "bot-a");
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({
+                    "twapWindowSecs": "60",
+                    "twapMaxDeviationBps": "50",
+                    "leanShadow": true,
+                    "leanFloorBps": "3.0",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "first patch: {body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["twapWindowSecs"], "60");
+        assert_eq!(v["settings"]["twapMaxDeviationBps"], "50");
+        assert_eq!(v["settings"]["leanShadow"], true);
+        assert_eq!(v["settings"]["leanEnabled"], false);
+
+        // Lean on without a floor is refused; nothing written for that field set.
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "leanEnabled": true, "leanFloorBps": "" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("lean_floor"), "{body}");
     }
 
     #[tokio::test]

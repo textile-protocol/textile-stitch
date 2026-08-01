@@ -172,70 +172,79 @@ export default function BotDetail() {
       )}
 
       <Card>
-        <div className="flex flex-wrap items-center gap-2">
-          {bot.container ? (
-            <>
-              {bot.canStop ? (
+        {/*
+          On narrow screens a single flex+ml-auto row wraps badly: Update stays
+          left and Remove jumps to the far right of the next line. Lifecycle
+          actions share a 2-col grid on mobile; Remove sits full-width under
+          them. From sm up, everything is one wrapping row with Remove pushed
+          to the end.
+        */}
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+          <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center [&_button]:w-full sm:[&_button]:w-auto">
+            {bot.container ? (
+              <>
+                {bot.canStop ? (
+                  <Button
+                    busy={busy === 'stop'}
+                    onClick={() => void act('stop')}
+                    title="Sends SIGTERM and waits, so the bot finishes its tick and cancels cleanly"
+                  >
+                    Stop
+                  </Button>
+                ) : (
+                  <Button busy={busy === 'start'} onClick={() => void act('start')}>
+                    Start
+                  </Button>
+                )}
+                {/* See Fleet.tsx: Restart needs a live process, exactly like Stop. */}
                 <Button
-                  busy={busy === 'stop'}
-                  onClick={() => void act('stop')}
-                  title="Sends SIGTERM and waits, so the bot finishes its tick and cancels cleanly"
+                  busy={busy === 'restart'}
+                  disabled={!bot.canStop}
+                  onClick={() => void act('restart')}
+                  title={
+                    bot.canStop
+                      ? 'Stop and start it again, with the full tick grace period'
+                      : `${bot.name} is ${bot.state} — there is nothing to restart. Use Start.`
+                  }
                 >
-                  Stop
+                  Restart
                 </Button>
-              ) : (
-                <Button busy={busy === 'start'} onClick={() => void act('start')}>
-                  Start
+                <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
+                  Recreate
                 </Button>
-              )}
-              {/* See Fleet.tsx: Restart needs a live process, exactly like Stop. */}
-              <Button
-                busy={busy === 'restart'}
-                disabled={!bot.canStop}
-                onClick={() => void act('restart')}
-                title={
-                  bot.canStop
-                    ? 'Stop and start it again, with the full tick grace period'
-                    : `${bot.name} is ${bot.state} — there is nothing to restart. Use Start.`
-                }
-              >
-                Restart
-              </Button>
-              <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
-                Recreate
-              </Button>
-              {updateAvailable && !bot.canMigrate && bot.layout !== 'flat-files' && (
+                {updateAvailable && !bot.canMigrate && bot.layout !== 'flat-files' && (
+                  <Button
+                    variant="primary"
+                    busy={busy === 'update'}
+                    onClick={() => void act('update')}
+                    title={`Pull ${updates?.bot.targetImage} and recreate this bot on it`}
+                  >
+                    Update
+                  </Button>
+                )}
+              </>
+            ) : (
+              <>
+                <Tag>no container</Tag>
+                {/*
+                  Config is on disk but no container: the wizard failed mid-create, or
+                  someone removed the container and kept the files. Recreate is the
+                  only recovery — Add Bot conflicts with the existing directory.
+                */}
                 <Button
-                  variant="primary"
-                  busy={busy === 'update'}
-                  onClick={() => void act('update')}
-                  title={`Pull ${updates?.bot.targetImage} and recreate this bot on it`}
+                  busy={busy === 'recreate'}
+                  onClick={() => void act('recreate')}
+                  title="Build a container from the config already on disk"
                 >
-                  Update
+                  Recreate
                 </Button>
-              )}
-            </>
-          ) : (
-            <>
-              <Tag>no container</Tag>
-              {/*
-                Config is on disk but no container: the wizard failed mid-create, or
-                someone removed the container and kept the files. Recreate is the
-                only recovery — Add Bot conflicts with the existing directory.
-              */}
-              <Button
-                busy={busy === 'recreate'}
-                onClick={() => void act('recreate')}
-                title="Build a container from the config already on disk"
-              >
-                Recreate
-              </Button>
-            </>
-          )}
+              </>
+            )}
+          </div>
           <Button
             variant="danger"
             busy={busy === 'remove'}
-            className="ml-auto"
+            className="w-full sm:ml-auto sm:w-auto"
             onClick={() => void remove()}
           >
             Remove

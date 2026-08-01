@@ -8,6 +8,7 @@ import {
   isSignerComplete,
   type SignerState,
 } from './SignerFields'
+import SignerConflictWarning from './SignerConflictWarning'
 
 /**
  * Switch a bot's signer backend. Unlike the raw config editor, this collects the new
@@ -16,9 +17,18 @@ import {
  */
 export default function ChangeSigner({
   bot,
+  chainId,
+  wantsToBeUp,
   onChanged,
 }: {
   bot: string
+  /** Chain this bot trades on — wallet conflicts are per chain. */
+  chainId: number | null | undefined
+  /**
+   * Whether changing the signer will restart this bot (running / restarting).
+   * A live-transacting sibling then makes the server refuse the switch.
+   */
+  wantsToBeUp: boolean
   onChanged: (message: string) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -33,6 +43,38 @@ export default function ChangeSigner({
   }
 
   async function submit() {
+    if (chainId != null) {
+      try {
+        const check = await api.checkSigner({
+          chainId,
+          signer: buildSigner(signer),
+          excludeBot: bot,
+        })
+        if (check.conflicts.length > 0) {
+          const names = check.conflicts.map((c) => c.name).join(', ')
+          const blockers = check.conflicts
+            .filter((c) => c.blocksLiveSwitch)
+            .map((c) => c.name)
+          // change_signer refuses a restart onto a wallet a live taker/closer
+          // sibling already spends — don't offer "Switch anyway" for a 409.
+          if (wantsToBeUp && blockers.length > 0) {
+            setError(
+              `${blockers.join(', ')} ${blockers.length === 1 ? 'is' : 'are'} live with taker/closer on and share this wallet. Stop ${blockers.length === 1 ? 'that bot' : 'those bots'} first — switching while both are up always fails.`,
+            )
+            return
+          }
+          if (
+            !window.confirm(
+              `Another bot already uses this wallet on chain ${chainId}: ${names}.\n\nSharing one wallet across bots on the same chain races nonces and will cause issues. Switch anyway?`,
+            )
+          ) {
+            return
+          }
+        }
+      } catch {
+        // changeSigner will surface a bad key.
+      }
+    }
     setBusy(true)
     setError(null)
     try {
@@ -71,6 +113,11 @@ export default function ChangeSigner({
           signed stay on the book until they expire.
         </Banner>
         <SignerFields value={signer} onChange={setSigner} />
+        <SignerConflictWarning
+          chainId={chainId}
+          signer={signer}
+          excludeBot={bot}
+        />
         {error && <Banner tone="danger">{error}</Banner>}
         <div className="flex justify-between">
           <Button onClick={close}>Cancel</Button>
