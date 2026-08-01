@@ -224,9 +224,13 @@ impl BindSpec {
         }
     }
 
-    /// Docker's bind string. Paths with a colon would produce a mount spec that
-    /// silently means something else, so they're rejected rather than escaped —
-    /// Docker has no escape for this and a wrong mount is worse than an error.
+    /// Docker's short bind string (`src:dst[:ro]`). Paths with a colon would
+    /// produce a mount spec that silently means something else, so they're
+    /// rejected rather than escaped — Docker has no escape for this form.
+    ///
+    /// Prefer [`Self::to_compose_volume_yaml`] for compose export and the
+    /// structured Mount API for container create: both accept Windows drive
+    /// paths (`C:/Users/...`) that this short form cannot express.
     pub fn to_bind_string(&self) -> Result<String> {
         let host = path_str(&self.host_path)?;
         let container = path_str(&self.container_path)?;
@@ -241,6 +245,12 @@ impl BindSpec {
         } else {
             format!("{host}:{container}")
         })
+    }
+
+    /// Host and container paths as UTF-8 strings, for long-form compose mounts
+    /// when [`Self::to_bind_string`] cannot express them (Windows drive letters).
+    pub fn path_strings(&self) -> Result<(String, String)> {
+        Ok((path_str(&self.host_path)?, path_str(&self.container_path)?))
     }
 }
 
@@ -546,6 +556,21 @@ mod tests {
         let spec = BindSpec::rw("/host/bot:a", "/home/stitch/run");
         let err = spec.to_bind_string().unwrap_err();
         assert!(err.to_string().contains("colon"));
+    }
+
+    #[test]
+    fn windows_drive_paths_cannot_use_short_bind_strings() {
+        // Docker Desktop on Windows passes host paths like C:/Users/… into
+        // STITCH_PANEL_HOST_BOTS_DIR. Short bind syntax can't express the
+        // drive letter; callers must use long-form mounts / the Mount API.
+        let spec = BindSpec::ro(
+            "C:/Users/op/stitch-bots/bot-a/stitch.toml",
+            "/home/stitch/run/stitch.toml",
+        );
+        assert!(spec.to_bind_string().is_err());
+        let (host, container) = spec.path_strings().unwrap();
+        assert_eq!(host, "C:/Users/op/stitch-bots/bot-a/stitch.toml");
+        assert_eq!(container, "/home/stitch/run/stitch.toml");
     }
 
     #[test]

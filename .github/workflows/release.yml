@@ -27,6 +27,7 @@ on:
       - 'dist-workspace.toml'
       - 'docker-compose.panel.local.yml'
       - 'docker-compose.panel.yml'
+      - 'install-panel.ps1'
       - 'install-panel.sh'
       - 'src/**'
       - 'stitch.example.toml'
@@ -41,6 +42,7 @@ on:
       - 'dist-workspace.toml'
       - 'docker-compose.panel.local.yml'
       - 'docker-compose.panel.yml'
+      - 'install-panel.ps1'
       - 'install-panel.sh'
       - 'src/**'
       - 'stitch.example.toml'
@@ -416,12 +418,15 @@ jobs:
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -euo pipefail
-          # Operators verify these before `sh install-panel.sh` (see docs/install-panel.md).
+          # Operators verify these before `sh install-panel.sh` /
+          # `install-panel.ps1` (see docs/install-panel.md).
           sha256sum install-panel.sh | awk '{print $1 "  install-panel.sh"}' > install-panel.sh.sha256
+          sha256sum install-panel.ps1 | awk '{print $1 "  install-panel.ps1"}' > install-panel.ps1.sha256
           sha256sum docker-compose.panel.yml | awk '{print $1 "  docker-compose.panel.yml"}' > docker-compose.panel.yml.sha256
           sha256sum docker-compose.panel.local.yml | awk '{print $1 "  docker-compose.panel.local.yml"}' > docker-compose.panel.local.yml.sha256
           gh release upload "$TAG" --clobber \
             install-panel.sh.sha256 \
+            install-panel.ps1.sha256 \
             docker-compose.panel.yml.sha256 \
             docker-compose.panel.local.yml.sha256
       # The release above is created with GITHUB_TOKEN, so it does NOT fire the

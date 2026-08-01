@@ -30,6 +30,19 @@
 
 set -eu
 
+# Native Windows has no POSIX sh that can drive this installer reliably. Point
+# operators at the PowerShell installer instead of failing halfway through.
+case "$(uname -s 2>/dev/null || true)" in
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    printf '%s\n' "error: install-panel.sh is for macOS/Linux. On Windows use PowerShell:" >&2
+    printf '%s\n' "" >&2
+    printf '%s\n' "  irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1 | iex" >&2
+    printf '%s\n' "" >&2
+    printf '%s\n' "Docs: https://github.com/textile-protocol/textile-stitch/blob/main/docs/install-panel.md" >&2
+    exit 1
+    ;;
+esac
+
 # Every secret this writes — the auth key, the password hash — lands in .env, so
 # tighten the mask before creating anything rather than chmod-ing after.
 umask 077

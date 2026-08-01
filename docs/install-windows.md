@@ -1,11 +1,30 @@
 # Manual install — Windows
 
-Run Stitch from a release binary in PowerShell. If you'd rather not touch the
-terminal, use the [desktop app](../README.md#option-2--desktop-app)
-(`stitch-setup.exe`) instead — it does setup and then runs the bot with
-Start/Stop, logs, approvals, and updates.
+Two paths:
+
+1. **Stitch web UI (Docker Desktop)** — run several bots from a browser:
+   see [install-panel.md](install-panel.md) / `install-panel.ps1`.
+2. **Standalone bot binary** — this page. Or use the
+   [desktop app](../README.md#option-2--desktop-app) (`stitch-setup.exe`) for
+   setup plus Start/Stop, logs, approvals, and updates.
 
 All commands below are PowerShell.
+
+## Stitch web UI (Docker)
+
+Needs [Docker Desktop for Windows](https://docs.docker.com/desktop/setup/install/windows-install/)
+with the Linux engine running.
+
+```powershell
+$env:PANEL_MODE = 'local'
+$env:PANEL_PASSWORD = 'choose-a-long-password'
+irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1 | iex
+```
+
+Open `http://127.0.0.1:8420`, log in, add a bot in the UI. Tailscale server mode
+is Linux-only — use `install-panel.sh` on a Linux host for that.
+
+## Standalone bot binary
 
 ## 1. Install the binary
 

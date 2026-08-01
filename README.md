@@ -60,17 +60,24 @@ For a server, a laptop with Docker, or more than one bot. One command on any
 Docker host:
 
 ```bash
-# Prefer a release tag + checksum (see docs/install-panel.md). Quick path:
+# macOS / Linux — prefer a release tag + checksum (see docs/install-panel.md). Quick path:
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
 ```
 
+```powershell
+# Windows PowerShell + Docker Desktop (local mode):
+irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1 | iex
+```
+
 It asks whether you're installing on a **local computer** (password login at
-`http://127.0.0.1:8420`) or a **server** (Tailscale, so you can open it from
-your other devices). Then it starts the web UI. Add a bot with a wizard, start
-and stop it, edit settings, approve allowances, tail logs — all in the browser.
+`http://127.0.0.1:8420`) or a **server** (Tailscale on Linux, so you can open it
+from your other devices). Then it starts the web UI. Add a bot with a wizard,
+start and stop it, edit settings, approve allowances, tail logs — all in the
+browser.
 
 You need Docker with Compose v2. Server mode also needs a Tailscale account
-(the free tier is enough). Nothing is compiled: it runs the published image.
+(the free tier is enough) and a Linux Docker host. Nothing is compiled: it runs
+the published image.
 
 Then open the URL it prints, click **Add a bot**, pick a corridor, paste your
 operator wallet key, and approve the router allowance from the bot's page before

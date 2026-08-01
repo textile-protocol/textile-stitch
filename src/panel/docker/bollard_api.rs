@@ -16,8 +16,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bollard::container::LogOutput;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, HostConfig, HostConfigLogConfig, MountPoint,
-    RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerSummary, HostConfig, HostConfigLogConfig, Mount, MountPoint,
+    MountType, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder,
@@ -290,14 +290,42 @@ impl DockerApi for BollardDocker {
     }
 
     async fn create(&self, spec: &CreateSpec) -> Result<String> {
-        let binds = spec
+        // Structured Mounts, not colon-delimited bind strings: Windows Docker
+        // Desktop host paths look like `C:/Users/…` and cannot be expressed in
+        // the short `src:dst` form without mangling the drive letter.
+        let mounts = spec
             .binds
             .iter()
-            .map(|b| b.to_bind_string())
+            .map(|b| {
+                let source = b
+                    .host_path
+                    .to_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("host path {} is not valid UTF-8", b.host_path.display())
+                    })?
+                    .to_string();
+                let target = b
+                    .container_path
+                    .to_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "container path {} is not valid UTF-8",
+                            b.container_path.display()
+                        )
+                    })?
+                    .to_string();
+                Ok(Mount {
+                    target: Some(target),
+                    source: Some(source),
+                    typ: Some(MountType::BIND),
+                    read_only: Some(b.read_only),
+                    ..Default::default()
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let host_config = HostConfig {
-            binds: Some(binds),
+            mounts: Some(mounts),
             restart_policy: spec.restart_unless_stopped.then_some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,

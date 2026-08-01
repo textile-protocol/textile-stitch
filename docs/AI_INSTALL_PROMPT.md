@@ -7,8 +7,9 @@ This installs the **Stitch web UI** (`stitch-panel`) only. Bot corridors, wallet
 keys, spreads, Permit2 approvals, dry runs, and live starts happen in the browser
 afterward — the agent does not configure bots.
 
-Coding agents often block `curl ... | sh`. The prompt below downloads
-`install-panel.sh` to disk first, then runs it from that file.
+Coding agents often block `curl ... | sh` / `irm ... | iex`. The prompt below
+downloads the installer to disk first, then runs it from that file
+(`install-panel.sh` on macOS/Linux, `install-panel.ps1` on Windows).
 
 ```text
 You are helping me install Textile Stitch, the operator web UI at:
@@ -30,13 +31,15 @@ Hard rules:
   Scheduler services for a bot.
 - Never ask me to paste a bot wallet private key into chat or a question tool.
 - Never pipe a remote script into an interpreter. Forbidden: `curl ... | sh`,
-  `curl ... | bash`, `irm ... | iex`. Download install-panel.sh to a local file,
-  then run it from disk.
+  `curl ... | bash`, `irm ... | iex`. Download the OS-appropriate installer to a
+  local file, then run it from disk.
 - If Docker is missing or the daemon is unreachable, stop and tell me how to
-  install/start Docker, then wait.
+  install/start Docker (Docker Desktop on Windows/macOS), then wait.
 - If the install fails, stop and explain. Do not invent a hand-rolled compose
-  stack unless install-panel.sh is unavailable and I ask you to continue from
+  stack unless the installer is unavailable and I ask you to continue from
   docs/install-panel.md.
+- On Windows, only local mode is supported by install-panel.ps1. Do not attempt
+  Tailscale server mode on Windows Docker Desktop.
 
 Question tool rules:
 - Use AskUserQuestion for every non-secret question when that tool exists. If the
@@ -56,9 +59,10 @@ Ask ONLY this before installing:
      http://127.0.0.1:8420 on this machine only; Server — Tailscale, so you can
      open Stitch from your other devices on the tailnet.
    - Local computer → password auth, loopback bind. No Tailscale. Use this on
-     macOS (Apple Silicon or Intel) and on Linux laptops.
+     macOS, Windows (Docker Desktop), and Linux laptops.
    - Server → Tailscale sidecar on a Linux Docker host, no host port published.
-     Prefer local on a Mac; server mode expects Linux (/dev/net/tun).
+     Prefer local on a Mac or Windows PC; server mode expects Linux (/dev/net/tun).
+     On Windows, do not offer server — force local.
    - Remember the answer. It selects PANEL_MODE=local or PANEL_MODE=server for
      the installer.
 
@@ -67,39 +71,53 @@ signers, or bot wallet keys. Those are configured in the web app after install.
 
 Defaults:
 - GitHub repo: textile-protocol/textile-stitch
-- Installer: install-panel.sh from the latest main (or the release docs point at)
-- Install dir: ~/stitch-panel
-- Local bots dir default: ~/stitch-bots
+- Installer: install-panel.sh (macOS/Linux) or install-panel.ps1 (Windows)
+- Install dir: ~/stitch-panel or %USERPROFILE%\stitch-panel
+- Local bots dir default: ~/stitch-bots or %USERPROFILE%\stitch-bots
 - Server bots dir default: /srv/stitch/bots
 - Panel image: ghcr.io/textile-protocol/textile-stitch-panel:latest
+  (multi-arch: linux/amd64 + linux/arm64; Docker picks the host arch)
 
 Install procedure:
 1. Confirm Docker works: `docker compose version` and `docker info`. If either
    fails, stop and help me fix Docker first.
 
-2. Download the installer to a local file (do not pipe to sh):
+2. Download the installer to a local file (do not pipe to a shell):
 
-   INSTALLER_URL="https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh"
-   INSTALLER_PATH="$(mktemp -t stitch-install-panel.XXXXXX.sh)"
-   curl --proto '=https' --tlsv1.2 -fsSL "$INSTALLER_URL" -o "$INSTALLER_PATH"
-   chmod 700 "$INSTALLER_PATH"
+   macOS / Linux:
+
+     INSTALLER_URL="https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh"
+     INSTALLER_PATH="$(mktemp -t stitch-install-panel.XXXXXX.sh)"
+     curl --proto '=https' --tlsv1.2 -fsSL "$INSTALLER_URL" -o "$INSTALLER_PATH"
+     chmod 700 "$INSTALLER_PATH"
+
+   Windows PowerShell:
+
+     $InstallerUrl = 'https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1'
+     $InstallerPath = Join-Path $env:TEMP 'install-panel.ps1'
+     Invoke-WebRequest $InstallerUrl -OutFile $InstallerPath
 
    Prefer a local copy if this machine already has the textile-stitch repo or the
-   Textile monorepo's packages/stitch-bot/install-panel.sh — use that path instead
+   Textile monorepo's packages/stitch-bot/install-panel.* — use that path instead
    of downloading.
 
 3. Run the installer with the mode from question 1.
 
-   Local computer:
+   Local computer (macOS / Linux):
 
      PANEL_MODE=local sh "$INSTALLER_PATH"
+
+   Local computer (Windows):
+
+     $env:PANEL_MODE = 'local'
+     & $InstallerPath
 
    The installer prompts for a panel login password (hidden). Do not put that
    password in chat. If you cannot give it a real TTY, set PANEL_PASSWORD in the
    environment for that one command only after collecting it via a local hidden
    prompt / saved Terminal script — never via AskUserQuestion.
 
-   Server:
+   Server (Linux only):
 
      PANEL_MODE=server sh "$INSTALLER_PATH"
 
@@ -108,7 +126,8 @@ Install procedure:
    https://login.tailscale.com/admin/settings/keys. Use the login from the
    Tailscale Users page, not a nickname.
 
-4. Remove the temp installer file when finished: `rm -f "$INSTALLER_PATH"`.
+4. Remove the temp installer file when finished (`rm -f "$INSTALLER_PATH"` or
+   `Remove-Item $InstallerPath`).
 
 5. Open the web app:
    - Local: http://127.0.0.1:8420 (log in with the panel password).

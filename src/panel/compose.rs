@@ -246,9 +246,6 @@ fn service(bot: &Bot, cfg: &PanelConfig) -> Result<String, String> {
 
     block.push_str("    volumes:\n");
     for m in &mounts {
-        let spec = m
-            .to_bind_string()
-            .map_err(|e| format!("one of its mounts can't be expressed in compose ({e})"))?;
         // Only the writable directory mount earns the note, and a flat-layout bot
         // doesn't have one — which is exactly why its ledger doesn't survive.
         let note = if m.read_only {
@@ -256,7 +253,23 @@ fn service(bot: &Bot, cfg: &PanelConfig) -> Result<String, String> {
         } else {
             " # rw: persists the nonce ledger across restarts"
         };
-        block.push_str(&format!("      - {}{note}\n", yaml_scalar(&spec)));
+        match m.to_bind_string() {
+            Ok(spec) => {
+                block.push_str(&format!("      - {}{note}\n", yaml_scalar(&spec)));
+            }
+            Err(_) => {
+                // Windows drive paths (`C:/Users/…`) can't use short bind syntax.
+                let (host, container) = m.path_strings().map_err(|e| {
+                    format!("one of its mounts can't be expressed in compose ({e})")
+                })?;
+                block.push_str(&format!("      - type: bind{note}\n"));
+                block.push_str(&format!("        source: {}\n", yaml_scalar(&host)));
+                block.push_str(&format!("        target: {}\n", yaml_scalar(&container)));
+                if m.read_only {
+                    block.push_str("        read_only: true\n");
+                }
+            }
+        }
     }
     block.push('\n');
     Ok(block)
@@ -675,6 +688,30 @@ mod tests {
         );
         assert!(yaml.contains("outside"), "{yaml}");
         assert!(yaml.contains("another machine"), "{yaml}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn windows_drive_host_paths_export_as_long_form_binds() {
+        // In-root bots export as ./bot-a (no colon). Absolute Windows paths show
+        // up for adopted bots outside the bots root — short `src:dst` can't
+        // express the drive letter, so compose must use long-form binds.
+        let (mut cfg, root) = test_cfg("win-drive");
+        cfg.host_bots_dir = PathBuf::from("C:/Users/op/stitch-bots");
+        let elsewhere = "C:/Users/op/elsewhere/bot-a";
+        seed(&root, "bot-a");
+        let mut c = container("stitch-bot-a", ContainerState::Running);
+        c.labels.insert(LABEL_BOT.into(), "bot-a".into());
+        c.mounts = dir_layout_mounts(elsewhere);
+
+        let yaml = render(&discover(&[c], &cfg), &cfg);
+        assert!(yaml.contains("type: bind"), "{yaml}");
+        assert!(yaml.contains(&format!("source: {elsewhere}")), "{yaml}");
+        assert!(yaml.contains("target: /home/stitch/run"), "{yaml}");
+        assert!(
+            !yaml.contains(&format!("- {elsewhere}:/home/stitch/run")),
+            "must not use short bind syntax for drive paths: {yaml}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

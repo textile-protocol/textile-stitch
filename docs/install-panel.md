@@ -24,16 +24,46 @@ to start on a routable address unless you override it explicitly.
 - Docker with Compose v2 (`docker compose version`).
 - A host that can pull `linux/amd64` or `linux/arm64`. Published panel and bot
   images are multi-arch, so the same `:latest` / `sha-*` tag works on Apple
-  Silicon Macs (arm64) and on Linux servers (amd64). Docker picks the matching
-  variant; do not pin `platform:` in compose.
+  Silicon Macs (arm64), Windows Docker Desktop (usually amd64), and Linux
+  servers. Docker picks the matching variant; do not pin `platform:` in compose.
 - A Tailscale account, for **server** installs (Linux hosts). Free tier is
-  enough. On a Mac, use **local** mode instead — password on loopback.
-- A directory on the host for bot configs (`~/stitch-bots` locally, or
-  `/srv/stitch/bots` on a server).
+  enough. On a Mac or Windows PC, use **local** mode instead — password on
+  loopback.
+- A directory on the host for bot configs (`~/stitch-bots` / `%USERPROFILE%\stitch-bots`
+  locally, or `/srv/stitch/bots` on a server).
 
 ## Install it
 
-**Recommended — pin a release and verify the installer checksum:**
+**Windows (PowerShell + Docker Desktop) — local mode:**
+
+```powershell
+# Quick path
+$env:PANEL_MODE = 'local'
+$env:PANEL_PASSWORD = 'choose-a-long-password'
+irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1 | iex
+```
+
+**Windows — recommended pin + checksum:**
+
+```powershell
+$TAG = 'vX.Y.Z'   # from https://github.com/textile-protocol/textile-stitch/releases
+Invoke-WebRequest "https://raw.githubusercontent.com/textile-protocol/textile-stitch/$TAG/install-panel.ps1" -OutFile install-panel.ps1
+Invoke-WebRequest "https://github.com/textile-protocol/textile-stitch/releases/download/$TAG/install-panel.ps1.sha256" -OutFile install-panel.ps1.sha256
+$expected = ((Get-Content install-panel.ps1.sha256).Split()[0]).ToLowerInvariant()
+$actual = (Get-FileHash install-panel.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "checksum mismatch for install-panel.ps1 (got $actual, want $expected)" }
+$env:STITCH_REF = $TAG
+$env:PANEL_IMAGE = 'ghcr.io/textile-protocol/textile-stitch-panel:sha-<commit>'
+$env:STITCH_REQUIRE_PINNED = '1'
+$env:PANEL_MODE = 'local'
+$env:PANEL_PASSWORD = 'choose-a-long-password'
+.\install-panel.ps1
+```
+
+Tailscale **server** mode is not offered by `install-panel.ps1` — use a Linux
+Docker host and `install-panel.sh` for that.
+
+**macOS / Linux — recommended pin + checksum:**
 
 ```bash
 TAG=vX.Y.Z   # from https://github.com/textile-protocol/textile-stitch/releases
@@ -54,20 +84,30 @@ Tailscale server variables above.
 
 `PANEL_IMAGE` should be a `sha-*` tag or `@sha256:…` digest from
 [GHCR](https://github.com/textile-protocol/textile-stitch/pkgs/container/textile-stitch-panel).
-Set `STITCH_COMPOSE_SHA256` from the release's `docker-compose.panel.yml.sha256`
-asset when you want the fetched compose file integrity-checked too.
+On macOS/Linux server installs, set `STITCH_COMPOSE_SHA256` from the release's
+`docker-compose.panel.yml.sha256` asset when you want the fetched server compose
+file integrity-checked. Windows/`install-panel.ps1` always uses
+`docker-compose.panel.local.yml`, so that env var is skipped there (same as
+`install-panel.sh` in local mode); the release also publishes
+`docker-compose.panel.local.yml.sha256` for manual checks.
 
 **Quick path** (image defaults to `:latest`, so compose is fetched from `main`
 to stay aligned; pin both `STITCH_REF` and `PANEL_IMAGE` for a release install):
 
 ```bash
+# macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh | sh
 ```
 
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1 | iex
+```
+
 That is the whole install. It checks Docker, asks whether this is a **local
-computer** (password on `http://127.0.0.1:8420`) or a **server** (Tailscale),
-writes an owner-only `.env`, and starts the published image. No checkout, no
-build. You add bots in the web UI afterward.
+computer** (password on `http://127.0.0.1:8420`) or a **server** (Tailscale;
+Linux/`install-panel.sh` only), writes an owner-only `.env`, and starts the
+published image. No checkout, no build. You add bots in the web UI afterward.
 
 To run it unattended, set the answers in the environment and it won't prompt.
 Omit `STITCH_REF` here so compose stays on `main` with the default `:latest`
@@ -79,9 +119,16 @@ recommended block above.
 PANEL_MODE=local PANEL_PASSWORD='choose-a-long-password' \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
 
-# Linux server — Tailscale (not the usual path on a Mac)
+# Linux server — Tailscale (not the usual path on a Mac or Windows PC)
 PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
+```
+
+```powershell
+# Windows — local mode only
+$env:PANEL_MODE = 'local'
+$env:PANEL_PASSWORD = 'choose-a-long-password'
+irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1 | iex
 ```
 
 | Variable | Default | What |
@@ -94,7 +141,7 @@ PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
 | `PANEL_DIR` | `~/stitch-panel` | Where the compose file and `.env` go. |
 | `PANEL_IMAGE` | published `:latest` | Pin a `sha-*` tag or digest in production. |
 | `STITCH_REF` | `main` when image is `:latest`; else latest release tag | Git ref for compose + serve config. |
-| `STITCH_COMPOSE_SHA256` | unset | Expected SHA-256 of `docker-compose.panel.yml`. |
+| `STITCH_COMPOSE_SHA256` | unset | Expected SHA-256 of `docker-compose.panel.yml` (server/`install-panel.sh` only; skipped for local compose). |
 | `STITCH_REQUIRE_PINNED` | off | Require explicit immutable `STITCH_REF` (`vX.Y.Z` / 40-char SHA) and `PANEL_IMAGE` (`sha-*` / `@sha256:…`). |
 
 Re-running it is safe: an existing `.env` is left alone, so it doubles as
