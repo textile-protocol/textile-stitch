@@ -201,6 +201,15 @@ impl ProcessRuntime {
             if let Some(pid) = live.record.pid.take() {
                 let starttime = live.record.pid_starttime.take();
                 terminate_managed_pid(pid, starttime, &self.stitch_bin, STOP_GRACE_SECS);
+                // If graceful stop didn't land (stuck child, ignored SIGTERM),
+                // don't leave the orphan running beside the respawn.
+                if pid_is_our_stitch(pid, starttime, &self.stitch_bin) {
+                    tracing::warn!(
+                        pid,
+                        "orphan survived graceful stop on restore; sending SIGKILL"
+                    );
+                    terminate_pid(pid, 0);
+                }
                 let _ = persist_record(&self.state_dir, &live.record);
             }
             if wanted {
@@ -592,39 +601,41 @@ fn stop_child(child: &mut Child, grace_secs: i64) -> Result<()> {
     }
 }
 
-/// True when `pid` is a live (non-zombie) process. Zombies still have a
-/// `/proc/<pid>` entry and answer `kill(pid, 0)`, but they aren't running
-/// market-maker code — safe to ignore and respawn.
+/// True when `pid` still exists as a non-zombie process.
+///
+/// Zombies keep a `/proc/<pid>` entry and answer `kill(pid, 0)`, but they aren't
+/// running market-maker code — safe to ignore and respawn.
+///
+/// Important: a transient failure to read `/proc/<pid>/status` must NOT be
+/// treated as "dead". That skips terminate and leaves orphans running; under
+/// parallel CI load the later assertion then sees the original starttime still
+/// alive.
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
     #[cfg(target_os = "linux")]
     {
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-            return false;
-        };
-        for line in status.lines() {
-            let Some(state) = line.strip_prefix("State:") else {
-                continue;
-            };
-            // `State:\tZ (zombie)` — anything else (R/S/D/T…) counts as alive.
-            return !state.trim_start().starts_with('Z');
+        match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(status) => {
+                for line in status.lines() {
+                    let Some(state) = line.strip_prefix("State:") else {
+                        continue;
+                    };
+                    // `State:\tZ (zombie)` — anything else (R/S/D/T…) counts as alive.
+                    return !state.trim_start().starts_with('Z');
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => {
+                // Fall through to the kill(0) probe.
+            }
         }
-        // status file without State: treat as alive if the pid exists.
-        true
+        pid_kill0_exists(pid)
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        let Ok(pid) = i32::try_from(pid) else {
-            return false;
-        };
-        // SAFETY: kill(pid, 0) is a liveness probe.
-        let rc = unsafe { libc::kill(pid, 0) };
-        if rc == 0 {
-            return true;
-        }
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        pid_kill0_exists(pid)
     }
     #[cfg(windows)]
     {
@@ -637,6 +648,21 @@ fn process_alive(pid: u32) -> bool {
         let text = String::from_utf8_lossy(&output.stdout);
         text.contains(&pid.to_string())
     }
+}
+
+/// `kill(pid, 0)` existence probe. True when the pid exists (including zombies)
+/// or we lack permission to signal it.
+#[cfg(unix)]
+fn pid_kill0_exists(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(pid, 0) is a liveness probe; it does not deliver a signal.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Linux starttime from `/proc/<pid>/stat` (field 22), used as a pid-reuse guard.
@@ -763,24 +789,28 @@ fn terminate_pid(pid: u32, grace_secs: i64) {
     }
     #[cfg(unix)]
     {
-        // kill(1) rather than libc::kill — clearer and matches what operators run.
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(grace_secs.max(0) as u64);
-        while Instant::now() < deadline {
-            if !process_alive(pid) {
-                return;
+        let Ok(pid_i) = i32::try_from(pid) else {
+            return;
+        };
+        // libc::kill — same path as setup::terminate. Shelling out to kill(1)
+        // can fail silently (PATH / wrapper) and leave orphans running.
+        if grace_secs > 0 {
+            // SAFETY: pid came from a process we spawned or persisted; signal is SIGTERM.
+            unsafe {
+                libc::kill(pid_i, libc::SIGTERM);
             }
-            std::thread::sleep(Duration::from_millis(100));
+            let deadline = Instant::now() + Duration::from_secs(grace_secs as u64);
+            while Instant::now() < deadline {
+                if !process_alive(pid) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // SAFETY: last-resort SIGKILL for a pid that survived SIGTERM (or grace 0).
+        unsafe {
+            libc::kill(pid_i, libc::SIGKILL);
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline && process_alive(pid) {
             std::thread::sleep(Duration::from_millis(50));
@@ -1357,6 +1387,12 @@ mod tests {
             process_alive(orphan_pid),
             "precondition: orphan must be running"
         );
+        // Identity must accept this orphan before we forget the Child — otherwise
+        // restore would skip the kill and the assertion below is meaningless.
+        assert!(
+            pid_is_our_stitch(orphan_pid, orphan_start, &stitch_bin),
+            "precondition: orphan must match stitch identity checks"
+        );
         std::mem::forget(orphan);
         let record = PersistedBot {
             id: "proc-stitch-bot-a".into(),
@@ -1374,7 +1410,7 @@ mod tests {
         };
         persist_record(&state, &record).unwrap();
 
-        let rt = ProcessRuntime::new(stitch_bin, &bots).unwrap();
+        let rt = ProcessRuntime::new(stitch_bin.clone(), &bots).unwrap();
         let new_pid = {
             let inner = rt.inner.lock().unwrap();
             inner["stitch-bot-a"].record.pid
@@ -1397,10 +1433,18 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(
-            orphan_gone,
-            "orphan pid {orphan_pid} still running with original starttime after restore"
-        );
+        if !orphan_gone {
+            let status = std::fs::read_to_string(format!("/proc/{orphan_pid}/status"))
+                .unwrap_or_else(|e| format!("<status unreadable: {e}>"));
+            let exe = std::fs::read_link(format!("/proc/{orphan_pid}/exe"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("<exe unreadable: {e}>"));
+            panic!(
+                "orphan pid {orphan_pid} still running with original starttime after restore \
+                 (new_pid={new_pid:?}, exe={exe}, still_ours={still_ours}, status=\n{status})",
+                still_ours = pid_is_our_stitch(orphan_pid, orphan_start, &stitch_bin),
+            );
+        }
         drop(rt);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1539,8 +1583,12 @@ mod tests {
     }
 
     fn temp_root(tag: &str) -> PathBuf {
+        // Include a monotonic seq: now_unix() is 1s resolution and all tests share
+        // one pid, so two fixtures in the same second must not collide / wipe each other.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "stitch-process-rt-{tag}-{}-{}",
+            "stitch-process-rt-{tag}-{}-{}-{seq}",
             std::process::id(),
             now_unix()
         ));
