@@ -31,9 +31,8 @@ second:
 
 Two recommended paths — pick by need:
 
-1. **[Desktop app](#option-1--desktop-app)** — menu bar / system tray (plus a
-   Dock icon and control window on macOS) on your computer. No Docker, no
-   terminal. Opens the Stitch panel in your browser.
+1. **[Desktop app](#option-1--desktop-app)** — menu bar / system tray on your
+   computer. No Docker, no terminal. Opens the Stitch panel in your browser.
 2. **[Server / Docker](#option-2--server--docker)** — always-on host or Tailscale
    access from other devices. One command, then the same web UI.
 
