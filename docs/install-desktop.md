@@ -14,16 +14,22 @@ tray or the window). On first launch it:
 2. If you previously used `stitch-setup`, imports that config into
    `<data_root>/bots/<id>` (from `config-location`, `~/Stitch`, or the
    release folder) so the fleet isn't empty after the upgrade.
-3. Generates a panel password and writes `panel.env` + `panel.password`.
+3. Asks you to create a panel password (entered twice). Only an Argon2 hash is
+   written to `panel.env` — no plaintext password file.
 4. Starts bundled `stitch-panel` with `STITCH_PANEL_RUNTIME=process` (local
    `stitch` child processes — not containers).
-5. Opens the control window and `http://127.0.0.1:8420` in your browser.
+5. Opens the control window and `http://127.0.0.1:8420` in your browser so you
+   can sign in with that password.
 
-From the menu / tray or the control window you can Show the window, Open Stitch,
-Start / Stop the panel, toggle **Start at login**, Copy panel password, Check
-for updates (releases page), and Quit. On macOS, **Hide Dock icon** (off by
-default) keeps the menu-bar icon and drops the Dock entry; the preference is
-saved in `<data_root>/desktop-prefs.json`.
+The tray menu leads with a running/stopped status, then **Open Stitch panel**,
+**Pause** / **Resume**, login/Dock prefs, updates, **Show window**, and Quit.
+When a newer desktop release is published, the control window shows an update
+banner and the tray item becomes **Download update**. On macOS, **Hide Dock
+icon** (off by default) keeps the menu-bar icon and drops the Dock entry; the
+preference is saved in `<data_root>/desktop-prefs.json`.
+
+If you still have a legacy `panel.password` file from an older build, the app
+asks you to choose a new password and deletes the cleartext file.
 
 Closing the control window hides it — it does not quit. Use **Show Stitch
 window** in the tray, or click the Dock icon when it has no visible windows.

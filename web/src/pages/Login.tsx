@@ -46,13 +46,30 @@ export default function Login({
 
         {session.passwordLogin ? (
           <Card>
-            <form onSubmit={submit} className="space-y-4">
+            <form
+              onSubmit={submit}
+              method="post"
+              action="http://127.0.0.1:8420/api/login"
+              className="space-y-4"
+            >
+              {/* Stable username so managers match the desktop signup form. */}
+              <input
+                type="text"
+                name="username"
+                autoComplete="username"
+                value="stitch"
+                readOnly
+                tabIndex={-1}
+                aria-hidden
+                className="sr-only"
+              />
               <Field
                 label="Panel password"
-                hint="Set on the panel as STITCH_PANEL_PASSWORD_HASH."
+                hint="The password you chose in the Stitch desktop app (or STITCH_PANEL_PASSWORD_HASH)."
               >
                 <Input
                   type="password"
+                  name="password"
                   value={password}
                   autoFocus
                   autoComplete="current-password"

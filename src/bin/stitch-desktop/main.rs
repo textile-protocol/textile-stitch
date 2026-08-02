@@ -14,6 +14,7 @@
 
 mod autostart;
 mod control_ui;
+mod menu_icons;
 mod migrate;
 mod password;
 mod paths;
@@ -26,8 +27,10 @@ use anyhow::{Context, Result};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+use crate::menu_icons::MenuIcons;
 use wry::WebViewBuilder;
 
 use crate::prefs::DesktopPrefs;
@@ -44,9 +47,13 @@ enum UserEvent {
     Ipc(String),
     /// Periodic poll so the control window reflects panel exits without a click.
     RefreshStatus,
+    /// Latest GitHub release newer than this build, or `None` when current / offline.
+    UpdateCheckResult(Option<String>),
 }
 
 const STATUS_POLL_SECS: u64 = 2;
+/// How often to re-query GitHub for a newer desktop release.
+const UPDATE_POLL_SECS: u64 = 6 * 60 * 60;
 
 fn main() {
     if let Err(e) = run() {
@@ -119,8 +126,11 @@ fn run() -> Result<()> {
     if let Err(e) = migrate::import_legacy_desktop_config(&paths) {
         eprintln!("stitch-desktop: legacy config import skipped: {e:#}");
     }
-    let password = password::ensure_panel_password(&paths)?;
     let mut prefs = DesktopPrefs::load(&paths);
+    // First run (or legacy cleartext `panel.password`): user picks a password
+    // before the panel starts. Hash-only on disk — no copy-to-clipboard path.
+    let mut awaiting_signup = password::needs_setup(&paths);
+    let legacy_password_reset = paths.password_file.exists();
 
     let supervisor = Arc::new(Mutex::new(PanelSupervisor::new(paths.clone())?));
 
@@ -147,6 +157,7 @@ fn run() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let ipc_proxy = proxy.clone();
     let status_proxy = proxy.clone();
+    let update_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let _ = proxy.send_event(UserEvent::Menu(event.id));
     }));
@@ -158,55 +169,99 @@ fn run() -> Result<()> {
             break;
         }
     });
+    // Best-effort release check (no install receipt needed — works for Stitch.app).
+    std::thread::spawn(move || loop {
+        let latest = stitch_bot::update::newer_release_blocking();
+        if update_proxy
+            .send_event(UserEvent::UpdateCheckResult(latest))
+            .is_err()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(UPDATE_POLL_SECS));
+    });
 
-    let show_item = MenuItem::new("Show Stitch window", true, None);
-    let open_item = MenuItem::new("Open Stitch", true, None);
-    let start_item = MenuItem::new("Start panel", true, None);
-    let stop_item = MenuItem::new("Stop panel", true, None);
-    let autostart_item = CheckMenuItem::new("Start at login", true, autostart::is_enabled(), None);
-    #[cfg(target_os = "macos")]
-    let hide_dock_item = CheckMenuItem::new("Hide Dock icon", true, prefs.hide_dock_icon, None);
-    let copy_pw_item = MenuItem::new("Copy panel password", true, None);
-    let update_item = MenuItem::new("Check for updates…", true, None);
-    let quit_item = MenuItem::new("Quit Stitch", true, None);
-
-    let show_id = show_item.id().clone();
-    let open_id = open_item.id().clone();
-    let start_id = start_item.id().clone();
-    let stop_id = stop_item.id().clone();
-    let autostart_id = autostart_item.id().clone();
-    #[cfg(target_os = "macos")]
-    let hide_dock_id = hide_dock_item.id().clone();
-    let copy_pw_id = copy_pw_item.id().clone();
-    let update_id = update_item.id().clone();
-    let quit_id = quit_item.id().clone();
-
-    let menu = Menu::new();
-    menu.append(&show_item)?;
-    menu.append(&open_item)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&start_item)?;
-    menu.append(&stop_item)?;
-    menu.append(&autostart_item)?;
-    #[cfg(target_os = "macos")]
-    menu.append(&hide_dock_item)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&copy_pw_item)?;
-    menu.append(&update_item)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&quit_item)?;
-
+    let menu_icons = MenuIcons::new();
     let panel_running = supervisor
         .lock()
         .map(|mut s| s.is_running())
         .unwrap_or(false);
+
+    // Docker-style tray menu: status first, then actions, prefs, update, show/quit.
+    let status_item = IconMenuItem::new(
+        if panel_running {
+            "Panel running"
+        } else {
+            "Panel stopped"
+        },
+        false,
+        Some(if panel_running {
+            menu_icons.dot_running.clone()
+        } else {
+            menu_icons.dot_stopped.clone()
+        }),
+        None,
+    );
+    let open_item = IconMenuItem::new(
+        "Open Stitch panel",
+        true,
+        Some(menu_icons.open.clone()),
+        None,
+    );
+    let pause_item = IconMenuItem::new(
+        if panel_running { "Pause" } else { "Resume" },
+        true,
+        Some(if panel_running {
+            menu_icons.pause.clone()
+        } else {
+            menu_icons.resume.clone()
+        }),
+        None,
+    );
+    let autostart_item = CheckMenuItem::new("Start at login", true, autostart::is_enabled(), None);
+    #[cfg(target_os = "macos")]
+    let hide_dock_item = CheckMenuItem::new("Hide Dock icon", true, prefs.hide_dock_icon, None);
+    let update_item = IconMenuItem::new(
+        "Check for updates…",
+        true,
+        Some(menu_icons.update.clone()),
+        None,
+    );
+    let show_item = IconMenuItem::new("Show window", true, Some(menu_icons.show.clone()), None);
+    let quit_item = IconMenuItem::new("Quit Stitch", true, Some(menu_icons.quit.clone()), None);
+
+    let open_id = open_item.id().clone();
+    let pause_id = pause_item.id().clone();
+    let autostart_id = autostart_item.id().clone();
+    #[cfg(target_os = "macos")]
+    let hide_dock_id = hide_dock_item.id().clone();
+    let update_id = update_item.id().clone();
+    let show_id = show_item.id().clone();
+    let quit_id = quit_item.id().clone();
+
+    let menu = Menu::new();
+    menu.append(&status_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&open_item)?;
+    menu.append(&pause_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&autostart_item)?;
+    #[cfg(target_os = "macos")]
+    menu.append(&hide_dock_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&update_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&show_item)?;
+    menu.append(&quit_item)?;
+    // Password setup always shows the window, even on login-item autostart.
+    let show_window = !quiet_launch || awaiting_signup;
     let window = WindowBuilder::new()
         .with_title(WINDOW_TITLE)
         .with_inner_size(tao::dpi::LogicalSize::new(
             WINDOW_INNER_WIDTH,
             WINDOW_INNER_HEIGHT,
         ))
-        .with_visible(!quiet_launch)
+        .with_visible(show_window)
         .build(&event_loop)
         .context("creating Stitch window")?;
     let window_id = window.id();
@@ -216,12 +271,16 @@ fn run() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let hide_dock_row = false;
 
-    let html = control_ui::html(
-        autostart_item.is_checked(),
-        prefs.hide_dock_icon,
-        panel_running,
-        hide_dock_row,
-    );
+    let html = if awaiting_signup {
+        control_ui::signup_html(legacy_password_reset)
+    } else {
+        control_ui::html(
+            autostart_item.is_checked(),
+            prefs.hide_dock_icon,
+            panel_running,
+            hide_dock_row,
+        )
+    };
     let webview = WebViewBuilder::new()
         .with_html(&html)
         .with_ipc_handler(move |req| {
@@ -230,10 +289,10 @@ fn run() -> Result<()> {
         .build(&window)
         .context("creating Stitch control webview")?;
 
-    let password = Arc::new(password);
     // tray-icon requires the macOS event loop to be running before TrayIcon::new.
     let mut tray: Option<TrayIcon> = None;
     let mut started_panel = false;
+    let mut update_version: Option<String> = None;
     let mut window: Option<Window> = Some(window);
     let mut webview = Some(webview);
 
@@ -268,33 +327,15 @@ fn run() -> Result<()> {
                         }
                     }
                 }
-                if !started_panel {
+                if !started_panel && !awaiting_signup {
                     started_panel = true;
-                    let start_result = {
-                        let mut s = supervisor.lock().unwrap();
-                        s.start().context("starting the local Stitch panel")
-                    };
-                    match start_result {
-                        Ok(()) => {
-                            // Interactive launches open the browser; login
-                            // autostart stays in the tray / Dock.
-                            if !quiet_launch {
-                                std::thread::spawn(|| {
-                                    std::thread::sleep(std::time::Duration::from_millis(800));
-                                    let _ = open_url(PANEL_URL);
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            // Keep the tray alive so the user can Quit / retry Start.
-                            eprintln!("stitch-desktop: {e:#}");
-                        }
-                    }
-                    sync_control_ui(
+                    start_panel_and_maybe_open(
+                        &supervisor,
+                        !quiet_launch,
                         webview.as_ref(),
                         &autostart_item,
                         prefs.hide_dock_icon,
-                        &supervisor,
+                        update_version.as_deref(),
                     );
                 }
             }
@@ -302,31 +343,28 @@ fn run() -> Result<()> {
                 if id == show_id {
                     show_control_window(window.as_ref());
                 } else if id == open_id {
-                    let _ = open_url(PANEL_URL);
-                } else if id == start_id {
-                    if let Ok(mut s) = supervisor.lock() {
-                        if let Err(e) = s.start() {
-                            eprintln!("start failed: {e:#}");
-                        }
+                    if awaiting_signup {
+                        show_control_window(window.as_ref());
+                    } else {
+                        let _ = open_url(PANEL_URL);
                     }
-                    sync_control_ui(
-                        webview.as_ref(),
-                        &autostart_item,
-                        prefs.hide_dock_icon,
-                        &supervisor,
-                    );
-                } else if id == stop_id {
-                    if let Ok(mut s) = supervisor.lock() {
-                        if let Err(e) = s.stop() {
-                            eprintln!("stop failed: {e:#}");
-                        }
+                } else if id == pause_id {
+                    if awaiting_signup {
+                        show_control_window(window.as_ref());
+                    } else {
+                        toggle_panel(&supervisor);
+                        sync_tray_and_window(
+                            &status_item,
+                            &pause_item,
+                            &update_item,
+                            &menu_icons,
+                            webview.as_ref(),
+                            &autostart_item,
+                            prefs.hide_dock_icon,
+                            &supervisor,
+                            update_version.as_deref(),
+                        );
                     }
-                    sync_control_ui(
-                        webview.as_ref(),
-                        &autostart_item,
-                        prefs.hide_dock_icon,
-                        &supervisor,
-                    );
                 } else if id == autostart_id {
                     // muda toggles the checkmark before we see the event.
                     let enabled = autostart_item.is_checked();
@@ -334,15 +372,14 @@ fn run() -> Result<()> {
                         eprintln!("start at login failed: {e}");
                         autostart_item.set_checked(!enabled);
                     }
-                    sync_control_ui(
-                        webview.as_ref(),
-                        &autostart_item,
-                        prefs.hide_dock_icon,
-                        &supervisor,
-                    );
-                } else if id == copy_pw_id {
-                    if let Err(e) = copy_to_clipboard(&password) {
-                        eprintln!("copy password failed: {e:#}");
+                    if !awaiting_signup {
+                        sync_control_ui(
+                            webview.as_ref(),
+                            &autostart_item,
+                            prefs.hide_dock_icon,
+                            &supervisor,
+                            update_version.as_deref(),
+                        );
                     }
                 } else if id == update_id {
                     let _ = open_url(stitch_bot::update::RELEASES_PAGE);
@@ -360,36 +397,111 @@ fn run() -> Result<()> {
                         eprintln!("saving desktop prefs failed: {e:#}");
                     }
                     apply_dock_policy(elwt, hide);
+                    if !awaiting_signup {
+                        sync_control_ui(
+                            webview.as_ref(),
+                            &autostart_item,
+                            prefs.hide_dock_icon,
+                            &supervisor,
+                            update_version.as_deref(),
+                        );
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::Ipc(msg)) => {
+                if awaiting_signup {
+                    if let Some((pw, confirm)) = parse_signup_ipc(&msg) {
+                        match password::set_panel_password(&paths, &pw, &confirm) {
+                            Ok(()) => {
+                                awaiting_signup = false;
+                                let control_html = control_ui::html(
+                                    autostart_item.is_checked(),
+                                    prefs.hide_dock_icon,
+                                    false,
+                                    hide_dock_row,
+                                );
+                                if let Some(wv) = webview.as_ref() {
+                                    if let Err(e) = wv.load_html(&control_html) {
+                                        eprintln!(
+                                            "stitch-desktop: loading control window failed: {e:#}"
+                                        );
+                                    }
+                                }
+                                show_control_window(window.as_ref());
+                                if !started_panel {
+                                    started_panel = true;
+                                    start_panel_and_maybe_open(
+                                        &supervisor,
+                                        true,
+                                        webview.as_ref(),
+                                        &autostart_item,
+                                        prefs.hide_dock_icon,
+                                        update_version.as_deref(),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(wv) = webview.as_ref() {
+                                    let script = control_ui::signup_error_script(&format!("{e:#}"));
+                                    let _ = wv.evaluate_script(&script);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    handle_ipc(
+                        &msg,
+                        &supervisor,
+                        &autostart_item,
+                        #[cfg(target_os = "macos")]
+                        &hide_dock_item,
+                        &mut prefs,
+                        &paths,
+                        elwt,
+                        control_flow,
+                        webview.as_ref(),
+                        update_version.as_deref(),
+                    );
+                }
+            }
+            Event::UserEvent(UserEvent::UpdateCheckResult(latest)) => {
+                update_version = latest;
+                sync_tray_menu(
+                    &status_item,
+                    &pause_item,
+                    &update_item,
+                    &menu_icons,
+                    &supervisor,
+                    update_version.as_deref(),
+                );
+                if !awaiting_signup {
                     sync_control_ui(
                         webview.as_ref(),
                         &autostart_item,
                         prefs.hide_dock_icon,
                         &supervisor,
+                        update_version.as_deref(),
                     );
                 }
             }
-            Event::UserEvent(UserEvent::Ipc(msg)) => {
-                handle_ipc(
-                    &msg,
-                    &supervisor,
-                    &password,
-                    &autostart_item,
-                    #[cfg(target_os = "macos")]
-                    &hide_dock_item,
-                    &mut prefs,
-                    &paths,
-                    elwt,
-                    control_flow,
-                    webview.as_ref(),
-                );
-            }
             Event::UserEvent(UserEvent::RefreshStatus) => {
-                sync_control_ui(
-                    webview.as_ref(),
-                    &autostart_item,
-                    prefs.hide_dock_icon,
+                sync_tray_menu(
+                    &status_item,
+                    &pause_item,
+                    &update_item,
+                    &menu_icons,
                     &supervisor,
+                    update_version.as_deref(),
                 );
+                if !awaiting_signup {
+                    sync_control_ui(
+                        webview.as_ref(),
+                        &autostart_item,
+                        prefs.hide_dock_icon,
+                        &supervisor,
+                        update_version.as_deref(),
+                    );
+                }
             }
             Event::WindowEvent {
                 window_id: id,
@@ -422,10 +534,128 @@ fn run() -> Result<()> {
     });
 }
 
+fn toggle_panel(supervisor: &Arc<Mutex<PanelSupervisor>>) {
+    if let Ok(mut s) = supervisor.lock() {
+        if s.is_running() {
+            if let Err(e) = s.stop() {
+                eprintln!("pause failed: {e:#}");
+            }
+        } else if let Err(e) = s.start() {
+            eprintln!("resume failed: {e:#}");
+        }
+    }
+}
+
+fn sync_tray_menu(
+    status_item: &IconMenuItem,
+    pause_item: &IconMenuItem,
+    update_item: &IconMenuItem,
+    icons: &MenuIcons,
+    supervisor: &Arc<Mutex<PanelSupervisor>>,
+    update_version: Option<&str>,
+) {
+    let running = supervisor
+        .lock()
+        .map(|mut s| s.is_running())
+        .unwrap_or(false);
+    if running {
+        status_item.set_text("Panel running");
+        status_item.set_icon(Some(icons.dot_running.clone()));
+        pause_item.set_text("Pause");
+        pause_item.set_icon(Some(icons.pause.clone()));
+    } else {
+        status_item.set_text("Panel stopped");
+        status_item.set_icon(Some(icons.dot_stopped.clone()));
+        pause_item.set_text("Resume");
+        pause_item.set_icon(Some(icons.resume.clone()));
+    }
+    if update_version.is_some() {
+        update_item.set_text("Download update");
+    } else {
+        update_item.set_text("Check for updates…");
+    }
+}
+
+fn sync_tray_and_window(
+    status_item: &IconMenuItem,
+    pause_item: &IconMenuItem,
+    update_item: &IconMenuItem,
+    icons: &MenuIcons,
+    webview: Option<&wry::WebView>,
+    autostart_item: &CheckMenuItem,
+    hide_dock: bool,
+    supervisor: &Arc<Mutex<PanelSupervisor>>,
+    update_version: Option<&str>,
+) {
+    sync_tray_menu(
+        status_item,
+        pause_item,
+        update_item,
+        icons,
+        supervisor,
+        update_version,
+    );
+    sync_control_ui(
+        webview,
+        autostart_item,
+        hide_dock,
+        supervisor,
+        update_version,
+    );
+}
+
+fn start_panel_and_maybe_open(
+    supervisor: &Arc<Mutex<PanelSupervisor>>,
+    open_browser: bool,
+    webview: Option<&wry::WebView>,
+    autostart_item: &CheckMenuItem,
+    hide_dock: bool,
+    update_version: Option<&str>,
+) {
+    let start_result = {
+        let mut s = supervisor.lock().unwrap();
+        s.start().context("starting the local Stitch panel")
+    };
+    match start_result {
+        Ok(()) => {
+            if open_browser {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    let _ = open_url(PANEL_URL);
+                });
+            }
+        }
+        Err(e) => {
+            // Keep the tray alive so the user can Quit / retry Start.
+            eprintln!("stitch-desktop: {e:#}");
+        }
+    }
+    sync_control_ui(
+        webview,
+        autostart_item,
+        hide_dock,
+        supervisor,
+        update_version,
+    );
+}
+
+fn parse_signup_ipc(msg: &str) -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct SignupMsg {
+        op: String,
+        password: String,
+        confirm: String,
+    }
+    let parsed: SignupMsg = serde_json::from_str(msg).ok()?;
+    if parsed.op != "signup" {
+        return None;
+    }
+    Some((parsed.password, parsed.confirm))
+}
+
 fn handle_ipc(
     msg: &str,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
-    password: &str,
     autostart_item: &CheckMenuItem,
     #[cfg(target_os = "macos")] hide_dock_item: &CheckMenuItem,
     prefs: &mut DesktopPrefs,
@@ -434,29 +664,14 @@ fn handle_ipc(
     elwt: &tao::event_loop::EventLoopWindowTarget<UserEvent>,
     control_flow: &mut ControlFlow,
     webview: Option<&wry::WebView>,
+    update_version: Option<&str>,
 ) {
     match msg {
         "open" => {
             let _ = open_url(PANEL_URL);
         }
-        "start" => {
-            if let Ok(mut s) = supervisor.lock() {
-                if let Err(e) = s.start() {
-                    eprintln!("start failed: {e:#}");
-                }
-            }
-        }
-        "stop" => {
-            if let Ok(mut s) = supervisor.lock() {
-                if let Err(e) = s.stop() {
-                    eprintln!("stop failed: {e:#}");
-                }
-            }
-        }
-        "copy_password" => {
-            if let Err(e) = copy_to_clipboard(password) {
-                eprintln!("copy password failed: {e:#}");
-            }
+        "toggle_panel" => {
+            toggle_panel(supervisor);
         }
         "update" => {
             let _ = open_url(stitch_bot::update::RELEASES_PAGE);
@@ -493,7 +708,13 @@ fn handle_ipc(
         }
         _ => {}
     }
-    sync_control_ui(webview, autostart_item, prefs.hide_dock_icon, supervisor);
+    sync_control_ui(
+        webview,
+        autostart_item,
+        prefs.hide_dock_icon,
+        supervisor,
+        update_version,
+    );
 }
 
 fn sync_control_ui(
@@ -501,14 +722,19 @@ fn sync_control_ui(
     autostart_item: &CheckMenuItem,
     hide_dock: bool,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
+    update_version: Option<&str>,
 ) {
     let Some(wv) = webview else { return };
     let panel_running = supervisor
         .lock()
         .map(|mut s| s.is_running())
         .unwrap_or(false);
-    let script =
-        control_ui::set_state_script(autostart_item.is_checked(), hide_dock, panel_running);
+    let script = control_ui::set_state_script(
+        autostart_item.is_checked(),
+        hide_dock,
+        panel_running,
+        update_version,
+    );
     if let Err(e) = wv.evaluate_script(&script) {
         eprintln!("stitch-desktop: updating control window failed: {e:#}");
     }
@@ -561,69 +787,6 @@ fn open_url(url: &str) -> Result<()> {
     {
         let _ = url;
         anyhow::bail!("cannot open URLs on this platform")
-    }
-}
-
-fn copy_to_clipboard(text: &str) -> Result<()> {
-    use std::io::Write;
-
-    fn write_and_close(child: &mut std::process::Child, text: &str) -> Result<()> {
-        // Clipboard helpers read stdin to EOF before exiting — leave the pipe
-        // open across wait() and they hang forever.
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-            stdin.flush()?;
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut child = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("pbcopy")?;
-        write_and_close(&mut child, text)?;
-        let status = child.wait()?;
-        anyhow::ensure!(status.success(), "pbcopy failed");
-        return Ok(());
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let mut child = std::process::Command::new("clip")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("clip")?;
-        write_and_close(&mut child, text)?;
-        let status = child.wait()?;
-        anyhow::ensure!(status.success(), "clip failed");
-        return Ok(());
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Ok(mut child) = std::process::Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            write_and_close(&mut child, text)?;
-            let _ = child.wait();
-            return Ok(());
-        }
-        if let Ok(mut child) = std::process::Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            write_and_close(&mut child, text)?;
-            let _ = child.wait();
-            return Ok(());
-        }
-        anyhow::bail!("no clipboard tool (xclip/wl-copy); password is in the panel.password file")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
-    {
-        let _ = text;
-        anyhow::bail!("clipboard unsupported on this platform")
     }
 }
 

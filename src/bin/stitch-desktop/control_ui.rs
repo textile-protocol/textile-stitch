@@ -14,33 +14,9 @@ const TEXTILE_ICON_SVG: &str = r##"<svg viewBox="0 0 32 32" fill="none" aria-hid
   <path d="M30.8194 14.4758L29.022 12.6811L30.8194 10.8863C31.0448 10.6612 31.0448 10.2976 30.8194 10.0726L28.6117 7.86802C28.5019 7.75837 28.3574 7.70066 28.2014 7.70066C28.0454 7.70066 27.9009 7.76414 27.7911 7.86802L25.9937 9.66281L24.1964 7.86802C23.971 7.64295 23.6069 7.64295 23.3815 7.86802L21.5841 9.66281L19.7868 7.86802C19.5672 7.64872 19.1857 7.64872 18.9719 7.86802L17.1745 9.66281L15.3772 7.86802C15.1518 7.64295 14.7877 7.64295 14.5623 7.86802L12.7649 9.66281L10.9676 7.86802C10.8578 7.75837 10.7133 7.70066 10.5573 7.70066C10.4012 7.70066 10.2567 7.76414 10.1469 7.86802L7.93925 10.0726C7.71385 10.2976 7.71385 10.6612 7.93925 10.8863L9.7366 12.6811L7.93925 14.4758C7.82944 14.5855 7.77165 14.7298 7.77165 14.8856C7.77165 15.0414 7.83522 15.1857 7.93925 15.2953L9.7366 17.0901L7.93925 18.8849C7.71385 19.11 7.71385 19.4736 7.93925 19.6986L9.7366 21.4934L7.93925 23.2882C7.82944 23.3979 7.77165 23.5421 7.77165 23.6979C7.77165 23.8538 7.83522 23.998 7.93925 24.1077L9.7366 25.9025L7.93925 27.6973C7.82944 27.8069 7.77165 27.9512 7.77165 28.107C7.77165 28.2628 7.83522 28.4071 7.93925 28.5168L10.1469 30.7213C10.2625 30.8367 10.407 30.8887 10.5573 30.8887C10.7075 30.8887 10.852 30.8309 10.9676 30.7213L12.7649 28.9265L14.5623 30.7213C14.7877 30.9464 15.1518 30.9464 15.3772 30.7213L17.1745 28.9265L18.9719 30.7213C19.0875 30.8367 19.232 30.8887 19.3822 30.8887C19.5325 30.8887 19.677 30.8309 19.7925 30.7213L21.5899 28.9265L23.3873 30.7213C23.5028 30.8367 23.6473 30.8887 23.7976 30.8887C23.9478 30.8887 24.0923 30.8309 24.2079 30.7213L26.0053 28.9265L27.8026 30.7213C27.9182 30.8367 28.0627 30.8887 28.213 30.8887C28.3632 30.8887 28.5077 30.8309 28.6233 30.7213L30.831 28.5168C31.0564 28.2917 31.0564 27.9281 30.831 27.703L29.0336 25.9083L30.831 24.1135C31.0564 23.8884 31.0564 23.5248 30.831 23.2997L29.0336 21.505L30.831 19.7102C31.0564 19.4851 31.0564 19.1215 30.831 18.8965L29.0336 17.1017L30.831 15.3069C31.0564 15.0818 31.0564 14.7182 30.831 14.4932L30.8194 14.4758ZM10.5573 29.4805L9.17023 28.0955L10.9676 26.3007C11.193 26.0756 11.193 25.712 10.9676 25.487L9.17023 23.6922L10.9676 21.8974C11.0774 21.7877 11.1352 21.6435 11.1352 21.4876C11.1352 21.3318 11.0716 21.1876 10.9676 21.0779L9.17023 19.2831L10.9676 17.4883C11.193 17.2633 11.193 16.8997 10.9676 16.6746L9.17023 14.8798L10.9676 13.085C11.0774 12.9754 11.1352 12.8311 11.1352 12.6753C11.1352 12.5195 11.0716 12.3752 10.9676 12.2655L9.17023 10.4708L10.5573 9.08571L12.187 10.7131V27.8531L10.5573 29.4805ZM14.9726 29.4805L13.3429 27.8531V10.7131L14.9726 9.08571L16.6024 10.7131V27.8531L14.9726 29.4805ZM17.7525 27.8589V10.7189L19.3822 9.09148L21.012 10.7189V27.8589L19.3822 29.4863L17.7525 27.8589ZM23.7918 29.4805L22.162 27.8531V10.7131L23.7918 9.08571L25.4216 10.7131V27.8531L23.7918 29.4805ZM27.7968 16.6746C27.5715 16.8997 27.5715 17.2633 27.7968 17.4883L29.5942 19.2831L27.7968 21.0779C27.5715 21.303 27.5715 21.6665 27.7968 21.8916L29.5942 23.6864L27.7968 25.4812C27.5715 25.7063 27.5715 26.0698 27.7968 26.2949L29.5942 28.0897L28.2072 29.4747L26.5774 27.8473V10.7074L28.2072 9.07994L29.5942 10.465L27.7968 12.2598C27.5715 12.4848 27.5715 12.8484 27.7968 13.0735L29.5942 14.8683L27.7968 16.6631V16.6746Z" fill="#15181c"/>
 </svg>"##;
 
-/// Build the control-panel HTML. `hide_dock_row` is macOS-only in the menu;
-/// pass false on other platforms to omit the Dock checkbox.
-pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row: bool) -> String {
-    let autostart_checked = if autostart { " checked" } else { "" };
-    let hide_dock_checked = if hide_dock { " checked" } else { "" };
-    let status = if panel_running {
-        ("running", "Panel running")
-    } else {
-        ("stopped", "Panel stopped")
-    };
-    let dock_row = if hide_dock_row {
-        format!(
-            r#"<label class="check"><input type="checkbox" id="hide-dock"{hide_dock_checked}> Hide Dock icon</label>"#
-        )
-    } else {
-        String::new()
-    };
-
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stitch</title>
-<style>
-  :root {{
+fn theme_css() -> &'static str {
+    r#"
+  :root {
     color-scheme: light;
     --tx-bg-primary: #fbfaf7;
     --tx-bg-secondary: #ffffff;
@@ -56,40 +32,45 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
     --tx-text-success: #3b6d11;
     --tx-bg-success: #ecf4df;
     --tx-text-danger: #b03a2e;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
+  }
+  * { box-sizing: border-box; }
+  body {
     margin: 0;
     font: 14px/1.45 Lato, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
     background: var(--tx-bg-primary);
     color: var(--tx-text-primary);
     min-height: 100vh;
     -webkit-font-smoothing: antialiased;
-  }}
-  main {{
+  }
+  main {
     max-width: 360px;
     margin: 0 auto;
     padding: 28px 22px 24px;
-  }}
-  .brand-row {{
+  }
+  .brand-row {
     display: flex;
     align-items: center;
     gap: 12px;
     margin: 0 0 18px;
-  }}
-  .mark {{
+  }
+  .mark {
     width: 36px;
     height: 36px;
     flex: 0 0 auto;
-  }}
-  h1 {{
+  }
+  h1 {
     margin: 0;
     font-size: 22px;
     font-weight: 700;
     letter-spacing: -0.02em;
     color: var(--tx-text-primary);
-  }}
-  .status {{
+  }
+  .lede {
+    margin: 0 0 18px;
+    color: var(--tx-text-secondary);
+    font-size: 13px;
+  }
+  .status {
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -100,25 +81,45 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
     border: 1px solid var(--tx-border-tertiary);
     font-size: 12px;
     color: var(--tx-text-secondary);
-  }}
-  .dot {{
+  }
+  .dot {
     width: 8px;
     height: 8px;
     border-radius: 50%;
     background: var(--tx-text-tertiary);
-  }}
-  .status.running .dot {{ background: var(--tx-text-success); }}
-  .status.running {{
+  }
+  .status.running .dot { background: var(--tx-text-success); }
+  .status.running {
     background: var(--tx-bg-success);
     color: var(--tx-text-success);
     border-color: transparent;
-  }}
-  .stack {{
+  }
+  .stack {
     display: flex;
     flex-direction: column;
     gap: 8px;
-  }}
-  button, .check {{
+  }
+  label.field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--tx-text-secondary);
+  }
+  input[type="password"] {
+    width: 100%;
+    border: 1px solid var(--tx-border-tertiary);
+    background: var(--tx-bg-secondary);
+    color: var(--tx-text-primary);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font: inherit;
+  }
+  input[type="password"]:focus {
+    outline: 2px solid var(--tx-accent);
+    outline-offset: 1px;
+  }
+  button, .check {
     width: 100%;
     border: 1px solid var(--tx-border-tertiary);
     background: var(--tx-bg-secondary);
@@ -128,44 +129,94 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
     font: inherit;
     text-align: left;
     cursor: pointer;
-  }}
-  button.primary {{
+  }
+  button.primary {
     background: var(--tx-accent);
     border-color: var(--tx-accent);
     color: var(--tx-on-accent);
     font-weight: 600;
-  }}
-  button.danger {{
-    color: var(--tx-text-danger);
-  }}
-  button:hover, .check:hover {{
+    text-align: center;
+  }
+  button.danger { color: var(--tx-text-danger); }
+  button:hover, .check:hover {
     background: var(--tx-bg-hover);
     border-color: var(--tx-border-secondary);
-  }}
-  button.primary:hover {{
+  }
+  button.primary:hover {
     background: #8a279c;
     border-color: #8a279c;
-  }}
-  button:active {{
-    transform: translateY(1px);
-  }}
-  .check {{
+  }
+  button.primary:disabled {
+    opacity: 0.65;
+    cursor: wait;
+  }
+  button:active { transform: translateY(1px); }
+  .check {
     display: flex;
     align-items: center;
     gap: 10px;
     user-select: none;
-  }}
-  .check input {{
+  }
+  .check input {
     width: 15px;
     height: 15px;
     accent-color: var(--tx-accent);
-  }}
-  .sep {{
+  }
+  .sep {
     height: 1px;
     background: var(--tx-border-tertiary);
     margin: 6px 0;
-  }}
-</style>
+  }
+  .error {
+    display: none;
+    margin: 0 0 12px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgb(176 58 46 / 0.08);
+    color: var(--tx-text-danger);
+    font-size: 12px;
+  }
+  .error.show { display: block; }
+  .update-banner {
+    display: none;
+    margin: 0 0 14px;
+    padding: 12px;
+    border-radius: 10px;
+    background: var(--tx-accent-tint);
+    border: 1px solid rgb(156 46 176 / 0.28);
+    color: var(--tx-text-primary);
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  .update-banner.show { display: block; }
+  .update-banner strong { font-weight: 700; }
+  .update-banner .update-actions {
+    margin-top: 10px;
+  }
+  .update-banner button.primary {
+    text-align: center;
+  }
+"#
+}
+
+/// First-run / upgrade password setup. `legacy_reset` explains that an old
+/// cleartext password file is being replaced.
+pub fn signup_html(legacy_reset: bool) -> String {
+    let note = if legacy_reset {
+        "Choose a password for the local panel. An older cleartext password file \
+         was found and will be removed — pick a password you’ll remember."
+    } else {
+        "Choose a password for the local panel. You’ll enter it in the browser \
+         to sign in. Only a hash is stored on disk."
+    };
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stitch</title>
+<style>{css}</style>
 </head>
 <body>
 <main>
@@ -173,16 +224,100 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
     {textile_icon}
     <h1>Stitch</h1>
   </div>
+  <p class="lede">{note}</p>
+  <div id="error" class="error" role="alert"></div>
+  <form id="signup" class="stack" method="post" action="http://127.0.0.1:8420/api/login">
+    <!-- Username + action URL help password managers key the secret to the panel origin. -->
+    <input type="text" name="username" autocomplete="username" value="stitch" readonly tabindex="-1" aria-hidden="true" style="position:absolute;opacity:0;height:0;width:0;pointer-events:none">
+    <label class="field">Password
+      <input type="password" id="password" name="password" autocomplete="new-password" minlength="8" maxlength="128" required autofocus>
+    </label>
+    <label class="field">Confirm password
+      <input type="password" id="confirm" name="password-confirm" autocomplete="new-password" minlength="8" maxlength="128" required>
+    </label>
+    <button class="primary" type="submit" id="submit">Create password</button>
+  </form>
+</main>
+<script>
+  function post(msg) {{
+    if (window.ipc && window.ipc.postMessage) {{
+      window.ipc.postMessage(msg);
+    }}
+  }}
+  const form = document.getElementById("signup");
+  const error = document.getElementById("error");
+  const submit = document.getElementById("submit");
+  form.addEventListener("submit", (e) => {{
+    e.preventDefault();
+    error.classList.remove("show");
+    error.textContent = "";
+    const password = document.getElementById("password").value;
+    const confirm = document.getElementById("confirm").value;
+    submit.disabled = true;
+    post(JSON.stringify({{ op: "signup", password, confirm }}));
+  }});
+  window.__stitchSignupError = function (msg) {{
+    submit.disabled = false;
+    error.textContent = msg || "Could not set password.";
+    error.classList.add("show");
+  }};
+</script>
+</body>
+</html>"#,
+        css = theme_css(),
+        textile_icon = TEXTILE_ICON_SVG,
+        note = note,
+    )
+}
+
+/// Build the control-panel HTML. `hide_dock_row` is macOS-only in the menu;
+/// pass false on other platforms to omit the Dock checkbox.
+pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row: bool) -> String {
+    let autostart_checked = if autostart { " checked" } else { "" };
+    let hide_dock_checked = if hide_dock { " checked" } else { "" };
+    let status = if panel_running {
+        ("running", "Panel running")
+    } else {
+        ("stopped", "Panel stopped")
+    };
+    let pause_label = if panel_running { "Pause" } else { "Resume" };
+    let dock_row = if hide_dock_row {
+        format!(
+            r#"<label class="check"><input type="checkbox" id="hide-dock"{hide_dock_checked}> Hide Dock icon</label>"#
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stitch</title>
+<style>{css}</style>
+</head>
+<body>
+<main>
+  <div class="brand-row">
+    {textile_icon}
+    <h1>Stitch</h1>
+  </div>
+  <div id="update-banner" class="update-banner" hidden>
+    <div><strong>Update available</strong> — Stitch <span id="update-version"></span> is ready to download.</div>
+    <div class="update-actions">
+      <button type="button" class="primary" data-action="update">Download update</button>
+    </div>
+  </div>
   <div id="status" class="status {status_class}"><span class="dot"></span><span id="status-text">{status_text}</span></div>
   <div class="stack">
-    <button class="primary" data-action="open">Open Stitch</button>
-    <button data-action="start">Start panel</button>
-    <button data-action="stop">Stop panel</button>
+    <button class="primary" data-action="open">Open Stitch panel</button>
+    <button data-action="toggle_panel" id="pause-resume">{pause_label}</button>
     <label class="check"><input type="checkbox" id="autostart"{autostart_checked}> Start at login</label>
     {dock_row}
     <div class="sep"></div>
-    <button data-action="copy_password">Copy panel password</button>
-    <button data-action="update">Check for updates…</button>
+    <button data-action="update" id="update-btn">Check for updates…</button>
     <div class="sep"></div>
     <button class="danger" data-action="quit">Quit Stitch</button>
   </div>
@@ -211,26 +346,65 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
       status.className = "status " + (state.panelRunning ? "running" : "stopped");
       statusText.textContent = state.panelRunning ? "Panel running" : "Panel stopped";
     }}
+    const pauseBtn = document.getElementById("pause-resume");
+    if (pauseBtn) {{
+      pauseBtn.textContent = state.panelRunning ? "Pause" : "Resume";
+    }}
     if (autostart) autostart.checked = !!state.autostart;
     if (hideDock) hideDock.checked = !!state.hideDock;
+    const banner = document.getElementById("update-banner");
+    const versionEl = document.getElementById("update-version");
+    const updateBtn = document.getElementById("update-btn");
+    if (banner && versionEl) {{
+      if (state.updateVersion) {{
+        versionEl.textContent = state.updateVersion;
+        banner.hidden = false;
+        banner.classList.add("show");
+        if (updateBtn) updateBtn.textContent = "Download update";
+      }} else {{
+        versionEl.textContent = "";
+        banner.hidden = true;
+        banner.classList.remove("show");
+        if (updateBtn) updateBtn.textContent = "Check for updates…";
+      }}
+    }}
   }};
 </script>
 </body>
 </html>"#,
+        css = theme_css(),
         textile_icon = TEXTILE_ICON_SVG,
         status_class = status.0,
         status_text = status.1,
+        pause_label = pause_label,
         autostart_checked = autostart_checked,
         dock_row = dock_row,
     )
 }
 
 /// JS snippet to push tray/window state into the control UI.
-pub fn set_state_script(autostart: bool, hide_dock: bool, panel_running: bool) -> String {
+pub fn set_state_script(
+    autostart: bool,
+    hide_dock: bool,
+    panel_running: bool,
+    update_version: Option<&str>,
+) -> String {
+    let update = match update_version {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "null".into()),
+        None => "null".to_string(),
+    };
     format!(
-        "window.__stitchSetState && window.__stitchSetState({{ autostart: {}, hideDock: {}, panelRunning: {} }});",
+        "window.__stitchSetState && window.__stitchSetState({{ autostart: {}, hideDock: {}, panelRunning: {}, updateVersion: {} }});",
         if autostart { "true" } else { "false" },
         if hide_dock { "true" } else { "false" },
         if panel_running { "true" } else { "false" },
+        update,
     )
+}
+
+/// Show a signup validation / write error in the first-run UI.
+pub fn signup_error_script(message: &str) -> String {
+    let escaped =
+        serde_json::to_string(message).unwrap_or_else(|_| "\"Could not set password.\"".into());
+    format!("window.__stitchSignupError && window.__stitchSignupError({escaped});")
 }

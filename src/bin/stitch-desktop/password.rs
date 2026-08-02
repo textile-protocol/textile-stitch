@@ -1,44 +1,64 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! First-run panel password: generate, hash into panel.env, keep a local copy.
+//! Panel password setup for the desktop app.
+//!
+//! The user chooses a password (confirmed twice). Only an Argon2 hash is written
+//! to `panel.env`. Plaintext is never persisted — including the legacy
+//! `panel.password` file, which is deleted after a successful setup.
 
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use argon2::password_hash::rand_core::{OsRng, RngCore};
+use anyhow::{bail, Context, Result};
+use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHasher, SaltString};
 use argon2::Argon2;
 
 use crate::paths::DesktopPaths;
 
-const PASSWORD_LEN: usize = 20;
+const MIN_LEN: usize = 8;
+const MAX_LEN: usize = 128;
+const HASH_KEY: &str = "STITCH_PANEL_PASSWORD_HASH";
 
-/// Ensure `panel.env` has a password hash and return the plaintext for Copy.
-pub fn ensure_panel_password(paths: &DesktopPaths) -> Result<String> {
-    if paths.env_file.exists() && paths.password_file.exists() {
-        return std::fs::read_to_string(&paths.password_file)
-            .map(|s| s.trim().to_string())
-            .context("reading saved panel password");
+/// True when the user still needs to choose a password before the panel can run.
+///
+/// Also true when a legacy `panel.password` plaintext file is present, so an
+/// upgrade wipes cleartext and replaces the old auto-generated secret.
+pub fn needs_setup(paths: &DesktopPaths) -> bool {
+    if paths.password_file.exists() {
+        return true;
     }
-
-    let password = generate_password();
-    let hash = hash_password(&password)?;
-    write_env_file(paths, &hash)?;
-    write_password_file(&paths.password_file, &password)?;
-    Ok(password)
+    !env_has_password_hash(&paths.env_file)
 }
 
-fn generate_password() -> String {
-    // Crockford-ish alphabet without ambiguous glyphs.
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxyz";
-    let mut bytes = [0u8; PASSWORD_LEN];
-    OsRng.fill_bytes(&mut bytes);
-    bytes
-        .iter()
-        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
-        .collect()
+/// Validate the pair, store an Argon2 hash in `panel.env`, delete any plaintext copy.
+pub fn set_panel_password(paths: &DesktopPaths, password: &str, confirm: &str) -> Result<()> {
+    validate_password_pair(password, confirm)?;
+    let hash = hash_password(password)?;
+    write_or_update_env(paths, &hash)?;
+    if paths.password_file.exists() {
+        std::fs::remove_file(&paths.password_file).with_context(|| {
+            format!(
+                "removing legacy plaintext password {}",
+                paths.password_file.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+pub fn validate_password_pair(password: &str, confirm: &str) -> Result<()> {
+    if password.len() < MIN_LEN {
+        bail!("Password must be at least {MIN_LEN} characters.");
+    }
+    if password.len() > MAX_LEN {
+        bail!("Password must be at most {MAX_LEN} characters.");
+    }
+    if password != confirm {
+        bail!("Passwords do not match.");
+    }
+    Ok(())
 }
 
 fn hash_password(password: &str) -> Result<String> {
@@ -50,24 +70,73 @@ fn hash_password(password: &str) -> Result<String> {
     Ok(hash)
 }
 
-fn write_env_file(paths: &DesktopPaths, password_hash: &str) -> Result<()> {
-    // Quote the hash — it contains `$`.
+fn env_has_password_hash(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        line.split_once('=')
+            .is_some_and(|(k, v)| k.trim() == HASH_KEY && !unquote(v.trim()).is_empty())
+    })
+}
+
+fn write_or_update_env(paths: &DesktopPaths, password_hash: &str) -> Result<()> {
+    let quoted = format!("'{}'", password_hash.replace('\'', "'\\''"));
+    if paths.env_file.exists() {
+        let text = std::fs::read_to_string(&paths.env_file)
+            .with_context(|| format!("reading {}", paths.env_file.display()))?;
+        let mut out = String::new();
+        let mut replaced = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            if let Some((key, _)) = trimmed.split_once('=') {
+                if key.trim() == HASH_KEY {
+                    out.push_str(&format!("{HASH_KEY}={quoted}\n"));
+                    replaced = true;
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !replaced {
+            if !out.ends_with('\n') && !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("{HASH_KEY}={quoted}\n"));
+        }
+        atomic_write(&paths.env_file, out.as_bytes())?;
+        return Ok(());
+    }
+
     let contents = format!(
         "# Generated by stitch-desktop. Do not commit.\n\
          STITCH_PANEL_RUNTIME=process\n\
          STITCH_PANEL_BIND=127.0.0.1:8420\n\
          STITCH_PANEL_BOTS_DIR={bots}\n\
          STITCH_PANEL_HOST_BOTS_DIR={bots}\n\
-         STITCH_PANEL_PASSWORD_HASH='{hash}'\n",
+         {HASH_KEY}={quoted}\n",
         bots = paths.bots_dir.display(),
-        hash = password_hash.replace('\'', "'\\''"),
     );
     atomic_write(&paths.env_file, contents.as_bytes())?;
     Ok(())
 }
 
-fn write_password_file(path: &Path, password: &str) -> Result<()> {
-    atomic_write(path, password.as_bytes())
+fn unquote(s: &str) -> String {
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        s[1..s.len() - 1].replace("'\\''", "'")
+    } else {
+        s.to_string()
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -93,4 +162,98 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_paths(tag: &str) -> DesktopPaths {
+        let root = std::env::temp_dir().join(format!(
+            "stitch-desktop-pw-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        DesktopPaths {
+            bots_dir: root.join("bots"),
+            env_file: root.join("panel.env"),
+            password_file: root.join("panel.password"),
+            panel_log: root.join("panel.log"),
+            root,
+        }
+    }
+
+    #[test]
+    fn needs_setup_when_missing_env() {
+        let paths = tmp_paths("missing");
+        assert!(needs_setup(&paths));
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn needs_setup_when_legacy_plaintext_present() {
+        let paths = tmp_paths("legacy");
+        std::fs::write(
+            &paths.env_file,
+            "STITCH_PANEL_PASSWORD_HASH='$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQ$hash'\n",
+        )
+        .unwrap();
+        std::fs::write(&paths.password_file, "old-cleartext\n").unwrap();
+        assert!(needs_setup(&paths));
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn set_password_writes_hash_only() {
+        let paths = tmp_paths("set");
+        std::fs::create_dir_all(&paths.bots_dir).unwrap();
+        set_panel_password(&paths, "correct horse", "correct horse").unwrap();
+        assert!(!paths.password_file.exists());
+        assert!(env_has_password_hash(&paths.env_file));
+        let env = std::fs::read_to_string(&paths.env_file).unwrap();
+        assert!(env.contains(HASH_KEY));
+        assert!(!env.contains("correct horse"));
+        assert!(!needs_setup(&paths));
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn set_password_removes_legacy_plaintext() {
+        let paths = tmp_paths("wipe");
+        std::fs::create_dir_all(&paths.bots_dir).unwrap();
+        std::fs::write(&paths.password_file, "legacy-secret\n").unwrap();
+        set_panel_password(&paths, "new-password-ok", "new-password-ok").unwrap();
+        assert!(!paths.password_file.exists());
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn set_password_updates_existing_env_hash() {
+        let paths = tmp_paths("update");
+        std::fs::create_dir_all(&paths.bots_dir).unwrap();
+        std::fs::write(
+            &paths.env_file,
+            "STITCH_PANEL_BIND=127.0.0.1:8420\nSTITCH_PANEL_PASSWORD_HASH='old'\n",
+        )
+        .unwrap();
+        set_panel_password(&paths, "updated-password", "updated-password").unwrap();
+        let env = std::fs::read_to_string(&paths.env_file).unwrap();
+        assert!(env.contains("STITCH_PANEL_BIND=127.0.0.1:8420"));
+        assert!(!env.contains("'old'"));
+        assert_eq!(env.matches(HASH_KEY).count(), 1);
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn reject_mismatch_and_short() {
+        assert!(validate_password_pair("short", "short").is_err());
+        assert!(validate_password_pair("long-enough", "different!").is_err());
+        assert!(validate_password_pair("long-enough", "long-enough").is_ok());
+    }
 }
