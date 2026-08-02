@@ -117,8 +117,20 @@ jobs:
       - name: Assemble Stitch.app
         # make-app.sh signs with $STITCH_CODESIGN_ID when set (Developer ID),
         # otherwise ad-hoc ("-").
-        run: packaging/macos/make-app.sh target/universal/stitch-desktop dist \
-          target/universal/stitch target/universal/stitch-panel
+        # Use a `|` block — a plain YAML scalar with `\` turns `\ ` into an
+        # escaped space, so arg3 became " target/universal/stitch" (leading
+        # space), stitch was omitted from the .app, and macOS launches exited
+        # immediately with nothing in the Dock / Activity Monitor.
+        run: |
+          set -euo pipefail
+          packaging/macos/make-app.sh \
+            target/universal/stitch-desktop \
+            dist \
+            target/universal/stitch \
+            target/universal/stitch-panel
+          test -f dist/Stitch.app/Contents/MacOS/stitch
+          test -f dist/Stitch.app/Contents/MacOS/stitch-panel
+          test -f dist/Stitch.app/Contents/MacOS/stitch-desktop
 
       - name: Build Stitch.dmg
         # Wrap the (signed) app in a drag-to-Applications image. make-dmg.sh signs

@@ -50,8 +50,40 @@ const STATUS_POLL_SECS: u64 = 2;
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("stitch-desktop: {e:#}");
+        let detail = format!("{e:#}");
+        eprintln!("stitch-desktop: {detail}");
+        // Finder launches have no terminal — surface fatal errors in a dialog
+        // so "double-click → nothing" isn't the only feedback.
+        show_launch_error(&detail);
         std::process::exit(1);
+    }
+}
+
+/// Best-effort native alert when startup fails (macOS Finder / Dock launches).
+fn show_launch_error(detail: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        // AppleScript string literals: escape `\`, `"`, and flatten newlines.
+        let escaped: String = detail
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .chars()
+            .map(|c| match c {
+                '\n' | '\r' => ' ',
+                other => other,
+            })
+            .collect();
+        let script = format!(
+            "display dialog \"Stitch couldn't start.\\n\\n{escaped}\" with title \"Stitch\" buttons {{\"OK\"}} default button \"OK\" with icon stop"
+        );
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = detail;
     }
 }
 
