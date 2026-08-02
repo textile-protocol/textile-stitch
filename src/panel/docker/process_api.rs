@@ -39,11 +39,6 @@ const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Must not depend on UI/API polls — desktop `--autostart` has no browser traffic.
 const SUPERVISOR_TICK: Duration = Duration::from_secs(2);
 
-/// Grace period when killing a persisted orphan on panel restore. Keep this short:
-/// the previous panel is already gone, and blocking startup for [`STOP_GRACE_SECS`]
-/// per orphan makes cold start feel broken. SIGKILL follows if needed.
-const ORPHAN_STOP_GRACE_SECS: i64 = 2;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedBot {
     id: String,
@@ -179,7 +174,10 @@ impl ProcessRuntime {
             Ok(e) => e,
             Err(_) => return Ok(()),
         };
-        let mut inner = self.inner.lock().unwrap();
+        // Collect first so orphan stops can run concurrently. Sequential waits
+        // would be N × STOP_GRACE_SECS on a multi-bot restore.
+        let mut pending: Vec<(String, LiveBot, bool)> = Vec::new();
+        let mut orphans: Vec<(u32, Option<u64>)> = Vec::new();
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -199,24 +197,39 @@ impl ProcessRuntime {
                 restart_after: None,
                 restart_failures: 0,
             };
-            // Kill any orphan left from a previous panel process before we spawn
-            // again — otherwise two market makers share one wallet. Only signal
-            // the pid when it still looks like our stitch binary (and, on Linux,
-            // the starttime matches) so a recycled PID is never killed.
+            // Only signal the pid when it still looks like our stitch binary
+            // (and, on Linux, the starttime matches) so a recycled PID is never
+            // killed. Clear the persisted pid before waiting so a crash mid-
+            // restore doesn't leave a stale claim.
             if let Some(pid) = live.record.pid.take() {
                 let starttime = live.record.pid_starttime.take();
-                terminate_managed_pid(pid, starttime, &self.stitch_bin, ORPHAN_STOP_GRACE_SECS);
-                // If graceful stop didn't land (stuck child, ignored SIGTERM),
-                // don't leave the orphan running beside the respawn.
-                if pid_is_our_stitch(pid, starttime, &self.stitch_bin) {
-                    tracing::warn!(
-                        pid,
-                        "orphan survived graceful stop on restore; sending SIGKILL"
-                    );
-                    terminate_pid(pid, 0);
-                }
+                orphans.push((pid, starttime));
                 let _ = persist_record(&self.state_dir, &live.record);
             }
+            pending.push((name, live, wanted));
+        }
+
+        // Full STOP_GRACE_SECS so a mid-tick bot can finish after SIGTERM —
+        // a 2s grace would SIGKILL during that window. Parallelize so fleet
+        // size doesn't multiply cold-start latency.
+        let stitch_bin = &self.stitch_bin;
+        std::thread::scope(|scope| {
+            for (pid, starttime) in orphans {
+                scope.spawn(move || {
+                    terminate_managed_pid(pid, starttime, stitch_bin, STOP_GRACE_SECS);
+                    if pid_is_our_stitch(pid, starttime, stitch_bin) {
+                        tracing::warn!(
+                            pid,
+                            "orphan survived graceful stop on restore; sending SIGKILL"
+                        );
+                        terminate_pid(pid, 0);
+                    }
+                });
+            }
+        });
+
+        let mut inner = self.inner.lock().unwrap();
+        for (name, mut live, wanted) in pending {
             if wanted {
                 if let Err(e) = spawn_bot(&self.stitch_bin, &self.state_dir, &mut live) {
                     tracing::error!("failed to restore {}: {e:#}", live.record.name);
@@ -672,18 +685,27 @@ fn pid_kill0_exists(pid: u32) -> bool {
 }
 
 /// Poll briefly for [`process_starttime`] after spawn — right after `execve` the
-/// `/proc` entry can briefly be missing under load.
+/// `/proc` entry can briefly be missing under load. No-op on non-Linux: starttime
+/// is always `None` there, so polling would only burn ~500ms per spawn.
 fn wait_process_starttime(pid: u32) -> Option<u64> {
-    for _ in 0..50 {
-        if let Some(start) = process_starttime(pid) {
-            return Some(start);
+    #[cfg(target_os = "linux")]
+    {
+        for _ in 0..50 {
+            if let Some(start) = process_starttime(pid) {
+                return Some(start);
+            }
+            if !process_alive(pid) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        if !process_alive(pid) {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+        process_starttime(pid)
     }
-    process_starttime(pid)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// Linux starttime from `/proc/<pid>/stat` (field 22), used as a pid-reuse guard.
