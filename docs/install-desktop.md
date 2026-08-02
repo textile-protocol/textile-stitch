@@ -5,7 +5,9 @@ you. No Docker and no terminal. For an always-on server, see
 [install-panel.md](install-panel.md).
 
 The desktop app (`stitch-desktop`) is a light menu-bar (macOS) or system-tray
-(Windows / Linux) controller. On first launch it:
+(Windows / Linux) controller. There is **no Dock window** on macOS — look for a
+teal Stitch icon in the menu bar (top right; may be under the `»` overflow). On
+first launch it:
 
 1. Creates a data directory (`~/Library/Application Support/Stitch` on macOS,
    `%APPDATA%\Stitch` on Windows, `~/.local/share/stitch` on Linux).

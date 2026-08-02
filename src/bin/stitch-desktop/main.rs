@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::supervise::PanelSupervisor;
 
@@ -74,24 +74,19 @@ fn run() -> Result<()> {
     }
     let password = password::ensure_panel_password(&paths)?;
 
-    let supervisor = Arc::new(Mutex::new(PanelSupervisor::new(paths.clone())?));
+    let supervisor = Arc::new(Mutex::new(PanelSupervisor::new(paths)?));
+
+    // `mut` is required on macOS for set_activation_policy before run.
+    #[allow(unused_mut)]
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    // Menu-bar agent: match Info.plist LSUIElement so we never take a Dock slot.
+    #[cfg(target_os = "macos")]
     {
-        let mut s = supervisor.lock().unwrap();
-        s.start().context("starting the local Stitch panel")?;
-    }
-    // Interactive launches open the browser; login autostart stays in the tray.
-    // Bots that were `wanted_up` when the panel last stopped come back via the
-    // process runtime's persisted state — no extra work here.
-    if !quiet_launch {
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            let _ = open_url(PANEL_URL);
-        });
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
     }
 
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
-
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let _ = proxy.send_event(UserEvent::Menu(event.id));
     }));
@@ -124,20 +119,57 @@ fn run() -> Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
-    let icon = tray_icon_from_embedded().unwrap_or_else(fallback_icon);
-    let mut _tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("Stitch")
-        .with_icon(icon)
-        .build()
-        .context("creating the menu bar / tray icon")?;
-
     let password = Arc::new(password);
+    // tray-icon requires the macOS event loop to be running before TrayIcon::new.
+    // Creating it here (before run) leaves LSUIElement apps with no visible icon.
+    let mut tray: Option<TrayIcon> = None;
+    let mut started_panel = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
-            Event::NewEvents(StartCause::Init) => {}
+            Event::NewEvents(StartCause::Init) => {
+                if tray.is_none() {
+                    let icon = tray_icon_from_embedded().unwrap_or_else(fallback_icon);
+                    match TrayIconBuilder::new()
+                        .with_menu(Box::new(menu.clone()))
+                        .with_tooltip("Stitch")
+                        .with_icon(icon)
+                        .build()
+                    {
+                        Ok(t) => tray = Some(t),
+                        Err(e) => {
+                            eprintln!("stitch-desktop: creating menu bar icon failed: {e:#}");
+                            *control_flow = ControlFlow::Exit;
+                            return;
+                        }
+                    }
+                }
+                if !started_panel {
+                    started_panel = true;
+                    let start_result = {
+                        let mut s = supervisor.lock().unwrap();
+                        s.start().context("starting the local Stitch panel")
+                    };
+                    match start_result {
+                        Ok(()) => {
+                            // Interactive launches open the browser; login
+                            // autostart stays in the tray.
+                            if !quiet_launch {
+                                std::thread::spawn(|| {
+                                    std::thread::sleep(std::time::Duration::from_millis(800));
+                                    let _ = open_url(PANEL_URL);
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            // Keep the tray alive so the user can Quit / retry Start.
+                            // Finder launches have no terminal for eprintln alone.
+                            eprintln!("stitch-desktop: {e:#}");
+                        }
+                    }
+                }
+            }
             Event::UserEvent(UserEvent::Menu(id)) => {
                 if id == open_id {
                     let _ = open_url(PANEL_URL);
@@ -177,6 +209,7 @@ fn run() -> Result<()> {
                 if let Ok(mut s) = supervisor.lock() {
                     let _ = s.stop();
                 }
+                tray.take();
             }
             _ => {}
         }
