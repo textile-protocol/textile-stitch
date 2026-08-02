@@ -147,6 +147,50 @@ function Need-Value([string]$Current, [string]$Prompt, [string]$VarName, [switch
     return (Read-Host -Prompt $Prompt)
 }
 
+# Unicode scalar count — matches stitch-panel's chars().count() (not UTF-16 .Length).
+function Get-PasswordCharCount([string]$Password) {
+    $n = 0
+    for ($i = 0; $i -lt $Password.Length; $i++) {
+        $n++
+        if (
+            [char]::IsHighSurrogate($Password[$i]) -and
+            ($i + 1) -lt $Password.Length -and
+            [char]::IsLowSurrogate($Password[$i + 1])
+        ) {
+            $i++
+        }
+    }
+    return $n
+}
+
+function Need-Password([string]$Current, [string]$Prompt, [string]$VarName) {
+    if ($Current) {
+        $len = Get-PasswordCharCount $Current
+        if ($len -lt 12) {
+            Die "$VarName must be at least 12 characters (got $len)"
+        }
+        return $Current
+    }
+    if (-not [Environment]::UserInteractive) {
+        Die "$VarName is not set and there is no interactive session to ask on. Set it and re-run."
+    }
+    while ($true) {
+        $pw = Read-Secret $Prompt
+        if (-not $pw) { Die 'a panel password is required' }
+        $len = Get-PasswordCharCount $pw
+        if ($len -lt 12) {
+            Write-Warn "need at least 12 characters (got $len). Try again."
+            continue
+        }
+        $again = Read-Secret 'Again'
+        if ($pw -cne $again) {
+            Write-Warn "those didn't match. Try again."
+            continue
+        }
+        return $pw
+    }
+}
+
 function Fetch-File([string]$Url, [string]$Dest) {
     try {
         Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
@@ -156,14 +200,61 @@ function Fetch-File([string]$Url, [string]$Dest) {
 }
 
 # ---------------------------------------------------------------- preflight ---
+# Plain-language Docker help — many Windows operators have never used containers.
+# Use Write-Host (not Write-Error): $ErrorActionPreference=Stop would otherwise
+# abort before the "what to do" steps print.
+function Explain-Docker([ValidateSet('missing', 'compose', 'not_running')][string]$Reason) {
+    Write-Host ''
+    switch ($Reason) {
+        'missing' {
+            Write-Host 'error: Docker is not installed on this computer.'
+            Write-Host ''
+            Write-Host 'Stitch runs inside Docker — a free app that hosts the web panel.'
+            Write-Host 'Install it once, then re-run the same install command.'
+            Write-Host ''
+            Write-Host 'What to do:'
+            Write-Host '  1. Download and install Docker Desktop for Windows:'
+            Write-Host '     https://docs.docker.com/desktop/setup/install/windows-install/'
+            Write-Host '  2. Open Docker Desktop from the Start menu and wait until it says'
+            Write-Host '     Docker is running (whale icon in the system tray is steady).'
+            Write-Host '  3. Open a new PowerShell window and re-run:'
+            Write-Host '     irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1 | iex'
+        }
+        'compose' {
+            Write-Host 'error: Docker Compose v2 is missing.'
+            Write-Host ''
+            Write-Host 'The docker command is present, but docker compose does not work.'
+            Write-Host 'Stitch needs Compose v2. Update or reinstall Docker Desktop, then re-run.'
+            Write-Host '  https://docs.docker.com/desktop/setup/install/windows-install/'
+        }
+        'not_running' {
+            Write-Host 'error: Docker is installed but not running.'
+            Write-Host ''
+            Write-Host 'The panel cannot start until Docker Desktop is up.'
+            Write-Host ''
+            Write-Host 'What to do:'
+            Write-Host '  1. Open Docker Desktop from the Start menu.'
+            Write-Host '  2. Wait until it finishes starting (system-tray whale icon steady /'
+            Write-Host '     Docker Desktop is running).'
+            Write-Host '  3. Re-run the install command in PowerShell.'
+        }
+    }
+    Write-Host ''
+    exit 1
+}
+
 Write-Step 'Checking Docker'
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Die 'Docker is not installed. Install Docker Desktop for Windows: https://docs.docker.com/desktop/setup/install/windows-install/'
+    Explain-Docker missing
 }
 docker compose version | Out-Null
-Assert-LastExitOk 'Docker Compose v2 is missing. `docker compose version` has to work.'
+if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+    Explain-Docker compose
+}
 docker info | Out-Null
-Assert-LastExitOk 'the Docker daemon is not reachable. Start Docker Desktop and re-run.'
+if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+    Explain-Docker not_running
+}
 Write-Say 'Docker and Compose v2 are ready.'
 
 # Windows Docker Desktop runs Linux containers. Tailscale server compose needs
@@ -287,11 +378,29 @@ if (-not $ReuseEnv) {
 }
 
 function Add-Password([string]$Password, [string]$Label = 'password') {
-    $hash = $Password | docker run --rm -i $PanelImage hash-password 2>$null
-    Assert-LastExitOk 'hashing the password failed'
-    if (-not $hash) { Die 'hashing the password failed' }
-    $hash = ($hash | Select-Object -Last 1).ToString().Trim()
-    if (-not $hash) { Die 'the panel returned an empty password hash' }
+    $len = Get-PasswordCharCount $Password
+    if ($len -lt 12) {
+        Die "password must be at least 12 characters (got $len)"
+    }
+
+    # Keep stderr: the binary's real reason used to disappear into $null.
+    $errFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $hash = $Password | docker run --rm -i $PanelImage hash-password 2>$errFile
+        if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+            $msg = @(Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue |
+                Where-Object { $_.Trim() } |
+                ForEach-Object { $_ -replace '^Error:\s*', '' } |
+                Select-Object -Last 1) -join ''
+            if ($msg) { Die "hashing the password failed: $msg" }
+            Die 'hashing the password failed'
+        }
+        $hashLine = @($hash) | Where-Object { $_ -match '^\$argon2' } | Select-Object -First 1
+        if (-not $hashLine) { Die 'the panel returned no argon2 password hash' }
+        $hash = $hashLine.ToString().Trim()
+    } finally {
+        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+    }
 
     $lines = @()
     if (Test-Path -LiteralPath $EnvFile) {
@@ -313,8 +422,7 @@ if (-not (Get-EnvFileValue $EnvFile 'PANEL_PASSWORD_HASH')) {
     if (-not $env:PANEL_PASSWORD) {
         Write-Say 'This install is loopback-only. You log in with a password you choose now.'
     }
-    $password = Need-Value $env:PANEL_PASSWORD 'Panel password (12+ characters, not shown)' 'PANEL_PASSWORD' -Secret
-    if (-not $password) { Die 'a panel password is required for a local install' }
+    $password = Need-Password $env:PANEL_PASSWORD 'Panel password (12+ characters, not shown)' 'PANEL_PASSWORD'
     Add-Password $password 'panel password'
 } elseif ($env:PANEL_PASSWORD) {
     Write-Step 'Updating the panel password'

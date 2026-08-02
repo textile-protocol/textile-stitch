@@ -78,7 +78,11 @@ fn hash_password() -> Result<()> {
         "use at least 12 characters: this password guards the Docker socket"
     );
     println!("{}", auth::hash_password(&password)?);
-    eprintln!("\nSet it as STITCH_PANEL_PASSWORD_HASH (quote it — it contains $).");
+    // Tip is for humans at a terminal. install-panel.sh pipes on stdin and
+    // keeps stderr for real failures — don't pollute it with a success note.
+    if std::io::stdin().is_terminal() {
+        eprintln!("\nSet it as STITCH_PANEL_PASSWORD_HASH (quote it — it contains $).");
+    }
     Ok(())
 }
 

@@ -91,6 +91,34 @@ ask_secret() { # prompt -> echoes the answer, never echoing keystrokes
   printf '%s' "$_secret"
 }
 
+# Unicode scalar count — matches stitch-panel's `chars().count()`, independent of
+# locale. Under LC_ALL=C, `wc -m` counts UTF-8 bytes and would accept six emoji
+# (24 bytes) that the panel then rejects as six characters.
+password_chars() {
+  # Only python3: unversioned `python` is still Python 2 on some hosts, where
+  # len(sys.stdin.read()) counts UTF-8 bytes and the 12-char check lies.
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | PYTHONIOENCODING=utf-8 python3 -c 'import sys; print(len(sys.stdin.read()))'
+    return
+  fi
+  # Probe before trusting wc -m: an unsupported LC_ALL often falls back to C,
+  # where wc still succeeds but counts UTF-8 bytes (é → 2). A real UTF-8 locale
+  # counts that single character as 1.
+  for _loc in C.UTF-8 en_US.UTF-8 UTF-8; do
+    _probe="$(printf 'é' | LC_ALL="$_loc" wc -m 2>/dev/null | tr -d ' \t')" || _probe=''
+    [ "$_probe" = 1 ] || continue
+    printf '%s' "$1" | LC_ALL="$_loc" wc -m | tr -d ' \t'
+    return
+  done
+  # Last resort: byte count. Safe for ASCII (the usual password). Non-ASCII
+  # without python3/UTF-8 locale is rare; a byte count would over-count and
+  # incorrectly pass, so refuse rather than guess.
+  if printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'; then
+    die 'need python3 (or a UTF-8 locale) to count non-ASCII password characters'
+  fi
+  printf '%s' "$1" | wc -c | tr -d ' \t'
+}
+
 # A value from the environment, or a prompt, or a clear failure naming the
 # variable to set. The third case is what an unattended run hits.
 need() { # env-value prompt var-name secret?
@@ -98,6 +126,39 @@ need() { # env-value prompt var-name secret?
   have_tty || die "$3 is not set and there is no terminal to ask on. Set it and re-run:
   $3=… sh install-panel.sh"
   if [ "${4:-}" = secret ]; then ask_secret "$2" "$3"; else ask "$2" ''; fi
+}
+
+# Password of at least 12 characters. Retries on a TTY when the typed value is
+# too short or the confirmation does not match — the panel rejects short ones,
+# and a silent re-prompt beats a dead install with "hashing the password failed".
+need_password() { # env-value prompt var-name
+  _existing="$1"
+  _prompt="$2"
+  _var="$3"
+  if [ -n "$_existing" ]; then
+    _len="$(password_chars "$_existing")"
+    [ "$_len" -ge 12 ] || die "$_var must be at least 12 characters (got $_len)"
+    printf '%s' "$_existing"
+    return
+  fi
+  have_tty || die "$_var is not set and there is no terminal to ask on. Set it and re-run:
+  $_var=… sh install-panel.sh"
+  while :; do
+    _pw="$(ask_secret "$_prompt" "$_var")"
+    [ -n "$_pw" ] || die 'a panel password is required'
+    _len="$(password_chars "$_pw")"
+    if [ "$_len" -lt 12 ]; then
+      warn "need at least 12 characters (got $_len). Try again."
+      continue
+    fi
+    _again="$(ask_secret 'Again' "$_var")"
+    if [ "$_pw" != "$_again" ]; then
+      warn "those didn't match. Try again."
+      continue
+    fi
+    printf '%s' "$_pw"
+    return
+  done
 }
 
 fetch() { # url dest
@@ -217,12 +278,112 @@ is_floating_latest_image() {
 }
 
 # ---------------------------------------------------------------- preflight ---
+# Plain-language Docker help for operators who may never have used containers.
+# Detect the OS so the install link and "how to start it" steps match the machine.
+docker_os() {
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin) printf 'mac' ;;
+    Linux) printf 'linux' ;;
+    *) printf 'other' ;;
+  esac
+}
+
+docker_install_url() {
+  case "$(docker_os)" in
+    mac) printf 'https://docs.docker.com/desktop/setup/install/mac-install/' ;;
+    linux) printf 'https://docs.docker.com/engine/install/' ;;
+    *) printf 'https://docs.docker.com/get-docker/' ;;
+  esac
+}
+
+# reason: missing | compose | not_running
+explain_docker() {
+  _reason="$1"
+  _os="$(docker_os)"
+  say '' >&2
+  case "$_reason" in
+    missing)
+      printf 'error: Docker is not installed on this computer.\n' >&2
+      say '' >&2
+      say 'Stitch runs inside Docker — a free app that hosts the web panel.' >&2
+      say 'Install it once, then re-run the same install command.' >&2
+      say '' >&2
+      case "$_os" in
+        mac)
+          say 'What to do:' >&2
+          say '  1. Download and install Docker Desktop for Mac:' >&2
+          say "     $(docker_install_url)" >&2
+          say '  2. Open Docker Desktop from Applications and wait until it says' >&2
+          say '     Docker is running (the whale icon in the menu bar is steady).' >&2
+          say '  3. Re-run this install command in Terminal.' >&2
+          ;;
+        linux)
+          say 'What to do:' >&2
+          say '  1. Install Docker Engine (or Docker Desktop) for your distro:' >&2
+          say "     $(docker_install_url)" >&2
+          say '  2. Start it, e.g. `sudo systemctl start docker` (and enable it if you want).' >&2
+          say '  3. Make sure your user can run docker (`sudo usermod -aG docker $USER`,' >&2
+          say '     then log out and back in), then re-run this install command.' >&2
+          ;;
+        *)
+          say "Install Docker from $(docker_install_url), start it, then re-run this command." >&2
+          ;;
+      esac
+      ;;
+    compose)
+      printf 'error: Docker Compose v2 is missing.\n' >&2
+      say '' >&2
+      say 'The `docker` command is present, but `docker compose` does not work.' >&2
+      say 'Stitch needs Compose v2 (the plugin). The old `docker-compose` script is not enough.' >&2
+      say '' >&2
+      case "$_os" in
+        mac)
+          say 'Fix: update or reinstall Docker Desktop for Mac, open it, then re-run:' >&2
+          say "  $(docker_install_url)" >&2
+          ;;
+        linux)
+          say 'Fix: install the Compose plugin for your distro, then re-run:' >&2
+          say '  https://docs.docker.com/compose/install/linux/' >&2
+          ;;
+        *)
+          say 'Install or update Docker so `docker compose version` works, then re-run.' >&2
+          ;;
+      esac
+      ;;
+    not_running)
+      printf 'error: Docker is installed but not running.\n' >&2
+      say '' >&2
+      say 'The panel cannot start until Docker is up.' >&2
+      say '' >&2
+      case "$_os" in
+        mac)
+          say 'What to do:' >&2
+          say '  1. Open Docker Desktop from Applications (or Spotlight: Docker).' >&2
+          say '  2. Wait until it finishes starting (menu bar whale icon steady /' >&2
+          say '     "Docker Desktop is running").' >&2
+          say '  3. Re-run this install command.' >&2
+          ;;
+        linux)
+          say 'What to do:' >&2
+          say '  1. Start Docker: `sudo systemctl start docker`' >&2
+          say '  2. If you see permission denied, add yourself to the docker group:' >&2
+          say '     `sudo usermod -aG docker $USER` — then log out and back in.' >&2
+          say '  3. Re-run this install command.' >&2
+          ;;
+        *)
+          say 'Start Docker, wait until it is ready, then re-run this command.' >&2
+          ;;
+      esac
+      ;;
+  esac
+  say '' >&2
+  exit 1
+}
+
 step 'Checking Docker'
-command -v docker >/dev/null 2>&1 || die 'Docker is not installed. See https://docs.docker.com/get-docker/'
-docker compose version >/dev/null 2>&1 ||
-  die 'Docker Compose v2 is missing. `docker compose version` has to work (the old `docker-compose` script is not enough).'
-docker info >/dev/null 2>&1 ||
-  die 'the Docker daemon is not reachable. Start Docker (or add yourself to the docker group) and re-run.'
+command -v docker >/dev/null 2>&1 || explain_docker missing
+docker compose version >/dev/null 2>&1 || explain_docker compose
+docker info >/dev/null 2>&1 || explain_docker not_running
 say 'Docker and Compose v2 are ready.'
 
 # ------------------------------------------------------------------- inputs ---
@@ -480,9 +641,25 @@ fi
 add_password() {
   _pw="$1"
   _label="${2:-password}"
-  _hash="$(printf '%s\n' "$_pw" | docker run --rm -i "$PANEL_IMAGE" hash-password 2>/dev/null)" ||
+  _len="$(password_chars "$_pw")"
+  [ "$_len" -ge 12 ] || die "password must be at least 12 characters (got $_len)"
+
+  # Keep stderr: the binary's real reason (too short, docker failure, …) used to
+  # disappear into /dev/null, leaving only "hashing the password failed".
+  # mktemp: a predictable /tmp/…$$ path is symlink-clobberable on multi-user hosts.
+  _err="$(mktemp "${TMPDIR:-/tmp}/stitch-panel-hash.XXXXXX")" ||
+    die 'could not create a temp file for password hashing'
+  if ! _out="$(printf '%s\n' "$_pw" | docker run --rm -i "$PANEL_IMAGE" hash-password 2>"$_err")"; then
+    _msg="$(tr -d '\r' <"$_err" | sed '/^$/d; s/^Error: //' | tail -n 1)"
+    rm -f "$_err"
+    [ -n "$_msg" ] && die "hashing the password failed: $_msg"
     die 'hashing the password failed'
-  [ -n "$_hash" ] || die 'the panel returned an empty password hash'
+  fi
+  rm -f "$_err"
+  # Exact PHC line only — some Docker setups print warnings on stdout.
+  _hash="$(printf '%s\n' "$_out" | grep -m1 '^\$argon2')" ||
+    die 'the panel returned no argon2 password hash'
+
   # Single-quoted: an argon2 hash is full of $ that compose would otherwise read
   # as variable interpolation.
   # Drop any previous hash line so re-running with PANEL_PASSWORD replaces it.
@@ -515,8 +692,7 @@ if [ "$compose_mode" = local ]; then
     if [ -z "${PANEL_PASSWORD:-}" ]; then
       say 'This install is loopback-only. You log in with a password you choose now.'
     fi
-    PANEL_PASSWORD="$(need "${PANEL_PASSWORD:-}" 'Panel password (12+ characters, not shown)' PANEL_PASSWORD secret)"
-    [ -n "$PANEL_PASSWORD" ] || die 'a panel password is required for a local install'
+    PANEL_PASSWORD="$(need_password "${PANEL_PASSWORD:-}" 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
     add_password "$PANEL_PASSWORD" 'panel password'
   elif [ -n "${PANEL_PASSWORD:-}" ]; then
     step 'Updating the panel password'
@@ -532,7 +708,17 @@ else
     say 'Useful if you browse from a tagged Tailscale node, which gets no identity'
     say 'header. Press Enter to skip.'
     _pw="$(ask_secret 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
-    if [ -n "$_pw" ]; then add_password "$_pw" 'password fallback'; else say 'Skipped.'; fi
+    if [ -n "$_pw" ]; then
+      _len="$(password_chars "$_pw")"
+      if [ "$_len" -lt 12 ]; then
+        die "password must be at least 12 characters (got $_len)"
+      fi
+      _again="$(ask_secret 'Again' PANEL_PASSWORD)"
+      [ "$_pw" = "$_again" ] || die "those didn't match"
+      add_password "$_pw" 'password fallback'
+    else
+      say 'Skipped.'
+    fi
   fi
 fi
 
