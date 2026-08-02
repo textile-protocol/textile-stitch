@@ -42,5 +42,7 @@ libssl-dev = '*'
 libayatana-appindicator3-dev = '*'
 # tray-icon / muda link against libxdo for predefined menu accelerators on Linux.
 libxdo-dev = '*'
-# wry control window (WebKitGTK 4.1).
-libwebkit2gtk-4.1-dev = '*'
+# wry control window (WebKitGTK 4.1). Quote the key — bare TOML keys treat
+# dots as table nesting, so libwebkit2gtk-4.1-dev becomes package
+# "libwebkit2gtk-4" and Release CI fails with "Unable to locate package".
+"libwebkit2gtk-4.1-dev" = '*'
