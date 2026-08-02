@@ -704,21 +704,30 @@ else
     step 'Adding the password fallback'
     add_password "$PANEL_PASSWORD" 'password fallback'
   elif [ "$reuse_env" = no ] && have_tty; then
+    # Retry on short / mismatched passwords. .env is already written by here, so
+    # dying would leave reuse_env=yes on the next run and skip this prompt forever.
     step 'Password fallback (optional)'
     say 'Useful if you browse from a tagged Tailscale node, which gets no identity'
     say 'header. Press Enter to skip.'
-    _pw="$(ask_secret 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
-    if [ -n "$_pw" ]; then
+    while :; do
+      _pw="$(ask_secret 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
+      if [ -z "$_pw" ]; then
+        say 'Skipped.'
+        break
+      fi
       _len="$(password_chars "$_pw")"
       if [ "$_len" -lt 12 ]; then
-        die "password must be at least 12 characters (got $_len)"
+        warn "need at least 12 characters (got $_len). Try again."
+        continue
       fi
       _again="$(ask_secret 'Again' PANEL_PASSWORD)"
-      [ "$_pw" = "$_again" ] || die "those didn't match"
+      if [ "$_pw" != "$_again" ]; then
+        warn "those didn't match. Try again."
+        continue
+      fi
       add_password "$_pw" 'password fallback'
-    else
-      say 'Skipped.'
-    fi
+      break
+    done
   fi
 fi
 
