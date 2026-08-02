@@ -67,6 +67,8 @@ export default function BotDetail() {
 
   const botUpdate = updates?.bots.find((b) => b.name === name)
   const updateAvailable = botUpdate?.updateAvailable ?? false
+  // Pins keep an Update button even when no newer digest was detected.
+  const canUpdate = botUpdate?.canUpdate ?? updateAvailable
 
   async function act(what: 'start' | 'stop' | 'restart' | 'recreate' | 'update') {
     if (
@@ -153,17 +155,34 @@ export default function BotDetail() {
         {updateAvailable && <Tag>update available</Tag>}
       </div>
 
-      {updateAvailable &&
+      {canUpdate &&
         (bot.canMigrate || bot.layout === 'flat-files' ? (
           <Banner tone="warning">
-            A newer stitch image is available ({shortImage(updates?.bot.targetImage ?? null)}
-            ), but this bot still uses the flat layout. Migrate first so updating
-            doesn't lose the slot-nonce ledger.
+            {updateAvailable ? (
+              <>
+                A newer stitch image is available (
+                {shortImage(updates?.bot.targetImage ?? null)}), but this bot still
+                uses the flat layout. Migrate first so updating doesn't lose the
+                slot-nonce ledger.
+              </>
+            ) : (
+              <>
+                This bot is on a pinned image. Migrate first so updating to{' '}
+                {shortImage(updates?.bot.targetImage ?? null)} doesn't lose the
+                slot-nonce ledger.
+              </>
+            )}
           </Banner>
-        ) : (
+        ) : updateAvailable ? (
           <Banner tone="info">
             A newer stitch image is available ({shortImage(updates?.bot.targetImage ?? null)}
             ). Update recreates this bot on that image; config stays on disk.
+          </Banner>
+        ) : (
+          <Banner tone="info">
+            This bot is on a pinned image (
+            {shortImage(bot.image)}). Update moves it to{' '}
+            {shortImage(updates?.bot.targetImage ?? null)}; config stays on disk.
           </Banner>
         ))}
 
@@ -219,7 +238,7 @@ export default function BotDetail() {
                 <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
                   Recreate
                 </Button>
-                {updateAvailable && !bot.canMigrate && bot.layout !== 'flat-files' && (
+                {canUpdate && !bot.canMigrate && bot.layout !== 'flat-files' && (
                   <Button
                     variant="primary"
                     busy={busy === 'update'}

@@ -88,7 +88,33 @@ pub fn same_image_repository(a: &str, b: &str) -> bool {
     a.registry == b.registry && a.repository == b.repository
 }
 
-/// Whether a running bot image is on `STITCH_PANEL_BOT_IMAGE`'s update channel.
+/// True when Docker is reporting a bare content id (`sha256:` + hex) instead of
+/// a named `registry/repo:tag` (or `repo@sha256:…`) reference.
+///
+/// ContainerList often does this after the tag is deleted or the container was
+/// created from a digest. Those bots still need a path to Update.
+pub fn is_content_digest_ref(image: &str) -> bool {
+    let Some(hex) = image.strip_prefix("sha256:") else {
+        return false;
+    };
+    // Reject `sha256:…` that still has a path/name — those are malformed refs,
+    // not Docker image ids.
+    !hex.is_empty()
+        && !hex.contains('/')
+        && !hex.contains('@')
+        && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// True when the running ref is a pin operators expect to leave via Update:
+/// `sha-*` tags, `name@sha256:…`, or a bare `sha256:…` image id.
+pub fn is_pin_image_ref(image: &str) -> bool {
+    if is_content_digest_ref(image) || image.contains('@') {
+        return true;
+    }
+    parse_image_ref(image).tag.starts_with("sha-")
+}
+
+/// Whether named image refs place the bot on `STITCH_PANEL_BOT_IMAGE`'s channel.
 ///
 /// Same repository is not enough: a bot on `:canary` must not be Updated onto
 /// `:latest` just because they share a repo. Mutable tags must match.
@@ -99,7 +125,13 @@ pub fn same_image_repository(a: &str, b: &str) -> bool {
 /// already on the resolved `:latest` target stay eligible for later releases
 /// (otherwise a successful pin→latest Update would leave them "off channel"
 /// forever while the env still names the pin).
+///
+/// Bare `sha256:…` image ids have no repository in the string — use
+/// [`bot_eligible_for_update`] so RepoDigests can attribute them.
 pub fn bot_eligible_for_configured_update(current: &str, configured: &str) -> bool {
+    if is_content_digest_ref(current) {
+        return false;
+    }
     if !same_image_repository(current, configured) {
         return false;
     }
@@ -119,6 +151,56 @@ pub fn bot_eligible_for_configured_update(current: &str, configured: &str) -> bo
     }
     // Mutable channel: already on that tag.
     cur.tag == cfg.tag
+}
+
+/// Whether local RepoDigests attribute an image id to `configured`'s repository.
+pub fn digests_match_configured_repository(local_digests: &[String], configured: &str) -> bool {
+    let cfg = parse_image_ref(configured);
+    let Some(registry) = cfg.registry.as_deref() else {
+        return false;
+    };
+    let repo = format!("{registry}/{}", cfg.repository);
+    local_digests.iter().any(|d| {
+        d.rsplit_once('@')
+            .is_some_and(|(name, _)| name == repo.as_str())
+    })
+}
+
+/// Async eligibility: named refs via [`bot_eligible_for_configured_update`], bare
+/// `sha256:…` ids via RepoDigests under the configured repository.
+///
+/// `panel_origin` covers the case where Docker reports a bare id and RepoDigests
+/// are empty (tag pruned, odd runtime): panel-created bots were launched from
+/// `STITCH_PANEL_BOT_IMAGE`, so Update onto that channel is still correct.
+pub async fn bot_eligible_for_update(
+    current: Option<&str>,
+    image_id: Option<&str>,
+    configured: &str,
+    docker: &dyn DockerApi,
+    panel_origin: bool,
+) -> bool {
+    let Some(current) = current.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if bot_eligible_for_configured_update(current, configured) {
+        return true;
+    }
+    if !is_content_digest_ref(current) {
+        return false;
+    }
+    // Try image id first (what the container is running), then the Image field —
+    // they usually match for bare digests, but fakes / odd daemons can diverge.
+    for lookup in [image_id.filter(|id| !id.is_empty()), Some(current)]
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(local) = docker.local_image_digests(lookup).await {
+            if digests_match_configured_repository(&local, configured) {
+                return true;
+            }
+        }
+    }
+    panel_origin
 }
 
 /// True when `remote` (a `sha256:…` digest) is not among the local RepoDigests.
@@ -178,7 +260,12 @@ pub struct ImageUpdateInfo {
 pub struct BotUpdateInfo {
     pub name: String,
     pub current_image: Option<String>,
+    /// Newer digest on the update channel than this bot is running.
     pub update_available: bool,
+    /// The Update action is allowed (on-channel / attributable pin), even when
+    /// no newer digest was detected — so sha-* and bare `sha256:…` bots still
+    /// get an Update button to leave the pin.
+    pub can_update: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -236,9 +323,15 @@ pub async fn check_updates(
             .as_deref()
             .filter(|id| !id.is_empty())
             .or(current.as_deref());
-        let on_channel = current
-            .as_deref()
-            .is_some_and(|img| bot_eligible_for_configured_update(img, &cfg.bot_image));
+        let on_channel = bot_eligible_for_update(
+            current.as_deref(),
+            bot.image_id.as_deref(),
+            &cfg.bot_image,
+            docker,
+            bot.origin == super::inventory::Origin::Panel,
+        )
+        .await;
+        let pinned = current.as_deref().is_some_and(is_pin_image_ref);
         let update_available = if !on_channel {
             // Wrong repo or wrong tag channel (e.g. :canary vs :latest) — Update
             // would recreate onto the configured image/channel.
@@ -261,6 +354,9 @@ pub async fn check_updates(
             name: bot.name.clone(),
             current_image: current,
             update_available,
+            // Pins keep an Update affordance even when the registry check can't
+            // prove a newer digest (or the pin already matches :latest content).
+            can_update: on_channel && (update_available || pinned),
         });
     }
 
@@ -472,6 +568,43 @@ mod tests {
         ));
         assert!(!same_image_repository(
             "ghcr.io/acme/stitch-fork:v9",
+            "ghcr.io/textile-protocol/textile-stitch:latest"
+        ));
+    }
+
+    #[test]
+    fn content_digest_refs_are_bare_image_ids() {
+        assert!(is_content_digest_ref(
+            "sha256:e67d65aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa055252"
+        ));
+        assert!(!is_content_digest_ref(
+            "ghcr.io/textile-protocol/textile-stitch@sha256:aaaa"
+        ));
+        assert!(!is_content_digest_ref(
+            "ghcr.io/textile-protocol/textile-stitch:sha-deadbeef"
+        ));
+        assert!(is_pin_image_ref("sha256:abcdef"));
+        assert!(is_pin_image_ref(
+            "ghcr.io/textile-protocol/textile-stitch:sha-deadbeef"
+        ));
+        assert!(!is_pin_image_ref(
+            "ghcr.io/textile-protocol/textile-stitch:latest"
+        ));
+    }
+
+    #[test]
+    fn digests_attribute_bare_ids_to_the_configured_repo() {
+        let local = vec!["ghcr.io/textile-protocol/textile-stitch@sha256:e67d65aa".into()];
+        assert!(digests_match_configured_repository(
+            &local,
+            "ghcr.io/textile-protocol/textile-stitch:latest"
+        ));
+        assert!(!digests_match_configured_repository(
+            &local,
+            "ghcr.io/acme/stitch-fork:latest"
+        ));
+        assert!(!digests_match_configured_repository(
+            &[],
             "ghcr.io/textile-protocol/textile-stitch:latest"
         ));
     }

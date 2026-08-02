@@ -864,22 +864,27 @@ async fn recreate_on_image(
     // Same gate as /api/updates: wrong repo or tag channel (fork, :canary vs
     // :latest) must not be recreated onto STITCH_PANEL_BOT_IMAGE via Update.
     // Recreate still uses the configured image for recovery — that path is explicit.
-    if require_fresh {
-        if let Some(current) = bot.image.as_deref() {
-            if !crate::panel::updates::bot_eligible_for_configured_update(
-                current,
-                &state.cfg.bot_image,
-            ) {
-                return Err(ApiError::conflict(format!(
-                    "{name} runs {current}, which is not on the update channel for {}. Update \
-                     only refreshes bots on STITCH_PANEL_BOT_IMAGE's repository and tag \
-                     channel (same-repo sha-* / digest pins may move to the resolved \
-                     target) — recreate it from your own compose file, or change \
-                     STITCH_PANEL_BOT_IMAGE.",
-                    state.cfg.bot_image
-                )));
-            }
-        }
+    // Bare `sha256:…` image ids go through RepoDigests so digest-only containers
+    // can still leave the pin.
+    if require_fresh
+        && !crate::panel::updates::bot_eligible_for_update(
+            bot.image.as_deref(),
+            bot.image_id.as_deref(),
+            &state.cfg.bot_image,
+            state.docker.as_ref(),
+            bot.origin == crate::panel::inventory::Origin::Panel,
+        )
+        .await
+    {
+        let current = bot.image.as_deref().unwrap_or("(unknown image)");
+        return Err(ApiError::conflict(format!(
+            "{name} runs {current}, which is not on the update channel for {}. Update \
+             only refreshes bots on STITCH_PANEL_BOT_IMAGE's repository and tag \
+             channel (same-repo sha-* / digest pins may move to the resolved \
+             target) — recreate it from your own compose file, or change \
+             STITCH_PANEL_BOT_IMAGE.",
+            state.cfg.bot_image
+        )));
     }
 
     // `wants_to_be_up`, not `is_running`: a bot Docker is restarting is one the
@@ -2865,6 +2870,58 @@ mod tests {
             "update must pull :latest for a sha-* pin, got {:?}",
             h.docker.calls()
         );
+    }
+
+    #[tokio::test]
+    async fn update_allows_a_bare_sha256_image_id_attributed_via_repo_digests() {
+        // Docker often reports Image as a bare content id after the tag is gone.
+        // RepoDigests still name the registry repo — Update must use that, not
+        // treat `sha256:…` as an off-channel repository named "sha256".
+        let h = super::super::testkit::harness_with_bot_image(
+            "bot-update-bare-digest",
+            "ghcr.io/textile-protocol/textile-stitch:latest",
+        );
+        seed_panel_bot(&h, "bot-a");
+        let digest = "sha256:e67d65aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa055252";
+        h.docker.set_container_image("stitch-bot-a", digest);
+        h.docker.set_image_digests(
+            digest,
+            vec!["ghcr.io/textile-protocol/textile-stitch@sha256:e67d65aa".into()],
+        );
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            h.docker.calls().iter().any(|c| matches!(
+                c,
+                Call::EnsureImage { image, refresh: true }
+                    if image == "ghcr.io/textile-protocol/textile-stitch:latest"
+            )),
+            "bare digest bot must Update onto :latest, got {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_allows_a_panel_bot_with_a_bare_digest_and_no_repo_digests() {
+        // Tag pruned, RepoDigests empty — panel origin is enough to know this
+        // bot was launched from STITCH_PANEL_BOT_IMAGE.
+        let h = super::super::testkit::harness_with_bot_image(
+            "bot-update-bare-digest-panel",
+            "ghcr.io/textile-protocol/textile-stitch:latest",
+        );
+        seed_panel_bot(&h, "bot-a");
+        h.docker.set_container_image(
+            "stitch-bot-a",
+            "sha256:e67d65aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa055252",
+        );
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/update", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]

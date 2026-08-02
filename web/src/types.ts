@@ -170,7 +170,14 @@ export interface ImageUpdateInfo {
 export interface BotUpdateInfo {
   name: string
   currentImage: string | null
+  /** Newer digest on the update channel than this bot is running. */
   updateAvailable: boolean
+  /**
+   * Update is allowed. True for on-channel bots that are behind, and for
+   * sha-* / bare `sha256:…` pins so they can leave the pin even when the
+   * registry check can't prove a newer digest.
+   */
+  canUpdate: boolean
 }
 
 export interface UpdatesStatus {

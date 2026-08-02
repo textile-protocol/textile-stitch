@@ -137,6 +137,8 @@ mod tests {
             v["bots"][0]["updateAvailable"], false,
             "registry failure must not report behind via pin≠latest drift: {body}"
         );
+        // Pin stays Update-able so the button isn't gated on a live registry check.
+        assert_eq!(v["bots"][0]["canUpdate"], true, "{body}");
         assert_eq!(v["bot"]["updateAvailable"], false, "{body}");
         assert!(v["panel"].is_object());
     }

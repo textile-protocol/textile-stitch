@@ -160,6 +160,11 @@ impl FakeDocker {
         let mut st = self.state.lock().unwrap();
         if let Some(c) = st.containers.iter_mut().find(|c| c.name == name) {
             c.image = image.to_string();
+            // Docker's Image field is often the bare id when there's no tag; keep
+            // ImageID in sync so digest lookups in update checks hit the same key.
+            if image.starts_with("sha256:") && !image.contains('/') {
+                c.image_id = image.to_string();
+            }
         }
     }
 

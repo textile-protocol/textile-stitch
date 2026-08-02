@@ -90,6 +90,9 @@ export default function Fleet() {
   const behind = new Set(
     (updates?.bots ?? []).filter((b) => b.updateAvailable).map((b) => b.name),
   )
+  const canUpdate = new Set(
+    (updates?.bots ?? []).filter((b) => b.canUpdate).map((b) => b.name),
+  )
 
   return (
     <div className="space-y-4">
@@ -131,6 +134,9 @@ export default function Fleet() {
                 updateAvailable={
                   behind.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
                 }
+                canUpdate={
+                  canUpdate.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
+                }
                 onAct={act}
               />
             </li>
@@ -151,11 +157,13 @@ function BotRow({
   bot,
   busy,
   updateAvailable,
+  canUpdate,
   onAct,
 }: {
   bot: Bot
   busy: string | null
   updateAvailable: boolean
+  canUpdate: boolean
   onAct: (name: string, what: 'start' | 'stop' | 'restart' | 'update') => void
 }) {
   const blocking = bot.warnings.filter((w) => w.blocksEditing)
@@ -208,7 +216,7 @@ function BotRow({
               >
                 Restart
               </Button>
-              {updateAvailable && (
+              {canUpdate && (
                 <Button
                   variant="primary"
                   busy={busy === `${bot.name}:update`}
