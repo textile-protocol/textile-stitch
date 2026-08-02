@@ -685,6 +685,13 @@ fn pid_is_our_stitch(pid: u32, starttime: Option<u64>, stitch_bin: &Path) -> boo
             if exe == stitch_bin {
                 return true;
             }
+            // `/bin/sleep` vs `/usr/bin/sleep` (usr-merge) — compare canonical paths.
+            let exe_canon = std::fs::canonicalize(&exe).unwrap_or(exe);
+            if let Ok(want_canon) = std::fs::canonicalize(stitch_bin) {
+                if exe_canon == want_canon {
+                    return true;
+                }
+            }
         }
         if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
             let first = cmdline.split(|b| *b == 0).next().unwrap_or(&[]);
@@ -1316,7 +1323,6 @@ mod tests {
 
     #[tokio::test]
     async fn restore_kills_orphan_pid_before_respawn() {
-        let sleep_bin = which_sleep();
         let root = temp_root("orphan");
         let bots = root.join("bots");
         let state = bots.join(".process-runtime");
@@ -1324,18 +1330,33 @@ mod tests {
         let host = bots.join("bot-a");
         std::fs::create_dir_all(&host).unwrap();
 
-        // Spawn an orphan the new runtime should find via persisted pid.
+        // Unique binary path so identity checks don't collide with other tests'
+        // `/usr/bin/sleep` orphans under parallel cargo test.
+        let stitch_bin = root.join("stitch");
+        std::fs::copy(which_sleep(), &stitch_bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stitch_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stitch_bin, perms).unwrap();
+        }
+
         // Forget the Child so the OS reparents it (like a crashed panel would):
         // if we keep the handle, a SIGTERM'd process becomes our zombie and
         // kill(pid, 0) stays true until we wait().
-        let orphan = Command::new(&sleep_bin)
-            .arg("30")
+        let orphan = Command::new(&stitch_bin)
+            .arg("60")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let orphan_pid = orphan.id();
         let orphan_start = process_starttime(orphan_pid);
+        assert!(
+            process_alive(orphan_pid),
+            "precondition: orphan must be running"
+        );
         std::mem::forget(orphan);
         let record = PersistedBot {
             id: "proc-stitch-bot-a".into(),
@@ -1344,7 +1365,7 @@ mod tests {
             labels: HashMap::new(),
             env: vec![],
             binds: vec![PersistedBind::from(&BindSpec::rw(&host, RUN_DIR))],
-            cmd: Some(vec!["30".into()]),
+            cmd: Some(vec!["60".into()]),
             restart_unless_stopped: true,
             wanted_up: true,
             created_unix: now_unix(),
@@ -1353,30 +1374,33 @@ mod tests {
         };
         persist_record(&state, &record).unwrap();
 
-        let rt = ProcessRuntime::new(sleep_bin, &bots).unwrap();
-        let (new_pid, new_start) = {
+        let rt = ProcessRuntime::new(stitch_bin, &bots).unwrap();
+        let new_pid = {
             let inner = rt.inner.lock().unwrap();
-            let live = &inner["stitch-bot-a"];
-            (live.record.pid, live.record.pid_starttime)
+            inner["stitch-bot-a"].record.pid
         };
         assert!(
             new_pid.is_some(),
             "wanted bot must be respawned after orphan kill"
         );
-        // Don't assert `!process_alive(orphan_pid)` alone: under load the OS can
-        // recycle that pid onto the respawned bot, which is still a successful
-        // kill+spawn. Prove the orphan is gone via pid or starttime.
-        if new_pid == Some(orphan_pid) {
-            assert_ne!(
-                new_start, orphan_start,
-                "respawn reused orphan pid; starttime must show a new process"
-            );
-        } else {
-            assert!(
-                !process_alive(orphan_pid),
-                "orphan from the previous panel must be terminated on restore"
-            );
+        // Identify the orphan by (pid, starttime), not pid alone. Under load the
+        // kernel can recycle the number onto the respawned bot or an unrelated
+        // process — `process_alive(orphan_pid)` would then spuriously fail the
+        // test even though the original orphan is gone.
+        let mut orphan_gone = false;
+        for _ in 0..100 {
+            let same_process =
+                process_alive(orphan_pid) && process_starttime(orphan_pid) == orphan_start;
+            if !same_process {
+                orphan_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
+        assert!(
+            orphan_gone,
+            "orphan pid {orphan_pid} still running with original starttime after restore"
+        );
         drop(rt);
         let _ = std::fs::remove_dir_all(root);
     }
