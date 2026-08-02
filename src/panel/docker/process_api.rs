@@ -1354,16 +1354,29 @@ mod tests {
         persist_record(&state, &record).unwrap();
 
         let rt = ProcessRuntime::new(sleep_bin, &bots).unwrap();
-        assert!(
-            !process_alive(orphan_pid),
-            "orphan from the previous panel must be terminated on restore"
-        );
-        let new_pid = {
+        let (new_pid, new_start) = {
             let inner = rt.inner.lock().unwrap();
-            inner["stitch-bot-a"].record.pid
+            let live = &inner["stitch-bot-a"];
+            (live.record.pid, live.record.pid_starttime)
         };
-        assert!(new_pid.is_some());
-        assert_ne!(new_pid, Some(orphan_pid));
+        assert!(
+            new_pid.is_some(),
+            "wanted bot must be respawned after orphan kill"
+        );
+        // Don't assert `!process_alive(orphan_pid)` alone: under load the OS can
+        // recycle that pid onto the respawned bot, which is still a successful
+        // kill+spawn. Prove the orphan is gone via pid or starttime.
+        if new_pid == Some(orphan_pid) {
+            assert_ne!(
+                new_start, orphan_start,
+                "respawn reused orphan pid; starttime must show a new process"
+            );
+        } else {
+            assert!(
+                !process_alive(orphan_pid),
+                "orphan from the previous panel must be terminated on restore"
+            );
+        }
         drop(rt);
         let _ = std::fs::remove_dir_all(root);
     }
