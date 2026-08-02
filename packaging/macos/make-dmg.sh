@@ -49,8 +49,22 @@ SIZE_MB=$(( $(du -sm "$STAGE" | cut -f1) + 50 ))
 hdiutil create -srcfolder "$STAGE" -volname "$VOL" -fs HFS+ \
   -format UDRW -size "${SIZE_MB}m" -ov "$TMP_DMG" >/dev/null
 
-DEV="$(hdiutil attach -readwrite -noverify -noautoopen "$TMP_DMG" \
-  | awk '/Apple_HFS/ {print $1; exit}')"
+# Capture device + mount point from this attach. If another volume already uses
+# the volname, macOS mounts us at "/Volumes/Stitch 1" (etc.); Finder "disk Stitch"
+# and a hardcoded /Volumes/$VOL path would then target the wrong volume.
+ATTACH_OUT="$(hdiutil attach -readwrite -noverify -noautoopen "$TMP_DMG")"
+DEV="$(printf '%s\n' "$ATTACH_OUT" | awk '/Apple_HFS/ {print $1; exit}')"
+# Mount path is everything from /Volumes/… (may contain spaces).
+MNT="$(printf '%s\n' "$ATTACH_OUT" | awk '/Apple_HFS/ {
+  match($0, /\/Volumes\/.*/); if (RSTART) print substr($0, RSTART, RLENGTH); exit
+}')"
+[ -n "$DEV" ] && [ -n "$MNT" ] && [ -d "$MNT" ] || {
+  echo "error: failed to attach $TMP_DMG (dev='$DEV' mnt='$MNT')" >&2
+  printf '%s\n' "$ATTACH_OUT" >&2
+  exit 1
+}
+# Finder disk name matches the mount folder (e.g. "Stitch" or "Stitch 1").
+DISK_NAME="$(basename "$MNT")"
 # Let the volume settle before scripting Finder.
 sleep 2
 
@@ -59,7 +73,7 @@ sleep 2
 # still works — it just lacks the custom positions/arrow.
 osascript <<OSA || echo "warning: Finder layout failed; shipping a plain drag-to-Applications image" >&2
 tell application "Finder"
-  tell disk "$VOL"
+  tell disk "$DISK_NAME"
     open
     set current view of container window to icon view
     set toolbar visible of container window to false
@@ -85,11 +99,12 @@ sync
 # Finder often keeps the volume busy for a few seconds after layout (Spotlight /
 # .DS_Store / the container window). A single detach or even -force can fail with
 # "Resource busy" (hdiutil exit 16) on CI runners. Close the window, ask Finder to
-# eject, then retry detach with backoff before converting.
+# eject *this* mount, then retry detach with backoff before converting.
 is_detached() {
   local target="$1"
+  local mount="$2"
   # Mount point gone and device no longer listed → already ejected (e.g. via Finder).
-  if [ ! -d "/Volumes/$VOL" ] && ! hdiutil info 2>/dev/null | grep -q "$target"; then
+  if [ ! -d "$mount" ] && ! hdiutil info 2>/dev/null | grep -Fq "$target"; then
     return 0
   fi
   return 1
@@ -97,19 +112,21 @@ is_detached() {
 
 detach_dmg() {
   local target="$1"
+  local mount="$2"
+  local disk_name="$3"
   local attempt
-  # Best-effort: drop Finder's hold before hdiutil fights it.
+  # Best-effort: drop Finder's hold on this mount before hdiutil fights it.
   osascript <<OSA >/dev/null 2>&1 || true
 tell application "Finder"
   try
-    close every window of disk "$VOL"
+    close every window of disk "$disk_name"
   end try
   try
-    eject disk "$VOL"
+    eject disk "$disk_name"
   end try
 end tell
 OSA
-  if is_detached "$target"; then
+  if is_detached "$target" "$mount"; then
     return 0
   fi
   for attempt in 1 2 3 4 5 6 7 8; do
@@ -119,21 +136,21 @@ OSA
     if hdiutil detach "$target" -force >/dev/null 2>&1; then
       return 0
     fi
-    # Also try the mount point — device node vs path can disagree after eject.
-    if [ -d "/Volumes/$VOL" ] && hdiutil detach "/Volumes/$VOL" -force >/dev/null 2>&1; then
+    # Device node vs path can disagree after a partial eject — only this mount.
+    if [ -d "$mount" ] && hdiutil detach "$mount" -force >/dev/null 2>&1; then
       return 0
     fi
-    if is_detached "$target"; then
+    if is_detached "$target" "$mount"; then
       return 0
     fi
     sleep "$attempt"
   done
-  echo "error: could not detach $target (/Volumes/$VOL) after retries" >&2
+  echo "error: could not detach $target ($mount) after retries" >&2
   hdiutil info >&2 || true
   return 1
 }
 
-detach_dmg "$DEV"
+detach_dmg "$DEV" "$MNT" "$DISK_NAME"
 hdiutil convert "$TMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
 
 # Ad-hoc ("-") DMGs aren't worth signing (nothing verifies them); sign only with
