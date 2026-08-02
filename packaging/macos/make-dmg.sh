@@ -81,7 +81,59 @@ end tell
 OSA
 
 sync
-hdiutil detach "$DEV" >/dev/null 2>&1 || hdiutil detach "$DEV" -force >/dev/null
+
+# Finder often keeps the volume busy for a few seconds after layout (Spotlight /
+# .DS_Store / the container window). A single detach or even -force can fail with
+# "Resource busy" (hdiutil exit 16) on CI runners. Close the window, ask Finder to
+# eject, then retry detach with backoff before converting.
+is_detached() {
+  local target="$1"
+  # Mount point gone and device no longer listed → already ejected (e.g. via Finder).
+  if [ ! -d "/Volumes/$VOL" ] && ! hdiutil info 2>/dev/null | grep -q "$target"; then
+    return 0
+  fi
+  return 1
+}
+
+detach_dmg() {
+  local target="$1"
+  local attempt
+  # Best-effort: drop Finder's hold before hdiutil fights it.
+  osascript <<OSA >/dev/null 2>&1 || true
+tell application "Finder"
+  try
+    close every window of disk "$VOL"
+  end try
+  try
+    eject disk "$VOL"
+  end try
+end tell
+OSA
+  if is_detached "$target"; then
+    return 0
+  fi
+  for attempt in 1 2 3 4 5 6 7 8; do
+    if hdiutil detach "$target" >/dev/null 2>&1; then
+      return 0
+    fi
+    if hdiutil detach "$target" -force >/dev/null 2>&1; then
+      return 0
+    fi
+    # Also try the mount point — device node vs path can disagree after eject.
+    if [ -d "/Volumes/$VOL" ] && hdiutil detach "/Volumes/$VOL" -force >/dev/null 2>&1; then
+      return 0
+    fi
+    if is_detached "$target"; then
+      return 0
+    fi
+    sleep "$attempt"
+  done
+  echo "error: could not detach $target (/Volumes/$VOL) after retries" >&2
+  hdiutil info >&2 || true
+  return 1
+}
+
+detach_dmg "$DEV"
 hdiutil convert "$TMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
 
 # Ad-hoc ("-") DMGs aren't worth signing (nothing verifies them); sign only with
