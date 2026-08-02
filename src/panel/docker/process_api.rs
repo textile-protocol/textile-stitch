@@ -174,10 +174,11 @@ impl ProcessRuntime {
             Ok(e) => e,
             Err(_) => return Ok(()),
         };
-        // Collect first so orphan stops can run concurrently. Sequential waits
-        // would be N × STOP_GRACE_SECS on a multi-bot restore.
+        // Phase 1: parse every record before mutating any of them. If a later
+        // file is corrupt, `?` must not leave earlier bots with their pid wiped
+        // from disk while the orphan is still running (no ownership left to
+        // reclaim on the next start → duplicate market makers).
         let mut pending: Vec<(String, LiveBot, bool)> = Vec::new();
-        let mut orphans: Vec<(u32, Option<u64>)> = Vec::new();
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -190,28 +191,32 @@ impl ProcessRuntime {
             let name = record.name.clone();
             let log_path = self.log_path_for(&name);
             let wanted = record.wanted_up && record.restart_unless_stopped;
-            let mut live = LiveBot {
-                record,
-                child: None,
-                log_path,
-                restart_after: None,
-                restart_failures: 0,
-            };
-            // Only signal the pid when it still looks like our stitch binary
-            // (and, on Linux, the starttime matches) so a recycled PID is never
-            // killed. Clear the persisted pid before waiting so a crash mid-
-            // restore doesn't leave a stale claim.
+            pending.push((
+                name,
+                LiveBot {
+                    record,
+                    child: None,
+                    log_path,
+                    restart_after: None,
+                    restart_failures: 0,
+                },
+                wanted,
+            ));
+        }
+
+        // Phase 2: claim orphans (clear persisted pid) then stop them. Only
+        // signal when the pid still looks like our stitch binary (and, on
+        // Linux, the starttime matches) so a recycled PID is never killed.
+        // Full STOP_GRACE_SECS so a mid-tick bot can finish after SIGTERM;
+        // parallelize so fleet size doesn't multiply cold-start latency.
+        let mut orphans: Vec<(u32, Option<u64>)> = Vec::new();
+        for (_, live, _) in &mut pending {
             if let Some(pid) = live.record.pid.take() {
                 let starttime = live.record.pid_starttime.take();
                 orphans.push((pid, starttime));
                 let _ = persist_record(&self.state_dir, &live.record);
             }
-            pending.push((name, live, wanted));
         }
-
-        // Full STOP_GRACE_SECS so a mid-tick bot can finish after SIGTERM —
-        // a 2s grace would SIGKILL during that window. Parallelize so fleet
-        // size doesn't multiply cold-start latency.
         let stitch_bin = &self.stitch_bin;
         std::thread::scope(|scope| {
             for (pid, starttime) in orphans {
@@ -1510,6 +1515,81 @@ mod tests {
             );
         }
         drop(rt);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_persisted_keeps_pids_when_a_later_record_is_corrupt() {
+        // Regression: clearing pid from early records before a later parse
+        // failure left orphans running with no ownership on disk.
+        let root = temp_root("corrupt-record");
+        let bots = root.join("bots");
+        let state = bots.join(".process-runtime");
+        std::fs::create_dir_all(&state).unwrap();
+        let host = bots.join("bot-a");
+        std::fs::create_dir_all(&host).unwrap();
+
+        let stitch_bin = root.join("stitch");
+        std::fs::copy(which_sleep(), &stitch_bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stitch_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stitch_bin, perms).unwrap();
+        }
+
+        let orphan = Command::new(&stitch_bin)
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let orphan_pid = orphan.id();
+        let orphan_start = wait_process_starttime(orphan_pid);
+        std::mem::forget(orphan);
+
+        let good = PersistedBot {
+            id: "proc-stitch-bot-a".into(),
+            name: "stitch-bot-a".into(),
+            image: BUNDLED_IMAGE.into(),
+            labels: HashMap::new(),
+            env: vec![],
+            binds: vec![PersistedBind::from(&BindSpec::rw(&host, RUN_DIR))],
+            cmd: Some(vec!["60".into()]),
+            restart_unless_stopped: true,
+            wanted_up: true,
+            created_unix: now_unix(),
+            pid: Some(orphan_pid),
+            pid_starttime: orphan_start,
+        };
+        persist_record(&state, &good).unwrap();
+        // Lexically after stitch-bot-a.json so parse reaches the good record first.
+        std::fs::write(state.join("stitch-bot-z-corrupt.json"), "{not-json").unwrap();
+
+        match ProcessRuntime::new(stitch_bin, &bots) {
+            Ok(_) => panic!("expected parse failure from corrupt sibling record"),
+            Err(err) => assert!(
+                format!("{err:#}").contains("parsing"),
+                "expected parse failure, got: {err:#}"
+            ),
+        }
+
+        let on_disk: PersistedBot = serde_json::from_str(
+            &std::fs::read_to_string(state.join("stitch-bot-a.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk.pid,
+            Some(orphan_pid),
+            "good record pid must survive a later corrupt sibling"
+        );
+        assert_eq!(on_disk.pid_starttime, orphan_start);
+        assert!(
+            process_alive(orphan_pid),
+            "orphan must still be running so ownership can be reclaimed"
+        );
+        terminate_pid(orphan_pid, 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
