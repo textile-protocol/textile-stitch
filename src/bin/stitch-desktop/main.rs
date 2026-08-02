@@ -251,12 +251,15 @@ fn run() -> Result<()> {
             Event::NewEvents(StartCause::Init) => {
                 if tray.is_none() {
                     let icon = tray_icon_from_embedded().unwrap_or_else(fallback_icon);
-                    match TrayIconBuilder::new()
+                    let tray_builder = TrayIconBuilder::new()
                         .with_menu(Box::new(menu.clone()))
                         .with_tooltip("Stitch")
-                        .with_icon(icon)
-                        .build()
-                    {
+                        .with_icon(icon);
+                    // macOS menu bar: template image so the system tints the
+                    // monochrome grandma for light/dark menu bar chrome.
+                    #[cfg(target_os = "macos")]
+                    let tray_builder = tray_builder.with_icon_as_template(true);
+                    match tray_builder.build() {
                         Ok(t) => tray = Some(t),
                         Err(e) => {
                             eprintln!("stitch-desktop: creating menu bar icon failed: {e:#}");
@@ -625,18 +628,16 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 }
 
 fn tray_icon_from_embedded() -> Option<Icon> {
-    // 32×32 RGBA teal square — light, no asset pipeline.
-    let size = 32u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    for px in rgba.chunks_exact_mut(4) {
-        px[0] = 0x14;
-        px[1] = 0xb8;
-        px[2] = 0xa6;
-        px[3] = 0xff;
+    // Monochrome geometric grandma (32×32 premultiplied-ready RGBA, black + alpha).
+    // Built as a menu-bar / tray template: macOS tints it; Windows/Linux show black.
+    const SIZE: u32 = 32;
+    const RGBA: &[u8] = include_bytes!("../../../assets/grandma-tray-32.rgba");
+    if RGBA.len() != (SIZE * SIZE * 4) as usize {
+        return None;
     }
-    Icon::from_rgba(rgba, size, size).ok()
+    Icon::from_rgba(RGBA.to_vec(), SIZE, SIZE).ok()
 }
 
 fn fallback_icon() -> Icon {
-    tray_icon_from_embedded().expect("fallback icon")
+    tray_icon_from_embedded().expect("grandma tray icon")
 }
