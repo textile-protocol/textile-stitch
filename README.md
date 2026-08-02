@@ -94,7 +94,7 @@ Everything else — custom reverse proxy, building from source — is in
 
 - [Install with an AI agent](#install-with-an-ai-agent) — your coding agent
   installs the panel; you finish bot setup in the web UI.
-- [Docker](docs/install-docker.md) — the bot image on its own, without Stitch.
+- [Docker](docs/install-docker.md) — the Stitch on its own, without Stitch panel.
 - [Stitch (web)](docs/install-panel.md) — the advanced and manual routes for
   Option 2 above.
 - [Desktop app (menu bar / tray)](docs/install-desktop.md) — Option 1 in detail.
