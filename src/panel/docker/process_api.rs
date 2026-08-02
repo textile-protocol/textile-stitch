@@ -39,6 +39,11 @@ const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Must not depend on UI/API polls — desktop `--autostart` has no browser traffic.
 const SUPERVISOR_TICK: Duration = Duration::from_secs(2);
 
+/// Grace period when killing a persisted orphan on panel restore. Keep this short:
+/// the previous panel is already gone, and blocking startup for [`STOP_GRACE_SECS`]
+/// per orphan makes cold start feel broken. SIGKILL follows if needed.
+const ORPHAN_STOP_GRACE_SECS: i64 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedBot {
     id: String,
@@ -200,7 +205,7 @@ impl ProcessRuntime {
             // the starttime matches) so a recycled PID is never killed.
             if let Some(pid) = live.record.pid.take() {
                 let starttime = live.record.pid_starttime.take();
-                terminate_managed_pid(pid, starttime, &self.stitch_bin, STOP_GRACE_SECS);
+                terminate_managed_pid(pid, starttime, &self.stitch_bin, ORPHAN_STOP_GRACE_SECS);
                 // If graceful stop didn't land (stuck child, ignored SIGTERM),
                 // don't leave the orphan running beside the respawn.
                 if pid_is_our_stitch(pid, starttime, &self.stitch_bin) {
@@ -546,7 +551,8 @@ fn spawn_bot(stitch_bin: &Path, state_dir: &Path, live: &mut LiveBot) -> Result<
         .with_context(|| format!("spawning {} for {}", stitch_bin.display(), live.record.name))?;
     let pid = child.id();
     live.record.pid = Some(pid);
-    live.record.pid_starttime = process_starttime(pid);
+    // execve can race spawn(); retry so we persist a stable starttime.
+    live.record.pid_starttime = wait_process_starttime(pid);
     live.child = Some(child);
     live.record.wanted_up = true;
     live.restart_after = None;
@@ -665,6 +671,21 @@ fn pid_kill0_exists(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Poll briefly for [`process_starttime`] after spawn — right after `execve` the
+/// `/proc` entry can briefly be missing under load.
+fn wait_process_starttime(pid: u32) -> Option<u64> {
+    for _ in 0..50 {
+        if let Some(start) = process_starttime(pid) {
+            return Some(start);
+        }
+        if !process_alive(pid) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    process_starttime(pid)
+}
+
 /// Linux starttime from `/proc/<pid>/stat` (field 22), used as a pid-reuse guard.
 fn process_starttime(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -683,8 +704,14 @@ fn process_starttime(pid: u32) -> Option<u64> {
     }
 }
 
-/// True when `pid` still looks like a stitch bot we spawned: exe/cmdline match
-/// `stitch_bin`, and on Linux the persisted starttime still matches.
+/// True when `pid` still looks like a stitch bot we spawned.
+///
+/// On Linux, a matching persisted `starttime` is sufficient: that pair is what
+/// we wrote at spawn, so it is the pid-reuse guard. Requiring exe/cmdline as
+/// well caused restore to skip kills under CI load when `/proc/<pid>/exe` was
+/// briefly unreadable, leaving the orphan running beside the respawn.
+/// Exe/cmdline checks apply when starttime was never recorded (non-Linux or
+/// older state files).
 fn pid_is_our_stitch(pid: u32, starttime: Option<u64>, stitch_bin: &Path) -> bool {
     if !process_alive(pid) {
         return false;
@@ -692,10 +719,7 @@ fn pid_is_our_stitch(pid: u32, starttime: Option<u64>, stitch_bin: &Path) -> boo
     #[cfg(target_os = "linux")]
     {
         if let Some(expected) = starttime {
-            match process_starttime(pid) {
-                Some(actual) if actual == expected => {}
-                _ => return false,
-            }
+            return matches!(process_starttime(pid), Some(actual) if actual == expected);
         }
         let want_name = stitch_bin.file_name();
         if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
@@ -784,40 +808,50 @@ fn terminate_managed_pid(pid: u32, starttime: Option<u64>, stitch_bin: &Path, gr
 }
 
 fn terminate_pid(pid: u32, grace_secs: i64) {
-    if !process_alive(pid) {
-        return;
-    }
     #[cfg(unix)]
     {
         let Ok(pid_i) = i32::try_from(pid) else {
             return;
         };
-        // libc::kill — same path as setup::terminate. Shelling out to kill(1)
-        // can fail silently (PATH / wrapper) and leave orphans running.
-        if grace_secs > 0 {
-            // SAFETY: pid came from a process we spawned or persisted; signal is SIGTERM.
-            unsafe {
-                libc::kill(pid_i, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + Duration::from_secs(grace_secs as u64);
-            while Instant::now() < deadline {
-                if !process_alive(pid) {
-                    return;
+        if process_alive(pid) {
+            // libc::kill — same path as setup::terminate. Shelling out to kill(1)
+            // can fail silently (PATH / wrapper) and leave orphans running.
+            if grace_secs > 0 {
+                // SAFETY: pid came from a process we spawned or persisted; signal is SIGTERM.
+                unsafe {
+                    libc::kill(pid_i, libc::SIGTERM);
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let deadline = Instant::now() + Duration::from_secs(grace_secs as u64);
+                while Instant::now() < deadline {
+                    if !process_alive(pid) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            if process_alive(pid) {
+                // SAFETY: last-resort SIGKILL for a pid that survived SIGTERM (or grace 0).
+                unsafe {
+                    libc::kill(pid_i, libc::SIGKILL);
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline && process_alive(pid) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
-        // SAFETY: last-resort SIGKILL for a pid that survived SIGTERM (or grace 0).
+        // If this pid is still our child (e.g. test `mem::forget` orphans), reap
+        // the zombie so later (pid, starttime) probes don't see a leftover entry.
+        // SAFETY: WNOHANG waitpid on a concrete pid; ECHILD/ESRCH are ignored.
         unsafe {
-            libc::kill(pid_i, libc::SIGKILL);
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && process_alive(pid) {
-            std::thread::sleep(Duration::from_millis(50));
+            libc::waitpid(pid_i, std::ptr::null_mut(), libc::WNOHANG);
         }
     }
     #[cfg(windows)]
     {
+        if !process_alive(pid) {
+            return;
+        }
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
@@ -1382,16 +1416,24 @@ mod tests {
             .spawn()
             .unwrap();
         let orphan_pid = orphan.id();
-        let orphan_start = process_starttime(orphan_pid);
+        // Spawn returns before execve finishes; poll until /proc identity is stable.
+        let orphan_start = wait_process_starttime(orphan_pid);
+        let mut identity_ok = false;
+        for _ in 0..50 {
+            if pid_is_our_stitch(orphan_pid, orphan_start, &stitch_bin) {
+                identity_ok = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             process_alive(orphan_pid),
             "precondition: orphan must be running"
         );
-        // Identity must accept this orphan before we forget the Child — otherwise
-        // restore would skip the kill and the assertion below is meaningless.
         assert!(
-            pid_is_our_stitch(orphan_pid, orphan_start, &stitch_bin),
-            "precondition: orphan must match stitch identity checks"
+            identity_ok,
+            "precondition: orphan must match stitch identity checks \
+             (pid={orphan_pid}, starttime={orphan_start:?})"
         );
         std::mem::forget(orphan);
         let record = PersistedBot {
@@ -1642,14 +1684,40 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = orphan.id();
-        let start = process_starttime(pid);
         std::mem::forget(orphan);
-        // Claim this sleep pid belongs to `true` — identity check must refuse.
-        terminate_managed_pid(pid, start, &true_bin, 2);
+        // No starttime + wrong binary name → must refuse (pid-reuse safe path).
+        terminate_managed_pid(pid, None, &true_bin, 2);
         assert!(
             process_alive(pid),
             "must not kill a live process that isn't our stitch binary"
         );
         terminate_pid(pid, 2); // cleanup
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_starttime_is_enough_to_own_a_pid() {
+        // Regression: restore used to also require /proc/exe to match, and skipped
+        // the kill when that read flaked under parallel CI.
+        let sleep_bin = which_sleep();
+        let orphan = Command::new(&sleep_bin)
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = orphan.id();
+        let start = wait_process_starttime(pid);
+        std::mem::forget(orphan);
+        let unrelated = PathBuf::from("/nonexistent/stitch-not-this-path");
+        assert!(
+            start.is_some() && pid_is_our_stitch(pid, start, &unrelated),
+            "starttime match alone must identify the persisted orphan"
+        );
+        terminate_managed_pid(pid, start, &unrelated, 2);
+        assert!(
+            !process_alive(pid),
+            "matching starttime must be enough to terminate on restore"
+        );
     }
 }
