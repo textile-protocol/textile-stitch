@@ -50,8 +50,10 @@ hdiutil create -srcfolder "$STAGE" -volname "$VOL" -fs HFS+ \
   -format UDRW -size "${SIZE_MB}m" -ov "$TMP_DMG" >/dev/null
 
 # Capture device + mount point from this attach. If another volume already uses
-# the volname, macOS mounts us at "/Volumes/Stitch 1" (etc.); Finder "disk Stitch"
-# and a hardcoded /Volumes/$VOL path would then target the wrong volume.
+# the volname, macOS mounts us at "/Volumes/Stitch 1" (etc.) while the HFS
+# volume name — and Finder's `disk` name — stay "Stitch". Never key Finder off
+# basename(mount) ("Stitch 1") or bare `disk "Stitch"` (ambiguous); always use
+# the POSIX mount path from this attach.
 ATTACH_OUT="$(hdiutil attach -readwrite -noverify -noautoopen "$TMP_DMG")"
 DEV="$(printf '%s\n' "$ATTACH_OUT" | awk '/Apple_HFS/ {print $1; exit}')"
 # Mount path is everything from /Volumes/… (may contain spaces).
@@ -63,8 +65,11 @@ MNT="$(printf '%s\n' "$ATTACH_OUT" | awk '/Apple_HFS/ {
   printf '%s\n' "$ATTACH_OUT" >&2
   exit 1
 }
-# Finder disk name matches the mount folder (e.g. "Stitch" or "Stitch 1").
-DISK_NAME="$(basename "$MNT")"
+# Escape for AppleScript double-quoted strings.
+as_quote() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+MNT_AS="$(as_quote "$MNT")"
 # Let the volume settle before scripting Finder.
 sleep 2
 
@@ -72,25 +77,25 @@ sleep 2
 # automation is available on the macOS CI runners; if it ever isn't, the image
 # still works — it just lacks the custom positions/arrow.
 osascript <<OSA || echo "warning: Finder layout failed; shipping a plain drag-to-Applications image" >&2
+set mntAlias to POSIX file "$MNT_AS" as alias
 tell application "Finder"
-  tell disk "$DISK_NAME"
-    open
-    set current view of container window to icon view
-    set toolbar visible of container window to false
-    set statusbar visible of container window to false
-    set the bounds of container window to {200, 120, 800, 520}
-    set theViewOptions to the icon view options of container window
-    set arrangement of theViewOptions to not arranged
-    set icon size of theViewOptions to 120
-    try
-      set background picture of theViewOptions to file ".background:background.png"
-    end try
-    set position of item "Stitch.app" of container window to {150, 205}
-    set position of item "Applications" of container window to {455, 205}
-    update without registering applications
-    delay 1
-    close
-  end tell
+  open mntAlias
+  set win to container window of mntAlias
+  set current view of win to icon view
+  set toolbar visible of win to false
+  set statusbar visible of win to false
+  set the bounds of win to {200, 120, 800, 520}
+  set theViewOptions to the icon view options of win
+  set arrangement of theViewOptions to not arranged
+  set icon size of theViewOptions to 120
+  try
+    set background picture of theViewOptions to file ".background:background.png" of mntAlias
+  end try
+  set position of item "Stitch.app" of win to {150, 205}
+  set position of item "Applications" of win to {455, 205}
+  update without registering applications
+  delay 1
+  close win
 end tell
 OSA
 
@@ -98,8 +103,8 @@ sync
 
 # Finder often keeps the volume busy for a few seconds after layout (Spotlight /
 # .DS_Store / the container window). A single detach or even -force can fail with
-# "Resource busy" (hdiutil exit 16) on CI runners. Close the window, ask Finder to
-# eject *this* mount, then retry detach with backoff before converting.
+# "Resource busy" (hdiutil exit 16) on CI runners. Close/eject *this* mount via
+# its POSIX path, then retry detach with backoff before converting.
 is_detached() {
   local target="$1"
   local mount="$2"
@@ -113,16 +118,17 @@ is_detached() {
 detach_dmg() {
   local target="$1"
   local mount="$2"
-  local disk_name="$3"
+  local mount_as="$3"
   local attempt
   # Best-effort: drop Finder's hold on this mount before hdiutil fights it.
   osascript <<OSA >/dev/null 2>&1 || true
+set mntAlias to POSIX file "$mount_as" as alias
 tell application "Finder"
   try
-    close every window of disk "$disk_name"
+    close (every window whose target is mntAlias)
   end try
   try
-    eject disk "$disk_name"
+    eject mntAlias
   end try
 end tell
 OSA
@@ -150,7 +156,7 @@ OSA
   return 1
 }
 
-detach_dmg "$DEV" "$MNT" "$DISK_NAME"
+detach_dmg "$DEV" "$MNT" "$MNT_AS"
 hdiutil convert "$TMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
 
 # Ad-hoc ("-") DMGs aren't worth signing (nothing verifies them); sign only with
