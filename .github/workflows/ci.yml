@@ -72,5 +72,7 @@ jobs:
       - name: Run panel tests
         run: cargo test --features panel
 
-      - name: Build the panel binary
-        run: cargo build --release --features panel --bin stitch-panel
+      - name: Build the panel and desktop binaries
+        run: |
+          cargo build --release --features panel,desktop \
+            --bin stitch-panel --bin stitch-desktop

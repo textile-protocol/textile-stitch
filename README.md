@@ -29,35 +29,36 @@ second:
 
 ## Quick Start
 
-Two paths. Pick one:
+Two recommended paths — pick by need:
 
-1. **[Desktop app](#option-1--desktop-app)** — one machine, a window you watch.
-   No terminal.
-2. **[Docker with Stitch](#option-2--docker-with-stitch)** — a
-   server, or several bots. One command, then a web UI.
+1. **[Desktop app](#option-1--desktop-app)** — menu bar / system tray on your
+   computer. No Docker, no terminal. Opens the Stitch panel in your browser.
+2. **[Server / Docker](#option-2--server--docker)** — always-on host or Tailscale
+   access from other devices. One command, then the same web UI.
 
 ### Option 1 — Desktop app
 
-No terminal needed. [Download the release for your OS](https://github.com/textile-protocol/textile-stitch/releases) and open the Stitch app:
+No Docker and no terminal. [Download the release for your OS](https://github.com/textile-protocol/textile-stitch/releases) and open Stitch:
 
-- **macOS**: download `Stitch.dmg` from the release, open it, and drag Stitch
-  into Applications. Launch it from Applications so it runs from a stable path
-  (this also avoids Gatekeeper's App Translocation). The image is Developer
-  ID-signed and Apple-notarized, so it opens without a Gatekeeper prompt. You can
-  also run the `stitch-setup` binary from a terminal.
-- **Windows**: double-click `stitch-setup.exe`.
-- **Linux**: run `stitch-setup` (or use the bundled `stitch.desktop` entry).
+- **macOS**: download `Stitch.dmg`, open it, drag Stitch into Applications, and
+  launch it from there. It appears in the menu bar, starts the local panel
+  (process runtime), and opens `http://127.0.0.1:8420`. Copy the panel password
+  from the menu if you need it again.
+- **Windows**: unzip the release and double-click `stitch-desktop.exe`. It sits
+  in the system tray and opens the same local panel.
+- **Linux**: extract and run `stitch-desktop` (or the bundled `stitch.desktop`
+  entry). For a headless server, prefer Option 2.
 
-Pick a corridor, paste your operator wallet key, and click Create. The same
-window then runs the bot: Start/Stop, a dry-run toggle, a Permit2 "Approve
-tokens" button, live logs, and an Update button. Closing the window stops the
-bot; for unattended 24/7 running, use Option 2 below or install it as a service
-(see the [manual guides](#other-ways-to-install)).
+In the browser: **Add a bot**, pick a corridor, paste your operator wallet key,
+approve allowances, dry-run, then Start. Use **Start at login** in the menu /
+tray if you want the panel (and any bots left running) to come back after a
+reboot — login starts stay in the tray and skip opening a browser tab. Quit
+Stitch from the menu / tray to stop the panel. For unattended 24/7 quoting on a
+server, use Option 2.
 
-### Option 2 — Docker, with Stitch
+### Option 2 — Server / Docker
 
-For a server, a laptop with Docker, or more than one bot. One command on any
-Docker host:
+For a server or any Docker host that should stay up. One command:
 
 ```bash
 # macOS / Linux — prefer a release tag + checksum (see docs/install-panel.md). Quick path:
@@ -97,6 +98,7 @@ Everything else — custom reverse proxy, building from source — is in
 - [Docker](docs/install-docker.md) — the bot image on its own, without Stitch.
 - [Stitch (web)](docs/install-panel.md) — the advanced and manual routes for
   Option 2 above.
+- [Desktop app (menu bar / tray)](docs/install-desktop.md) — Option 1 in detail.
 - [Manual install — macOS](docs/install-macos.md)
 - [Manual install — Windows](docs/install-windows.md)
 - [Manual install — Linux](docs/install-linux.md) — includes the systemd service setup.
@@ -166,11 +168,11 @@ Secrets always come from the environment, never the config file, and each has a
 `_FILE` variant (a path) that takes precedence over the raw value, the same as
 `STITCH_PRIVATE_KEY_FILE` vs `STITCH_PRIVATE_KEY`.
 
-The desktop app writes all of this for you: the `stitch-setup` first-run wizard
-and its Settings screen have a **Signer** dropdown (hot wallet / Turnkey /
-MPCVault) that collects the fields below, drops the secret in an owner-only file,
-and points `stitch.env` at it. The manual `[signer]` fields below are for CLI and
-server operators editing `stitch.toml` by hand.
+The desktop / panel UI writes all of this for you: Add a bot and Settings have a
+**Signer** dropdown (hot wallet / Turnkey / MPCVault) that collects the fields
+below, drops the secret in an owner-only file, and points `stitch.env` at it. The
+manual `[signer]` fields below are for CLI and server operators editing
+`stitch.toml` by hand.
 
 - **Local hotwallet** (default): omit `[signer]`, or set `provider = "local"`.
   Uses `STITCH_PRIVATE_KEY` / `STITCH_PRIVATE_KEY_FILE`.

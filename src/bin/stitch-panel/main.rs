@@ -2,22 +2,24 @@
 // Copyright (c) 2026 Textile, Inc.
 //! `stitch-panel` — the process behind the Stitch web UI.
 //!
-//! One process per Docker host. It manages bots by writing config files and
-//! driving the Docker Engine API; there is no database, because the container list
-//! plus the config directories already are the state.
+//! One process per host. It manages bots by writing config files and driving
+//! either the Docker Engine API or local `stitch` child processes
+//! (`STITCH_PANEL_RUNTIME=process`); there is no database, because the
+//! container/process list plus the config directories already are the state.
 //!
-//! Reaching this panel means reaching the Docker socket, which means owning the
-//! host. It binds to loopback by default, refuses to start on a routable address
-//! without an explicit override, and requires a credential on every API route. See
+//! Reaching a Docker-backed panel means reaching the Docker socket. The desktop
+//! process runtime has no socket — it only supervises local bots. Either way the
+//! panel binds to loopback by default, refuses a routable address without an
+//! explicit override, and requires a credential on every API route. See
 //! [`stitch_bot::panel::config`] for the environment it reads.
 
 use std::io::IsTerminal;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use stitch_bot::panel::docker::BollardDocker;
+use stitch_bot::panel::docker::{BollardDocker, ProcessRuntime};
 use stitch_bot::panel::http::{router, AppState};
-use stitch_bot::panel::{auth, AuthMode, PanelConfig};
+use stitch_bot::panel::{auth, AuthMode, PanelConfig, PanelRuntime};
 
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
@@ -49,11 +51,13 @@ USAGE:
 
 The panel is configured entirely from the environment:
 
+    STITCH_PANEL_RUNTIME            docker (default) or process (desktop, no Docker)
     STITCH_PANEL_BIND               listen address        (default 127.0.0.1:8420)
     STITCH_PANEL_BOTS_DIR           config root as the panel sees it   (/data/bots)
     STITCH_PANEL_HOST_BOTS_DIR      the same root on the Docker host
     STITCH_PANEL_DOCKER_SOCKET      Docker socket         (/var/run/docker.sock)
-    STITCH_PANEL_BOT_IMAGE          image new bots run
+    STITCH_PANEL_STITCH_BIN         path to the stitch binary (process runtime)
+    STITCH_PANEL_BOT_IMAGE          image new bots run (docker runtime)
     STITCH_PANEL_TAILNET_USERS      comma-separated tailnet login allowlist
     STITCH_PANEL_PASSWORD_HASH      argon2 hash for password login
     STITCH_PANEL_ALLOW_INSECURE_BIND=1   permit a routable bind (you own the risk)
@@ -75,7 +79,7 @@ fn hash_password() -> Result<()> {
     let password = read_password()?;
     anyhow::ensure!(
         password.chars().count() >= 12,
-        "use at least 12 characters: this password guards the Docker socket"
+        "use at least 12 characters: this password guards the panel (and the Docker socket when using the docker runtime)"
     );
     println!("{}", auth::hash_password(&password)?);
     // Tip is for humans at a terminal. install-panel.sh pipes on stdin and
@@ -132,25 +136,43 @@ fn serve() -> Result<()> {
 }
 
 async fn run(cfg: PanelConfig) -> Result<()> {
-    let docker = Arc::new(BollardDocker::connect(&cfg.docker_socket)?);
-    // Fail at startup rather than on the operator's first click: a panel that can't
-    // reach the daemon can't do anything useful, and the cause is almost always a
-    // missing socket mount.
-    docker.ping().await.with_context(|| {
-        format!(
-            "couldn't talk to the Docker daemon at {}. Mount the socket into the panel \
-             container (-v /var/run/docker.sock:/var/run/docker.sock) or point \
-             STITCH_PANEL_DOCKER_SOCKET at the right path.",
-            cfg.docker_socket.display()
-        )
-    })?;
-
     std::fs::create_dir_all(&cfg.bots_dir)
         .with_context(|| format!("creating the bots root at {}", cfg.bots_dir.display()))?;
 
     let bind = cfg.bind;
+    let runtime = cfg.runtime;
     let auth_summary = describe_auth(&cfg.auth, cfg.trust_identity_header);
-    let state = AppState::new(cfg, docker.clone()).with_container_files(docker);
+
+    let state = match runtime {
+        PanelRuntime::Docker => {
+            let docker = Arc::new(BollardDocker::connect(&cfg.docker_socket)?);
+            // Fail at startup rather than on the operator's first click: a panel that
+            // can't reach the daemon can't do anything useful, and the cause is almost
+            // always a missing socket mount.
+            docker.ping().await.with_context(|| {
+                format!(
+                    "couldn't talk to the Docker daemon at {}. Mount the socket into the panel \
+                     container (-v /var/run/docker.sock:/var/run/docker.sock) or point \
+                     STITCH_PANEL_DOCKER_SOCKET at the right path.",
+                    cfg.docker_socket.display()
+                )
+            })?;
+            AppState::new(cfg, docker.clone()).with_container_files(docker)
+        }
+        PanelRuntime::Process => {
+            let stitch_bin = ProcessRuntime::find_stitch_binary().with_context(|| {
+                "STITCH_PANEL_RUNTIME=process but no stitch binary was found. Set \
+                 STITCH_PANEL_STITCH_BIN or place `stitch` next to stitch-panel."
+            })?;
+            let docker = Arc::new(ProcessRuntime::new(stitch_bin.clone(), &cfg.bots_dir)?);
+            tracing::info!(
+                stitch_bin = %stitch_bin.display(),
+                "process runtime: supervising local stitch binaries (no Docker)"
+            );
+            AppState::new(cfg, docker)
+        }
+    };
+
     // Report the fleet size once at startup. A panel that comes up seeing zero bots
     // on a host that has some is the signature of a wrong STITCH_PANEL_BOTS_DIR.
     let bots = state.fleet().await.map(|f| f.len()).unwrap_or_default();
@@ -161,6 +183,7 @@ async fn run(cfg: PanelConfig) -> Result<()> {
     tracing::info!(
         %bind,
         bots,
+        runtime = runtime.as_str(),
         auth = %auth_summary,
         "stitch-panel {} is up",
         env!("CARGO_PKG_VERSION")

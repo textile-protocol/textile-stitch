@@ -1,7 +1,7 @@
 @import 'tailwindcss';
 
 /* Textile's design tokens, the same --tx-* values the web app defines and the
-   desktop app ports onto egui in src/bin/stitch-setup/theme.rs. Kept as CSS
+   panel UI tokens. Kept as CSS
    variables rather than hard-coded Tailwind colours so the three surfaces stay
    recognisably one product. */
 :root {

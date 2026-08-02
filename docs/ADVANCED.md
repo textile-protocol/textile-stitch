@@ -322,8 +322,8 @@ over the raw value, exactly like `STITCH_PRIVATE_KEY_FILE` vs
 The operator wallet or vault still needs a little native gas for Permit2
 approvals (`stitch approve`) regardless of the signer.
 
-**Desktop app.** If you use `stitch-setup`, you don't need to edit any of this by
-hand. The first-run wizard and the Settings screen both have a **Signer**
+**Desktop / panel.** If you use `stitch-desktop` or the server panel, you don't
+need to edit any of this by hand. Add a bot and Settings both have a **Signer**
 dropdown (hot wallet / Turnkey / MPCVault) that collects the fields below, writes
 the `[signer]` section, stores each secret in an owner-only file, and points
 `stitch.env` at it. Changing the signer in Settings rewrites all three and
@@ -538,8 +538,8 @@ self-updates.
 
 ### Corridor Catalog
 
-The desktop app (`stitch-setup`) and `stitch init` ship pre-filled configs for
-every supported corridor:
+The panel / desktop app and `stitch init` ship pre-filled configs for every
+supported corridor:
 
 - **cNGN / USDT on BNB Smart Chain** — the NGN stablecoin against USDT on BSC (chain 56).
 - **XAUt / USDT on Ethereum** — Tether Gold against USDT on Ethereum (chain 1).

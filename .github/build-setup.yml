@@ -1,0 +1,17 @@
+# Injected into cargo-dist's build-local-artifacts job via
+# `github-build-setup` in dist-workspace.toml. Runs after checkout so
+# `stitch-panel` embeds the real panel SPA instead of the empty-placeholder page.
+- name: Setup Node
+  uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+  with:
+    node-version: 22
+    cache: npm
+    cache-dependency-path: web/package-lock.json
+
+- name: Build panel frontend
+  working-directory: web
+  shell: bash
+  run: |
+    set -euo pipefail
+    npm ci --no-audit --no-fund
+    npm run build

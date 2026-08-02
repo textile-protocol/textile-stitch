@@ -87,13 +87,16 @@ impl AppState {
     /// state, so there is nothing to cache and no way to serve a stale view.
     pub async fn fleet(&self) -> Result<Fleet, ApiError> {
         let containers = self.docker.list_all().await.map_err(|e| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                format!(
+            let detail = match self.cfg.runtime {
+                crate::panel::PanelRuntime::Docker => format!(
                     "couldn't reach the Docker daemon at {}: {e:#}",
                     self.cfg.docker_socket.display()
                 ),
-            )
+                crate::panel::PanelRuntime::Process => {
+                    format!("couldn't list local bots: {e:#}")
+                }
+            };
+            ApiError::new(StatusCode::BAD_GATEWAY, detail)
         })?;
         Ok(inventory::discover(&containers, &self.cfg))
     }

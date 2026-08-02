@@ -171,13 +171,12 @@ most common thing to get wrong:
 
 ### Desktop app
 
-Open the Stitch setup app (**Stitch.app** on macOS, `stitch-setup.exe` on
-Windows, the `stitch-setup` binary or `stitch.desktop` entry on Linux). Pick
-**Signer → MPCVault** and fill Vault UUID, Client-signer public key, Operator
-address, and API token. Saving writes the `[signer]`
-section, stores the token in an owner-only `mpcvault-api.token`, and points
-`stitch.env` at it. The form shows the EXPERIMENTAL notice and a reminder that the
-sidecar must be running.
+Open the Stitch panel (via **Stitch.app** / `stitch-desktop` on the desktop, or
+your server panel URL). Pick **Signer → MPCVault** and fill Vault UUID,
+Client-signer public key, Operator address, and API token. Saving writes the
+`[signer]` section, stores the token in an owner-only `mpcvault-api.token`, and
+points `stitch.env` at it. The form shows the EXPERIMENTAL notice and a reminder
+that the sidecar must be running.
 
 ### Manual
 

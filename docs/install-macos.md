@@ -1,8 +1,8 @@
 # Manual install — macOS
 
 Run Stitch from a release binary in a terminal. If you'd rather not touch the
-terminal, use the [desktop app](../README.md#option-2--desktop-app) instead — it
-does setup and then runs the bot with Start/Stop, logs, approvals, and updates.
+terminal, use the [desktop app](../README.md#option-1--desktop-app) instead —
+menu bar controller, local panel in the browser, no Docker.
 
 ## 1. Install the binary
 

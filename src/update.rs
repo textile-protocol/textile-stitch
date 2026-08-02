@@ -50,7 +50,7 @@ pub async fn warn_if_outdated() {
     }
 }
 
-/// Public repo the release binaries (both `stitch` and `stitch-setup`) are cut
+/// Public repo the release binaries (`stitch`, `stitch-panel`, `stitch-desktop`) are cut
 /// from. The two ship from one crate version, so a single check covers both.
 const RELEASE_REPO: &str = "textile-protocol/textile-stitch";
 

@@ -1,27 +1,33 @@
 #!/usr/bin/env bash
-# Assemble Stitch.app around a built stitch-setup binary. The bot binary
-# (`stitch`) is bundled alongside it so the GUI can find and supervise it when
-# the app is launched from Finder (where PATH is minimal). By default `stitch`
-# is taken from the same directory as the stitch-setup binary (cargo builds both
-# into the same target dir); override with a third argument.
-# Usage: make-app.sh <path-to-stitch-setup-binary> <output-dir> [path-to-stitch-binary]
+# Assemble Stitch.app around stitch-desktop (menu bar) + stitch-panel + stitch.
+# The tray app starts the local panel (process runtime, no Docker) and opens the
+# browser. Usage:
+#   make-app.sh <path-to-stitch-desktop> <output-dir> [path-to-stitch] [path-to-stitch-panel]
 set -euo pipefail
 BIN="$1"
 OUT="$2"
 STITCH_BIN="${3:-$(dirname "$BIN")/stitch}"
+PANEL_BIN="${4:-$(dirname "$BIN")/stitch-panel}"
 APP="$OUT/Stitch.app"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
-cp "$BIN" "$APP/Contents/MacOS/stitch-setup"
-chmod +x "$APP/Contents/MacOS/stitch-setup"
-if [ -f "$STITCH_BIN" ]; then
-  cp "$STITCH_BIN" "$APP/Contents/MacOS/stitch"
-  chmod +x "$APP/Contents/MacOS/stitch"
-else
-  echo "warning: stitch bot binary not found at $STITCH_BIN; the app's Start/Approve/Update will be disabled until stitch is on PATH" >&2
-fi
+cp "$BIN" "$APP/Contents/MacOS/stitch-desktop"
+chmod +x "$APP/Contents/MacOS/stitch-desktop"
+
+copy_helper() {
+  local src="$1"
+  local name="$2"
+  if [ -f "$src" ]; then
+    cp "$src" "$APP/Contents/MacOS/$name"
+    chmod +x "$APP/Contents/MacOS/$name"
+  else
+    echo "warning: $name not found at $src; Start Panel will fail until it is present" >&2
+  fi
+}
+copy_helper "$STITCH_BIN" "stitch"
+copy_helper "$PANEL_BIN" "stitch-panel"
 
 # App icon (referenced by CFBundleIconFile in Info.plist).
 if [ -f "$HERE/Stitch.icns" ]; then
@@ -35,18 +41,17 @@ fi
 # still shows the unidentified-developer prompt on first launch. Sign the nested
 # binaries before the bundle. Set STITCH_CODESIGN_ID to use a real identity.
 SIGN_ID="${STITCH_CODESIGN_ID:--}"
-# Notarization requires the Hardened Runtime. Enable it for real Developer ID
-# signing; ad-hoc ("-") bundles are never notarized, and hardened runtime can add
-# friction to a locally-built ad-hoc app, so skip it there.
 RUNTIME_OPT=""
 if [ "$SIGN_ID" != "-" ]; then
   RUNTIME_OPT="--options runtime"
 fi
 if command -v codesign >/dev/null 2>&1; then
-  # shellcheck disable=SC2086  # RUNTIME_OPT is intentionally word-split (may be empty)
+  # shellcheck disable=SC2086
   [ -f "$APP/Contents/MacOS/stitch" ] && codesign --force $RUNTIME_OPT --sign "$SIGN_ID" "$APP/Contents/MacOS/stitch"
   # shellcheck disable=SC2086
-  codesign --force $RUNTIME_OPT --sign "$SIGN_ID" "$APP/Contents/MacOS/stitch-setup"
+  [ -f "$APP/Contents/MacOS/stitch-panel" ] && codesign --force $RUNTIME_OPT --sign "$SIGN_ID" "$APP/Contents/MacOS/stitch-panel"
+  # shellcheck disable=SC2086
+  codesign --force $RUNTIME_OPT --sign "$SIGN_ID" "$APP/Contents/MacOS/stitch-desktop"
   # shellcheck disable=SC2086
   codesign --force $RUNTIME_OPT --sign "$SIGN_ID" "$APP"
 fi

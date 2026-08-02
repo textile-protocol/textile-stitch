@@ -5,17 +5,15 @@
 <dict>
   <key>CFBundleName</key>            <string>Stitch</string>
   <key>CFBundleDisplayName</key>     <string>Stitch</string>
-  <key>CFBundleIdentifier</key>      <string>com.textilecredit.stitch.setup</string>
+  <key>CFBundleIdentifier</key>      <string>com.textilecredit.stitch.desktop</string>
   <key>CFBundleVersion</key>         <string>0.1.0</string>
   <key>CFBundleShortVersionString</key> <string>0.1.0</string>
-  <key>CFBundleExecutable</key>      <string>stitch-setup</string>
+  <key>CFBundleExecutable</key>      <string>stitch-desktop</string>
   <key>CFBundleIconFile</key>        <string>Stitch</string>
   <key>CFBundlePackageType</key>     <string>APPL</string>
-  <!-- Category shown in Finder's "Kind"/Get Info and Launchpad grouping; not
-       required for Spotlight to index the app, just metadata hygiene. Stitch is
-       a trading/market-making operator tool. -->
+  <!-- Menu bar agent: no Dock icon. The browser is the UI. -->
+  <key>LSUIElement</key>             <true/>
   <key>LSApplicationCategoryType</key> <string>public.app-category.finance</string>
-  <!-- Shown in the About box and Finder Get Info; matches the source SPDX headers. -->
   <key>NSHumanReadableCopyright</key> <string>Copyright © 2026 Textile, Inc.</string>
   <key>NSHighResolutionCapable</key> <true/>
 </dict>

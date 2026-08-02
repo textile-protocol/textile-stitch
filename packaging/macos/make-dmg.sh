@@ -6,7 +6,7 @@
 #
 # That move matters for Stitch specifically. A freshly-downloaded, quarantined
 # app launched in place is subject to Gatekeeper App Translocation: macOS runs it
-# from a randomized read-only mount, which breaks stitch-setup's lookup of the
+# from a randomized read-only mount, which breaks stitch-desktop's lookup of the
 # sibling `stitch` binary (see make-app.sh) and the in-app Update button. Moving
 # the app in Finder — which is exactly what dragging it to Applications is —
 # disables translocation and gives it a writable, predictable home.

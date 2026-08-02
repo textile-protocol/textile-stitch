@@ -66,19 +66,26 @@ jobs:
           [ -n "${MACOS_CERT_P12:-}" ] && echo "have_cert=true" >> "$GITHUB_OUTPUT" || echo "have_cert=false" >> "$GITHUB_OUTPUT"
           [ -n "${MACOS_NOTARY_API_KEY:-}" ] && echo "have_notary=true" >> "$GITHUB_OUTPUT" || echo "have_notary=false" >> "$GITHUB_OUTPUT"
 
+      - name: Build panel frontend
+        working-directory: web
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
       - name: Build universal binaries
         run: |
           set -euo pipefail
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --features gui --bin stitch --bin stitch-setup --target "$target"
+            cargo build --release --features panel,desktop \
+              --bin stitch --bin stitch-panel --bin stitch-desktop --target "$target"
           done
           mkdir -p target/universal
-          lipo -create -output target/universal/stitch \
-            target/aarch64-apple-darwin/release/stitch \
-            target/x86_64-apple-darwin/release/stitch
-          lipo -create -output target/universal/stitch-setup \
-            target/aarch64-apple-darwin/release/stitch-setup \
-            target/x86_64-apple-darwin/release/stitch-setup
+          for bin in stitch stitch-panel stitch-desktop; do
+            lipo -create -output "target/universal/$bin" \
+              "target/aarch64-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin"
+          done
 
       - name: Import Developer ID signing certificate
         if: ${{ steps.signing.outputs.have_cert == 'true' }}
@@ -110,7 +117,8 @@ jobs:
       - name: Assemble Stitch.app
         # make-app.sh signs with $STITCH_CODESIGN_ID when set (Developer ID),
         # otherwise ad-hoc ("-").
-        run: packaging/macos/make-app.sh target/universal/stitch-setup dist target/universal/stitch
+        run: packaging/macos/make-app.sh target/universal/stitch-desktop dist \
+          target/universal/stitch target/universal/stitch-panel
 
       - name: Build Stitch.dmg
         # Wrap the (signed) app in a drag-to-Applications image. make-dmg.sh signs

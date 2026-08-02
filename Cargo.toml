@@ -1,13 +1,13 @@
 [package]
 name = "stitch-bot"
-version = "0.1.125"
+version = "0.1.126"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; market-makes the filler order book with signed UniswapX limit orders."
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/textile-protocol/textile-stitch"
 homepage = "https://github.com/textile-protocol/textile-stitch"
-# `stitch` is the bot; `stitch-setup` is an optional GUI helper. Name the default
-# so bare `cargo run` (run-local.mjs, dev habit) isn't ambiguous between the two.
+# `stitch` is the bot; `stitch-desktop` is the tray app. Name the default so bare
+# `cargo run` isn't ambiguous.
 default-run = "stitch"
 
 [lib]
@@ -19,19 +19,22 @@ name = "stitch"
 path = "src/main.rs"
 
 [[bin]]
-name = "stitch-setup"
-path = "src/bin/stitch-setup/main.rs"
-required-features = ["gui"]
-
-[[bin]]
 name = "stitch-panel"
 path = "src/bin/stitch-panel/main.rs"
 required-features = ["panel"]
 
+[[bin]]
+name = "stitch-desktop"
+path = "src/bin/stitch-desktop/main.rs"
+required-features = ["desktop"]
+
 [features]
-gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:image"]
-# The Stitch web UI. Gated so the bot image and the desktop app
-# don't pull in the Docker client or the embedded web assets.
+# Menu bar / system tray controller for the local panel (no Docker).
+# Pulls in `panel` so stitch-desktop can share STOP_GRACE_SECS and talk to the
+# same process-runtime types the panel binary embeds.
+desktop = ["panel", "dep:tray-icon", "dep:tao", "dep:argon2"]
+# The Stitch web UI. Gated so the bot image doesn't pull in the Docker client
+# or the embedded web assets. Process runtime (desktop) shares this feature.
 panel = [
   "dep:bollard",
   "dep:rust-embed",
@@ -43,10 +46,8 @@ panel = [
   "dep:tar",
 ]
 [dependencies]
-eframe = { version = "0.35", optional = true }
-egui = { version = "0.35", optional = true }
-rfd = { version = "0.17", optional = true }
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+tray-icon = { version = "0.19", optional = true }
+tao = { version = "0.30", default-features = false, features = ["rwh_05"], optional = true }
 alloy-primitives = { version = "1", features = ["rlp"] }
 alloy-rlp = "0.3"
 async-trait = "0.1"

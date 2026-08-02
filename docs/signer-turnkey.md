@@ -102,11 +102,11 @@ Add it on the dashboard Policies page or with `turnkey policies create`.
 
 ## 5. Configure the bot
 
-**Desktop app.** In `stitch-setup`, pick **Signer -> Turnkey** and fill
+**Desktop / panel.** In the Stitch panel (via `stitch-desktop` or a server
+install), open the bot's Settings, pick **Signer → Turnkey**, and fill
 Organization ID, Sign with, Operator address, API public key, and API private
 key. Saving writes the `[signer]` section, stores the private key in an
-owner-only `turnkey-api.key`, and points `stitch.env` at it. The dropdown no
-longer shows an "Experimental" marker for Turnkey.
+owner-only `turnkey-api.key`, and points `stitch.env` at it.
 
 **Manual.** Edit `stitch.toml` directly:
 

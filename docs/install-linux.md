@@ -15,7 +15,7 @@ update-desktop-database ~/.local/share/applications 2>/dev/null || true
 gtk-update-icon-cache ~/.local/share/icons/hicolor 2>/dev/null || true
 ```
 
-Put `stitch-setup` on your `PATH` (or edit `Exec=` to an absolute path) so the
+Put `stitch-desktop` on your `PATH` (or edit `Exec=` to an absolute path) so the
 launcher can find it.
 
 ## 1. Install the binary

@@ -18,12 +18,18 @@ pub mod fake;
 
 #[cfg(feature = "panel")]
 mod bollard_api;
+#[cfg(feature = "panel")]
+mod process_api;
 
 #[cfg(feature = "panel")]
 pub use bollard_api::BollardDocker;
+#[cfg(feature = "panel")]
+pub use process_api::ProcessRuntime;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::Result;

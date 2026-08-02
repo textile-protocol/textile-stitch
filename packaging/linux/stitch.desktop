@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=Stitch
-Comment=Set up and run the Textile Stitch operator bot
-Exec=stitch-setup
+Comment=Textile filler bot — local Stitch panel (menu / tray)
+Exec=stitch-desktop
 Icon=stitch
 Terminal=false
+Categories=Finance;Network;
 StartupWMClass=stitch
-Categories=Finance;Utility;

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
 //! Operator onboarding: the corridor catalog, config-file writer, path helpers,
-//! and child-process command builders shared by `stitch init` and the GUI.
+//! and child-process helpers shared by `stitch init`, the panel, and the
+//! desktop tray app.
 
 pub mod catalog;
 pub mod macos;
@@ -12,13 +13,11 @@ pub mod writer;
 
 pub use catalog::{catalog, find_corridor, identify_corridor, Corridor};
 pub use paths::{
-    config_paths, default_dir, has_operator_files, home_dir, is_configured, legacy_gui_dirs,
-    operator_address, operator_address_from_key, remember_config_dir, remembered_config_dir,
-    ConfigPaths,
+    app_state_dir, config_paths, default_dir, has_operator_files, home_dir, is_configured,
+    legacy_gui_dirs, operator_address, operator_address_from_key, remember_config_dir,
+    remembered_config_dir, ConfigPaths,
 };
-pub use process::{
-    approve_command, find_stitch_binary, run_command, terminate, update_command, Status,
-};
+pub use process::{find_stitch_binary, terminate};
 pub use settings::{
     apply_settings, read_settings, read_settings_at, read_signer, try_read_signer, PoolPair,
     SettingsPatch, SettingsView, SideSizing, SignerView, SpreadEdit, SpreadKind,

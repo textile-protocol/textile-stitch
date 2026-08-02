@@ -1,8 +1,13 @@
-# Install — Stitch
+# Install — Stitch (Docker / server)
 
-Stitch is the web UI for running several bots on one Docker host. Add a bot with
-a wizard, start and stop it, edit its settings, watch its logs, run Permit2
+Stitch is the web UI for running several bots on one host. Add a bot with a
+wizard, start and stop it, edit its settings, watch its logs, run Permit2
 approvals — instead of SSHing in and hand-editing `docker-compose.yml`.
+
+**Both installs are recommended** — pick by need. On a personal Mac or Windows
+machine, the [desktop app](../README.md#option-1--desktop-app) (`Stitch.dmg` /
+`stitch-desktop.exe`) runs the same panel locally without Docker. This page is
+the Docker / Compose path for servers and always-on hosts.
 
 The product name in the browser is **Stitch**. The binary, container, and image
 are still named `stitch-panel` — that's the process underneath.

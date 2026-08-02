@@ -71,8 +71,10 @@ Layouts, in the order to check:
   (`https://stitch-panel.<tailnet>.ts.net`). See [Docker fleet](#docker-fleet).
 - **Docker fleet without panel**: bot containers only, driven with
   `docker compose`. See [Docker fleet](#docker-fleet).
-- **Desktop app** (`stitch-setup` — macOS `Stitch.app`, Windows
-  `stitch-setup.exe`, Linux `stitch-setup`): GUI that supervises one bot in-window.
+- **Desktop app** (`stitch-desktop` — macOS `Stitch.app`, Windows
+  `stitch-desktop.exe`, Linux `stitch-desktop`): menu-bar / tray controller that
+  runs the local panel without Docker. Tray **Start at login** registers an OS
+  login item (`--autostart`); the panel restores bots that were left running.
 - **Foreground / manual** or **local service**: `~/Stitch/` (or
   `/etc/stitch-bot/` on Linux systemd) with `stitch.toml` / key / env.
 - **AWS cloud** (ECS Fargate): operator-owned `deploy/aws` stack. See
@@ -82,9 +84,9 @@ Detect it: `docker ps --filter name=stitch-panel` (or image
 `textile-stitch-panel`) means the panel is installed. Bot containers show under
 `ghcr.io/textile-protocol/textile-stitch`. Local layouts: `stitch --version`,
 `systemctl status stitch`, `launchctl list | grep -i stitch`, or a running
-`stitch-setup`/`Stitch` process. Cloud: ECS service `<bot>-stitch`. Only if none
-of those exist is it genuinely not installed — then see
-[Not installed yet](#not-installed-yet).
+`stitch-desktop`/`Stitch` / `stitch-panel` process. Cloud: ECS service
+`<bot>-stitch`. Only if none of those exist is it genuinely not installed — then
+see [Not installed yet](#not-installed-yet).
 
 ## Golden rules — every operation
 
@@ -287,7 +289,7 @@ Other paths only if the operator explicitly prefers them (do not offer these as
 the default install):
 
 - **Desktop app** (no terminal): download the release for their OS and open Stitch
-  — macOS `Stitch.dmg`, Windows `stitch-setup.exe`, Linux `stitch-setup`.
+  — macOS `Stitch.dmg`, Windows `stitch-desktop.exe`, Linux `stitch-desktop`.
 - **Manual / CLI**: the per-OS guides under `docs/install-*.md`, or `stitch init`
   for a single foreground bot.
 

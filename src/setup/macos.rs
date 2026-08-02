@@ -6,12 +6,12 @@
 //! A freshly-downloaded, quarantined app launched in place — straight from the
 //! mounted DMG, or from ~/Downloads after unzipping — is subject to Gatekeeper
 //! App Translocation: macOS runs it from a randomized, read-only mount. That
-//! breaks two things stitch-setup relies on: finding the sibling `stitch` binary
-//! by relative path (see [`crate::setup::find_stitch_binary`]) and the in-app
-//! Update button. Dragging the app into /Applications is a Finder "move", which
-//! disables translocation and gives the app a stable, writable home. The DMG
-//! nudges most operators into doing that; this is the backstop for the ones who
-//! double-click it in place instead.
+//! breaks sibling binary lookup for `stitch-panel` / `stitch` (see
+//! [`crate::setup::find_stitch_binary`]). Dragging the app into /Applications
+//! is a Finder "move", which disables translocation and gives the app a stable,
+//! writable home. The DMG nudges most operators into doing that; `stitch-desktop`
+//! also auto-installs here when it detects translocation or a non-Applications
+//! launch path.
 
 use std::path::{Path, PathBuf};
 
@@ -80,8 +80,8 @@ pub fn open(path: &Path) {
 }
 
 /// Detect the running app's install location. `None` when we're not inside a
-/// `.app` bundle — a dev build, the bare `stitch-setup` binary, or any non-macOS
-/// platform — because then there's nothing to nudge about.
+/// `.app` bundle — a dev build, a bare `stitch-desktop` binary, or any non-macOS
+/// platform — because then there's nothing to relocate.
 pub fn detect() -> Option<MacInstall> {
     // Only macOS has App Translocation and an Applications folder to install into;
     // the `if cfg!` (not `#[cfg]`) keeps the pure helpers referenced — and their
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn finds_the_bundle_root_above_the_executable() {
-        let exe = Path::new("/Applications/Stitch.app/Contents/MacOS/stitch-setup");
+        let exe = Path::new("/Applications/Stitch.app/Contents/MacOS/stitch-desktop");
         assert_eq!(
             find_app_bundle(exe),
             Some(PathBuf::from("/Applications/Stitch.app"))
@@ -151,9 +151,9 @@ mod tests {
 
     #[test]
     fn no_bundle_for_a_bare_binary() {
-        // A dev build or the standalone stitch-setup binary isn't in a .app.
+        // A dev build or the standalone stitch-desktop binary isn't in a .app.
         assert_eq!(
-            find_app_bundle(Path::new("/tmp/target/debug/stitch-setup")),
+            find_app_bundle(Path::new("/tmp/target/debug/stitch-desktop")),
             None
         );
     }

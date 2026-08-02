@@ -32,6 +32,24 @@ pub const DEFAULT_BOT_IMAGE: &str = "ghcr.io/textile-protocol/textile-stitch:lat
 /// Overridable for anyone running a custom image built with a different user.
 pub const DEFAULT_BOT_UID: u32 = 1000;
 
+/// How the panel supervises bots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelRuntime {
+    /// Docker Engine API (server installs, `install-panel.sh`).
+    Docker,
+    /// Local `stitch` child processes (desktop tray app). No Docker required.
+    Process,
+}
+
+impl PanelRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PanelRuntime::Docker => "docker",
+            PanelRuntime::Process => "process",
+        }
+    }
+}
+
 /// How a request proves it's an authorized operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthMode {
@@ -78,8 +96,11 @@ pub struct PanelConfig {
     /// Where those same directories live on the Docker host. Bind mounts are
     /// resolved by the daemon, not by us, so a path that is correct inside the
     /// panel container is wrong in a mount spec unless we translate it.
+    ///
+    /// In process runtime this equals [`Self::bots_dir`] — there is no host/container
+    /// split.
     pub host_bots_dir: PathBuf,
-    /// Unix socket path for the Docker Engine API.
+    /// Unix socket path for the Docker Engine API. Ignored in process runtime.
     pub docker_socket: PathBuf,
     pub bind: SocketAddr,
     pub auth: AuthMode,
@@ -91,7 +112,8 @@ pub struct PanelConfig {
     /// client-supplied one would let anyone who can reach the listener and knows
     /// an operator's email drive the Docker socket.
     pub trust_identity_header: bool,
-    /// Image used for bots the panel creates.
+    /// Image used for bots the panel creates (Docker runtime). Process runtime
+    /// ignores this and runs the local `stitch` binary.
     pub bot_image: String,
     /// The uid the bot image runs as, pinned to 1000 in its Dockerfile.
     ///
@@ -100,13 +122,18 @@ pub struct PanelConfig {
     /// and its entrypoint locks the run directory down with `chmod 700`, which a
     /// non-owner can't do, so it exits before reading a line of config. Every
     /// directory the panel hands to a bot is chowned to this uid.
+    ///
+    /// Process runtime defaults this to the current user so chown is a no-op.
     pub bot_uid: u32,
+    /// Docker Engine vs local process supervision.
+    pub runtime: PanelRuntime,
 }
 
 impl PanelConfig {
     /// Read the config from the process environment, validating as we go so a
     /// misconfigured panel fails at startup rather than on first request.
     pub fn from_env() -> Result<Self> {
+        let runtime = runtime_from_env()?;
         let bots_dir = path_var("STITCH_PANEL_BOTS_DIR", DEFAULT_BOTS_DIR);
         // Defaults to the in-container path, which is correct when the panel runs
         // directly on the host. Containerised panels must set this to the host
@@ -140,6 +167,11 @@ impl PanelConfig {
             );
         }
 
+        let default_uid = match runtime {
+            PanelRuntime::Process => current_uid_runtime(),
+            PanelRuntime::Docker => DEFAULT_BOT_UID,
+        };
+
         Ok(Self {
             bots_dir,
             host_bots_dir,
@@ -148,7 +180,8 @@ impl PanelConfig {
             auth,
             trust_identity_header,
             bot_image: string_var("STITCH_PANEL_BOT_IMAGE", DEFAULT_BOT_IMAGE),
-            bot_uid: uid_var("STITCH_PANEL_BOT_UID", DEFAULT_BOT_UID)?,
+            bot_uid: uid_var("STITCH_PANEL_BOT_UID", default_uid)?,
+            runtime,
         })
     }
 
@@ -200,21 +233,36 @@ impl PanelConfig {
             trust_identity_header: true,
             bot_image: DEFAULT_BOT_IMAGE.to_string(),
             bot_uid: current_uid(),
+            runtime: PanelRuntime::Docker,
         }
     }
 }
 
-/// The uid the current process runs as, for tests that write files and then hand
-/// them to "the bot".
-#[cfg(all(test, unix))]
+fn runtime_from_env() -> Result<PanelRuntime> {
+    match std::env::var("STITCH_PANEL_RUNTIME") {
+        Err(_) => Ok(PanelRuntime::Docker),
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" | "docker" => Ok(PanelRuntime::Docker),
+            "process" | "native" | "desktop" => Ok(PanelRuntime::Process),
+            other => bail!("STITCH_PANEL_RUNTIME must be \"docker\" or \"process\", not {other:?}"),
+        },
+    }
+}
+
+/// The uid the current process runs as (desktop process runtime + tests).
+#[cfg(unix)]
 pub(crate) fn current_uid() -> u32 {
     // Safe: getuid has no preconditions and cannot fail.
     unsafe { libc::getuid() }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(not(unix))]
 pub(crate) fn current_uid() -> u32 {
     DEFAULT_BOT_UID
+}
+
+fn current_uid_runtime() -> u32 {
+    current_uid()
 }
 
 /// Reject a listen address that would expose the panel beyond the operator's
