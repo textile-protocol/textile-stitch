@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Stitch
-Comment=Textile filler bot — local Stitch panel (menu / tray)
+Comment=Textile filler bot — local Stitch panel (tray + control window)
 Exec=stitch-desktop
 Icon=stitch
 Terminal=false

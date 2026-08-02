@@ -72,7 +72,7 @@ jobs:
       - name: Run panel tests
         run: cargo test --features panel
 
-      # stitch-desktop pulls tray-icon → GTK / libappindicator / libxdo on Linux.
+      # stitch-desktop: tray-icon → GTK / libappindicator / libxdo; wry → WebKitGTK.
       - name: Install Linux desktop build deps
         run: |
           sudo apt-get update
@@ -83,7 +83,8 @@ jobs:
             libxcb-render0-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
-            libxkbcommon-dev
+            libxkbcommon-dev \
+            libwebkit2gtk-4.1-dev
 
       - name: Build the panel and desktop binaries
         run: |

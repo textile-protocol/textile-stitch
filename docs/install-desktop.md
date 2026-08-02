@@ -4,10 +4,10 @@ Recommended when you're installing on the Mac or Windows machine in front of
 you. No Docker and no terminal. For an always-on server, see
 [install-panel.md](install-panel.md).
 
-The desktop app (`stitch-desktop`) is a light menu-bar (macOS) or system-tray
-(Windows / Linux) controller. There is **no Dock window** on macOS — look for a
-teal Stitch icon in the menu bar (top right; may be under the `»` overflow). On
-first launch it:
+The desktop app (`stitch-desktop`) is a menu-bar (macOS) or system-tray
+(Windows / Linux) controller with a small control window that exposes the same
+actions. On macOS it also shows a Dock icon by default (you can hide it from the
+tray or the window). On first launch it:
 
 1. Creates a data directory (`~/Library/Application Support/Stitch` on macOS,
    `%APPDATA%\Stitch` on Windows, `~/.local/share/stitch` on Linux).
@@ -17,16 +17,22 @@ first launch it:
 3. Generates a panel password and writes `panel.env` + `panel.password`.
 4. Starts bundled `stitch-panel` with `STITCH_PANEL_RUNTIME=process` (local
    `stitch` child processes — not containers).
-5. Opens `http://127.0.0.1:8420` in your browser.
+5. Opens the control window and `http://127.0.0.1:8420` in your browser.
 
-From the menu / tray you can Open Stitch, Start / Stop the panel, toggle
-**Start at login**, Copy panel password, Check for updates (releases page),
-and Quit.
+From the menu / tray or the control window you can Show the window, Open Stitch,
+Start / Stop the panel, toggle **Start at login**, Copy panel password, Check
+for updates (releases page), and Quit. On macOS, **Hide Dock icon** (off by
+default) keeps the menu-bar icon and drops the Dock entry; the preference is
+saved in `<data_root>/desktop-prefs.json`.
+
+Closing the control window hides it — it does not quit. Use **Show Stitch
+window** in the tray, or click the Dock icon when it has no visible windows.
 
 **Start at login** registers the OS login item (LaunchAgent on macOS, Run key
 on Windows, XDG autostart on Linux). On boot the tray app starts quietly
-(`--autostart` — no browser tab), brings the panel up, and the process runtime
-restarts bots that were left on when you last stopped or quit the panel.
+(`--autostart` — no browser tab, no control window), brings the panel up, and
+the process runtime restarts bots that were left on when you last stopped or
+quit the panel.
 
 ## Download
 

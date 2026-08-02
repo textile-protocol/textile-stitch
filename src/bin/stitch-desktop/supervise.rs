@@ -127,11 +127,11 @@ impl PanelSupervisor {
         Ok(())
     }
 
-    fn is_running(&mut self) -> bool {
-        match self.child.as_mut() {
-            Some(child) => matches!(child.try_wait(), Ok(None)),
-            None => false,
-        }
+    /// True while the supervised panel child is still alive. Reaps a dead child
+    /// (and clears `panel.pid`) so callers see a consistent stopped state.
+    pub(crate) fn is_running(&mut self) -> bool {
+        self.reap();
+        self.child.is_some()
     }
 
     fn reap(&mut self) {

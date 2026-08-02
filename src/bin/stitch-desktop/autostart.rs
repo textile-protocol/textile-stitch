@@ -189,7 +189,7 @@ fn xdg_autostart_desktop(exe: &Path) -> String {
          Type=Application\n\
          Version=1.0\n\
          Name=Textile Stitch\n\
-         Comment=Local Stitch panel (menu bar)\n\
+         Comment=Local Stitch panel (tray + window)\n\
          Exec=\"{}\" --autostart\n\
          Terminal=false\n\
          Categories=Utility;Network;\n\

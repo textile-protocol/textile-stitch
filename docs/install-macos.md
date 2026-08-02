@@ -2,7 +2,7 @@
 
 Run Stitch from a release binary in a terminal. If you'd rather not touch the
 terminal, use the [desktop app](../README.md#option-1--desktop-app) instead —
-menu bar controller, local panel in the browser, no Docker.
+menu bar + Dock + control window, local panel in the browser, no Docker.
 
 ## 1. Install the binary
 

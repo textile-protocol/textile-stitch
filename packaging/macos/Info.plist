@@ -11,8 +11,9 @@
   <key>CFBundleExecutable</key>      <string>stitch-desktop</string>
   <key>CFBundleIconFile</key>        <string>Stitch</string>
   <key>CFBundlePackageType</key>     <string>APPL</string>
-  <!-- Menu bar agent: no Dock icon. The browser is the UI. -->
-  <key>LSUIElement</key>             <true/>
+  <!-- Dock icon on by default. Users can hide it from the tray / control window
+       (ActivationPolicy::Accessory at runtime). -->
+  <key>LSUIElement</key>             <false/>
   <key>LSApplicationCategoryType</key> <string>public.app-category.finance</string>
   <key>NSHumanReadableCopyright</key> <string>Copyright © 2026 Textile, Inc.</string>
   <key>NSHighResolutionCapable</key> <true/>
