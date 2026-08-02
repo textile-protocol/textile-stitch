@@ -17,6 +17,11 @@ use anyhow::{bail, Context, Result};
 pub const DEFAULT_BOTS_DIR: &str = "/data/bots";
 
 /// Default Docker socket path.
+#[cfg(unix)]
+pub const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
+#[cfg(windows)]
+pub const DEFAULT_DOCKER_SOCKET: &str = r"\\.\pipe\docker_engine";
+#[cfg(not(any(unix, windows)))]
 pub const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
 /// Default listen address. Loopback because the intended deployment puts the

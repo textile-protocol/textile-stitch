@@ -40,3 +40,5 @@ libxcb-xfixes0-dev = '*'
 libxkbcommon-dev = '*'
 libssl-dev = '*'
 libayatana-appindicator3-dev = '*'
+# tray-icon / muda link against libxdo for predefined menu accelerators on Linux.
+libxdo-dev = '*'

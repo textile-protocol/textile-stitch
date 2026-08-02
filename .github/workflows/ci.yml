@@ -72,6 +72,19 @@ jobs:
       - name: Run panel tests
         run: cargo test --features panel
 
+      # stitch-desktop pulls tray-icon → GTK / libappindicator / libxdo on Linux.
+      - name: Install Linux desktop build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev
+
       - name: Build the panel and desktop binaries
         run: |
           cargo build --release --features panel,desktop \

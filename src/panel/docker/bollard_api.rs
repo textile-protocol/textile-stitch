@@ -57,14 +57,17 @@ pub struct BollardDocker {
 }
 
 impl BollardDocker {
-    /// Connect to the daemon over a unix socket.
+    /// Connect to the daemon over a local pipe (unix socket / Windows named pipe).
     pub fn connect(socket: &Path) -> Result<Self> {
         let path = socket
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("docker socket path is not valid UTF-8"))?;
         // Docker's API is backwards compatible; bollard's default version is
         // negotiated down by the daemon if it's older.
-        let docker = Docker::connect_with_unix(path, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
+        // `connect_with_socket` is the cross-platform entry point — unix sockets
+        // on Unix, named pipes on Windows. `connect_with_unix` is Unix-only and
+        // breaks the Windows release build of the panel feature.
+        let docker = Docker::connect_with_socket(path, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
             .with_context(|| format!("connecting to the Docker socket at {path}"))?;
         Ok(Self { docker })
     }
