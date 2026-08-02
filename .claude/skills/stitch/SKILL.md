@@ -19,10 +19,10 @@ nothing is set up yet, installs the panel only — bot config happens in the bro
 3. **If the Stitch panel is installed**, prefer pointing the operator at the web
    UI for add/start/stop/settings/approvals/logs. Only drive the API or Docker
    CLI if they ask you to do it from the terminal.
-4. **If another layout is installed** (desktop app, local service, compose-only,
-   cloud), ask what they want to do with `AskUserQuestion`, **one question at a
-   time**. Never guess the action from a vague request — ask. Wait for each
-   answer before the next question or any command.
+4. **If another layout is installed** (desktop app, local service, compose-only),
+   ask what they want to do with `AskUserQuestion`, **one question at a time**.
+   Never guess the action from a vague request — ask. Wait for each answer
+   before the next question or any command.
 
 Question-tool rules (same as the install prompt): one question per call, multiple
 choice, most-likely option first, and the tool always adds a free-form answer so
@@ -37,8 +37,7 @@ type anything else.
 
 First question — "What do you want to do with Stitch?":
 
-- **Start / resume live** → [Start](#start) (cloud: [AWS cloud](#aws-cloud-ecs-fargate),
-  Docker fleet: [Docker fleet](#docker-fleet))
+- **Start / resume live** → [Start](#start) (Docker fleet: [Docker fleet](#docker-fleet))
 - **Stop / pause** → [Stop](#stop)
 - **Inspect or change it** — status/logs, parameters, approvals, or upgrade
 
@@ -60,8 +59,7 @@ detected, honoring the golden rules throughout.
 
 Figure out which layout is in use *before* doing anything. Check for the panel
 first — that is the default install path now. A missing local `stitch` binary
-does **not** mean "not installed" if `stitch-panel` is running, and the cloud
-layout has no local binary by design.
+does **not** mean "not installed" if `stitch-panel` is running.
 
 Layouts, in the order to check:
 
@@ -77,8 +75,6 @@ Layouts, in the order to check:
   login item (`--autostart`); the panel restores bots that were left running.
 - **Foreground / manual** or **local service**: `~/Stitch/` (or
   `/etc/stitch-bot/` on Linux systemd) with `stitch.toml` / key / env.
-- **AWS cloud** (ECS Fargate): operator-owned `deploy/aws` stack. See
-  [AWS cloud](#aws-cloud-ecs-fargate).
 
 Detect it: `docker ps --filter name=stitch-panel` (or image
 `textile-stitch-panel`) means the panel is installed. Bot containers show under
@@ -174,55 +170,6 @@ stitch --version
 Then restart: `sudo systemctl restart stitch`, or restart your foreground run. If
 `--update` reports "no install receipt found", it was an archive install — grab
 the latest binary from the GitHub Release instead.
-
-## AWS cloud (ECS Fargate)
-
-For the operator-owned AWS stack (`deploy/aws`), there's no local binary —
-everything is `aws` CLI against the operator's account. Substitute the bot name
-you deployed under (default `stitch-operator`; the README example uses
-`stitch-operator-a`). The full runbook is `deploy/aws/README.md`.
-
-- **Start / resume live**: set the service to one task.
-
-  ```bash
-  aws ecs update-service --cluster <bot>-cluster --service <bot>-stitch --desired-count 1
-  ```
-
-- **Pause** (no infra teardown): desired count `0`. The stack also ships at `0`,
-  so a fresh deploy is paused until you do this.
-
-  ```bash
-  aws ecs update-service --cluster <bot>-cluster --service <bot>-stitch --desired-count 0
-  ```
-
-- **Logs**: `aws logs tail /ecs/<bot>/stitch --follow`.
-
-- **Change parameters**: the config is the `STITCH_CONFIG_TOML` field of a JSON
-  secret that *also* holds `STITCH_PRIVATE_KEY`, and `put-secret-value` replaces
-  the **whole** value — so you must merge, not overwrite. Pause to `0`, then run
-  the merge helper (it never prints `SecretString`, so the hot wallet key stays
-  out of the agent transcript):
-
-  ```bash
-  # From a checkout of textile-stitch / packages/stitch-bot:
-  scripts/merge-stitch-secret-config.sh "$secret_arn" stitch.toml
-  ```
-
-  Do **not** `get-secret-value` the blob into a shell variable, and do not `echo`
-  or `jq` it into chat. Then resume to `1`. Keep `DesiredCount=0` while changing
-  config or rotating keys. `$secret_arn` is the stack's `SecretArn` output (see
-  `deploy/aws/README.md`).
-
-- **Approvals**: a one-off ECS task with an `approve` command override (not
-  `systemctl`/local). See the `aws ecs run-task` block in `deploy/aws/README.md`;
-  add `--exact` to the override for capped approvals.
-
-- **Upgrade**: bump the pinned `ContainerImage` (use an immutable `sha-*` tag for
-  production) and redeploy the stack; the service pulls the new image on next task
-  start.
-
-Same golden rules apply: never put the key in a file or on a command line (it's a
-Secrets Manager value), and dry-run/pause around any pricing or sizing change.
 
 ## Docker fleet
 

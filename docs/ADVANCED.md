@@ -433,12 +433,10 @@ security model and known limitations.
 
 #### Deployment notes
 
-On AWS Fargate the provided CloudFormation template supports local and Turnkey
-directly: fill the matching keys in the `<BotName>/operator` secret
-(`TURNKEY_API_PUBLIC_KEY`, `TURNKEY_API_PRIVATE_KEY`, or `MPCVAULT_API_TOKEN`).
-MPCVault additionally needs the client-signer sidecar running alongside, which
-suits the EC2/docker-compose or systemd host setup better than the
-single-container Fargate Quick Create.
+Local and Turnkey signers run in the same process as the bot, so any install
+path works (desktop, panel, Docker, systemd). MPCVault needs the client-signer
+sidecar co-located with the bot, so use Docker Compose, systemd, or another
+host setup that can run both containers/processes side by side.
 
 ## Troubleshooting
 

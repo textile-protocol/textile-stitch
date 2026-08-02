@@ -274,10 +274,9 @@ digest` in the log.
   fail-closed logic are already covered by unit tests, and we're confirming the
   exact protobuf wire format the real sidecar sends on a running setup. We
   recommend starting with a smaller allocation while that wraps up.
-- **No Fargate path.** MPCVault needs the sidecar co-located, so it suits an
-  EC2/docker-compose or systemd host rather than the single-container Fargate
-  Quick Create. The provided CloudFormation template covers local and Turnkey
-  directly; MPCVault additionally needs the sidecar running alongside.
+- **Needs a co-located sidecar.** MPCVault's client-signer must run alongside
+  the bot, so use Docker Compose, systemd, or another host setup that can run
+  both. Local and Turnkey signers do not need this.
 - **One sidecar per operator.** MPCVault binds one client-signer per vault and
   each operator needs their own vault and funds, so it can't be run as one shared
   service.

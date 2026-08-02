@@ -4,8 +4,6 @@ target
 *.local.toml
 stitch.key
 stitch.env
-deploy/aws/.terraform
-deploy/aws/terraform.tfstate*
 
 # The panel's frontend is built inside the image's node stage. Shipping a local
 # node_modules into the build context would be slow and, on a different host

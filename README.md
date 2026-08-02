@@ -94,7 +94,6 @@ Everything else — custom reverse proxy, building from source — is in
 
 - [Install with an AI agent](#install-with-an-ai-agent) — your coding agent
   installs the panel; you finish bot setup in the web UI.
-- [Cloud (AWS Fargate)](docs/install-cloud.md) — operator-owned managed deployment.
 - [Docker](docs/install-docker.md) — the bot image on its own, without Stitch.
 - [Stitch (web)](docs/install-panel.md) — the advanced and manual routes for
   Option 2 above.

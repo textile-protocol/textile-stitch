@@ -126,6 +126,4 @@ Two things about this layout to know before your fleet grows:
   configure, tail logs, run approvals. It adopts the containers this compose file
   already started, without restarting them.
 
-For a managed cloud deployment on AWS ECS Fargate, see
-[install-cloud.md](install-cloud.md). For configuration reference and tuning, see
-[ADVANCED.md](ADVANCED.md).
+For configuration reference and tuning, see [ADVANCED.md](ADVANCED.md).
