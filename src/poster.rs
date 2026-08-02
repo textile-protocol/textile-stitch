@@ -83,6 +83,8 @@ impl Poster<'_> {
                     output_token,
                     output_amount: draft.output_amount,
                     recipient: self.maker,
+                    additional_validation_contract: Address::ZERO,
+                    additional_validation_data: Default::default(),
                 };
                 Some((order, draft.client_order_id.clone()))
             })
@@ -274,6 +276,8 @@ mod tests {
             output_token: Address::ZERO,
             output_amount: U256::from(1u64),
             recipient: Address::ZERO,
+            additional_validation_contract: Address::ZERO,
+            additional_validation_data: Default::default(),
         }
     }
 

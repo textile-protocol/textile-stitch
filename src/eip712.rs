@@ -81,15 +81,14 @@ fn hash_words(words: &[[u8; 32]]) -> B256 {
 }
 
 fn order_info_hash(o: &OrderParams) -> B256 {
-    let empty_validation_data = keccak256([]); // keccak256("")
     hash_words(&[
         b256_word(k(ORDER_INFO_TYPE)),
         addr_word(o.reactor),
         addr_word(o.swapper),
         u256_word(o.nonce),
         u256_word(o.deadline),
-        addr_word(Address::ZERO), // additionalValidationContract
-        b256_word(empty_validation_data),
+        addr_word(o.additional_validation_contract),
+        b256_word(keccak256(&o.additional_validation_data)),
     ])
 }
 
@@ -175,6 +174,8 @@ mod tests {
             output_token: address!("4444444444444444444444444444444444444444"), // cNGN
             output_amount: U256::from(1_550_000_000u64),
             recipient: address!("2222222222222222222222222222222222222222"),
+            additional_validation_contract: Address::ZERO,
+            additional_validation_data: Default::default(),
         }
     }
 

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Shared types for the operator bot.
 
-pub use alloy_primitives::{Address, B256, U256};
+pub use alloy_primitives::{Address, Bytes, B256, U256};
 
 /// One operator limit order: pay `input_amount` debt (USDT) to buy
 /// `output_amount` collateral (cNGN). For a limit order (no Dutch decay) the
@@ -28,4 +28,8 @@ pub struct OrderParams {
     pub output_amount: U256,
     /// Where the bought collateral lands (the operator's wallet).
     pub recipient: Address,
+    /// Optional UniswapX validation callback; zero for operator quote orders.
+    pub additional_validation_contract: Address,
+    /// ABI-encoded callback parameters; empty for operator quote orders.
+    pub additional_validation_data: Bytes,
 }

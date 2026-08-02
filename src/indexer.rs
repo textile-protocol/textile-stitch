@@ -16,9 +16,10 @@ const COMMITTED_INPUT_QUERY: &str =
     "query CommittedInput($chainId: Int!, $maker: String!, $inputToken: String!) { \
 fillerCommittedInput(chainId: $chainId, maker: $maker, inputToken: $inputToken) }";
 const RESTING_LIMIT_ORDERS_QUERY: &str =
-    "query RestingLimitOrders($chainId: Int!, $inputToken: String!, $outputToken: String!) { \
-restingLimitOrders(chainId: $chainId, inputToken: $inputToken, outputToken: $outputToken) { \
-id reactor maker inputToken inputAmount outputToken outputAmount rateRay nonce deadlineSec signature } }";
+    "query RestingLimitOrders($chainId: Int!, $inputToken: String!, $outputToken: String!, $fillerWallet: String!) { \
+  restingLimitOrders(chainId: $chainId, inputToken: $inputToken, outputToken: $outputToken, fillerWallet: $fillerWallet) { \
+id reactor maker inputToken inputAmount outputToken outputAmount rateRay nonce deadlineSec \
+additionalValidationContract additionalValidationData signature } }";
 
 /// Build the GraphQL request body for one order (pure — easy to assert on).
 pub fn build_submit_request(order: &SubmitOrder) -> Value {
@@ -53,6 +54,7 @@ pub fn build_resting_limit_orders_request(
     chain_id: u64,
     input_token: &str,
     output_token: &str,
+    filler_wallet: &str,
 ) -> Value {
     json!({
         "query": RESTING_LIMIT_ORDERS_QUERY,
@@ -60,6 +62,7 @@ pub fn build_resting_limit_orders_request(
             "chainId": chain_id,
             "inputToken": input_token,
             "outputToken": output_token,
+            "fillerWallet": filler_wallet,
         }
     })
 }
@@ -163,8 +166,10 @@ impl Indexer {
         chain_id: u64,
         input_token: &str,
         output_token: &str,
+        filler_wallet: &str,
     ) -> anyhow::Result<Value> {
-        let body = build_resting_limit_orders_request(chain_id, input_token, output_token);
+        let body =
+            build_resting_limit_orders_request(chain_id, input_token, output_token, filler_wallet);
         let resp = self.post_graphql(&body, "resting limit orders").await?;
         Ok(resp
             .pointer("/data/restingLimitOrders")

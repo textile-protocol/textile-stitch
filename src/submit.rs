@@ -79,6 +79,8 @@ mod tests {
             output_token: address!("4444444444444444444444444444444444444444"),
             output_amount: U256::from(1_550_000_000u64),
             recipient: maker,
+            additional_validation_contract: Address::ZERO,
+            additional_validation_data: Default::default(),
         };
 
         let s = sign_submission(&order, PERMIT2, 8453, &signer)

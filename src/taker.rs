@@ -66,6 +66,8 @@ pub struct RestingOrder {
     pub output_amount: U256,
     pub nonce: U256,
     pub deadline_sec: u64,
+    pub additional_validation_contract: Address,
+    pub additional_validation_data: Bytes,
     /// 65-byte EIP-712 signature over the Permit2 witness digest.
     pub signature: Vec<u8>,
 }
@@ -85,6 +87,8 @@ impl RestingOrder {
             output_token: self.output_token,
             output_amount: self.output_amount,
             recipient: self.maker,
+            additional_validation_contract: self.additional_validation_contract,
+            additional_validation_data: self.additional_validation_data.clone(),
         }
     }
 }
@@ -109,6 +113,11 @@ fn parse_signature_field(v: &Value) -> Option<Vec<u8>> {
     (bytes.len() == 65).then_some(bytes)
 }
 
+fn parse_bytes_field(v: &Value) -> Option<Bytes> {
+    let value = v.as_str()?;
+    alloy_primitives::hex::decode(value).ok().map(Bytes::from)
+}
+
 /// Parse the `restingLimitOrders` response rows; malformed rows are dropped
 /// (they can only have come from a broken or hostile indexer).
 pub fn parse_resting_orders(rows: &Value) -> Vec<RestingOrder> {
@@ -126,6 +135,14 @@ pub fn parse_resting_orders(rows: &Value) -> Vec<RestingOrder> {
                         output_amount: parse_u256_field(row.get("outputAmount")?)?,
                         nonce: parse_u256_field(row.get("nonce")?)?,
                         deadline_sec: parse_u256_field(row.get("deadlineSec")?)?.try_into().ok()?,
+                        additional_validation_contract: row
+                            .get("additionalValidationContract")
+                            .and_then(parse_address_field)
+                            .unwrap_or(Address::ZERO),
+                        additional_validation_data: row
+                            .get("additionalValidationData")
+                            .and_then(parse_bytes_field)
+                            .unwrap_or_default(),
                         signature: parse_signature_field(row.get("signature")?)?,
                     })
                 })
@@ -294,7 +311,9 @@ fn word_address(a: Address) -> [u8; 32] {
 /// encoding locally from verified fields is what keeps a hostile indexer's
 /// `encodedOrder` out of the transaction entirely.
 pub fn encode_order_bytes(o: &OrderParams) -> Vec<u8> {
-    let mut out = Vec::with_capacity(17 * 32);
+    let validation_data = padded_bytes(&o.additional_validation_data);
+    let info_size = 6 * 32 + validation_data.len();
+    let mut out = Vec::with_capacity(10 * 32 + info_size);
     out.extend_from_slice(&word_usize(0x20)); // offset to the tuple
 
     // Tuple head: [info offset, input.token, input.amount, input.maxAmount,
@@ -304,16 +323,16 @@ pub fn encode_order_bytes(o: &OrderParams) -> Vec<u8> {
     out.extend_from_slice(&word_address(o.input_token));
     out.extend_from_slice(&word_u256(o.input_amount));
     out.extend_from_slice(&word_u256(o.input_amount)); // maxAmount == amount
-    out.extend_from_slice(&word_usize(5 * 32 + 7 * 32)); // outputs after info
+    out.extend_from_slice(&word_usize(5 * 32 + info_size)); // outputs after info
 
-    // OrderInfo: 5 static words + offset to empty `additionalValidationData`.
+    // OrderInfo: 5 static words + offset to `additionalValidationData`.
     out.extend_from_slice(&word_address(o.reactor));
     out.extend_from_slice(&word_address(o.swapper));
     out.extend_from_slice(&word_u256(o.nonce));
     out.extend_from_slice(&word_u256(o.deadline));
-    out.extend_from_slice(&word_address(Address::ZERO));
+    out.extend_from_slice(&word_address(o.additional_validation_contract));
     out.extend_from_slice(&word_usize(6 * 32)); // bytes offset within info
-    out.extend_from_slice(&word_usize(0)); // len(additionalValidationData)
+    out.extend_from_slice(&validation_data);
 
     // OutputToken[1]
     out.extend_from_slice(&word_usize(1));
@@ -476,6 +495,7 @@ async fn take_direction_once(
             chain_id,
             &input_token.to_string(),
             &output_token.to_string(),
+            &wallet.address().to_string(),
         )
         .await?;
     let orders = parse_resting_orders(&rows);
@@ -648,6 +668,8 @@ mod tests {
             output_amount: U256::from(1_000_000u64),
             nonce: U256::from(42u64),
             deadline_sec,
+            additional_validation_contract: Address::ZERO,
+            additional_validation_data: Default::default(),
             signature: vec![],
         };
         let digest = permit2_digest(&order.params(), PERMIT2, CHAIN);
@@ -834,6 +856,8 @@ mod tests {
             output_token: CNGN,
             output_amount: U256::from(1_550_000_000u64),
             recipient: address!("2222222222222222222222222222222222222222"),
+            additional_validation_contract: Address::ZERO,
+            additional_validation_data: Default::default(),
         }
     }
 
