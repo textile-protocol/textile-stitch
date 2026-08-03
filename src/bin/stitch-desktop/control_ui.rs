@@ -272,9 +272,16 @@ pub fn signup_html(legacy_reset: bool) -> String {
 
 /// Build the control-panel HTML. `hide_dock_row` is macOS-only in the menu;
 /// pass false on other platforms to omit the Dock checkbox.
-pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row: bool) -> String {
+pub fn html(
+    autostart: bool,
+    hide_dock: bool,
+    keep_awake: bool,
+    panel_running: bool,
+    hide_dock_row: bool,
+) -> String {
     let autostart_checked = if autostart { " checked" } else { "" };
     let hide_dock_checked = if hide_dock { " checked" } else { "" };
+    let keep_awake_checked = if keep_awake { " checked" } else { "" };
     let status = if panel_running {
         ("running", "Panel running")
     } else {
@@ -288,6 +295,7 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
     } else {
         String::new()
     };
+    let keep_awake_label = crate::keep_awake::label();
 
     format!(
         r#"<!DOCTYPE html>
@@ -315,6 +323,7 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
     <button class="primary" data-action="open">Open Stitch panel</button>
     <button data-action="toggle_panel" id="pause-resume">{pause_label}</button>
     <label class="check"><input type="checkbox" id="autostart"{autostart_checked}> Start at login</label>
+    <label class="check"><input type="checkbox" id="keep-awake"{keep_awake_checked}> {keep_awake_label}</label>
     {dock_row}
     <div class="sep"></div>
     <button data-action="update" id="update-btn">Check for updates…</button>
@@ -335,6 +344,10 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
   if (autostart) {{
     autostart.addEventListener("change", () => post("toggle_autostart:" + (autostart.checked ? "1" : "0")));
   }}
+  const keepAwake = document.getElementById("keep-awake");
+  if (keepAwake) {{
+    keepAwake.addEventListener("change", () => post("toggle_keep_awake:" + (keepAwake.checked ? "1" : "0")));
+  }}
   const hideDock = document.getElementById("hide-dock");
   if (hideDock) {{
     hideDock.addEventListener("change", () => post("toggle_hide_dock:" + (hideDock.checked ? "1" : "0")));
@@ -351,6 +364,7 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
       pauseBtn.textContent = state.panelRunning ? "Pause" : "Resume";
     }}
     if (autostart) autostart.checked = !!state.autostart;
+    if (keepAwake) keepAwake.checked = !!state.keepAwake;
     if (hideDock) hideDock.checked = !!state.hideDock;
     const banner = document.getElementById("update-banner");
     const versionEl = document.getElementById("update-version");
@@ -378,6 +392,8 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
         status_text = status.1,
         pause_label = pause_label,
         autostart_checked = autostart_checked,
+        keep_awake_checked = keep_awake_checked,
+        keep_awake_label = keep_awake_label,
         dock_row = dock_row,
     )
 }
@@ -386,6 +402,7 @@ pub fn html(autostart: bool, hide_dock: bool, panel_running: bool, hide_dock_row
 pub fn set_state_script(
     autostart: bool,
     hide_dock: bool,
+    keep_awake: bool,
     panel_running: bool,
     update_version: Option<&str>,
 ) -> String {
@@ -394,9 +411,10 @@ pub fn set_state_script(
         None => "null".to_string(),
     };
     format!(
-        "window.__stitchSetState && window.__stitchSetState({{ autostart: {}, hideDock: {}, panelRunning: {}, updateVersion: {} }});",
+        "window.__stitchSetState && window.__stitchSetState({{ autostart: {}, hideDock: {}, keepAwake: {}, panelRunning: {}, updateVersion: {} }});",
         if autostart { "true" } else { "false" },
         if hide_dock { "true" } else { "false" },
+        if keep_awake { "true" } else { "false" },
         if panel_running { "true" } else { "false" },
         update,
     )

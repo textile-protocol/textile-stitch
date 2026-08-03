@@ -15,12 +15,16 @@ pub struct DesktopPrefs {
     /// When true, macOS uses ActivationPolicy::Accessory (no Dock icon).
     /// Default is false — Dock icon is shown.
     pub hide_dock_icon: bool,
+    /// When true, hold an OS power assertion so the machine does not idle-sleep
+    /// (Amphetamine-style). Restored on launch from this file.
+    pub keep_awake: bool,
 }
 
 impl Default for DesktopPrefs {
     fn default() -> Self {
         Self {
             hide_dock_icon: false,
+            keep_awake: false,
         }
     }
 }
@@ -67,6 +71,7 @@ mod tests {
     #[test]
     fn default_hides_dock_off() {
         assert!(!DesktopPrefs::default().hide_dock_icon);
+        assert!(!DesktopPrefs::default().keep_awake);
     }
 
     #[test]
@@ -77,10 +82,12 @@ mod tests {
         let paths = tmp_paths(dir.clone());
         let prefs = DesktopPrefs {
             hide_dock_icon: true,
+            keep_awake: true,
         };
         prefs.save(&paths).unwrap();
         let loaded = DesktopPrefs::load(&paths);
         assert!(loaded.hide_dock_icon);
+        assert!(loaded.keep_awake);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -94,6 +101,27 @@ mod tests {
         let paths = tmp_paths(dir);
         let loaded = DesktopPrefs::load(&paths);
         assert!(!loaded.hide_dock_icon);
+        assert!(!loaded.keep_awake);
+    }
+
+    #[test]
+    fn legacy_prefs_without_keep_awake_default_off() {
+        let dir = std::env::temp_dir().join(format!(
+            "stitch-desktop-prefs-legacy-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let paths = tmp_paths(dir.clone());
+        fs::write(
+            paths.root.join("desktop-prefs.json"),
+            r#"{ "hide_dock_icon": true }"#,
+        )
+        .unwrap();
+        let loaded = DesktopPrefs::load(&paths);
+        assert!(loaded.hide_dock_icon);
+        assert!(!loaded.keep_awake);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

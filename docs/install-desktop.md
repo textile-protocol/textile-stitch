@@ -22,12 +22,14 @@ it:
    can sign in with that password.
 
 The tray menu leads with a running/stopped status, then **Open Stitch panel**,
-**Pause** / **Resume**, updates, **Settings**, and Quit. Login and Dock prefs
-live in the Settings window only. When a newer desktop release is published,
-the control window shows an update banner and the tray item becomes **Download
-update**. On macOS, **Hide Dock icon** (off by default, in Settings) keeps the
-menu-bar icon and drops the Dock entry; the preference is saved in
-`<data_root>/desktop-prefs.json`.
+**Pause** / **Resume**, **Keep Mac awake** / **Keep computer awake**, updates,
+**Settings**, and Quit. Login and Dock prefs live in the Settings window only;
+keep-awake is also in Settings and persists across launches. When keep-awake is
+on, the menu-bar / tray icon shows a small lightning badge. When a newer
+desktop release is published, the control window shows an update banner and the
+tray item becomes **Download update**. On macOS, **Hide Dock icon** (off by
+default, in Settings) keeps the menu-bar icon and drops the Dock entry; the
+preference is saved in `<data_root>/desktop-prefs.json`.
 
 If you still have a legacy `panel.password` file from an older build, the app
 asks you to choose a new password and deletes the cleartext file.
@@ -40,6 +42,11 @@ macOS, Run key on Windows, XDG autostart on Linux). On boot the tray app starts
 quietly (`--autostart` — no browser tab, no control window), brings the panel
 up, and the process runtime restarts bots that were left on when you last
 stopped or quit the panel.
+
+**Keep Mac / computer awake** (tray + Settings) holds an OS power assertion so
+idle sleep does not stop the local panel and bots. Display sleep is still
+allowed. The preference is stored in `desktop-prefs.json` and restored on
+launch.
 
 ## Download
 

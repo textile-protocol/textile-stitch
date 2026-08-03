@@ -14,6 +14,7 @@
 
 mod autostart;
 mod control_ui;
+mod keep_awake;
 mod menu_icons;
 mod migrate;
 mod password;
@@ -27,9 +28,10 @@ use anyhow::{Context, Result};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
-use tray_icon::menu::{IconMenuItem, Menu, MenuEvent, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use crate::keep_awake::KeepAwakeController;
 use crate::menu_icons::{ActionKind, MenuIcons, StatusKind};
 use wry::WebViewBuilder;
 
@@ -187,8 +189,18 @@ fn run() -> Result<()> {
         .map(|mut s| s.is_running())
         .unwrap_or(false);
 
-    // Tray menu: status, open/pause, updates, settings, quit.
-    // Login / Dock prefs live only in the Settings window.
+    let mut keep_awake = KeepAwakeController::new();
+    if prefs.keep_awake {
+        if let Err(e) = keep_awake.set_enabled(true) {
+            eprintln!("stitch-desktop: keep awake on launch failed: {e:#}");
+            prefs.keep_awake = false;
+            let _ = prefs.save(&paths);
+        }
+    }
+
+    // Tray menu: status, open/pause, keep awake, updates, settings, quit.
+    // Login / Dock prefs live only in the Settings window; keep-awake is in
+    // both (quick toggle from the tray, like Amphetamine).
     let status_item = menu_icons::status_item(
         if panel_running {
             "Panel running"
@@ -212,6 +224,7 @@ fn run() -> Result<()> {
         },
         &menu_icons,
     );
+    let keep_awake_item = CheckMenuItem::new(keep_awake::label(), true, prefs.keep_awake, None);
     let update_item =
         menu_icons::action_item("Check for updates…", ActionKind::Update, &menu_icons);
     let settings_item = menu_icons::action_item("Settings", ActionKind::Show, &menu_icons);
@@ -219,6 +232,7 @@ fn run() -> Result<()> {
 
     let open_id = open_item.id().clone();
     let pause_id = pause_item.id().clone();
+    let keep_awake_id = keep_awake_item.id().clone();
     let update_id = update_item.id().clone();
     let settings_id = settings_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -228,6 +242,7 @@ fn run() -> Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&open_item)?;
     menu.append(&pause_item)?;
+    menu.append(&keep_awake_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&update_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -261,6 +276,7 @@ fn run() -> Result<()> {
         control_ui::html(
             autostart_enabled,
             prefs.hide_dock_icon,
+            prefs.keep_awake,
             panel_running,
             hide_dock_row,
         )
@@ -293,10 +309,11 @@ fn run() -> Result<()> {
         match event {
             Event::NewEvents(StartCause::Init) => {
                 if tray.is_none() {
-                    let icon = tray_icon_from_embedded().unwrap_or_else(fallback_icon);
+                    let icon = tray_icon_for_state(prefs.keep_awake);
+                    let tooltip = tray_tooltip(prefs.keep_awake);
                     let tray_builder = TrayIconBuilder::new()
                         .with_menu(Box::new(menu.clone()))
-                        .with_tooltip("Stitch")
+                        .with_tooltip(tooltip)
                         .with_icon(icon);
                     // macOS menu bar: template image so the system tints the
                     // monochrome grandma for light/dark menu bar chrome.
@@ -319,6 +336,7 @@ fn run() -> Result<()> {
                         webview.as_ref(),
                         autostart_enabled,
                         prefs.hide_dock_icon,
+                        prefs.keep_awake,
                         update_version.as_deref(),
                     );
                 }
@@ -345,6 +363,28 @@ fn run() -> Result<()> {
                             webview.as_ref(),
                             autostart_enabled,
                             prefs.hide_dock_icon,
+                            prefs.keep_awake,
+                            &supervisor,
+                            update_version.as_deref(),
+                        );
+                    }
+                } else if id == keep_awake_id {
+                    // muda toggles the checkmark before we see the event.
+                    let enabled = keep_awake_item.is_checked();
+                    apply_keep_awake(
+                        enabled,
+                        &mut keep_awake,
+                        &mut prefs,
+                        &paths,
+                        &keep_awake_item,
+                        tray.as_ref(),
+                    );
+                    if !awaiting_signup {
+                        sync_control_ui(
+                            webview.as_ref(),
+                            autostart_enabled,
+                            prefs.hide_dock_icon,
+                            prefs.keep_awake,
                             &supervisor,
                             update_version.as_deref(),
                         );
@@ -355,6 +395,7 @@ fn run() -> Result<()> {
                     if let Ok(mut s) = supervisor.lock() {
                         let _ = s.stop();
                     }
+                    let _ = keep_awake.set_enabled(false);
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -367,6 +408,7 @@ fn run() -> Result<()> {
                                 let control_html = control_ui::html(
                                     autostart_enabled,
                                     prefs.hide_dock_icon,
+                                    prefs.keep_awake,
                                     false,
                                     hide_dock_row,
                                 );
@@ -386,6 +428,7 @@ fn run() -> Result<()> {
                                         webview.as_ref(),
                                         autostart_enabled,
                                         prefs.hide_dock_icon,
+                                        prefs.keep_awake,
                                         update_version.as_deref(),
                                     );
                                 }
@@ -408,6 +451,9 @@ fn run() -> Result<()> {
                         control_flow,
                         webview.as_ref(),
                         &mut autostart_enabled,
+                        &mut keep_awake,
+                        &keep_awake_item,
+                        tray.as_ref(),
                         update_version.as_deref(),
                     );
                 }
@@ -427,6 +473,7 @@ fn run() -> Result<()> {
                         webview.as_ref(),
                         autostart_enabled,
                         prefs.hide_dock_icon,
+                        prefs.keep_awake,
                         &supervisor,
                         update_version.as_deref(),
                     );
@@ -446,6 +493,7 @@ fn run() -> Result<()> {
                         webview.as_ref(),
                         autostart_enabled,
                         prefs.hide_dock_icon,
+                        prefs.keep_awake,
                         &supervisor,
                         update_version.as_deref(),
                     );
@@ -473,6 +521,7 @@ fn run() -> Result<()> {
                 if let Ok(mut s) = supervisor.lock() {
                     let _ = s.stop();
                 }
+                let _ = keep_awake.set_enabled(false);
                 webview.take();
                 window.take();
                 tray.take();
@@ -532,6 +581,7 @@ fn sync_tray_and_window(
     webview: Option<&wry::WebView>,
     autostart: bool,
     hide_dock: bool,
+    keep_awake: bool,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
     update_version: Option<&str>,
 ) {
@@ -543,7 +593,14 @@ fn sync_tray_and_window(
         supervisor,
         update_version,
     );
-    sync_control_ui(webview, autostart, hide_dock, supervisor, update_version);
+    sync_control_ui(
+        webview,
+        autostart,
+        hide_dock,
+        keep_awake,
+        supervisor,
+        update_version,
+    );
 }
 
 fn start_panel_and_maybe_open(
@@ -552,6 +609,7 @@ fn start_panel_and_maybe_open(
     webview: Option<&wry::WebView>,
     autostart: bool,
     hide_dock: bool,
+    keep_awake: bool,
     update_version: Option<&str>,
 ) {
     let start_result = {
@@ -572,7 +630,14 @@ fn start_panel_and_maybe_open(
             eprintln!("stitch-desktop: {e:#}");
         }
     }
-    sync_control_ui(webview, autostart, hide_dock, supervisor, update_version);
+    sync_control_ui(
+        webview,
+        autostart,
+        hide_dock,
+        keep_awake,
+        supervisor,
+        update_version,
+    );
 }
 
 fn parse_signup_ipc(msg: &str) -> Option<(String, String)> {
@@ -599,6 +664,9 @@ fn handle_ipc(
     control_flow: &mut ControlFlow,
     webview: Option<&wry::WebView>,
     autostart_enabled: &mut bool,
+    keep_awake: &mut KeepAwakeController,
+    keep_awake_item: &CheckMenuItem,
+    tray: Option<&TrayIcon>,
     update_version: Option<&str>,
 ) {
     match msg {
@@ -615,6 +683,7 @@ fn handle_ipc(
             if let Ok(mut s) = supervisor.lock() {
                 let _ = s.stop();
             }
+            let _ = keep_awake.set_enabled(false);
             *control_flow = ControlFlow::Exit;
             return;
         }
@@ -624,6 +693,10 @@ fn handle_ipc(
                 Ok(()) => *autostart_enabled = enabled,
                 Err(e) => eprintln!("start at login failed: {e}"),
             }
+        }
+        other if other.starts_with("toggle_keep_awake:") => {
+            let enabled = other.ends_with(":1");
+            apply_keep_awake(enabled, keep_awake, prefs, paths, keep_awake_item, tray);
         }
         #[cfg(target_os = "macos")]
         other if other.starts_with("toggle_hide_dock:") => {
@@ -644,15 +717,57 @@ fn handle_ipc(
         webview,
         *autostart_enabled,
         prefs.hide_dock_icon,
+        prefs.keep_awake,
         supervisor,
         update_version,
     );
+}
+
+fn apply_keep_awake(
+    enabled: bool,
+    controller: &mut KeepAwakeController,
+    prefs: &mut DesktopPrefs,
+    paths: &paths::DesktopPaths,
+    menu_item: &CheckMenuItem,
+    tray: Option<&TrayIcon>,
+) {
+    match controller.set_enabled(enabled) {
+        Ok(()) => {
+            prefs.keep_awake = enabled;
+            if let Err(e) = prefs.save(paths) {
+                eprintln!("saving desktop prefs failed: {e:#}");
+            }
+            menu_item.set_checked(enabled);
+            apply_tray_keep_awake_chrome(tray, enabled);
+        }
+        Err(e) => {
+            eprintln!("keep awake failed: {e:#}");
+            prefs.keep_awake = false;
+            let _ = controller.set_enabled(false);
+            menu_item.set_checked(false);
+            apply_tray_keep_awake_chrome(tray, false);
+            if let Err(save_err) = prefs.save(paths) {
+                eprintln!("saving desktop prefs failed: {save_err:#}");
+            }
+        }
+    }
+}
+
+fn apply_tray_keep_awake_chrome(tray: Option<&TrayIcon>, keep_awake: bool) {
+    let Some(tray) = tray else { return };
+    if let Err(e) = tray.set_icon(Some(tray_icon_for_state(keep_awake))) {
+        eprintln!("stitch-desktop: updating tray icon failed: {e:#}");
+    }
+    if let Err(e) = tray.set_tooltip(Some(tray_tooltip(keep_awake))) {
+        eprintln!("stitch-desktop: updating tray tooltip failed: {e:#}");
+    }
 }
 
 fn sync_control_ui(
     webview: Option<&wry::WebView>,
     autostart: bool,
     hide_dock: bool,
+    keep_awake: bool,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
     update_version: Option<&str>,
 ) {
@@ -661,7 +776,13 @@ fn sync_control_ui(
         .lock()
         .map(|mut s| s.is_running())
         .unwrap_or(false);
-    let script = control_ui::set_state_script(autostart, hide_dock, panel_running, update_version);
+    let script = control_ui::set_state_script(
+        autostart,
+        hide_dock,
+        keep_awake,
+        panel_running,
+        update_version,
+    );
     if let Err(e) = wv.evaluate_script(&script) {
         eprintln!("stitch-desktop: updating control window failed: {e:#}");
     }
@@ -717,6 +838,22 @@ fn open_url(url: &str) -> Result<()> {
     }
 }
 
+fn tray_tooltip(keep_awake: bool) -> &'static str {
+    if keep_awake {
+        "Stitch — keeping awake"
+    } else {
+        "Stitch"
+    }
+}
+
+fn tray_icon_for_state(keep_awake: bool) -> Icon {
+    if keep_awake {
+        tray_icon_with_awake_badge().unwrap_or_else(fallback_icon)
+    } else {
+        tray_icon_from_embedded().unwrap_or_else(fallback_icon)
+    }
+}
+
 fn tray_icon_from_embedded() -> Option<Icon> {
     // Monochrome geometric grandma (32×32 premultiplied-ready RGBA, black + alpha).
     // Built as a menu-bar / tray template: macOS tints it; Windows/Linux show black.
@@ -728,6 +865,95 @@ fn tray_icon_from_embedded() -> Option<Icon> {
     Icon::from_rgba(RGBA.to_vec(), SIZE, SIZE).ok()
 }
 
+/// Grandma tray icon plus a small lightning badge in the lower-right corner.
+/// Template-safe (black + alpha) so macOS menu-bar tinting still works.
+fn tray_icon_with_awake_badge() -> Option<Icon> {
+    const SIZE: u32 = 32;
+    const RGBA: &[u8] = include_bytes!("../../../assets/grandma-tray-32.rgba");
+    if RGBA.len() != (SIZE * SIZE * 4) as usize {
+        return None;
+    }
+    let mut px = RGBA.to_vec();
+    paint_awake_badge(&mut px, SIZE);
+    Icon::from_rgba(px, SIZE, SIZE).ok()
+}
+
+/// Draw a compact lightning bolt (template ink) into the lower-right of a
+/// 32×32 RGBA buffer. Cleared with a soft hole first so it reads as an overlay
+/// even when the grandma mark already occupies that corner.
+fn paint_awake_badge(rgba: &mut [u8], size: u32) {
+    // Bolt polygon in icon space (lower-right).
+    let bolt: [(f32, f32); 6] = [
+        (22.0, 17.0),
+        (27.5, 17.0),
+        (24.5, 22.0),
+        (29.0, 22.0),
+        (21.5, 30.5),
+        (23.5, 23.5),
+    ];
+    // Soft circular wipe behind the bolt so it doesn't merge into grandma ink.
+    for y in 16..size as i32 {
+        for x in 20..size as i32 {
+            let dx = x as f32 + 0.5 - 25.5;
+            let dy = y as f32 + 0.5 - 24.0;
+            if dx * dx + dy * dy <= 7.5 * 7.5 {
+                let i = ((y as u32 * size + x as u32) * 4) as usize;
+                rgba[i] = 0;
+                rgba[i + 1] = 0;
+                rgba[i + 2] = 0;
+                rgba[i + 3] = 0;
+            }
+        }
+    }
+    for y in 0..size as i32 {
+        for x in 0..size as i32 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            if point_in_polygon(px, py, &bolt) {
+                let i = ((y as u32 * size + x as u32) * 4) as usize;
+                rgba[i] = 0;
+                rgba[i + 1] = 0;
+                rgba[i + 2] = 0;
+                rgba[i + 3] = 255;
+            }
+        }
+    }
+}
+
+fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    // Ray cast — even-odd fill for the small badge polygon.
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        let intersect =
+            ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi + f32::EPSILON) + xi);
+        if intersect {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 fn fallback_icon() -> Icon {
     tray_icon_from_embedded().expect("grandma tray icon")
+}
+
+#[cfg(test)]
+mod tray_badge_tests {
+    use super::paint_awake_badge;
+
+    #[test]
+    fn awake_badge_sets_ink_pixels() {
+        let mut rgba = vec![0u8; 32 * 32 * 4];
+        paint_awake_badge(&mut rgba, 32);
+        let ink = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(ink > 10, "expected lightning ink, got {ink} pixels");
+        assert!(
+            ink < 120,
+            "badge should stay a small corner overlay, got {ink}"
+        );
+    }
 }

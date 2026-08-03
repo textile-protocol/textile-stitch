@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.147"
+version = "0.1.148"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; market-makes the filler order book with signed UniswapX limit orders."
 license = "AGPL-3.0-or-later"
@@ -33,7 +33,7 @@ required-features = ["desktop"]
 # Pulls in `panel` so stitch-desktop can share STOP_GRACE_SECS and talk to the
 # same process-runtime types the panel binary embeds. `wry` draws the control
 # window; Linux `gtk` (optional target dep) is for WebKitGTK init/event pumping.
-desktop = ["panel", "dep:tray-icon", "dep:tao", "dep:wry", "dep:argon2", "gtk"]
+desktop = ["panel", "dep:tray-icon", "dep:tao", "dep:wry", "dep:argon2", "dep:keepawake", "gtk"]
 # The Stitch web UI. Gated so the bot image doesn't pull in the Docker client
 # or the embedded web assets. Process runtime (desktop) shares this feature.
 panel = [
@@ -50,6 +50,8 @@ panel = [
 tray-icon = { version = "0.19", optional = true }
 tao = { version = "0.30", default-features = false, features = ["rwh_05", "rwh_06"], optional = true }
 wry = { version = "0.48", optional = true }
+# Amphetamine-style idle/system sleep prevention for stitch-desktop.
+keepawake = { version = "0.6", optional = true, default-features = false }
 alloy-primitives = { version = "1", features = ["rlp"] }
 alloy-rlp = "0.3"
 async-trait = "0.1"
