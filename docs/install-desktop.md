@@ -5,9 +5,9 @@ you. No Docker and no terminal. For an always-on server, see
 [install-panel.md](install-panel.md).
 
 The desktop app (`stitch-desktop`) is a menu-bar (macOS) or system-tray
-(Windows / Linux) controller with a small control window that exposes the same
-actions. On macOS it also shows a Dock icon by default (you can hide it from the
-tray or the window). On first launch it:
+(Windows / Linux) controller with a small Settings window. On macOS it also
+shows a Dock icon by default (you can hide it from Settings). On first launch
+it:
 
 1. Creates a data directory (`~/Library/Application Support/Stitch` on macOS,
    `%APPDATA%\Stitch` on Windows, `~/.local/share/stitch` on Linux).
@@ -22,23 +22,24 @@ tray or the window). On first launch it:
    can sign in with that password.
 
 The tray menu leads with a running/stopped status, then **Open Stitch panel**,
-**Pause** / **Resume**, login/Dock prefs, updates, **Show window**, and Quit.
-When a newer desktop release is published, the control window shows an update
-banner and the tray item becomes **Download update**. On macOS, **Hide Dock
-icon** (off by default) keeps the menu-bar icon and drops the Dock entry; the
-preference is saved in `<data_root>/desktop-prefs.json`.
+**Pause** / **Resume**, updates, **Settings**, and Quit. Login and Dock prefs
+live in the Settings window only. When a newer desktop release is published,
+the control window shows an update banner and the tray item becomes **Download
+update**. On macOS, **Hide Dock icon** (off by default, in Settings) keeps the
+menu-bar icon and drops the Dock entry; the preference is saved in
+`<data_root>/desktop-prefs.json`.
 
 If you still have a legacy `panel.password` file from an older build, the app
 asks you to choose a new password and deletes the cleartext file.
 
-Closing the control window hides it — it does not quit. Use **Show Stitch
-window** in the tray, or click the Dock icon when it has no visible windows.
+Closing the Settings window hides it — it does not quit. Use **Settings** in
+the tray, or click the Dock icon when it has no visible windows.
 
-**Start at login** registers the OS login item (LaunchAgent on macOS, Run key
-on Windows, XDG autostart on Linux). On boot the tray app starts quietly
-(`--autostart` — no browser tab, no control window), brings the panel up, and
-the process runtime restarts bots that were left on when you last stopped or
-quit the panel.
+**Start at login** (in Settings) registers the OS login item (LaunchAgent on
+macOS, Run key on Windows, XDG autostart on Linux). On boot the tray app starts
+quietly (`--autostart` — no browser tab, no control window), brings the panel
+up, and the process runtime restarts bots that were left on when you last
+stopped or quit the panel.
 
 ## Download
 

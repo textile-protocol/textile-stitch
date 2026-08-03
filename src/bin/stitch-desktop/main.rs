@@ -27,10 +27,10 @@ use anyhow::{Context, Result};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
-use tray_icon::menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, PredefinedMenuItem};
+use tray_icon::menu::{IconMenuItem, Menu, MenuEvent, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::menu_icons::MenuIcons;
+use crate::menu_icons::{ActionKind, MenuIcons, StatusKind};
 use wry::WebViewBuilder;
 
 use crate::prefs::DesktopPrefs;
@@ -187,56 +187,40 @@ fn run() -> Result<()> {
         .map(|mut s| s.is_running())
         .unwrap_or(false);
 
-    // Docker-style tray menu: status first, then actions, prefs, update, show/quit.
-    let status_item = IconMenuItem::new(
+    // Tray menu: status, open/pause, updates, settings, quit.
+    // Login / Dock prefs live only in the Settings window.
+    let status_item = menu_icons::status_item(
         if panel_running {
             "Panel running"
         } else {
             "Panel stopped"
         },
-        false,
-        Some(if panel_running {
-            menu_icons.dot_running.clone()
+        if panel_running {
+            StatusKind::Running
         } else {
-            menu_icons.dot_stopped.clone()
-        }),
-        None,
+            StatusKind::Stopped
+        },
+        &menu_icons,
     );
-    let open_item = IconMenuItem::new(
-        "Open Stitch panel",
-        true,
-        Some(menu_icons.open.clone()),
-        None,
-    );
-    let pause_item = IconMenuItem::new(
+    let open_item = menu_icons::action_item("Open Stitch panel", ActionKind::Open, &menu_icons);
+    let pause_item = menu_icons::action_item(
         if panel_running { "Pause" } else { "Resume" },
-        true,
-        Some(if panel_running {
-            menu_icons.pause.clone()
+        if panel_running {
+            ActionKind::Pause
         } else {
-            menu_icons.resume.clone()
-        }),
-        None,
+            ActionKind::Resume
+        },
+        &menu_icons,
     );
-    let autostart_item = CheckMenuItem::new("Start at login", true, autostart::is_enabled(), None);
-    #[cfg(target_os = "macos")]
-    let hide_dock_item = CheckMenuItem::new("Hide Dock icon", true, prefs.hide_dock_icon, None);
-    let update_item = IconMenuItem::new(
-        "Check for updates…",
-        true,
-        Some(menu_icons.update.clone()),
-        None,
-    );
-    let show_item = IconMenuItem::new("Show window", true, Some(menu_icons.show.clone()), None);
-    let quit_item = IconMenuItem::new("Quit Stitch", true, Some(menu_icons.quit.clone()), None);
+    let update_item =
+        menu_icons::action_item("Check for updates…", ActionKind::Update, &menu_icons);
+    let settings_item = menu_icons::action_item("Settings", ActionKind::Show, &menu_icons);
+    let quit_item = menu_icons::action_item("Quit Stitch", ActionKind::Quit, &menu_icons);
 
     let open_id = open_item.id().clone();
     let pause_id = pause_item.id().clone();
-    let autostart_id = autostart_item.id().clone();
-    #[cfg(target_os = "macos")]
-    let hide_dock_id = hide_dock_item.id().clone();
     let update_id = update_item.id().clone();
-    let show_id = show_item.id().clone();
+    let settings_id = settings_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     let menu = Menu::new();
@@ -245,13 +229,9 @@ fn run() -> Result<()> {
     menu.append(&open_item)?;
     menu.append(&pause_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&autostart_item)?;
-    #[cfg(target_os = "macos")]
-    menu.append(&hide_dock_item)?;
-    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&update_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&show_item)?;
+    menu.append(&settings_item)?;
     menu.append(&quit_item)?;
     // Password setup always shows the window, even on login-item autostart.
     let show_window = !quiet_launch || awaiting_signup;
@@ -275,7 +255,7 @@ fn run() -> Result<()> {
         control_ui::signup_html(legacy_password_reset)
     } else {
         control_ui::html(
-            autostart_item.is_checked(),
+            autostart::is_enabled(),
             prefs.hide_dock_icon,
             panel_running,
             hide_dock_row,
@@ -333,14 +313,14 @@ fn run() -> Result<()> {
                         &supervisor,
                         !quiet_launch,
                         webview.as_ref(),
-                        &autostart_item,
+                        autostart::is_enabled(),
                         prefs.hide_dock_icon,
                         update_version.as_deref(),
                     );
                 }
             }
             Event::UserEvent(UserEvent::Menu(id)) => {
-                if id == show_id {
+                if id == settings_id {
                     show_control_window(window.as_ref());
                 } else if id == open_id {
                     if awaiting_signup {
@@ -359,23 +339,7 @@ fn run() -> Result<()> {
                             &update_item,
                             &menu_icons,
                             webview.as_ref(),
-                            &autostart_item,
-                            prefs.hide_dock_icon,
-                            &supervisor,
-                            update_version.as_deref(),
-                        );
-                    }
-                } else if id == autostart_id {
-                    // muda toggles the checkmark before we see the event.
-                    let enabled = autostart_item.is_checked();
-                    if let Err(e) = autostart::set_enabled(enabled) {
-                        eprintln!("start at login failed: {e}");
-                        autostart_item.set_checked(!enabled);
-                    }
-                    if !awaiting_signup {
-                        sync_control_ui(
-                            webview.as_ref(),
-                            &autostart_item,
+                            autostart::is_enabled(),
                             prefs.hide_dock_icon,
                             &supervisor,
                             update_version.as_deref(),
@@ -389,24 +353,6 @@ fn run() -> Result<()> {
                     }
                     *control_flow = ControlFlow::Exit;
                 }
-                #[cfg(target_os = "macos")]
-                if id == hide_dock_id {
-                    let hide = hide_dock_item.is_checked();
-                    prefs.hide_dock_icon = hide;
-                    if let Err(e) = prefs.save(&paths) {
-                        eprintln!("saving desktop prefs failed: {e:#}");
-                    }
-                    apply_dock_policy(elwt, hide);
-                    if !awaiting_signup {
-                        sync_control_ui(
-                            webview.as_ref(),
-                            &autostart_item,
-                            prefs.hide_dock_icon,
-                            &supervisor,
-                            update_version.as_deref(),
-                        );
-                    }
-                }
             }
             Event::UserEvent(UserEvent::Ipc(msg)) => {
                 if awaiting_signup {
@@ -415,7 +361,7 @@ fn run() -> Result<()> {
                             Ok(()) => {
                                 awaiting_signup = false;
                                 let control_html = control_ui::html(
-                                    autostart_item.is_checked(),
+                                    autostart::is_enabled(),
                                     prefs.hide_dock_icon,
                                     false,
                                     hide_dock_row,
@@ -434,7 +380,7 @@ fn run() -> Result<()> {
                                         &supervisor,
                                         true,
                                         webview.as_ref(),
-                                        &autostart_item,
+                                        autostart::is_enabled(),
                                         prefs.hide_dock_icon,
                                         update_version.as_deref(),
                                     );
@@ -452,9 +398,6 @@ fn run() -> Result<()> {
                     handle_ipc(
                         &msg,
                         &supervisor,
-                        &autostart_item,
-                        #[cfg(target_os = "macos")]
-                        &hide_dock_item,
                         &mut prefs,
                         &paths,
                         elwt,
@@ -477,7 +420,7 @@ fn run() -> Result<()> {
                 if !awaiting_signup {
                     sync_control_ui(
                         webview.as_ref(),
-                        &autostart_item,
+                        autostart::is_enabled(),
                         prefs.hide_dock_icon,
                         &supervisor,
                         update_version.as_deref(),
@@ -496,7 +439,7 @@ fn run() -> Result<()> {
                 if !awaiting_signup {
                     sync_control_ui(
                         webview.as_ref(),
-                        &autostart_item,
+                        autostart::is_enabled(),
                         prefs.hide_dock_icon,
                         &supervisor,
                         update_version.as_deref(),
@@ -560,14 +503,14 @@ fn sync_tray_menu(
         .unwrap_or(false);
     if running {
         status_item.set_text("Panel running");
-        status_item.set_icon(Some(icons.dot_running.clone()));
+        menu_icons::apply_status(status_item, StatusKind::Running, icons);
         pause_item.set_text("Pause");
-        pause_item.set_icon(Some(icons.pause.clone()));
+        menu_icons::apply_action(pause_item, ActionKind::Pause, icons);
     } else {
         status_item.set_text("Panel stopped");
-        status_item.set_icon(Some(icons.dot_stopped.clone()));
+        menu_icons::apply_status(status_item, StatusKind::Stopped, icons);
         pause_item.set_text("Resume");
-        pause_item.set_icon(Some(icons.resume.clone()));
+        menu_icons::apply_action(pause_item, ActionKind::Resume, icons);
     }
     if update_version.is_some() {
         update_item.set_text("Download update");
@@ -582,7 +525,7 @@ fn sync_tray_and_window(
     update_item: &IconMenuItem,
     icons: &MenuIcons,
     webview: Option<&wry::WebView>,
-    autostart_item: &CheckMenuItem,
+    autostart: bool,
     hide_dock: bool,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
     update_version: Option<&str>,
@@ -595,20 +538,14 @@ fn sync_tray_and_window(
         supervisor,
         update_version,
     );
-    sync_control_ui(
-        webview,
-        autostart_item,
-        hide_dock,
-        supervisor,
-        update_version,
-    );
+    sync_control_ui(webview, autostart, hide_dock, supervisor, update_version);
 }
 
 fn start_panel_and_maybe_open(
     supervisor: &Arc<Mutex<PanelSupervisor>>,
     open_browser: bool,
     webview: Option<&wry::WebView>,
-    autostart_item: &CheckMenuItem,
+    autostart: bool,
     hide_dock: bool,
     update_version: Option<&str>,
 ) {
@@ -630,13 +567,7 @@ fn start_panel_and_maybe_open(
             eprintln!("stitch-desktop: {e:#}");
         }
     }
-    sync_control_ui(
-        webview,
-        autostart_item,
-        hide_dock,
-        supervisor,
-        update_version,
-    );
+    sync_control_ui(webview, autostart, hide_dock, supervisor, update_version);
 }
 
 fn parse_signup_ipc(msg: &str) -> Option<(String, String)> {
@@ -656,8 +587,6 @@ fn parse_signup_ipc(msg: &str) -> Option<(String, String)> {
 fn handle_ipc(
     msg: &str,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
-    autostart_item: &CheckMenuItem,
-    #[cfg(target_os = "macos")] hide_dock_item: &CheckMenuItem,
     prefs: &mut DesktopPrefs,
     paths: &paths::DesktopPaths,
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -687,16 +616,12 @@ fn handle_ipc(
             let enabled = other.ends_with(":1");
             if let Err(e) = autostart::set_enabled(enabled) {
                 eprintln!("start at login failed: {e}");
-                autostart_item.set_checked(!enabled);
-            } else {
-                autostart_item.set_checked(enabled);
             }
         }
         #[cfg(target_os = "macos")]
         other if other.starts_with("toggle_hide_dock:") => {
             let hide = other.ends_with(":1");
             prefs.hide_dock_icon = hide;
-            hide_dock_item.set_checked(hide);
             if let Err(e) = prefs.save(paths) {
                 eprintln!("saving desktop prefs failed: {e:#}");
             }
@@ -710,7 +635,7 @@ fn handle_ipc(
     }
     sync_control_ui(
         webview,
-        autostart_item,
+        autostart::is_enabled(),
         prefs.hide_dock_icon,
         supervisor,
         update_version,
@@ -719,7 +644,7 @@ fn handle_ipc(
 
 fn sync_control_ui(
     webview: Option<&wry::WebView>,
-    autostart_item: &CheckMenuItem,
+    autostart: bool,
     hide_dock: bool,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
     update_version: Option<&str>,
@@ -729,12 +654,7 @@ fn sync_control_ui(
         .lock()
         .map(|mut s| s.is_running())
         .unwrap_or(false);
-    let script = control_ui::set_state_script(
-        autostart_item.is_checked(),
-        hide_dock,
-        panel_running,
-        update_version,
-    );
+    let script = control_ui::set_state_script(autostart, hide_dock, panel_running, update_version);
     if let Err(e) = wv.evaluate_script(&script) {
         eprintln!("stitch-desktop: updating control window failed: {e:#}");
     }
