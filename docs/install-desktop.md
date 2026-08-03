@@ -58,5 +58,6 @@ Product page: [textilecredit.com/stitch](https://textilecredit.com/stitch).
 
 ## Server / Docker
 
-For always-on hosts, use [install-panel.md](install-panel.md) (`install-panel.sh`
-/ `.ps1`). That path still uses Docker Compose.
+For always-on hosts (AWS EC2, any Linux VPS), start with
+[Install on AWS or any server](install-server.md). The advanced Docker panel
+reference is [install-panel.md](install-panel.md) (`install-panel.sh` / `.ps1`).

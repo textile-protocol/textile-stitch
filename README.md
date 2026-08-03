@@ -60,7 +60,9 @@ panel. For unattended 24/7 quoting on a server, use Option 2.
 
 ### Option 2 — Server / Docker
 
-For a server or any Docker host that should stay up. One command:
+For a server or any Docker host that should stay up — including AWS EC2 and
+other Linux VPS hosts. Full walkthrough:
+[Install on AWS or any server](docs/install-server.md). One command:
 
 ```bash
 # macOS / Linux — prefer a release tag + checksum (see docs/install-panel.md). Quick path:
@@ -96,6 +98,8 @@ Everything else — custom reverse proxy, building from source — is in
 
 - [Install with an AI agent](#install-with-an-ai-agent) — your coding agent
   installs the panel; you finish bot setup in the web UI.
+- [Install on AWS or any server](docs/install-server.md) — always-on Linux host
+  (EC2, VPS, bare metal) with Docker + Tailscale.
 - [Docker](docs/install-docker.md) — the Stitch on its own, without Stitch panel.
 - [Stitch (web)](docs/install-panel.md) — the advanced and manual routes for
   Option 2 above.

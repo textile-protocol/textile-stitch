@@ -39,6 +39,10 @@ use crate::prefs::DesktopPrefs;
 use crate::supervise::PanelSupervisor;
 
 const PANEL_URL: &str = "http://127.0.0.1:8420";
+
+/// Public guide for always-on Linux hosts (EC2, VPS, bare metal).
+const SERVER_INSTALL_DOCS: &str =
+    "https://github.com/textile-protocol/textile-stitch/blob/main/docs/install-server.md";
 const WINDOW_TITLE: &str = "Stitch";
 const WINDOW_INNER_WIDTH: f64 = 380.0;
 const WINDOW_INNER_HEIGHT: f64 = 520.0;
@@ -672,6 +676,9 @@ fn handle_ipc(
     match msg {
         "open" => {
             let _ = open_url(PANEL_URL);
+        }
+        "open_server_docs" => {
+            let _ = open_url(SERVER_INSTALL_DOCS);
         }
         "toggle_panel" => {
             toggle_panel(supervisor);

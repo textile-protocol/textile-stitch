@@ -53,6 +53,12 @@ fn theme_css() -> &'static str {
     gap: 12px;
     margin: 0 0 18px;
   }
+  .brand-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
   .mark {
     width: 36px;
     height: 36px;
@@ -151,6 +157,25 @@ fn theme_css() -> &'static str {
     cursor: wait;
   }
   button:active { transform: translateY(1px); }
+  button.subtitle {
+    width: auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--tx-text-tertiary);
+    font-size: 12px;
+    line-height: 1.35;
+    letter-spacing: 0.01em;
+    font-weight: 400;
+  }
+  button.subtitle:hover {
+    color: var(--tx-accent);
+    background: transparent;
+    border-color: transparent;
+  }
+  button.subtitle:active { transform: none; }
   .check {
     display: flex;
     align-items: center;
@@ -310,7 +335,12 @@ pub fn html(
 <main>
   <div class="brand-row">
     {textile_icon}
-    <h1>Stitch</h1>
+    <div class="brand-text">
+      <h1>Stitch</h1>
+      <button type="button" class="subtitle" data-action="open_server_docs">
+        Install on AWS or any server →
+      </button>
+    </div>
   </div>
   <div id="update-banner" class="update-banner" hidden>
     <div><strong>Update available</strong> — Stitch <span id="update-version"></span> is ready to download.</div>
