@@ -47,6 +47,8 @@ pub struct MenuIcons {
     show: Icon,
     #[cfg(not(target_os = "macos"))]
     quit: Icon,
+    #[cfg(not(target_os = "macos"))]
+    keep_awake: Icon,
 }
 
 impl MenuIcons {
@@ -68,6 +70,7 @@ impl MenuIcons {
                 update: draw_update(ink).expect("update"),
                 show: draw_show(ink).expect("show"),
                 quit: draw_quit(ink).expect("quit"),
+                keep_awake: draw_keep_awake(ink).expect("keep_awake"),
             }
         }
     }
@@ -121,6 +124,44 @@ pub fn apply_action(item: &IconMenuItem, kind: ActionKind, icons: &MenuIcons) {
     }
 }
 
+/// Keep-awake row. muda's [`CheckMenuItem`] cannot carry an icon, so this is an
+/// [`IconMenuItem`] with a computer glyph; on-state uses a leading checkmark in
+/// the title (AppKit's state column isn't available on icon items).
+pub fn keep_awake_item(enabled: bool, icons: &MenuIcons) -> IconMenuItem {
+    let text = keep_awake_title(enabled);
+    #[cfg(target_os = "macos")]
+    {
+        let _ = icons;
+        IconMenuItem::with_native_icon(text, true, Some(NativeIcon::Computer), None)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        IconMenuItem::new(text, true, Some(icons.keep_awake.clone()), None)
+    }
+}
+
+pub fn apply_keep_awake(item: &IconMenuItem, enabled: bool, icons: &MenuIcons) {
+    item.set_text(keep_awake_title(enabled));
+    #[cfg(target_os = "macos")]
+    {
+        let _ = icons;
+        item.set_native_icon(Some(NativeIcon::Computer));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = icons;
+    }
+}
+
+fn keep_awake_title(enabled: bool) -> String {
+    let label = crate::keep_awake::label();
+    if enabled {
+        format!("✓  {label}")
+    } else {
+        label.to_string()
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn native_status(kind: StatusKind) -> NativeIcon {
     match kind {
@@ -138,7 +179,9 @@ fn native_action(kind: ActionKind) -> NativeIcon {
         // glyph. Resume uses the right-facing triangle (play).
         ActionKind::Pause => NativeIcon::StopProgress,
         ActionKind::Resume => NativeIcon::RightFacingTriangle,
-        ActionKind::Update => NativeIcon::Caution,
+        // Outlined circular arrows — Caution was a yellow warning triangle.
+        ActionKind::Update => NativeIcon::RefreshFreestanding,
+        // Template gear (System Settings family). Outlined at menu size.
         ActionKind::Show => NativeIcon::PreferencesGeneral,
         ActionKind::Quit => NativeIcon::StopProgressFreestanding,
     }
@@ -297,22 +340,65 @@ fn edge(x0: f32, y0: f32, x1: f32, y1: f32, x: f32, y: f32) -> f32 {
     (x - x0) * (y1 - y0) - (y - y0) * (x1 - x0)
 }
 
+/// Outlined circular arrows (refresh) — matches macOS RefreshFreestanding.
 #[cfg(not(target_os = "macos"))]
 fn draw_update(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
     let cx = 15.5;
     let cy = 15.5;
-    px.stroke_circle_aa(cx, cy, 10.0, c, 2.0);
-    px.fill_round_rect(14.5, 8.0, 16.5, 18.0, 0.8, c);
-    px.fill_circle_aa(cx, 21.5, 1.6, c.0, c.1, c.2);
+    // Open ring (gap at top-right) + arrow head.
+    px.stroke_arc_aa(cx, cy, 9.0, 40.0, 300.0, c, 2.2);
+    // Arrow head pointing clockwise at the gap.
+    px.fill_circle_aa(cx + 7.2, cy - 5.2, 1.4, c.0, c.1, c.2);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let px_x = x as f32 + 0.5;
+            let px_y = y as f32 + 0.5;
+            // Small triangle tip near (22, 8).
+            let a = edge(19.0, 6.0, 24.5, 6.5, px_x, px_y);
+            let b = edge(24.5, 6.5, 22.0, 11.5, px_x, px_y);
+            let d = edge(22.0, 11.5, 19.0, 6.0, px_x, px_y);
+            if a >= 0.0 && b >= 0.0 && d >= 0.0 {
+                px.blend(x as i32, y as i32, c.0, c.1, c.2, 1.0);
+            }
+        }
+    }
     px.into_icon()
 }
 
+/// Outlined gear for Settings.
 #[cfg(not(target_os = "macos"))]
 fn draw_show(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
-    px.stroke_round_rect(5.0, 7.0, 26.0, 24.0, 2.0, c, 2.0);
-    px.hline_aa(5.0, 12.0, 26.0, c, 2.0);
+    let cx = 15.5;
+    let cy = 15.5;
+    // Hub ring.
+    px.stroke_circle_aa(cx, cy, 5.0, c, 2.0);
+    // Six teeth as short radial strokes.
+    for i in 0..6 {
+        let ang = (i as f32 * 60.0).to_radians();
+        let x0 = cx + ang.cos() * 7.5;
+        let y0 = cy + ang.sin() * 7.5;
+        let x1 = cx + ang.cos() * 11.5;
+        let y1 = cy + ang.sin() * 11.5;
+        // Approximate stroke with a chain of dots.
+        for t in 0..=6 {
+            let u = t as f32 / 6.0;
+            px.fill_circle_aa(x0 + (x1 - x0) * u, y0 + (y1 - y0) * u, 1.15, c.0, c.1, c.2);
+        }
+    }
+    px.into_icon()
+}
+
+/// Outlined display / computer for Keep awake (off).
+#[cfg(not(target_os = "macos"))]
+fn draw_keep_awake(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
+    let mut px = Canvas::new();
+    // Monitor bezel.
+    px.stroke_round_rect(5.0, 6.0, 26.0, 20.0, 2.0, c, 2.0);
+    // Stand.
+    px.hline_aa(12.0, 23.0, 19.0, c, 2.0);
+    px.hline_aa(9.0, 26.0, 22.0, c, 2.0);
     px.into_icon()
 }
 

@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
-use tray_icon::menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, PredefinedMenuItem};
+use tray_icon::menu::{IconMenuItem, Menu, MenuEvent, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::keep_awake::KeepAwakeController;
@@ -228,7 +228,7 @@ fn run() -> Result<()> {
         },
         &menu_icons,
     );
-    let keep_awake_item = CheckMenuItem::new(keep_awake::label(), true, prefs.keep_awake, None);
+    let keep_awake_item = menu_icons::keep_awake_item(prefs.keep_awake, &menu_icons);
     let update_item =
         menu_icons::action_item("Check for updates…", ActionKind::Update, &menu_icons);
     let settings_item = menu_icons::action_item("Settings", ActionKind::Show, &menu_icons);
@@ -373,14 +373,16 @@ fn run() -> Result<()> {
                         );
                     }
                 } else if id == keep_awake_id {
-                    // muda toggles the checkmark before we see the event.
-                    let enabled = keep_awake_item.is_checked();
+                    // IconMenuItem (needed for the computer glyph) does not
+                    // auto-toggle — flip from current prefs.
+                    let enabled = !prefs.keep_awake;
                     apply_keep_awake(
                         enabled,
                         &mut keep_awake,
                         &mut prefs,
                         &paths,
                         &keep_awake_item,
+                        &menu_icons,
                         tray.as_ref(),
                     );
                     if !awaiting_signup {
@@ -457,6 +459,7 @@ fn run() -> Result<()> {
                         &mut autostart_enabled,
                         &mut keep_awake,
                         &keep_awake_item,
+                        &menu_icons,
                         tray.as_ref(),
                         update_version.as_deref(),
                     );
@@ -669,7 +672,8 @@ fn handle_ipc(
     webview: Option<&wry::WebView>,
     autostart_enabled: &mut bool,
     keep_awake: &mut KeepAwakeController,
-    keep_awake_item: &CheckMenuItem,
+    keep_awake_item: &IconMenuItem,
+    menu_icons: &MenuIcons,
     tray: Option<&TrayIcon>,
     update_version: Option<&str>,
 ) {
@@ -703,7 +707,15 @@ fn handle_ipc(
         }
         other if other.starts_with("toggle_keep_awake:") => {
             let enabled = other.ends_with(":1");
-            apply_keep_awake(enabled, keep_awake, prefs, paths, keep_awake_item, tray);
+            apply_keep_awake(
+                enabled,
+                keep_awake,
+                prefs,
+                paths,
+                keep_awake_item,
+                menu_icons,
+                tray,
+            );
         }
         #[cfg(target_os = "macos")]
         other if other.starts_with("toggle_hide_dock:") => {
@@ -735,7 +747,8 @@ fn apply_keep_awake(
     controller: &mut KeepAwakeController,
     prefs: &mut DesktopPrefs,
     paths: &paths::DesktopPaths,
-    menu_item: &CheckMenuItem,
+    menu_item: &IconMenuItem,
+    menu_icons: &MenuIcons,
     tray: Option<&TrayIcon>,
 ) {
     match controller.set_enabled(enabled) {
@@ -744,14 +757,14 @@ fn apply_keep_awake(
             if let Err(e) = prefs.save(paths) {
                 eprintln!("saving desktop prefs failed: {e:#}");
             }
-            menu_item.set_checked(enabled);
+            menu_icons::apply_keep_awake(menu_item, enabled, menu_icons);
             apply_tray_keep_awake_chrome(tray, enabled);
         }
         Err(e) => {
             eprintln!("keep awake failed: {e:#}");
             prefs.keep_awake = false;
             let _ = controller.set_enabled(false);
-            menu_item.set_checked(false);
+            menu_icons::apply_keep_awake(menu_item, false, menu_icons);
             apply_tray_keep_awake_chrome(tray, false);
             if let Err(save_err) = prefs.save(paths) {
                 eprintln!("saving desktop prefs failed: {save_err:#}");
@@ -762,7 +775,15 @@ fn apply_keep_awake(
 
 fn apply_tray_keep_awake_chrome(tray: Option<&TrayIcon>, keep_awake: bool) {
     let Some(tray) = tray else { return };
-    if let Err(e) = tray.set_icon(Some(tray_icon_for_state(keep_awake))) {
+    let icon = tray_icon_for_state(keep_awake);
+    // set_icon alone drops the macOS template flag, so the grandma stops
+    // following light/dark menu-bar chrome after the first toggle. Always
+    // re-assert template=true with the replacement icon.
+    #[cfg(target_os = "macos")]
+    let icon_result = tray.set_icon_with_as_template(Some(icon), true);
+    #[cfg(not(target_os = "macos"))]
+    let icon_result = tray.set_icon(Some(icon));
+    if let Err(e) = icon_result {
         eprintln!("stitch-desktop: updating tray icon failed: {e:#}");
     }
     if let Err(e) = tray.set_tooltip(Some(tray_tooltip(keep_awake))) {
