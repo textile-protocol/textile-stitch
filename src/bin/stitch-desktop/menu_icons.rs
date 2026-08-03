@@ -164,8 +164,7 @@ fn action_bitmap(icons: &MenuIcons, kind: ActionKind) -> Icon {
     }
 }
 
-/// Ink for monochrome glyphs. Prefer light glyphs on Windows (Win11 tray menus
-/// are usually dark) and when a dark GTK theme is advertised.
+/// Ink for monochrome glyphs. Light glyphs on dark menus; dark glyphs on light.
 #[cfg(not(target_os = "macos"))]
 fn menu_ink() -> (u8, u8, u8) {
     if prefer_light_glyphs() {
@@ -179,13 +178,61 @@ fn menu_ink() -> (u8, u8, u8) {
 fn prefer_light_glyphs() -> bool {
     #[cfg(target_os = "windows")]
     {
-        true
+        // AppsUseLightTheme=1 → light app chrome / menus → dark ink.
+        // Missing key or query failure: Win11 tray menus are usually dark.
+        !windows_apps_use_light_theme().unwrap_or(false)
     }
     #[cfg(not(target_os = "windows"))]
     {
         std::env::var_os("GTK_THEME")
             .map(|v| v.to_string_lossy().to_ascii_lowercase().contains("dark"))
             .unwrap_or(false)
+    }
+}
+
+/// `HKCU\...\Personalize\AppsUseLightTheme` — 1 light, 0 dark.
+#[cfg(target_os = "windows")]
+fn windows_apps_use_light_theme() -> Option<bool> {
+    use std::process::Command;
+    let output = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "/v",
+            "AppsUseLightTheme",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_apps_use_light_theme_reg(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `reg query … /v AppsUseLightTheme` stdout.
+#[cfg(any(test, target_os = "windows"))]
+fn parse_apps_use_light_theme_reg(stdout: &str) -> Option<bool> {
+    // Typical line: `    AppsUseLightTheme    REG_DWORD    0x1`
+    let value = stdout
+        .lines()
+        .find(|line| line.contains("AppsUseLightTheme"))?
+        .split_whitespace()
+        .last()?;
+    let n = u32::from_str_radix(value.trim_start_matches("0x"), 16).ok()?;
+    Some(n != 0)
+}
+
+#[cfg(test)]
+mod theme_ink_tests {
+    use super::parse_apps_use_light_theme_reg;
+
+    #[test]
+    fn parses_light_and_dark_reg_output() {
+        let light = "\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\n    AppsUseLightTheme    REG_DWORD    0x1\n\n";
+        let dark = "\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\n    AppsUseLightTheme    REG_DWORD    0x0\n\n";
+        assert_eq!(parse_apps_use_light_theme_reg(light), Some(true));
+        assert_eq!(parse_apps_use_light_theme_reg(dark), Some(false));
+        assert_eq!(parse_apps_use_light_theme_reg("nope"), None);
     }
 }
 

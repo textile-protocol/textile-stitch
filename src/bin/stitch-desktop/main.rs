@@ -251,11 +251,15 @@ fn run() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let hide_dock_row = false;
 
+    // Cache OS login-item state. RefreshStatus runs every few seconds; on Windows
+    // is_enabled() shells out to `reg query`, which stalls the UI thread.
+    let mut autostart_enabled = autostart::is_enabled();
+
     let html = if awaiting_signup {
         control_ui::signup_html(legacy_password_reset)
     } else {
         control_ui::html(
-            autostart::is_enabled(),
+            autostart_enabled,
             prefs.hide_dock_icon,
             panel_running,
             hide_dock_row,
@@ -313,7 +317,7 @@ fn run() -> Result<()> {
                         &supervisor,
                         !quiet_launch,
                         webview.as_ref(),
-                        autostart::is_enabled(),
+                        autostart_enabled,
                         prefs.hide_dock_icon,
                         update_version.as_deref(),
                     );
@@ -339,7 +343,7 @@ fn run() -> Result<()> {
                             &update_item,
                             &menu_icons,
                             webview.as_ref(),
-                            autostart::is_enabled(),
+                            autostart_enabled,
                             prefs.hide_dock_icon,
                             &supervisor,
                             update_version.as_deref(),
@@ -361,7 +365,7 @@ fn run() -> Result<()> {
                             Ok(()) => {
                                 awaiting_signup = false;
                                 let control_html = control_ui::html(
-                                    autostart::is_enabled(),
+                                    autostart_enabled,
                                     prefs.hide_dock_icon,
                                     false,
                                     hide_dock_row,
@@ -380,7 +384,7 @@ fn run() -> Result<()> {
                                         &supervisor,
                                         true,
                                         webview.as_ref(),
-                                        autostart::is_enabled(),
+                                        autostart_enabled,
                                         prefs.hide_dock_icon,
                                         update_version.as_deref(),
                                     );
@@ -403,6 +407,7 @@ fn run() -> Result<()> {
                         elwt,
                         control_flow,
                         webview.as_ref(),
+                        &mut autostart_enabled,
                         update_version.as_deref(),
                     );
                 }
@@ -420,7 +425,7 @@ fn run() -> Result<()> {
                 if !awaiting_signup {
                     sync_control_ui(
                         webview.as_ref(),
-                        autostart::is_enabled(),
+                        autostart_enabled,
                         prefs.hide_dock_icon,
                         &supervisor,
                         update_version.as_deref(),
@@ -439,7 +444,7 @@ fn run() -> Result<()> {
                 if !awaiting_signup {
                     sync_control_ui(
                         webview.as_ref(),
-                        autostart::is_enabled(),
+                        autostart_enabled,
                         prefs.hide_dock_icon,
                         &supervisor,
                         update_version.as_deref(),
@@ -593,6 +598,7 @@ fn handle_ipc(
     elwt: &tao::event_loop::EventLoopWindowTarget<UserEvent>,
     control_flow: &mut ControlFlow,
     webview: Option<&wry::WebView>,
+    autostart_enabled: &mut bool,
     update_version: Option<&str>,
 ) {
     match msg {
@@ -614,8 +620,9 @@ fn handle_ipc(
         }
         other if other.starts_with("toggle_autostart:") => {
             let enabled = other.ends_with(":1");
-            if let Err(e) = autostart::set_enabled(enabled) {
-                eprintln!("start at login failed: {e}");
+            match autostart::set_enabled(enabled) {
+                Ok(()) => *autostart_enabled = enabled,
+                Err(e) => eprintln!("start at login failed: {e}"),
             }
         }
         #[cfg(target_os = "macos")]
@@ -635,7 +642,7 @@ fn handle_ipc(
     }
     sync_control_ui(
         webview,
-        autostart::is_enabled(),
+        *autostart_enabled,
         prefs.hide_dock_icon,
         supervisor,
         update_version,
