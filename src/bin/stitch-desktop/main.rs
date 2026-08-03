@@ -25,6 +25,8 @@ mod paths;
 mod prefs;
 mod supervise;
 mod win_cmd;
+#[cfg(windows)]
+mod win_reg;
 
 use std::sync::{Arc, Mutex};
 
@@ -296,8 +298,7 @@ fn run() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let hide_dock_row = false;
 
-    // Cache OS login-item state. RefreshStatus runs every few seconds; on Windows
-    // is_enabled() shells out to `reg query`, which stalls the UI thread.
+    // Cache OS login-item state (toggle updates this; avoid re-querying every poll).
     let mut autostart_enabled = autostart::is_enabled();
 
     let html = if awaiting_signup {

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Hide the console window when spawning Windows CLI tools (`reg`, `cmd`,
-//! `tasklist`, …). Without this, each spawn flashes a black console — operators
-//! often mistake that for the panel browser failing to open.
+//! Hide the console window when spawning Windows CLI tools (`tasklist`,
+//! `taskkill`, …). Without this, each spawn flashes a black console.
+//! Registry access goes through [`crate::win_reg`] (no `reg.exe`).
 
 use std::process::Command;
 

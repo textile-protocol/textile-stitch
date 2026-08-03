@@ -16,8 +16,9 @@ const APP_ID: &str = "io.textile.stitch-desktop";
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_LABEL: &str = "io.textile.stitch-desktop";
 
+/// Subkey under HKCU (no `HKCU\` prefix — Advapi32 takes the hive separately).
 #[cfg(target_os = "windows")]
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 #[cfg(target_os = "windows")]
 const VALUE_NAME: &str = "TextileStitchDesktop";
@@ -126,53 +127,20 @@ fn disable() -> io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn platform_is_enabled() -> io::Result<bool> {
-    use std::process::Command;
-    let mut cmd = Command::new("reg");
-    cmd.args(["query", RUN_KEY, "/v", VALUE_NAME]);
-    crate::win_cmd::no_window(&mut cmd);
-    let output = cmd.output()?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).contains(VALUE_NAME))
+    // In-process registry read — no `reg.exe` console flash / spawn cost.
+    Ok(crate::win_reg::hkcu_has_value(RUN_SUBKEY, VALUE_NAME))
 }
 
 #[cfg(target_os = "windows")]
 fn enable() -> io::Result<()> {
-    use std::process::Command;
     let exe = current_exe()?;
     let value = format!("\"{}\" --autostart", exe.display());
-    let mut cmd = Command::new("reg");
-    cmd.args([
-        "add", RUN_KEY, "/v", VALUE_NAME, "/t", "REG_SZ", "/d", &value, "/f",
-    ]);
-    crate::win_cmd::no_window(&mut cmd);
-    let status = cmd.status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "reg add failed with status {status}"
-        )));
-    }
-    Ok(())
+    crate::win_reg::hkcu_set_string(RUN_SUBKEY, VALUE_NAME, &value)
 }
 
 #[cfg(target_os = "windows")]
 fn disable() -> io::Result<()> {
-    use std::process::Command;
-    let mut cmd = Command::new("reg");
-    cmd.args(["delete", RUN_KEY, "/v", VALUE_NAME, "/f"]);
-    crate::win_cmd::no_window(&mut cmd);
-    let status = cmd.status()?;
-    // Missing value is fine (already disabled).
-    if !status.success() {
-        let code = status.code().unwrap_or(-1);
-        if code != 1 {
-            return Err(io::Error::other(format!(
-                "reg delete failed with status {status}"
-            )));
-        }
-    }
-    Ok(())
+    crate::win_reg::hkcu_delete_value(RUN_SUBKEY, VALUE_NAME)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

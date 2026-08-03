@@ -214,51 +214,16 @@ fn macos_interface_style_is_dark() -> Option<bool> {
 }
 
 /// `HKCU\...\Personalize\AppsUseLightTheme` — 1 light, 0 dark.
+///
+/// In-process Advapi32 read — never spawn `reg.exe` (that flashed a console
+/// and stalled the UI thread every status poll).
 #[cfg(target_os = "windows")]
 fn windows_apps_use_light_theme() -> Option<bool> {
-    use std::process::Command;
-    // Hide the console — this runs on every appearance poll (~2s) and would
-    // otherwise flash `reg.exe` on the desktop.
-    let mut cmd = Command::new("reg");
-    cmd.args([
-        "query",
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-        "/v",
+    crate::win_reg::hkcu_get_dword(
+        r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
         "AppsUseLightTheme",
-    ]);
-    crate::win_cmd::no_window(&mut cmd);
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_apps_use_light_theme_reg(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// Parse `reg query … /v AppsUseLightTheme` stdout.
-#[cfg(any(test, target_os = "windows"))]
-fn parse_apps_use_light_theme_reg(stdout: &str) -> Option<bool> {
-    // Typical line: `    AppsUseLightTheme    REG_DWORD    0x1`
-    let value = stdout
-        .lines()
-        .find(|line| line.contains("AppsUseLightTheme"))?
-        .split_whitespace()
-        .last()?;
-    let n = u32::from_str_radix(value.trim_start_matches("0x"), 16).ok()?;
-    Some(n != 0)
-}
-
-#[cfg(test)]
-mod theme_ink_tests {
-    use super::parse_apps_use_light_theme_reg;
-
-    #[test]
-    fn parses_light_and_dark_reg_output() {
-        let light = "\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\n    AppsUseLightTheme    REG_DWORD    0x1\n\n";
-        let dark = "\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\n    AppsUseLightTheme    REG_DWORD    0x0\n\n";
-        assert_eq!(parse_apps_use_light_theme_reg(light), Some(true));
-        assert_eq!(parse_apps_use_light_theme_reg(dark), Some(false));
-        assert_eq!(parse_apps_use_light_theme_reg("nope"), None);
-    }
+    )
+    .map(|n| n != 0)
 }
 
 #[cfg(test)]
