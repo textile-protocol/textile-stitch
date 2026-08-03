@@ -226,6 +226,29 @@ pub fn parse_private_key(raw: &str) -> anyhow::Result<SigningKey> {
 /// imported here resolves to the same address the operator sees in their wallet.
 pub const DEFAULT_DERIVATION_PATH: &str = "m/44'/60'/0'/0/0";
 
+/// A freshly generated hot wallet: BIP-39 seed phrase (12 words) plus the
+/// account-0 address at [`DEFAULT_DERIVATION_PATH`]. The panel shows the phrase
+/// once so the operator can back it up; only the derived hex key is persisted.
+#[derive(Debug, Clone)]
+pub struct GeneratedLocalWallet {
+    pub address: Address,
+    pub seed_phrase: String,
+}
+
+/// Generate a new local operator wallet (OsRng entropy → BIP-39 → account 0).
+pub fn generate_local_wallet() -> anyhow::Result<GeneratedLocalWallet> {
+    use coins_bip39::{English, Mnemonic};
+    use rand::rngs::OsRng;
+
+    let mnemonic = Mnemonic::<English>::new(&mut OsRng);
+    let seed_phrase = mnemonic.to_phrase();
+    let key = parse_mnemonic(&seed_phrase)?;
+    Ok(GeneratedLocalWallet {
+        address: address_from_signing_key(&key),
+        seed_phrase,
+    })
+}
+
 /// Derive the operator signing key from a BIP-39 seed phrase at
 /// [`DEFAULT_DERIVATION_PATH`]. The phrase is validated (wordlist + checksum) by
 /// the parse; a bad word or wrong length fails here rather than deriving a
@@ -448,6 +471,17 @@ mod tests {
         );
         // Same key the raw-hex path yields — the seed phrase is just another way in.
         assert_eq!(from_phrase.to_bytes(), key().to_bytes());
+    }
+
+    #[test]
+    fn generate_local_wallet_is_twelve_words_and_round_trips() {
+        let wallet = generate_local_wallet().expect("generate");
+        let words: Vec<_> = wallet.seed_phrase.split_whitespace().collect();
+        assert_eq!(words.len(), 12, "expected 12-word phrase");
+        let derived = parse_mnemonic(&wallet.seed_phrase).expect("phrase parses");
+        assert_eq!(address_from_signing_key(&derived), wallet.address);
+        let other = generate_local_wallet().expect("second generate");
+        assert_ne!(wallet.address, other.address, "two draws must not collide");
     }
 
     #[test]

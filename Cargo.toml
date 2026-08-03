@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.148"
+version = "0.1.149"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; market-makes the filler order book with signed UniswapX limit orders."
 license = "AGPL-3.0-or-later"
@@ -58,6 +58,9 @@ async-trait = "0.1"
 # BIP-39/BIP-32 seed-phrase derivation for the hot wallet (same crate ethers/alloy
 # use, so account 0 at m/44'/60'/0'/0/0 matches MetaMask/Rabby/etc.).
 coins-bip39 = "0.12"
+# Same major as coins-bip39 — used to generate a fresh BIP-39 phrase for
+# "Create wallet" in the panel (OsRng).
+rand = "0.8"
 axum = "0.8"
 base64 = "0.22"
 k256 = { version = "0.13", features = ["ecdsa"] }

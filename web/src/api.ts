@@ -142,6 +142,17 @@ export const api = {
     request<{ bot: Bot; message: string }>('/api/bots', json(body)),
 
   /**
+   * Mint a fresh hot wallet for the Create wallet step. Returns address + seed
+   * phrase once — nothing is stored until the client posts the phrase back on
+   * create / change-signer.
+   */
+  generateWallet: () =>
+    request<{ address: string; seedPhrase: string }>(
+      '/api/wallets/generate',
+      json({}),
+    ),
+
+  /**
    * Dry-run: which other bots already use this signer on this chain. Used to warn
    * before create / change-signer — sharing a wallet races nonces.
    */

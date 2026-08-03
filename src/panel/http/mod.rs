@@ -256,6 +256,7 @@ fn public_routes() -> Router<AppState> {
 fn protected_routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/api/corridors", get(wizard::corridors))
+        .route("/api/wallets/generate", post(wizard::generate_wallet))
         .route("/api/signer/check", post(wizard::check_signer))
         .route("/api/bots", get(bots::list).post(wizard::create))
         .route("/api/bots/{name}", get(bots::show).delete(bots::remove))

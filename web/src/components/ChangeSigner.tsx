@@ -92,21 +92,22 @@ export default function ChangeSigner({
 
   if (!open) {
     return (
-      <Card title="Signer">
+      <Card title="Wallet">
         <p className="text-sm text-muted">
-          Switch this bot's signer backend (hot wallet, Turnkey, or MPCVault). This
-          writes the new credentials and recreates the container — a raw config edit
-          can't, because the backend's secret lives outside the TOML.
+          Create a new hot wallet, import an existing key, or switch to Turnkey /
+          MPCVault. This writes the credentials and recreates the container — a
+          raw config edit can't, because the backend's secret lives outside the
+          TOML.
         </p>
         <div className="mt-3">
-          <Button onClick={() => setOpen(true)}>Change signer</Button>
+          <Button onClick={() => setOpen(true)}>Change wallet</Button>
         </div>
       </Card>
     )
   }
 
   return (
-    <Card title="Change signer">
+    <Card title="Change wallet">
       <div className="space-y-4">
         <Banner tone="warning">
           This recreates {bot}'s container with the new backend. Orders it already

@@ -46,6 +46,20 @@ pub async fn corridors() -> Response {
     Json(serde_json::json!({ "corridors": list })).into_response()
 }
 
+/// Generate a fresh hot wallet for the "Create wallet" step.
+///
+/// Returns the seed phrase once so the SPA can show a backup screen. The phrase
+/// is not stored server-side — the client posts it back (as `seedPhrase`) on
+/// create / change-signer, and the writer persists only the derived hex key.
+pub async fn generate_wallet() -> Result<Response, ApiError> {
+    let wallet = crate::signer::generate_local_wallet()?;
+    Ok(Json(serde_json::json!({
+        "address": format!("{:?}", wallet.address).to_lowercase(),
+        "seedPhrase": wallet.seed_phrase,
+    }))
+    .into_response())
+}
+
 /// The signer half of the wizard payload.
 ///
 /// Tagged on `kind` so the shape and the backend can't disagree, and so a missing
@@ -445,6 +459,41 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[[pools]]"));
+    }
+
+    #[tokio::test]
+    async fn generate_wallet_returns_a_phrase_and_matching_address() {
+        let h = harness("gen-wallet");
+        let (status, body) = h.post_json("/api/wallets/generate", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        let phrase = v["seedPhrase"].as_str().expect("seedPhrase");
+        assert_eq!(phrase.split_whitespace().count(), 12);
+        let address = v["address"].as_str().expect("address");
+        assert!(address.starts_with("0x"));
+        assert_eq!(address.len(), 42);
+        // Round-trip through create so the derived key is what the fleet sees.
+        let (status, _) = h
+            .post_json(
+                "/api/bots",
+                json!({
+                    "name": "fresh",
+                    "corridorId": "cngn-usdt-bsc",
+                    "signer": { "kind": "local", "seedPhrase": phrase },
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create with generated phrase");
+        let (_, show) = h.get("/api/bots/fresh").await;
+        let shown = Harness::parse(&show);
+        let shown_addr = shown["config"]["operatorAddress"]
+            .as_str()
+            .or_else(|| shown["operatorAddress"].as_str())
+            .expect("operator address on bot");
+        assert_eq!(shown_addr.to_lowercase(), address.to_lowercase());
+        // Secrets stay write-only — the generate response is the only place the
+        // phrase appears, and the bot detail never echoes key material.
+        assert!(!show.contains(phrase));
     }
 
     #[tokio::test]

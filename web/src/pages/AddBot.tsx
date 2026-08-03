@@ -22,11 +22,12 @@ import SignerConflictWarning from '../components/SignerConflictWarning'
 import type { Corridor } from '../types'
 
 /**
- * The add-bot wizard: corridor, then name, then signer.
+ * The add-bot wizard: corridor, then name, then wallet.
  *
  * Deliberately three visible steps rather than one long form, matching the desktop
  * app. Nothing is sent until the last step, and the secret fields are never
- * pre-filled or read back — the API has no route that returns key material.
+ * pre-filled or read back — the API has no route that returns key material
+ * (Create wallet returns a phrase once at generation time only).
  */
 export default function AddBot() {
   const navigate = useNavigate()
@@ -104,7 +105,7 @@ export default function AddBot() {
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-bold">Add a bot</h1>
-      <Steps current={step} labels={['Corridor', 'Name', 'Signer']} />
+      <Steps current={step} labels={['Corridor', 'Name', 'Wallet']} />
 
       {step === 0 && (
         <Card title="Which corridor should it quote?">
@@ -179,7 +180,7 @@ export default function AddBot() {
       )}
 
       {step === 2 && (
-        <Card title="How does it sign?">
+        <Card title="Set up the operator wallet">
           <div className="space-y-4">
             <SignerFields value={signer} onChange={setSigner} />
 
