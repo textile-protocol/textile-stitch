@@ -30,6 +30,8 @@ pub enum ActionKind {
 const STROKE: f32 = 2.0;
 
 pub struct MenuIcons {
+    /// Matches [`prefer_light_glyphs`] at the time these bitmaps were drawn.
+    light_glyphs: bool,
     dot_running: Icon,
     dot_stopped: Icon,
     open: Icon,
@@ -43,8 +45,13 @@ pub struct MenuIcons {
 
 impl MenuIcons {
     pub fn new() -> Self {
-        let ink = menu_ink();
+        Self::with_appearance(prefer_light_glyphs())
+    }
+
+    fn with_appearance(light_glyphs: bool) -> Self {
+        let ink = ink_for(light_glyphs);
         Self {
+            light_glyphs,
             // Outline rings; running adds a solid inner disc (radio-on).
             dot_running: draw_status_running(ink).expect("dot_running"),
             dot_stopped: draw_status_stopped(ink).expect("dot_stopped"),
@@ -56,6 +63,20 @@ impl MenuIcons {
             quit: draw_quit(ink).expect("quit"),
             keep_awake: draw_keep_awake(ink).expect("keep_awake"),
         }
+    }
+
+    /// Rebuild bitmaps when the OS light/dark preference changes.
+    ///
+    /// muda doesn't expose a template-image flag for custom RGBA menu icons, so
+    /// ink is baked into pixels. Call this from the periodic status poll (or an
+    /// appearance notification) and reapply icons when it returns `true`.
+    pub fn refresh_for_appearance(&mut self) -> bool {
+        let light = prefer_light_glyphs();
+        if light == self.light_glyphs {
+            return false;
+        }
+        *self = Self::with_appearance(light);
+        true
     }
 }
 
@@ -120,12 +141,35 @@ fn action_bitmap(icons: &MenuIcons, kind: ActionKind) -> Icon {
 }
 
 /// Ink for monochrome glyphs. Light glyphs on dark menus; dark glyphs on light.
-fn menu_ink() -> (u8, u8, u8) {
-    if prefer_light_glyphs() {
+fn ink_for(light_glyphs: bool) -> (u8, u8, u8) {
+    if light_glyphs {
         (0xf2, 0xf2, 0xf7)
     } else {
         (0x1c, 0x1c, 0x1e)
     }
+}
+
+/// Re-stamp every tray-menu icon after [`MenuIcons::refresh_for_appearance`].
+pub fn reapply_all(
+    icons: &MenuIcons,
+    status: &IconMenuItem,
+    status_kind: StatusKind,
+    open: &IconMenuItem,
+    pause: &IconMenuItem,
+    pause_kind: ActionKind,
+    keep_awake: &IconMenuItem,
+    keep_awake_enabled: bool,
+    update: &IconMenuItem,
+    settings: &IconMenuItem,
+    quit: &IconMenuItem,
+) {
+    apply_status(status, status_kind, icons);
+    apply_action(open, ActionKind::Open, icons);
+    apply_action(pause, pause_kind, icons);
+    apply_keep_awake(keep_awake, keep_awake_enabled, icons);
+    apply_action(update, ActionKind::Update, icons);
+    apply_action(settings, ActionKind::Show, icons);
+    apply_action(quit, ActionKind::Quit, icons);
 }
 
 fn prefer_light_glyphs() -> bool {
@@ -209,6 +253,33 @@ mod theme_ink_tests {
     }
 }
 
+#[cfg(test)]
+mod keep_awake_layout_tests {
+    use super::{KEEP_AWAKE_ZS, SIZE};
+
+    /// `stroke_line_aa` stamps circles of radius `thickness/2`; `coverage`
+    /// softens another ~1 px beyond that. Both must stay inside the canvas.
+    const AA_FRINGE: f32 = 1.0;
+
+    #[test]
+    fn keep_awake_zs_fit_inside_canvas() {
+        for &(x, y, size, thickness) in &KEEP_AWAKE_ZS {
+            let half = thickness / 2.0;
+            let x1 = x + size;
+            let y1 = y + size * 0.85;
+            let left = x - half - AA_FRINGE;
+            let right = x1 + half + AA_FRINGE;
+            let top = y - half - AA_FRINGE;
+            let bottom = y1 + half + AA_FRINGE;
+            assert!(
+                left >= 0.0 && right < SIZE as f32 && top >= 0.0 && bottom < SIZE as f32,
+                "Z at ({x},{y}) size={size} thickness={thickness} extends to \
+                 L={left} R={right} T={top} B={bottom} outside 0..{SIZE}"
+            );
+        }
+    }
+}
+
 // --- Shared 32×32 anti-aliased outline glyphs ---
 
 const SIZE: u32 = 32;
@@ -284,13 +355,22 @@ fn draw_show(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     px.into_icon()
 }
 
+/// Layout for the three rising Z's. Kept as data so tests can assert the
+/// round stroke + AA fringe stays inside the 32×32 canvas.
+const KEEP_AWAKE_ZS: [(f32, f32, f32, f32); 3] = [
+    // (x, y, size, thickness)
+    (5.0, 18.0, 7.0, 1.6),
+    (11.0, 11.5, 9.0, 1.8),
+    // Right edge: x+size + thickness/2 + AA fringe (1px) must stay < SIZE.
+    (17.5, 5.0, 11.0, STROKE),
+];
+
 /// Outlined zZZ sleep glyph for Keep awake (💤).
 fn draw_keep_awake(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
-    // Three Z's of increasing size, rising left → right like 💤.
-    stroke_z(&mut px, 5.0, 18.0, 7.0, c, 1.6);
-    stroke_z(&mut px, 11.5, 11.5, 9.5, c, 1.8);
-    stroke_z(&mut px, 19.0, 4.5, 12.0, c, STROKE);
+    for &(x, y, size, thickness) in &KEEP_AWAKE_ZS {
+        stroke_z(&mut px, x, y, size, c, thickness);
+    }
     px.into_icon()
 }
 

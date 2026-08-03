@@ -187,7 +187,7 @@ fn run() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(UPDATE_POLL_SECS));
     });
 
-    let menu_icons = MenuIcons::new();
+    let mut menu_icons = MenuIcons::new();
     let panel_running = supervisor
         .lock()
         .map(|mut s| s.is_running())
@@ -487,6 +487,35 @@ fn run() -> Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::RefreshStatus) => {
+                // Custom menu icons bake OS ink into RGBA. muda can't mark them
+                // as AppKit templates, so rebuild when light/dark flips.
+                if menu_icons.refresh_for_appearance() {
+                    let running = supervisor
+                        .lock()
+                        .map(|mut s| s.is_running())
+                        .unwrap_or(false);
+                    menu_icons::reapply_all(
+                        &menu_icons,
+                        &status_item,
+                        if running {
+                            StatusKind::Running
+                        } else {
+                            StatusKind::Stopped
+                        },
+                        &open_item,
+                        &pause_item,
+                        if running {
+                            ActionKind::Pause
+                        } else {
+                            ActionKind::Resume
+                        },
+                        &keep_awake_item,
+                        prefs.keep_awake,
+                        &update_item,
+                        &settings_item,
+                        &quit_item,
+                    );
+                }
                 sync_tray_menu(
                     &status_item,
                     &pause_item,
