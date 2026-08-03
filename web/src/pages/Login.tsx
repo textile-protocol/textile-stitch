@@ -63,10 +63,7 @@ export default function Login({
                 aria-hidden
                 className="sr-only"
               />
-              <Field
-                label="Panel password"
-                hint="The password you chose in the Stitch desktop app (or STITCH_PANEL_PASSWORD_HASH)."
-              >
+              <Field label="Panel password">
                 <Input
                   type="password"
                   name="password"
@@ -99,9 +96,12 @@ export default function Login({
           </Card>
         )}
 
-        <p className="text-center text-xs text-faint">
-          Whoever reaches this panel controls the Docker socket on this host.
-        </p>
+        {session.runtime === 'docker' && (
+          <p className="text-center text-xs text-faint">
+            Access to this panel includes control of the Docker socket on this
+            host.
+          </p>
+        )}
       </div>
     </div>
   )

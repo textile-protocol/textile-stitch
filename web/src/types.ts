@@ -121,11 +121,15 @@ export interface SaveResult {
   message: string
 }
 
+export type PanelRuntime = 'docker' | 'process'
+
 export interface SessionInfo {
   authenticated: boolean
   identity: string | null
   passwordLogin: boolean
   tailnetLogin: boolean
+  /** How the panel supervises bots. Desktop uses `process` (no Docker socket). */
+  runtime: PanelRuntime
 }
 
 export interface ActionResult {

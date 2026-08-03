@@ -30,20 +30,28 @@ pub struct SessionBody {
     /// True when the panel accepts a proxy identity header, so the UI can explain
     /// why it's waiting on `tailscale serve` instead of showing a blank page.
     tailnet_login: bool,
+    /// How the panel supervises bots: `"docker"` or `"process"` (desktop).
+    /// The login screen uses this to show a Docker-socket warning only when it
+    /// applies.
+    runtime: &'static str,
+}
+
+fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
+    SessionBody {
+        authenticated: identity.is_some(),
+        identity: identity.map(|i| i.label().to_string()),
+        password_login: state.cfg.auth.password_hash().is_some(),
+        tailnet_login: state.cfg.trust_identity_header
+            && !state.cfg.auth.allowed_users().is_empty(),
+        runtime: state.cfg.runtime.as_str(),
+    }
 }
 
 /// Who am I? Never fails: an unauthenticated caller gets `authenticated: false`
 /// plus which login methods exist.
 pub async fn current(State(state): State<AppState>, req: axum::extract::Request) -> Response {
     let identity = identify(&state, &req).ok();
-    Json(SessionBody {
-        authenticated: identity.is_some(),
-        identity: identity.as_ref().map(|i| i.label().to_string()),
-        password_login: state.cfg.auth.password_hash().is_some(),
-        tailnet_login: state.cfg.trust_identity_header
-            && !state.cfg.auth.allowed_users().is_empty(),
-    })
-    .into_response()
+    Json(session_body(&state, identity.as_ref())).into_response()
 }
 
 #[derive(Deserialize)]
@@ -93,12 +101,7 @@ pub async fn login(
     tracing::info!("a password login succeeded");
     Ok((
         [(header::SET_COOKIE, session_cookie_header(&token))],
-        Json(SessionBody {
-            authenticated: true,
-            identity: Some(Identity::Password.label().to_string()),
-            password_login: true,
-            tailnet_login: false,
-        }),
+        Json(session_body(&state, Some(&Identity::Password))),
     )
         .into_response())
 }
@@ -269,6 +272,7 @@ mod tests {
         assert_eq!(v["authenticated"], false);
         assert_eq!(v["passwordLogin"], true);
         assert_eq!(v["tailnetLogin"], false);
+        assert_eq!(v["runtime"], "docker");
     }
 
     #[tokio::test]
