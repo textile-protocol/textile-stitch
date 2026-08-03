@@ -217,15 +217,17 @@ fn macos_interface_style_is_dark() -> Option<bool> {
 #[cfg(target_os = "windows")]
 fn windows_apps_use_light_theme() -> Option<bool> {
     use std::process::Command;
-    let output = Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-            "/v",
-            "AppsUseLightTheme",
-        ])
-        .output()
-        .ok()?;
+    // Hide the console — this runs on every appearance poll (~2s) and would
+    // otherwise flash `reg.exe` on the desktop.
+    let mut cmd = Command::new("reg");
+    cmd.args([
+        "query",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        "/v",
+        "AppsUseLightTheme",
+    ]);
+    crate::win_cmd::no_window(&mut cmd);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }

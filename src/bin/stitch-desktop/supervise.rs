@@ -149,11 +149,12 @@ fn stop_panel_process_tree(pid: u32, child: &mut Child, grace_secs: u64) -> Resu
     {
         // Prefer graceful taskkill (no /F) so the panel can Drop-stop bots;
         // force the tree only if it outlives the grace window.
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T"])
+        let mut kill = Command::new("taskkill");
+        kill.args(["/PID", &pid.to_string(), "/T"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        crate::win_cmd::no_window(&mut kill);
+        let _ = kill.status();
         let deadline = std::time::Instant::now() + Duration::from_secs(grace_secs);
         loop {
             match child.try_wait() {
@@ -201,11 +202,12 @@ fn stop_panel_process_tree(pid: u32, child: &mut Child, grace_secs: u64) -> Resu
 fn stop_external_panel(pid: u32, grace_secs: u64) -> Result<()> {
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T"])
+        let mut kill = Command::new("taskkill");
+        kill.args(["/PID", &pid.to_string(), "/T"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        crate::win_cmd::no_window(&mut kill);
+        let _ = kill.status();
         wait_for_pid_exit(pid, grace_secs);
         if pid_alive(pid) {
             signal_process_tree(pid);
@@ -254,11 +256,12 @@ fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        let mut list = Command::new("tasklist");
+        list.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
+            .stderr(Stdio::null());
+        crate::win_cmd::no_window(&mut list);
+        list.output()
             .map(|o| {
                 o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
             })
@@ -275,11 +278,12 @@ fn panel_stop_grace_secs() -> u64 {
 fn signal_process_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
+        let mut kill = Command::new("taskkill");
+        kill.args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        crate::win_cmd::no_window(&mut kill);
+        let _ = kill.status();
     }
     #[cfg(unix)]
     {
@@ -369,10 +373,10 @@ fn pid_looks_like_panel(pid: u32, panel_bin: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        let Ok(output) = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
-        else {
+        let mut list = Command::new("tasklist");
+        list.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+        crate::win_cmd::no_window(&mut list);
+        let Ok(output) = list.output() else {
             return false;
         };
         let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();

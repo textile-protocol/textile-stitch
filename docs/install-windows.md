@@ -3,8 +3,9 @@
 Three paths:
 
 1. **Desktop app** — [download](../README.md#option-1--desktop-app) and run
-   `stitch-desktop.exe`. Menu / tray controller, local panel in the browser, no
-   Docker. Recommended for a personal PC.
+   `stitch-desktop.exe`. Menu / tray controller with a control window; open the
+   local panel in the browser when you're ready. No Docker. Recommended for a
+   personal PC.
 2. **Stitch web UI (Docker Desktop)** — recommended for always-on / server-style
    hosts; see [install-panel.md](install-panel.md) / `install-panel.ps1`.
 3. **Standalone bot binary** — this page (`stitch` CLI only).

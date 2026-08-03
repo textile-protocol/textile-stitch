@@ -1,8 +1,9 @@
 //! Register / unregister OS "start at login" for the desktop tray app.
 //!
-//! Launch args always include `--autostart` so a login start does not open a
-//! browser tab. The panel still comes up and restores bots that were `wanted_up`
-//! when the previous session stopped (see process runtime persistence).
+//! Launch args always include `--autostart` so a login start does not show the
+//! control window. The panel still comes up and restores bots that were
+//! `wanted_up` when the previous session stopped (see process runtime
+//! persistence).
 
 use std::env;
 use std::fs;
@@ -126,9 +127,10 @@ fn disable() -> io::Result<()> {
 #[cfg(target_os = "windows")]
 fn platform_is_enabled() -> io::Result<bool> {
     use std::process::Command;
-    let output = Command::new("reg")
-        .args(["query", RUN_KEY, "/v", VALUE_NAME])
-        .output()?;
+    let mut cmd = Command::new("reg");
+    cmd.args(["query", RUN_KEY, "/v", VALUE_NAME]);
+    crate::win_cmd::no_window(&mut cmd);
+    let output = cmd.output()?;
     if !output.status.success() {
         return Ok(false);
     }
@@ -140,11 +142,12 @@ fn enable() -> io::Result<()> {
     use std::process::Command;
     let exe = current_exe()?;
     let value = format!("\"{}\" --autostart", exe.display());
-    let status = Command::new("reg")
-        .args([
-            "add", RUN_KEY, "/v", VALUE_NAME, "/t", "REG_SZ", "/d", &value, "/f",
-        ])
-        .status()?;
+    let mut cmd = Command::new("reg");
+    cmd.args([
+        "add", RUN_KEY, "/v", VALUE_NAME, "/t", "REG_SZ", "/d", &value, "/f",
+    ]);
+    crate::win_cmd::no_window(&mut cmd);
+    let status = cmd.status()?;
     if !status.success() {
         return Err(io::Error::other(format!(
             "reg add failed with status {status}"
@@ -156,9 +159,10 @@ fn enable() -> io::Result<()> {
 #[cfg(target_os = "windows")]
 fn disable() -> io::Result<()> {
     use std::process::Command;
-    let status = Command::new("reg")
-        .args(["delete", RUN_KEY, "/v", VALUE_NAME, "/f"])
-        .status()?;
+    let mut cmd = Command::new("reg");
+    cmd.args(["delete", RUN_KEY, "/v", VALUE_NAME, "/f"]);
+    crate::win_cmd::no_window(&mut cmd);
+    let status = cmd.status()?;
     // Missing value is fine (already disabled).
     if !status.success() {
         let code = status.code().unwrap_or(-1);

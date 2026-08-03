@@ -42,20 +42,21 @@ No Docker and no terminal. [Download the release for your OS](https://github.com
 
 - **macOS**: download `Stitch.dmg`, open it, drag Stitch into Applications, and
   launch it from there. It appears in the menu bar and Dock, opens a small
-  control window, starts the local panel (process runtime), and opens
-  `http://127.0.0.1:8420`. Copy the panel password from the menu or window if
-  you need it again. **Hide Dock icon** is available in the tray / window and
-  is off by default.
+  control window, and starts the local panel (process runtime). On first launch
+  you create a panel password (entered twice). Click **Open Stitch panel** when
+  you want `http://127.0.0.1:8420` in the browser — it does not open a tab on
+  launch. **Hide Dock icon** is available in Settings and is off by default.
 - **Windows**: unzip the release and double-click `stitch-desktop.exe`. It sits
-  in the system tray, opens the control window, and opens the same local panel.
+  in the system tray, opens the control window, and starts the same local panel.
+  Use **Open Stitch panel** to open the browser UI.
 - **Linux**: extract and run `stitch-desktop` (or the bundled `stitch.desktop`
   entry). For a headless server, prefer Option 2.
 
-In the browser: **Add a bot**, pick a corridor, paste your operator wallet key,
-approve allowances, dry-run, then Start. Use **Start at login** in the menu /
-tray / window if you want the panel (and any bots left running) to come back
-after a reboot — login starts stay in the tray and skip opening a browser tab
-and the control window. Quit Stitch from the menu / tray / window to stop the
+In the browser: sign in with the password you created, **Add a bot**, pick a
+corridor, paste your operator wallet key, approve allowances, dry-run, then
+Start. Use **Start at login** in Settings if you want the panel (and any bots
+left running) to come back after a reboot — login starts stay in the tray and
+skip the control window. Quit Stitch from the menu / tray / window to stop the
 panel. For unattended 24/7 quoting on a server, use Option 2.
 
 ### Option 2 — Server / Docker

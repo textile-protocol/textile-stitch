@@ -228,11 +228,13 @@ fn theme_css() -> &'static str {
 /// cleartext password file is being replaced.
 pub fn signup_html(legacy_reset: bool) -> String {
     let note = if legacy_reset {
-        "Choose a password for the local panel. An older cleartext password file \
-         was found and will be removed — pick a password you’ll remember."
+        "Create a password (enter it twice below). An older cleartext password \
+         file was found and will be removed. After this, use Open Stitch panel \
+         in this window to sign in with that password in your browser."
     } else {
-        "Choose a password for the local panel. You’ll enter it in the browser \
-         to sign in. Only a hash is stored on disk."
+        "Create a password (enter it twice below). After this, use Open Stitch \
+         panel in this window to sign in with that password in your browser. \
+         Only a hash is stored on disk."
     };
     format!(
         r#"<!DOCTYPE html>
@@ -297,12 +299,17 @@ pub fn signup_html(legacy_reset: bool) -> String {
 
 /// Build the control-panel HTML. `hide_dock_row` is macOS-only in the menu;
 /// pass false on other platforms to omit the Dock checkbox.
+///
+/// `panel_error`, when set, is baked into the markup so it survives a fresh
+/// `load_html` (evaluate_script right after navigation is a no-op while the
+/// previous document is still active).
 pub fn html(
     autostart: bool,
     hide_dock: bool,
     keep_awake: bool,
     panel_running: bool,
     hide_dock_row: bool,
+    panel_error: Option<&str>,
 ) -> String {
     let autostart_checked = if autostart { " checked" } else { "" };
     let hide_dock_checked = if hide_dock { " checked" } else { "" };
@@ -321,6 +328,13 @@ pub fn html(
         String::new()
     };
     let keep_awake_label = crate::keep_awake::label();
+    let error_block = match panel_error {
+        Some(msg) if !msg.is_empty() => {
+            let escaped = html_escape(msg);
+            format!(r#"<div id="panel-error" class="error show" role="alert">{escaped}</div>"#)
+        }
+        _ => r#"<div id="panel-error" class="error" role="alert"></div>"#.to_string(),
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -348,6 +362,7 @@ pub fn html(
       <button type="button" class="primary" data-action="update">Download update</button>
     </div>
   </div>
+  {error_block}
   <div id="status" class="status {status_class}"><span class="dot"></span><span id="status-text">{status_text}</span></div>
   <div class="stack">
     <button class="primary" data-action="open">Open Stitch panel</button>
@@ -412,12 +427,26 @@ pub fn html(
         if (updateBtn) updateBtn.textContent = "Check for updates…";
       }}
     }}
+    if (state.panelRunning) {{
+      const err = document.getElementById("panel-error");
+      if (err) {{
+        err.textContent = "";
+        err.classList.remove("show");
+      }}
+    }}
+  }};
+  window.__stitchPanelError = function (msg) {{
+    const err = document.getElementById("panel-error");
+    if (!err) return;
+    err.textContent = msg || "Could not start the local panel.";
+    err.classList.add("show");
   }};
 </script>
 </body>
 </html>"#,
         css = theme_css(),
         textile_icon = TEXTILE_ICON_SVG,
+        error_block = error_block,
         status_class = status.0,
         status_text = status.1,
         pause_label = pause_label,
@@ -426,6 +455,21 @@ pub fn html(
         keep_awake_label = keep_awake_label,
         dock_row = dock_row,
     )
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// JS snippet to push tray/window state into the control UI.
@@ -455,4 +499,39 @@ pub fn signup_error_script(message: &str) -> String {
     let escaped =
         serde_json::to_string(message).unwrap_or_else(|_| "\"Could not set password.\"".into());
     format!("window.__stitchSignupError && window.__stitchSignupError({escaped});")
+}
+
+/// Show a panel start failure in the control window (no terminal on Windows).
+pub fn panel_error_script(message: &str) -> String {
+    let escaped = serde_json::to_string(message)
+        .unwrap_or_else(|_| "\"Could not start the local panel.\"".into());
+    format!("window.__stitchPanelError && window.__stitchPanelError({escaped});")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{html, html_escape};
+
+    #[test]
+    fn baked_panel_error_is_visible_in_markup() {
+        let page = html(
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some("port 8420 in use <oops>"),
+        );
+        assert!(page.contains(r#"id="panel-error" class="error show""#));
+        assert!(page.contains("port 8420 in use &lt;oops&gt;"));
+        assert!(!page.contains("<oops>"));
+    }
+
+    #[test]
+    fn html_escape_covers_markup_chars() {
+        assert_eq!(
+            html_escape(r#"a&b<"c">'d"#),
+            "a&amp;b&lt;&quot;c&quot;&gt;&#39;d"
+        );
+    }
 }

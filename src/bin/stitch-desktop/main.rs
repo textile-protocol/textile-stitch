@@ -3,13 +3,16 @@
 //! Stitch desktop — menu bar / system tray controller with a Dock icon and
 //! control window (macOS Dock can be hidden via a preference).
 //!
-//! Starts `stitch-panel` in process runtime (no Docker), opens the browser, and
-//! offers start/stop/update without a terminal. The browser UI is the same Stitch
-//! panel used on servers; the desktop window mirrors tray actions.
+//! Starts `stitch-panel` in process runtime (no Docker) and offers
+//! start/stop/update without a terminal. The browser UI is the same Stitch
+//! panel used on servers; open it from the control window or tray when ready.
+//! The desktop window mirrors tray actions.
 //!
-//! Pass `--autostart` (set by the OS login item) to skip opening a browser tab
-//! and the control window; the panel still starts and restores bots that were
-//! left running.
+//! Pass `--autostart` (set by the OS login item) to skip showing the control
+//! window; the panel still starts and restores bots that were left running.
+//! Interactive launches also leave the browser closed until the operator clicks
+//! **Open Stitch panel** (avoids a connection-refused flash while the panel
+//! comes up, and skips a console flash from `cmd start` on Windows).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
@@ -21,6 +24,7 @@ mod password;
 mod paths;
 mod prefs;
 mod supervise;
+mod win_cmd;
 
 use std::sync::{Arc, Mutex};
 
@@ -72,7 +76,7 @@ fn main() {
     }
 }
 
-/// Best-effort native alert when startup fails (macOS Finder / Dock launches).
+/// Best-effort native alert when startup fails (no terminal for GUI launches).
 fn show_launch_error(detail: &str) {
     #[cfg(target_os = "macos")]
     {
@@ -94,7 +98,29 @@ fn show_launch_error(detail: &str) {
             .arg(script)
             .status();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        // PowerShell MessageBox — no extra crate; hide the console host.
+        let escaped = detail
+            .replace('\'', "''")
+            .chars()
+            .map(|c| match c {
+                '\n' | '\r' => ' ',
+                other => other,
+            })
+            .collect::<String>();
+        let script = format!(
+            "Add-Type -AssemblyName PresentationFramework; \
+             [System.Windows.MessageBox]::Show(\
+               'Stitch couldn''t start.`n`n{escaped}',\
+               'Stitch','OK','Error') | Out-Null"
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
+        win_cmd::no_window(&mut cmd);
+        let _ = cmd.status();
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let _ = detail;
     }
@@ -283,6 +309,7 @@ fn run() -> Result<()> {
             prefs.keep_awake,
             panel_running,
             hide_dock_row,
+            None,
         )
     };
     let webview = WebViewBuilder::new()
@@ -334,9 +361,8 @@ fn run() -> Result<()> {
                 }
                 if !started_panel && !awaiting_signup {
                     started_panel = true;
-                    start_panel_and_maybe_open(
+                    start_panel(
                         &supervisor,
-                        !quiet_launch,
                         webview.as_ref(),
                         autostart_enabled,
                         prefs.hide_dock_icon,
@@ -411,12 +437,34 @@ fn run() -> Result<()> {
                         match password::set_panel_password(&paths, &pw, &confirm) {
                             Ok(()) => {
                                 awaiting_signup = false;
+                                // Start the panel *before* navigating away from
+                                // signup HTML, then bake any failure into the
+                                // control document. evaluate_script right after
+                                // load_html is a no-op while the old page is
+                                // still active (no __stitchPanelError yet).
+                                let (panel_running_now, panel_err) = if !started_panel {
+                                    started_panel = true;
+                                    match try_start_panel(&supervisor) {
+                                        Ok(()) => (true, None),
+                                        Err(e) => {
+                                            eprintln!("stitch-desktop: {e:#}");
+                                            (false, Some(format!("{e:#}")))
+                                        }
+                                    }
+                                } else {
+                                    let running = supervisor
+                                        .lock()
+                                        .map(|mut s| s.is_running())
+                                        .unwrap_or(false);
+                                    (running, None)
+                                };
                                 let control_html = control_ui::html(
                                     autostart_enabled,
                                     prefs.hide_dock_icon,
                                     prefs.keep_awake,
-                                    false,
+                                    panel_running_now,
                                     hide_dock_row,
+                                    panel_err.as_deref(),
                                 );
                                 if let Some(wv) = webview.as_ref() {
                                     if let Err(e) = wv.load_html(&control_html) {
@@ -426,18 +474,14 @@ fn run() -> Result<()> {
                                     }
                                 }
                                 show_control_window(window.as_ref());
-                                if !started_panel {
-                                    started_panel = true;
-                                    start_panel_and_maybe_open(
-                                        &supervisor,
-                                        true,
-                                        webview.as_ref(),
-                                        autostart_enabled,
-                                        prefs.hide_dock_icon,
-                                        prefs.keep_awake,
-                                        update_version.as_deref(),
-                                    );
-                                }
+                                sync_control_ui(
+                                    webview.as_ref(),
+                                    autostart_enabled,
+                                    prefs.hide_dock_icon,
+                                    prefs.keep_awake,
+                                    &supervisor,
+                                    update_version.as_deref(),
+                                );
                             }
                             Err(e) => {
                                 if let Some(wv) = webview.as_ref() {
@@ -639,31 +683,29 @@ fn sync_tray_and_window(
     );
 }
 
-fn start_panel_and_maybe_open(
+fn try_start_panel(supervisor: &Arc<Mutex<PanelSupervisor>>) -> Result<()> {
+    let mut s = supervisor.lock().unwrap();
+    s.start().context("starting the local Stitch panel")
+}
+
+/// Start the panel when the control document is already loaded (Init path).
+/// Startup failures are injected via script — safe here because signup HTML is
+/// not on screen. After signup, callers must bake the error into `html(...)`
+/// instead (see the signup IPC branch).
+fn start_panel(
     supervisor: &Arc<Mutex<PanelSupervisor>>,
-    open_browser: bool,
     webview: Option<&wry::WebView>,
     autostart: bool,
     hide_dock: bool,
     keep_awake: bool,
     update_version: Option<&str>,
 ) {
-    let start_result = {
-        let mut s = supervisor.lock().unwrap();
-        s.start().context("starting the local Stitch panel")
-    };
-    match start_result {
-        Ok(()) => {
-            if open_browser {
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(800));
-                    let _ = open_url(PANEL_URL);
-                });
-            }
-        }
-        Err(e) => {
-            // Keep the tray alive so the user can Quit / retry Start.
-            eprintln!("stitch-desktop: {e:#}");
+    if let Err(e) = try_start_panel(supervisor) {
+        // Keep the tray alive so the user can Quit / retry Resume.
+        eprintln!("stitch-desktop: {e:#}");
+        if let Some(wv) = webview {
+            let script = control_ui::panel_error_script(&format!("{e:#}"));
+            let _ = wv.evaluate_script(&script);
         }
     }
     sync_control_ui(
@@ -874,10 +916,12 @@ fn open_url(url: &str) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .status()
-            .context("start")?;
+        // `rundll32 url.dll,FileProtocolHandler` opens the default browser
+        // without a visible console. `cmd /C start` flashes a black window.
+        let mut cmd = std::process::Command::new("rundll32");
+        cmd.args(["url.dll,FileProtocolHandler", url]);
+        win_cmd::no_window(&mut cmd);
+        cmd.status().context("open URL")?;
         return Ok(());
     }
     #[cfg(all(unix, not(target_os = "macos")))]

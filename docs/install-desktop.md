@@ -18,8 +18,9 @@ it:
    written to `panel.env` — no plaintext password file.
 4. Starts bundled `stitch-panel` with `STITCH_PANEL_RUNTIME=process` (local
    `stitch` child processes — not containers).
-5. Opens the control window and `http://127.0.0.1:8420` in your browser so you
-   can sign in with that password.
+5. Opens the control window. Use **Open Stitch panel** (tray or window) when
+   you want `http://127.0.0.1:8420` in your browser — it does not open a tab
+   on launch.
 
 The tray menu leads with a running/stopped status, then **Open Stitch panel**,
 **Pause** / **Resume**, **Keep Mac awake** / **Keep computer awake**, updates,
@@ -39,9 +40,10 @@ the tray, or click the Dock icon when it has no visible windows.
 
 **Start at login** (in Settings) registers the OS login item (LaunchAgent on
 macOS, Run key on Windows, XDG autostart on Linux). On boot the tray app starts
-quietly (`--autostart` — no browser tab, no control window), brings the panel
-up, and the process runtime restarts bots that were left on when you last
-stopped or quit the panel.
+quietly (`--autostart` — no control window), brings the panel up, and the
+process runtime restarts bots that were left on when you last stopped or quit
+the panel. Interactive launches also leave the browser closed until you click
+**Open Stitch panel**.
 
 **Keep Mac / computer awake** (tray + Settings) holds an OS power assertion so
 idle sleep does not stop the local panel and bots. Display sleep is still
