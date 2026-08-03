@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Tray-menu icons.
+//! Tray-menu icons — one family of monochrome outline glyphs on every OS.
 //!
-//! On macOS we use AppKit named images via muda's [`NativeIcon`] — the same
-//! template / status assets system menus use, so they stay crisp and follow
-//! light/dark appearance. On Windows / Linux we draw anti-aliased 32×32
-//! bitmaps (no SF Symbols there).
+//! AppKit named images mix templates, filled status dots, and full-color
+//! assets (`Computer`), so we draw the same anti-aliased 32×32 bitmaps
+//! everywhere. Ink follows the menu chrome (dark glyphs on light menus,
+//! light on dark). Stroke weight is shared so the set reads as one family.
 
-#[cfg(not(target_os = "macos"))]
 use tray_icon::menu::Icon;
 use tray_icon::menu::IconMenuItem;
-#[cfg(target_os = "macos")]
-use tray_icon::menu::NativeIcon;
 
 #[derive(Clone, Copy)]
 pub enum StatusKind {
@@ -29,128 +26,70 @@ pub enum ActionKind {
     Quit,
 }
 
-/// Fallback bitmaps for non-macOS. Empty on macOS (native icons only).
+/// Shared outline stroke for every glyph in the set.
+const STROKE: f32 = 2.0;
+
 pub struct MenuIcons {
-    #[cfg(not(target_os = "macos"))]
     dot_running: Icon,
-    #[cfg(not(target_os = "macos"))]
     dot_stopped: Icon,
-    #[cfg(not(target_os = "macos"))]
     open: Icon,
-    #[cfg(not(target_os = "macos"))]
     pause: Icon,
-    #[cfg(not(target_os = "macos"))]
     resume: Icon,
-    #[cfg(not(target_os = "macos"))]
     update: Icon,
-    #[cfg(not(target_os = "macos"))]
     show: Icon,
-    #[cfg(not(target_os = "macos"))]
     quit: Icon,
-    #[cfg(not(target_os = "macos"))]
     keep_awake: Icon,
 }
 
 impl MenuIcons {
     pub fn new() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            Self {}
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let ink = menu_ink();
-            Self {
-                // Radius chosen so the disc reads as a circle at menu size, not a diamond.
-                dot_running: aa_circle(0x34, 0xc7, 0x59, 10.0).expect("dot_running"),
-                dot_stopped: aa_circle(0x8e, 0x8e, 0x93, 10.0).expect("dot_stopped"),
-                open: draw_open(ink).expect("open"),
-                pause: draw_pause(ink).expect("pause"),
-                resume: draw_resume(ink).expect("resume"),
-                update: draw_update(ink).expect("update"),
-                show: draw_show(ink).expect("show"),
-                quit: draw_quit(ink).expect("quit"),
-                keep_awake: draw_keep_awake(ink).expect("keep_awake"),
-            }
+        let ink = menu_ink();
+        Self {
+            // Outline rings; running adds a solid inner disc (radio-on).
+            dot_running: draw_status_running(ink).expect("dot_running"),
+            dot_stopped: draw_status_stopped(ink).expect("dot_stopped"),
+            open: draw_open(ink).expect("open"),
+            pause: draw_pause(ink).expect("pause"),
+            resume: draw_resume(ink).expect("resume"),
+            update: draw_update(ink).expect("update"),
+            show: draw_show(ink).expect("show"),
+            quit: draw_quit(ink).expect("quit"),
+            keep_awake: draw_keep_awake(ink).expect("keep_awake"),
         }
     }
 }
 
 pub fn status_item(text: &str, kind: StatusKind, icons: &MenuIcons) -> IconMenuItem {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = icons;
-        IconMenuItem::with_native_icon(text, false, Some(native_status(kind)), None)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        IconMenuItem::new(text, false, Some(status_bitmap(icons, kind)), None)
-    }
+    IconMenuItem::new(text, false, Some(status_bitmap(icons, kind)), None)
 }
 
 pub fn action_item(text: &str, kind: ActionKind, icons: &MenuIcons) -> IconMenuItem {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = icons;
-        IconMenuItem::with_native_icon(text, true, Some(native_action(kind)), None)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        IconMenuItem::new(text, true, Some(action_bitmap(icons, kind)), None)
-    }
+    IconMenuItem::new(text, true, Some(action_bitmap(icons, kind)), None)
 }
 
 pub fn apply_status(item: &IconMenuItem, kind: StatusKind, icons: &MenuIcons) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = icons;
-        item.set_native_icon(Some(native_status(kind)));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        item.set_icon(Some(status_bitmap(icons, kind)));
-    }
+    item.set_icon(Some(status_bitmap(icons, kind)));
 }
 
 pub fn apply_action(item: &IconMenuItem, kind: ActionKind, icons: &MenuIcons) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = icons;
-        item.set_native_icon(Some(native_action(kind)));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        item.set_icon(Some(action_bitmap(icons, kind)));
-    }
+    item.set_icon(Some(action_bitmap(icons, kind)));
 }
 
 /// Keep-awake row. muda's [`CheckMenuItem`] cannot carry an icon, so this is an
-/// [`IconMenuItem`] with a computer glyph; on-state uses a leading checkmark in
-/// the title (AppKit's state column isn't available on icon items).
+/// [`IconMenuItem`] with a sleep (zZZ) glyph; on-state uses a leading checkmark
+/// in the title (AppKit's state column isn't available on icon items).
 pub fn keep_awake_item(enabled: bool, icons: &MenuIcons) -> IconMenuItem {
-    let text = keep_awake_title(enabled);
-    #[cfg(target_os = "macos")]
-    {
-        let _ = icons;
-        IconMenuItem::with_native_icon(text, true, Some(NativeIcon::Computer), None)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        IconMenuItem::new(text, true, Some(icons.keep_awake.clone()), None)
-    }
+    IconMenuItem::new(
+        keep_awake_title(enabled),
+        true,
+        Some(icons.keep_awake.clone()),
+        None,
+    )
 }
 
 pub fn apply_keep_awake(item: &IconMenuItem, enabled: bool, icons: &MenuIcons) {
     item.set_text(keep_awake_title(enabled));
-    #[cfg(target_os = "macos")]
-    {
-        let _ = icons;
-        item.set_native_icon(Some(NativeIcon::Computer));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = icons;
-    }
+    item.set_icon(Some(icons.keep_awake.clone()));
 }
 
 fn keep_awake_title(enabled: bool) -> String {
@@ -162,32 +101,6 @@ fn keep_awake_title(enabled: bool) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn native_status(kind: StatusKind) -> NativeIcon {
-    match kind {
-        // AppKit statusAvailable = the standard green circle (same family Docker uses).
-        StatusKind::Running => NativeIcon::StatusAvailable,
-        StatusKind::Stopped => NativeIcon::StatusNone,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn native_action(kind: ActionKind) -> NativeIcon {
-    match kind {
-        ActionKind::Open => NativeIcon::FollowLinkFreestanding,
-        // Named AppKit set has no pause bars; stop-progress is the closest system
-        // glyph. Resume uses the right-facing triangle (play).
-        ActionKind::Pause => NativeIcon::StopProgress,
-        ActionKind::Resume => NativeIcon::RightFacingTriangle,
-        // Outlined circular arrows — Caution was a yellow warning triangle.
-        ActionKind::Update => NativeIcon::RefreshFreestanding,
-        // Template gear (System Settings family). Outlined at menu size.
-        ActionKind::Show => NativeIcon::PreferencesGeneral,
-        ActionKind::Quit => NativeIcon::StopProgressFreestanding,
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
 fn status_bitmap(icons: &MenuIcons, kind: StatusKind) -> Icon {
     match kind {
         StatusKind::Running => icons.dot_running.clone(),
@@ -195,7 +108,6 @@ fn status_bitmap(icons: &MenuIcons, kind: StatusKind) -> Icon {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn action_bitmap(icons: &MenuIcons, kind: ActionKind) -> Icon {
     match kind {
         ActionKind::Open => icons.open.clone(),
@@ -208,7 +120,6 @@ fn action_bitmap(icons: &MenuIcons, kind: ActionKind) -> Icon {
 }
 
 /// Ink for monochrome glyphs. Light glyphs on dark menus; dark glyphs on light.
-#[cfg(not(target_os = "macos"))]
 fn menu_ink() -> (u8, u8, u8) {
     if prefer_light_glyphs() {
         (0xf2, 0xf2, 0xf7)
@@ -217,20 +128,39 @@ fn menu_ink() -> (u8, u8, u8) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn prefer_light_glyphs() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // `AppleInterfaceStyle` is unset in light mode; "Dark" when dark.
+        macos_interface_style_is_dark().unwrap_or(false)
+    }
     #[cfg(target_os = "windows")]
     {
         // AppsUseLightTheme=1 → light app chrome / menus → dark ink.
         // Missing key or query failure: Win11 tray menus are usually dark.
         !windows_apps_use_light_theme().unwrap_or(false)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         std::env::var_os("GTK_THEME")
             .map(|v| v.to_string_lossy().to_ascii_lowercase().contains("dark"))
             .unwrap_or(false)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_interface_style_is_dark() -> Option<bool> {
+    use std::process::Command;
+    let output = Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        // Command fails when the key is absent (light mode).
+        return Some(false);
+    }
+    let style = String::from_utf8_lossy(&output.stdout);
+    Some(style.to_ascii_lowercase().contains("dark"))
 }
 
 /// `HKCU\...\Personalize\AppsUseLightTheme` — 1 light, 0 dark.
@@ -279,143 +209,112 @@ mod theme_ink_tests {
     }
 }
 
-// --- Windows / Linux bitmap fallbacks (32×32, anti-aliased) ---
+// --- Shared 32×32 anti-aliased outline glyphs ---
 
-#[cfg(not(target_os = "macos"))]
 const SIZE: u32 = 32;
 
-#[cfg(not(target_os = "macos"))]
-fn aa_circle(r: u8, g: u8, b: u8, radius: f32) -> Result<Icon, tray_icon::menu::BadIcon> {
+fn draw_status_running(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
-    let c = (SIZE as f32 - 1.0) / 2.0;
-    px.fill_circle_aa(c, c, radius, r, g, b);
+    let cx = 15.5;
+    let cy = 15.5;
+    px.stroke_circle_aa(cx, cy, 9.0, c, STROKE);
+    px.fill_circle_aa(cx, cy, 4.0, c.0, c.1, c.2);
     px.into_icon()
 }
 
-#[cfg(not(target_os = "macos"))]
+fn draw_status_stopped(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
+    let mut px = Canvas::new();
+    px.stroke_circle_aa(15.5, 15.5, 9.0, c, STROKE);
+    px.into_icon()
+}
+
+/// Outlined panel with an inset chevron — "open the panel".
 fn draw_open(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
-    px.stroke_round_rect(5.0, 6.0, 26.0, 25.0, 2.0, c, 2.0);
-    px.vline_aa(12.0, 6.0, 25.0, c, 2.0);
+    px.stroke_round_rect(6.0, 6.0, 26.0, 26.0, 3.0, c, STROKE);
+    // Chevron pointing into the panel (→).
+    px.stroke_line_aa(12.0, 11.0, 18.0, 15.5, c, STROKE);
+    px.stroke_line_aa(18.0, 15.5, 12.0, 20.0, c, STROKE);
     px.into_icon()
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Two outlined vertical bars.
 fn draw_pause(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
-    px.fill_round_rect(8.0, 7.0, 13.0, 24.0, 1.2, c);
-    px.fill_round_rect(18.0, 7.0, 23.0, 24.0, 1.2, c);
+    px.stroke_round_rect(9.0, 8.0, 13.5, 24.0, 1.5, c, STROKE);
+    px.stroke_round_rect(18.5, 8.0, 23.0, 24.0, 1.5, c, STROKE);
     px.into_icon()
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Outlined play triangle.
 fn draw_resume(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let px_x = x as f32 + 0.5;
-            let px_y = y as f32 + 0.5;
-            let a = edge(9.0, 6.0, 9.0, 25.0, px_x, px_y);
-            let b = edge(9.0, 25.0, 24.0, 15.5, px_x, px_y);
-            let d = edge(24.0, 15.5, 9.0, 6.0, px_x, px_y);
-            let inside = a >= 0.0 && b >= 0.0 && d >= 0.0;
-            let dist = a.min(b).min(d);
-            let alpha = if inside {
-                1.0
-            } else if dist > -1.2 {
-                ((1.2 + dist) / 1.2).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            if alpha > 0.01 {
-                px.blend(x as i32, y as i32, c.0, c.1, c.2, alpha);
-            }
-        }
-    }
+    px.stroke_triangle_aa(10.0, 7.0, 10.0, 25.0, 24.0, 16.0, c, STROKE);
     px.into_icon()
 }
 
-#[cfg(not(target_os = "macos"))]
-fn edge(x0: f32, y0: f32, x1: f32, y1: f32, x: f32, y: f32) -> f32 {
-    (x - x0) * (y1 - y0) - (y - y0) * (x1 - x0)
-}
-
-/// Outlined circular arrows (refresh) — matches macOS RefreshFreestanding.
-#[cfg(not(target_os = "macos"))]
+/// Outlined circular arrows (refresh).
 fn draw_update(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
     let cx = 15.5;
     let cy = 15.5;
     // Open ring (gap at top-right) + arrow head.
-    px.stroke_arc_aa(cx, cy, 9.0, 40.0, 300.0, c, 2.2);
+    px.stroke_arc_aa(cx, cy, 9.0, 40.0, 300.0, c, STROKE);
     // Arrow head pointing clockwise at the gap.
-    px.fill_circle_aa(cx + 7.2, cy - 5.2, 1.4, c.0, c.1, c.2);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let px_x = x as f32 + 0.5;
-            let px_y = y as f32 + 0.5;
-            // Small triangle tip near (22, 8).
-            let a = edge(19.0, 6.0, 24.5, 6.5, px_x, px_y);
-            let b = edge(24.5, 6.5, 22.0, 11.5, px_x, px_y);
-            let d = edge(22.0, 11.5, 19.0, 6.0, px_x, px_y);
-            if a >= 0.0 && b >= 0.0 && d >= 0.0 {
-                px.blend(x as i32, y as i32, c.0, c.1, c.2, 1.0);
-            }
-        }
-    }
+    px.stroke_line_aa(cx + 5.5, cy - 7.5, cx + 9.0, cy - 4.0, c, STROKE);
+    px.stroke_line_aa(cx + 9.0, cy - 4.0, cx + 5.0, cy - 3.0, c, STROKE);
     px.into_icon()
 }
 
 /// Outlined gear for Settings.
-#[cfg(not(target_os = "macos"))]
 fn draw_show(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
     let cx = 15.5;
     let cy = 15.5;
-    // Hub ring.
-    px.stroke_circle_aa(cx, cy, 5.0, c, 2.0);
+    px.stroke_circle_aa(cx, cy, 4.5, c, STROKE);
     // Six teeth as short radial strokes.
     for i in 0..6 {
         let ang = (i as f32 * 60.0).to_radians();
-        let x0 = cx + ang.cos() * 7.5;
-        let y0 = cy + ang.sin() * 7.5;
-        let x1 = cx + ang.cos() * 11.5;
-        let y1 = cy + ang.sin() * 11.5;
-        // Approximate stroke with a chain of dots.
-        for t in 0..=6 {
-            let u = t as f32 / 6.0;
-            px.fill_circle_aa(x0 + (x1 - x0) * u, y0 + (y1 - y0) * u, 1.15, c.0, c.1, c.2);
-        }
+        let x0 = cx + ang.cos() * 7.0;
+        let y0 = cy + ang.sin() * 7.0;
+        let x1 = cx + ang.cos() * 11.0;
+        let y1 = cy + ang.sin() * 11.0;
+        px.stroke_line_aa(x0, y0, x1, y1, c, STROKE);
     }
     px.into_icon()
 }
 
-/// Outlined display / computer for Keep awake (off).
-#[cfg(not(target_os = "macos"))]
+/// Outlined zZZ sleep glyph for Keep awake (💤).
 fn draw_keep_awake(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
-    // Monitor bezel.
-    px.stroke_round_rect(5.0, 6.0, 26.0, 20.0, 2.0, c, 2.0);
-    // Stand.
-    px.hline_aa(12.0, 23.0, 19.0, c, 2.0);
-    px.hline_aa(9.0, 26.0, 22.0, c, 2.0);
+    // Three Z's of increasing size, rising left → right like 💤.
+    stroke_z(&mut px, 5.0, 18.0, 7.0, c, 1.6);
+    stroke_z(&mut px, 11.5, 11.5, 9.5, c, 1.8);
+    stroke_z(&mut px, 19.0, 4.5, 12.0, c, STROKE);
     px.into_icon()
 }
 
-#[cfg(not(target_os = "macos"))]
+/// One block-letter Z: top bar, diagonal, bottom bar.
+fn stroke_z(px: &mut Canvas, x: f32, y: f32, size: f32, c: (u8, u8, u8), thickness: f32) {
+    let x1 = x + size;
+    let y1 = y + size * 0.85;
+    px.stroke_line_aa(x, y, x1, y, c, thickness);
+    px.stroke_line_aa(x1, y, x, y1, c, thickness);
+    px.stroke_line_aa(x, y1, x1, y1, c, thickness);
+}
+
+/// Outlined power symbol (circle with stem) for Quit.
 fn draw_quit(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
-    px.stroke_arc_aa(15.5, 16.5, 9.0, 40.0, 320.0, c, 2.2);
-    px.fill_round_rect(14.5, 5.0, 16.5, 16.0, 0.8, c);
+    px.stroke_arc_aa(15.5, 17.0, 9.0, 45.0, 315.0, c, STROKE);
+    px.stroke_line_aa(15.5, 6.0, 15.5, 16.0, c, STROKE);
     px.into_icon()
 }
 
-#[cfg(not(target_os = "macos"))]
 struct Canvas {
     rgba: Vec<u8>,
 }
 
-#[cfg(not(target_os = "macos"))]
 impl Canvas {
     fn new() -> Self {
         Self {
@@ -471,26 +370,6 @@ impl Canvas {
         }
     }
 
-    fn fill_round_rect(
-        &mut self,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        radius: f32,
-        c: (u8, u8, u8),
-    ) {
-        for y in 0..SIZE as i32 {
-            for x in 0..SIZE as i32 {
-                let d = sd_round_rect(x as f32 + 0.5, y as f32 + 0.5, x0, y0, x1, y1, radius);
-                let alpha = if d <= 0.0 { 1.0 } else { coverage(d, 0.75) };
-                if alpha > 0.01 {
-                    self.blend(x, y, c.0, c.1, c.2, alpha);
-                }
-            }
-        }
-    }
-
     fn stroke_round_rect(
         &mut self,
         x0: f32,
@@ -512,36 +391,40 @@ impl Canvas {
         }
     }
 
-    fn hline_aa(&mut self, x0: f32, y: f32, x1: f32, c: (u8, u8, u8), thickness: f32) {
-        for py in 0..SIZE as i32 {
-            for px in 0..SIZE as i32 {
-                let x = px as f32 + 0.5;
-                let yy = py as f32 + 0.5;
-                if !(x0 - 1.0..=x1 + 1.0).contains(&x) {
-                    continue;
-                }
-                let alpha = coverage((yy - y).abs(), thickness / 2.0);
-                if alpha > 0.01 {
-                    self.blend(px, py, c.0, c.1, c.2, alpha);
-                }
-            }
+    fn stroke_line_aa(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        c: (u8, u8, u8),
+        thickness: f32,
+    ) {
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len = (dx * dx + dy * dy).sqrt().max(0.001);
+        let steps = (len * 2.0).ceil() as i32;
+        let half = thickness / 2.0;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            self.fill_circle_aa(x0 + dx * t, y0 + dy * t, half, c.0, c.1, c.2);
         }
     }
 
-    fn vline_aa(&mut self, x: f32, y0: f32, y1: f32, c: (u8, u8, u8), thickness: f32) {
-        for py in 0..SIZE as i32 {
-            for px in 0..SIZE as i32 {
-                let xx = px as f32 + 0.5;
-                let y = py as f32 + 0.5;
-                if !(y0 - 1.0..=y1 + 1.0).contains(&y) {
-                    continue;
-                }
-                let alpha = coverage((xx - x).abs(), thickness / 2.0);
-                if alpha > 0.01 {
-                    self.blend(px, py, c.0, c.1, c.2, alpha);
-                }
-            }
-        }
+    fn stroke_triangle_aa(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        c: (u8, u8, u8),
+        thickness: f32,
+    ) {
+        self.stroke_line_aa(x0, y0, x1, y1, c, thickness);
+        self.stroke_line_aa(x1, y1, x2, y2, c, thickness);
+        self.stroke_line_aa(x2, y2, x0, y0, c, thickness);
     }
 
     fn stroke_arc_aa(
@@ -571,7 +454,6 @@ impl Canvas {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn coverage(dist: f32, radius: f32) -> f32 {
     let edge = 1.0;
     if dist <= radius - edge {
@@ -583,7 +465,6 @@ fn coverage(dist: f32, radius: f32) -> f32 {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn sd_round_rect(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32) -> f32 {
     let half_w = (x1 - x0) * 0.5;
     let half_h = (y1 - y0) * 0.5;
