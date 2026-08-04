@@ -48,21 +48,22 @@ if ! command -v hdiutil >/dev/null 2>&1; then
   exit 1
 fi
 
-ensure_dmgbuild() {
-  if command -v dmgbuild >/dev/null 2>&1; then
-    return 0
-  fi
-  python3 -m pip install --user --quiet 'dmgbuild>=1.6.7,<2'
-  local user_base
-  user_base="$(python3 -m site --user-base)"
-  export PATH="${user_base}/bin:${PATH}"
-  command -v dmgbuild >/dev/null 2>&1 || {
-    echo "error: dmgbuild not on PATH after pip install (looked in ${user_base}/bin)" >&2
-    exit 1
-  }
+# Homebrew Python on macos runners is PEP 668 externally managed, so
+# `pip install --user` fails. Always install dmgbuild into a throwaway venv.
+VENV="$(mktemp -d)"
+cleanup() {
+  rm -rf "$VENV"
 }
+trap cleanup EXIT
 
-ensure_dmgbuild
+python3 -m venv "$VENV"
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+python3 -m pip install --quiet 'dmgbuild>=1.6.7,<2'
+command -v dmgbuild >/dev/null 2>&1 || {
+  echo "error: dmgbuild missing after venv install" >&2
+  exit 1
+}
 
 # Creates a compressed UDZO image with background + icon layout baked in.
 # Fail hard on any error — never ship a plain white drag-to-Applications DMG.
