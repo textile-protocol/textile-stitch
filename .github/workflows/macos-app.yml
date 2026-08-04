@@ -133,7 +133,8 @@ jobs:
           test -f dist/Stitch.app/Contents/MacOS/stitch-desktop
 
       - name: Build Stitch.dmg
-        # Wrap the (signed) app in a drag-to-Applications image. make-dmg.sh signs
+        # Wrap the (signed) app in a drag-to-Applications image. make-dmg.sh uses
+        # dmgbuild (no Finder AppleScript) so the background ships on CI, and signs
         # the .dmg with $STITCH_CODESIGN_ID when it's a real Developer ID.
         run: packaging/macos/make-dmg.sh dist/Stitch.app dist
 
