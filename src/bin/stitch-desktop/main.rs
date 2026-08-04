@@ -669,15 +669,33 @@ fn run() -> Result<()> {
 }
 
 fn toggle_panel(supervisor: &Arc<Mutex<PanelSupervisor>>) {
-    if let Ok(mut s) = supervisor.lock() {
-        if s.is_running() {
-            if !confirm_panel_pause() {
+    // Sample running state under a short lock, then drop it before any
+    // blocking confirmation. On Linux, gtk::Dialog::run() nests the GTK loop
+    // and can dispatch RefreshStatus, which also needs this mutex — holding
+    // it across the dialog deadlocks the UI thread.
+    let running = match supervisor.lock() {
+        Ok(mut s) => s.is_running(),
+        Err(_) => return,
+    };
+
+    if running {
+        if !confirm_panel_pause() {
+            return;
+        }
+        if let Ok(mut s) = supervisor.lock() {
+            // State may have changed while the dialog was open.
+            if !s.is_running() {
                 return;
             }
             if let Err(e) = s.stop() {
                 eprintln!("pause failed: {e:#}");
             }
-        } else if let Err(e) = s.start() {
+        }
+        return;
+    }
+
+    if let Ok(mut s) = supervisor.lock() {
+        if let Err(e) = s.start() {
             eprintln!("resume failed: {e:#}");
         }
     }
