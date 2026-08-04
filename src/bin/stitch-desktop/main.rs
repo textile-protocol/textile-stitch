@@ -52,6 +52,8 @@ const SERVER_INSTALL_DOCS: &str =
 const WINDOW_TITLE: &str = "Stitch";
 const WINDOW_INNER_WIDTH: f64 = 380.0;
 const WINDOW_INNER_HEIGHT: f64 = 520.0;
+const PAUSE_CONFIRMATION_TITLE: &str = "Pause Stitch?";
+const PAUSE_CONFIRMATION_MESSAGE: &str = "Pausing the panel also pauses every bot that is running now. When you resume, Stitch restarts only those bots. Bots that were already paused stay paused.";
 
 #[derive(Debug)]
 enum UserEvent {
@@ -125,6 +127,56 @@ fn show_launch_error(detail: &str) {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let _ = detail;
+    }
+}
+
+/// Confirm the fleet-wide effect before pausing the panel. Fail closed when a
+/// platform dialog cannot be shown: silently stopping trading bots is worse
+/// than leaving the panel running.
+fn confirm_panel_pause() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display alert \"{PAUSE_CONFIRMATION_TITLE}\" message \"{PAUSE_CONFIRMATION_MESSAGE}\" buttons {{\"Cancel\", \"Pause panel and bots\"}} default button \"Pause panel and bots\" cancel button \"Cancel\" as warning"
+        );
+        return std::process::Command::new("/usr/bin/osascript")
+            .args(["-e", &script])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "Add-Type -AssemblyName PresentationFramework; \
+             $answer = [System.Windows.MessageBox]::Show(\
+               '{PAUSE_CONFIRMATION_MESSAGE}',\
+               '{PAUSE_CONFIRMATION_TITLE}','OKCancel','Warning'); \
+             if ($answer -eq 'OK') {{ exit 0 }} else {{ exit 1 }}"
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
+        win_cmd::no_window(&mut cmd);
+        return cmd.status().map(|status| status.success()).unwrap_or(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::*;
+        let dialog = gtk::MessageDialog::new(
+            None::<&gtk::Window>,
+            gtk::DialogFlags::MODAL,
+            gtk::MessageType::Warning,
+            gtk::ButtonsType::OkCancel,
+            PAUSE_CONFIRMATION_MESSAGE,
+        );
+        dialog.set_title(PAUSE_CONFIRMATION_TITLE);
+        let confirmed = dialog.run() == gtk::ResponseType::Ok;
+        dialog.close();
+        return confirmed;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        false
     }
 }
 
@@ -619,6 +671,9 @@ fn run() -> Result<()> {
 fn toggle_panel(supervisor: &Arc<Mutex<PanelSupervisor>>) {
     if let Ok(mut s) = supervisor.lock() {
         if s.is_running() {
+            if !confirm_panel_pause() {
+                return;
+            }
             if let Err(e) = s.stop() {
                 eprintln!("pause failed: {e:#}");
             }
@@ -1066,5 +1121,18 @@ mod tray_badge_tests {
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
         assert_eq!(&rgba[4..8], &[242, 242, 247, 128]);
         assert_eq!(&rgba[8..12], &[242, 242, 247, 255]);
+    }
+}
+
+#[cfg(test)]
+mod pause_confirmation_tests {
+    use super::{PAUSE_CONFIRMATION_MESSAGE, PAUSE_CONFIRMATION_TITLE};
+
+    #[test]
+    fn confirmation_explains_selective_bot_restore() {
+        assert_eq!(PAUSE_CONFIRMATION_TITLE, "Pause Stitch?");
+        assert!(PAUSE_CONFIRMATION_MESSAGE.contains("every bot that is running now"));
+        assert!(PAUSE_CONFIRMATION_MESSAGE.contains("restarts only those bots"));
+        assert!(PAUSE_CONFIRMATION_MESSAGE.contains("already paused stay paused"));
     }
 }

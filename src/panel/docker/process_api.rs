@@ -1413,6 +1413,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restarting_runtime_restores_only_previously_running_bots() {
+        let sleep_bin = which_sleep();
+        let root = temp_root("selective-restore");
+        let bots = root.join("bots");
+        std::fs::create_dir_all(&bots).unwrap();
+        let rt = ProcessRuntime::new(sleep_bin.clone(), &bots).unwrap();
+
+        for name in ["bot-running", "bot-paused"] {
+            let host = bots.join(name);
+            std::fs::create_dir_all(&host).unwrap();
+            let container = format!("stitch-{name}");
+            let mut labels = HashMap::new();
+            labels.insert(LABEL_BOT.into(), name.into());
+            rt.create(&CreateSpec {
+                name: container,
+                image: BUNDLED_IMAGE.into(),
+                labels,
+                env: vec![],
+                binds: vec![BindSpec::rw(&host, RUN_DIR)],
+                cmd: Some(vec!["30".into()]),
+                restart_unless_stopped: true,
+            })
+            .await
+            .unwrap();
+        }
+        rt.start("stitch-bot-running").await.unwrap();
+        drop(rt); // panel pause: stop children, preserve each bot's wanted_up.
+
+        let restored = ProcessRuntime::new(sleep_bin, &bots).unwrap();
+        {
+            let inner = restored.inner.lock().unwrap();
+            let running = &inner["stitch-bot-running"];
+            let paused = &inner["stitch-bot-paused"];
+            assert!(running.record.wanted_up);
+            assert!(
+                running.child.is_some(),
+                "previously running bot must resume"
+            );
+            assert!(!paused.record.wanted_up);
+            assert!(
+                paused.child.is_none(),
+                "previously paused bot must stay paused"
+            );
+        }
+        drop(restored);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn restore_kills_orphan_pid_before_respawn() {
         let root = temp_root("orphan");
         let bots = root.join("bots");
