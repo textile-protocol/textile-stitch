@@ -5,7 +5,7 @@
 # for XAUt (USDT -> XAUt) and the sell side sells XAUt for USDT (XAUt -> USDT).
 
 chain_id        = 1                                    # Ethereum mainnet
-rpc_url         = "https://ethereum-rpc.publicnode.com" # free public Ethereum RPC; swap for your own if you have one
+rpc_url         = "https://gateway.tenderly.co/public/mainnet" # free public Ethereum RPC; swap for your own if you have one
 indexer_url     = "https://api.textilecredit.com"
 permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
 reactor         = "0x26a1aedaa26affc4fd9f910acfca754a31bc43c6"  # SETTLEMENT_V3_FILLER_REACTOR (Ethereum)

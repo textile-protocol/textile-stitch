@@ -5,7 +5,7 @@
 # for wBRL (USDT -> wBRL) and the sell side sells wBRL for USDT (wBRL -> USDT).
 
 chain_id        = 42220                                # Celo mainnet
-rpc_url         = "https://celo-rpc.publicnode.com"    # free public Celo RPC; swap for your own if you have one
+rpc_url         = "https://forno.celo.org"             # free public Celo RPC; swap for your own if you have one
 indexer_url     = "https://api.textilecredit.com"
 permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
 reactor         = "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"  # SETTLEMENT_V3_FILLER_REACTOR (Celo)

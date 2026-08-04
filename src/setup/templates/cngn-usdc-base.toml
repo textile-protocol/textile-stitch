@@ -5,7 +5,7 @@
 # for cNGN (USDC -> cNGN) and the sell side sells cNGN for USDC (cNGN -> USDC).
 
 chain_id        = 8453                                 # Base mainnet
-rpc_url         = "https://base-rpc.publicnode.com"    # free public Base RPC; swap for your own if you have one
+rpc_url         = "https://mainnet.base.org"           # free public Base RPC; swap for your own if you have one
 indexer_url     = "https://api.textilecredit.com"
 permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
 reactor         = "0xEb5A29F869FF084B3Fce18d3487a38A56feDC59E"  # SETTLEMENT_V3_FILLER_REACTOR (Base)

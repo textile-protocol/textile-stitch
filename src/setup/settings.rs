@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn reads_current_values_from_a_template() {
         let v = read_settings(TEMPLATE).unwrap();
-        assert!(v.rpc_url.starts_with("https://bsc-rpc.publicnode.com"));
+        assert!(v.rpc_url.starts_with("https://bsc-dataseed.binance.org"));
         assert_eq!(
             v.feed_url,
             "https://api.textilecredit.com/price?chainId=56&pair=cngn-usdt"

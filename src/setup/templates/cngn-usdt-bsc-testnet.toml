@@ -8,7 +8,7 @@
 #     both the maker and taker legs work here.
 
 chain_id        = 97                                            # BNB Smart Chain testnet
-rpc_url         = "https://data-seed-prebsc-1-s1.binance.org:8545"  # public BSC testnet RPC; swap for your own if you have one
+rpc_url         = "https://bsc-testnet.bnbchain.org"                # public BSC testnet RPC; swap for your own if you have one
 indexer_url     = "https://api.textilecredit.com"               # serves chain 97; staging is https://api.s1.textilecredit.com
 permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor         = "0x65B2f3847b391783e15554D5f2826FBaF318a7Df"  # SETTLEMENT_V3_FILLER_REACTOR (BSC testnet) — FILL IN after `deploy-filler-reactor.ts`

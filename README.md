@@ -241,7 +241,7 @@ configuration looks like this:
 
 ```toml
 chain_id = 56
-rpc_url = "https://bsc-rpc.publicnode.com"   # free public RPC; swap for your own if you have one
+rpc_url = "https://bsc-dataseed.binance.org" # free public RPC; swap for your own if you have one
 indexer_url = "https://api.textilecredit.com"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0x0000000000000000000000000000000000000000"
