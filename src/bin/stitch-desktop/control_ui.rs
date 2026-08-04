@@ -66,10 +66,19 @@ fn theme_css() -> &'static str {
   }
   h1 {
     margin: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
     font-size: 22px;
     font-weight: 700;
     letter-spacing: -0.02em;
     color: var(--tx-text-primary);
+  }
+  .app-version {
+    color: var(--tx-text-tertiary);
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0.01em;
   }
   .lede {
     margin: 0 0 18px;
@@ -350,7 +359,7 @@ pub fn html(
   <div class="brand-row">
     {textile_icon}
     <div class="brand-text">
-      <h1>Stitch</h1>
+      <h1>Stitch <span class="app-version" aria-label="App version">v{app_version}</span></h1>
       <button type="button" class="subtitle" data-action="open_server_docs">
         Install on AWS or any server →
       </button>
@@ -454,6 +463,7 @@ pub fn html(
         keep_awake_checked = keep_awake_checked,
         keep_awake_label = keep_awake_label,
         dock_row = dock_row,
+        app_version = env!("CARGO_PKG_VERSION"),
     )
 }
 
@@ -533,5 +543,15 @@ mod tests {
             html_escape(r#"a&b<"c">'d"#),
             "a&amp;b&lt;&quot;c&quot;&gt;&#39;d"
         );
+    }
+
+    #[test]
+    fn main_window_shows_packaged_app_version_beside_title() {
+        let page = html(false, false, false, true, false, None);
+        let expected = format!(
+            r#"<h1>Stitch <span class="app-version" aria-label="App version">v{}</span></h1>"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(page.contains(&expected));
     }
 }

@@ -347,10 +347,11 @@ fn run() -> Result<()> {
                         .with_menu(Box::new(menu.clone()))
                         .with_tooltip(tooltip)
                         .with_icon(icon);
-                    // macOS menu bar: template image so the system tints the
-                    // monochrome grandma for light/dark menu bar chrome.
+                    // The normal grandma is a macOS template. The awake state
+                    // carries a yellow dot, so it is an appearance-aware color
+                    // bitmap and must not be system-tinted.
                     #[cfg(target_os = "macos")]
-                    let tray_builder = tray_builder.with_icon_as_template(true);
+                    let tray_builder = tray_builder.with_icon_as_template(!prefs.keep_awake);
                     match tray_builder.build() {
                         Ok(t) => tray = Some(t),
                         Err(e) => {
@@ -560,6 +561,9 @@ fn run() -> Result<()> {
                         &settings_item,
                         &quit_item,
                     );
+                    if prefs.keep_awake {
+                        apply_tray_keep_awake_chrome(tray.as_ref(), true);
+                    }
                 }
                 sync_tray_menu(
                     &status_item,
@@ -848,11 +852,10 @@ fn apply_keep_awake(
 fn apply_tray_keep_awake_chrome(tray: Option<&TrayIcon>, keep_awake: bool) {
     let Some(tray) = tray else { return };
     let icon = tray_icon_for_state(keep_awake);
-    // set_icon alone drops the macOS template flag, so the grandma stops
-    // following light/dark menu-bar chrome after the first toggle. Always
-    // re-assert template=true with the replacement icon.
+    // Normal is a system-tinted template. Awake contains a yellow dot and is
+    // already tinted for the current appearance, so preserve its color.
     #[cfg(target_os = "macos")]
-    let icon_result = tray.set_icon_with_as_template(Some(icon), true);
+    let icon_result = tray.set_icon_with_as_template(Some(icon), !keep_awake);
     #[cfg(not(target_os = "macos"))]
     let icon_result = tray.set_icon(Some(icon));
     if let Err(e) = icon_result {
@@ -967,8 +970,10 @@ fn tray_icon_from_embedded() -> Option<Icon> {
     Icon::from_rgba(RGBA.to_vec(), SIZE, SIZE).ok()
 }
 
-/// Grandma tray icon plus a small lightning badge in the lower-right corner.
-/// Template-safe (black + alpha) so macOS menu-bar tinting still works.
+/// Original grandma tray icon plus a small Textile-yellow "on" dot.
+///
+/// This state is not a macOS template because template tinting would erase the
+/// yellow. Tint the grandma ourselves for the current light/dark appearance.
 fn tray_icon_with_awake_badge() -> Option<Icon> {
     const SIZE: u32 = 32;
     const RGBA: &[u8] = include_bytes!("../../../assets/grandma-tray-32.rgba");
@@ -976,67 +981,51 @@ fn tray_icon_with_awake_badge() -> Option<Icon> {
         return None;
     }
     let mut px = RGBA.to_vec();
-    paint_awake_badge(&mut px, SIZE);
+    tint_opaque_pixels(&mut px, menu_icons::current_ink());
+    paint_awake_dot(&mut px, SIZE);
     Icon::from_rgba(px, SIZE, SIZE).ok()
 }
 
-/// Draw a compact lightning bolt (template ink) into the lower-right of a
-/// 32×32 RGBA buffer. Cleared with a soft hole first so it reads as an overlay
-/// even when the grandma mark already occupies that corner.
-fn paint_awake_badge(rgba: &mut [u8], size: u32) {
-    // Bolt polygon in icon space (lower-right).
-    let bolt: [(f32, f32); 6] = [
-        (22.0, 17.0),
-        (27.5, 17.0),
-        (24.5, 22.0),
-        (29.0, 22.0),
-        (21.5, 30.5),
-        (23.5, 23.5),
-    ];
-    // Soft circular wipe behind the bolt so it doesn't merge into grandma ink.
-    for y in 16..size as i32 {
-        for x in 20..size as i32 {
-            let dx = x as f32 + 0.5 - 25.5;
-            let dy = y as f32 + 0.5 - 24.0;
-            if dx * dx + dy * dy <= 7.5 * 7.5 {
-                let i = ((y as u32 * size + x as u32) * 4) as usize;
-                rgba[i] = 0;
-                rgba[i + 1] = 0;
-                rgba[i + 2] = 0;
-                rgba[i + 3] = 0;
-            }
-        }
-    }
-    for y in 0..size as i32 {
-        for x in 0..size as i32 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            if point_in_polygon(px, py, &bolt) {
-                let i = ((y as u32 * size + x as u32) * 4) as usize;
-                rgba[i] = 0;
-                rgba[i + 1] = 0;
-                rgba[i + 2] = 0;
-                rgba[i + 3] = 255;
-            }
+fn tint_opaque_pixels(rgba: &mut [u8], ink: (u8, u8, u8)) {
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] > 0 {
+            pixel[0] = ink.0;
+            pixel[1] = ink.1;
+            pixel[2] = ink.2;
         }
     }
 }
 
-fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
-    // Ray cast — even-odd fill for the small badge polygon.
-    let mut inside = false;
-    let mut j = poly.len() - 1;
-    for i in 0..poly.len() {
-        let (xi, yi) = poly[i];
-        let (xj, yj) = poly[j];
-        let intersect =
-            ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi + f32::EPSILON) + xi);
-        if intersect {
-            inside = !inside;
+/// Paint a crisp status dot in the upper-right, with a transparent separation
+/// ring so the original grandma remains legible at 1×.
+fn paint_awake_dot(rgba: &mut [u8], size: u32) {
+    const CX: f32 = 25.0;
+    const CY: f32 = 7.0;
+    const DOT_R: f32 = 3.4;
+    const KNOCKOUT_R: f32 = 4.7;
+    const YELLOW: (u8, u8, u8) = (0xf7, 0xcc, 0x1e);
+
+    for y in 0..size as i32 {
+        for x in 0..size as i32 {
+            let dx = x as f32 + 0.5 - CX;
+            let dy = y as f32 + 0.5 - CY;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let i = ((y as u32 * size + x as u32) * 4) as usize;
+
+            if distance <= KNOCKOUT_R + 0.5 {
+                let keep = (distance - (KNOCKOUT_R - 0.5)).clamp(0.0, 1.0);
+                rgba[i + 3] = (rgba[i + 3] as f32 * keep).round() as u8;
+            }
+
+            let dot_alpha = (DOT_R + 0.5 - distance).clamp(0.0, 1.0);
+            if dot_alpha > 0.0 {
+                rgba[i] = YELLOW.0;
+                rgba[i + 1] = YELLOW.1;
+                rgba[i + 2] = YELLOW.2;
+                rgba[i + 3] = (dot_alpha * 255.0).round() as u8;
+            }
         }
-        j = i;
     }
-    inside
 }
 
 fn fallback_icon() -> Icon {
@@ -1045,17 +1034,37 @@ fn fallback_icon() -> Icon {
 
 #[cfg(test)]
 mod tray_badge_tests {
-    use super::paint_awake_badge;
+    use super::{paint_awake_dot, tint_opaque_pixels};
 
     #[test]
-    fn awake_badge_sets_ink_pixels() {
+    fn awake_dot_is_small_yellow_and_antialiased() {
         let mut rgba = vec![0u8; 32 * 32 * 4];
-        paint_awake_badge(&mut rgba, 32);
-        let ink = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
-        assert!(ink > 10, "expected lightning ink, got {ink} pixels");
+        paint_awake_dot(&mut rgba, 32);
+        let yellow: Vec<&[u8]> = rgba
+            .chunks_exact(4)
+            .filter(|p| p[0..3] == [0xf7, 0xcc, 0x1e] && p[3] > 0)
+            .collect();
         assert!(
-            ink < 120,
-            "badge should stay a small corner overlay, got {ink}"
+            (25..=60).contains(&yellow.len()),
+            "yellow pixels: {}",
+            yellow.len()
         );
+        assert!(
+            yellow.iter().any(|p| p[3] == 255),
+            "dot needs a solid center"
+        );
+        assert!(
+            yellow.iter().any(|p| p[3] > 0 && p[3] < 255),
+            "dot edge should be anti-aliased"
+        );
+    }
+
+    #[test]
+    fn awake_grandma_tint_preserves_alpha() {
+        let mut rgba = vec![0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 255];
+        tint_opaque_pixels(&mut rgba, (242, 242, 247));
+        assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&rgba[4..8], &[242, 242, 247, 128]);
+        assert_eq!(&rgba[8..12], &[242, 242, 247, 255]);
     }
 }

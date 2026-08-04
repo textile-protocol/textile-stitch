@@ -9,8 +9,7 @@
 //!
 //! Design rules for the set (Lucide conventions at 32×32):
 //! - Shared stroke weight ([`STROKE`]) and ~6 px padding (optical ~20×20).
-//! - Outline strokes for wireframe shapes; solid fills for pause, play,
-//!   moon, and the refresh arrowhead so weight matches at menu size.
+//! - Outline strokes throughout, including pause, play, moon, and refresh.
 //! - No mixed per-glyph stroke thicknesses.
 
 use tray_icon::menu::Icon;
@@ -153,6 +152,11 @@ fn ink_for(light_glyphs: bool) -> (u8, u8, u8) {
     } else {
         (0x1c, 0x1c, 0x1e)
     }
+}
+
+/// Current menu-chrome ink, also used to tint the non-template awake tray icon.
+pub fn current_ink() -> (u8, u8, u8) {
+    ink_for(prefer_light_glyphs())
 }
 
 /// Re-stamp every tray-menu icon after [`MenuIcons::refresh_for_appearance`].
@@ -339,7 +343,7 @@ fn paint_glyph_rgba(name: &str, ink: (u8, u8, u8)) -> Vec<u8> {
             let cx = 15.5;
             let cy = 15.5;
             px.stroke_circle_aa(cx, cy, 9.0, ink, STROKE);
-            px.fill_circle_aa(cx, cy, 3.5, ink.0, ink.1, ink.2);
+            px.stroke_circle_aa(cx, cy, 3.5, ink, STROKE);
         }
         "stopped" => px.stroke_circle_aa(15.5, 15.5, 9.0, ink, STROKE),
         "open" => paint_open(&mut px, ink),
@@ -363,7 +367,7 @@ fn draw_status_running(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon
     let cx = 15.5;
     let cy = 15.5;
     px.stroke_circle_aa(cx, cy, 9.0, c, STROKE);
-    px.fill_circle_aa(cx, cy, 3.5, c.0, c.1, c.2);
+    px.stroke_circle_aa(cx, cy, 3.5, c, STROKE);
     px.into_icon()
 }
 
@@ -386,7 +390,7 @@ fn paint_open(px: &mut Canvas, c: (u8, u8, u8)) {
     px.stroke_line_aa(12.0, 7.5, 12.0, 24.5, c, STROKE);
 }
 
-/// Two solid rounded bars — Lucide pause; solid weight matches outline siblings.
+/// Two rounded outline bars — Lucide pause in the shared family stroke.
 fn draw_pause(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
     paint_pause(&mut px, c);
@@ -394,11 +398,11 @@ fn draw_pause(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
 }
 
 fn paint_pause(px: &mut Canvas, c: (u8, u8, u8)) {
-    px.fill_round_rect(8.0, 7.0, 13.5, 25.0, 1.75, c);
-    px.fill_round_rect(18.5, 7.0, 24.0, 25.0, 1.75, c);
+    px.stroke_round_rect(8.0, 7.0, 13.5, 25.0, 1.75, c, STROKE);
+    px.stroke_round_rect(18.5, 7.0, 24.0, 25.0, 1.75, c, STROKE);
 }
 
-/// Solid play triangle (Lucide play).
+/// Outline play triangle (Lucide play).
 fn draw_resume(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
     paint_resume(&mut px, c);
@@ -406,8 +410,9 @@ fn draw_resume(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
 }
 
 fn paint_resume(px: &mut Canvas, c: (u8, u8, u8)) {
-    // CCW winding (top → tip → bottom) for a correct inside SDF.
-    px.fill_triangle_aa(9.5, 6.5, 25.0, 16.0, 9.5, 25.5, c);
+    px.stroke_line_aa(9.5, 6.5, 25.0, 16.0, c, STROKE);
+    px.stroke_line_aa(25.0, 16.0, 9.5, 25.5, c, STROKE);
+    px.stroke_line_aa(9.5, 25.5, 9.5, 6.5, c, STROKE);
 }
 
 /// Circular refresh arrow (Lucide `refresh-cw`).
@@ -422,16 +427,9 @@ fn paint_update(px: &mut Canvas, c: (u8, u8, u8)) {
     let cy = 15.5;
     // Open ring with gap at top-right for the arrowhead.
     px.stroke_arc_aa(cx, cy, 9.0, 55.0, 315.0, c, STROKE);
-    // Filled arrowhead at the clockwise end of the arc.
-    px.fill_triangle_aa(
-        cx + 3.5,
-        cy - 9.0,
-        cx + 10.0,
-        cy - 8.0,
-        cx + 6.0,
-        cy - 3.0,
-        c,
-    );
+    // Open chevron arrowhead keeps the refresh icon outline-only.
+    px.stroke_line_aa(cx + 3.5, cy - 9.0, cx + 10.0, cy - 8.0, c, STROKE);
+    px.stroke_line_aa(cx + 10.0, cy - 8.0, cx + 6.0, cy - 3.0, c, STROKE);
 }
 
 /// Horizontal sliders — Settings at menu size; radial "gears" read as suns.
@@ -460,7 +458,7 @@ fn paint_show(px: &mut Canvas, c: (u8, u8, u8)) {
     }
 }
 
-/// Solid crescent moon for Keep awake (Lucide `moon` — sleep control).
+/// Outline crescent moon for Keep awake (Lucide `moon` — sleep control).
 fn draw_keep_awake(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
     paint_keep_awake(&mut px, c);
@@ -474,7 +472,7 @@ fn paint_keep_awake(px: &mut Canvas, c: (u8, u8, u8)) {
     let cut_cx = cx + 5.0;
     let cut_cy = cy - 3.0;
     let cut_r = 8.0;
-    px.fill_crescent_aa(cx, cy, r, cut_cx, cut_cy, cut_r, c);
+    px.stroke_crescent_aa(cx, cy, r, cut_cx, cut_cy, cut_r, c, STROKE);
 }
 
 /// Power symbol (circle with stem) for Quit.
@@ -570,27 +568,6 @@ impl Canvas {
         }
     }
 
-    fn fill_round_rect(
-        &mut self,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        radius: f32,
-        c: (u8, u8, u8),
-    ) {
-        for y in 0..SIZE as i32 {
-            for x in 0..SIZE as i32 {
-                let d = sd_round_rect(x as f32 + 0.5, y as f32 + 0.5, x0, y0, x1, y1, radius);
-                // Negative SDF is inside; coverage() expects distance from edge outward.
-                let alpha = if d <= 0.0 { 1.0 } else { coverage(d, 0.0) };
-                if alpha > 0.01 {
-                    self.blend(x, y, c.0, c.1, c.2, alpha);
-                }
-            }
-        }
-    }
-
     fn stroke_line_aa(
         &mut self,
         x0: f32,
@@ -608,29 +585,6 @@ impl Canvas {
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
             self.fill_circle_aa(x0 + dx * t, y0 + dy * t, half, c.0, c.1, c.2);
-        }
-    }
-
-    fn fill_triangle_aa(
-        &mut self,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        x2: f32,
-        y2: f32,
-        c: (u8, u8, u8),
-    ) {
-        for y in 0..SIZE as i32 {
-            for x in 0..SIZE as i32 {
-                let px = x as f32 + 0.5;
-                let py = y as f32 + 0.5;
-                let d = sd_triangle(px, py, x0, y0, x1, y1, x2, y2);
-                let alpha = if d <= 0.0 { 1.0 } else { coverage(d, 0.0) };
-                if alpha > 0.01 {
-                    self.blend(x, y, c.0, c.1, c.2, alpha);
-                }
-            }
         }
     }
 
@@ -660,8 +614,9 @@ impl Canvas {
         }
     }
 
-    /// Filled `circle(cx,cy,r) \ circle(cut_cx,cut_cy,cut_r)` (crescent moon).
-    fn fill_crescent_aa(
+    /// Outline of `circle(cx,cy,r) \ circle(cut_cx,cut_cy,cut_r)`.
+    #[allow(clippy::too_many_arguments)]
+    fn stroke_crescent_aa(
         &mut self,
         cx: f32,
         cy: f32,
@@ -670,6 +625,7 @@ impl Canvas {
         cut_cy: f32,
         cut_r: f32,
         c: (u8, u8, u8),
+        thickness: f32,
     ) {
         for y in 0..SIZE as i32 {
             for x in 0..SIZE as i32 {
@@ -678,7 +634,7 @@ impl Canvas {
                 let d_outer = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - r;
                 let d_cut = ((px - cut_cx).powi(2) + (py - cut_cy).powi(2)).sqrt() - cut_r;
                 let d = d_outer.max(-d_cut);
-                let alpha = if d <= 0.0 { 1.0 } else { coverage(d, 0.0) };
+                let alpha = coverage(d.abs(), thickness / 2.0);
                 if alpha > 0.01 {
                     self.blend(x, y, c.0, c.1, c.2, alpha);
                 }
@@ -708,46 +664,4 @@ fn sd_round_rect(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, radius: f
     let ax = dx.max(0.0);
     let ay = dy.max(0.0);
     (ax * ax + ay * ay).sqrt() + dx.min(0.0).max(dy.min(0.0)) - radius
-}
-
-fn sd_triangle(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
-    // Signed distance via edge half-planes + vertex distances. Assumes CCW winding.
-    let e0x = x1 - x0;
-    let e0y = y1 - y0;
-    let e1x = x2 - x1;
-    let e1y = y2 - y1;
-    let e2x = x0 - x2;
-    let e2y = y0 - y2;
-    let v0x = px - x0;
-    let v0y = py - y0;
-    let v1x = px - x1;
-    let v1y = py - y1;
-    let v2x = px - x2;
-    let v2y = py - y2;
-
-    let cross0 = e0x * v0y - e0y * v0x;
-    let cross1 = e1x * v1y - e1y * v1x;
-    let cross2 = e2x * v2y - e2y * v2x;
-    let inside = cross0 >= 0.0 && cross1 >= 0.0 && cross2 >= 0.0;
-
-    let d0 = dist_to_segment(px, py, x0, y0, x1, y1);
-    let d1 = dist_to_segment(px, py, x1, y1, x2, y2);
-    let d2 = dist_to_segment(px, py, x2, y2, x0, y0);
-    let dist = d0.min(d1).min(d2);
-    if inside {
-        -dist
-    } else {
-        dist
-    }
-}
-
-fn dist_to_segment(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
-    let dx = x1 - x0;
-    let dy = y1 - y0;
-    let len2 = (dx * dx + dy * dy).max(0.0001);
-    let t = ((px - x0) * dx + (py - y0) * dy) / len2;
-    let t = t.clamp(0.0, 1.0);
-    let sx = x0 + dx * t;
-    let sy = y0 + dy * t;
-    ((px - sx).powi(2) + (py - sy).powi(2)).sqrt()
 }
