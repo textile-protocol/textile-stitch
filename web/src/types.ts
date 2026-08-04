@@ -137,6 +137,17 @@ export interface ActionResult {
   message: string | null
 }
 
+/** POST /api/bots — create. */
+export interface CreateBotResult {
+  bot: Bot
+  message: string
+  /**
+   * Always true today: create does not verify on-chain Permit2. The UI shows
+   * the approval handoff; Approve is a no-op when allowances are already set.
+   */
+  needsPermit2Approval: boolean
+}
+
 export interface MigrationResult {
   bot: Bot
   message: string

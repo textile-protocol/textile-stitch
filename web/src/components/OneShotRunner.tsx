@@ -29,10 +29,16 @@ export default function OneShotRunner({
   bot,
   canApprove,
   approveBlockedReason,
+  highlightPermit2 = false,
+  onApproved,
 }: {
   bot: string
   canApprove: boolean
   approveBlockedReason: string | null
+  /** After create: surface the Permit2 + gas requirement up front. */
+  highlightPermit2?: boolean
+  /** Fired when `stitch approve` exits successfully. */
+  onApproved?: () => void
 }) {
   const [lines, setLines] = useState<LogLine[]>([])
   const [running, setRunning] = useState<string | null>(null)
@@ -50,7 +56,7 @@ export default function OneShotRunner({
     if (
       action === 'approve' &&
       !window.confirm(
-        `Approve the router allowances for ${bot}? This sends transactions from its operator wallet and costs gas.`,
+        `Approve Permit2 for ${bot}'s input tokens?\n\nThis sends transactions from its operator wallet and costs a little gas. Without this approval the bot cannot trade.`,
       )
     ) {
       return
@@ -70,8 +76,12 @@ export default function OneShotRunner({
           if (event === 'line') {
             setLines((prev) => appendLine(prev, data as LogLine))
           } else if (event === 'exit') {
-            setExit(data as ExitEvent)
+            const result = data as ExitEvent
+            setExit(result)
             setRunning(null)
+            if (result.ok && result.action === 'approve') {
+              onApproved?.()
+            }
           } else if (event === 'error') {
             setError((data as { message: string }).message)
             setRunning(null)
@@ -88,6 +98,15 @@ export default function OneShotRunner({
 
   return (
     <div className="space-y-3">
+      {highlightPermit2 && (
+        <Banner tone="warning">
+          Before the first live start, run <strong>Approve allowances</strong>. That
+          grants Permit2 permission on each input token. The operator wallet needs a
+          little native gas for those one-time approval transactions — without them,
+          orders would post but fail to fill.
+        </Banner>
+      )}
+
       <div className="flex flex-wrap items-center gap-2">
         <Button
           busy={running === 'dry-run'}
@@ -103,7 +122,7 @@ export default function OneShotRunner({
           onClick={() => run('approve')}
           title={
             approveBlockedReason ??
-            'Grant the allowances the bot needs to trade. Sends transactions.'
+            'Approve input tokens to Permit2. Sends transactions and costs gas.'
           }
         >
           Approve allowances
@@ -122,8 +141,9 @@ export default function OneShotRunner({
       </div>
 
       <p className="text-xs text-faint">
-        Both run in a throwaway container with this bot's own config and key. A dry
-        run posts nothing; approve sends transactions and costs gas.
+        Both run in a throwaway container with this bot&apos;s own config and key. A
+        dry run posts nothing; Approve allowances sends Permit2 approval
+        transactions and costs a little gas.
       </p>
 
       {!canApprove && approveBlockedReason && (

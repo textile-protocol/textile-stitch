@@ -36,10 +36,19 @@ export default function BotDetail() {
   const [error, setError] = useState<string | null>(null)
   // The wizard redirects here with what it just did, so its confirmation survives
   // the navigation.
-  const handoff = (useLocation().state as { note?: string } | null)?.note ?? null
-  const [note, setNote] = useState<string | null>(handoff)
+  const handoff = useLocation().state as {
+    note?: string
+    needsPermit2?: boolean
+  } | null
+  const [note, setNote] = useState<string | null>(handoff?.note ?? null)
+  const [showPermit2Banner, setShowPermit2Banner] = useState(
+    () => !!handoff?.needsPermit2,
+  )
   const [busy, setBusy] = useState<string | null>(null)
-  const [tab, setTab] = useState<Tab>('settings')
+  // After create, land on Tools so Approve allowances is the next obvious step.
+  const [tab, setTab] = useState<Tab>(() =>
+    handoff?.needsPermit2 ? 'tools' : 'settings',
+  )
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
 
   const load = useCallback(async () => {
@@ -194,6 +203,30 @@ export default function BotDetail() {
       {note && (
         <Banner tone="success" onDismiss={() => setNote(null)}>
           {note}
+        </Banner>
+      )}
+
+      {showPermit2Banner && (
+        <Banner tone="warning" onDismiss={() => setShowPermit2Banner(false)}>
+          <div className="space-y-2">
+            <p>
+              <strong>Permit2 approval required.</strong> This bot cannot trade
+              until its operator wallet approves Permit2 for each input token.
+              That is a one-time on-chain step and needs a little native gas on
+              the wallet (for the approval transactions).
+            </p>
+            <p>
+              Open{' '}
+              <button
+                type="button"
+                className="font-bold underline hover:no-underline"
+                onClick={() => setTab('tools')}
+              >
+                Tools → Approve allowances
+              </button>
+              , then dry-run, then Start.
+            </p>
+          </div>
         </Banner>
       )}
 
@@ -366,6 +399,8 @@ export default function BotDetail() {
             bot={bot.name}
             canApprove={bot.canApprove}
             approveBlockedReason={bot.approveBlockedReason}
+            highlightPermit2={showPermit2Banner}
+            onApproved={() => setShowPermit2Banner(false)}
           />
         </Card>
       )}

@@ -9,6 +9,7 @@ import type {
   ActionResult,
   Bot,
   Corridor,
+  CreateBotResult,
   Fleet,
   MigrationResult,
   SaveResult,
@@ -139,7 +140,7 @@ export const api = {
   corridors: () => request<{ corridors: Corridor[] }>('/api/corridors'),
 
   createBot: (body: unknown) =>
-    request<{ bot: Bot; message: string }>('/api/bots', json(body)),
+    request<CreateBotResult>('/api/bots', json(body)),
 
   /**
    * Mint a fresh hot wallet for the Create wallet step. Returns address + seed

@@ -253,7 +253,7 @@ pub struct CreateRequest {
     pub corridor_id: String,
     pub signer: SignerRequest,
     /// Start the bot immediately. Off by default: the recommended path is to
-    /// approve the router allowance and dry-run first.
+    /// approve Permit2 (costs a little gas) and dry-run first.
     #[serde(default)]
     pub start: bool,
 }
@@ -411,10 +411,16 @@ pub async fn create(
     // Re-read for the response — the wallet comes from the config just written, and the
     // state changed if the start took.
     let (bot, fleet) = state.bot_and_fleet(&name).await?;
+    // Create never checks on-chain Permit2 allowances. `docker.start` succeeding
+    // only means the container launched — the bot's own preflight can still fail
+    // and restart-loop if approvals are missing. Always tell the UI to surface
+    // the Permit2 handoff; Approve is a no-op when allowances are already set.
+    let needs_permit2_approval = true;
     Ok((
         axum::http::StatusCode::CREATED,
         Json(serde_json::json!({
             "bot": bots::to_body(&bot, &state, &fleet),
+            "needsPermit2Approval": needs_permit2_approval,
             "message": format!(
                 "{name} is set up for {} on {}. {}",
                 corridor.display_name,
@@ -422,11 +428,17 @@ pub async fn create(
                 match (&start_error, started) {
                     (Some(reason), _) => format!(
                         "It was created but not started: {reason} Start it from its page once that \
-                         clears."
+                         clears. Approve Permit2 first if that was the blocker (needs a little gas)."
                     ),
-                    (None, true) => "It's running — check its logs.".to_string(),
+                    (None, true) => {
+                        "It's running — check its logs. If it restart-loops, approve Permit2 \
+                         (Tools → Approve allowances — needs a little gas)."
+                            .to_string()
+                    },
                     (None, false) => {
-                        "Approve the router allowance and dry-run it before starting.".to_string()
+                        "Next: approve Permit2 for its input tokens (Tools → Approve \
+                         allowances — needs a little gas), then dry-run before starting."
+                            .to_string()
                     }
                 }
             ),
@@ -630,6 +642,18 @@ mod tests {
         let v = Harness::parse(&body);
         assert_eq!(v["bot"]["running"], false);
         assert!(v["message"].as_str().unwrap().contains("dry-run"), "{body}");
+        assert!(
+            v["message"].as_str().unwrap().contains("Permit2"),
+            "create message should name Permit2: {body}"
+        );
+        assert!(
+            v["message"].as_str().unwrap().contains("gas"),
+            "create message should mention gas: {body}"
+        );
+        assert_eq!(
+            v["needsPermit2Approval"], true,
+            "create must hand off Permit2 regardless of container state: {body}"
+        );
         // The response must not echo the key back.
         assert!(!body.contains(TEST_KEY));
     }

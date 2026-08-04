@@ -269,7 +269,7 @@ function CorridorCard({
   async function apply() {
     if (
       !window.confirm(
-        `Switch ${bot.name} to a different corridor?\n\nThis replaces stitch.toml with the preset (your signer is kept). A running bot is stopped — approve tokens for the new corridor before starting.`,
+        `Switch ${bot.name} to a different corridor?\n\nThis replaces stitch.toml with the preset (your signer is kept). A running bot is stopped — approve Permit2 for the new corridor's tokens (needs a little gas) before starting.`,
       )
     ) {
       return

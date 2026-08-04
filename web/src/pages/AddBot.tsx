@@ -93,7 +93,12 @@ export default function AddBot() {
       // Clear the secret from component state the moment it's no longer needed.
       setSigner(emptySigner)
       navigate(`/bots/${encodeURIComponent(res.bot.name)}`, {
-        state: { note: res.message },
+        state: {
+          note: res.message,
+          // From the create API — not `bot.running`. Docker can report running
+          // before the bot's Permit2 preflight finishes (and fails).
+          needsPermit2: res.needsPermit2Approval,
+        },
       })
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -196,9 +201,10 @@ export default function AddBot() {
             />
             {!start && (
               <p className="text-xs text-faint">
-                Left off, the bot is created but stopped. Approve the router
-                allowance and dry-run it from its page first — that's the safer
-                order.
+                Left off, the bot is created but stopped. On its page, approve
+                Permit2 for the input tokens (needs a little gas on the operator
+                wallet), then dry-run — that&apos;s the safer order before the
+                first live start.
               </p>
             )}
 
