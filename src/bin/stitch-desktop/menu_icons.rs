@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Tray-menu icons — one family of monochrome Lucide-style glyphs on every OS.
+//! Tray-menu icons with native AppKit artwork where it has a clear semantic
+//! match and crisp custom fallbacks everywhere else.
 //!
-//! AppKit named images mix templates, filled status dots, and full-color
-//! assets (`Computer`), so we draw the same anti-aliased 32×32 bitmaps
-//! everywhere. Ink follows the menu chrome (dark glyphs on light menus,
-//! light on dark).
+//! muda displays macOS menu images in an 18 pt slot but Windows and GTK consume
+//! 16 px bitmaps. Custom icons are rendered directly at those backend sizes so
+//! the OS never has to resample a mismatched 32 px source.
 //!
 //! Design rules for the set (Lucide conventions at 32×32):
 //! - Shared stroke weight ([`STROKE`]) and ~6 px padding (optical ~20×20).
 //! - Outline strokes throughout, including pause, play, moon, and refresh.
 //! - No mixed per-glyph stroke thicknesses.
 
-use tray_icon::menu::Icon;
-use tray_icon::menu::IconMenuItem;
+#[cfg(target_os = "macos")]
+use tray_icon::menu::NativeIcon;
+use tray_icon::menu::{Icon, IconMenuItem};
 
 #[derive(Clone, Copy)]
 pub enum StatusKind {
@@ -31,8 +32,15 @@ pub enum ActionKind {
     Quit,
 }
 
-/// Shared outline stroke for every glyph in the set.
+/// Shared outline stroke in the 32-unit logical coordinate system.
 const STROKE: f32 = 2.0;
+
+const LOGICAL_SIZE: f32 = 32.0;
+
+#[cfg(target_os = "macos")]
+const RASTER_SIZE: u32 = 36;
+#[cfg(not(target_os = "macos"))]
+const RASTER_SIZE: u32 = 16;
 
 pub struct MenuIcons {
     /// Matches [`prefer_light_glyphs`] at the time these bitmaps were drawn.
@@ -57,7 +65,7 @@ impl MenuIcons {
         let ink = ink_for(light_glyphs);
         Self {
             light_glyphs,
-            // Outline rings; running adds a solid inner disc (radio-on).
+            // Outline rings; running adds an inner ring (radio-on).
             dot_running: draw_status_running(ink).expect("dot_running"),
             dot_stopped: draw_status_stopped(ink).expect("dot_stopped"),
             open: draw_open(ink).expect("open"),
@@ -90,6 +98,10 @@ pub fn status_item(text: &str, kind: StatusKind, icons: &MenuIcons) -> IconMenuI
 }
 
 pub fn action_item(text: &str, kind: ActionKind, icons: &MenuIcons) -> IconMenuItem {
+    #[cfg(target_os = "macos")]
+    if let Some(native) = native_action(kind) {
+        return IconMenuItem::with_native_icon(text, true, Some(native), None);
+    }
     IconMenuItem::new(text, true, Some(action_bitmap(icons, kind)), None)
 }
 
@@ -98,7 +110,22 @@ pub fn apply_status(item: &IconMenuItem, kind: StatusKind, icons: &MenuIcons) {
 }
 
 pub fn apply_action(item: &IconMenuItem, kind: ActionKind, icons: &MenuIcons) {
+    #[cfg(target_os = "macos")]
+    if let Some(native) = native_action(kind) {
+        item.set_native_icon(Some(native));
+        return;
+    }
     item.set_icon(Some(action_bitmap(icons, kind)));
+}
+
+#[cfg(target_os = "macos")]
+fn native_action(kind: ActionKind) -> Option<NativeIcon> {
+    match kind {
+        ActionKind::Open => Some(NativeIcon::ColumnView),
+        ActionKind::Resume => Some(NativeIcon::RightFacingTriangle),
+        ActionKind::Update => Some(NativeIcon::Refresh),
+        ActionKind::Pause | ActionKind::Show | ActionKind::Quit => None,
+    }
 }
 
 /// Keep-awake row. muda's [`CheckMenuItem`] cannot carry an icon, so this is an
@@ -232,7 +259,7 @@ fn windows_apps_use_light_theme() -> Option<bool> {
 
 #[cfg(test)]
 mod glyph_bounds_tests {
-    use super::{paint_glyph_rgba, SIZE, STROKE};
+    use super::{paint_glyph_rgba, LOGICAL_SIZE, RASTER_SIZE, STROKE};
 
     const GLYPHS: &[&str] = &[
         "running",
@@ -249,6 +276,33 @@ mod glyph_bounds_tests {
     #[test]
     fn shared_stroke_is_uniform() {
         assert!((STROKE - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn raster_size_matches_the_platform_menu_backend() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(RASTER_SIZE, 36, "AppKit uses an 18 pt menu-image slot");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(RASTER_SIZE, 16, "Windows and GTK consume 16 px images");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_native_icons_only_for_exact_action_matches() {
+        use super::{native_action, ActionKind, NativeIcon};
+
+        assert_eq!(
+            native_action(ActionKind::Open),
+            Some(NativeIcon::ColumnView)
+        );
+        assert_eq!(
+            native_action(ActionKind::Resume),
+            Some(NativeIcon::RightFacingTriangle)
+        );
+        assert_eq!(native_action(ActionKind::Update), Some(NativeIcon::Refresh));
+        assert_eq!(native_action(ActionKind::Pause), None);
+        assert_eq!(native_action(ActionKind::Show), None);
+        assert_eq!(native_action(ActionKind::Quit), None);
     }
 
     #[test]
@@ -270,11 +324,11 @@ mod glyph_bounds_tests {
             }
             .unwrap_or_else(|e| panic!("{name}: {e}"));
 
-            let rgba = paint_glyph_rgba(name, ink);
+            let rgba = paint_glyph_rgba(name, ink, RASTER_SIZE);
             let (min_x, min_y, max_x, max_y) =
                 ink_bounds(&rgba).unwrap_or_else(|| panic!("{name}: expected non-empty ink"));
             assert!(
-                min_x >= 1 && min_y >= 1 && max_x < SIZE - 1 && max_y < SIZE - 1,
+                min_x >= 1 && min_y >= 1 && max_x < RASTER_SIZE - 1 && max_y < RASTER_SIZE - 1,
                 "{name}: ink touches canvas edge (bounds {min_x},{min_y}..{max_x},{max_y}); \
                  leave ≥1 px margin so AA fringe isn't clipped"
             );
@@ -294,14 +348,17 @@ mod glyph_bounds_tests {
             "keep_awake",
             "quit",
         ] {
-            let rgba = paint_glyph_rgba(name, ink);
+            let rgba = paint_glyph_rgba(name, ink, RASTER_SIZE);
             let (min_x, min_y, max_x, max_y) = ink_bounds(&rgba).expect(name);
             let w = max_x - min_x + 1;
             let h = max_y - min_y + 1;
             spans.push((name, w, h));
+            let scale = RASTER_SIZE as f32 / LOGICAL_SIZE;
+            let min_span = (16.0 * scale).floor() as u32;
+            let max_span = (24.0 * scale).ceil() as u32;
             assert!(
-                (16..=24).contains(&w) && (16..=24).contains(&h),
-                "{name}: optical size {w}×{h} outside 16..24 (family mismatch)"
+                (min_span..=max_span).contains(&w) && (min_span..=max_span).contains(&h),
+                "{name}: optical size {w}×{h} outside {min_span}..{max_span} (family mismatch)"
             );
         }
         let ws: Vec<u32> = spans.iter().map(|(_, w, _)| *w).collect();
@@ -314,14 +371,16 @@ mod glyph_bounds_tests {
     }
 
     fn ink_bounds(rgba: &[u8]) -> Option<(u32, u32, u32, u32)> {
-        let mut min_x = SIZE;
-        let mut min_y = SIZE;
+        let size = (rgba.len() / 4) as f32;
+        let size = size.sqrt() as u32;
+        let mut min_x = size;
+        let mut min_y = size;
         let mut max_x = 0u32;
         let mut max_y = 0u32;
         let mut any = false;
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let a = rgba[((y * SIZE + x) * 4 + 3) as usize];
+        for y in 0..size {
+            for x in 0..size {
+                let a = rgba[((y * size + x) * 4 + 3) as usize];
                 if a > 16 {
                     any = true;
                     min_x = min_x.min(x);
@@ -333,11 +392,60 @@ mod glyph_bounds_tests {
         }
         any.then_some((min_x, min_y, max_x, max_y))
     }
+
+    #[test]
+    fn quit_is_a_power_symbol_with_a_top_gap_and_centered_stem() {
+        const TEST_SIZE: u32 = 64;
+        let rgba = paint_glyph_rgba("quit", (0x1c, 0x1c, 0x1e), TEST_SIZE);
+        let alpha_at = |logical_x: f32, logical_y: f32| {
+            let x = (logical_x / LOGICAL_SIZE * TEST_SIZE as f32).floor() as u32;
+            let y = (logical_y / LOGICAL_SIZE * TEST_SIZE as f32).floor() as u32;
+            rgba[((y * TEST_SIZE + x) * 4 + 3) as usize]
+        };
+
+        assert!(alpha_at(15.5, 8.0) > 180, "stem should be solid");
+        assert!(alpha_at(12.5, 8.0) < 32, "left side of gap should be clear");
+        assert!(
+            alpha_at(18.5, 8.0) < 32,
+            "right side of gap should be clear"
+        );
+        assert!(alpha_at(15.5, 25.5) > 180, "ring bottom should be solid");
+    }
+
+    #[test]
+    fn settings_gear_is_outline_only() {
+        const TEST_SIZE: u32 = 64;
+        let rgba = paint_glyph_rgba("show", (0x1c, 0x1c, 0x1e), TEST_SIZE);
+        let alpha_at = |logical_x: f32, logical_y: f32| {
+            let x = (logical_x / LOGICAL_SIZE * TEST_SIZE as f32).floor() as u32;
+            let y = (logical_y / LOGICAL_SIZE * TEST_SIZE as f32).floor() as u32;
+            rgba[((y * TEST_SIZE + x) * 4 + 3) as usize]
+        };
+
+        assert!(alpha_at(15.5, 15.5) < 32, "gear center should be clear");
+        assert!(alpha_at(18.5, 15.5) > 180, "inner ring should be visible");
+        assert!(alpha_at(20.5, 15.5) < 32, "gear body should not be filled");
+        assert!(alpha_at(25.0, 15.5) > 180, "outer teeth should be visible");
+    }
+
+    #[test]
+    fn every_fallback_renders_directly_at_windows_and_gtk_size() {
+        const BACKEND_SIZE: u32 = 16;
+        for name in GLYPHS {
+            let rgba = paint_glyph_rgba(name, (0x1c, 0x1c, 0x1e), BACKEND_SIZE);
+            assert_eq!(rgba.len(), (BACKEND_SIZE * BACKEND_SIZE * 4) as usize);
+            let (min_x, min_y, max_x, max_y) = ink_bounds(&rgba).expect(name);
+            assert!(
+                min_x > 0 && min_y > 0 && max_x < BACKEND_SIZE - 1 && max_y < BACKEND_SIZE - 1,
+                "{name}: 16 px fallback clips at {min_x},{min_y}..{max_x},{max_y}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
-fn paint_glyph_rgba(name: &str, ink: (u8, u8, u8)) -> Vec<u8> {
-    let mut px = Canvas::new();
+fn paint_glyph_rgba(name: &str, ink: (u8, u8, u8), size: u32) -> Vec<u8> {
+    let mut px = Canvas::with_size(size);
     match name {
         "running" => {
             let cx = 15.5;
@@ -358,9 +466,7 @@ fn paint_glyph_rgba(name: &str, ink: (u8, u8, u8)) -> Vec<u8> {
     px.rgba
 }
 
-// --- Shared 32×32 anti-aliased outline glyphs ---
-
-const SIZE: u32 = 32;
+// --- Shared anti-aliased outline glyphs in a 32-unit logical canvas ---
 
 fn draw_status_running(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
@@ -432,7 +538,7 @@ fn paint_update(px: &mut Canvas, c: (u8, u8, u8)) {
     px.stroke_line_aa(cx + 10.0, cy - 8.0, cx + 6.0, cy - 3.0, c, STROKE);
 }
 
-/// Horizontal sliders — Settings at menu size; radial "gears" read as suns.
+/// Outlined gear for Settings.
 fn draw_show(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
     let mut px = Canvas::new();
     paint_show(&mut px, c);
@@ -440,22 +546,29 @@ fn draw_show(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
 }
 
 fn paint_show(px: &mut Canvas, c: (u8, u8, u8)) {
-    // Tracks stop at the knob so the stroke doesn't cut through (Lucide).
-    const KNOB_R: f32 = 3.0;
-    const GAP: f32 = 1.25;
-    for &(y, knob_x) in &[(9.5_f32, 12.0_f32), (16.0, 20.5), (22.5, 14.5)] {
-        let left = 6.5_f32;
-        let right = 25.5_f32;
-        let stop_l = knob_x - KNOB_R - GAP;
-        let stop_r = knob_x + KNOB_R + GAP;
-        if stop_l > left {
-            px.stroke_line_aa(left, y, stop_l, y, c, STROKE);
+    const CX: f32 = 15.5;
+    const CY: f32 = 15.5;
+    const ROOT_R: f32 = 7.5;
+    const TOOTH_R: f32 = 10.0;
+    let mut outline = Vec::with_capacity(8 * 6);
+
+    for tooth in 0..8 {
+        let center = tooth as f32 * 45.0;
+        for (offset, radius) in [
+            (-22.5_f32, ROOT_R),
+            (-13.0, ROOT_R),
+            (-13.0, TOOTH_R),
+            (13.0, TOOTH_R),
+            (13.0, ROOT_R),
+            (22.5, ROOT_R),
+        ] {
+            let angle = (center + offset).to_radians();
+            outline.push((CX + radius * angle.cos(), CY + radius * angle.sin()));
         }
-        if stop_r < right {
-            px.stroke_line_aa(stop_r, y, right, y, c, STROKE);
-        }
-        px.stroke_circle_aa(knob_x, y, KNOB_R, c, STROKE);
     }
+
+    px.stroke_polygon_aa(&outline, c, STROKE);
+    px.stroke_circle_aa(CX, CY, 3.0, c, STROKE);
 }
 
 /// Outline crescent moon for Keep awake (Lucide `moon` — sleep control).
@@ -483,32 +596,42 @@ fn draw_quit(c: (u8, u8, u8)) -> Result<Icon, tray_icon::menu::BadIcon> {
 }
 
 fn paint_quit(px: &mut Canvas, c: (u8, u8, u8)) {
-    // Centered in the 32×32 canvas (stem + open ring).
-    px.stroke_arc_aa(15.5, 16.5, 9.0, 52.0, 308.0, c, STROKE);
+    // Travel from the upper-right around the bottom to the upper-left, leaving
+    // a centered top gap for the stem. The old 52°..308° arc left its gap on
+    // the right, which made the glyph look like a broken refresh icon.
+    px.stroke_arc_aa(15.5, 16.5, 9.0, -52.0, 232.0, c, STROKE);
     px.stroke_line_aa(15.5, 6.0, 15.5, 16.0, c, STROKE);
 }
 
 struct Canvas {
     rgba: Vec<u8>,
+    size: u32,
+    scale: f32,
 }
 
 impl Canvas {
     fn new() -> Self {
+        Self::with_size(RASTER_SIZE)
+    }
+
+    fn with_size(size: u32) -> Self {
         Self {
-            rgba: vec![0u8; (SIZE * SIZE * 4) as usize],
+            rgba: vec![0u8; (size * size * 4) as usize],
+            size,
+            scale: size as f32 / LOGICAL_SIZE,
         }
     }
 
     fn into_icon(self) -> Result<Icon, tray_icon::menu::BadIcon> {
-        Icon::from_rgba(self.rgba, SIZE, SIZE)
+        Icon::from_rgba(self.rgba, self.size, self.size)
     }
 
     fn blend(&mut self, x: i32, y: i32, r: u8, g: u8, b: u8, a: f32) {
-        if x < 0 || y < 0 || x >= SIZE as i32 || y >= SIZE as i32 {
+        if x < 0 || y < 0 || x >= self.size as i32 || y >= self.size as i32 {
             return;
         }
         let a = a.clamp(0.0, 1.0);
-        let i = ((y as u32 * SIZE + x as u32) * 4) as usize;
+        let i = ((y as u32 * self.size + x as u32) * 4) as usize;
         let src_a = (a * 255.0).round() as u16;
         let dst_a = self.rgba[i + 3] as u16;
         if src_a >= dst_a {
@@ -520,8 +643,11 @@ impl Canvas {
     }
 
     fn fill_circle_aa(&mut self, cx: f32, cy: f32, radius: f32, r: u8, g: u8, b: u8) {
-        for y in 0..SIZE as i32 {
-            for x in 0..SIZE as i32 {
+        let cx = cx * self.scale;
+        let cy = cy * self.scale;
+        let radius = radius * self.scale;
+        for y in 0..self.size as i32 {
+            for x in 0..self.size as i32 {
                 let dx = x as f32 + 0.5 - cx;
                 let dy = y as f32 + 0.5 - cy;
                 let d = (dx * dx + dy * dy).sqrt();
@@ -534,8 +660,12 @@ impl Canvas {
     }
 
     fn stroke_circle_aa(&mut self, cx: f32, cy: f32, radius: f32, c: (u8, u8, u8), thickness: f32) {
-        for y in 0..SIZE as i32 {
-            for x in 0..SIZE as i32 {
+        let cx = cx * self.scale;
+        let cy = cy * self.scale;
+        let radius = radius * self.scale;
+        let thickness = thickness * self.scale;
+        for y in 0..self.size as i32 {
+            for x in 0..self.size as i32 {
                 let dx = x as f32 + 0.5 - cx;
                 let dy = y as f32 + 0.5 - cy;
                 let d = (dx * dx + dy * dy).sqrt();
@@ -557,8 +687,14 @@ impl Canvas {
         c: (u8, u8, u8),
         thickness: f32,
     ) {
-        for y in 0..SIZE as i32 {
-            for x in 0..SIZE as i32 {
+        let x0 = x0 * self.scale;
+        let y0 = y0 * self.scale;
+        let x1 = x1 * self.scale;
+        let y1 = y1 * self.scale;
+        let radius = radius * self.scale;
+        let thickness = thickness * self.scale;
+        for y in 0..self.size as i32 {
+            for x in 0..self.size as i32 {
                 let d = sd_round_rect(x as f32 + 0.5, y as f32 + 0.5, x0, y0, x1, y1, radius).abs();
                 let alpha = coverage(d, thickness / 2.0);
                 if alpha > 0.01 {
@@ -580,7 +716,7 @@ impl Canvas {
         let dx = x1 - x0;
         let dy = y1 - y0;
         let len = (dx * dx + dy * dy).sqrt().max(0.001);
-        let steps = (len * 2.0).ceil() as i32;
+        let steps = (len * self.scale * 2.0).ceil() as i32;
         let half = thickness / 2.0;
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
@@ -614,6 +750,14 @@ impl Canvas {
         }
     }
 
+    fn stroke_polygon_aa(&mut self, points: &[(f32, f32)], c: (u8, u8, u8), thickness: f32) {
+        for index in 0..points.len() {
+            let (x0, y0) = points[index];
+            let (x1, y1) = points[(index + 1) % points.len()];
+            self.stroke_line_aa(x0, y0, x1, y1, c, thickness);
+        }
+    }
+
     /// Outline of `circle(cx,cy,r) \ circle(cut_cx,cut_cy,cut_r)`.
     #[allow(clippy::too_many_arguments)]
     fn stroke_crescent_aa(
@@ -627,8 +771,15 @@ impl Canvas {
         c: (u8, u8, u8),
         thickness: f32,
     ) {
-        for y in 0..SIZE as i32 {
-            for x in 0..SIZE as i32 {
+        let cx = cx * self.scale;
+        let cy = cy * self.scale;
+        let r = r * self.scale;
+        let cut_cx = cut_cx * self.scale;
+        let cut_cy = cut_cy * self.scale;
+        let cut_r = cut_r * self.scale;
+        let thickness = thickness * self.scale;
+        for y in 0..self.size as i32 {
+            for x in 0..self.size as i32 {
                 let px = x as f32 + 0.5;
                 let py = y as f32 + 0.5;
                 let d_outer = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - r;
@@ -644,7 +795,9 @@ impl Canvas {
 }
 
 fn coverage(dist: f32, radius: f32) -> f32 {
-    let edge = 1.0;
+    // A one-pixel transition (0.5 px on each side) stays sharp at the exact
+    // backend target size while retaining smooth diagonal and curved edges.
+    let edge = 0.5;
     if dist <= radius - edge {
         1.0
     } else if dist >= radius + edge {
