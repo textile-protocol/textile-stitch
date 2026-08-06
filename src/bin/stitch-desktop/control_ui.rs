@@ -224,12 +224,63 @@ fn theme_css() -> &'static str {
   }
   .update-banner.show { display: block; }
   .update-banner strong { font-weight: 700; }
+  .update-banner-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .update-banner-copy { flex: 1; }
+  .update-dismiss {
+    width: 28px;
+    flex: 0 0 28px;
+    margin: -6px -6px 0 0;
+    padding: 3px;
+    border: 0;
+    background: transparent;
+    color: var(--tx-text-secondary);
+    font-size: 20px;
+    line-height: 1;
+    text-align: center;
+  }
   .update-banner .update-actions {
     margin-top: 10px;
   }
   .update-banner button.primary {
     text-align: center;
   }
+  .update-note {
+    display: none;
+    margin: 0 0 12px;
+    font-size: 12px;
+    color: var(--tx-text-secondary);
+  }
+  .update-note.show { display: block; }
+  dialog {
+    width: min(336px, calc(100vw - 32px));
+    padding: 20px;
+    border: 1px solid var(--tx-border-secondary);
+    border-radius: 14px;
+    background: var(--tx-bg-secondary);
+    color: var(--tx-text-primary);
+    box-shadow: 0 18px 50px rgb(21 24 28 / 0.22);
+  }
+  dialog::backdrop { background: rgb(21 24 28 / 0.38); }
+  dialog h2 {
+    margin: 0 0 8px;
+    font-size: 18px;
+    line-height: 1.25;
+  }
+  dialog p {
+    margin: 0 0 16px;
+    color: var(--tx-text-secondary);
+    font-size: 13px;
+  }
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .dialog-actions button { width: auto; text-align: center; }
 "#
 }
 
@@ -309,9 +360,9 @@ pub fn signup_html(legacy_reset: bool) -> String {
 /// Build the control-panel HTML. `hide_dock_row` is macOS-only in the menu;
 /// pass false on other platforms to omit the Dock checkbox.
 ///
-/// `panel_error`, when set, is baked into the markup so it survives a fresh
-/// `load_html` (evaluate_script right after navigation is a no-op while the
-/// previous document is still active).
+/// `panel_error` and `update_version`, when set, are baked into the markup so
+/// they survive a fresh `load_html` (evaluate_script right after navigation is
+/// a no-op while the previous document is still active).
 pub fn html(
     autostart: bool,
     hide_dock: bool,
@@ -319,6 +370,7 @@ pub fn html(
     panel_running: bool,
     hide_dock_row: bool,
     panel_error: Option<&str>,
+    update_version: Option<&str>,
 ) -> String {
     let autostart_checked = if autostart { " checked" } else { "" };
     let hide_dock_checked = if hide_dock { " checked" } else { "" };
@@ -344,6 +396,24 @@ pub fn html(
         }
         _ => r#"<div id="panel-error" class="error" role="alert"></div>"#.to_string(),
     };
+    let (banner_class, banner_hidden, banner_version, update_btn_label, update_action) =
+        match update_version {
+            Some(v) if !v.is_empty() => (
+                "update-banner show",
+                "",
+                html_escape(v),
+                "Update",
+                "show_update_dialog",
+            ),
+            _ => (
+                "update-banner",
+                " hidden",
+                String::new(),
+                "Check for updates…",
+                "update",
+            ),
+        };
+    let (update_explanation, update_confirm_label) = update_dialog_copy();
 
     format!(
         r#"<!DOCTYPE html>
@@ -365,12 +435,16 @@ pub fn html(
       </button>
     </div>
   </div>
-  <div id="update-banner" class="update-banner" hidden>
-    <div><strong>Update available</strong> — Stitch <span id="update-version"></span> is ready to download.</div>
+  <div id="update-banner" class="{banner_class}"{banner_hidden}>
+    <div class="update-banner-head">
+      <div class="update-banner-copy"><strong>Update available</strong> — Stitch <span id="update-version">{banner_version}</span> is ready.</div>
+      <button type="button" class="update-dismiss" data-action="dismiss_update" aria-label="Dismiss this update">×</button>
+    </div>
     <div class="update-actions">
-      <button type="button" class="primary" data-action="update">Download update</button>
+      <button type="button" class="primary" data-action="show_update_dialog">Update</button>
     </div>
   </div>
+  <div id="update-note" class="update-note" role="status"></div>
   {error_block}
   <div id="status" class="status {status_class}"><span class="dot"></span><span id="status-text">{status_text}</span></div>
   <div class="stack">
@@ -380,20 +454,47 @@ pub fn html(
     <label class="check"><input type="checkbox" id="keep-awake"{keep_awake_checked}> {keep_awake_label}</label>
     {dock_row}
     <div class="sep"></div>
-    <button data-action="update" id="update-btn">Check for updates…</button>
+    <button data-action="{update_action}" id="update-btn">{update_btn_label}</button>
     <div class="sep"></div>
     <button class="danger" data-action="quit">Quit Stitch</button>
   </div>
 </main>
+<dialog id="update-dialog" aria-labelledby="update-dialog-title">
+  <h2 id="update-dialog-title">Update Stitch?</h2>
+  <p>{update_explanation}</p>
+  <div class="dialog-actions">
+    <button type="button" id="update-later">Later</button>
+    <button type="button" class="primary" data-action="download_update">{update_confirm_label}</button>
+  </div>
+</dialog>
 <script>
   function post(action) {{
     if (window.ipc && window.ipc.postMessage) {{
       window.ipc.postMessage(action);
     }}
   }}
+  let dismissedUpdateVersion = null;
   document.querySelectorAll("[data-action]").forEach((el) => {{
-    el.addEventListener("click", () => post(el.getAttribute("data-action")));
+    el.addEventListener("click", () => {{
+      const action = el.getAttribute("data-action");
+      if (action === "show_update_dialog") {{
+        window.__stitchShowUpdateDialog();
+      }} else if (action === "dismiss_update") {{
+        dismissedUpdateVersion = document.getElementById("update-version").textContent;
+        const banner = document.getElementById("update-banner");
+        banner.hidden = true;
+        banner.classList.remove("show");
+      }} else {{
+        if (action === "download_update" && updateDialog.open) updateDialog.close();
+        post(action);
+      }}
+    }});
   }});
+  const updateDialog = document.getElementById("update-dialog");
+  document.getElementById("update-later").addEventListener("click", () => updateDialog.close());
+  window.__stitchShowUpdateDialog = function () {{
+    if (updateDialog && !updateDialog.open) updateDialog.showModal();
+  }};
   const autostart = document.getElementById("autostart");
   if (autostart) {{
     autostart.addEventListener("change", () => post("toggle_autostart:" + (autostart.checked ? "1" : "0")));
@@ -423,17 +524,34 @@ pub fn html(
     const banner = document.getElementById("update-banner");
     const versionEl = document.getElementById("update-version");
     const updateBtn = document.getElementById("update-btn");
+    const note = document.getElementById("update-note");
     if (banner && versionEl) {{
       if (state.updateVersion) {{
         versionEl.textContent = state.updateVersion;
-        banner.hidden = false;
-        banner.classList.add("show");
-        if (updateBtn) updateBtn.textContent = "Download update";
+        const showBanner = state.updateVersion !== dismissedUpdateVersion;
+        banner.hidden = !showBanner;
+        banner.classList.toggle("show", showBanner);
+        if (updateBtn) {{
+          updateBtn.textContent = "Update";
+          updateBtn.setAttribute("data-action", "show_update_dialog");
+        }}
       }} else {{
         versionEl.textContent = "";
         banner.hidden = true;
         banner.classList.remove("show");
-        if (updateBtn) updateBtn.textContent = "Check for updates…";
+        if (updateBtn) {{
+          updateBtn.textContent = "Check for updates…";
+          updateBtn.setAttribute("data-action", "update");
+        }}
+      }}
+    }}
+    if (note) {{
+      if (state.updateNote) {{
+        note.textContent = state.updateNote;
+        note.classList.add("show");
+      }} else {{
+        note.textContent = "";
+        note.classList.remove("show");
       }}
     }}
     if (state.panelRunning) {{
@@ -456,6 +574,13 @@ pub fn html(
         css = theme_css(),
         textile_icon = TEXTILE_ICON_SVG,
         error_block = error_block,
+        banner_class = banner_class,
+        banner_hidden = banner_hidden,
+        banner_version = banner_version,
+        update_btn_label = update_btn_label,
+        update_action = update_action,
+        update_explanation = update_explanation,
+        update_confirm_label = update_confirm_label,
         status_class = status.0,
         status_text = status.1,
         pause_label = pause_label,
@@ -482,6 +607,20 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+fn update_dialog_copy() -> (&'static str, &'static str) {
+    if cfg!(target_os = "macos") {
+        (
+            "Stitch will download and verify the latest disk image, open it in Finder, then quit. Drag Stitch into Applications and open it when the copy finishes.",
+            "Download and open",
+        )
+    } else {
+        (
+            "Stitch will download and verify the update, quit, replace the desktop binaries, and reopen automatically.",
+            "Update and restart",
+        )
+    }
+}
+
 /// JS snippet to push tray/window state into the control UI.
 pub fn set_state_script(
     autostart: bool,
@@ -489,18 +628,24 @@ pub fn set_state_script(
     keep_awake: bool,
     panel_running: bool,
     update_version: Option<&str>,
+    update_note: Option<&str>,
 ) -> String {
     let update = match update_version {
         Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "null".into()),
         None => "null".to_string(),
     };
+    let note = match update_note {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "null".into()),
+        None => "null".to_string(),
+    };
     format!(
-        "window.__stitchSetState && window.__stitchSetState({{ autostart: {}, hideDock: {}, keepAwake: {}, panelRunning: {}, updateVersion: {} }});",
+        "window.__stitchSetState && window.__stitchSetState({{ autostart: {}, hideDock: {}, keepAwake: {}, panelRunning: {}, updateVersion: {}, updateNote: {} }});",
         if autostart { "true" } else { "false" },
         if hide_dock { "true" } else { "false" },
         if keep_awake { "true" } else { "false" },
         if panel_running { "true" } else { "false" },
         update,
+        note,
     )
 }
 
@@ -518,6 +663,11 @@ pub fn panel_error_script(message: &str) -> String {
     format!("window.__stitchPanelError && window.__stitchPanelError({escaped});")
 }
 
+/// Open the update confirmation dialog from the native tray action.
+pub fn show_update_dialog_script() -> &'static str {
+    "window.__stitchShowUpdateDialog && window.__stitchShowUpdateDialog();"
+}
+
 #[cfg(test)]
 mod tests {
     use super::{html, html_escape};
@@ -531,6 +681,7 @@ mod tests {
             false,
             false,
             Some("port 8420 in use <oops>"),
+            None,
         );
         assert!(page.contains(r#"id="panel-error" class="error show""#));
         assert!(page.contains("port 8420 in use &lt;oops&gt;"));
@@ -547,11 +698,31 @@ mod tests {
 
     #[test]
     fn main_window_shows_packaged_app_version_beside_title() {
-        let page = html(false, false, false, true, false, None);
+        let page = html(false, false, false, true, false, None, None);
         let expected = format!(
             r#"<h1>Stitch <span class="app-version" aria-label="App version">v{}</span></h1>"#,
             env!("CARGO_PKG_VERSION")
         );
         assert!(page.contains(&expected));
+    }
+
+    #[test]
+    fn update_banner_is_baked_visible_when_version_known() {
+        let page = html(false, false, false, true, false, None, Some("0.2.0"));
+        assert!(page.contains(r#"id="update-banner" class="update-banner show""#));
+        assert!(page.contains(">0.2.0</span>"));
+        assert!(page.contains(r#"data-action="show_update_dialog">Update</button>"#));
+        assert!(page.contains(r#"aria-label="Dismiss this update""#));
+        assert!(page.contains(r#"id="update-dialog""#));
+        assert!(page.contains("state.updateVersion !== dismissedUpdateVersion"));
+        assert!(page.contains(r#"updateBtn.textContent = "Update""#));
+        assert!(!page.contains(r#"id="update-banner" class="update-banner" hidden"#));
+    }
+
+    #[test]
+    fn update_banner_stays_hidden_without_version() {
+        let page = html(false, false, false, true, false, None, None);
+        assert!(page.contains(r#"id="update-banner" class="update-banner" hidden"#));
+        assert!(page.contains(">Check for updates…</button>"));
     }
 }

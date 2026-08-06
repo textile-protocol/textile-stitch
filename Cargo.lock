@@ -5378,7 +5378,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stitch-bot"
-version = "0.1.167"
+version = "0.1.168"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -5405,6 +5405,7 @@ dependencies = [
  "semver 1.0.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "subtle",
  "tao",
  "tar",

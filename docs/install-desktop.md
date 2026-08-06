@@ -28,9 +28,17 @@ The tray menu leads with a running/stopped status, then **Open Stitch panel**,
 keep-awake is also in Settings and persists across launches. When keep-awake is
 on, the menu-bar / tray icon shows a small lightning badge. When a newer
 desktop release is published, the control window shows an update banner and the
-tray item becomes **Download update**. On macOS, **Hide Dock icon** (off by
-default, in Settings) keeps the menu-bar icon and drops the Dock entry; the
-preference is saved in `<data_root>/desktop-prefs.json`.
+tray item becomes **Update**. The banner can be dismissed for the current
+window. **Check for updates…** re-queries GitHub immediately.
+
+Choosing **Update** explains what will happen before downloading anything. All
+downloads are matched to the current platform and checked against GitHub's
+SHA-256 digest. On macOS, Stitch downloads and mounts `Stitch.dmg`, then quits;
+drag the mounted Stitch app into Applications and open it. On Windows and Linux,
+Stitch quits after the download, replaces the release binaries, and reopens
+automatically. On macOS, **Hide Dock icon** (off by default, in Settings) keeps
+the menu-bar icon and drops the Dock entry; the preference is saved in
+`<data_root>/desktop-prefs.json`.
 
 If you still have a legacy `panel.password` file from an older build, the app
 asks you to choose a new password and deletes the cleartext file.

@@ -24,13 +24,18 @@ mod password;
 mod paths;
 mod prefs;
 mod supervise;
+mod update_install;
 mod win_cmd;
 #[cfg(windows)]
 mod win_reg;
 
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use stitch_bot::update::{ReleaseAsset, ReleaseCheck};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
@@ -61,13 +66,17 @@ enum UserEvent {
     Ipc(String),
     /// Periodic poll so the control window reflects panel exits without a click.
     RefreshStatus,
-    /// Latest GitHub release newer than this build, or `None` when current / offline.
-    UpdateCheckResult(Option<String>),
+    /// Outcome of a GitHub latest-release poll (background or manual).
+    UpdateCheckResult(ReleaseCheck),
+    /// Outcome of downloading and verifying the selected platform artifact.
+    UpdateDownloadResult(Result<PathBuf, String>),
 }
 
 const STATUS_POLL_SECS: u64 = 2;
-/// How often to re-query GitHub for a newer desktop release.
+/// How often to re-query GitHub once we know the network works.
 const UPDATE_POLL_SECS: u64 = 6 * 60 * 60;
+/// Backoff steps when a release check fails (wifi/DNS race on launch).
+const UPDATE_RETRY_SECS: &[u64] = &[30, 120, 600, UPDATE_POLL_SECS];
 
 fn main() {
     if let Err(e) = run() {
@@ -244,27 +253,53 @@ fn run() -> Result<()> {
     let ipc_proxy = proxy.clone();
     let status_proxy = proxy.clone();
     let update_proxy = proxy.clone();
+    let download_proxy = proxy.clone();
+    let (update_kick_tx, update_kick_rx) = mpsc::channel::<()>();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let _ = proxy.send_event(UserEvent::Menu(event.id));
     }));
     // The event loop is Wait-based — without a timer, a crashed panel leaves the
     // control window stuck on "Panel running" until the next user action.
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(STATUS_POLL_SECS));
+        std::thread::sleep(Duration::from_secs(STATUS_POLL_SECS));
         if status_proxy.send_event(UserEvent::RefreshStatus).is_err() {
             break;
         }
     });
     // Best-effort release check (no install receipt needed — works for Stitch.app).
-    std::thread::spawn(move || loop {
-        let latest = stitch_bot::update::newer_release_blocking();
-        if update_proxy
-            .send_event(UserEvent::UpdateCheckResult(latest))
-            .is_err()
-        {
-            break;
+    // Failed polls retry quickly; successful Current/Available settle on the
+    // long interval. A kick from "Check for updates…" runs immediately.
+    std::thread::spawn(move || {
+        let mut fail_streak: usize = 0;
+        loop {
+            let result = stitch_bot::update::check_latest_release_blocking();
+            let sleep_secs = match &result {
+                ReleaseCheck::Failed { reason } => {
+                    let idx = fail_streak.min(UPDATE_RETRY_SECS.len() - 1);
+                    fail_streak = fail_streak.saturating_add(1);
+                    eprintln!(
+                        "stitch-desktop: update check failed ({reason}); retry in {}s",
+                        UPDATE_RETRY_SECS[idx]
+                    );
+                    UPDATE_RETRY_SECS[idx]
+                }
+                ReleaseCheck::Available { .. } | ReleaseCheck::Current => {
+                    fail_streak = 0;
+                    UPDATE_POLL_SECS
+                }
+            };
+            if update_proxy
+                .send_event(UserEvent::UpdateCheckResult(result))
+                .is_err()
+            {
+                break;
+            }
+            // Wait for the interval, or wake early on a manual check kick.
+            match update_kick_rx.recv_timeout(Duration::from_secs(sleep_secs)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
-        std::thread::sleep(std::time::Duration::from_secs(UPDATE_POLL_SECS));
     });
 
     let mut menu_icons = MenuIcons::new();
@@ -363,6 +398,7 @@ fn run() -> Result<()> {
             panel_running,
             hide_dock_row,
             None,
+            None,
         )
     };
     let webview = WebViewBuilder::new()
@@ -377,6 +413,9 @@ fn run() -> Result<()> {
     let mut tray: Option<TrayIcon> = None;
     let mut started_panel = false;
     let mut update_version: Option<String> = None;
+    let mut update_asset: Option<ReleaseAsset> = None;
+    let mut update_note: Option<String> = None;
+    let mut update_in_progress = false;
     let mut window: Option<Window> = Some(window);
     let mut webview = Some(webview);
 
@@ -422,6 +461,7 @@ fn run() -> Result<()> {
                         prefs.hide_dock_icon,
                         prefs.keep_awake,
                         update_version.as_deref(),
+                        update_note.as_deref(),
                     );
                 }
             }
@@ -450,6 +490,7 @@ fn run() -> Result<()> {
                             prefs.keep_awake,
                             &supervisor,
                             update_version.as_deref(),
+                            update_note.as_deref(),
                         );
                     }
                 } else if id == keep_awake_id {
@@ -473,10 +514,25 @@ fn run() -> Result<()> {
                             prefs.keep_awake,
                             &supervisor,
                             update_version.as_deref(),
+                            update_note.as_deref(),
                         );
                     }
                 } else if id == update_id {
-                    let _ = open_url(stitch_bot::update::RELEASES_PAGE);
+                    handle_update_action(
+                        &update_kick_tx,
+                        &mut update_version,
+                        &mut update_note,
+                        webview.as_ref(),
+                        autostart_enabled,
+                        prefs.hide_dock_icon,
+                        prefs.keep_awake,
+                        &supervisor,
+                        &status_item,
+                        &pause_item,
+                        &update_item,
+                        &menu_icons,
+                        window.as_ref(),
+                    );
                 } else if id == quit_id {
                     if let Ok(mut s) = supervisor.lock() {
                         let _ = s.stop();
@@ -519,6 +575,7 @@ fn run() -> Result<()> {
                                     panel_running_now,
                                     hide_dock_row,
                                     panel_err.as_deref(),
+                                    update_version.as_deref(),
                                 );
                                 if let Some(wv) = webview.as_ref() {
                                     if let Err(e) = wv.load_html(&control_html) {
@@ -535,6 +592,7 @@ fn run() -> Result<()> {
                                     prefs.keep_awake,
                                     &supervisor,
                                     update_version.as_deref(),
+                                    update_note.as_deref(),
                                 );
                             }
                             Err(e) => {
@@ -559,12 +617,25 @@ fn run() -> Result<()> {
                         &keep_awake_item,
                         &menu_icons,
                         tray.as_ref(),
-                        update_version.as_deref(),
+                        &update_kick_tx,
+                        &mut update_version,
+                        update_asset.as_ref(),
+                        &mut update_note,
+                        &mut update_in_progress,
+                        &download_proxy,
+                        &status_item,
+                        &pause_item,
+                        &update_item,
                     );
                 }
             }
-            Event::UserEvent(UserEvent::UpdateCheckResult(latest)) => {
-                update_version = latest;
+            Event::UserEvent(UserEvent::UpdateCheckResult(result)) => {
+                apply_release_check(
+                    &mut update_version,
+                    &mut update_asset,
+                    &mut update_note,
+                    result,
+                );
                 sync_tray_menu(
                     &status_item,
                     &pause_item,
@@ -581,6 +652,38 @@ fn run() -> Result<()> {
                         prefs.keep_awake,
                         &supervisor,
                         update_version.as_deref(),
+                        update_note.as_deref(),
+                    );
+                }
+            }
+            Event::UserEvent(UserEvent::UpdateDownloadResult(result)) => {
+                update_in_progress = false;
+                match result {
+                    Ok(path) => match update_install::stage(&path) {
+                        Ok(()) => {
+                            if let Ok(mut s) = supervisor.lock() {
+                                let _ = s.stop();
+                            }
+                            let _ = keep_awake.set_enabled(false);
+                            *control_flow = ControlFlow::Exit;
+                        }
+                        Err(error) => {
+                            update_note = Some(format!("Couldn't install update: {error:#}"));
+                        }
+                    },
+                    Err(error) => {
+                        update_note = Some(format!("Couldn't download update: {error}"));
+                    }
+                }
+                if !matches!(*control_flow, ControlFlow::Exit) {
+                    sync_control_ui(
+                        webview.as_ref(),
+                        autostart_enabled,
+                        prefs.hide_dock_icon,
+                        prefs.keep_awake,
+                        &supervisor,
+                        update_version.as_deref(),
+                        update_note.as_deref(),
                     );
                 }
             }
@@ -633,6 +736,7 @@ fn run() -> Result<()> {
                         prefs.keep_awake,
                         &supervisor,
                         update_version.as_deref(),
+                        update_note.as_deref(),
                     );
                 }
             }
@@ -725,7 +829,7 @@ fn sync_tray_menu(
         menu_icons::apply_action(pause_item, ActionKind::Resume, icons);
     }
     if update_version.is_some() {
-        update_item.set_text("Download update");
+        update_item.set_text("Update");
     } else {
         update_item.set_text("Check for updates…");
     }
@@ -742,6 +846,7 @@ fn sync_tray_and_window(
     keep_awake: bool,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
     update_version: Option<&str>,
+    update_note: Option<&str>,
 ) {
     sync_tray_menu(
         status_item,
@@ -758,6 +863,7 @@ fn sync_tray_and_window(
         keep_awake,
         supervisor,
         update_version,
+        update_note,
     );
 }
 
@@ -777,6 +883,7 @@ fn start_panel(
     hide_dock: bool,
     keep_awake: bool,
     update_version: Option<&str>,
+    update_note: Option<&str>,
 ) {
     if let Err(e) = try_start_panel(supervisor) {
         // Keep the tray alive so the user can Quit / retry Resume.
@@ -793,6 +900,7 @@ fn start_panel(
         keep_awake,
         supervisor,
         update_version,
+        update_note,
     );
 }
 
@@ -810,6 +918,81 @@ fn parse_signup_ipc(msg: &str) -> Option<(String, String)> {
     Some((parsed.password, parsed.confirm))
 }
 
+/// Apply a release poll without treating network failure as "up to date".
+fn apply_release_check(
+    update_version: &mut Option<String>,
+    update_asset: &mut Option<ReleaseAsset>,
+    update_note: &mut Option<String>,
+    result: ReleaseCheck,
+) {
+    match result {
+        ReleaseCheck::Available { latest, asset } => {
+            *update_version = Some(latest);
+            *update_asset = Some(asset);
+            *update_note = None;
+        }
+        ReleaseCheck::Current => {
+            *update_version = None;
+            *update_asset = None;
+            // Only show "up to date" after an explicit check (note already set
+            // to "Checking…"). Background polls stay quiet when current.
+            if update_note.as_deref() == Some("Checking for updates…") {
+                *update_note = Some("You're up to date.".into());
+            } else {
+                *update_note = None;
+            }
+        }
+        ReleaseCheck::Failed { reason } => {
+            // Keep a previously discovered update; a flaky check must not hide it.
+            // Only surface the error after the operator asked us to check.
+            if update_note.as_deref() == Some("Checking for updates…") {
+                *update_note = Some(format!("Couldn't check for updates ({reason})."));
+            }
+        }
+    }
+}
+
+/// Tray / window update action: confirm an available update, or kick an
+/// immediate release check when no update is known yet.
+fn handle_update_action(
+    update_kick_tx: &Sender<()>,
+    update_version: &mut Option<String>,
+    update_note: &mut Option<String>,
+    webview: Option<&wry::WebView>,
+    autostart: bool,
+    hide_dock: bool,
+    keep_awake: bool,
+    supervisor: &Arc<Mutex<PanelSupervisor>>,
+    status_item: &IconMenuItem,
+    pause_item: &IconMenuItem,
+    update_item: &IconMenuItem,
+    menu_icons: &MenuIcons,
+    window: Option<&Window>,
+) {
+    if update_version.is_some() {
+        show_control_window(window);
+        if let Some(wv) = webview {
+            let _ = wv.evaluate_script(control_ui::show_update_dialog_script());
+        }
+        return;
+    }
+    *update_note = Some("Checking for updates…".into());
+    let _ = update_kick_tx.send(());
+    sync_tray_and_window(
+        status_item,
+        pause_item,
+        update_item,
+        menu_icons,
+        webview,
+        autostart,
+        hide_dock,
+        keep_awake,
+        supervisor,
+        update_version.as_deref(),
+        update_note.as_deref(),
+    );
+}
+
 fn handle_ipc(
     msg: &str,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
@@ -824,7 +1007,15 @@ fn handle_ipc(
     keep_awake_item: &IconMenuItem,
     menu_icons: &MenuIcons,
     tray: Option<&TrayIcon>,
-    update_version: Option<&str>,
+    update_kick_tx: &Sender<()>,
+    update_version: &mut Option<String>,
+    update_asset: Option<&ReleaseAsset>,
+    update_note: &mut Option<String>,
+    update_in_progress: &mut bool,
+    download_proxy: &tao::event_loop::EventLoopProxy<UserEvent>,
+    status_item: &IconMenuItem,
+    pause_item: &IconMenuItem,
+    update_item: &IconMenuItem,
 ) {
     match msg {
         "open" => {
@@ -837,7 +1028,31 @@ fn handle_ipc(
             toggle_panel(supervisor);
         }
         "update" => {
-            let _ = open_url(stitch_bot::update::RELEASES_PAGE);
+            handle_update_action(
+                update_kick_tx,
+                update_version,
+                update_note,
+                webview,
+                *autostart_enabled,
+                prefs.hide_dock_icon,
+                prefs.keep_awake,
+                supervisor,
+                status_item,
+                pause_item,
+                update_item,
+                menu_icons,
+                None,
+            );
+            return;
+        }
+        "download_update" => {
+            start_update_download(
+                update_version.as_deref(),
+                update_asset,
+                update_note,
+                update_in_progress,
+                download_proxy,
+            );
         }
         "quit" => {
             if let Ok(mut s) = supervisor.lock() {
@@ -887,8 +1102,36 @@ fn handle_ipc(
         prefs.hide_dock_icon,
         prefs.keep_awake,
         supervisor,
-        update_version,
+        update_version.as_deref(),
+        update_note.as_deref(),
     );
+}
+
+fn start_update_download(
+    update_version: Option<&str>,
+    update_asset: Option<&ReleaseAsset>,
+    update_note: &mut Option<String>,
+    update_in_progress: &mut bool,
+    proxy: &tao::event_loop::EventLoopProxy<UserEvent>,
+) {
+    if *update_in_progress {
+        return;
+    }
+    let (Some(version), Some(asset)) = (update_version, update_asset) else {
+        *update_note = Some("Check for updates before downloading.".into());
+        return;
+    };
+
+    *update_in_progress = true;
+    *update_note = Some("Downloading and verifying the update…".into());
+    let version = version.to_owned();
+    let asset = asset.clone();
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let result = stitch_bot::update::download_desktop_update_blocking(&version, &asset)
+            .map_err(|error| format!("{error:#}"));
+        let _ = proxy.send_event(UserEvent::UpdateDownloadResult(result));
+    });
 }
 
 fn apply_keep_awake(
@@ -946,6 +1189,7 @@ fn sync_control_ui(
     keep_awake: bool,
     supervisor: &Arc<Mutex<PanelSupervisor>>,
     update_version: Option<&str>,
+    update_note: Option<&str>,
 ) {
     let Some(wv) = webview else { return };
     let panel_running = supervisor
@@ -958,6 +1202,7 @@ fn sync_control_ui(
         keep_awake,
         panel_running,
         update_version,
+        update_note,
     );
     if let Err(e) = wv.evaluate_script(&script) {
         eprintln!("stitch-desktop: updating control window failed: {e:#}");
@@ -1152,5 +1397,55 @@ mod pause_confirmation_tests {
         assert!(PAUSE_CONFIRMATION_MESSAGE.contains("every bot that is running now"));
         assert!(PAUSE_CONFIRMATION_MESSAGE.contains("restarts only those bots"));
         assert!(PAUSE_CONFIRMATION_MESSAGE.contains("already paused stay paused"));
+    }
+}
+
+#[cfg(test)]
+mod release_state_tests {
+    use super::{apply_release_check, ReleaseAsset, ReleaseCheck};
+
+    fn asset() -> ReleaseAsset {
+        ReleaseAsset {
+            name: "Stitch.dmg".into(),
+            browser_download_url: "https://example.com/Stitch.dmg".into(),
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+        }
+    }
+
+    #[test]
+    fn failed_poll_preserves_a_known_update() {
+        let mut version = Some("0.2.0".into());
+        let mut selected_asset = Some(asset());
+        let mut note = Some("Checking for updates…".into());
+        apply_release_check(
+            &mut version,
+            &mut selected_asset,
+            &mut note,
+            ReleaseCheck::Failed {
+                reason: "offline".into(),
+            },
+        );
+        assert_eq!(version.as_deref(), Some("0.2.0"));
+        assert!(selected_asset.is_some());
+        assert_eq!(
+            note.as_deref(),
+            Some("Couldn't check for updates (offline).")
+        );
+    }
+
+    #[test]
+    fn current_release_clears_a_previous_update() {
+        let mut version = Some("0.2.0".into());
+        let mut selected_asset = Some(asset());
+        let mut note = None;
+        apply_release_check(
+            &mut version,
+            &mut selected_asset,
+            &mut note,
+            ReleaseCheck::Current,
+        );
+        assert!(version.is_none());
+        assert!(selected_asset.is_none());
+        assert!(note.is_none());
     }
 }

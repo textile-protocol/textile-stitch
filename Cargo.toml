@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.167"
+version = "0.1.168"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; market-makes the filler order book with signed UniswapX limit orders."
 license = "AGPL-3.0-or-later"
@@ -92,6 +92,7 @@ argon2 = { version = "0.5.3", optional = true }
 subtle = { version = "2.6.1", default-features = false, optional = true }
 tar = { version = "0.4.46", default-features = false, optional = true }
 mime_guess = { version = "2.0.5", optional = true }
+sha2 = "0.10.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
