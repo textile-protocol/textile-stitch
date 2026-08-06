@@ -465,12 +465,24 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let v = Harness::parse(&body);
         let list = v["corridors"].as_array().unwrap();
-        assert!(list.len() >= 7, "the shipped catalog");
+        assert!(list.len() >= 8, "the shipped catalog");
         assert_eq!(list[0]["id"], "cngn-usdt-bsc");
         assert!(list[0]["tomlTemplate"]
             .as_str()
             .unwrap()
             .contains("[[pools]]"));
+        // cNGN/USDT on Celo is a first-class panel preset (Add Bot + Switch).
+        let celo_cngn = list
+            .iter()
+            .find(|c| c["id"] == "cngn-usdt-celo")
+            .expect("cngn-usdt-celo preset");
+        assert_eq!(celo_cngn["displayName"], "cNGN / USDT");
+        assert_eq!(celo_cngn["networkLabel"], "Celo");
+        assert_eq!(celo_cngn["chainId"], 42220);
+        assert!(celo_cngn["tomlTemplate"]
+            .as_str()
+            .unwrap()
+            .contains("0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f"));
     }
 
     #[tokio::test]

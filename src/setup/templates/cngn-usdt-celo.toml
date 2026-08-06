@@ -1,0 +1,39 @@
+# Textile Stitch — cNGN/USDT on Celo (chain 42220).
+# The wallet key is NOT here; export STITCH_PRIVATE_KEY (or STITCH_PRIVATE_KEY_FILE).
+#
+# A single [[pools]] block quotes BOTH swap directions: the buy side pays USDT
+# for cNGN (USDT -> cNGN) and the sell side sells cNGN for USDT (cNGN -> USDT).
+
+chain_id        = 42220                                # Celo mainnet
+rpc_url         = "https://forno.celo.org"             # free public Celo RPC; swap for your own if you have one
+indexer_url     = "https://api.textilecredit.com"
+permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
+reactor         = "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"  # SETTLEMENT_V3_FILLER_REACTOR (Celo)
+tick_interval_secs = 5
+
+# Textile's own price endpoint. Returns { price, timestamp } where price is
+# debt-per-collateral (USDT per cNGN, e.g. ~0.000728).
+[feed]
+url            = "https://api.textilecredit.com/price?chainId=42220&pair=cngn-usdt"
+staleness_secs = 900
+
+[[pools]]
+collateral = "0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f"  # cNGN (soft asset, 6dp)
+collateral_decimals = 6
+debt = "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"        # USDT on Celo (stable, 6dp)
+debt_decimals = 6
+
+# Buy low: bid below the mid, paying USDT for cNGN. Funds USDT + Permit2 on USDT.
+buy_offset_bps = 1                                # 1 bps below mid
+buy_total_liquidity_debt = "max"                  # quote all funded USDT
+buy_min_slice_debt = "10000000"                   # 10 USDT smallest slice (6dp)
+buy_max_orders = 40
+
+# Sell high: ask above the mid, selling cNGN for USDT. Funds cNGN + Permit2 on cNGN.
+sell_offset_bps = 1                               # 1 bps above mid
+sell_total_liquidity_collateral = "max"           # quote all funded cNGN
+sell_min_slice_debt = "10000000"                  # 10 USDT-equivalent slice (6dp)
+sell_max_orders = 40
+
+ttl_secs = 120
+refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
