@@ -35,6 +35,13 @@ const CORRIDORS: &[Corridor] = &[
         toml_template: include_str!("templates/cngn-usdt-celo.toml"),
     },
     Corridor {
+        id: "usdc-usdt-celo",
+        display_name: "USDC / USDT",
+        network_label: "Celo",
+        chain_id: 42220,
+        toml_template: include_str!("templates/usdc-usdt-celo.toml"),
+    },
+    Corridor {
         id: "cngn-usdc-base",
         display_name: "cNGN / USDC",
         network_label: "Base",
@@ -155,15 +162,18 @@ mod tests {
 
     #[test]
     fn corridors_sharing_a_chain_are_told_apart_by_collateral() {
-        // Celo hosts cNGN/USDT, wARS/USDT and wBRL/USDT (chain 42220). A chain-only
-        // match would collapse them; identify must key on the collateral token so
-        // the control panel names (and preselects) the right one.
+        // Celo hosts cNGN/USDT, USDC/USDT, wARS/USDT and wBRL/USDT (chain 42220).
+        // A chain-only match would collapse them; identify must key on the
+        // collateral token so the control panel names (and preselects) the right one.
         let cngn = find_corridor("cngn-usdt-celo").expect("cngn corridor exists");
+        let usdc = find_corridor("usdc-usdt-celo").expect("usdc corridor exists");
         let wars = find_corridor("wars-usdt-celo").expect("wars corridor exists");
         let wbrl = find_corridor("wbrl-usdt-celo").expect("wbrl corridor exists");
-        assert_eq!(cngn.chain_id, wars.chain_id, "test premise: same chain");
+        assert_eq!(cngn.chain_id, usdc.chain_id, "test premise: same chain");
+        assert_eq!(usdc.chain_id, wars.chain_id, "test premise: same chain");
         assert_eq!(wars.chain_id, wbrl.chain_id, "test premise: same chain");
         assert_eq!(identify_corridor(cngn.toml_template).unwrap().id, cngn.id);
+        assert_eq!(identify_corridor(usdc.toml_template).unwrap().id, usdc.id);
         assert_eq!(identify_corridor(wars.toml_template).unwrap().id, wars.id);
         assert_eq!(identify_corridor(wbrl.toml_template).unwrap().id, wbrl.id);
     }

@@ -483,6 +483,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f"));
+        // USDC/USDT on Celo is a first-class panel preset too.
+        let celo_usdc = list
+            .iter()
+            .find(|c| c["id"] == "usdc-usdt-celo")
+            .expect("usdc-usdt-celo preset");
+        assert_eq!(celo_usdc["displayName"], "USDC / USDT");
+        assert_eq!(celo_usdc["networkLabel"], "Celo");
+        assert_eq!(celo_usdc["chainId"], 42220);
+        assert!(celo_usdc["tomlTemplate"]
+            .as_str()
+            .unwrap()
+            .contains("0xcebA9300f2b948710d2653dD7B07f33A8B32118C"));
     }
 
     #[tokio::test]
