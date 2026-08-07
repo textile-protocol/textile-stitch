@@ -1428,7 +1428,8 @@ fn tray_icon_from_embedded() -> Option<Icon> {
 /// Original grandma tray icon plus a small Textile-yellow "on" dot.
 ///
 /// This state is not a macOS template because template tinting would erase the
-/// yellow. Tint the grandma ourselves for the current light/dark appearance.
+/// yellow. Tint the grandma ourselves to match the menu-bar contrast the
+/// template would have produced (see [`menu_icons::tray_awake_ink`]).
 fn tray_icon_with_awake_badge() -> Option<Icon> {
     const SIZE: u32 = 32;
     const RGBA: &[u8] = include_bytes!("../../../assets/grandma-tray-32.rgba");
@@ -1436,7 +1437,7 @@ fn tray_icon_with_awake_badge() -> Option<Icon> {
         return None;
     }
     let mut px = RGBA.to_vec();
-    tint_opaque_pixels(&mut px, menu_icons::current_ink());
+    tint_opaque_pixels(&mut px, menu_icons::tray_awake_ink());
     paint_awake_dot(&mut px, SIZE);
     Icon::from_rgba(px, SIZE, SIZE).ok()
 }

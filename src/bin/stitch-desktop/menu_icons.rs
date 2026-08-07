@@ -181,9 +181,26 @@ fn ink_for(light_glyphs: bool) -> (u8, u8, u8) {
     }
 }
 
-/// Current menu-chrome ink, also used to tint the non-template awake tray icon.
-pub fn current_ink() -> (u8, u8, u8) {
-    ink_for(prefer_light_glyphs())
+/// Ink for the non-template "keep awake" tray grandma.
+///
+/// The default grandma is a macOS template, so the system tints it to contrast
+/// the menu bar, which comes out light in both Light and Dark mode. The awake
+/// state can't be a template (templating flattens the yellow dot to a single
+/// tint), so bake in a matching light ink on macOS regardless of the Light/Dark
+/// setting. `prefer_light_glyphs` tracks the dropdown-menu popover, which does
+/// follow the OS theme, so it's the wrong signal for the menu-bar icon here.
+///
+/// Windows/Linux tray backgrounds do follow the OS theme, so derive the ink
+/// from the theme there.
+pub fn tray_awake_ink() -> (u8, u8, u8) {
+    #[cfg(target_os = "macos")]
+    {
+        ink_for(true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ink_for(prefer_light_glyphs())
+    }
 }
 
 /// Re-stamp every tray-menu icon after [`MenuIcons::refresh_for_appearance`].
@@ -276,6 +293,15 @@ mod glyph_bounds_tests {
     #[test]
     fn shared_stroke_is_uniform() {
         assert!((STROKE - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tray_awake_ink_is_light_regardless_of_theme() {
+        // The menu bar renders the template grandma light in both Light and
+        // Dark; the awake grandma is a non-template bitmap, so it must be tinted
+        // light to match instead of following the OS theme.
+        assert_eq!(super::tray_awake_ink(), super::ink_for(true));
     }
 
     #[test]
