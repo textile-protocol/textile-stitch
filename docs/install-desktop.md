@@ -29,7 +29,10 @@ keep-awake is also in Settings and persists across launches. When keep-awake is
 on, the menu-bar / tray icon shows a small lightning badge. When a newer
 desktop release is published, the control window shows an update banner and the
 tray item becomes **Update**. The banner can be dismissed for the current
-window. **Check for updates…** re-queries GitHub immediately.
+window. **Check for updates…** re-queries GitHub immediately; if a newer
+release is available, Stitch shows a native alert (**Upgrade** / **Later**).
+**Upgrade** opens Settings and the install confirmation dialog; **Later**
+leaves the tray on **Update** so you can come back to it.
 
 Choosing **Update** explains what will happen before downloading anything. All
 downloads are matched to the current platform and checked against GitHub's

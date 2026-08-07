@@ -59,6 +59,13 @@ const WINDOW_INNER_WIDTH: f64 = 380.0;
 const WINDOW_INNER_HEIGHT: f64 = 520.0;
 const PAUSE_CONFIRMATION_TITLE: &str = "Pause Stitch?";
 const PAUSE_CONFIRMATION_MESSAGE: &str = "Pausing the panel also pauses every bot that is running now. When you resume, Stitch restarts only those bots. Bots that were already paused stay paused.";
+/// Note set while a tray/Settings "Check for updates…" is in flight. Background
+/// polls leave this unset so they stay quiet when current or when an update
+/// appears.
+const CHECKING_UPDATES_NOTE: &str = "Checking for updates…";
+const UPDATE_AVAILABLE_TITLE: &str = "Update available";
+const UPDATE_UPGRADE_BUTTON: &str = "Upgrade";
+const UPDATE_LATER_BUTTON: &str = "Later";
 
 #[derive(Debug)]
 enum UserEvent {
@@ -67,7 +74,13 @@ enum UserEvent {
     /// Periodic poll so the control window reflects panel exits without a click.
     RefreshStatus,
     /// Outcome of a GitHub latest-release poll (background or manual).
-    UpdateCheckResult(ReleaseCheck),
+    /// `manual` is true only for checks woken by "Check for updates…", not
+    /// inferred from UI note text (an in-flight background poll must not be
+    /// treated as the kicked check).
+    UpdateCheckResult {
+        result: ReleaseCheck,
+        manual: bool,
+    },
     /// Outcome of downloading and verifying the selected platform artifact.
     UpdateDownloadResult(Result<PathBuf, String>),
 }
@@ -136,6 +149,94 @@ fn show_launch_error(detail: &str) {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let _ = detail;
+    }
+}
+
+/// Escape a string for embedding in an AppleScript double-quoted literal.
+#[cfg(target_os = "macos")]
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// Escape a string for embedding in a PowerShell single-quoted literal.
+#[cfg(target_os = "windows")]
+fn powershell_single_quote(s: &str) -> String {
+    s.replace('\'', "''")
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// After a manual "Check for updates…", ask whether to open the install flow.
+/// Returns true when the operator chooses Upgrade.
+fn confirm_update_available(version: &str) -> bool {
+    let message = format!("Stitch {version} is ready.");
+    #[cfg(target_os = "macos")]
+    {
+        let title = applescript_escape(UPDATE_AVAILABLE_TITLE);
+        let body = applescript_escape(&message);
+        let upgrade = applescript_escape(UPDATE_UPGRADE_BUTTON);
+        let later = applescript_escape(UPDATE_LATER_BUTTON);
+        let script = format!(
+            "display alert \"{title}\" message \"{body}\" buttons {{\"{later}\", \"{upgrade}\"}} default button \"{upgrade}\" cancel button \"{later}\""
+        );
+        return std::process::Command::new("/usr/bin/osascript")
+            .args(["-e", &script])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // MessageBox has fixed Yes/No labels; map Yes → Upgrade, No → Later.
+        let title = powershell_single_quote(UPDATE_AVAILABLE_TITLE);
+        let body = powershell_single_quote(&format!(
+            "{message}`n`nClick Yes to upgrade, or No to decide later."
+        ));
+        let script = format!(
+            "Add-Type -AssemblyName PresentationFramework; \
+             $answer = [System.Windows.MessageBox]::Show(\
+               '{body}',\
+               '{title}','YesNo','Information'); \
+             if ($answer -eq 'Yes') {{ exit 0 }} else {{ exit 1 }}"
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
+        win_cmd::no_window(&mut cmd);
+        return cmd.status().map(|status| status.success()).unwrap_or(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::*;
+        let dialog = gtk::MessageDialog::new(
+            None::<&gtk::Window>,
+            gtk::DialogFlags::MODAL,
+            gtk::MessageType::Info,
+            gtk::ButtonsType::None,
+            &message,
+        );
+        dialog.set_title(UPDATE_AVAILABLE_TITLE);
+        dialog.add_button(UPDATE_LATER_BUTTON, gtk::ResponseType::Cancel);
+        dialog.add_button(UPDATE_UPGRADE_BUTTON, gtk::ResponseType::Accept);
+        dialog.set_default_response(gtk::ResponseType::Accept);
+        let confirmed = dialog.run() == gtk::ResponseType::Accept;
+        dialog.close();
+        return confirmed;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = message;
+        false
     }
 }
 
@@ -268,9 +369,11 @@ fn run() -> Result<()> {
     });
     // Best-effort release check (no install receipt needed — works for Stitch.app).
     // Failed polls retry quickly; successful Current/Available settle on the
-    // long interval. A kick from "Check for updates…" runs immediately.
+    // long interval. A kick from "Check for updates…" runs immediately and is
+    // tagged `manual` on that next poll only — never on an already in-flight one.
     std::thread::spawn(move || {
         let mut fail_streak: usize = 0;
+        let mut manual = false;
         loop {
             let result = stitch_bot::update::check_latest_release_blocking();
             let sleep_secs = match &result {
@@ -289,14 +392,20 @@ fn run() -> Result<()> {
                 }
             };
             if update_proxy
-                .send_event(UserEvent::UpdateCheckResult(result))
+                .send_event(UserEvent::UpdateCheckResult { result, manual })
                 .is_err()
             {
                 break;
             }
+            manual = false;
             // Wait for the interval, or wake early on a manual check kick.
             match update_kick_rx.recv_timeout(Duration::from_secs(sleep_secs)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(()) => {
+                    // Collapse duplicate kicks into one tagged check.
+                    while update_kick_rx.try_recv().is_ok() {}
+                    manual = true;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -629,12 +738,13 @@ fn run() -> Result<()> {
                     );
                 }
             }
-            Event::UserEvent(UserEvent::UpdateCheckResult(result)) => {
-                apply_release_check(
+            Event::UserEvent(UserEvent::UpdateCheckResult { result, manual }) => {
+                let prompt_version = apply_release_check(
                     &mut update_version,
                     &mut update_asset,
                     &mut update_note,
                     result,
+                    manual,
                 );
                 sync_tray_menu(
                     &status_item,
@@ -654,6 +764,20 @@ fn run() -> Result<()> {
                         update_version.as_deref(),
                         update_note.as_deref(),
                     );
+                }
+                // Manual "Check for updates…" found a release — ask before
+                // opening the Settings install dialog. Skip during password
+                // setup: the signup document has no update dialog. Background
+                // polls only flip the tray to Update.
+                if !awaiting_signup {
+                    if let Some(version) = prompt_version {
+                        if confirm_update_available(&version) {
+                            show_control_window(window.as_ref());
+                            if let Some(wv) = webview.as_ref() {
+                                let _ = wv.evaluate_script(control_ui::show_update_dialog_script());
+                            }
+                        }
+                    }
                 }
             }
             Event::UserEvent(UserEvent::UpdateDownloadResult(result)) => {
@@ -919,35 +1043,48 @@ fn parse_signup_ipc(msg: &str) -> Option<(String, String)> {
 }
 
 /// Apply a release poll without treating network failure as "up to date".
+/// Returns the version to prompt about when a *manual* check found an update
+/// (background polls stay quiet). `manual` comes from the poller kick flag —
+/// not from `update_note`, so an in-flight background result can't steal the
+/// kicked check's prompt.
 fn apply_release_check(
     update_version: &mut Option<String>,
     update_asset: &mut Option<ReleaseAsset>,
     update_note: &mut Option<String>,
     result: ReleaseCheck,
-) {
+    manual: bool,
+) -> Option<String> {
     match result {
         ReleaseCheck::Available { latest, asset } => {
+            let prompt = manual.then(|| latest.clone());
             *update_version = Some(latest);
             *update_asset = Some(asset);
-            *update_note = None;
+            // Keep "Checking…" if a manual kick is still outstanding (this
+            // result was a concurrent background poll). Manual results clear it.
+            if manual || update_note.as_deref() != Some(CHECKING_UPDATES_NOTE) {
+                *update_note = None;
+            }
+            prompt
         }
         ReleaseCheck::Current => {
             *update_version = None;
             *update_asset = None;
-            // Only show "up to date" after an explicit check (note already set
-            // to "Checking…"). Background polls stay quiet when current.
-            if update_note.as_deref() == Some("Checking for updates…") {
+            // Only show "up to date" after an explicit check. Background polls
+            // stay quiet when current, and must not clear a pending Checking note.
+            if manual {
                 *update_note = Some("You're up to date.".into());
-            } else {
+            } else if update_note.as_deref() != Some(CHECKING_UPDATES_NOTE) {
                 *update_note = None;
             }
+            None
         }
         ReleaseCheck::Failed { reason } => {
             // Keep a previously discovered update; a flaky check must not hide it.
             // Only surface the error after the operator asked us to check.
-            if update_note.as_deref() == Some("Checking for updates…") {
+            if manual {
                 *update_note = Some(format!("Couldn't check for updates ({reason})."));
             }
+            None
         }
     }
 }
@@ -976,7 +1113,7 @@ fn handle_update_action(
         }
         return;
     }
-    *update_note = Some("Checking for updates…".into());
+    *update_note = Some(CHECKING_UPDATES_NOTE.into());
     let _ = update_kick_tx.send(());
     sync_tray_and_window(
         status_item,
@@ -1401,8 +1538,20 @@ mod pause_confirmation_tests {
 }
 
 #[cfg(test)]
+mod update_available_prompt_tests {
+    use super::{UPDATE_AVAILABLE_TITLE, UPDATE_LATER_BUTTON, UPDATE_UPGRADE_BUTTON};
+
+    #[test]
+    fn prompt_copy_matches_upgrade_later_flow() {
+        assert_eq!(UPDATE_AVAILABLE_TITLE, "Update available");
+        assert_eq!(UPDATE_UPGRADE_BUTTON, "Upgrade");
+        assert_eq!(UPDATE_LATER_BUTTON, "Later");
+    }
+}
+
+#[cfg(test)]
 mod release_state_tests {
-    use super::{apply_release_check, ReleaseAsset, ReleaseCheck};
+    use super::{apply_release_check, ReleaseAsset, ReleaseCheck, CHECKING_UPDATES_NOTE};
 
     fn asset() -> ReleaseAsset {
         ReleaseAsset {
@@ -1413,17 +1562,18 @@ mod release_state_tests {
     }
 
     #[test]
-    fn failed_poll_preserves_a_known_update() {
+    fn failed_manual_poll_preserves_a_known_update() {
         let mut version = Some("0.2.0".into());
         let mut selected_asset = Some(asset());
-        let mut note = Some("Checking for updates…".into());
-        apply_release_check(
+        let mut note = Some(CHECKING_UPDATES_NOTE.into());
+        let prompt = apply_release_check(
             &mut version,
             &mut selected_asset,
             &mut note,
             ReleaseCheck::Failed {
                 reason: "offline".into(),
             },
+            true,
         );
         assert_eq!(version.as_deref(), Some("0.2.0"));
         assert!(selected_asset.is_some());
@@ -1431,6 +1581,7 @@ mod release_state_tests {
             note.as_deref(),
             Some("Couldn't check for updates (offline).")
         );
+        assert!(prompt.is_none());
     }
 
     #[test]
@@ -1438,14 +1589,95 @@ mod release_state_tests {
         let mut version = Some("0.2.0".into());
         let mut selected_asset = Some(asset());
         let mut note = None;
-        apply_release_check(
+        let prompt = apply_release_check(
             &mut version,
             &mut selected_asset,
             &mut note,
             ReleaseCheck::Current,
+            false,
         );
         assert!(version.is_none());
         assert!(selected_asset.is_none());
         assert!(note.is_none());
+        assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn manual_available_check_returns_prompt_version() {
+        let mut version = None;
+        let mut selected_asset = None;
+        let mut note = Some(CHECKING_UPDATES_NOTE.into());
+        let prompt = apply_release_check(
+            &mut version,
+            &mut selected_asset,
+            &mut note,
+            ReleaseCheck::Available {
+                latest: "0.3.0".into(),
+                asset: asset(),
+            },
+            true,
+        );
+        assert_eq!(version.as_deref(), Some("0.3.0"));
+        assert!(selected_asset.is_some());
+        assert!(note.is_none());
+        assert_eq!(prompt.as_deref(), Some("0.3.0"));
+    }
+
+    #[test]
+    fn background_available_check_stays_quiet() {
+        let mut version = None;
+        let mut selected_asset = None;
+        let mut note = None;
+        let prompt = apply_release_check(
+            &mut version,
+            &mut selected_asset,
+            &mut note,
+            ReleaseCheck::Available {
+                latest: "0.3.0".into(),
+                asset: asset(),
+            },
+            false,
+        );
+        assert_eq!(version.as_deref(), Some("0.3.0"));
+        assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn background_result_does_not_steal_pending_manual_prompt() {
+        // Kick while a background poll is in flight: note is already Checking,
+        // but the arriving result is still tagged background.
+        let mut version = None;
+        let mut selected_asset = None;
+        let mut note = Some(CHECKING_UPDATES_NOTE.into());
+        let prompt = apply_release_check(
+            &mut version,
+            &mut selected_asset,
+            &mut note,
+            ReleaseCheck::Available {
+                latest: "0.3.0".into(),
+                asset: asset(),
+            },
+            false,
+        );
+        assert_eq!(version.as_deref(), Some("0.3.0"));
+        assert!(prompt.is_none());
+        assert_eq!(note.as_deref(), Some(CHECKING_UPDATES_NOTE));
+    }
+
+    #[test]
+    fn background_current_keeps_checking_note() {
+        let mut version = Some("0.2.0".into());
+        let mut selected_asset = Some(asset());
+        let mut note = Some(CHECKING_UPDATES_NOTE.into());
+        let prompt = apply_release_check(
+            &mut version,
+            &mut selected_asset,
+            &mut note,
+            ReleaseCheck::Current,
+            false,
+        );
+        assert!(version.is_none());
+        assert!(prompt.is_none());
+        assert_eq!(note.as_deref(), Some(CHECKING_UPDATES_NOTE));
     }
 }
