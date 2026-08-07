@@ -63,8 +63,58 @@ pub struct Config {
     /// set `provider = "turnkey" | "mpcvault"` to sign via an MPC wallet.
     #[serde(default)]
     pub signer: Option<crate::signer::SignerConfig>,
+    /// RFQ responder (dual-run pilot). Omitted → the responder never spawns and
+    /// nothing else changes. See [`RfqConfig`].
+    #[serde(default)]
+    pub rfq: Option<RfqConfig>,
+    /// Raw experimental gates. Values are uninterpreted strings on purpose:
+    /// each consumer matches its own exact token, so a typo fails closed
+    /// instead of enabling something adjacent.
+    #[serde(default)]
+    pub experimental: Option<ExperimentalConfig>,
     pub pools: Vec<PoolConfig>,
 }
+
+/// The `[rfq]` block: connection details for the venue's maker quote stream.
+/// The maker API key is NOT here — it comes from the environment variable
+/// named by `api_key_env`, mirroring how the wallet key stays out of the file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RfqConfig {
+    /// Master switch. `false` (the default) keeps the responder fully off even
+    /// when the rest of the block is filled in — the kill switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The venue's maker stream, e.g. `wss://api.textilecredit.com/v2/maker/stream`.
+    pub url: String,
+    /// The maker id the venue issued at onboarding (sent as `X-Textile-Maker-Id`).
+    pub maker_id: String,
+    /// Name of the environment variable holding the maker API key.
+    #[serde(default = "default_rfq_api_key_env")]
+    pub api_key_env: String,
+    /// The chain's PreferredFillerValidation contract. Every RFQ order binds
+    /// its taker through this contract, so an off-venue observer can't fill a
+    /// quote that lost.
+    pub validation_contract: String,
+}
+
+fn default_rfq_api_key_env() -> String {
+    "STITCH_RFQ_API_KEY".to_string()
+}
+
+/// The `[experimental]` block. Every field is a raw string read verbatim; the
+/// parser attaches no meaning so an unknown/old gate token can never turn a
+/// feature on by accident.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExperimentalConfig {
+    /// Gate for the panel's read-only "RFQ (beta)" card. Only the exact token
+    /// checked by [`Config::rfq_panel_unlocked`] unlocks it.
+    #[serde(default)]
+    pub rfq_panel: Option<String>,
+}
+
+/// The one token that unlocks the panel's RFQ beta card. Exact, case-sensitive
+/// match — anything else (including a different case) fails closed.
+pub const RFQ_PANEL_GATE: &str = "enable-rfq-beta";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeedConfig {
@@ -121,6 +171,11 @@ pub struct PoolConfig {
     /// price cNGN, COPM, and KES at once.
     #[serde(default)]
     pub feed_url: Option<String>,
+    /// Venue corridor slug for the RFQ responder (e.g. `"cngn-usdc"`). Set it
+    /// to serve this pool over RFQ; unset, the pool is ladder-only. Only takes
+    /// effect with `[rfq].enabled = true`.
+    #[serde(default)]
+    pub rfq_corridor: Option<String>,
 
     // ----- Buy side (bid below mid — "buy low"). Configure a spread (one of
     // bps / abs) and a size to enable it; omit to run sell-only. The operator
@@ -359,6 +414,62 @@ impl PoolConfig {
             floor_bps: self.lean_floor_bps?,
         })
     }
+
+    /// Debt capacity (atomic) the RFQ responder may commit on the bid side, or
+    /// `None` when the side doesn't quote over RFQ (no spread configured).
+    ///
+    /// RFQ capacity must be an explicit number: the responder tracks in-flight
+    /// reservations against it and publishes it as level size, so the `max`
+    /// sentinel (a wallet read the responder deliberately doesn't do) is an
+    /// error rather than a guess.
+    pub fn rfq_buy_capacity_debt(&self) -> anyhow::Result<Option<U256>> {
+        if self.buy_spread().is_none() {
+            return Ok(None);
+        }
+        rfq_side_capacity(
+            self.buy_total_liquidity_debt.as_deref(),
+            self.buy_order_size_debt.as_deref(),
+            "buy",
+        )
+    }
+
+    /// Collateral capacity (atomic) for the RFQ ask side; see
+    /// [`Self::rfq_buy_capacity_debt`].
+    pub fn rfq_sell_capacity_collateral(&self) -> anyhow::Result<Option<U256>> {
+        if self.sell_spread().is_none() {
+            return Ok(None);
+        }
+        rfq_side_capacity(
+            self.sell_total_liquidity_collateral.as_deref(),
+            self.sell_order_size_collateral.as_deref(),
+            "sell",
+        )
+    }
+}
+
+/// One RFQ side's committed capacity: the ladder total when it's an exact
+/// number, else the flat order size, else the side is off. `max` is rejected —
+/// the responder needs a hard number to reserve against.
+fn rfq_side_capacity(
+    total: Option<&str>,
+    order_size: Option<&str>,
+    side: &str,
+) -> anyhow::Result<Option<U256>> {
+    if let Some(raw) = total {
+        return match parse_liquidity_amount(raw, &format!("{side} total liquidity"))? {
+            LiquidityAmount::Exact(v) => Ok(Some(v)),
+            LiquidityAmount::Max => anyhow::bail!(
+                "rfq pools need an explicit {side}-side liquidity amount, not \"max\" — \
+                 the responder reserves in-flight quotes against a fixed capacity"
+            ),
+        };
+    }
+    match order_size {
+        Some(raw) => Ok(Some(raw.trim().parse::<U256>().with_context(|| {
+            format!("invalid {side} order size for an rfq pool")
+        })?)),
+        None => Ok(None),
+    }
 }
 
 impl Config {
@@ -366,6 +477,23 @@ impl Config {
         let cfg = toml::from_str::<Self>(s)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// True when the RFQ responder should run: the master switch is on AND at
+    /// least one pool names a corridor. Anything less is a no-op — the ladder
+    /// never changes either way.
+    pub fn rfq_active(&self) -> bool {
+        self.rfq.as_ref().is_some_and(|r| r.enabled)
+            && self.pools.iter().any(|p| p.rfq_corridor.is_some())
+    }
+
+    /// True only for the exact [`RFQ_PANEL_GATE`] token. Read-only surface for
+    /// the panel; nothing in the bot keys off it.
+    pub fn rfq_panel_unlocked(&self) -> bool {
+        self.experimental
+            .as_ref()
+            .and_then(|e| e.rfq_panel.as_deref())
+            == Some(RFQ_PANEL_GATE)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -455,6 +583,45 @@ impl Config {
                 }
                 crate::signer::SignerConfig::Local => {}
             }
+        }
+        self.validate_rfq()?;
+        Ok(())
+    }
+
+    /// RFQ cross-field rules. All of them are scoped to configs that actually
+    /// turn the responder on, so a pre-RFQ config can never trip them.
+    fn validate_rfq(&self) -> anyhow::Result<()> {
+        let Some(rfq) = &self.rfq else { return Ok(()) };
+        if !rfq.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            rfq.url.starts_with("wss://") || rfq.url.starts_with("ws://"),
+            "[rfq].url must be a ws(s):// URL, got {:?}",
+            rfq.url
+        );
+        anyhow::ensure!(!rfq.maker_id.trim().is_empty(), "[rfq].maker_id is empty");
+        anyhow::ensure!(
+            !rfq.api_key_env.trim().is_empty(),
+            "[rfq].api_key_env is empty"
+        );
+        rfq.validation_contract
+            .parse::<alloy_primitives::Address>()
+            .context("[rfq].validation_contract is not a valid address")?;
+        for (idx, pool) in self.pools.iter().enumerate() {
+            let Some(slug) = &pool.rfq_corridor else {
+                continue;
+            };
+            anyhow::ensure!(
+                !slug.trim().is_empty(),
+                "pools[{idx}].rfq_corridor is empty"
+            );
+            // Surface capacity problems (notably `max` liquidity) at load time
+            // instead of when the first quote request arrives.
+            pool.rfq_buy_capacity_debt()
+                .with_context(|| format!("pools[{idx}] (rfq corridor {slug})"))?;
+            pool.rfq_sell_capacity_collateral()
+                .with_context(|| format!("pools[{idx}] (rfq corridor {slug})"))?;
         }
         Ok(())
     }
@@ -744,6 +911,142 @@ mod tests {
         );
         let err = Config::from_toml(&toml).expect_err("negative wide is rejected");
         assert!(err.to_string().contains("lean_wide_bps"));
+    }
+
+    #[test]
+    fn the_example_config_keeps_rfq_disabled() {
+        // The kill-switch guarantee: a config written before RFQ existed (the
+        // shipped example documents it commented out) must parse with the
+        // responder fully off and the panel gate locked.
+        let cfg = Config::from_toml(EXAMPLE).expect("example config parses");
+        assert!(cfg.rfq.is_none());
+        assert!(!cfg.rfq_active());
+        assert!(!cfg.rfq_panel_unlocked());
+        assert!(cfg.pools.iter().all(|p| p.rfq_corridor.is_none()));
+    }
+
+    #[test]
+    fn rfq_panel_gate_only_opens_on_the_exact_token() {
+        // No [experimental] block at all → locked.
+        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert!(!cfg.rfq_panel_unlocked());
+
+        // Near-misses fail closed: truthy strings, the wrong case, whitespace.
+        for wrong in ["true", "1", "yes", "ENABLE-RFQ-BETA", " enable-rfq-beta"] {
+            let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_panel = \"{wrong}\"\n");
+            let cfg = Config::from_toml(&toml).unwrap();
+            assert!(!cfg.rfq_panel_unlocked(), "{wrong:?} must not unlock");
+        }
+
+        let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_panel = \"enable-rfq-beta\"\n");
+        assert!(Config::from_toml(&toml).unwrap().rfq_panel_unlocked());
+    }
+
+    const RFQ_BLOCK: &str = r#"
+        [rfq]
+        enabled = true
+        url = "wss://api.textilecredit.com/v2/maker/stream"
+        maker_id = "mk_test"
+        validation_contract = "0x00000000000000000000000000000000000000aa"
+    "#;
+
+    #[test]
+    fn rfq_is_inert_unless_enabled_and_a_pool_names_a_corridor() {
+        // Block present but disabled → inactive.
+        let toml = format!(
+            "{LEAN_POOL_BASE}\n{}",
+            RFQ_BLOCK.replace("enabled = true", "enabled = false")
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert!(!cfg.rfq_active());
+
+        // Enabled but no pool opted in → still inactive.
+        let toml = format!("{LEAN_POOL_BASE}\n{RFQ_BLOCK}");
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert!(!cfg.rfq_active());
+
+        // Enabled + a corridor → active. The corridor rides on the pool, so
+        // splice it in before the [rfq] table.
+        let toml = format!(
+            "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
+            LEAN_POOL_BASE
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert!(cfg.rfq_active());
+        assert_eq!(
+            cfg.rfq.as_ref().unwrap().api_key_env,
+            "STITCH_RFQ_API_KEY",
+            "the api key env var name has a default"
+        );
+    }
+
+    #[test]
+    fn an_enabled_rfq_block_is_validated() {
+        let base = format!(
+            "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
+            LEAN_POOL_BASE
+        );
+        let bad_url = base.replace("wss://api.textilecredit.com/v2/maker/stream", "https://x");
+        assert!(Config::from_toml(&bad_url)
+            .unwrap_err()
+            .to_string()
+            .contains("[rfq].url"));
+
+        let bad_contract = base.replace(
+            "0x00000000000000000000000000000000000000aa",
+            "not-an-address",
+        );
+        assert!(
+            format!("{:#}", Config::from_toml(&bad_contract).unwrap_err())
+                .contains("validation_contract")
+        );
+    }
+
+    #[test]
+    fn rfq_capacity_needs_an_explicit_number_not_max() {
+        // The LEAN_POOL_BASE pool sizes both sides with flat order sizes, so
+        // those are the capacities.
+        let toml = format!(
+            "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
+            LEAN_POOL_BASE
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        let pool = &cfg.pools[0];
+        assert_eq!(
+            pool.rfq_buy_capacity_debt().unwrap(),
+            Some(U256::from(1_000_000_000u64))
+        );
+        assert_eq!(
+            pool.rfq_sell_capacity_collateral().unwrap(),
+            Some(U256::from(1_000_000u64))
+        );
+
+        // A ladder total wins over the flat size when both are set.
+        let toml = format!(
+            "{}\nbuy_total_liquidity_debt = \"5000000000\"\nbuy_min_slice_debt = \"10000000\"\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
+            LEAN_POOL_BASE
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert_eq!(
+            cfg.pools[0].rfq_buy_capacity_debt().unwrap(),
+            Some(U256::from(5_000_000_000u64))
+        );
+
+        // `max` can't back an RFQ reservation ledger — rejected at load time.
+        let toml = format!(
+            "{}\nbuy_total_liquidity_debt = \"max\"\nbuy_min_slice_debt = \"10000000\"\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
+            LEAN_POOL_BASE
+        );
+        let err = Config::from_toml(&toml).expect_err("max capacity is rejected for rfq pools");
+        assert!(format!("{err:#}").contains("max"));
+
+        // A side with no spread simply doesn't quote over RFQ.
+        let toml = format!(
+            "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
+            LEAN_POOL_BASE.replace("sell_offset_bps = 1", "")
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert_eq!(cfg.pools[0].rfq_sell_capacity_collateral().unwrap(), None);
     }
 
     #[test]

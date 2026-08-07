@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.170"
+version = "0.1.171"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; market-makes the filler order book with signed UniswapX limit orders."
 license = "AGPL-3.0-or-later"
@@ -40,7 +40,6 @@ panel = [
   "dep:bollard",
   "dep:rust-embed",
   "dep:mime_guess",
-  "dep:futures-util",
   "dep:tokio-stream",
   "dep:argon2",
   "dep:subtle",
@@ -74,6 +73,12 @@ anyhow = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# RFQ responder: WebSocket client to the venue's maker stream. rustls to match
+# reqwest's TLS stack. The direct rustls dep exists so the rfq module can
+# install ring as the process-default crypto provider — the dependency graph
+# also compiles aws-lc-rs, and rustls refuses to pick between two providers.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", features = ["ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axoupdater = "0.10.0"
@@ -84,7 +89,9 @@ rpassword = "7"
 # unix socket, so it needs no TLS provider of its own.
 bollard = { version = "0.21.0", default-features = false, features = ["http", "pipe"], optional = true }
 rust-embed = { version = "8.12.0", features = ["mime-guess"], optional = true }
-futures-util = { version = "0.3.33", default-features = false, features = ["std"], optional = true }
+# No longer panel-only: the rfq responder's WebSocket read/write loop needs
+# StreamExt/SinkExt in the default build.
+futures-util = { version = "0.3.33", default-features = false, features = ["std", "sink"] }
 tokio-stream = { version = "0.1.19", optional = true }
 # argon2 brings `password_hash::rand_core::OsRng`, which is what generates both
 # password salts and session tokens — no second RNG crate needed.

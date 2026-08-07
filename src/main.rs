@@ -479,6 +479,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         dry_run,
     };
 
+    // RFQ responder (dual-run pilot): spawned only when `[rfq].enabled` AND a
+    // pool sets `rfq_corridor`. It runs beside the ladder on its own cadence
+    // and WebSocket; with the config off this is a no-op and every tick below
+    // behaves exactly as before.
+    let rfq_task = stitch_bot::rfq::maybe_spawn(&cfg, signer.clone(), dry_run);
+
     // Per closer pool: position id → unix time we last submitted a fill for it,
     // so a pending tx or lagging subgraph can't trigger a duplicate `fill()`.
     let mut closer_pending: HashMap<Address, HashMap<U256, u64>> = HashMap::new();
@@ -574,6 +580,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         tokio::select! {
             _ = &mut shutdown => {
                 info!("shutdown signal received; stopping after current tick");
+                if let Some(task) = &rfq_task {
+                    task.abort();
+                }
                 return Ok(());
             }
             _ = interval.tick() => {}

@@ -113,6 +113,18 @@ pub struct SettingsView {
     pub lean_base_bps: String,
     /// Extra widening at the heavy inventory edge, in bps. Empty = bot default (3.0).
     pub lean_wide_bps: String,
+    // ----- RFQ (beta). READ-ONLY: none of these have a patch field, no form
+    // writes them, and `to_patch` skips them — the gate and the [rfq] block
+    // are edited by hand (or by the venue's onboarding docs) only. -----
+    /// True only when `[experimental].rfq_panel` is exactly the beta token.
+    /// Gates the panel's read-only RFQ card; false hides it entirely.
+    pub rfq_panel_unlocked: bool,
+    /// Whether `[rfq].enabled` is set. Bot-wide.
+    pub rfq_enabled: bool,
+    /// The venue stream URL from `[rfq]`, empty when the block is absent.
+    pub rfq_url: String,
+    /// Corridor slugs of every pool with `rfq_corridor` set.
+    pub rfq_corridors: Vec<String>,
 }
 
 impl SettingsView {
@@ -232,6 +244,14 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
         lean_floor_bps: opt_f64(pool.lean_floor_bps),
         lean_base_bps: opt_f64(pool.lean_base_bps),
         lean_wide_bps: opt_f64(pool.lean_wide_bps),
+        rfq_panel_unlocked: cfg.rfq_panel_unlocked(),
+        rfq_enabled: cfg.rfq.as_ref().is_some_and(|r| r.enabled),
+        rfq_url: cfg.rfq.as_ref().map(|r| r.url.clone()).unwrap_or_default(),
+        rfq_corridors: cfg
+            .pools
+            .iter()
+            .filter_map(|p| p.rfq_corridor.clone())
+            .collect(),
     })
 }
 
@@ -1320,6 +1340,54 @@ mod tests {
         assert!(!without.contains("twap_window_secs"), "{without}");
         assert!(!without.contains("lean_shadow"), "{without}");
         assert!(!without.contains("lean_floor_bps"), "{without}");
+    }
+
+    #[test]
+    fn the_rfq_panel_gate_is_read_only_and_exact_match() {
+        // Template ships locked, RFQ absent.
+        let v = read_settings(TEMPLATE).unwrap();
+        assert!(!v.rfq_panel_unlocked);
+        assert!(!v.rfq_enabled);
+        assert!(v.rfq_url.is_empty());
+        assert!(v.rfq_corridors.is_empty());
+
+        // The exact token unlocks; near-misses stay locked (fail closed).
+        let unlocked = format!("{TEMPLATE}\n[experimental]\nrfq_panel = \"enable-rfq-beta\"\n");
+        assert!(read_settings(&unlocked).unwrap().rfq_panel_unlocked);
+        for wrong in ["true", "1", "yes", "ENABLE-RFQ-BETA"] {
+            let toml = format!("{TEMPLATE}\n[experimental]\nrfq_panel = \"{wrong}\"\n");
+            assert!(
+                !read_settings(&toml).unwrap().rfq_panel_unlocked,
+                "{wrong:?} must not unlock"
+            );
+        }
+
+        // Read-only means read-only: a full round-trip save of the unlocked
+        // config leaves both new tables byte-identical — no patch field can
+        // touch them, and the file the operator wrote survives.
+        let view = read_settings(&unlocked).unwrap();
+        let out = apply_settings(&unlocked, &view.to_patch()).unwrap();
+        assert_eq!(out, unlocked, "the gate must survive a save untouched");
+    }
+
+    #[test]
+    fn rfq_state_surfaces_read_only_through_the_view() {
+        // An enabled RFQ pool needs explicit capacity, so swap the template's
+        // "max" sentinels for hard numbers before opting the pool in.
+        let sized = TEMPLATE.replace("\"max\"", "\"1000000000000000000000\"");
+        let src = format!(
+            "{}\nrfq_corridor = \"cngn-usdt\"\n\n[rfq]\nenabled = true\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\nmaker_id = \"mk_x\"\nvalidation_contract = \"0x00000000000000000000000000000000000000aa\"\n",
+            sized.trim_end()
+        );
+        let v = read_settings(&src).unwrap();
+        assert!(v.rfq_enabled);
+        assert_eq!(v.rfq_url, "wss://api.textilecredit.com/v2/maker/stream");
+        assert_eq!(v.rfq_corridors, vec!["cngn-usdt".to_string()]);
+        assert!(!v.rfq_panel_unlocked, "showing [rfq] still needs the gate");
+
+        // A no-op save keeps the [rfq] block and the corridor intact.
+        let out = apply_settings(&src, &v.to_patch()).unwrap();
+        assert_eq!(out, src);
     }
 
     #[test]

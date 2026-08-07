@@ -29,6 +29,7 @@ pub mod net;
 pub mod panel;
 pub mod poster;
 pub mod quote;
+pub mod rfq;
 pub mod rpc;
 pub mod setup;
 pub mod signer;

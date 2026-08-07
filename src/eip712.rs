@@ -158,6 +158,47 @@ pub fn permit2_digest(o: &OrderParams, permit2: Address, chain_id: u64) -> B256 
     keccak256(&buf)
 }
 
+// --- Maker session auth (the RFQ venue's WebSocket challenge) ---
+
+/// The venue's session domain has NO chainId or verifyingContract — the
+/// signature authenticates a maker to an off-chain stream, not to a contract,
+/// and the LIVE/TEST split rides on the domain *name* the venue sends.
+const SESSION_DOMAIN_TYPE: &str = "EIP712Domain(string name,string version)";
+const MAKER_SESSION_TYPE: &str =
+    "MakerSession(string makerId,address signingAddress,bytes32 challenge,uint256 issuedAt)";
+const SESSION_DOMAIN_VERSION: &str = "1";
+
+/// EIP-712 digest of the venue's `MakerSession` challenge reply.
+///
+/// `domain_name` comes verbatim from the venue's challenge frame ("Textile
+/// Maker Session (LIVE)" / "(TEST)") so a signature for the test stream can
+/// never authenticate on the live one. `issued_at` is unix milliseconds.
+pub fn maker_session_digest(
+    domain_name: &str,
+    maker_id: &str,
+    signing_address: Address,
+    challenge: B256,
+    issued_at_ms: u64,
+) -> B256 {
+    let domain = hash_words(&[
+        b256_word(k(SESSION_DOMAIN_TYPE)),
+        b256_word(k(domain_name)),
+        b256_word(k(SESSION_DOMAIN_VERSION)),
+    ]);
+    let struct_hash = hash_words(&[
+        b256_word(k(MAKER_SESSION_TYPE)),
+        b256_word(k(maker_id)),
+        addr_word(signing_address),
+        b256_word(challenge),
+        u256_word(U256::from(issued_at_ms)),
+    ]);
+    let mut buf = Vec::with_capacity(66);
+    buf.extend_from_slice(&[0x19, 0x01]);
+    buf.extend_from_slice(&domain.0);
+    buf.extend_from_slice(&struct_hash.0);
+    keccak256(&buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +258,98 @@ mod tests {
         let mut o3 = o.clone();
         o3.output_amount = o.output_amount + U256::from(1u64);
         assert_ne!(order_hash(&o), order_hash(&o3));
+    }
+
+    #[test]
+    fn maker_session_digest_matches_the_venue_golden_vector() {
+        // Golden vector from the venue's own implementation. Signing this
+        // digest with 0x59c6…690d recovers 0x7099…79C8, which the session
+        // test below asserts end to end.
+        let digest = maker_session_digest(
+            "Textile Maker Session (LIVE)",
+            "mk_golden",
+            address!("1111111111111111111111111111111111111111"),
+            b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+            1_754_388_000_000,
+        );
+        assert_eq!(
+            digest,
+            b256!("7eeb5f513a7b151fa336a782fe00fce66bc6e64e832b8d5bf34222d2e939f863")
+        );
+    }
+
+    #[test]
+    fn maker_session_signature_recovers_the_golden_signer() {
+        use crate::signer::{recover_address, sign_digest};
+        use k256::ecdsa::SigningKey;
+
+        let digest = maker_session_digest(
+            "Textile Maker Session (LIVE)",
+            "mk_golden",
+            address!("1111111111111111111111111111111111111111"),
+            b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+            1_754_388_000_000,
+        );
+        let key = SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let sig = sign_digest(&key, digest).unwrap();
+        assert_eq!(
+            alloy_primitives::hex::encode_prefixed(sig),
+            "0xf54e7f8081b26a1a7fcf19e57fefbac1782b07e1bb526f9d5f51cc1b39dc90ed1dded868fbde13bea3e9df9b605566772b1f6c98278fc1cc2b10aac49ba882bf1c"
+        );
+        assert_eq!(
+            recover_address(digest, &sig).unwrap(),
+            address!("70997970C51812dc3A010C7d01b50e0d17dc79C8")
+        );
+    }
+
+    #[test]
+    fn session_digest_binds_the_live_test_split_and_every_field() {
+        let base = || {
+            maker_session_digest(
+                "Textile Maker Session (LIVE)",
+                "mk_golden",
+                address!("1111111111111111111111111111111111111111"),
+                b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+                1_754_388_000_000,
+            )
+        };
+        // A TEST-domain signature must never validate on LIVE.
+        assert_ne!(
+            base(),
+            maker_session_digest(
+                "Textile Maker Session (TEST)",
+                "mk_golden",
+                address!("1111111111111111111111111111111111111111"),
+                b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+                1_754_388_000_000,
+            )
+        );
+        assert_ne!(
+            base(),
+            maker_session_digest(
+                "Textile Maker Session (LIVE)",
+                "mk_other",
+                address!("1111111111111111111111111111111111111111"),
+                b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+                1_754_388_000_000,
+            )
+        );
+        assert_ne!(
+            base(),
+            maker_session_digest(
+                "Textile Maker Session (LIVE)",
+                "mk_golden",
+                address!("1111111111111111111111111111111111111111"),
+                b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+                1_754_388_000_001,
+            )
+        );
     }
 
     #[test]

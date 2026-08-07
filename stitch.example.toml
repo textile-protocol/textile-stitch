@@ -108,6 +108,26 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # limit_taker_min_profit_debt = "50000"  # skip fills clearing < 0.05 USDC (6dp)
 # limit_taker_max_orders = 10            # per executeBatch
 
+# ----- RFQ responder (dual-run pilot, off by default). WARNING: leave this
+# commented out unless the venue has onboarded your maker id — enabling it
+# signs firm, taker-bound orders against your funded wallet. The ladder above
+# keeps running unchanged either way. The maker API key is never in this file;
+# it comes from the env var named by api_key_env. Each participating [[pools]]
+# block also needs `rfq_corridor = "<venue slug>"` and explicit (non-"max")
+# liquidity amounts, since the responder reserves in-flight quotes against a
+# fixed capacity.
+# [rfq]
+# enabled = false                                        # master kill switch
+# url = "wss://api.textilecredit.com/v2/maker/stream"
+# maker_id = "mk_your_maker_id"
+# api_key_env = "STITCH_RFQ_API_KEY"                     # env var holding the maker API key
+# validation_contract = "0x0000000000000000000000000000000000000000"  # PreferredFillerValidation (per chain)
+
+# ----- Experimental gates (off by default). Raw tokens read by the panel;
+# nothing here changes trading behavior. Leave unset unless instructed.
+# [experimental]
+# rfq_panel = ""                    # panel-only display gate for the RFQ beta card
+
 # ----- Signer / wallet backend. Omit this whole section to use the local
 # hotwallet (the default, unchanged): the bot signs with STITCH_PRIVATE_KEY /
 # STITCH_PRIVATE_KEY_FILE from the environment. Set [signer] to use an MPC wallet

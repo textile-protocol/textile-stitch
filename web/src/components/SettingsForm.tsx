@@ -204,6 +204,8 @@ export default function SettingsForm({
         onChange={set}
       />
 
+      {loaded.rfqPanelUnlocked && <RfqBetaCard settings={loaded} />}
+
       {error && <Banner tone="danger">{error}</Banner>}
 
       <div className="sticky bottom-4 flex items-center gap-3 rounded-xl border border-line-soft bg-surface p-3">
@@ -536,6 +538,38 @@ function ExperimentalSubsection({
       </header>
       {children}
     </section>
+  )
+}
+
+/**
+ * Read-only status for the RFQ responder beta. Rendered ONLY when the config's
+ * [experimental] gate unlocks it — with the gate off this component never
+ * mounts and the page is pixel-identical to a build without it. Deliberately
+ * no controls: the [rfq] block is edited by hand (Raw config tab), never here.
+ */
+function RfqBetaCard({ settings }: { settings: Settings }) {
+  return (
+    <Card title="RFQ (beta)">
+      <div className="space-y-3">
+        <p className="text-xs text-faint">
+          Dual-run pilot: the bot answers the venue&apos;s private quote
+          requests beside the public ladder. Configured in stitch.toml under
+          [rfq]; this card is informational only.
+        </p>
+        <dl className="grid gap-x-4 gap-y-2 text-sm sm:grid-cols-[auto_1fr]">
+          <dt className="text-faint">State</dt>
+          <dd>{settings.rfqEnabled ? 'Enabled' : 'Disabled'}</dd>
+          <dt className="text-faint">Corridors</dt>
+          <dd>
+            {settings.rfqCorridors.length > 0
+              ? settings.rfqCorridors.join(', ')
+              : '—'}
+          </dd>
+          <dt className="text-faint">Stream</dt>
+          <dd className="break-all">{settings.rfqUrl || '—'}</dd>
+        </dl>
+      </div>
+    </Card>
   )
 }
 

@@ -149,6 +149,15 @@ pub struct SettingsBody {
     /// Whether saving will be accepted. False for a bot whose config the panel can
     /// see but not write.
     pub editable: bool,
+    // ----- RFQ (beta), all read-only. Like `editable`, none of these exist in
+    // `SettingsUpdate`: the gate and the [rfq] block can't be written from the
+    // panel — the spec forbids a form control for them. -----
+    /// True only when the config's `[experimental].rfq_panel` is exactly the
+    /// beta token; gates the read-only RFQ card. Fail closed.
+    pub rfq_panel_unlocked: bool,
+    pub rfq_enabled: bool,
+    pub rfq_url: String,
+    pub rfq_corridors: Vec<String>,
 }
 
 impl SettingsBody {
@@ -175,6 +184,10 @@ impl SettingsBody {
             lean_base_bps: v.lean_base_bps.clone(),
             lean_wide_bps: v.lean_wide_bps.clone(),
             editable,
+            rfq_panel_unlocked: v.rfq_panel_unlocked,
+            rfq_enabled: v.rfq_enabled,
+            rfq_url: v.rfq_url.clone(),
+            rfq_corridors: v.rfq_corridors.clone(),
         }
     }
 }
@@ -980,6 +993,38 @@ mod tests {
         assert!(v["ttlSecs"].as_u64().unwrap() > 0);
         // Present even when the operator hasn't touched it — templates set it.
         assert!(v["refreshThresholdBps"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn rfq_panel_fields_default_locked_and_ignore_write_attempts() {
+        let h = harness("settings-rfq-gate");
+        seed(&h, "bot-a");
+        let (status, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        // Templates never ship the gate or an [rfq] block: locked, disabled.
+        assert_eq!(v["rfqPanelUnlocked"], false);
+        assert_eq!(v["rfqEnabled"], false);
+        assert_eq!(v["rfqUrl"], "");
+        assert_eq!(v["rfqCorridors"], serde_json::json!([]));
+
+        // A PATCH trying to flip the gate is silently dropped — there is no
+        // SettingsUpdate field for it, by design. The save itself succeeds
+        // (unknown keys are ignored) and the gate stays locked.
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "rfqPanelUnlocked": true, "rfqEnabled": true, "ttlSecs": 90 }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["rfqPanelUnlocked"], false);
+        assert_eq!(v["settings"]["rfqEnabled"], false);
+        assert_eq!(v["settings"]["ttlSecs"], 90, "the legitimate edit lands");
+        // And the file on disk gained no gate either.
+        let toml = std::fs::read_to_string(h.root.join("bot-a").join("stitch.toml")).unwrap();
+        assert!(!toml.contains("rfq"), "no rfq keys may appear from a save");
     }
 
     #[tokio::test]
