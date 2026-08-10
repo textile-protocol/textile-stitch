@@ -52,6 +52,20 @@ export function formatTimestamp(unix: number | null | undefined): string {
   }).format(new Date(unix * 1000))
 }
 
+/**
+ * An RFC 3339 timestamp as a locale date, or a dash.
+ *
+ * Separate from [`formatTimestamp`] because the source is different: this one
+ * comes from a registry / commit record as a string, and an unparseable value
+ * has to read as "unknown" rather than as `Invalid Date`.
+ */
+export function formatDate(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const at = new Date(iso)
+  if (Number.isNaN(at.getTime())) return '—'
+  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(at)
+}
+
 /** A duration in seconds, as the shortest sensible unit. */
 export function formatSeconds(secs: number): string {
   if (secs < 60) return `${secs}s`

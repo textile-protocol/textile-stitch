@@ -439,7 +439,8 @@ it; the compose export is there for when you want to go back.
 | Permit2 approve | `docker compose run --rm bot1 stitch approve …` | Approve allowances, output streamed |
 | Dry run | same, with `--dry-run` | Dry run button |
 | Logs | `docker compose logs -f bot1` | live tail with level colouring |
-| Upgrade a bot | edit the image tag, `up -d` | **Update** when a newer digest is available (pulls `STITCH_PANEL_BOT_IMAGE` and recreates that bot). **Recreate** still rebuilds on the configured image for recovery. |
+| Upgrade a bot | edit the image tag, `up -d` | **Update** when a newer digest is available (pulls `STITCH_PANEL_BOT_IMAGE` and recreates that bot). **Recreate** rebuilds on the configured image for recovery, keeping a pinned bot's own build. |
+| Downgrade a bot | edit the image tag back, `up -d` | **Tools → Roll back** — pick one of the last 10 published builds |
 | Upgrade the panel | `docker compose pull && up -d` | **Update panel** in the header when a newer `textile-stitch-panel` digest is published |
 
 **Approve needs the operator wallet to itself.** It runs in a throwaway container
@@ -623,7 +624,10 @@ image and of its own panel image. Results are cached for about 15 minutes; pass
   Config and key stay on disk. Expect a brief gap in quoting. If the bot still
   uses the flat layout, migrate first so the nonce ledger isn't lost on recreate.
 - **Recreate** is the same Docker action without the "you're behind" nudge — use
-  it for recovery (missing container, stuck state).
+  it for recovery (missing container, stuck state). It rebuilds on
+  `STITCH_PANEL_BOT_IMAGE`, except for a bot already pinned to one build of that
+  repository (a `sha-*` / digest ref, or a rollback), which keeps its own image —
+  recovering a stuck container must not quietly move it onto another release.
 - **Update panel** pulls a newer `textile-stitch-panel` image (pinned `sha-*`
   tags resolve to `:latest` of the same repo) and schedules a self-recreate via a
   short-lived helper on the Docker socket. The UI disconnects briefly; bots keep
@@ -632,6 +636,39 @@ image and of its own panel image. Results are cached for about 15 minutes; pass
 
 Offline or private registries that reject anonymous pulls soft-fail: the UI
 simply doesn't show an update, rather than erroring the fleet page.
+
+### Rolling back a bot
+
+**Tools → Roll back to an earlier version** lists the ten most recent published
+builds of `STITCH_PANEL_BOT_IMAGE`'s repository with the commit date and subject
+behind each. Picking one recreates that bot on it — the same Docker action as
+Update, aimed backwards.
+
+The order comes from the commits behind the tags, not from the registry's tag
+list (the Distribution spec orders that lexically, which for `sha-<hex>` means
+nothing). That needs the image to be published from a public GitHub repository
+of the same name — true for `ghcr.io/textile-protocol/textile-stitch`. Where it
+isn't, the panel says so on the card and drops the "newest" marker rather than
+claiming an order it can't stand behind.
+
+Read this before using it:
+
+- It runs older code. Every fix published since that build goes with it,
+  security ones included. It's for getting out from under a bad release, not for
+  staying put.
+- **The config is not rolled back.** `stitch.toml` keeps whatever it says today,
+  so a build that predates a setting in it will refuse to start. Watch the logs
+  straight after.
+- The bot pins to that exact tag and stops picking up releases until you press
+  Update again. Recreate keeps the pin, so recovering a stuck container won't
+  put the release you just left back on.
+- Only per-commit `sha-…` tags are offered. Channel tags like `latest` move on
+  the next release, so pinning to one wouldn't be a pin — the API refuses them.
+- Flat-layout bots are refused: the recreate would drop the in-container nonce
+  ledger and leave live orders on the book with nothing able to replace them.
+  Migrate first.
+- Desktop (process runtime) has no per-bot image, so there's nothing to roll
+  back — install an earlier release from the menu bar instead.
 
 ## Hardening, once it works
 

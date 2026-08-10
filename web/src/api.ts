@@ -8,6 +8,7 @@
 import type {
   ActionResult,
   Bot,
+  BotVersions,
   Corridor,
   CreateBotResult,
   Fleet,
@@ -180,6 +181,21 @@ export const api = {
   recreate: (name: string) => act(name, 'recreate'),
   /** Pull the panel bot image and recreate this bot on it. */
   updateBot: (name: string) => act(name, 'update'),
+
+  /** The published builds this bot could be rolled back to, newest first. */
+  botVersions: (name: string) =>
+    request<BotVersions>(`/api/bots/${encodeURIComponent(name)}/versions`),
+
+  /**
+   * Recreate this bot on an earlier published build. `tag` names one exact
+   * version (`sha-…`); the repository is the panel's own, so a client picks a
+   * version and never an image.
+   */
+  rollback: (name: string, tag: string) =>
+    request<ActionResult>(
+      `/api/bots/${encodeURIComponent(name)}/rollback`,
+      json({ tag }),
+    ),
 
   // `acceptLedgerLoss` is for the second attempt only. The first rolls back when
   // the old container's nonce ledger can't be read, so a transient daemon error

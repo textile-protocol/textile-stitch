@@ -16,7 +16,8 @@ use super::logs;
 use super::{ApiError, AppState};
 use crate::panel::docker::{ContainerState, STOP_GRACE_SECS};
 use crate::panel::inventory::{Bot, ConfigSummary, Fleet, Layout, WalletId, Warning};
-use crate::panel::{compose, migrate, provision};
+use crate::panel::versions::{PublishedVersion, ROLLBACK_CHOICES};
+use crate::panel::{compose, migrate, provision, PanelRuntime};
 use crate::setup::{self, SignerSetup};
 
 /// One bot, as the UI sees it.
@@ -733,7 +734,217 @@ pub async fn update(
         .unwrap_or_else(|| state.cfg.bot_image.clone());
     // Strict pull: Update must not fall back to a stale cached tag the way
     // recovery Recreate does when an unauthenticated refresh fails.
-    recreate_on_image(state, name, image, true).await
+    recreate_on_image(state, name, image, Rebuild::Update).await
+}
+
+/// The published builds this bot could be rolled back to.
+///
+/// Newest first when the commits behind the tags could be read; see
+/// [`VersionOrdering`](crate::panel::versions::VersionOrdering) for what the reply
+/// says when they couldn't.
+///
+/// Answers even when the rollback itself is refused: the picker shows the reason
+/// beside a disabled list rather than making the operator click to find out.
+pub async fn versions(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let bot = state.bot(&name).await?;
+    let blocked = rollback_check(&state, &bot).await.err();
+
+    // Process runtime has no per-bot image, so there is nothing to list and no
+    // reason to ask a registry about it.
+    let listed = if state.cfg.runtime == PanelRuntime::Process {
+        Ok(Vec::new())
+    } else {
+        crate::panel::versions::list_published(&state.cfg.bot_image, ROLLBACK_CHOICES).await
+    };
+    let (published, listing_error) = match listed {
+        Ok(v) => (v, None),
+        // A registry the panel can't read is a missing feature, not a broken
+        // page: the rest of the detail screen still works.
+        Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+    };
+
+    // Key off the running image id, like the update check: a mutable tag
+    // resolves to whatever was pulled last, which may not be what this
+    // container started from.
+    let local_digests = match bot
+        .image_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .or(bot.image.as_deref())
+    {
+        Some(lookup) => state
+            .docker
+            .local_image_digests(lookup)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let versions: Vec<VersionBody> = published
+        .into_iter()
+        .map(|version| VersionBody {
+            current: crate::panel::versions::is_current(
+                &version,
+                &local_digests,
+                bot.image.as_deref(),
+            ),
+            version,
+        })
+        .collect();
+
+    Ok(Json(VersionsBody {
+        can_roll_back: blocked.is_none() && !versions.is_empty(),
+        blocked_reason: blocked,
+        listing_error,
+        current_image: bot.image.clone(),
+        ordering: crate::panel::versions::ordering_of(
+            &versions
+                .iter()
+                .map(|v| v.version.clone())
+                .collect::<Vec<_>>(),
+        ),
+        versions,
+    })
+    .into_response())
+}
+
+/// One published build in the rollback picker.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionBody {
+    #[serde(flatten)]
+    version: PublishedVersion,
+    /// This is the build the container is on now.
+    current: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionsBody {
+    /// Empty when the registry couldn't be listed. Newest first only when
+    /// `ordering` says so.
+    versions: Vec<VersionBody>,
+    /// What the order of `versions` is worth — the UI must not call the first
+    /// row the newest when nothing could place it.
+    ordering: crate::panel::versions::VersionOrdering,
+    current_image: Option<String>,
+    can_roll_back: bool,
+    /// Why a rollback would be refused, when it would.
+    blocked_reason: Option<String>,
+    /// Why the list is empty, when asking the registry failed.
+    listing_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackBody {
+    /// Registry tag of the published build to go back to, e.g. `sha-14cd877`.
+    /// The repository is the panel's own — a caller chooses a version, never an
+    /// image.
+    pub tag: String,
+}
+
+/// Recreate this bot on an earlier published build.
+///
+/// The inverse of [`update`], and deliberately the same machinery: pull the
+/// chosen reference, then rebuild the container from the config already on disk.
+/// The config is *not* rolled back with it — it is the operator's, not the
+/// release's — so an older binary meets whatever `stitch.toml` says today. That
+/// is the risk the UI warns about, and the reason the reply says to watch the
+/// logs.
+pub async fn rollback(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<RollbackBody>,
+) -> Result<Response, ApiError> {
+    let tag = body.tag.trim().to_string();
+    crate::panel::versions::check_rollback_tag(&tag).map_err(ApiError::bad_request)?;
+
+    let bot = state.bot(&name).await?;
+    rollback_check(&state, &bot)
+        .await
+        .map_err(ApiError::conflict)?;
+
+    let image = crate::panel::versions::rollback_image(&state.cfg.bot_image, &tag)
+        .ok_or_else(|| ApiError::conflict(no_registry_path(&state.cfg.bot_image)))?;
+    if bot.image.as_deref() == Some(image.as_str()) {
+        return Err(ApiError::conflict(format!(
+            "{name} already runs {image}, so there is nothing to roll back to."
+        )));
+    }
+
+    recreate_on_image(state, name, image, Rebuild::Rollback).await
+}
+
+fn no_registry_path(configured: &str) -> String {
+    format!(
+        "{configured} has no registry path, so the panel can't pull another version of it — \
+         point STITCH_PANEL_BOT_IMAGE at ghcr.io/textile-protocol/textile-stitch."
+    )
+}
+
+/// Whether this bot can be moved onto a chosen published build right now.
+///
+/// One function for both sides: [`versions`] shows the reason next to a disabled
+/// picker and [`rollback`] refuses with it, so the button and the API can't
+/// disagree about what is allowed. [`recreate_on_image`] re-checks the ledger and
+/// channel rules itself — this is the readable refusal, not the guard.
+async fn rollback_check(state: &AppState, bot: &Bot) -> Result<(), String> {
+    if state.cfg.runtime == PanelRuntime::Process {
+        return Err(format!(
+            "this panel supervises bots as local processes, which all run the installed stitch \
+             binary — {} has no image of its own to roll back. Install an earlier release from \
+             the Stitch menu bar (or system tray) instead.",
+            bot.name
+        ));
+    }
+    if let Err(e) = super::require_editable(bot) {
+        return Err(e.message);
+    }
+    // Before the directory check, not after: a flat-layout bot's config sits in
+    // the bots root itself, so the path comparison below would refuse it with a
+    // message naming the same directory twice. The ledger is the real reason.
+    if bot.layout == Layout::FlatFiles {
+        return Err(format!(
+            "{} still uses the flat file layout, so its slot-nonce ledger lives inside the \
+             container. Rolling back recreates that container and would throw the ledger away, \
+             leaving live orders on the book that the bot can't replace. Migrate first.",
+            bot.name
+        ));
+    }
+    let Some(dir) = bot.config_dir() else {
+        return Err(format!("{} has no config directory.", bot.name));
+    };
+    if dir != state.cfg.bot_dir(&bot.name) {
+        return Err(format!(
+            "{}'s config is at {}, not under {}. Migrate it to the per-bot directory layout \
+             first, or roll it back from your own compose file.",
+            bot.name,
+            dir.display(),
+            state.cfg.bots_dir.display()
+        ));
+    }
+    if !crate::panel::updates::bot_eligible_for_update(
+        bot.image.as_deref(),
+        bot.image_id.as_deref(),
+        &state.cfg.bot_image,
+        state.docker.as_ref(),
+        bot.origin == crate::panel::inventory::Origin::Panel,
+    )
+    .await
+    {
+        let current = bot.image.as_deref().unwrap_or("(unknown image)");
+        return Err(format!(
+            "{} runs {current}, which isn't on {}'s repository and tag channel. The panel only \
+             moves bots between builds it publishes — roll this one back from your own compose \
+             file.",
+            bot.name, state.cfg.bot_image
+        ));
+    }
+    Ok(())
 }
 
 /// Replace stitch.toml with a corridor preset, keeping the signer. Stops a
@@ -819,33 +1030,106 @@ pub struct CorridorBody {
 /// Recreate a bot's container from its config on disk, in the panel's layout.
 ///
 /// This is how a bot whose container was removed comes back, and how an operator
-/// picks up a new image tag. Uses `STITCH_PANEL_BOT_IMAGE` as configured (pins
-/// stay pins). Prefer [`update`] when the goal is "pull a newer publish".
+/// picks up a new image tag. Uses `STITCH_PANEL_BOT_IMAGE` as configured, except
+/// for a bot already pinned to one build — see [`recreate_image`]. Prefer
+/// [`update`] when the goal is "pull a newer publish".
 pub async fn recreate(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
     let image = state.cfg.bot_image.clone();
-    recreate_on_image(state, name, image, false).await
+    recreate_on_image(state, name, image, Rebuild::Recreate).await
 }
 
-/// Recreate onto a specific image reference (configured pin, or an Update target).
+/// The image a recovery Recreate rebuilds on.
 ///
-/// When `require_fresh` is set (Update), the registry pull must succeed — never
-/// fall back to a local copy. Recovery Recreate keeps the softer
+/// Normally the configured one. But a bot that was rolled back runs an earlier
+/// build deliberately, and Recreate is the button an operator reaches for when a
+/// container is stuck — quietly moving it back onto `STITCH_PANEL_BOT_IMAGE`'s
+/// channel there would reinstall the release they rolled away from, which is the
+/// one thing the rollback promised wouldn't happen. So a bot sitting on an
+/// immutable pin of the configured repository keeps it.
+///
+/// Same rule [`change_signer`] already follows, for the same reason: a rebuild
+/// that isn't about the image must not swap the trading binary underneath.
+///
+/// Everything else falls back to the configured image — a mutable channel (which
+/// is what "recreate on the current release" means anyway), a bare `sha256:…`
+/// id, another repository's image, or no readable image at all.
+///
+/// "Pinned" is [`is_pin_image_ref`](crate::panel::updates::is_pin_image_ref)'s
+/// definition, the same one `/api/updates` uses to decide a bot may leave a pin,
+/// so the two can't disagree about what a pin is.
+fn recreate_image(current: Option<&str>, configured: &str) -> String {
+    let pinned = current.is_some_and(|image| {
+        // `same_image_repository` also keeps bare `sha256:…` ids out: a content
+        // id carries no repository, so nothing proves it belongs to our channel.
+        crate::panel::updates::is_pin_image_ref(image)
+            && crate::panel::updates::same_image_repository(image, configured)
+    });
+    match (pinned, current) {
+        (true, Some(image)) => image.to_string(),
+        _ => configured.to_string(),
+    }
+}
+
+/// Why a bot's container is being rebuilt.
+///
+/// Recovery Recreate uses the configured image and tolerates a cached copy of
+/// it. Update and Roll back both move the bot onto a *published* reference, so
+/// both demand a successful pull and both refuse the layouts and channels where
+/// replacing the container would lose the nonce ledger or land on someone
+/// else's image. Only the wording differs, and it differs in every refusal an
+/// operator reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    Recreate,
+    Update,
+    Rollback,
+}
+
+impl Rebuild {
+    /// The pull must succeed — never fall back to a stale local tag.
+    fn require_fresh(self) -> bool {
+        !matches!(self, Rebuild::Recreate)
+    }
+
+    /// How refusals and confirmations name the action.
+    fn label(self) -> &'static str {
+        match self {
+            Rebuild::Recreate => "Recreate",
+            Rebuild::Update => "Update",
+            Rebuild::Rollback => "Roll back",
+        }
+    }
+}
+
+/// Recreate onto a specific image reference (configured pin, an Update target,
+/// or an earlier published build).
+///
+/// For anything but recovery Recreate the registry pull must succeed — never
+/// fall back to a local copy. Recreate keeps the softer
 /// [`DockerApi::ensure_image`] refresh path so a private image pulled by hand
 /// still comes back when the daemon can't re-authenticate.
 async fn recreate_on_image(
     state: AppState,
     name: String,
     image: String,
-    require_fresh: bool,
+    rebuild: Rebuild,
 ) -> Result<Response, ApiError> {
+    let require_fresh = rebuild.require_fresh();
     // Config lock held across the whole recreate: the signer is read from the config
     // dir and the wallet is claimed from it, so a save that moved the config mid-recreate
     // would launch a container whose signer and claim disagree. `_config` lives to the
     // end of the handler.
     let (_config, bot) = lock_config(&name, &state).await?;
+    // Recovery keeps a pinned bot on its build; Update and Roll back were handed
+    // the exact reference they mean. Decided here rather than in the handler so
+    // it reads the snapshot the lock protects.
+    let image = match rebuild {
+        Rebuild::Recreate => recreate_image(bot.image.as_deref(), &image),
+        Rebuild::Update | Rebuild::Rollback => image,
+    };
     super::require_editable(&bot)?;
     let dir = bot
         .config_dir()
@@ -861,14 +1145,16 @@ async fn recreate_on_image(
             state.cfg.bots_dir.display()
         )));
     }
-    // Update recreates without migrating. Flat layout keeps the slot-nonce ledger
-    // inside the container, so a recreate drops it and live orders can collide.
-    // The UI already hides the button; refuse the API too (stale clients / curl).
+    // Update and Roll back rebuild without migrating. Flat layout keeps the
+    // slot-nonce ledger inside the container, so a recreate drops it and live
+    // orders can collide. The UI already hides the button; refuse the API too
+    // (stale clients / curl).
     if require_fresh && bot.layout == Layout::FlatFiles {
         return Err(ApiError::conflict(format!(
             "{name} still uses the flat file layout. Migrate it to the per-bot directory \
-             layout first — Update recreates the container and would drop the in-container \
-             nonce ledger."
+             layout first — {} recreates the container and would drop the in-container \
+             nonce ledger.",
+            rebuild.label()
         )));
     }
     // Same gate as /api/updates: wrong repo or tag channel (fork, :canary vs
@@ -888,12 +1174,13 @@ async fn recreate_on_image(
     {
         let current = bot.image.as_deref().unwrap_or("(unknown image)");
         return Err(ApiError::conflict(format!(
-            "{name} runs {current}, which is not on the update channel for {}. Update \
-             only refreshes bots on STITCH_PANEL_BOT_IMAGE's repository and tag \
+            "{name} runs {current}, which is not on the update channel for {}. {} \
+             only moves bots on STITCH_PANEL_BOT_IMAGE's repository and tag \
              channel (same-repo sha-* / digest pins may move to the resolved \
              target) — recreate it from your own compose file, or change \
              STITCH_PANEL_BOT_IMAGE.",
-            state.cfg.bot_image
+            state.cfg.bot_image,
+            rebuild.label()
         )));
     }
 
@@ -917,27 +1204,30 @@ async fn recreate_on_image(
         &bot,
         &dir,
         &image,
-        require_fresh,
+        rebuild,
         restart_after,
         wallet,
     )
     .await?;
 
     crate::panel::updates::clear_cache();
-    tracing::info!(bot = %name, %image, "recreated");
-    action_response(
-        &state,
-        &name,
-        Some(format!(
-            "{name} was recreated on {image}{}.",
-            if restart_after {
-                " and started"
-            } else {
-                " and left stopped, because it wasn't up before"
-            }
-        )),
-    )
-    .await
+    tracing::info!(bot = %name, %image, action = rebuild.label(), "recreated");
+    let ending = if restart_after {
+        " and started"
+    } else {
+        " and left stopped, because it wasn't up before"
+    };
+    let message = match rebuild {
+        // Say the pin out loud. An operator who rolls back and forgets will
+        // otherwise wonder why this bot stopped picking up releases.
+        Rebuild::Rollback => format!(
+            "{name} was rolled back to {image}{ending}. It stays on that version until you \
+             Update it again — Recreate keeps the pin — and its config was not rolled back \
+             with it, so watch its logs."
+        ),
+        _ => format!("{name} was recreated on {image}{ending}."),
+    };
+    action_response(&state, &name, Some(message)).await
 }
 
 /// Rebuild a bot's container from the config on disk *now*, in the panel's layout.
@@ -953,7 +1243,7 @@ async fn recreate_container(
     bot: &Bot,
     dir: &std::path::Path,
     image: &str,
-    require_fresh: bool,
+    rebuild: Rebuild,
     restart_after: bool,
     claim: Option<logs::WalletClaim>,
 ) -> Result<(), ApiError> {
@@ -963,15 +1253,16 @@ async fn recreate_container(
     // target for Update), not the one the bot is running.
     let spec = provision::bot_container_spec(&state.cfg, name, image, &signer, corridor.as_deref());
     provision::check_file_mounts(&spec.binds, &state.cfg).map_err(ApiError::conflict)?;
-    if require_fresh {
+    if rebuild.require_fresh() {
         state
             .docker
             .require_fresh_image(&spec.image)
             .await
             .map_err(|e| {
                 ApiError::internal(&e.context(format!(
-                    "pulling {image} for an Update — the bot was left on its current container \
-                     rather than recreating onto a possibly stale local copy"
+                    "{}: pulling {image} failed — the bot was left on its current container \
+                     rather than recreating onto a possibly stale local copy",
+                    rebuild.label()
                 )))
             })?;
     } else {
@@ -3134,6 +3425,234 @@ mod tests {
                 .any(|c| matches!(c, Call::Remove { .. })),
             "must not remove a flat-layout bot on Update: {:?}",
             h.docker.calls()
+        );
+    }
+
+    /// A running flat-layout bot whose config sits in its own panel directory,
+    /// so only the layout — not the config path — is what a caller trips over.
+    fn seed_flat_layout_bot(h: &Harness, name: &str) {
+        let dir = h.root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        std::fs::write(dir.join("stitch.toml"), corridor.toml_template).unwrap();
+        std::fs::write(dir.join("stitch.key"), super::super::testkit::TEST_KEY).unwrap();
+        let mut c = container(&format!("stitch-{name}"), ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), name.to_string());
+        c.mounts = vec![
+            crate::panel::docker::MountInfo {
+                source: dir.join("stitch.toml"),
+                destination: std::path::PathBuf::from("/home/stitch/run/stitch.toml"),
+                rw: false,
+            },
+            crate::panel::docker::MountInfo {
+                source: dir.join("stitch.key"),
+                destination: std::path::PathBuf::from("/home/stitch/run/stitch.key"),
+                rw: false,
+            },
+        ];
+        h.docker.add_container(c);
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_a_tag_that_doesnt_name_one_build() {
+        // `latest` moves on the next release, so pinning to it isn't a pin —
+        // and the operator meant Update anyway.
+        let h = harness("rollback-channel-tag");
+        seed_panel_bot(&h, "bot-a");
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/rollback",
+                serde_json::json!({ "tag": "latest" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Use Update"), "{body}");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Remove { .. })),
+            "a refused tag must not touch the container: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_a_flat_layout_bot() {
+        // Same reason as Update: the ledger is inside the container, and a
+        // rollback recreates it. Live orders would be left unreplaceable.
+        let h = harness("rollback-flat");
+        seed_flat_layout_bot(&h, "bot1");
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot1/rollback",
+                serde_json::json!({ "tag": "sha-14cd877" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("flat file layout"), "{body}");
+        assert_eq!(
+            h.docker.state_of("stitch-bot1"),
+            Some(ContainerState::Running),
+            "a refused rollback must leave the container alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_the_build_the_bot_already_runs() {
+        let h = super::super::testkit::harness_with_bot_image(
+            "rollback-same-build",
+            "ghcr.io/textile-protocol/textile-stitch:latest",
+        );
+        seed_panel_bot(&h, "bot-a");
+        h.docker.set_container_image(
+            "stitch-bot-a",
+            "ghcr.io/textile-protocol/textile-stitch:sha-14cd877",
+        );
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/rollback",
+                serde_json::json!({ "tag": "sha-14cd877" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("already runs"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn rollback_recreates_the_bot_on_the_chosen_build() {
+        let h = harness("rollback-ok");
+        seed_panel_bot(&h, "bot-a");
+        h.docker
+            .set_container_image("stitch-bot-a", h.state.cfg.bot_image.as_str());
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/rollback",
+                serde_json::json!({ "tag": "sha-14cd877" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = "ghcr.io/textile-protocol/textile-stitch:sha-14cd877";
+        assert!(body.contains("rolled back"), "{body}");
+        // The pin is the part operators forget, so the reply has to say it.
+        assert!(body.contains("stays on that version"), "{body}");
+        assert!(
+            h.docker.calls().iter().any(|c| matches!(
+                c,
+                Call::EnsureImage { image, refresh: true } if image == expected
+            )),
+            "rollback must pull the chosen build, got {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_keeps_the_container_when_the_chosen_build_cannot_be_pulled() {
+        // A tag that never existed, or a registry that's down: the bot must be
+        // left standing rather than removed and unable to come back.
+        let h = harness("rollback-nopull");
+        seed_panel_bot(&h, "bot-a");
+        h.docker
+            .set_container_image("stitch-bot-a", h.state.cfg.bot_image.as_str());
+        h.docker.fail_image("manifest unknown");
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/rollback",
+                serde_json::json!({ "tag": "sha-0000000" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("Roll back"), "{body}");
+        assert_eq!(
+            h.docker.state_of("stitch-bot-a"),
+            Some(ContainerState::Running)
+        );
+    }
+
+    #[test]
+    fn recovery_keeps_a_pinned_build_and_nothing_else() {
+        use super::recreate_image;
+        let configured = "ghcr.io/textile-protocol/textile-stitch:latest";
+        let pin = "ghcr.io/textile-protocol/textile-stitch:sha-14cd877";
+        // What a rollback leaves behind, and what an operator pins by hand.
+        assert_eq!(recreate_image(Some(pin), configured), pin);
+        assert_eq!(
+            recreate_image(
+                Some("ghcr.io/textile-protocol/textile-stitch@sha256:aaaa"),
+                configured
+            ),
+            "ghcr.io/textile-protocol/textile-stitch@sha256:aaaa"
+        );
+        // A channel is not a pin: recreating means "on the current release".
+        assert_eq!(recreate_image(Some(configured), configured), configured);
+        assert_eq!(
+            recreate_image(
+                Some("ghcr.io/textile-protocol/textile-stitch:canary"),
+                configured
+            ),
+            configured
+        );
+        // Nothing ties a bare content id or a fork to our channel.
+        assert_eq!(
+            recreate_image(Some("sha256:abcdef"), configured),
+            configured
+        );
+        assert_eq!(
+            recreate_image(Some("ghcr.io/acme/stitch-fork:sha-14cd877"), configured),
+            configured
+        );
+        assert_eq!(recreate_image(None, configured), configured);
+    }
+
+    #[tokio::test]
+    async fn recreate_keeps_a_rolled_back_bot_on_its_build() {
+        // The hole this closes: Recreate is the recovery button, and rebuilding
+        // a rolled-back bot on :latest would silently reinstall the release the
+        // operator rolled away from — while the UI promises the pin holds.
+        let h = super::super::testkit::harness_with_bot_image(
+            "recreate-keeps-pin",
+            "ghcr.io/textile-protocol/textile-stitch:latest",
+        );
+        seed_panel_bot(&h, "bot-a");
+        let pin = "ghcr.io/textile-protocol/textile-stitch:sha-14cd877";
+        h.docker.set_container_image("stitch-bot-a", pin);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/recreate", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = h.docker.create_specs();
+        let spec = created.last().expect("a replacement container was created");
+        assert_eq!(
+            spec.image, pin,
+            "recovery must not move a pinned bot onto the configured channel"
+        );
+        assert!(body.contains("sha-14cd877"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn versions_says_why_a_rollback_is_blocked_rather_than_failing() {
+        // The picker shows the reason beside a disabled list. A blocked bot
+        // still gets a 200 — the rest of the Tools tab has to keep working.
+        let h = harness("rollback-versions-blocked");
+        seed_flat_layout_bot(&h, "bot1");
+
+        let (status, body) = h.get("/api/bots/bot1/versions").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["canRollBack"], false, "{body}");
+        assert!(
+            v["blockedReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("flat file layout"),
+            "{body}"
         );
     }
 }

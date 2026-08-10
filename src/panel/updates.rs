@@ -484,7 +484,7 @@ pub async fn fetch_remote_digest(image: &str) -> Result<String> {
 }
 
 /// Host for the Docker Distribution HTTP API for a parsed image registry.
-fn distribution_api_host(registry: &str) -> &str {
+pub(super) fn distribution_api_host(registry: &str) -> &str {
     if registry == "docker.io" {
         "registry-1.docker.io"
     } else {
@@ -492,7 +492,7 @@ fn distribution_api_host(registry: &str) -> &str {
     }
 }
 
-async fn registry_token(
+pub(super) async fn registry_token(
     client: &reqwest::Client,
     registry: &str,
     repo: &str,

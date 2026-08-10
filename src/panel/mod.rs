@@ -28,6 +28,7 @@ pub mod migrate;
 pub mod naming;
 pub mod provision;
 pub mod updates;
+pub mod versions;
 
 pub use config::{AuthMode, PanelConfig, PanelRuntime};
 pub use docker::{DockerApi, STOP_GRACE_SECS};

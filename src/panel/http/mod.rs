@@ -265,6 +265,8 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/restart", post(bots::restart))
         .route("/api/bots/{name}/recreate", post(bots::recreate))
         .route("/api/bots/{name}/update", post(bots::update))
+        .route("/api/bots/{name}/versions", get(bots::versions))
+        .route("/api/bots/{name}/rollback", post(bots::rollback))
         .route("/api/bots/{name}/migrate", post(bots::migrate_layout))
         .route("/api/bots/{name}/settings", get(settings::show))
         .route("/api/bots/{name}/settings", patch(settings::update))

@@ -215,3 +215,40 @@ export interface UpdatesStatus {
   panel: ImageUpdateInfo
   bots: BotUpdateInfo[]
 }
+
+/** One published build, from GET /api/bots/{name}/versions. */
+export interface BotVersion {
+  /** Registry tag, e.g. `sha-14cd877`. */
+  tag: string
+  /** Full reference a rollback would recreate the bot on. */
+  image: string
+  digest: string | null
+  /** Commit timestamp (RFC 3339). Null when GitHub couldn't attribute the tag. */
+  publishedAt: string | null
+  /** Commit subject for that build. Same best-effort source as `publishedAt`. */
+  subject: string | null
+  /** The build the container is on right now. */
+  current: boolean
+}
+
+/**
+ * What a version list's order is worth.
+ *
+ * `commit` — ranked by the commit behind each tag, so it really is newest
+ * first. `registry` — nothing could be attributed (non-GHCR image, private
+ * repo, rate limit), so this is the registry's own tag order, which the
+ * Distribution spec says is lexical: a set of builds, not a ranking.
+ */
+export type VersionOrdering = 'commit' | 'registry'
+
+export interface BotVersions {
+  /** At most 10. Newest first only when `ordering` is `commit`. */
+  versions: BotVersion[]
+  ordering: VersionOrdering
+  currentImage: string | null
+  canRollBack: boolean
+  /** Why a rollback would be refused — shown instead of the picker. */
+  blockedReason: string | null
+  /** Why the list is empty, when asking the registry failed. */
+  listingError: string | null
+}

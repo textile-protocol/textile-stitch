@@ -16,6 +16,7 @@ import LogViewer from '../components/LogViewer'
 import OneShotRunner from '../components/OneShotRunner'
 import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
+import VersionRollback from '../components/VersionRollback'
 import { formatTimestamp, shortAddress, shortImage } from '../format'
 import type { Bot, MigrationResult, UpdatesStatus } from '../types'
 
@@ -394,15 +395,31 @@ export default function BotDetail() {
       )}
 
       {tab === 'tools' && (
-        <Card title="One-off runs">
-          <OneShotRunner
-            bot={bot.name}
-            canApprove={bot.canApprove}
-            approveBlockedReason={bot.approveBlockedReason}
-            highlightPermit2={showPermit2Banner}
-            onApproved={() => setShowPermit2Banner(false)}
-          />
-        </Card>
+        <>
+          <Card title="One-off runs">
+            <OneShotRunner
+              bot={bot.name}
+              canApprove={bot.canApprove}
+              approveBlockedReason={bot.approveBlockedReason}
+              highlightPermit2={showPermit2Banner}
+              onApproved={() => setShowPermit2Banner(false)}
+            />
+          </Card>
+          {/*
+            Last, and after the one-off runs: it's the recovery tool for a bad
+            release, not something to reach for on the way past.
+          */}
+          <Card title="Roll back to an earlier version">
+            <VersionRollback
+              bot={bot}
+              onRolledBack={(message) => {
+                setNote(message)
+                void load()
+                void loadUpdates()
+              }}
+            />
+          </Card>
+        </>
       )}
     </div>
   )
