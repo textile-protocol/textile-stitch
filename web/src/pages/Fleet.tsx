@@ -143,12 +143,6 @@ export default function Fleet() {
           ))}
         </ul>
       )}
-
-      <p className="text-xs text-faint">
-        New bots run{' '}
-        <code title={data.botImage}>{shortImage(data.botImage)}</code>. Configs
-        live in <code>{data.botsDir}</code>.
-      </p>
     </div>
   )
 }

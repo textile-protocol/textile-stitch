@@ -68,6 +68,7 @@ export default function App() {
         theme={theme}
         onTheme={setTheme}
         onSignedOut={() => void refresh()}
+        onPanelUpdated={() => void refresh()}
       />
       <main className="mx-auto max-w-5xl px-6 py-8">
         <Routes>
@@ -77,6 +78,9 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
+      <footer className="mx-auto max-w-5xl px-6 pb-8 text-xs text-faint">
+        Stitch v{session.version}
+      </footer>
     </div>
   )
 }
@@ -86,11 +90,14 @@ function Header({
   theme,
   onTheme,
   onSignedOut,
+  onPanelUpdated,
 }: {
   session: SessionInfo
   theme: Theme
   onTheme: (t: Theme) => void
   onSignedOut: () => void
+  /** Re-read the session once the panel is back, so the footer version refreshes. */
+  onPanelUpdated: () => void
 }) {
   const { pathname } = useLocation()
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
@@ -143,6 +150,10 @@ function Header({
           }
           setPanelNote('Panel is back on the new image.')
           setUpdates(await api.updates(true))
+          // The restart loop above threw away every session() it polled, so the
+          // parent still holds the pre-update version. Re-read it now that we're
+          // on the new image, or the footer keeps showing the old one until reload.
+          onPanelUpdated()
           setPanelBusy(false)
           return
         } catch {

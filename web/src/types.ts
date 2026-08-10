@@ -141,6 +141,8 @@ export interface SessionInfo {
   tailnetLogin: boolean
   /** How the panel supervises bots. Desktop uses `process` (no Docker socket). */
   runtime: PanelRuntime
+  /** The panel binary's version, e.g. `0.1.0`. */
+  version: string
 }
 
 export interface ActionResult {

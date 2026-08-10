@@ -34,6 +34,8 @@ pub struct SessionBody {
     /// The login screen uses this to show a Docker-socket warning only when it
     /// applies.
     runtime: &'static str,
+    /// The panel binary's own version, so the UI can show what it's running.
+    version: &'static str,
 }
 
 fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
@@ -44,6 +46,7 @@ fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
         tailnet_login: state.cfg.trust_identity_header
             && !state.cfg.auth.allowed_users().is_empty(),
         runtime: state.cfg.runtime.as_str(),
+        version: env!("CARGO_PKG_VERSION"),
     }
 }
 
