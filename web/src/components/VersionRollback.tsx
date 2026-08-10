@@ -59,9 +59,10 @@ export default function VersionRollback({
   if (!data) return <Loading what="published versions" />
 
   const { versions } = data
-  // Only a commit-ranked list is newest first. Without that, position carries no
-  // meaning at all, so nothing below may read anything into it — no "newest"
-  // badge, and no telling the operator which way along the list they're moving.
+  // Only a fully commit-ranked list is newest first. One row nothing could place
+  // is enough to sink it — it sorts last but could be the newest build there is —
+  // so nothing below may read meaning into position: no "newest" badge, and no
+  // telling the operator which way along the list they're moving.
   const ranked = data.ordering === 'commit'
   const currentIndex = versions.findIndex((v) => v.current)
   const selected = versions.find((v) => v.tag === chosen) ?? null
@@ -177,7 +178,16 @@ export default function VersionRollback({
             ))}
           </ul>
 
-          {!ranked && (
+          {data.ordering === 'partial' && (
+            <Banner tone="warning">
+              The undated builds below couldn&apos;t be placed — built off another
+              branch, or older than the last hundred commits. They&apos;re listed
+              last, but any of them could be newer than the dated ones above, so
+              this isn&apos;t a ranking. Check a tag against your own build history
+              before rolling back to it.
+            </Banner>
+          )}
+          {data.ordering === 'registry' && (
             <Banner tone="warning">
               These aren&apos;t in any particular order. Nothing could say when they
               were built — the image isn&apos;t published from a public GitHub

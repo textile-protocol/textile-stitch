@@ -10,11 +10,11 @@
 //! API, which wants a token even for a public image — says which build is newer
 //! and what it changed. The registry's own tag list can't: the Distribution spec
 //! orders it lexically, and lexical order over `sha-<hex>` is in effect random.
-//! Where that lookup isn't available (a private repo, a rate limit, a registry
-//! that isn't GHCR) the list degrades to bare hashes in the registry's own
-//! order. Rolling back to one still works — a target is just a tag — but the
-//! order then means nothing, so the reply says as much and the picker stops
-//! calling its first row the newest. See [`VersionOrdering`].
+//! Where that lookup can't place a build — a private repo, a rate limit, a
+//! registry that isn't GHCR, or a tag built off another branch — rolling back to
+//! it still works, because a target is just a tag. What's lost is the order, so
+//! the reply grades it and the picker only calls a row the newest when every row
+//! was placed. See [`VersionOrdering`].
 //!
 //! Only immutable tags are offered: a rollback has to name one exact build, and
 //! a channel tag like `latest` moves to whatever is published next, which would
@@ -156,34 +156,38 @@ fn recent_tags(
 
 /// What a finished list's order actually means.
 ///
-/// The picker has to be able to say "newest first" only when that's true. When
-/// nothing could be attributed there is still a list — a rollback target is a
-/// tag, and pulling one works regardless — but it is a set of builds, not a
-/// ranking, and the UI has to stop calling the first row the newest.
+/// The picker may say "newest first" only when that's true of the whole list.
+/// One unplaced row is enough to sink the claim: it sorts last by construction,
+/// but nothing knows when it was built, so it could be newer than every row
+/// above it. There is still a list either way — a rollback target is a tag, and
+/// pulling one works regardless — it just isn't a ranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VersionOrdering {
-    /// By the commit behind each tag. The list really is newest first.
+    /// Every row placed by the commit behind its tag. Provably newest first.
     Commit,
-    /// The registry's own tag order, because no row could be placed. The
-    /// Distribution spec orders tags lexically and lexical order over
-    /// `sha-<hex>` says nothing about age, so this order means nothing —
-    /// GHCR's happens to be push order, but that isn't a promise to lean on.
+    /// Some rows placed, some not. The placed ones are in order and the rest are
+    /// appended after them, so the list is still useful — but an unplaced build
+    /// (one off another branch, or older than the commit window) could be newer
+    /// than anything above it, so no row may be called the newest.
+    Partial,
+    /// Nothing placed. The registry's own tag order, and the Distribution spec
+    /// orders tags lexically — lexical order over `sha-<hex>` says nothing about
+    /// age. GHCR's happens to be push order, but that isn't a promise to lean on.
     Registry,
 }
 
-/// Which of the two a finished list got.
+/// Which of the three a finished list got.
 ///
-/// Read off the rows rather than off "did the commit lookup return anything",
-/// because those differ in the case that matters: a lookup that succeeded but
-/// placed none of these tags (all older than the commit window, or all built off
-/// other branches) leaves an order that is just as unjustified as no lookup at
-/// all. One dated row is enough for the top of the list to be real.
+/// Read off the rows, not off "did the commit lookup return anything": a lookup
+/// can succeed and still place none of these tags, which leaves an order just as
+/// unjustified as no lookup at all.
 pub fn ordering_of(versions: &[PublishedVersion]) -> VersionOrdering {
-    if versions.iter().any(|v| v.published_at.is_some()) {
-        VersionOrdering::Commit
-    } else {
-        VersionOrdering::Registry
+    let placed = versions.iter().filter(|v| v.published_at.is_some()).count();
+    match placed {
+        0 => VersionOrdering::Registry,
+        n if n == versions.len() => VersionOrdering::Commit,
+        _ => VersionOrdering::Partial,
     }
 }
 
@@ -564,15 +568,21 @@ mod tests {
     }
 
     #[test]
-    fn a_list_nothing_could_place_does_not_get_to_call_itself_newest_first() {
-        let placed = PublishedVersion {
+    fn a_row_nothing_could_place_sinks_the_newest_first_claim() {
+        let placed = |tag: &str| PublishedVersion {
             published_at: Some("2026-08-10T12:00:00Z".into()),
-            ..version("sha-aaaaaaa", None)
+            ..version(tag, None)
         };
         let bare = version("sha-bbbbbbb", None);
         assert_eq!(
-            ordering_of(&[placed, bare.clone()]),
+            ordering_of(&[placed("sha-aaaaaaa"), placed("sha-ccccccc")]),
             VersionOrdering::Commit
+        );
+        // One unplaced row is enough: it sorts last but could be the newest
+        // build of the lot, so the rows above it can't be called ranked.
+        assert_eq!(
+            ordering_of(&[placed("sha-aaaaaaa"), bare.clone()]),
+            VersionOrdering::Partial
         );
         assert_eq!(ordering_of(&[bare]), VersionOrdering::Registry);
         // Nothing to claim about an empty list either.

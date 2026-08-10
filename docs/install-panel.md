@@ -647,9 +647,14 @@ Update, aimed backwards.
 The order comes from the commits behind the tags, not from the registry's tag
 list (the Distribution spec orders that lexically, which for `sha-<hex>` means
 nothing). That needs the image to be published from a public GitHub repository
-of the same name — true for `ghcr.io/textile-protocol/textile-stitch`. Where it
-isn't, the panel says so on the card and drops the "newest" marker rather than
-claiming an order it can't stand behind.
+of the same name — true for `ghcr.io/textile-protocol/textile-stitch`.
+
+The card only claims "newest first" when every build on it was placed that way.
+If any row couldn't be — built off a branch that isn't the default, or older
+than the last hundred commits — the "newest" marker disappears and the card says
+so, because an unplaced build sorts last while possibly being the newest of the
+lot. Same when nothing at all could be placed: the list still works for rolling
+back, it just isn't a ranking.
 
 Read this before using it:
 

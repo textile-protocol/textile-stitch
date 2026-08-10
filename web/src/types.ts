@@ -234,12 +234,17 @@ export interface BotVersion {
 /**
  * What a version list's order is worth.
  *
- * `commit` — ranked by the commit behind each tag, so it really is newest
- * first. `registry` — nothing could be attributed (non-GHCR image, private
- * repo, rate limit), so this is the registry's own tag order, which the
- * Distribution spec says is lexical: a set of builds, not a ranking.
+ * `commit` — every row was placed by the commit behind its tag, so it really is
+ * newest first. `partial` — some rows couldn't be placed (built off another
+ * branch, or older than the commit window); they're appended last, and any one
+ * of them could be newer than the rows above. `registry` — nothing could be
+ * placed (non-GHCR image, private repo, rate limit), leaving the registry's own
+ * tag order, which the Distribution spec says is lexical: a set of builds, not
+ * a ranking.
+ *
+ * Only `commit` licenses calling a row the newest.
  */
-export type VersionOrdering = 'commit' | 'registry'
+export type VersionOrdering = 'commit' | 'partial' | 'registry'
 
 export interface BotVersions {
   /** At most 10. Newest first only when `ordering` is `commit`. */
