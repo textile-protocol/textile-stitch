@@ -66,6 +66,8 @@ export interface Corridor {
   networkLabel: string
   chainId: number
   tomlTemplate: string
+  /** Contracts aren't deployed yet — shown in the picker but not selectable. */
+  pendingDeploy: boolean
 }
 
 export interface Spread {

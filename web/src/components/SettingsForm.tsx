@@ -264,6 +264,10 @@ function CorridorCard({
     }
   }, [])
 
+  // Corridors a bot can actually be moved onto. Pending ones ship a preset
+  // with a placeholder reactor, and the API refuses them anyway.
+  const switchable = (corridors ?? []).filter((c) => !c.pendingDeploy)
+
   const current =
     bot.config?.corridorLabel ??
     (bot.config?.corridorId ? bot.config.corridorId : 'Custom corridor')
@@ -292,11 +296,11 @@ function CorridorCard({
   return (
     <Card title="Corridor">
       <p className="text-sm text-ink">{current}</p>
-      {corridors && corridors.length >= 2 && !switching && (
+      {corridors && switchable.length >= 2 && !switching && (
         <div className="mt-3">
           <Button
             onClick={() => {
-              setChoice(bot.config?.corridorId ?? corridors[0]!.id)
+              setChoice(bot.config?.corridorId ?? switchable[0]!.id)
               setSwitching(true)
               setError(null)
             }}
@@ -312,7 +316,7 @@ function CorridorCard({
             hint="Replaces this bot's config with the corridor preset. Spreads and endpoints reset; the signer stays."
           >
             <Select value={choice} onChange={(e) => setChoice(e.target.value)}>
-              {corridors.map((c) => (
+              {switchable.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.displayName} — {c.networkLabel}
                 </option>

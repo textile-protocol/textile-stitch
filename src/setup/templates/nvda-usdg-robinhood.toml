@@ -1,0 +1,87 @@
+# Textile Stitch — NVDA/USDG on Robinhood Chain (chain 4663).
+# The wallet key is NOT here; export STITCH_PRIVATE_KEY (or STITCH_PRIVATE_KEY_FILE).
+#
+# A single [[pools]] block quotes BOTH swap directions: the buy side pays USDG
+# for NVDA (USDG -> NVDA) and the sell side sells NVDA for USDG (NVDA -> USDG).
+#
+# NVDA is Robinhood's tokenized NVIDIA share; USDG is Paxos' Global Dollar.
+# This is the first equity corridor on the network — read the spread notes
+# below before funding, they are not the same as the FX templates.
+
+chain_id        = 4663                                 # Robinhood Chain mainnet
+rpc_url         = "https://rpc.mainnet.chain.robinhood.com" # free public RPC; rate limited, swap for your own
+indexer_url     = "https://api.textilecredit.com"
+permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
+reactor         = "0x0000000000000000000000000000000000000000"  # TODO: SETTLEMENT_V3_FILLER_REACTOR (Robinhood) — fill from deploy:v3:robinhood
+tick_interval_secs = 5
+
+# Textile's own price endpoint. Returns { price, timestamp } where price is
+# debt-per-collateral (USDG per NVDA, e.g. ~225).
+#
+# Behind it: Pyth Crypto.NVDAX/USD ÷ Crypto.USDG/USD. Both are 24/7 crypto
+# feeds, deliberately NOT the Equity.US.NVDA/USD share feed, which only
+# publishes 09:30-16:00 ET Mon-Fri and would leave this bot without a center
+# most of the week. The staleness window is tighter than the 900s the FX
+# templates use: the underlying feeds print every second, so anything older
+# than a few minutes means the feed is broken, not slow.
+[feed]
+url            = "https://api.textilecredit.com/price?chainId=4663&pair=nvda-usdg"
+staleness_secs = 300
+
+[[pools]]
+collateral = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"  # NVDA (tokenized NVIDIA, 18dp)
+collateral_decimals = 18
+debt = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"        # USDG on Robinhood Chain (stable, 6dp)
+debt_decimals = 6
+
+# An equity moves like ETH, not like a stablecoin pair, and it gaps on news and
+# on the US open — so this static spread follows the WETH template (5 bps) and
+# not the 1 bps FX ones. It has to clear feed latency plus the /price
+# endpoint's error vs the live mid, or a fast move picks the resting side off.
+# Tune to your own feed and RPC latency before funding.
+#
+# This template also centers the spread on a rolling TWAP of the feed
+# (twap_window_secs below) instead of the instantaneous value, so the book
+# stops chasing every tick. See "TWAP Quoting" in docs/ADVANCED.md.
+
+# Buy low: bid below the mid, paying USDG for NVDA. Funds USDG + Permit2 on USDG.
+buy_offset_bps = 5                                # 5 bps below mid
+buy_total_liquidity_debt = "max"                  # quote all funded USDG
+buy_min_slice_debt = "10000000"                   # 10 USDG smallest slice (6dp)
+buy_max_orders = 40
+
+# Sell high: ask above the mid, selling NVDA for USDG. Funds NVDA + Permit2 on NVDA.
+sell_offset_bps = 5                               # 5 bps above mid
+sell_total_liquidity_collateral = "max"           # quote all funded NVDA
+sell_min_slice_debt = "10000000"                  # 10 USDG-equivalent slice (6dp)
+sell_max_orders = 40
+
+ttl_secs = 60                                     # SHORT: a resting order can't be
+                                                  # cancelled, only expired — so the TTL
+                                                  # is the real staleness window. Must
+                                                  # clear the indexer's 30s live-deadline
+                                                  # margin; 60s leaves ~30s of visible
+                                                  # life and caps how far a stale
+                                                  # signature can sit through a move.
+refresh_threshold_bps = 0                         # no deadband: re-post every tick,
+                                                  # pinned to the current TWAP center
+                                                  # (posting is off-chain and free)
+
+# Center the spread on a rolling time-weighted average of the feed instead of
+# the instantaneous value, so a transient spike leaves the quote near the
+# settled mean while a persistent move flows into the average within a window.
+twap_window_secs = 60                             # ~1 min rolling TWAP, as WETH
+# On a move that persists, the lagging center would keep a stale side posted
+# through the market every tick; the guard trails it at most this far through
+# the instantaneous feed (ask below spot / bid above spot). Default 50.
+# twap_max_deviation_bps = 50
+
+# Inventory-lean quoting (off by default): lean both spreads against the
+# wallet's own inventory so the book self-rebalances and never freezes
+# one-sided, while no quote ever crosses fair. Recommended here given the
+# volatility, but it REQUIRES lean_floor_bps — the measured p95 of this feed's
+# error vs live Pyth (NVDAX/USD ÷ USDG/USD). Measure it, don't assume it, then
+# roll out with lean_shadow = true before flipping lean_enabled = true.
+# lean_shadow = true
+# lean_enabled = false
+# lean_floor_bps = 3.0

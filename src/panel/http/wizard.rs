@@ -29,6 +29,10 @@ pub struct CorridorBody {
     /// The `stitch.toml` this corridor ships, so the wizard can show exactly what
     /// it is about to write.
     pub toml_template: &'static str,
+    /// Listed for visibility, but not yet selectable: the corridor's contracts
+    /// aren't deployed, so its template still carries a placeholder reactor and
+    /// `create` refuses it.
+    pub pending_deploy: bool,
 }
 
 /// The corridors a new bot can be created for, in display order.
@@ -41,6 +45,7 @@ pub async fn corridors() -> Response {
             network_label: c.network_label,
             chain_id: c.chain_id,
             toml_template: c.toml_template,
+            pending_deploy: c.pending_deploy,
         })
         .collect();
     Json(serde_json::json!({ "corridors": list })).into_response()
@@ -278,6 +283,17 @@ pub async fn create(
         ))
     })?;
 
+    // A pending corridor's template still points at a zero reactor, so a bot
+    // built from it would post orders that can never be filled — and it would
+    // look healthy the whole time. Refuse here rather than let the operator
+    // find out by funding a wallet.
+    if corridor.pending_deploy {
+        return Err(ApiError::bad_request(format!(
+            "the {} corridor on {} isn't deployed yet, so a bot can't quote it. Pick a live              corridor from /api/corridors.",
+            corridor.display_name, corridor.network_label
+        )));
+    }
+
     let fleet = state.fleet().await?;
     if fleet.contains(&name) {
         return Err(ApiError::conflict(format!(
@@ -495,6 +511,20 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("0xcebA9300f2b948710d2653dD7B07f33A8B32118C"));
+        // NVDA/USDG on Robinhood Chain — the first tokenized-equity preset.
+        let robinhood_nvda = list
+            .iter()
+            .find(|c| c["id"] == "nvda-usdg-robinhood")
+            .expect("nvda-usdg-robinhood preset");
+        assert_eq!(robinhood_nvda["displayName"], "NVDA / USDG");
+        assert_eq!(robinhood_nvda["networkLabel"], "Robinhood Chain");
+        assert_eq!(robinhood_nvda["chainId"], 4663);
+        // Listed, but not yet selectable — its reactor is still a placeholder.
+        assert_eq!(robinhood_nvda["pendingDeploy"], true);
+        assert!(robinhood_nvda["tomlTemplate"]
+            .as_str()
+            .unwrap()
+            .contains("0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"));
     }
 
     #[tokio::test]

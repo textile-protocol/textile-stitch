@@ -17,6 +17,13 @@ pub struct Corridor {
     pub chain_id: u64,
     /// The `stitch.toml` body shipped for this corridor.
     pub toml_template: &'static str,
+    /// The corridor's contracts aren't on-chain yet, so its template still
+    /// carries a placeholder `reactor`. The preset is listed (so operators can
+    /// see what's coming and read the config it will write) but a bot can't be
+    /// created for it — one would quote into a reactor that doesn't exist.
+    /// Clear this in the same change that fills the address; the catalog tests
+    /// fail both ways, so the flag can't outlive the placeholder.
+    pub pending_deploy: bool,
 }
 
 const CORRIDORS: &[Corridor] = &[
@@ -26,6 +33,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "BNB Smart Chain",
         chain_id: 56,
         toml_template: include_str!("templates/cngn-usdt-bsc.toml"),
+        pending_deploy: false,
     },
     Corridor {
         id: "cngn-usdt-celo",
@@ -33,6 +41,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "Celo",
         chain_id: 42220,
         toml_template: include_str!("templates/cngn-usdt-celo.toml"),
+        pending_deploy: false,
     },
     Corridor {
         id: "usdc-usdt-celo",
@@ -40,6 +49,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "Celo",
         chain_id: 42220,
         toml_template: include_str!("templates/usdc-usdt-celo.toml"),
+        pending_deploy: false,
     },
     Corridor {
         id: "cngn-usdc-base",
@@ -47,6 +57,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "Base",
         chain_id: 8453,
         toml_template: include_str!("templates/cngn-usdc-base.toml"),
+        pending_deploy: false,
     },
     Corridor {
         id: "xaut-usdt-ethereum",
@@ -54,6 +65,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "Ethereum",
         chain_id: 1,
         toml_template: include_str!("templates/xaut-usdt-ethereum.toml"),
+        pending_deploy: false,
     },
     Corridor {
         id: "weth-usdt-ethereum",
@@ -61,6 +73,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "Ethereum",
         chain_id: 1,
         toml_template: include_str!("templates/weth-usdt-ethereum.toml"),
+        pending_deploy: false,
     },
     Corridor {
         id: "wars-usdt-celo",
@@ -68,6 +81,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "Celo",
         chain_id: 42220,
         toml_template: include_str!("templates/wars-usdt-celo.toml"),
+        pending_deploy: false,
     },
     Corridor {
         id: "wbrl-usdt-celo",
@@ -75,6 +89,15 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "Celo",
         chain_id: 42220,
         toml_template: include_str!("templates/wbrl-usdt-celo.toml"),
+        pending_deploy: false,
+    },
+    Corridor {
+        id: "nvda-usdg-robinhood",
+        display_name: "NVDA / USDG",
+        network_label: "Robinhood Chain",
+        chain_id: 4663,
+        toml_template: include_str!("templates/nvda-usdg-robinhood.toml"),
+        pending_deploy: true,
     },
     Corridor {
         id: "cngn-usdt-bsc-testnet",
@@ -82,6 +105,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "BNB Smart Chain testnet",
         chain_id: 97,
         toml_template: include_str!("templates/cngn-usdt-bsc-testnet.toml"),
+        pending_deploy: false,
     },
 ];
 
@@ -143,6 +167,47 @@ mod tests {
             crate::config::Config::from_toml(c.toml_template)
                 .unwrap_or_else(|e| panic!("corridor {} has an invalid template: {e}", c.id));
         }
+    }
+
+    /// A zero address parses fine (the config tests use one), so nothing stops
+    /// a corridor shipping with a placeholder `reactor` — and a bot built from
+    /// that preset would quote happily and never be fillable. `pending_deploy`
+    /// is the only way to ship one, and this asserts the pairing BOTH ways:
+    /// a live corridor can't carry a placeholder, and a pending one can't
+    /// carry a real address. The second half is what makes the flag
+    /// self-cleaning — fill the reactor without clearing it and this fails,
+    /// so the placeholder state can't quietly become permanent.
+    #[test]
+    fn only_pending_corridors_carry_a_placeholder_reactor() {
+        const ZERO: &str = "0x0000000000000000000000000000000000000000";
+        for c in catalog() {
+            let cfg = crate::config::Config::from_toml(c.toml_template).unwrap();
+            assert_eq!(
+                cfg.reactor.eq_ignore_ascii_case(ZERO),
+                c.pending_deploy,
+                "corridor {}: reactor is {} but pending_deploy is {}. A live corridor needs a \
+                 real SETTLEMENT_V3_FILLER_REACTOR; a pending one must keep the zero placeholder \
+                 until the deploy lands.",
+                c.id,
+                cfg.reactor,
+                c.pending_deploy
+            );
+            // Permit2 is the same canonical address on every chain, so there is
+            // never a reason for it to be a placeholder.
+            assert!(
+                !cfg.permit2.eq_ignore_ascii_case(ZERO),
+                "corridor {} ships a zero permit2 address",
+                c.id
+            );
+        }
+    }
+
+    /// The panel lists pending corridors but refuses to build a bot for one
+    /// (see panel::http::wizard::create). At least one live corridor must
+    /// always remain, or the Add Bot flow has nothing to offer.
+    #[test]
+    fn at_least_one_corridor_is_live() {
+        assert!(catalog().iter().any(|c| !c.pending_deploy));
     }
 
     #[test]

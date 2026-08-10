@@ -48,7 +48,9 @@ export default function AddBot() {
       .corridors()
       .then((r) => {
         setCorridors(r.corridors)
-        setCorridorId(r.corridors[0]?.id ?? '')
+        // Pending corridors are listed but can't be built, so never preselect
+        // one — the Next button would be dead on arrival.
+        setCorridorId(r.corridors.find((c) => !c.pendingDeploy)?.id ?? '')
       })
       .catch((e) => setLoadError(e instanceof ApiError ? e.message : String(e)))
   }, [])
@@ -118,21 +120,27 @@ export default function AddBot() {
             {corridors.map((c) => (
               <label
                 key={c.id}
-                className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 ${
-                  c.id === corridorId
-                    ? 'border-accent bg-accent-tint'
-                    : 'border-line-soft hover:bg-hover'
+                className={`flex items-center gap-3 rounded-lg border p-3 ${
+                  c.pendingDeploy
+                    ? 'cursor-not-allowed border-line-soft opacity-50'
+                    : c.id === corridorId
+                      ? 'cursor-pointer border-accent bg-accent-tint'
+                      : 'cursor-pointer border-line-soft hover:bg-hover'
                 }`}
               >
                 <input
                   type="radio"
                   name="corridor"
                   checked={c.id === corridorId}
+                  disabled={c.pendingDeploy}
                   onChange={() => setCorridorId(c.id)}
                   className="accent-[var(--tx-accent)]"
                 />
                 <span className="font-bold">{c.displayName}</span>
                 <span className="text-sm text-muted">{c.networkLabel}</span>
+                {c.pendingDeploy && (
+                  <span className="text-xs text-faint">not deployed yet</span>
+                )}
                 <span className="ml-auto text-xs text-faint">chain {c.chainId}</span>
               </label>
             ))}

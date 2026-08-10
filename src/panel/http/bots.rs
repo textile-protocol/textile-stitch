@@ -761,6 +761,16 @@ pub async fn switch_corridor(
         ))
     })?;
 
+    // Same refusal as create: a pending corridor's preset still carries a zero
+    // reactor, so switching onto it would turn a working bot into one that
+    // quotes into nothing.
+    if corridor.pending_deploy {
+        return Err(ApiError::bad_request(format!(
+            "the {} corridor on {} isn't deployed yet, so a bot can't quote it.",
+            corridor.display_name, corridor.network_label
+        )));
+    }
+
     if bot.config.as_ref().and_then(|c| c.corridor_id.as_deref()) == Some(corridor.id) {
         return Err(ApiError::bad_request(format!(
             "{name} is already on the {} corridor",
