@@ -294,7 +294,12 @@ fn run_init(dir: Option<String>) -> anyhow::Result<()> {
         }
     }
 
-    let corridors = setup::catalog();
+    // Only offer corridors that are actually deployed. A pending one's preset
+    // still points at a zero reactor, so writing a config for it would create a
+    // seemingly valid bot that quotes into nothing — the same state the panel's
+    // create/switch handlers refuse. Filter it out of the picker so the CLI can't
+    // reach it either.
+    let corridors = setup::deployable_catalog();
     println!("\nChoose a corridor:");
     for (i, c) in corridors.iter().enumerate() {
         println!("  {}) {} — {}", i + 1, c.display_name, c.network_label);
@@ -312,7 +317,7 @@ fn run_init(dir: Option<String>) -> anyhow::Result<()> {
             .map(|n| n - 1)
             .ok_or_else(|| anyhow!("not a valid choice: {s}"))?,
     };
-    let corridor = &corridors[idx];
+    let corridor = corridors[idx];
 
     // When stdin is not a TTY (e.g. piped input in smoke-tests), rpassword's
     // default console path fails. Fall back to reading from stdin directly.

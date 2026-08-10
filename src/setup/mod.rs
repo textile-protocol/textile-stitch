@@ -11,7 +11,7 @@ pub mod process;
 pub mod settings;
 pub mod writer;
 
-pub use catalog::{catalog, find_corridor, identify_corridor, Corridor};
+pub use catalog::{catalog, deployable_catalog, find_corridor, identify_corridor, Corridor};
 pub use paths::{
     app_state_dir, config_paths, default_dir, has_operator_files, home_dir, is_configured,
     legacy_gui_dirs, operator_address, operator_address_from_key, remember_config_dir,

@@ -114,6 +114,16 @@ pub fn catalog() -> &'static [Corridor] {
     CORRIDORS
 }
 
+/// Corridors an operator can actually stand a bot up on right now — the catalog
+/// minus anything still `pending_deploy`. A pending corridor's preset points at
+/// a zero reactor, so a bot built from it would quote into nothing while looking
+/// healthy. Any "pick a corridor to set up" surface (the CLI `init` picker, the
+/// web wizard) should offer this, not the raw catalog. Guaranteed non-empty by
+/// `catalog_has_at_least_one_deployable_corridor`.
+pub fn deployable_catalog() -> Vec<&'static Corridor> {
+    CORRIDORS.iter().filter(|c| !c.pending_deploy).collect()
+}
+
 /// Look a corridor up by its stable id.
 pub fn find_corridor(id: &str) -> Option<&'static Corridor> {
     CORRIDORS.iter().find(|c| c.id == id)
@@ -208,6 +218,28 @@ mod tests {
     #[test]
     fn at_least_one_corridor_is_live() {
         assert!(catalog().iter().any(|c| !c.pending_deploy));
+    }
+
+    /// `deployable_catalog` is what the setup surfaces (CLI `init`, web wizard)
+    /// offer, so it must never include a `pending_deploy` corridor and must never
+    /// be empty — otherwise the picker would let an operator stand a bot up on a
+    /// zero reactor, or have nothing to offer at all.
+    #[test]
+    fn deployable_catalog_excludes_pending_and_is_non_empty() {
+        let deployable = deployable_catalog();
+        assert!(
+            !deployable.is_empty(),
+            "deployable_catalog must offer at least one corridor"
+        );
+        assert!(
+            deployable.iter().all(|c| !c.pending_deploy),
+            "deployable_catalog must not include any pending_deploy corridor"
+        );
+        assert_eq!(
+            deployable.len(),
+            catalog().iter().filter(|c| !c.pending_deploy).count(),
+            "deployable_catalog must include every live corridor"
+        );
     }
 
     #[test]
