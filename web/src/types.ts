@@ -143,6 +143,8 @@ export interface SessionInfo {
   runtime: PanelRuntime
   /** The panel binary's version, e.g. `0.1.0`. */
   version: string
+  /** Full path to the local config data — where the per-bot config folders live on the host. */
+  configDir: string
 }
 
 export interface ActionResult {

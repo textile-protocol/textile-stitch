@@ -79,7 +79,7 @@ export default function App() {
         </Routes>
       </main>
       <footer className="mx-auto max-w-5xl px-6 pb-8 text-xs text-faint">
-        Stitch v{session.version}
+        Stitch v{session.version} · <span className="font-mono">{session.configDir}</span>
       </footer>
     </div>
   )

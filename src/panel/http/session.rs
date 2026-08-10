@@ -36,6 +36,10 @@ pub struct SessionBody {
     runtime: &'static str,
     /// The panel binary's own version, so the UI can show what it's running.
     version: &'static str,
+    /// The full path to the local config data — the directory holding the
+    /// per-bot config folders as it exists on the host, so the UI can show an
+    /// operator exactly where their bots live on disk.
+    config_dir: String,
 }
 
 fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
@@ -47,6 +51,7 @@ fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
             && !state.cfg.auth.allowed_users().is_empty(),
         runtime: state.cfg.runtime.as_str(),
         version: env!("CARGO_PKG_VERSION"),
+        config_dir: state.cfg.host_bots_dir.display().to_string(),
     }
 }
 
