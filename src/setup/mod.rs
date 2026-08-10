@@ -5,6 +5,7 @@
 //! desktop tray app.
 
 pub mod catalog;
+pub mod custom;
 pub mod macos;
 pub mod paths;
 pub mod process;
@@ -12,6 +13,7 @@ pub mod settings;
 pub mod writer;
 
 pub use catalog::{catalog, deployable_catalog, find_corridor, identify_corridor, Corridor};
+pub use custom::CustomCorridor;
 pub use paths::{
     app_state_dir, config_paths, default_dir, has_operator_files, home_dir, is_configured,
     legacy_gui_dirs, operator_address, operator_address_from_key, remember_config_dir,
@@ -25,5 +27,6 @@ pub use settings::{
 pub use writer::{
     apply_signer, render_env, signer_files, switch_corridor_file,
     switch_corridor_preserving_signer, validate_signer_change, write_config, write_config_signer,
-    write_key, write_toml_atomic, LocalKeyMaterial, SignerKind, SignerSetup,
+    write_config_signer_from_toml, write_key, write_toml_atomic, LocalKeyMaterial, SignerKind,
+    SignerSetup,
 };

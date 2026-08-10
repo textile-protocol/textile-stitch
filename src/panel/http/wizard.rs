@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{bots, ApiError, AppState};
 use crate::panel::{naming, provision};
-use crate::setup::{self, LocalKeyMaterial, SignerSetup};
+use crate::setup::{self, CustomCorridor, LocalKeyMaterial, SignerSetup};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,12 +255,89 @@ pub async fn check_signer(
 pub struct CreateRequest {
     /// Bot name. Becomes the config directory and part of the container name.
     pub name: String,
-    pub corridor_id: String,
+    /// A catalog corridor's id. Required unless `custom` is given.
+    #[serde(default)]
+    pub corridor_id: Option<String>,
+    /// Operator-supplied corridor details, for a pair the catalog doesn't ship.
+    /// When present it takes precedence over `corridor_id`.
+    #[serde(default)]
+    pub custom: Option<CustomCorridor>,
     pub signer: SignerRequest,
     /// Start the bot immediately. Off by default: the recommended path is to
     /// approve Permit2 (costs a little gas) and dry-run first.
     #[serde(default)]
     pub start: bool,
+}
+
+/// Where a new bot's `stitch.toml` comes from — a shipped preset or the custom
+/// form — resolved to the toml body plus the bits the create handler needs to
+/// label the container and word its response.
+struct ResolvedCorridor {
+    /// The rendered `stitch.toml` body.
+    toml: String,
+    /// The catalog id, used as the container's corridor label. `None` for a
+    /// custom corridor, which has no catalog entry (the panel then shows it as
+    /// "Custom corridor", derived from the config, not this label).
+    container_label: Option<String>,
+    /// Human strings for the response message ("set up for {display} on {network}").
+    display_name: String,
+    network_label: String,
+}
+
+impl CreateRequest {
+    /// Resolve the corridor source. Pure request-body work — no filesystem — so
+    /// it runs before the directory is claimed, and a bad corridor (unknown id,
+    /// pending preset, or invalid custom details) is refused before anything is
+    /// written.
+    fn resolve_corridor(&self) -> Result<ResolvedCorridor, ApiError> {
+        if let Some(custom) = &self.custom {
+            let toml = custom
+                .render()
+                .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+            return Ok(ResolvedCorridor {
+                toml,
+                container_label: None,
+                display_name: "a custom corridor".to_string(),
+                network_label: format!("chain {}", custom.chain_id),
+            });
+        }
+
+        let id = self
+            .corridor_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "pick a corridor, or send custom corridor details. Ask /api/corridors for the \
+                     list.",
+                )
+            })?;
+        let corridor = setup::find_corridor(id).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "there is no corridor called \"{id}\". Ask /api/corridors for the list."
+            ))
+        })?;
+
+        // A pending corridor's template still points at a zero reactor, so a bot
+        // built from it would post orders that can never be filled — and it would
+        // look healthy the whole time. Refuse here rather than let the operator
+        // find out by funding a wallet.
+        if corridor.pending_deploy {
+            return Err(ApiError::bad_request(format!(
+                "the {} corridor on {} isn't deployed yet, so a bot can't quote it. Pick a live \
+                 corridor from /api/corridors.",
+                corridor.display_name, corridor.network_label
+            )));
+        }
+
+        Ok(ResolvedCorridor {
+            toml: corridor.toml_template.to_string(),
+            container_label: Some(corridor.id.to_string()),
+            display_name: corridor.display_name.to_string(),
+            network_label: corridor.network_label.to_string(),
+        })
+    }
 }
 
 /// Create a bot: write its config, then create its container.
@@ -276,23 +353,10 @@ pub async fn create(
     let name = body.name.trim().to_string();
     naming::validate_bot_id(&name).map_err(ApiError::bad_request)?;
 
-    let corridor = setup::find_corridor(&body.corridor_id).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "there is no corridor called \"{}\". Ask /api/corridors for the list.",
-            body.corridor_id
-        ))
-    })?;
-
-    // A pending corridor's template still points at a zero reactor, so a bot
-    // built from it would post orders that can never be filled — and it would
-    // look healthy the whole time. Refuse here rather than let the operator
-    // find out by funding a wallet.
-    if corridor.pending_deploy {
-        return Err(ApiError::bad_request(format!(
-            "the {} corridor on {} isn't deployed yet, so a bot can't quote it. Pick a live              corridor from /api/corridors.",
-            corridor.display_name, corridor.network_label
-        )));
-    }
+    // A catalog preset or the custom form — either way this resolves to the toml
+    // to write, and refuses an unknown/pending/invalid corridor before the
+    // directory is claimed.
+    let corridor = body.resolve_corridor()?;
 
     let fleet = state.fleet().await?;
     if fleet.contains(&name) {
@@ -339,7 +403,7 @@ pub async fn create(
     // The directory goes with it on failure. We created it, so nothing else can be in
     // there — and leaving an empty one behind would make the `create_dir` above refuse
     // every retry of the name the operator just got wrong.
-    if let Err(e) = setup::write_config_signer(&dir, corridor, &signer) {
+    if let Err(e) = setup::write_config_signer_from_toml(&dir, &corridor.toml, &signer) {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(ApiError::bad_request(format!("{e:#}")));
     }
@@ -360,7 +424,7 @@ pub async fn create(
         &name,
         &state.cfg.bot_image,
         &runtime,
-        Some(corridor.id),
+        corridor.container_label.as_deref(),
     );
     // Docker's create endpoint doesn't pull, so on a host that has never run a
     // bot this is what actually fetches the image. Both failures land on the same
@@ -422,7 +486,12 @@ pub async fn create(
     if let Some(reason) = &start_error {
         tracing::warn!(bot = %name, "created but not started: {reason}");
     }
-    tracing::info!(bot = %name, corridor = %corridor.id, started, "created");
+    tracing::info!(
+        bot = %name,
+        corridor = %corridor.container_label.as_deref().unwrap_or("custom"),
+        started,
+        "created"
+    );
 
     // Re-read for the response — the wallet comes from the config just written, and the
     // state changed if the start took.
@@ -981,6 +1050,107 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("no corridor"), "{body}");
+    }
+
+    /// The custom-corridor equivalent of the shipped payload above.
+    fn custom_body() -> serde_json::Value {
+        json!({
+            "chainId": 42220,
+            "rpcUrl": "https://forno.celo.org",
+            "reactor": "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3",
+            "collateral": "0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f",
+            "collateralDecimals": 6,
+            "debt": "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+            "debtDecimals": 6,
+            "feedUrl": "https://api.textilecredit.com/price?chainId=42220&pair=cngn-usdt",
+        })
+    }
+
+    #[tokio::test]
+    async fn a_custom_corridor_writes_the_operator_supplied_config() {
+        let h = harness("create-custom");
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({ "name": "bot-a", "custom": custom_body(), "signer": local(TEST_KEY) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // The tokens and reactor the operator typed are in the written config.
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(
+            toml.contains("0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f"),
+            "{toml}"
+        );
+        assert!(toml.contains("chain_id        = 42220"), "{toml}");
+        // Permit2 and the indexer defaulted rather than being asked for.
+        assert!(
+            toml.contains("0x000000000022D473030F116dDEE9F6B43aC78BA3"),
+            "{toml}"
+        );
+
+        // It loads and the container was created, same as a preset bot.
+        assert!(crate::config::Config::from_toml(&toml).is_ok());
+        assert!(h.docker.exists("stitch-bot-a"));
+        // A custom corridor has no catalog id, so the message calls it that.
+        let v = Harness::parse(&body);
+        assert!(
+            v["message"].as_str().unwrap().contains("custom corridor"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_corridor_with_a_zero_reactor_is_refused() {
+        let h = harness("create-custom-zero-reactor");
+        let mut custom = custom_body();
+        custom["reactor"] = json!("0x0000000000000000000000000000000000000000");
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({ "name": "bot-a", "custom": custom, "signer": local(TEST_KEY) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("reactor"), "{body}");
+        // Nothing half-written, and the name stays free for a corrected retry.
+        assert!(
+            !h.root.join("bot-a").exists(),
+            "the claimed directory must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_corridor_with_a_garbage_token_is_refused() {
+        let h = harness("create-custom-bad-token");
+        let mut custom = custom_body();
+        custom["collateral"] = json!("not-an-address");
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({ "name": "bot-a", "custom": custom, "signer": local(TEST_KEY) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("collateral token address"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_create_with_neither_corridor_nor_custom_is_refused() {
+        let h = harness("create-no-corridor");
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({ "name": "bot-a", "signer": local(TEST_KEY) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("pick a corridor"), "{body}");
     }
 
     #[tokio::test]

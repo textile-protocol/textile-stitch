@@ -131,30 +131,49 @@ pub fn find_corridor(id: &str) -> Option<&'static Corridor> {
 
 /// Best-effort: match a written `stitch.toml` back to a catalog corridor so the
 /// control panel can name an already-configured folder. Chain id alone is not
-/// enough — a chain can host more than one corridor (e.g. wARS and wBRL on Celo),
-/// so disambiguate on the first pool's collateral (soft) token when we can, and
-/// fall back to the chain-only match for older configs with no matching pool.
+/// enough — a chain can host more than one corridor (e.g. wARS and wBRL on Celo) —
+/// so disambiguate on the first pool's **pair**: both the collateral (soft) and
+/// debt (stable) token. Collateral alone isn't enough either: a custom pair can
+/// reuse a catalog collateral against a different debt (cNGN/USDC where the
+/// catalog ships cNGN/USDT on the same chain), and matching on collateral only
+/// would mislabel it as that preset.
+///
+/// The chain-only fallback is *only* for a config with no pool to key on (older,
+/// pool-less configs). When a pool IS present but its pair matches no catalog
+/// corridor on that chain, this is a pair we don't ship — a custom corridor — so
+/// return `None` rather than the first catalog entry that happens to share the
+/// chain, which would make Settings preselect that unrelated preset.
 pub fn identify_corridor(toml_str: &str) -> Option<&'static Corridor> {
     let cfg = crate::config::Config::from_toml(toml_str).ok()?;
-    let collateral = cfg.pools.first().map(|p| p.collateral.to_lowercase());
+    let pair = cfg
+        .pools
+        .first()
+        .map(|p| (p.collateral.to_lowercase(), p.debt.to_lowercase()));
     CORRIDORS
         .iter()
         .find(|c| {
             c.chain_id == cfg.chain_id
-                && collateral
-                    .as_deref()
-                    .zip(corridor_collateral(c))
-                    .is_some_and(|(want, have)| want == have)
+                && pair
+                    .as_ref()
+                    .zip(corridor_pair(c))
+                    .is_some_and(|(want, have)| want.0 == have.0 && want.1 == have.1)
         })
-        .or_else(|| CORRIDORS.iter().find(|c| c.chain_id == cfg.chain_id))
+        .or_else(|| {
+            // No pool → nothing to disambiguate on, so a chain-only match is the
+            // best we can do. A present-but-unmatched pair falls through to None.
+            pair.is_none()
+                .then(|| CORRIDORS.iter().find(|c| c.chain_id == cfg.chain_id))
+                .flatten()
+        })
 }
 
-/// The first pool's collateral (soft) token address, lowercased, parsed from a
-/// corridor's own template. Returns `None` if the template can't be parsed (a
+/// The first pool's `(collateral, debt)` token addresses, lowercased, parsed from
+/// a corridor's own template. Returns `None` if the template can't be parsed (a
 /// guarded invariant — see `every_template_parses_as_a_valid_config`).
-fn corridor_collateral(c: &Corridor) -> Option<String> {
+fn corridor_pair(c: &Corridor) -> Option<(String, String)> {
     let cfg = crate::config::Config::from_toml(c.toml_template).ok()?;
-    cfg.pools.first().map(|p| p.collateral.to_lowercase())
+    let pool = cfg.pools.first()?;
+    Some((pool.collateral.to_lowercase(), pool.debt.to_lowercase()))
 }
 
 #[cfg(test)]
@@ -286,5 +305,55 @@ mod tests {
                 .unwrap_or_else(|| panic!("corridor {} not identified from its template", c.id));
             assert_eq!(identified.id, c.id, "identify mismatch for {}", c.id);
         }
+    }
+
+    #[test]
+    fn a_custom_pair_on_a_catalog_chain_is_not_mislabeled_as_a_preset() {
+        // A custom corridor can land on a chain the catalog already covers (e.g.
+        // some new Celo pair). Its pool's collateral matches no shipped corridor,
+        // so identify must return None — the panel then shows "Custom corridor"
+        // rather than the first catalog entry that shares the chain (which would
+        // mislabel it and make Settings preselect an unrelated preset).
+        let cngn = find_corridor("cngn-usdt-celo").expect("cngn corridor exists");
+        // Same chain as the Celo presets, but a collateral token none of them use.
+        let custom = cngn.toml_template.replace(
+            "0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f",
+            "0x1111111111111111111111111111111111111111",
+        );
+        assert!(
+            identify_corridor(&custom).is_none(),
+            "an unshipped Celo pair must not be identified as a catalog corridor"
+        );
+
+        // Trickier: a custom pair that *reuses* a catalog collateral (cNGN) but
+        // quotes it against a different debt token. Chain and collateral both
+        // match the cNGN/USDT preset, so a collateral-only match would mislabel
+        // it. Matching the full pair keeps it a custom corridor.
+        let same_collateral_new_debt = cngn.toml_template.replace(
+            "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e", // USDT on Celo
+            "0x2222222222222222222222222222222222222222",
+        );
+        assert!(
+            identify_corridor(&same_collateral_new_debt).is_none(),
+            "cNGN against a different debt must not be identified as cNGN/USDT"
+        );
+
+        // A pool-less config (nothing to key on) still gets the chain-only
+        // fallback, so the historical behavior for those is preserved.
+        let pool_less = "chain_id = 42220\n\
+             rpc_url = \"https://forno.celo.org\"\n\
+             indexer_url = \"https://api.textilecredit.com\"\n\
+             permit2 = \"0x000000000022D473030F116dDEE9F6B43aC78BA3\"\n\
+             reactor = \"0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3\"\n\
+             tick_interval_secs = 5\n\
+             pools = []\n\
+             [feed]\n\
+             url = \"https://api.textilecredit.com/price\"\n\
+             staleness_secs = 900\n";
+        assert_eq!(
+            identify_corridor(pool_less).map(|c| c.chain_id),
+            Some(42220),
+            "a pool-less config still resolves to a chain-only match"
+        );
     }
 }

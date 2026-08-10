@@ -191,6 +191,23 @@ pub fn write_config_signer(
             corridor.network_label
         );
     }
+    write_config_signer_from_toml(dir, corridor.toml_template, signer)
+}
+
+/// Write a config from an already-rendered `stitch.toml` body rather than a
+/// catalog corridor. Same file-writing guarantees as [`write_config_signer`];
+/// used by the panel's custom-corridor path, where the toml is built from
+/// operator input instead of shipped as a preset.
+///
+/// The caller is responsible for the body being a valid config — the custom
+/// renderer parses it before handing it here — because there is no catalog entry
+/// to fall back on. There is no pending-deploy notion for a custom corridor: its
+/// reactor is whatever the operator gave, validated non-zero at render time.
+pub fn write_config_signer_from_toml(
+    dir: impl AsRef<Path>,
+    toml_template: &str,
+    signer: &SignerSetup,
+) -> Result<ConfigPaths> {
     validate_signer(signer)?;
 
     let paths = config_paths(dir.as_ref());
@@ -200,8 +217,8 @@ pub fn write_config_signer(
     // Hot wallet keeps the template byte-for-byte; MPC backends get a [signer]
     // section appended (comments elsewhere preserved via toml_edit).
     let toml = match signer {
-        SignerSetup::Local { .. } => corridor.toml_template.to_string(),
-        _ => render_toml_with_signer(corridor.toml_template, signer)?,
+        SignerSetup::Local { .. } => toml_template.to_string(),
+        _ => render_toml_with_signer(toml_template, signer)?,
     };
 
     // Stage the secret and env first, then commit the toml (which selects the
