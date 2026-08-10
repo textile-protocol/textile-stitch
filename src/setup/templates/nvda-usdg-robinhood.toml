@@ -12,7 +12,7 @@ chain_id        = 4663                                 # Robinhood Chain mainnet
 rpc_url         = "https://rpc.mainnet.chain.robinhood.com" # free public RPC; rate limited, swap for your own
 indexer_url     = "https://api.textilecredit.com"
 permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 (same on every chain)
-reactor         = "0x0000000000000000000000000000000000000000"  # TODO: SETTLEMENT_V3_FILLER_REACTOR (Robinhood) — fill from deploy:v3:robinhood
+reactor         = "0xc3E1f6e34a633a37d1C8e73A0f3eb1003d0699fE"  # SETTLEMENT_V3_FILLER_REACTOR (Robinhood)
 tick_interval_secs = 5
 
 # Textile's own price endpoint. Returns { price, timestamp } where price is

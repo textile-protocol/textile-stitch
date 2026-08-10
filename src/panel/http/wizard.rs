@@ -519,8 +519,17 @@ mod tests {
         assert_eq!(robinhood_nvda["displayName"], "NVDA / USDG");
         assert_eq!(robinhood_nvda["networkLabel"], "Robinhood Chain");
         assert_eq!(robinhood_nvda["chainId"], 4663);
-        // Listed, but not yet selectable — its reactor is still a placeholder.
-        assert_eq!(robinhood_nvda["pendingDeploy"], true);
+        // Mirrors the catalog rather than hard-coding a value: pending_deploy is
+        // a transient state, and pinning the literal here made this test fail
+        // the moment the corridor went live — which says nothing about whether
+        // the field serializes. What matters is that the panel reports the
+        // catalog's answer, whatever it currently is.
+        assert_eq!(
+            robinhood_nvda["pendingDeploy"],
+            crate::setup::find_corridor("nvda-usdg-robinhood")
+                .unwrap()
+                .pending_deploy
+        );
         assert!(robinhood_nvda["tomlTemplate"]
             .as_str()
             .unwrap()

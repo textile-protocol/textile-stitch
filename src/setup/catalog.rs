@@ -97,7 +97,7 @@ const CORRIDORS: &[Corridor] = &[
         network_label: "Robinhood Chain",
         chain_id: 4663,
         toml_template: include_str!("templates/nvda-usdg-robinhood.toml"),
-        pending_deploy: true,
+        pending_deploy: false,
     },
     Corridor {
         id: "cngn-usdt-bsc-testnet",

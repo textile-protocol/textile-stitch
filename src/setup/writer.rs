@@ -178,6 +178,19 @@ pub fn write_config_signer(
     corridor: &Corridor,
     signer: &SignerSetup,
 ) -> Result<ConfigPaths> {
+    // Last line of defence, checked before anything touches disk. The CLI picker
+    // and the panel's create handler both filter pending corridors already, but
+    // they're two of several callers and the failure is silent: a config written
+    // from a pending template points at the zero reactor, so the bot starts,
+    // quotes, and is never fillable. Refusing at the single write point means a
+    // new caller can't reintroduce that.
+    if corridor.pending_deploy {
+        anyhow::bail!(
+            "the {} corridor on {} isn't deployed yet, so a bot can't quote it",
+            corridor.display_name,
+            corridor.network_label
+        );
+    }
     validate_signer(signer)?;
 
     let paths = config_paths(dir.as_ref());
@@ -820,6 +833,36 @@ mod tests {
         assert!(
             !config_paths(&dir).toml.exists(),
             "nothing written on bad key"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The picker filters pending corridors, but the write point is the only
+    /// place every caller funnels through — so it refuses too, and refuses
+    /// before touching disk. A half-written config pointing at a zero reactor
+    /// is worse than no config: the bot would start and quote into nothing.
+    ///
+    /// Built from a synthetic corridor rather than a catalog entry on purpose:
+    /// pending is a temporary state, so pinning this to whichever corridor
+    /// happens to be awaiting a deploy would silently stop testing the guard
+    /// the moment that corridor went live.
+    #[test]
+    fn write_config_rejects_a_pending_corridor_before_writing() {
+        let dir = unique_dir("pending");
+        let live = find_corridor("cngn-usdt-bsc").unwrap();
+        let pending = Corridor {
+            pending_deploy: true,
+            ..*live
+        };
+
+        let err = write_config(&dir, &pending, KEY).unwrap_err();
+        assert!(
+            err.to_string().contains("isn't deployed yet"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !config_paths(&dir).toml.exists(),
+            "nothing written for a pending corridor"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
