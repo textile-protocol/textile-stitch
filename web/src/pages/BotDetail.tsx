@@ -345,12 +345,17 @@ export default function BotDetail() {
 
       <MigrationPrompt bot={bot} onMigrated={setBot} />
 
-      <nav className="flex gap-1 border-b border-line-soft">
+      {/*
+        Five labels don't fit a phone width in one row. Wrap instead of
+        overflowing — a horizontal scrollbar here shoved the whole panel
+        sideways on mobile after Dashboard was added.
+      */}
+      <nav className="flex flex-wrap gap-x-0.5 border-b border-line-soft sm:gap-x-1">
         {TABS.map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
-            className={`-mb-px border-b-2 px-3 py-2 text-sm font-bold transition ${
+            className={`-mb-px border-b-2 px-2.5 py-2 text-xs font-bold transition sm:px-3 sm:text-sm ${
               tab === t
                 ? 'border-accent text-ink'
                 : 'border-transparent text-muted hover:text-ink'
