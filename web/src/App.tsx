@@ -14,6 +14,13 @@ import type { SessionInfo, UpdatesStatus } from './types'
 /** Persisted so the operator's choice survives a reload. */
 const THEME_KEY = 'stitch-panel-theme'
 
+/**
+ * How often the header re-queries the registry for a newer panel image.
+ * Soft checks on navigation reuse the server's 15-minute cache; this interval
+ * forces a fresh lookup so a long-lived tab still notices an update.
+ */
+const UPDATES_POLL_MS = 5 * 60 * 1000
+
 export default function App() {
   const [session, setSession] = useState<SessionInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -68,7 +75,6 @@ export default function App() {
         theme={theme}
         onTheme={setTheme}
         onSignedOut={() => void refresh()}
-        onPanelUpdated={() => void refresh()}
       />
       <main className="mx-auto max-w-5xl px-6 py-8">
         <Routes>
@@ -90,34 +96,36 @@ function Header({
   theme,
   onTheme,
   onSignedOut,
-  onPanelUpdated,
 }: {
   session: SessionInfo
   theme: Theme
   onTheme: (t: Theme) => void
   onSignedOut: () => void
-  /** Re-read the session once the panel is back, so the footer version refreshes. */
-  onPanelUpdated: () => void
 }) {
   const { pathname } = useLocation()
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
   const [panelBusy, setPanelBusy] = useState(false)
   const [panelNote, setPanelNote] = useState<string | null>(null)
 
+  // Soft check on every navigation (and mount); forced registry refresh on a
+  // timer so a parked tab still learns about a newer panel image.
   useEffect(() => {
     let cancelled = false
-    api
-      .updates()
-      .then((u) => {
+    async function check(force: boolean) {
+      try {
+        const u = await api.updates(force)
         if (!cancelled) setUpdates(u)
-      })
-      .catch(() => {
+      } catch {
         if (!cancelled) setUpdates(null)
-      })
+      }
+    }
+    void check(false)
+    const timer = setInterval(() => void check(true), UPDATES_POLL_MS)
     return () => {
       cancelled = true
+      clearInterval(timer)
     }
-  }, [])
+  }, [pathname])
 
   async function updatePanel() {
     const target = updates?.panel.targetImage
@@ -148,13 +156,11 @@ function Header({
             setPanelNote('Waiting for the panel to restart…')
             continue
           }
-          setPanelNote('Panel is back on the new image.')
-          setUpdates(await api.updates(true))
-          // The restart loop above threw away every session() it polled, so the
-          // parent still holds the pre-update version. Re-read it now that we're
-          // on the new image, or the footer keeps showing the old one until reload.
-          onPanelUpdated()
-          setPanelBusy(false)
+          // Soft API refreshes leave the browser on the old embedded SPA. The new
+          // container serves a fresh index.html (no-cache) + hashed assets — reload
+          // so version, shell, and UI all match the image we just swapped to.
+          setPanelNote('Panel is back — loading the new UI…')
+          window.location.reload()
           return
         } catch {
           sawDown = true
@@ -162,6 +168,7 @@ function Header({
         }
       }
       setPanelNote('Still waiting for the panel — reload the page in a moment.')
+      setPanelBusy(false)
     } catch (e) {
       setPanelNote(e instanceof ApiError ? e.message : String(e))
       setPanelBusy(false)
