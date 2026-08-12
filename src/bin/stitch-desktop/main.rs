@@ -64,7 +64,7 @@ const PAUSE_CONFIRMATION_MESSAGE: &str = "Pausing the panel also pauses every bo
 /// appears.
 const CHECKING_UPDATES_NOTE: &str = "Checking for updates…";
 const UPDATE_AVAILABLE_TITLE: &str = "Update available";
-const UPDATE_UPGRADE_BUTTON: &str = "Upgrade";
+const UPDATE_CONFIRM_BUTTON: &str = "Update";
 const UPDATE_LATER_BUTTON: &str = "Later";
 
 #[derive(Debug)]
@@ -178,17 +178,17 @@ fn powershell_single_quote(s: &str) -> String {
 }
 
 /// After a manual "Check for updates…", ask whether to open the install flow.
-/// Returns true when the operator chooses Upgrade.
+/// Returns true when the operator chooses Update.
 fn confirm_update_available(version: &str) -> bool {
     let message = format!("Stitch {version} is ready.");
     #[cfg(target_os = "macos")]
     {
         let title = applescript_escape(UPDATE_AVAILABLE_TITLE);
         let body = applescript_escape(&message);
-        let upgrade = applescript_escape(UPDATE_UPGRADE_BUTTON);
+        let update = applescript_escape(UPDATE_CONFIRM_BUTTON);
         let later = applescript_escape(UPDATE_LATER_BUTTON);
         let script = format!(
-            "display alert \"{title}\" message \"{body}\" buttons {{\"{later}\", \"{upgrade}\"}} default button \"{upgrade}\" cancel button \"{later}\""
+            "display alert \"{title}\" message \"{body}\" buttons {{\"{later}\", \"{update}\"}} default button \"{update}\" cancel button \"{later}\""
         );
         return std::process::Command::new("/usr/bin/osascript")
             .args(["-e", &script])
@@ -198,10 +198,10 @@ fn confirm_update_available(version: &str) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // MessageBox has fixed Yes/No labels; map Yes → Upgrade, No → Later.
+        // MessageBox has fixed Yes/No labels; map Yes → Update, No → Later.
         let title = powershell_single_quote(UPDATE_AVAILABLE_TITLE);
         let body = powershell_single_quote(&format!(
-            "{message}`n`nClick Yes to upgrade, or No to decide later."
+            "{message}`n`nClick Yes to update, or No to decide later."
         ));
         let script = format!(
             "Add-Type -AssemblyName PresentationFramework; \
@@ -227,7 +227,7 @@ fn confirm_update_available(version: &str) -> bool {
         );
         dialog.set_title(UPDATE_AVAILABLE_TITLE);
         dialog.add_button(UPDATE_LATER_BUTTON, gtk::ResponseType::Cancel);
-        dialog.add_button(UPDATE_UPGRADE_BUTTON, gtk::ResponseType::Accept);
+        dialog.add_button(UPDATE_CONFIRM_BUTTON, gtk::ResponseType::Accept);
         dialog.set_default_response(gtk::ResponseType::Accept);
         let confirmed = dialog.run() == gtk::ResponseType::Accept;
         dialog.close();
@@ -1540,12 +1540,12 @@ mod pause_confirmation_tests {
 
 #[cfg(test)]
 mod update_available_prompt_tests {
-    use super::{UPDATE_AVAILABLE_TITLE, UPDATE_LATER_BUTTON, UPDATE_UPGRADE_BUTTON};
+    use super::{UPDATE_AVAILABLE_TITLE, UPDATE_CONFIRM_BUTTON, UPDATE_LATER_BUTTON};
 
     #[test]
-    fn prompt_copy_matches_upgrade_later_flow() {
+    fn prompt_copy_matches_update_later_flow() {
         assert_eq!(UPDATE_AVAILABLE_TITLE, "Update available");
-        assert_eq!(UPDATE_UPGRADE_BUTTON, "Upgrade");
+        assert_eq!(UPDATE_CONFIRM_BUTTON, "Update");
         assert_eq!(UPDATE_LATER_BUTTON, "Later");
     }
 }

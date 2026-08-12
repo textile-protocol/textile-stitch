@@ -16,15 +16,17 @@ import LogViewer from '../components/LogViewer'
 import OneShotRunner from '../components/OneShotRunner'
 import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
+import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import VersionRollback from '../components/VersionRollback'
 import { formatTimestamp, shortAddress, shortImage } from '../format'
 import type { Bot, MigrationResult, UpdatesStatus } from '../types'
 
-const TABS = ['settings', 'config', 'logs', 'tools'] as const
+const TABS = ['settings', 'dashboard', 'config', 'logs', 'tools'] as const
 type Tab = (typeof TABS)[number]
 
 const TAB_LABEL: Record<Tab, string> = {
   settings: 'Settings',
+  dashboard: 'Dashboard',
   config: 'Raw config',
   logs: 'Logs',
   tools: 'Tools',
@@ -420,6 +422,10 @@ export default function BotDetail() {
             />
           </Card>
         </>
+      )}
+
+      {tab === 'dashboard' && (
+        <StitchDashboardEmbed operatorAddress={bot.config?.operatorAddress} />
       )}
     </div>
   )
