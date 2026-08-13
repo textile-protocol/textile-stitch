@@ -346,25 +346,35 @@ export default function BotDetail() {
       <MigrationPrompt bot={bot} onMigrated={setBot} />
 
       {/*
-        Five labels don't fit a phone width in one row. Wrap instead of
-        overflowing — a horizontal scrollbar here shoved the whole panel
-        sideways on mobile after Dashboard was added.
+        Five labels don't fit a phone width. Scroll horizontally in a clipped
+        strip (not the page) so they stay one line; a right-edge fade hints
+        that more tabs sit off-screen.
       */}
-      <nav className="flex flex-wrap gap-x-0.5 border-b border-line-soft sm:gap-x-1">
-        {TABS.map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`-mb-px border-b-2 px-2.5 py-2 text-xs font-bold transition sm:px-3 sm:text-sm ${
-              tab === t
-                ? 'border-accent text-ink'
-                : 'border-transparent text-muted hover:text-ink'
-            }`}
-          >
-            {TAB_LABEL[t]}
-          </button>
-        ))}
-      </nav>
+      <div className="relative">
+        <nav
+          className="flex flex-nowrap gap-x-0.5 overflow-x-auto border-b border-line-soft [scrollbar-width:none] [-ms-overflow-style:none] sm:gap-x-1 [&::-webkit-scrollbar]:hidden"
+          aria-label="Bot sections"
+        >
+          {TABS.map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setTab(t)}
+              className={`-mb-px shrink-0 border-b-2 px-2.5 py-2 text-xs font-bold transition sm:px-3 sm:text-sm ${
+                tab === t
+                  ? 'border-accent text-ink'
+                  : 'border-transparent text-muted hover:text-ink'
+              }`}
+            >
+              {TAB_LABEL[t]}
+            </button>
+          ))}
+        </nav>
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-canvas to-transparent sm:hidden"
+        />
+      </div>
 
       {tab === 'settings' &&
         (bot.editable ? (
