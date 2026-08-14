@@ -231,3 +231,4 @@ jobs:
         with:
           name: Stitch-dmg
           path: dist/Stitch.dmg
+          retention-days: 1

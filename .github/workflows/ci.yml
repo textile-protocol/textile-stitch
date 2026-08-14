@@ -37,6 +37,7 @@ jobs:
         with:
           name: stitch-linux-x86_64-${{ github.sha }}
           path: target/release/stitch
+          retention-days: 1
 
   # Stitch (web UI) is behind a cargo feature, so the job above never compiles it.
   # Its own job keeps the bot's CI fast while still gating the panel's tests and

@@ -1,0 +1,65 @@
+# Reclaim GitHub Actions artifact storage.
+#
+# cargo-dist parks platform zips as workflow artifacts on every main push.
+# GitHub keeps them 90 days unless retention-days is set. Same cleanup as
+# the monorepo copy; this file is what actually runs in textile-stitch.
+
+name: Cleanup Actions storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      older_than_hours:
+        description: 'Delete artifacts older than this many hours'
+        required: false
+        default: '6'
+      dry_run:
+        description: 'Print what would be deleted without deleting'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 5 * * *'
+  pull_request:
+    paths:
+      - '.github/workflows/cleanup-actions-storage.yml'
+      - '.github/scripts/cleanup_actions_artifacts.py'
+      - '.github/scripts/test_cleanup_actions_artifacts.py'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: cleanup-actions-storage
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: python3 .github/scripts/test_cleanup_actions_artifacts.py
+      - name: Require retention-days on artifact uploads
+        run: python3 .github/scripts/cleanup_actions_artifacts.py --lint-workflows
+
+  cleanup:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete stale artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OLDER_THAN_HOURS: ${{ github.event.inputs.older_than_hours || '6' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then
+            python3 .github/scripts/cleanup_actions_artifacts.py \
+              --older-than-hours "${OLDER_THAN_HOURS}" \
+              --dry-run
+          else
+            python3 .github/scripts/cleanup_actions_artifacts.py \
+              --older-than-hours "${OLDER_THAN_HOURS}"
+          fi

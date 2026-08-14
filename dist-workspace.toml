@@ -4,6 +4,10 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
+# `upload` rebuilds every platform on PRs and parks ~50MB zips for 90 days.
+# That is what filled the org Actions storage quota. `plan` still gates the
+# release config; binaries come from main/tag Release runs.
+pr-run-mode = "plan"
 installers = ["shell", "powershell"]
 targets = [
   "aarch64-apple-darwin",
