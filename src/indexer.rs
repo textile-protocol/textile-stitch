@@ -107,6 +107,18 @@ fn first_order_id_at(resp: &Value, pointer: &str) -> String {
         .to_string()
 }
 
+/// Config `indexer_url` is the API origin (`https://api.textilecredit.com`).
+/// GraphQL lives at `/graphql`. RFQ inventory used to POST the origin and
+/// 404 every second.
+pub fn graphql_url_from_base(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/graphql") {
+        base.to_string()
+    } else {
+        format!("{base}/graphql")
+    }
+}
+
 pub struct Indexer {
     graphql_url: String,
     client: reqwest::Client,
@@ -118,6 +130,11 @@ impl Indexer {
             graphql_url: graphql_url.into(),
             client: http_client(),
         }
+    }
+
+    /// Build from the config origin, not a hand-rolled `/graphql` suffix.
+    pub fn from_base_url(base: impl AsRef<str>) -> Self {
+        Self::new(graphql_url_from_base(base.as_ref()))
     }
 
     /// POST a GraphQL request and surface indexer-side errors. `what` names the
@@ -253,5 +270,21 @@ mod tests {
         assert_eq!(req["variables"]["chainId"], 8453);
         assert_eq!(req["variables"]["maker"], "0xmaker");
         assert_eq!(req["variables"]["inputToken"], "0xusdt");
+    }
+
+    #[test]
+    fn graphql_url_appends_path_to_the_config_origin() {
+        assert_eq!(
+            graphql_url_from_base("https://api.textilecredit.com"),
+            "https://api.textilecredit.com/graphql"
+        );
+        assert_eq!(
+            graphql_url_from_base("https://api.textilecredit.com/"),
+            "https://api.textilecredit.com/graphql"
+        );
+        assert_eq!(
+            graphql_url_from_base("https://api.textilecredit.com/graphql"),
+            "https://api.textilecredit.com/graphql"
+        );
     }
 }

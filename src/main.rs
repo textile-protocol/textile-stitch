@@ -409,7 +409,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             .entry(url.clone())
             .or_insert_with(|| HttpFeed::new(&url));
     }
-    let indexer = Indexer::new(format!("{}/graphql", cfg.indexer_url.trim_end_matches('/')));
+    let indexer = Indexer::from_base_url(&cfg.indexer_url);
 
     // Blue-leg I/O: a signing wallet (pays gas, sends fill()) and the subgraph
     // discoverer. The discoverer is only built when a subgraph is configured.

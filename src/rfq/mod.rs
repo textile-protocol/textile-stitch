@@ -239,7 +239,7 @@ async fn run(rt: RfqRuntime) {
     let tokens = wallet_tokens(&rt.books);
     if !tokens.is_empty() {
         let wallet = Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id);
-        let indexer = crate::indexer::Indexer::new(&rt.indexer_url);
+        let indexer = crate::indexer::Indexer::from_base_url(&rt.indexer_url);
         tokio::spawn(inventory_loop(
             wallet,
             indexer,
