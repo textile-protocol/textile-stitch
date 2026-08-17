@@ -23,6 +23,8 @@ export interface ConfigBody {
   pools: number
   operatorAddress: string | null
   signer: string
+  /** Address page on this chain's explorer, when the host is known. */
+  explorerUrl: string | null
 }
 
 export interface Bot {

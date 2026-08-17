@@ -71,6 +71,9 @@ pub struct ConfigBody {
     /// The signing address. Never the key.
     pub operator_address: Option<String>,
     pub signer: String,
+    /// Address page on this chain's explorer, when we know the host and have
+    /// an operator address. The panel only surfaces it for a hot wallet.
+    pub explorer_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +93,10 @@ impl From<&ConfigSummary> for ConfigBody {
             pools: c.pools,
             operator_address: c.operator_address.clone(),
             signer: c.signer.clone(),
+            explorer_url: c
+                .operator_address
+                .as_deref()
+                .and_then(|address| crate::setup::address_explorer_url(c.chain_id, address)),
         }
     }
 }
@@ -1731,10 +1738,14 @@ mod tests {
         assert_eq!(bot["config"]["chainId"], 56);
         assert_eq!(bot["config"]["signer"], "hot-wallet");
         // The operator address is derived and shown; the key never is.
-        assert!(bot["config"]["operatorAddress"]
+        let operator = bot["config"]["operatorAddress"]
             .as_str()
-            .unwrap()
-            .starts_with("0x"));
+            .expect("hot-wallet bots expose the derived address");
+        assert!(operator.starts_with("0x"), "{operator}");
+        assert_eq!(
+            bot["config"]["explorerUrl"].as_str(),
+            Some(format!("https://bscscan.com/address/{operator}").as_str())
+        );
         assert!(!body.contains(super::super::testkit::TEST_KEY));
         assert!(!body.to_lowercase().contains("private"));
     }

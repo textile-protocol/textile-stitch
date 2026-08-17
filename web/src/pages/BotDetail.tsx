@@ -19,7 +19,7 @@ import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import VersionRollback from '../components/VersionRollback'
 import { formatTimestamp, shortAddress, shortImage } from '../format'
-import type { Bot, MigrationResult, UpdatesStatus } from '../types'
+import type { Bot, ConfigBody, MigrationResult, UpdatesStatus } from '../types'
 
 const TABS = ['settings', 'dashboard', 'config', 'logs', 'tools'] as const
 type Tab = (typeof TABS)[number]
@@ -326,13 +326,7 @@ export default function BotDetail() {
           <Detail label="Pools">{bot.config ? bot.config.pools : '—'}</Detail>
           <Detail label="Signer">{bot.config?.signer ?? '—'}</Detail>
           <Detail label="Operator">
-            {bot.config?.operatorAddress ? (
-              <span title={bot.config.operatorAddress}>
-                {shortAddress(bot.config.operatorAddress)}
-              </span>
-            ) : (
-              '—'
-            )}
+            <OperatorCell config={bot.config} />
           </Detail>
         </dl>
       </Card>
@@ -452,6 +446,39 @@ function Detail({ label, children }: { label: string; children: React.ReactNode 
       <dt className="text-xs uppercase tracking-wide text-faint">{label}</dt>
       <dd className="mt-0.5">{children}</dd>
     </div>
+  )
+}
+
+/**
+ * Operator address, plus a collapsed explorer link for a hot wallet. Hidden
+ * until opened — same idea as Settings → Advanced. MPC signers get the
+ * address only; the key never lives in this browser.
+ */
+function OperatorCell({ config }: { config: ConfigBody | null }) {
+  if (!config?.operatorAddress) return '—'
+  const explorerUrl =
+    config.signer === 'hot-wallet' ? config.explorerUrl : null
+  return (
+    <>
+      <span title={config.operatorAddress}>
+        {shortAddress(config.operatorAddress)}
+      </span>
+      {explorerUrl && (
+        <details className="mt-1">
+          <summary className="cursor-pointer text-xs text-muted underline hover:text-ink">
+            More
+          </summary>
+          <a
+            href={explorerUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="mt-1 inline-block text-xs text-muted underline hover:text-ink"
+          >
+            Open wallet on explorer
+          </a>
+        </details>
+      )}
+    </>
   )
 }
 
