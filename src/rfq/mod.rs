@@ -34,23 +34,27 @@ pub mod wire;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, Bytes, U256};
 use anyhow::Context as _;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
+use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::Config;
 use crate::eip712::permit2_digest;
 use crate::feed::{HttpFeed, PriceFeed, Quote};
+use crate::rpc::Wallet;
 use crate::signer::DynSigner;
 use crate::taker::encode_order_bytes;
-use crate::tick::{is_price_usable, is_stale};
+use crate::tick::{is_price_usable, is_stale, unix_now};
 
 use nonce::rfq_nonce;
 use order::{build_order, RfqOrderSpec};
 use reserve::Reservations;
-use responder::{book_from_pool, decide_quote, levels_for, CorridorBook};
+use responder::{
+    book_from_pool, decide_quote, levels_for, wallet_tokens, CorridorBook, InventoryView,
+};
 use session::AuthedSession;
 use time::{format_iso_ms, parse_iso_ms, unix_ms_now};
 use wire::{
@@ -68,8 +72,40 @@ pub struct RfqRuntime {
     reactor: Address,
     validation_contract: Address,
     staleness_secs: u64,
+    rpc_url: String,
     books: Vec<CorridorBook>,
     signer: DynSigner,
+}
+
+/// How old a wallet reading may be before a `max` side goes dark.
+/// The refresh loop runs every second; 3s covers one missed tick plus RPC
+/// slop. Fail closed: a stale or missing reading is no inventory.
+const INVENTORY_TTL_SECS: u64 = 3;
+
+/// Latest `min(balance, Permit2 allowance)` per token, shared between the
+/// refresh loop and the session task. Quote path only reads — never waits
+/// on RPC, so a slow node can't blow the reply budget.
+#[derive(Clone, Default)]
+struct InventoryCache(Arc<RwLock<HashMap<Address, (U256, u64)>>>);
+
+impl InventoryCache {
+    fn view(&self, now_secs: u64) -> InventoryView {
+        let Ok(map) = self.0.read() else {
+            return InventoryView::default();
+        };
+        InventoryView::new(
+            map.iter()
+                .filter(|(_, (_, at))| now_secs.saturating_sub(*at) <= INVENTORY_TTL_SECS)
+                .map(|(token, (amount, _))| (*token, *amount))
+                .collect(),
+        )
+    }
+
+    fn set(&self, token: Address, funded: U256, at: u64) {
+        if let Ok(mut map) = self.0.write() {
+            map.insert(token, (funded, at));
+        }
+    }
 }
 
 /// Spawn the responder if — and only if — the config turns it on. Every
@@ -140,6 +176,7 @@ fn build_runtime(
             .parse()
             .context("invalid [rfq].validation_contract")?,
         staleness_secs: cfg.feed.staleness_secs,
+        rpc_url: cfg.rpc_url.clone(),
         books,
         signer,
     })
@@ -162,6 +199,20 @@ async fn run(rt: RfqRuntime) {
         tokio::spawn(price_loop(url, prices.clone()));
     }
 
+    // Live-wallet (`max`) sides: refresh funded amounts off the quote path.
+    // Exact-only configs skip this entirely — no extra RPC.
+    let inventory = InventoryCache::default();
+    let tokens = wallet_tokens(&rt.books);
+    if !tokens.is_empty() {
+        let wallet = Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id);
+        tokio::spawn(inventory_loop(
+            wallet,
+            rt.permit2,
+            tokens,
+            inventory.clone(),
+        ));
+    }
+
     // The reservation ledger outlives sessions: every quote signed before a
     // disconnect stays fillable until its deadline + skew, so a reconnect
     // must not forget it — a fresh ledger would re-advertise and re-quote
@@ -172,8 +223,14 @@ async fn run(rt: RfqRuntime) {
         match session::connect_and_auth(&rt.url, &rt.api_key, &rt.maker_id, &rt.signer).await {
             Ok(authed) => {
                 backoff_secs = 1;
-                let (err, ledger) =
-                    session_loop(&rt, &prices, authed, std::mem::take(&mut reservations)).await;
+                let (err, ledger) = session_loop(
+                    &rt,
+                    &prices,
+                    &inventory,
+                    authed,
+                    std::mem::take(&mut reservations),
+                )
+                .await;
                 reservations = ledger;
                 warn!(
                     error = %format!("{err:#}"),
@@ -195,10 +252,11 @@ async fn run(rt: RfqRuntime) {
 async fn session_loop(
     rt: &RfqRuntime,
     prices: &PriceCache,
+    inventory: &InventoryCache,
     authed: AuthedSession,
     reservations: Reservations,
 ) -> (anyhow::Error, Reservations) {
-    match session_loop_inner(rt, prices, authed, reservations).await {
+    match session_loop_inner(rt, prices, inventory, authed, reservations).await {
         (Ok(()), ledger) => (anyhow::anyhow!("venue closed the stream"), ledger),
         (Err(e), ledger) => (e, ledger),
     }
@@ -207,6 +265,7 @@ async fn session_loop(
 async fn session_loop_inner(
     rt: &RfqRuntime,
     prices: &PriceCache,
+    inventory: &InventoryCache,
     authed: AuthedSession,
     reservations: Reservations,
 ) -> (anyhow::Result<()>, Reservations) {
@@ -241,6 +300,7 @@ async fn session_loop_inner(
     let mut engine = Engine {
         books,
         reservations,
+        inventory: inventory.clone(),
         counter: 0,
         chain_id: rt.chain_id,
         permit2: rt.permit2,
@@ -320,6 +380,7 @@ async fn session_loop_inner(
 struct Engine {
     books: Vec<CorridorBook>,
     reservations: Reservations,
+    inventory: InventoryCache,
     counter: u64,
     chain_id: u64,
     permit2: Address,
@@ -335,6 +396,7 @@ impl Engine {
     /// which is exactly the stale-feed behavior we want.
     fn level_frames(&self, prices: &PriceCache, now_ms: u64) -> Vec<MakerFrame> {
         let now_secs = now_ms / 1_000;
+        let inventory = self.inventory.view(now_secs);
         self.books
             .iter()
             .filter_map(|book| {
@@ -350,6 +412,7 @@ impl Engine {
                     self.reservations.reserved(&book.slug, true, now_secs),
                     self.reservations.reserved(&book.slug, false, now_secs),
                     format_iso_ms(now_ms),
+                    &inventory,
                 )))
             })
             .collect()
@@ -448,6 +511,7 @@ impl Engine {
             quote.price,
             self.reservations.reserved(&book.slug, true, now_secs),
             self.reservations.reserved(&book.slug, false, now_secs),
+            &self.inventory.view(now_secs),
         ) {
             Ok(plan) => plan,
             Err(reason) => return reject(reason),
@@ -530,9 +594,51 @@ async fn price_loop(url: String, cache: PriceCache) {
     }
 }
 
+/// `min(ERC20 balance, Permit2 allowance)` — the same funded amount the
+/// ladder posts against. Allowance is the fill-time constraint: a balance
+/// the wallet hasn't approved is not quotable.
+async fn read_funded(wallet: &Wallet, permit2: Address, token: Address) -> anyhow::Result<U256> {
+    let owner = wallet.address();
+    let balance = wallet
+        .read_uint(token, &Bytes::from(encode_balance_of(owner)))
+        .await
+        .context("reading RFQ token balance")?;
+    let allowance = wallet
+        .read_uint(token, &Bytes::from(encode_allowance(owner, permit2)))
+        .await
+        .context("reading RFQ Permit2 allowance")?;
+    Ok(balance.min(allowance))
+}
+
+/// Refresh funded amounts for every `max` token, once a second. A failed
+/// read leaves the previous value in place; the TTL then fails the side
+/// closed instead of quoting a stale high balance forever.
+async fn inventory_loop(
+    wallet: Wallet,
+    permit2: Address,
+    tokens: Vec<Address>,
+    cache: InventoryCache,
+) {
+    loop {
+        let now = unix_now();
+        for token in &tokens {
+            match read_funded(&wallet, permit2, *token).await {
+                Ok(funded) => cache.set(*token, funded, now),
+                Err(e) => warn!(
+                    token = %token,
+                    error = %format!("{e:#}"),
+                    "rfq inventory refresh failed; last reading kept until TTL"
+                ),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RfqCapacity;
     use crate::quote::Spread;
     use crate::signer::{recover_address, LocalSigner};
     use crate::tick::unix_now;
@@ -559,11 +665,12 @@ mod tests {
                 debt_decimals: 6,
                 buy_spread: Some(Spread::Bps(200)),
                 sell_spread: Some(Spread::Bps(200)),
-                buy_capacity_debt: Some(U256::from(1_500_000_000u64)),
-                sell_capacity_collateral: Some(U256::from(1_500_000_000u64)),
+                buy_capacity_debt: Some(RfqCapacity::Exact(U256::from(1_500_000_000u64))),
+                sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(1_500_000_000u64))),
                 feed_url: "http://feed".into(),
             }],
             reservations: Reservations::new(),
+            inventory: InventoryCache::default(),
             counter: 0,
             chain_id: 8453,
             permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3"
@@ -786,5 +893,34 @@ mod tests {
             .unwrap()
             .block_on(signer.sign_digest(digest))
             .unwrap()
+    }
+
+    #[test]
+    fn inventory_cache_drops_stale_readings() {
+        let cache = InventoryCache::default();
+        let token: Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        cache.set(token, U256::from(100u64), 1_000);
+
+        assert_eq!(
+            cache.view(1_000 + INVENTORY_TTL_SECS).funded(token),
+            Some(U256::from(100u64)),
+            "a reading at the TTL edge is still usable"
+        );
+        assert_eq!(
+            cache.view(1_000 + INVENTORY_TTL_SECS + 1).funded(token),
+            None,
+            "one second past the TTL fails closed"
+        );
+        assert_eq!(
+            cache.view(1_000).funded(
+                "0x0000000000000000000000000000000000000002"
+                    .parse()
+                    .unwrap()
+            ),
+            None,
+            "an unread token is not inventable"
+        );
     }
 }

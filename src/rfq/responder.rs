@@ -6,9 +6,11 @@
 //! functions and owns everything async, so the price/size rules stay unit
 //! testable exactly like the ladder's `quote` module.
 
+use std::collections::HashMap;
+
 use alloy_primitives::{Address, U256};
 
-use crate::config::PoolConfig;
+use crate::config::{PoolConfig, RfqCapacity};
 use crate::quote::{ask_price, bid_price, Spread};
 use crate::tick::is_price_usable;
 
@@ -26,18 +28,66 @@ pub struct CorridorBook {
     pub debt_decimals: u8,
     pub buy_spread: Option<Spread>,
     pub sell_spread: Option<Spread>,
-    /// Debt the bid side may commit (atomic); `None` = side off for RFQ.
-    pub buy_capacity_debt: Option<U256>,
-    /// Collateral the ask side may commit (atomic); `None` = side off.
-    pub sell_capacity_collateral: Option<U256>,
+    /// Debt the bid side may commit; `None` = side off for RFQ.
+    pub buy_capacity_debt: Option<RfqCapacity>,
+    /// Collateral the ask side may commit; `None` = side off.
+    pub sell_capacity_collateral: Option<RfqCapacity>,
     /// The feed this corridor prices off (pool override or the bot default).
     pub feed_url: String,
 }
 
+/// Latest funded amounts (`min(balance, Permit2 allowance)`) keyed by token.
+/// Empty / missing entries fail closed for [`RfqCapacity::Wallet`] sides:
+/// no quote, no published level. Exact capacities ignore this map.
+#[derive(Debug, Clone, Default)]
+pub struct InventoryView {
+    funded: HashMap<Address, U256>,
+}
+
+impl InventoryView {
+    pub fn new(funded: HashMap<Address, U256>) -> Self {
+        Self { funded }
+    }
+
+    pub fn funded(&self, token: Address) -> Option<U256> {
+        self.funded.get(&token).copied()
+    }
+}
+
+/// Tokens a book needs live wallet reads for. Empty when every RFQ side is
+/// an exact cap — the inventory loop is then never spawned.
+pub fn wallet_tokens(books: &[CorridorBook]) -> Vec<Address> {
+    let mut tokens: Vec<Address> = books
+        .iter()
+        .flat_map(|book| {
+            [
+                matches!(book.buy_capacity_debt, Some(RfqCapacity::Wallet)).then_some(book.debt),
+                matches!(book.sell_capacity_collateral, Some(RfqCapacity::Wallet))
+                    .then_some(book.collateral),
+            ]
+        })
+        .flatten()
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn resolve_capacity(
+    policy: Option<RfqCapacity>,
+    token: Address,
+    inv: &InventoryView,
+) -> Option<U256> {
+    match policy? {
+        RfqCapacity::Exact(v) => Some(v),
+        RfqCapacity::Wallet => inv.funded(token),
+    }
+}
+
 /// Build the corridor book for a pool, or `None` when the pool doesn't opt
-/// into RFQ. Errors mirror config validation (bad addresses, `max` capacity) —
-/// unreachable for a config that passed `Config::from_toml`, kept as errors so
-/// the responder can never start on a half-parsed pool.
+/// into RFQ. Errors mirror config validation (bad addresses) — unreachable
+/// for a config that passed `Config::from_toml`, kept as errors so the
+/// responder can never start on a half-parsed pool.
 pub fn book_from_pool(
     pool: &PoolConfig,
     default_feed_url: &str,
@@ -91,6 +141,7 @@ pub fn decide_quote(
     mid: f64,
     reserved_bid: U256,
     reserved_ask: U256,
+    inventory: &InventoryView,
 ) -> Result<QuotePlan, RejectReason> {
     // Token orientation. sellToken = what the taker sells = maker's output.
     let (Ok(sell_token), Ok(buy_token)) = (
@@ -171,12 +222,13 @@ pub fn decide_quote(
         return Err(RejectReason::Size);
     }
 
-    // Capacity: the maker's committed input against configured liquidity
-    // minus what in-flight quotes already claim.
+    // Capacity: configured cap or the latest funded wallet reading, minus
+    // what in-flight quotes already claim. A `max` side with no fresh
+    // reading fails closed (inventory) rather than guessing.
     let capacity = if bid {
-        book.buy_capacity_debt
+        resolve_capacity(book.buy_capacity_debt, book.debt, inventory)
     } else {
-        book.sell_capacity_collateral
+        resolve_capacity(book.sell_capacity_collateral, book.collateral, inventory)
     };
     let Some(capacity) = capacity else {
         return Err(RejectReason::Inventory);
@@ -211,9 +263,13 @@ pub fn levels_for(
     reserved_bid: U256,
     reserved_ask: U256,
     as_of: String,
+    inventory: &InventoryView,
 ) -> LevelsFrame {
     let mut bids = Vec::new();
-    if let (Some(spread), Some(capacity)) = (book.buy_spread, book.buy_capacity_debt) {
+    if let (Some(spread), Some(capacity)) = (
+        book.buy_spread,
+        resolve_capacity(book.buy_capacity_debt, book.debt, inventory),
+    ) {
         let remaining = capacity.saturating_sub(reserved_bid);
         let price = bid_price(mid, spread);
         if !remaining.is_zero() && is_price_usable(price) {
@@ -233,7 +289,10 @@ pub fn levels_for(
         }
     }
     let mut asks = Vec::new();
-    if let (Some(spread), Some(capacity)) = (book.sell_spread, book.sell_capacity_collateral) {
+    if let (Some(spread), Some(capacity)) = (
+        book.sell_spread,
+        resolve_capacity(book.sell_capacity_collateral, book.collateral, inventory),
+    ) {
         let remaining = capacity.saturating_sub(reserved_ask);
         let price = ask_price(mid, spread);
         if !remaining.is_zero() && is_price_usable(price) {
@@ -270,10 +329,44 @@ mod tests {
             debt_decimals: 6,
             buy_spread: Some(Spread::Bps(200)),
             sell_spread: Some(Spread::Bps(200)),
-            buy_capacity_debt: Some(U256::from(5_000_000_000u64)),
-            sell_capacity_collateral: Some(U256::from(5_000_000_000u64)),
+            buy_capacity_debt: Some(RfqCapacity::Exact(U256::from(5_000_000_000u64))),
+            sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(5_000_000_000u64))),
             feed_url: "http://feed".into(),
         }
+    }
+
+    fn decide(
+        book: &CorridorBook,
+        req: &QuoteRequestFrame,
+        mid: f64,
+        reserved_bid: U256,
+        reserved_ask: U256,
+    ) -> Result<QuotePlan, RejectReason> {
+        decide_quote(
+            book,
+            req,
+            mid,
+            reserved_bid,
+            reserved_ask,
+            &InventoryView::default(),
+        )
+    }
+
+    fn levels(
+        book: &CorridorBook,
+        mid: f64,
+        reserved_bid: U256,
+        reserved_ask: U256,
+        as_of: String,
+    ) -> LevelsFrame {
+        levels_for(
+            book,
+            mid,
+            reserved_bid,
+            reserved_ask,
+            as_of,
+            &InventoryView::default(),
+        )
     }
 
     fn request(sell_token: &str, buy_token: &str) -> QuoteRequestFrame {
@@ -298,7 +391,7 @@ mod tests {
         // Taker sells 1000 collateral (cap, 6dp) at mid 1.0, 200 bps bid, 1 bps fee.
         let mut req = request(COLLATERAL, DEBT);
         req.sell_amount = Some("1000000000".into());
-        let plan = decide_quote(&book(), &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        let plan = decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
 
         assert!(plan.bid);
         // The golden fee-fit numbers ride through unchanged.
@@ -317,7 +410,7 @@ mod tests {
         // Taker sells 1000 debt; maker receives debt, pays collateral at 1.02.
         let mut req = request(DEBT, COLLATERAL);
         req.sell_amount = Some("1000000000".into());
-        let plan = decide_quote(&book(), &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        let plan = decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
 
         assert!(!plan.bid);
         assert_eq!(plan.output, U256::from(999_900_010u64));
@@ -334,7 +427,7 @@ mod tests {
         let mut req = request(COLLATERAL, DEBT);
         req.buy_amount = Some("980000000".into());
         req.fee_bps = 5;
-        let plan = decide_quote(&book(), &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        let plan = decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
 
         assert!(plan.bid);
         assert_eq!(
@@ -354,7 +447,7 @@ mod tests {
         let mut req = request(COLLATERAL, DEBT);
         req.sell_amount = Some("100000000000".into()); // maker would pay ~98e9 > 5e9
         assert_eq!(
-            decide_quote(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
+            decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
             Err(RejectReason::Size)
         );
 
@@ -363,11 +456,11 @@ mod tests {
         req.sell_amount = Some("1000000000".into()); // maker pays ~0.98e9
         let reserved_bid = U256::from(4_500_000_000u64); // 4.5e9 of 5e9 claimed
         assert_eq!(
-            decide_quote(&book(), &req, 1.0, reserved_bid, U256::ZERO),
+            decide(&book(), &req, 1.0, reserved_bid, U256::ZERO),
             Err(RejectReason::Inventory)
         );
         // The ask side's reservations don't bleed into the bid check.
-        assert!(decide_quote(&book(), &req, 1.0, U256::ZERO, reserved_bid).is_ok());
+        assert!(decide(&book(), &req, 1.0, U256::ZERO, reserved_bid).is_ok());
     }
 
     #[test]
@@ -378,7 +471,7 @@ mod tests {
         let mut req = request(DEBT, COLLATERAL); // hits the ask side
         req.sell_amount = Some("1000000".into());
         assert_eq!(
-            decide_quote(&one_sided, &req, 1.0, U256::ZERO, U256::ZERO),
+            decide(&one_sided, &req, 1.0, U256::ZERO, U256::ZERO),
             Err(RejectReason::Inventory)
         );
     }
@@ -392,27 +485,27 @@ mod tests {
         );
         req.sell_amount = Some("1000".into());
         assert_eq!(
-            decide_quote(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
+            decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
             Err(RejectReason::Busy)
         );
 
         // Neither amount, both amounts, or a non-numeric amount.
         let req = request(COLLATERAL, DEBT);
         assert_eq!(
-            decide_quote(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
+            decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
             Err(RejectReason::Busy)
         );
         let mut req = request(COLLATERAL, DEBT);
         req.sell_amount = Some("1".into());
         req.buy_amount = Some("1".into());
         assert_eq!(
-            decide_quote(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
+            decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
             Err(RejectReason::Busy)
         );
         let mut req = request(COLLATERAL, DEBT);
         req.sell_amount = Some("12.5".into());
         assert_eq!(
-            decide_quote(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
+            decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
             Err(RejectReason::Busy)
         );
     }
@@ -426,7 +519,7 @@ mod tests {
         let mut req = request(COLLATERAL, DEBT);
         req.sell_amount = Some("1".into());
         assert_eq!(
-            decide_quote(&wide, &req, 1.0, U256::ZERO, U256::ZERO),
+            decide(&wide, &req, 1.0, U256::ZERO, U256::ZERO),
             Err(RejectReason::Size)
         );
     }
@@ -434,7 +527,7 @@ mod tests {
     #[test]
     fn levels_shrink_with_reservations_and_drop_empty_sides() {
         let b = book();
-        let frame = levels_for(&b, 1.0, U256::ZERO, U256::ZERO, "t0".into());
+        let frame = levels(&b, 1.0, U256::ZERO, U256::ZERO, "t0".into());
         assert_eq!(frame.corridor_id, "cngn-usdc");
         assert_eq!(frame.bids.len(), 1);
         assert_eq!(frame.asks.len(), 1);
@@ -447,7 +540,7 @@ mod tests {
         assert_eq!(frame.asks[0].rate_ray, "1020000000000000000000000000");
 
         // Reservations shrink the published size…
-        let frame = levels_for(
+        let frame = levels(
             &b,
             1.0,
             U256::ZERO,
@@ -456,7 +549,7 @@ mod tests {
         );
         assert_eq!(frame.asks[0].size, "1");
         // …and a fully-claimed side disappears rather than publishing zero.
-        let frame = levels_for(
+        let frame = levels(
             &b,
             1.0,
             U256::ZERO,
@@ -504,11 +597,74 @@ mod tests {
             .unwrap()
             .expect("book built");
         assert_eq!(book.slug, "cngn-usdc");
-        assert_eq!(book.buy_capacity_debt, Some(U256::from(5_000_000_000u64)));
+        assert_eq!(
+            book.buy_capacity_debt,
+            Some(RfqCapacity::Exact(U256::from(5_000_000_000u64)))
+        );
         assert_eq!(
             book.sell_capacity_collateral, None,
             "sell side not configured"
         );
         assert_eq!(book.feed_url, "http://feed");
+    }
+
+    #[test]
+    fn max_liquidity_is_a_wallet_policy_and_needs_a_fresh_reading() {
+        let mut wallet_book = book();
+        wallet_book.buy_capacity_debt = Some(RfqCapacity::Wallet);
+        wallet_book.sell_capacity_collateral = Some(RfqCapacity::Wallet);
+
+        let mut req = request(COLLATERAL, DEBT);
+        req.sell_amount = Some("1000000000".into());
+
+        // No reading yet — fail closed, don't guess the balance.
+        assert_eq!(
+            decide(&wallet_book, &req, 1.0, U256::ZERO, U256::ZERO),
+            Err(RejectReason::Inventory)
+        );
+        let dark = levels(&wallet_book, 1.0, U256::ZERO, U256::ZERO, "t0".into());
+        assert!(dark.bids.is_empty() && dark.asks.is_empty());
+
+        let debt: Address = DEBT.parse().unwrap();
+        let collateral: Address = COLLATERAL.parse().unwrap();
+        let inv = InventoryView::new(HashMap::from([
+            (debt, U256::from(2_000_000_000u64)),
+            (collateral, U256::from(3_000_000_000u64)),
+        ]));
+        assert!(decide_quote(&wallet_book, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
+
+        // Reservations still eat the live balance.
+        assert_eq!(
+            decide_quote(
+                &wallet_book,
+                &req,
+                1.0,
+                U256::from(1_500_000_000u64),
+                U256::ZERO,
+                &inv
+            ),
+            Err(RejectReason::Inventory)
+        );
+
+        let frame = levels_for(&wallet_book, 1.0, U256::ZERO, U256::ZERO, "t1".into(), &inv);
+        assert_eq!(frame.asks[0].size, "3000000000");
+
+        // An exact cap ignores a smaller wallet reading — the policy is the cap.
+        let exact = book();
+        assert!(decide_quote(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
+    }
+
+    #[test]
+    fn wallet_tokens_are_only_the_max_sides() {
+        let exact = book();
+        assert!(wallet_tokens(&[exact.clone()]).is_empty());
+
+        let mut both = exact.clone();
+        both.buy_capacity_debt = Some(RfqCapacity::Wallet);
+        both.sell_capacity_collateral = Some(RfqCapacity::Wallet);
+        let tokens = wallet_tokens(&[both]);
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&COLLATERAL.parse().unwrap()));
+        assert!(tokens.contains(&DEBT.parse().unwrap()));
     }
 }

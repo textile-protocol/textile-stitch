@@ -1372,12 +1372,11 @@ mod tests {
 
     #[test]
     fn rfq_state_surfaces_read_only_through_the_view() {
-        // An enabled RFQ pool needs explicit capacity, so swap the template's
-        // "max" sentinels for hard numbers before opting the pool in.
-        let sized = TEMPLATE.replace("\"max\"", "\"1000000000000000000000\"");
+        // `"max"` is a valid RFQ capacity (live wallet). Keep the template's
+        // sentinels so a save can't silently rewrite them to a hard number.
         let src = format!(
             "{}\nrfq_corridor = \"cngn-usdt\"\n\n[rfq]\nenabled = true\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\nmaker_id = \"mk_x\"\nvalidation_contract = \"0x00000000000000000000000000000000000000aa\"\n",
-            sized.trim_end()
+            TEMPLATE.trim_end()
         );
         let v = read_settings(&src).unwrap();
         assert!(v.rfq_enabled);

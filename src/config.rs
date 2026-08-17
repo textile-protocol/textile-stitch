@@ -415,14 +415,14 @@ impl PoolConfig {
         })
     }
 
-    /// Debt capacity (atomic) the RFQ responder may commit on the bid side, or
-    /// `None` when the side doesn't quote over RFQ (no spread configured).
+    /// Debt capacity the RFQ responder may commit on the bid side, or `None`
+    /// when the side doesn't quote over RFQ (no spread configured).
     ///
-    /// RFQ capacity must be an explicit number: the responder tracks in-flight
-    /// reservations against it and publishes it as level size, so the `max`
-    /// sentinel (a wallet read the responder deliberately doesn't do) is an
-    /// error rather than a guess.
-    pub fn rfq_buy_capacity_debt(&self) -> anyhow::Result<Option<U256>> {
+    /// `"max"` is [`RfqCapacity::Wallet`]: the responder reads
+    /// `min(balance, Permit2 allowance)` on its own 1s loop and reserves
+    /// in-flight quotes against that number. An explicit amount stays a hard
+    /// cap. Neither path does an RPC on the quote hot path.
+    pub fn rfq_buy_capacity_debt(&self) -> anyhow::Result<Option<RfqCapacity>> {
         if self.buy_spread().is_none() {
             return Ok(None);
         }
@@ -433,9 +433,9 @@ impl PoolConfig {
         )
     }
 
-    /// Collateral capacity (atomic) for the RFQ ask side; see
+    /// Collateral capacity for the RFQ ask side; see
     /// [`Self::rfq_buy_capacity_debt`].
-    pub fn rfq_sell_capacity_collateral(&self) -> anyhow::Result<Option<U256>> {
+    pub fn rfq_sell_capacity_collateral(&self) -> anyhow::Result<Option<RfqCapacity>> {
         if self.sell_spread().is_none() {
             return Ok(None);
         }
@@ -447,27 +447,35 @@ impl PoolConfig {
     }
 }
 
-/// One RFQ side's committed capacity: the ladder total when it's an exact
-/// number, else the flat order size, else the side is off. `max` is rejected —
-/// the responder needs a hard number to reserve against.
+/// How one RFQ side sizes itself. [`RfqCapacity::Exact`] is a configured
+/// atomic cap; [`RfqCapacity::Wallet`] tracks the live funded balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RfqCapacity {
+    Exact(U256),
+    Wallet,
+}
+
+/// One RFQ side's capacity policy: the ladder total (`max` → live wallet,
+/// otherwise a hard cap), else the flat order size, else the side is off.
 fn rfq_side_capacity(
     total: Option<&str>,
     order_size: Option<&str>,
     side: &str,
-) -> anyhow::Result<Option<U256>> {
+) -> anyhow::Result<Option<RfqCapacity>> {
     if let Some(raw) = total {
         return match parse_liquidity_amount(raw, &format!("{side} total liquidity"))? {
-            LiquidityAmount::Exact(v) => Ok(Some(v)),
-            LiquidityAmount::Max => anyhow::bail!(
-                "rfq pools need an explicit {side}-side liquidity amount, not \"max\" — \
-                 the responder reserves in-flight quotes against a fixed capacity"
-            ),
+            LiquidityAmount::Exact(v) => Ok(Some(RfqCapacity::Exact(v))),
+            LiquidityAmount::Max => Ok(Some(RfqCapacity::Wallet)),
         };
     }
     match order_size {
-        Some(raw) => Ok(Some(raw.trim().parse::<U256>().with_context(|| {
-            format!("invalid {side} order size for an rfq pool")
-        })?)),
+        Some(raw) => {
+            let v = raw
+                .trim()
+                .parse::<U256>()
+                .with_context(|| format!("invalid {side} order size for an rfq pool"))?;
+            Ok(Some(RfqCapacity::Exact(v)))
+        }
         None => Ok(None),
     }
 }
@@ -616,8 +624,8 @@ impl Config {
                 !slug.trim().is_empty(),
                 "pools[{idx}].rfq_corridor is empty"
             );
-            // Surface capacity problems (notably `max` liquidity) at load time
-            // instead of when the first quote request arrives.
+            // Surface unparseable capacity at load time. `"max"` is valid —
+            // it means live wallet, resolved at runtime.
             pool.rfq_buy_capacity_debt()
                 .with_context(|| format!("pools[{idx}] (rfq corridor {slug})"))?;
             pool.rfq_sell_capacity_collateral()
@@ -1003,9 +1011,9 @@ mod tests {
     }
 
     #[test]
-    fn rfq_capacity_needs_an_explicit_number_not_max() {
+    fn rfq_capacity_accepts_max_as_live_wallet() {
         // The LEAN_POOL_BASE pool sizes both sides with flat order sizes, so
-        // those are the capacities.
+        // those are exact capacities.
         let toml = format!(
             "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
             LEAN_POOL_BASE
@@ -1014,11 +1022,11 @@ mod tests {
         let pool = &cfg.pools[0];
         assert_eq!(
             pool.rfq_buy_capacity_debt().unwrap(),
-            Some(U256::from(1_000_000_000u64))
+            Some(RfqCapacity::Exact(U256::from(1_000_000_000u64)))
         );
         assert_eq!(
             pool.rfq_sell_capacity_collateral().unwrap(),
-            Some(U256::from(1_000_000u64))
+            Some(RfqCapacity::Exact(U256::from(1_000_000u64)))
         );
 
         // A ladder total wins over the flat size when both are set.
@@ -1029,16 +1037,19 @@ mod tests {
         let cfg = Config::from_toml(&toml).unwrap();
         assert_eq!(
             cfg.pools[0].rfq_buy_capacity_debt().unwrap(),
-            Some(U256::from(5_000_000_000u64))
+            Some(RfqCapacity::Exact(U256::from(5_000_000_000u64)))
         );
 
-        // `max` can't back an RFQ reservation ledger — rejected at load time.
+        // `max` is the live-wallet policy — same sentinel the ladder uses.
         let toml = format!(
             "{}\nbuy_total_liquidity_debt = \"max\"\nbuy_min_slice_debt = \"10000000\"\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
             LEAN_POOL_BASE
         );
-        let err = Config::from_toml(&toml).expect_err("max capacity is rejected for rfq pools");
-        assert!(format!("{err:#}").contains("max"));
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert_eq!(
+            cfg.pools[0].rfq_buy_capacity_debt().unwrap(),
+            Some(RfqCapacity::Wallet)
+        );
 
         // A side with no spread simply doesn't quote over RFQ.
         let toml = format!(
