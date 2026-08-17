@@ -149,19 +149,17 @@ pub struct SettingsBody {
     /// Whether saving will be accepted. False for a bot whose config the panel can
     /// see but not write.
     pub editable: bool,
-    // ----- RFQ (beta), all read-only. Like `editable`, none of these exist in
-    // `SettingsUpdate`: the gate and the [rfq] block can't be written from the
-    // panel — the spec forbids a form control for them. -----
-    /// True only when the config's `[experimental].rfq_panel` is exactly the
-    /// beta token; gates the read-only RFQ card. Fail closed.
-    pub rfq_panel_unlocked: bool,
     pub rfq_enabled: bool,
     pub rfq_url: String,
-    pub rfq_corridors: Vec<String>,
+    pub rfq_maker_id: String,
+    pub rfq_validation_contract: String,
+    pub rfq_corridor: String,
+    /// A maker API key is stored in `rfq-api.key`. Never the secret itself.
+    pub rfq_api_key_set: bool,
 }
 
 impl SettingsBody {
-    fn from_view(v: &SettingsView, editable: bool) -> Self {
+    fn from_view(v: &SettingsView, editable: bool, rfq_api_key_set: bool) -> Self {
         Self {
             rpc_url: v.rpc_url.clone(),
             feed_url: v.feed_url.clone(),
@@ -184,12 +182,18 @@ impl SettingsBody {
             lean_base_bps: v.lean_base_bps.clone(),
             lean_wide_bps: v.lean_wide_bps.clone(),
             editable,
-            rfq_panel_unlocked: v.rfq_panel_unlocked,
             rfq_enabled: v.rfq_enabled,
             rfq_url: v.rfq_url.clone(),
-            rfq_corridors: v.rfq_corridors.clone(),
+            rfq_maker_id: v.rfq_maker_id.clone(),
+            rfq_validation_contract: v.rfq_validation_contract.clone(),
+            rfq_corridor: v.rfq_corridor.clone(),
+            rfq_api_key_set,
         }
     }
+}
+
+fn rfq_key_is_set(config_path: &std::path::Path) -> bool {
+    config_path.parent().is_some_and(setup::rfq_api_key_is_set)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -264,7 +268,12 @@ pub async fn show(
     let toml = read_toml(&path)?;
     // A pool index out of range is the caller's mistake, not a server fault.
     let view = setup::read_settings_at(&toml, query.pool).map_err(ApiError::bad_request)?;
-    Ok(Json(SettingsBody::from_view(&view, bot.is_editable())).into_response())
+    Ok(Json(SettingsBody::from_view(
+        &view,
+        bot.is_editable(),
+        rfq_key_is_set(&path),
+    ))
+    .into_response())
 }
 
 /// A partial update. Anything left out keeps its current value, so a UI that only
@@ -308,6 +317,19 @@ pub struct SettingsUpdate {
     pub lean_base_bps: Option<String>,
     #[serde(default)]
     pub lean_wide_bps: Option<String>,
+    #[serde(default)]
+    pub rfq_enabled: Option<bool>,
+    #[serde(default)]
+    pub rfq_url: Option<String>,
+    #[serde(default)]
+    pub rfq_maker_id: Option<String>,
+    #[serde(default)]
+    pub rfq_validation_contract: Option<String>,
+    #[serde(default)]
+    pub rfq_corridor: Option<String>,
+    /// Write-only. Omitted or empty leaves the stored key alone. Never returned.
+    #[serde(default)]
+    pub rfq_api_key: Option<String>,
 }
 
 impl SettingsUpdate {
@@ -379,6 +401,21 @@ impl SettingsUpdate {
         if let Some(v) = &self.lean_wide_bps {
             patch.lean_wide_bps = Some(v.trim().to_string());
         }
+        if let Some(v) = self.rfq_enabled {
+            patch.rfq_enabled = Some(v);
+        }
+        if let Some(v) = &self.rfq_url {
+            patch.rfq_url = Some(v.trim().to_string());
+        }
+        if let Some(v) = &self.rfq_maker_id {
+            patch.rfq_maker_id = Some(v.trim().to_string());
+        }
+        if let Some(v) = &self.rfq_validation_contract {
+            patch.rfq_validation_contract = Some(v.trim().to_string());
+        }
+        if let Some(v) = &self.rfq_corridor {
+            patch.rfq_corridor = Some(v.trim().to_string());
+        }
         Ok(patch)
     }
 }
@@ -408,6 +445,30 @@ pub async fn update(
     // "edited config is not valid" alone doesn't name the field that failed.
     let edited = setup::apply_settings(&current_toml, &patch)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+
+    if let Some(key) = body
+        .rfq_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        let dir = path.parent().ok_or_else(|| {
+            ApiError::internal(&anyhow::anyhow!(
+                "{}'s config has no parent directory",
+                bot.name
+            ))
+        })?;
+        setup::write_rfq_api_key(dir, key).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        crate::panel::provision::hand_over_paths_to_bot(
+            dir,
+            &[
+                setup::RFQ_API_KEY_FILE.to_string(),
+                "stitch.env".to_string(),
+            ],
+            state.cfg.bot_uid,
+        )
+        .map_err(|e| ApiError::internal(&e))?;
+    }
 
     save_and_restart(&state, &bot, &path, &edited, pool).await
 }
@@ -670,7 +731,7 @@ async fn save_and_restart(
     };
 
     Ok(Json(serde_json::json!({
-        "settings": SettingsBody::from_view(&view, true),
+        "settings": SettingsBody::from_view(&view, true, rfq_key_is_set(path)),
         "restarted": restarted,
         "restartError": restart_error,
         "message": message,
@@ -749,7 +810,7 @@ async fn apply_live_change(
         let view =
             setup::read_settings_at(&read_toml(path)?, pool).map_err(ApiError::bad_request)?;
         Ok(Json(serde_json::json!({
-            "settings": SettingsBody::from_view(&view, true),
+            "settings": SettingsBody::from_view(&view, true, rfq_key_is_set(path)),
             "restarted": restarted,
             "restartError": restart_error,
             "message": message,
@@ -996,35 +1057,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfq_panel_fields_default_locked_and_ignore_write_attempts() {
-        let h = harness("settings-rfq-gate");
+    async fn rfq_settings_round_trip_and_api_key_stays_off_the_wire() {
+        let h = harness("settings-rfq-write");
         seed(&h, "bot-a");
         let (status, body) = h.get("/api/bots/bot-a/settings").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
-        // Templates never ship the gate or an [rfq] block: locked, disabled.
-        assert_eq!(v["rfqPanelUnlocked"], false);
         assert_eq!(v["rfqEnabled"], false);
         assert_eq!(v["rfqUrl"], "");
-        assert_eq!(v["rfqCorridors"], serde_json::json!([]));
+        assert_eq!(v["rfqMakerId"], "");
+        assert_eq!(v["rfqCorridor"], "");
+        assert_eq!(v["rfqApiKeySet"], false);
+        assert!(
+            v.get("rfqApiKey").is_none(),
+            "GET must never name the secret"
+        );
 
-        // A PATCH trying to flip the gate is silently dropped — there is no
-        // SettingsUpdate field for it, by design. The save itself succeeds
-        // (unknown keys are ignored) and the gate stays locked.
         let (status, body) = h
             .patch_json(
                 "/api/bots/bot-a/settings",
-                json!({ "rfqPanelUnlocked": true, "rfqEnabled": true, "ttlSecs": 90 }),
+                json!({
+                    "rfqEnabled": true,
+                    "rfqUrl": "wss://api.textilecredit.com/v2/maker/stream",
+                    "rfqMakerId": "clmaker123",
+                    "rfqValidationContract": "0x00000000000000000000000000000000000000aa",
+                    "rfqCorridor": "cngn-usdt-bsc",
+                    "rfqApiKey": "tx_live_panel_secret",
+                    "ttlSecs": 90
+                }),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
-        assert_eq!(v["settings"]["rfqPanelUnlocked"], false);
-        assert_eq!(v["settings"]["rfqEnabled"], false);
-        assert_eq!(v["settings"]["ttlSecs"], 90, "the legitimate edit lands");
-        // And the file on disk gained no gate either.
+        assert_eq!(v["settings"]["rfqEnabled"], true);
+        assert_eq!(
+            v["settings"]["rfqUrl"],
+            "wss://api.textilecredit.com/v2/maker/stream"
+        );
+        assert_eq!(v["settings"]["rfqMakerId"], "clmaker123");
+        assert_eq!(v["settings"]["rfqCorridor"], "cngn-usdt-bsc");
+        assert_eq!(v["settings"]["rfqApiKeySet"], true);
+        assert_eq!(v["settings"]["ttlSecs"], 90);
+        assert!(
+            v["settings"].get("rfqApiKey").is_none(),
+            "PATCH response must not echo the key"
+        );
+        assert!(
+            !body.contains("tx_live_panel_secret"),
+            "the raw key must never appear in the HTTP body"
+        );
+
+        let stored = std::fs::read_to_string(h.root.join("bot-a").join("rfq-api.key")).unwrap();
+        assert_eq!(stored.trim(), "tx_live_panel_secret");
         let toml = std::fs::read_to_string(h.root.join("bot-a").join("stitch.toml")).unwrap();
-        assert!(!toml.contains("rfq"), "no rfq keys may appear from a save");
+        assert!(toml.contains("[rfq]"));
+        assert!(toml.contains("clmaker123"));
+        assert!(
+            !toml.contains("tx_live_panel_secret"),
+            "the key must not land in stitch.toml"
+        );
+
+        // A later spread-only save must not wipe RFQ or the key file.
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "ttlSecs": 120 }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["rfqEnabled"], true);
+        assert_eq!(v["settings"]["rfqMakerId"], "clmaker123");
+        assert_eq!(v["settings"]["rfqApiKeySet"], true);
+        assert_eq!(
+            std::fs::read_to_string(h.root.join("bot-a").join("rfq-api.key"))
+                .unwrap()
+                .trim(),
+            "tx_live_panel_secret"
+        );
     }
 
     #[tokio::test]

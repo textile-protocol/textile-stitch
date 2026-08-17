@@ -26,7 +26,7 @@ use crate::panel::inventory::{Bot, Layout, RUN_DIR};
 use crate::panel::naming::{
     container_name, LABEL_BOT, LABEL_CORRIDOR, LABEL_LAYOUT, LABEL_ONE_SHOT,
 };
-use crate::setup::{self, SignerView};
+use crate::setup::{self, SignerView, RFQ_API_KEY_FILE, RFQ_API_KEY_FILE_ENV};
 
 /// Value of the layout label on containers the panel creates.
 pub const LAYOUT_DIRECTORY: &str = "directory";
@@ -73,13 +73,19 @@ pub fn signer_runtime_at(config: &Path) -> Result<SignerRuntime> {
         std::fs::read_to_string(config).with_context(|| format!("reading {}", config.display()))?;
     let signer = setup::try_read_signer(&toml)
         .with_context(|| format!("working out which signer {} uses", config.display()))?;
-    Ok(signer_runtime_for(&signer, config))
+    Ok(with_rfq_key_env(
+        signer_runtime_for(&signer, config),
+        config,
+    ))
 }
 
 /// Pure core of [`signer_runtime`], so the mapping from signer to mounts and env
 /// is testable without a config on disk.
 pub fn signer_runtime_from(signer: &SignerView, dir: &Path) -> SignerRuntime {
-    signer_runtime_for(signer, &setup::config_paths(dir).toml)
+    with_rfq_key_env(
+        signer_runtime_for(signer, &setup::config_paths(dir).toml),
+        &setup::config_paths(dir).toml,
+    )
 }
 
 /// As [`signer_runtime_from`], keyed on the config file rather than its
@@ -121,6 +127,22 @@ pub fn signer_runtime_for(signer: &SignerView, config: &Path) -> SignerRuntime {
             )],
         },
     }
+}
+
+/// If the panel has written `rfq-api.key` beside the config, point the
+/// container at it. Existing containers created before the key was saved
+/// still see the file via the run-dir mount; the bot also falls back to
+/// that sibling path so a Settings save doesn't need a recreate.
+fn with_rfq_key_env(mut runtime: SignerRuntime, config: &Path) -> SignerRuntime {
+    let present = config
+        .parent()
+        .is_some_and(|dir| dir.join(RFQ_API_KEY_FILE).is_file());
+    if present {
+        runtime.env.push(format!(
+            "{RFQ_API_KEY_FILE_ENV}={RUN_DIR}/{RFQ_API_KEY_FILE}"
+        ));
+    }
+    runtime
 }
 
 /// Read one value out of the `stitch.env` beside a bot's config, undoing the
@@ -952,6 +974,20 @@ mod tests {
             !dry.contains(&"approve".to_string()),
             "a dry run must never send an approval transaction"
         );
+    }
+
+    #[test]
+    fn rfq_api_key_file_is_pointed_at_inside_the_container() {
+        let dir =
+            std::env::temp_dir().join(format!("stitch-prov-rfq-{}-{}", std::process::id(), "key"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stitch.toml"), "rpc_url = \"http://x\"\n").unwrap();
+        std::fs::write(dir.join(RFQ_API_KEY_FILE), "tx_live_x\n").unwrap();
+        let rt = signer_runtime_from(&SignerView::Local, &dir);
+        assert!(rt.env.contains(&format!(
+            "{RFQ_API_KEY_FILE_ENV}={RUN_DIR}/{RFQ_API_KEY_FILE}"
+        )));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

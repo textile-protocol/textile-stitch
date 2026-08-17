@@ -17,9 +17,8 @@ import type { Bot, Corridor, Settings, Spread } from '../types'
 
 /**
  * Structured settings matching the desktop Stitch app: corridor, signer, spreads,
- * taker leg, endpoints, plus a collapsed Experimental card for opt-in knobs
- * (TWAP / inventory-lean today; more subsections can land beside it).
- * Sizing / tick stay on the Raw config tab.
+ * taker leg, endpoints, RFQ, plus a collapsed Experimental card for opt-in knobs
+ * (TWAP / inventory-lean). Sizing / tick stay on the Raw config tab.
  *
  * Sends only the fields the operator touched — a partial patch means a concurrent
  * raw edit only loses what this form actually changed.
@@ -33,6 +32,7 @@ export default function SettingsForm({
 }) {
   const [loaded, setLoaded] = useState<Settings | null>(null)
   const [draft, setDraft] = useState<Settings | null>(null)
+  const [rfqApiKey, setRfqApiKey] = useState('')
   const [loadError, setLoadError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -62,7 +62,8 @@ export default function SettingsForm({
   if (loadError) return <ErrorState error={loadError} />
   if (!loaded || !draft) return <Loading what="the settings" />
 
-  const dirty = JSON.stringify(loaded) !== JSON.stringify(draft)
+  const dirty =
+    JSON.stringify(loaded) !== JSON.stringify(draft) || rfqApiKey.trim() !== ''
   // Functional update so two sets in one handler (e.g. clearing TWAP window +
   // deviation together) both land — a spread from a stale `draft` would drop the first.
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
@@ -72,9 +73,13 @@ export default function SettingsForm({
     setBusy(true)
     setError(null)
     try {
-      const res = await api.saveSettings(bot.name, changedFields(loaded!, draft!))
+      const res = await api.saveSettings(
+        bot.name,
+        changedFields(loaded!, draft!, rfqApiKey),
+      )
       setLoaded(res.settings)
       setDraft(res.settings)
+      setRfqApiKey('')
       onSaved(res.message)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -204,7 +209,14 @@ export default function SettingsForm({
         onChange={set}
       />
 
-      {loaded.rfqPanelUnlocked && <RfqBetaCard settings={loaded} />}
+      <RfqCard
+        draft={draft}
+        loaded={loaded}
+        rfqApiKey={rfqApiKey}
+        corridorId={bot.config?.corridorId ?? ''}
+        onChange={set}
+        onApiKey={setRfqApiKey}
+      />
 
       {error && <Banner tone="danger">{error}</Banner>}
 
@@ -217,7 +229,13 @@ export default function SettingsForm({
         >
           {bot.running ? 'Save and restart' : 'Save'}
         </Button>
-        <Button disabled={!dirty} onClick={() => setDraft(loaded)}>
+        <Button
+          disabled={!dirty}
+          onClick={() => {
+            setDraft(loaded)
+            setRfqApiKey('')
+          }}
+        >
           Discard
         </Button>
         <p className="text-xs text-faint">
@@ -545,40 +563,131 @@ function ExperimentalSubsection({
   )
 }
 
+const DEFAULT_RFQ_URL = 'wss://api.textilecredit.com/v2/maker/stream'
+
 /**
- * Read-only status for the RFQ responder beta. Rendered ONLY when the config's
- * [experimental] gate unlocks it — with the gate off this component never
- * mounts and the page is pixel-identical to a build without it. Deliberately
- * no controls: the [rfq] block is edited by hand (Raw config tab), never here.
+ * Dual-run RFQ: the bot answers the venue's private quote requests beside
+ * the public ladder. The maker API key is write-only — typed here, stored
+ * owner-only next to stitch.toml, never returned by GET.
  */
-function RfqBetaCard({ settings }: { settings: Settings }) {
+function RfqCard({
+  draft,
+  loaded,
+  rfqApiKey,
+  corridorId,
+  onChange,
+  onApiKey,
+}: {
+  draft: Settings
+  loaded: Settings
+  rfqApiKey: string
+  corridorId: string
+  onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void
+  onApiKey: (value: string) => void
+}) {
+  function enable(next: boolean) {
+    onChange('rfqEnabled', next)
+    if (!next) return
+    if (!draft.rfqUrl.trim()) onChange('rfqUrl', DEFAULT_RFQ_URL)
+    if (!draft.rfqCorridor.trim() && corridorId) {
+      onChange('rfqCorridor', corridorId)
+    }
+  }
+
   return (
-    <Card title="RFQ (beta)">
-      <div className="space-y-3">
+    <Card title="RFQ">
+      <div className="space-y-4">
+        <Toggle
+          checked={draft.rfqEnabled}
+          disabled={!loaded.editable}
+          onChange={enable}
+          label="Answer private quote requests beside the public ladder"
+        />
         <p className="text-xs text-faint">
-          Dual-run pilot: the bot answers the venue&apos;s private quote
-          requests beside the public ladder. Configured in stitch.toml under
-          [rfq]; this card is informational only.
+          Dual-run: the ladder keeps running. Enabling this signs firm,
+          taker-bound orders against the funded wallet. Stay on Dual-run
+          until you mean to go live.
         </p>
-        <dl className="grid gap-x-4 gap-y-2 text-sm sm:grid-cols-[auto_1fr]">
-          <dt className="text-faint">State</dt>
-          <dd>{settings.rfqEnabled ? 'Enabled' : 'Disabled'}</dd>
-          <dt className="text-faint">Corridors</dt>
-          <dd>
-            {settings.rfqCorridors.length > 0
-              ? settings.rfqCorridors.join(', ')
-              : '—'}
-          </dd>
-          <dt className="text-faint">Stream</dt>
-          <dd className="break-all">{settings.rfqUrl || '—'}</dd>
-        </dl>
+        {draft.rfqEnabled && !loaded.rfqApiKeySet && !rfqApiKey.trim() && (
+          <Banner tone="warning">
+            RFQ will not start until you paste the maker API key. The bot
+            leaves the ladder running either way.
+          </Banner>
+        )}
+        <Field
+          label="Stream URL"
+          hint="The venue maker WebSocket. Production is wss://api.textilecredit.com/v2/maker/stream."
+        >
+          <Input
+            value={draft.rfqUrl}
+            disabled={!loaded.editable}
+            placeholder={DEFAULT_RFQ_URL}
+            onChange={(e) => onChange('rfqUrl', e.target.value)}
+          />
+        </Field>
+        <Field
+          label="Maker id"
+          hint="The Prisma CUID from the admin RFQ page (starts with cl), not the slug."
+        >
+          <Input
+            value={draft.rfqMakerId}
+            disabled={!loaded.editable}
+            placeholder="cl…"
+            autoComplete="off"
+            onChange={(e) => onChange('rfqMakerId', e.target.value)}
+          />
+        </Field>
+        <Field
+          label="Validation contract"
+          hint="PreferredFillerValidation on this chain. BSC: 0xBCA5E344077AaC751A1C548a45F28215bB7ec165."
+        >
+          <Input
+            value={draft.rfqValidationContract}
+            disabled={!loaded.editable}
+            placeholder="0x…"
+            autoComplete="off"
+            onChange={(e) => onChange('rfqValidationContract', e.target.value)}
+          />
+        </Field>
+        <Field
+          label="Corridor slug"
+          hint="Venue corridor this pool quotes. Usually the same as the bot's corridor id."
+        >
+          <Input
+            value={draft.rfqCorridor}
+            disabled={!loaded.editable}
+            placeholder={corridorId || 'cngn-usdt-bsc'}
+            onChange={(e) => onChange('rfqCorridor', e.target.value)}
+          />
+        </Field>
+        <Field
+          label="Maker API key"
+          hint={
+            loaded.rfqApiKeySet
+              ? 'A key is already saved. Paste a new one only to rotate it. The current value is never shown.'
+              : 'The one-time claim key from the venue (tx_live_…). Stored owner-only on disk, never in stitch.toml.'
+          }
+        >
+          <Input
+            type="password"
+            value={rfqApiKey}
+            disabled={!loaded.editable}
+            placeholder={loaded.rfqApiKeySet ? '••••••••' : 'tx_live_…'}
+            autoComplete="off"
+            onChange={(e) => onApiKey(e.target.value)}
+          />
+        </Field>
       </div>
     </Card>
   )
 }
 
 /** Only the fields this form edits, plus the pool index the API needs. */
-function changedFields(loaded: Settings, draft: Settings): unknown {
+function changedFields(
+  loaded: Settings,
+  draft: Settings,
+  rfqApiKey: string,
+): unknown {
   const patch: Record<string, unknown> = { pool: 0 }
   const keys: (keyof Settings)[] = [
     'rpcUrl',
@@ -595,11 +704,18 @@ function changedFields(loaded: Settings, draft: Settings): unknown {
     'leanFloorBps',
     'leanBaseBps',
     'leanWideBps',
+    'rfqEnabled',
+    'rfqUrl',
+    'rfqMakerId',
+    'rfqValidationContract',
+    'rfqCorridor',
   ]
   for (const key of keys) {
     if (JSON.stringify(loaded[key]) !== JSON.stringify(draft[key])) {
       patch[key] = draft[key]
     }
   }
+  const key = rfqApiKey.trim()
+  if (key) patch.rfqApiKey = key
   return patch
 }

@@ -106,8 +106,8 @@ fn default_rfq_api_key_env() -> String {
 /// feature on by accident.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ExperimentalConfig {
-    /// Gate for the panel's read-only "RFQ (beta)" card. Only the exact token
-    /// checked by [`Config::rfq_panel_unlocked`] unlocks it.
+    /// Legacy panel display gate. The Settings form no longer requires it;
+    /// kept so existing configs still parse.
     #[serde(default)]
     pub rfq_panel: Option<String>,
 }

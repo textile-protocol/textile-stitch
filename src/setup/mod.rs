@@ -25,8 +25,8 @@ pub use settings::{
     SettingsPatch, SettingsView, SideSizing, SignerView, SpreadEdit, SpreadKind,
 };
 pub use writer::{
-    apply_signer, render_env, signer_files, switch_corridor_file,
+    apply_signer, render_env, rfq_api_key_is_set, signer_files, switch_corridor_file,
     switch_corridor_preserving_signer, validate_signer_change, write_config, write_config_signer,
-    write_config_signer_from_toml, write_key, write_toml_atomic, LocalKeyMaterial, SignerKind,
-    SignerSetup,
+    write_config_signer_from_toml, write_key, write_rfq_api_key, write_toml_atomic,
+    LocalKeyMaterial, SignerKind, SignerSetup, RFQ_API_KEY_FILE, RFQ_API_KEY_FILE_ENV,
 };

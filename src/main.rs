@@ -488,7 +488,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // pool sets `rfq_corridor`. It runs beside the ladder on its own cadence
     // and WebSocket; with the config off this is a no-op and every tick below
     // behaves exactly as before.
-    let rfq_task = stitch_bot::rfq::maybe_spawn(&cfg, signer.clone(), dry_run);
+    let rfq_task = stitch_bot::rfq::maybe_spawn(
+        &cfg,
+        signer.clone(),
+        dry_run,
+        std::path::Path::new(&config_path).parent(),
+    );
 
     // Per closer pool: position id → unix time we last submitted a fill for it,
     // so a pending tx or lagging subgraph can't trigger a duplicate `fill()`.

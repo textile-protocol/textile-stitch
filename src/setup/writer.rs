@@ -137,6 +137,90 @@ impl SignerSetup {
     }
 }
 
+/// Owner-only file holding the venue maker API key. Never written into TOML.
+/// The bot also accepts `STITCH_RFQ_API_KEY` / `STITCH_RFQ_API_KEY_FILE`; this
+/// sibling is what the panel writes so a Docker restart picks it up without
+/// recreating the container (the run dir is already mounted).
+pub const RFQ_API_KEY_FILE: &str = "rfq-api.key";
+
+/// Env var that points at [`RFQ_API_KEY_FILE`]. Kept in `stitch.env` so a
+/// process-mode bot that sources the file finds the key the same way it finds
+/// the wallet. The raw key itself is never inlined here.
+pub const RFQ_API_KEY_FILE_ENV: &str = "STITCH_RFQ_API_KEY_FILE";
+
+/// Write the maker API key to [`RFQ_API_KEY_FILE`] (owner-only) and point
+/// `stitch.env` at it. Empty input is refused so a blank paste can't wipe a
+/// working key. The caller's string should be dropped after this returns.
+pub fn write_rfq_api_key(dir: impl AsRef<Path>, key_raw: &str) -> Result<()> {
+    let key = key_raw.trim();
+    anyhow::ensure!(!key.is_empty(), "the RFQ API key can't be empty");
+    let paths = config_paths(dir.as_ref());
+    std::fs::create_dir_all(&paths.dir)
+        .with_context(|| format!("creating {}", paths.dir.display()))?;
+    let path = paths.dir.join(RFQ_API_KEY_FILE);
+    let mut line = format!("{key}\n");
+    write_key_file_atomic(&path, line.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    line.zeroize();
+    point_env_at_rfq_key(&paths)
+}
+
+/// True when [`RFQ_API_KEY_FILE`] is sitting next to the config. Used by the
+/// panel GET so the form can say "a key is saved" without ever reading it.
+pub fn rfq_api_key_is_set(dir: impl AsRef<Path>) -> bool {
+    dir.as_ref().join(RFQ_API_KEY_FILE).is_file()
+}
+
+/// Keep `STITCH_RFQ_API_KEY_FILE` in `stitch.env` after a signer rewrite, which
+/// otherwise replaces the whole file from the signer template.
+fn point_env_at_rfq_key(paths: &ConfigPaths) -> Result<()> {
+    let key_path = paths.dir.join(RFQ_API_KEY_FILE);
+    if !key_path.is_file() {
+        return Ok(());
+    }
+    upsert_env_assignment(
+        &paths.env,
+        RFQ_API_KEY_FILE_ENV,
+        &key_path.display().to_string(),
+    )
+}
+
+/// Replace or append one `KEY='value'` line in an env file. Preserves every
+/// other line (signer paths, comments, RUST_LOG). Creates the file when absent.
+fn upsert_env_assignment(env_path: &Path, key: &str, value: &str) -> Result<()> {
+    let assignment = format!("{key}={}\n", shell_single_quote(value));
+    let existing = match std::fs::read_to_string(env_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("reading {}", env_path.display()))
+        }
+    };
+    let mut out = String::new();
+    let mut replaced = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if let Some((k, _)) = trimmed.split_once('=') {
+            if k.trim() == key {
+                if !replaced {
+                    out.push_str(&assignment);
+                    replaced = true;
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !replaced {
+        out.push_str(&assignment);
+    }
+    write_toml_atomic(env_path, &out)?;
+    restrict_to_owner(env_path)?;
+    Ok(())
+}
+
 /// The `stitch.env` body: point the bot at the key file and set a sane log level.
 /// The path is shell-single-quoted because the install guides `source` this file,
 /// so a directory with spaces (e.g. `/Users/First Last`) must not be word-split.
@@ -261,6 +345,9 @@ pub fn apply_signer(dir: impl AsRef<Path>, signer: &SignerSetup) -> Result<()> {
         write_signer_secrets(&paths, signer)?;
         write_toml_atomic(&paths.env, &render_env_for(&paths, signer))?;
         restrict_to_owner(&paths.env)?;
+        // Signer rewrite replaces stitch.env wholesale. Put the RFQ key pointer
+        // back so a later signer change doesn't silently drop RFQ auth.
+        point_env_at_rfq_key(&paths)?;
         write_toml_atomic(&paths.toml, &updated)?;
         Ok(())
     })();
@@ -787,6 +874,53 @@ mod tests {
         let p = config_paths("/Users/First Last/Stitch");
         let env = render_env(&p);
         assert!(env.contains("STITCH_PRIVATE_KEY_FILE='/Users/First Last/Stitch/stitch.key'"));
+    }
+
+    #[test]
+    fn write_rfq_api_key_is_owner_only_and_never_echoed_into_toml() {
+        let dir = unique_dir("rfq-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stitch.env"),
+            "STITCH_PRIVATE_KEY_FILE='x'\nRUST_LOG=info\n",
+        )
+        .unwrap();
+
+        write_rfq_api_key(&dir, "  tx_live_secret  ").unwrap();
+        assert!(rfq_api_key_is_set(&dir));
+        let stored = std::fs::read_to_string(dir.join(RFQ_API_KEY_FILE)).unwrap();
+        assert_eq!(stored.trim(), "tx_live_secret");
+        let env = std::fs::read_to_string(dir.join("stitch.env")).unwrap();
+        assert!(env.contains("STITCH_PRIVATE_KEY_FILE='x'"));
+        assert!(env.contains(&format!(
+            "{RFQ_API_KEY_FILE_ENV}='{}/{}'",
+            dir.display(),
+            RFQ_API_KEY_FILE
+        )));
+        assert!(
+            !env.contains("tx_live_secret"),
+            "the raw key must not land in stitch.env"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(RFQ_API_KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "rfq-api.key must be owner-only");
+        }
+
+        assert!(write_rfq_api_key(&dir, "   ").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(RFQ_API_KEY_FILE))
+                .unwrap()
+                .trim(),
+            "tx_live_secret",
+            "a blank paste must not wipe a working key"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

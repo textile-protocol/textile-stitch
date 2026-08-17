@@ -108,15 +108,13 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # limit_taker_min_profit_debt = "50000"  # skip fills clearing < 0.05 USDC (6dp)
 # limit_taker_max_orders = 10            # per executeBatch
 
-# ----- RFQ responder (dual-run pilot, off by default). WARNING: leave this
-# commented out unless the venue has onboarded your maker id — enabling it
-# signs firm, taker-bound orders against your funded wallet. The ladder above
-# keeps running unchanged either way. The maker API key is never in this file;
-# it comes from the env var named by api_key_env. Each participating [[pools]]
-# block also needs `rfq_corridor = "<venue slug>"`. Liquidity may be `"max"`
-# (live wallet: min(balance, Permit2 allowance), refreshed every second) or
-# an explicit atomic cap. In-flight quotes reserve against whichever number
-# is live.
+# ----- RFQ responder (dual-run pilot, off by default). Prefer the panel
+# Settings form over editing this by hand. WARNING: enabling it signs firm,
+# taker-bound orders against your funded wallet. The ladder above keeps
+# running unchanged either way. The maker API key is never in this file; the
+# panel writes it to rfq-api.key (or set the env var named by api_key_env).
+# Each participating [[pools]] block also needs `rfq_corridor = "<venue slug>"`.
+# Liquidity may be `"max"` (live wallet) or an explicit atomic cap.
 # [rfq]
 # enabled = false                                        # master kill switch
 # url = "wss://api.textilecredit.com/v2/maker/stream"
@@ -124,10 +122,10 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # api_key_env = "STITCH_RFQ_API_KEY"                     # env var holding the maker API key
 # validation_contract = "0x0000000000000000000000000000000000000000"  # PreferredFillerValidation (per chain)
 
-# ----- Experimental gates (off by default). Raw tokens read by the panel;
-# nothing here changes trading behavior. Leave unset unless instructed.
+# ----- Experimental gates (off by default). Raw tokens; nothing here changes
+# trading behavior. The RFQ Settings card no longer needs rfq_panel.
 # [experimental]
-# rfq_panel = ""                    # panel-only display gate for the RFQ beta card
+# rfq_panel = ""
 
 # ----- Signer / wallet backend. Omit this whole section to use the local
 # hotwallet (the default, unchanged): the bot signs with STITCH_PRIVATE_KEY /

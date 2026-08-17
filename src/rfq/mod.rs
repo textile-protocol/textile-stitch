@@ -32,6 +32,7 @@ pub mod time;
 pub mod wire;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use alloy_primitives::{Address, Bytes, U256};
@@ -110,10 +111,15 @@ impl InventoryCache {
 
 /// Spawn the responder if — and only if — the config turns it on. Every
 /// failure here refuses to spawn (fail closed) and leaves the ladder alone.
+///
+/// `config_dir` is the folder holding `stitch.toml`, so a panel-written
+/// `rfq-api.key` sitting next to it is found even when the process env was
+/// baked at container-create time (a later Settings save only restarts).
 pub fn maybe_spawn(
     cfg: &Config,
     signer: DynSigner,
     dry_run: bool,
+    config_dir: Option<&Path>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.rfq_active() {
         return None;
@@ -123,12 +129,12 @@ pub fn maybe_spawn(
         return None;
     }
     let rfq = cfg.rfq.as_ref()?; // rfq_active() implies Some
-    let api_key = match std::env::var(&rfq.api_key_env) {
-        Ok(k) if !k.trim().is_empty() => k.trim().to_string(),
-        _ => {
+    let api_key = match load_rfq_api_key(&rfq.api_key_env, config_dir) {
+        Ok(k) => k,
+        Err(e) => {
             error!(
-                env = %rfq.api_key_env,
-                "RFQ responder NOT started: the maker api key env var is unset or empty"
+                error = %format!("{e:#}"),
+                "RFQ responder NOT started: the maker API key is missing"
             );
             return None;
         }
@@ -147,6 +153,32 @@ pub fn maybe_spawn(
         "starting RFQ responder (dual-run: the ladder is unchanged)"
     );
     Some(tokio::spawn(run(runtime)))
+}
+
+/// Resolve the maker API key without ever logging it.
+///
+/// Order: `{NAME}_FILE` (preferred, same as the wallet), then `{NAME}`, then
+/// `rfq-api.key` next to the config. The last is what the panel writes.
+fn load_rfq_api_key(api_key_env: &str, config_dir: Option<&Path>) -> anyhow::Result<String> {
+    let file_env = format!("{api_key_env}_FILE");
+    if let Ok(key) = crate::signer::read_env_secret(&file_env, api_key_env) {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    let Some(dir) = config_dir else {
+        anyhow::bail!("set {file_env} or {api_key_env}");
+    };
+    let path = dir.join(crate::setup::RFQ_API_KEY_FILE);
+    let key = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow::anyhow!("set {file_env} or {api_key_env}, or place rfq-api.key next to stitch.toml")
+    })?;
+    let key = key.trim().to_string();
+    anyhow::ensure!(
+        !key.is_empty(),
+        "rfq-api.key is empty; paste a new key in Settings"
+    );
+    Ok(key)
 }
 
 fn build_runtime(
@@ -922,5 +954,19 @@ mod tests {
             None,
             "an unread token is not inventable"
         );
+    }
+
+    #[test]
+    fn rfq_api_key_falls_back_to_the_sibling_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "stitch-rfq-key-{}-{}",
+            std::process::id(),
+            "sibling"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("rfq-api.key"), "  tx_live_from_file  \n").unwrap();
+        let key = load_rfq_api_key("STITCH_RFQ_API_KEY_UNSET_FOR_TEST", Some(&dir)).unwrap();
+        assert_eq!(key, "tx_live_from_file");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -114,15 +114,13 @@ export interface Settings {
   leanBaseBps: string
   leanWideBps: string
   editable: boolean
-  /**
-   * RFQ (beta), all read-only: no PATCH field exists server-side, so nothing
-   * in the UI may write them. `rfqPanelUnlocked` is true only for the exact
-   * [experimental] gate token; when false the RFQ card renders nothing at all.
-   */
-  rfqPanelUnlocked: boolean
   rfqEnabled: boolean
   rfqUrl: string
-  rfqCorridors: string[]
+  rfqMakerId: string
+  rfqValidationContract: string
+  rfqCorridor: string
+  /** A maker API key is stored on disk. The secret itself is never returned. */
+  rfqApiKeySet: boolean
 }
 
 export interface SaveResult {

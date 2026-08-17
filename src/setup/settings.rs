@@ -8,8 +8,9 @@
 //! configs through one implementation. Edits go through `toml_edit` so the
 //! template's comments and layout survive a save, and every edit is re-validated
 //! through `Config::from_toml` before it is handed back — a bad value fails here,
-//! so the caller never writes a broken file. The operator wallet is NOT here: it
-//! lives in `stitch.key`, edited via `writer::write_key`.
+//! so the caller never writes a broken file. Secrets are NOT here: the operator
+//! wallet lives in `stitch.key` (`writer::write_key`); the RFQ maker key lives
+//! in `rfq-api.key` (`writer::write_rfq_api_key`).
 //!
 //! Amounts stay strings end to end. They are atomic-unit `u128`/`U256` values, so
 //! parsing them into a float to render or edit would lose precision on large
@@ -113,18 +114,18 @@ pub struct SettingsView {
     pub lean_base_bps: String,
     /// Extra widening at the heavy inventory edge, in bps. Empty = bot default (3.0).
     pub lean_wide_bps: String,
-    // ----- RFQ (beta). READ-ONLY: none of these have a patch field, no form
-    // writes them, and `to_patch` skips them — the gate and the [rfq] block
-    // are edited by hand (or by the venue's onboarding docs) only. -----
-    /// True only when `[experimental].rfq_panel` is exactly the beta token.
-    /// Gates the panel's read-only RFQ card; false hides it entirely.
-    pub rfq_panel_unlocked: bool,
+    // ----- RFQ (beta). Optional on the patch: a spread-only save must not
+    // touch them. The maker API key is not here — it lives in `rfq-api.key`.
     /// Whether `[rfq].enabled` is set. Bot-wide.
     pub rfq_enabled: bool,
     /// The venue stream URL from `[rfq]`, empty when the block is absent.
     pub rfq_url: String,
-    /// Corridor slugs of every pool with `rfq_corridor` set.
-    pub rfq_corridors: Vec<String>,
+    /// Venue maker id (`X-Textile-Maker-Id`). Empty when `[rfq]` is absent.
+    pub rfq_maker_id: String,
+    /// PreferredFillerValidation address. Empty when `[rfq]` is absent.
+    pub rfq_validation_contract: String,
+    /// This pool's `rfq_corridor` slug. Empty when the pool is not on RFQ.
+    pub rfq_corridor: String,
 }
 
 impl SettingsView {
@@ -150,6 +151,13 @@ impl SettingsView {
             lean_floor_bps: Some(self.lean_floor_bps.clone()),
             lean_base_bps: Some(self.lean_base_bps.clone()),
             lean_wide_bps: Some(self.lean_wide_bps.clone()),
+            // RFQ is opt-in on the patch: a form that opened before the operator
+            // touched RFQ must not rewrite the [rfq] block on save.
+            rfq_enabled: None,
+            rfq_url: None,
+            rfq_maker_id: None,
+            rfq_validation_contract: None,
+            rfq_corridor: None,
         }
     }
 }
@@ -182,6 +190,11 @@ pub struct SettingsPatch {
     pub lean_floor_bps: Option<String>,
     pub lean_base_bps: Option<String>,
     pub lean_wide_bps: Option<String>,
+    pub rfq_enabled: Option<bool>,
+    pub rfq_url: Option<String>,
+    pub rfq_maker_id: Option<String>,
+    pub rfq_validation_contract: Option<String>,
+    pub rfq_corridor: Option<String>,
 }
 
 /// Read the first pool's editable values from a `stitch.toml` body.
@@ -244,14 +257,19 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
         lean_floor_bps: opt_f64(pool.lean_floor_bps),
         lean_base_bps: opt_f64(pool.lean_base_bps),
         lean_wide_bps: opt_f64(pool.lean_wide_bps),
-        rfq_panel_unlocked: cfg.rfq_panel_unlocked(),
         rfq_enabled: cfg.rfq.as_ref().is_some_and(|r| r.enabled),
         rfq_url: cfg.rfq.as_ref().map(|r| r.url.clone()).unwrap_or_default(),
-        rfq_corridors: cfg
-            .pools
-            .iter()
-            .filter_map(|p| p.rfq_corridor.clone())
-            .collect(),
+        rfq_maker_id: cfg
+            .rfq
+            .as_ref()
+            .map(|r| r.maker_id.clone())
+            .unwrap_or_default(),
+        rfq_validation_contract: cfg
+            .rfq
+            .as_ref()
+            .map(|r| r.validation_contract.clone())
+            .unwrap_or_default(),
+        rfq_corridor: pool.rfq_corridor.clone().unwrap_or_default(),
     })
 }
 
@@ -426,6 +444,7 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
     if let Some(raw) = &patch.lean_wide_bps {
         apply_optional_f64(pool, "lean_wide_bps", raw, "lean wide")?;
     }
+    apply_rfq(&mut doc, patch)?;
 
     let edited = doc.to_string();
     // Guard: never hand back something the bot can't load. This is also what
@@ -599,6 +618,81 @@ fn pool_mut(doc: &mut DocumentMut, index: usize) -> Result<&mut Table> {
 /// Both are used through reqwest's HTTP client, so fully parse the value and
 /// require an http(s) scheme with a host — a bare `https://`, a `ws://`, or other
 /// non-URL text would otherwise pass and fail every request after restart.
+/// Write the `[rfq]` block and this pool's `rfq_corridor` when the patch names
+/// them. A spread-only save leaves both alone — same rule as TWAP / lean.
+fn apply_rfq(doc: &mut DocumentMut, patch: &SettingsPatch) -> Result<()> {
+    let touching_block = patch.rfq_enabled.is_some()
+        || patch.rfq_url.is_some()
+        || patch.rfq_maker_id.is_some()
+        || patch.rfq_validation_contract.is_some();
+    if touching_block {
+        let has_table = doc.get("rfq").and_then(Item::as_table).is_some();
+        let only_disable = patch.rfq_enabled == Some(false)
+            && patch.rfq_url.is_none()
+            && patch.rfq_maker_id.is_none()
+            && patch.rfq_validation_contract.is_none();
+        if !(only_disable && !has_table) {
+            let table = rfq_table_mut(doc);
+            if let Some(enabled) = patch.rfq_enabled {
+                set_value(table, "enabled", Value::from(enabled));
+            }
+            if let Some(url) = &patch.rfq_url {
+                require_ws_url(url, "RFQ stream URL")?;
+                set_value(table, "url", Value::from(url.trim()));
+            }
+            if let Some(maker_id) = &patch.rfq_maker_id {
+                set_value(table, "maker_id", Value::from(maker_id.trim()));
+            }
+            if let Some(addr) = &patch.rfq_validation_contract {
+                let addr = addr.trim();
+                if !addr.is_empty() {
+                    addr.parse::<alloy_primitives::Address>()
+                        .context("RFQ validation contract is not a valid address")?;
+                }
+                set_value(table, "validation_contract", Value::from(addr));
+            }
+        }
+    }
+    if let Some(slug) = &patch.rfq_corridor {
+        let pool = pool_mut(doc, patch.pool_index)?;
+        let slug = slug.trim();
+        if slug.is_empty() {
+            pool.remove("rfq_corridor");
+        } else {
+            set_value(pool, "rfq_corridor", Value::from(slug));
+        }
+    }
+    Ok(())
+}
+
+fn rfq_table_mut(doc: &mut DocumentMut) -> &mut Table {
+    if doc.get("rfq").and_then(Item::as_table).is_none() {
+        let mut table = Table::new();
+        table.set_implicit(false);
+        doc.insert("rfq", Item::Table(table));
+    }
+    doc.get_mut("rfq")
+        .and_then(Item::as_table_mut)
+        .expect("just inserted [rfq]")
+}
+
+/// The venue stream is a WebSocket, not HTTP — `require_url` would reject it.
+fn require_ws_url(value: &str, field: &str) -> Result<()> {
+    let v = value.trim();
+    anyhow::ensure!(!v.is_empty(), "{field} can't be empty");
+    let parsed = url::Url::parse(v)
+        .with_context(|| format!("{field} must be a valid WebSocket URL (like wss://…)"))?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "ws" | "wss"),
+        "{field} must be a ws(s):// URL (like wss://api.textilecredit.com/v2/maker/stream)"
+    );
+    anyhow::ensure!(
+        parsed.host_str().is_some_and(|h| !h.is_empty()),
+        "{field} must include a host"
+    );
+    Ok(())
+}
+
 fn require_url(value: &str, field: &str) -> Result<()> {
     let v = value.trim();
     anyhow::ensure!(!v.is_empty(), "{field} can't be empty");
@@ -1343,37 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rfq_panel_gate_is_read_only_and_exact_match() {
-        // Template ships locked, RFQ absent.
-        let v = read_settings(TEMPLATE).unwrap();
-        assert!(!v.rfq_panel_unlocked);
-        assert!(!v.rfq_enabled);
-        assert!(v.rfq_url.is_empty());
-        assert!(v.rfq_corridors.is_empty());
-
-        // The exact token unlocks; near-misses stay locked (fail closed).
-        let unlocked = format!("{TEMPLATE}\n[experimental]\nrfq_panel = \"enable-rfq-beta\"\n");
-        assert!(read_settings(&unlocked).unwrap().rfq_panel_unlocked);
-        for wrong in ["true", "1", "yes", "ENABLE-RFQ-BETA"] {
-            let toml = format!("{TEMPLATE}\n[experimental]\nrfq_panel = \"{wrong}\"\n");
-            assert!(
-                !read_settings(&toml).unwrap().rfq_panel_unlocked,
-                "{wrong:?} must not unlock"
-            );
-        }
-
-        // Read-only means read-only: a full round-trip save of the unlocked
-        // config leaves both new tables byte-identical — no patch field can
-        // touch them, and the file the operator wrote survives.
-        let view = read_settings(&unlocked).unwrap();
-        let out = apply_settings(&unlocked, &view.to_patch()).unwrap();
-        assert_eq!(out, unlocked, "the gate must survive a save untouched");
-    }
-
-    #[test]
-    fn rfq_state_surfaces_read_only_through_the_view() {
-        // `"max"` is a valid RFQ capacity (live wallet). Keep the template's
-        // sentinels so a save can't silently rewrite them to a hard number.
+    fn a_spread_save_leaves_an_existing_rfq_block_untouched() {
         let src = format!(
             "{}\nrfq_corridor = \"cngn-usdt\"\n\n[rfq]\nenabled = true\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\nmaker_id = \"mk_x\"\nvalidation_contract = \"0x00000000000000000000000000000000000000aa\"\n",
             TEMPLATE.trim_end()
@@ -1381,12 +1445,54 @@ mod tests {
         let v = read_settings(&src).unwrap();
         assert!(v.rfq_enabled);
         assert_eq!(v.rfq_url, "wss://api.textilecredit.com/v2/maker/stream");
-        assert_eq!(v.rfq_corridors, vec!["cngn-usdt".to_string()]);
-        assert!(!v.rfq_panel_unlocked, "showing [rfq] still needs the gate");
+        assert_eq!(v.rfq_maker_id, "mk_x");
+        assert_eq!(
+            v.rfq_validation_contract,
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(v.rfq_corridor, "cngn-usdt");
 
-        // A no-op save keeps the [rfq] block and the corridor intact.
+        // to_patch() is what a form sends when RFQ wasn't edited.
         let out = apply_settings(&src, &v.to_patch()).unwrap();
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn rfq_fields_round_trip_through_the_patch() {
+        let mut patch = read_settings(TEMPLATE).unwrap().to_patch();
+        patch.rfq_enabled = Some(true);
+        patch.rfq_url = Some("wss://api.textilecredit.com/v2/maker/stream".into());
+        patch.rfq_maker_id = Some("clmaker123".into());
+        patch.rfq_validation_contract = Some("0x00000000000000000000000000000000000000aa".into());
+        patch.rfq_corridor = Some("cngn-usdt-bsc".into());
+
+        let out = apply_settings(TEMPLATE, &patch).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert!(back.rfq_enabled);
+        assert_eq!(back.rfq_url, "wss://api.textilecredit.com/v2/maker/stream");
+        assert_eq!(back.rfq_maker_id, "clmaker123");
+        assert_eq!(
+            back.rfq_validation_contract,
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(back.rfq_corridor, "cngn-usdt-bsc");
+
+        // Clearing the corridor removes the key; disabling keeps the block.
+        patch.rfq_enabled = Some(false);
+        patch.rfq_corridor = Some(String::new());
+        let off = apply_settings(&out, &patch).unwrap();
+        let back = read_settings(&off).unwrap();
+        assert!(!back.rfq_enabled);
+        assert!(back.rfq_corridor.is_empty());
+        assert!(off.contains("[rfq]"), "disable must not delete the block");
+    }
+
+    #[test]
+    fn rfq_rejects_a_non_websocket_url() {
+        let mut patch = read_settings(TEMPLATE).unwrap().to_patch();
+        patch.rfq_url = Some("https://api.textilecredit.com/v2/maker/stream".into());
+        let err = apply_settings(TEMPLATE, &patch).unwrap_err();
+        assert!(err.to_string().contains("ws"), "got {err:#}");
     }
 
     #[test]
