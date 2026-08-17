@@ -326,7 +326,7 @@ export default function BotDetail() {
           <Detail label="Pools">{bot.config ? bot.config.pools : '—'}</Detail>
           <Detail label="Signer">{bot.config?.signer ?? '—'}</Detail>
           <Detail label="Operator">
-            <OperatorCell config={bot.config} />
+            <OperatorAddress config={bot.config} />
           </Detail>
         </dl>
       </Card>
@@ -450,35 +450,27 @@ function Detail({ label, children }: { label: string; children: React.ReactNode 
 }
 
 /**
- * Operator address, plus a collapsed explorer link for a hot wallet. Hidden
- * until opened — same idea as Settings → Advanced. MPC signers get the
- * address only; the key never lives in this browser.
+ * Short operator address. A hot wallet with a known explorer becomes a link
+ * to that address page. MPC signers stay plain text.
  */
-function OperatorCell({ config }: { config: ConfigBody | null }) {
+function OperatorAddress({ config }: { config: ConfigBody | null }) {
   if (!config?.operatorAddress) return '—'
+  const text = shortAddress(config.operatorAddress)
   const explorerUrl =
     config.signer === 'hot-wallet' ? config.explorerUrl : null
+  if (!explorerUrl) {
+    return <span title={config.operatorAddress}>{text}</span>
+  }
   return (
-    <>
-      <span title={config.operatorAddress}>
-        {shortAddress(config.operatorAddress)}
-      </span>
-      {explorerUrl && (
-        <details className="mt-1">
-          <summary className="cursor-pointer text-xs text-muted underline hover:text-ink">
-            More
-          </summary>
-          <a
-            href={explorerUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="mt-1 inline-block text-xs text-muted underline hover:text-ink"
-          >
-            Open wallet on explorer
-          </a>
-        </details>
-      )}
-    </>
+    <a
+      href={explorerUrl}
+      target="_blank"
+      rel="noreferrer"
+      title={config.operatorAddress}
+      className="underline hover:text-ink"
+    >
+      {text}
+    </a>
   )
 }
 
