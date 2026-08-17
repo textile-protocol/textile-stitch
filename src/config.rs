@@ -106,8 +106,8 @@ fn default_rfq_api_key_env() -> String {
 /// feature on by accident.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ExperimentalConfig {
-    /// Legacy panel display gate. The Settings form no longer requires it;
-    /// kept so existing configs still parse.
+    /// Unlocks the Settings RFQ card. Exact token [`RFQ_PANEL_GATE`] only;
+    /// anything else (or omitted) keeps the card hidden.
     #[serde(default)]
     pub rfq_panel: Option<String>,
 }
@@ -419,9 +419,10 @@ impl PoolConfig {
     /// when the side doesn't quote over RFQ (no spread configured).
     ///
     /// `"max"` is [`RfqCapacity::Wallet`]: the responder reads
-    /// `min(balance, Permit2 allowance)` on its own 1s loop and reserves
-    /// in-flight quotes against that number. An explicit amount stays a hard
-    /// cap. Neither path does an RPC on the quote hot path.
+    /// `min(balance, Permit2 allowance)` minus live book commitments on its
+    /// own 1s loop and reserves in-flight quotes against that leftover. An
+    /// explicit amount stays a hard cap. Neither path does an RPC on the
+    /// quote hot path.
     pub fn rfq_buy_capacity_debt(&self) -> anyhow::Result<Option<RfqCapacity>> {
         if self.buy_spread().is_none() {
             return Ok(None);

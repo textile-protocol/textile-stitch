@@ -168,6 +168,51 @@ const MAKER_SESSION_TYPE: &str =
     "MakerSession(string makerId,address signingAddress,bytes32 challenge,uint256 issuedAt)";
 const SESSION_DOMAIN_VERSION: &str = "1";
 
+/// Enroll domain *does* bind chainId so a BSC signature cannot enroll Base.
+/// Different type string from MakerSession on purpose: a captured session
+/// challenge must never enroll.
+const ENROLL_DOMAIN_TYPE: &str = "EIP712Domain(string name,string version,uint256 chainId)";
+const MAKER_ENROLL_TYPE: &str =
+    "MakerEnroll(address signingAddress,uint256 chainId,uint256 issuedAt)";
+
+/// Mainnet FX chains — keep in lockstep with `LIVE_FX_CHAIN_IDS` on the venue.
+const LIVE_FX_CHAIN_IDS: &[u64] = &[1, 137, 56, 8453, 42220];
+
+pub fn maker_enroll_environment(chain_id: u64) -> &'static str {
+    if LIVE_FX_CHAIN_IDS.contains(&chain_id) {
+        "LIVE"
+    } else {
+        "TEST"
+    }
+}
+
+/// EIP-712 digest of `MakerEnroll`. `issued_at` is unix milliseconds.
+pub fn maker_enroll_digest(
+    environment: &str,
+    signing_address: Address,
+    chain_id: u64,
+    issued_at_ms: u64,
+) -> B256 {
+    let domain_name = format!("Textile Maker Enroll ({environment})");
+    let domain = hash_words(&[
+        b256_word(k(ENROLL_DOMAIN_TYPE)),
+        b256_word(k(&domain_name)),
+        b256_word(k(SESSION_DOMAIN_VERSION)),
+        u256_word(U256::from(chain_id)),
+    ]);
+    let struct_hash = hash_words(&[
+        b256_word(k(MAKER_ENROLL_TYPE)),
+        addr_word(signing_address),
+        u256_word(U256::from(chain_id)),
+        u256_word(U256::from(issued_at_ms)),
+    ]);
+    let mut buf = Vec::with_capacity(66);
+    buf.extend_from_slice(&[0x19, 0x01]);
+    buf.extend_from_slice(&domain.0);
+    buf.extend_from_slice(&struct_hash.0);
+    keccak256(&buf)
+}
+
 /// EIP-712 digest of the venue's `MakerSession` challenge reply.
 ///
 /// `domain_name` comes verbatim from the venue's challenge frame ("Textile
@@ -348,6 +393,48 @@ mod tests {
                 address!("1111111111111111111111111111111111111111"),
                 b256!("2222222222222222222222222222222222222222222222222222222222222222"),
                 1_754_388_000_001,
+            )
+        );
+    }
+
+    #[test]
+    fn maker_enroll_digest_matches_the_venue_golden_vector() {
+        let digest = maker_enroll_digest(
+            "LIVE",
+            address!("1111111111111111111111111111111111111111"),
+            56,
+            1_754_388_000_000,
+        );
+        assert_eq!(
+            digest,
+            b256!("6e5b7d7d1f37b729d30a62c2181b668dab82a4f28bf5266fd3ef7ccaf44fcbd4")
+        );
+    }
+
+    #[test]
+    fn maker_enroll_binds_environment_and_chain() {
+        let base = maker_enroll_digest(
+            "LIVE",
+            address!("1111111111111111111111111111111111111111"),
+            56,
+            1_754_388_000_000,
+        );
+        assert_ne!(
+            base,
+            maker_enroll_digest(
+                "TEST",
+                address!("1111111111111111111111111111111111111111"),
+                56,
+                1_754_388_000_000,
+            )
+        );
+        assert_ne!(
+            base,
+            maker_enroll_digest(
+                "LIVE",
+                address!("1111111111111111111111111111111111111111"),
+                8453,
+                1_754_388_000_000,
             )
         );
     }

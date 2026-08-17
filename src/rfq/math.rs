@@ -91,14 +91,16 @@ pub fn collateral_for_debt(
         / (scaled * ten_pow(debt_decimals))
 }
 
-/// The level rate the venue expects: debt-atomic per collateral-atomic,
-/// RAY (1e27) scaled — `RAY × price × 10^debt / 10^coll`.
-pub fn rate_ray(price: f64, debt_decimals: u8, collateral_decimals: u8) -> U256 {
+/// The level rate the venue expects: human debt-per-collateral, RAY (1e27)
+/// scaled — `RAY × price`. Decimal-normalized, same convention as
+/// `quoteRateRay` on the venue. Atomic scaling (`× 10^debt / 10^coll`) is
+/// wrong here: a 6/18 pair would publish a rate 10^12 away from the firm
+/// quote and fail `level_slack`.
+pub fn rate_ray(price: f64, _debt_decimals: u8, _collateral_decimals: u8) -> U256 {
     let Some(scaled) = price_scaled(price) else {
         return U256::ZERO;
     };
-    ten_pow(27) * scaled * ten_pow(debt_decimals)
-        / (U256::from(PRICE_SCALE) * ten_pow(collateral_decimals))
+    ten_pow(27) * scaled / U256::from(PRICE_SCALE)
 }
 
 #[cfg(test)]
@@ -179,18 +181,19 @@ mod tests {
     }
 
     #[test]
-    fn rate_ray_is_the_atomic_debt_per_collateral_in_ray() {
+    fn rate_ray_is_decimal_normalized_human_price() {
         let ray = U256::from(10u64).pow(U256::from(27u8));
-        // Equal decimals at price 1.0 → exactly RAY.
+        // Price 1.0 is RAY regardless of decimals — the venue compares this
+        // to quoteRateRay, which divides out the decimal gap.
         assert_eq!(rate_ray(1.0, 6, 6), ray);
-        // 18dp collateral, 6dp debt at 1.0 → RAY / 1e12 (one atomic collateral
-        // unit is worth far less than one atomic debt unit).
-        assert_eq!(
-            rate_ray(1.0, 6, 18),
-            ray / U256::from(10u64).pow(U256::from(12u8))
-        );
-        // Price scales linearly.
+        assert_eq!(rate_ray(1.0, 18, 6), ray);
+        assert_eq!(rate_ray(1.0, 6, 18), ray);
         assert_eq!(rate_ray(2.0, 6, 6), ray * U256::from(2u8));
+        // cNGN/USDT mid (~0.000728): 728000 / 1e9 * RAY = 728e21.
+        assert_eq!(
+            rate_ray(0.000728, 18, 6),
+            U256::from(728u64) * U256::from(10u64).pow(U256::from(21u8))
+        );
     }
 
     #[test]

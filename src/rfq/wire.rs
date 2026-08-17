@@ -140,7 +140,7 @@ pub struct LevelsFrame {
 pub struct Level {
     /// Collateral atomic units.
     pub size: String,
-    /// Debt-per-collateral rate, RAY (1e27) scaled.
+    /// Debt-per-collateral rate, decimal-normalized, RAY (1e27) scaled.
     pub rate_ray: String,
 }
 

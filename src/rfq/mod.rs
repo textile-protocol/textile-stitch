@@ -74,6 +74,7 @@ pub struct RfqRuntime {
     validation_contract: Address,
     staleness_secs: u64,
     rpc_url: String,
+    indexer_url: String,
     books: Vec<CorridorBook>,
     signer: DynSigner,
 }
@@ -209,6 +210,7 @@ fn build_runtime(
             .context("invalid [rfq].validation_contract")?,
         staleness_secs: cfg.feed.staleness_secs,
         rpc_url: cfg.rpc_url.clone(),
+        indexer_url: cfg.indexer_url.clone(),
         books,
         signer,
     })
@@ -237,8 +239,11 @@ async fn run(rt: RfqRuntime) {
     let tokens = wallet_tokens(&rt.books);
     if !tokens.is_empty() {
         let wallet = Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id);
+        let indexer = crate::indexer::Indexer::new(&rt.indexer_url);
         tokio::spawn(inventory_loop(
             wallet,
+            indexer,
+            rt.chain_id,
             rt.permit2,
             tokens,
             inventory.clone(),
@@ -626,10 +631,24 @@ async fn price_loop(url: String, cache: PriceCache) {
     }
 }
 
-/// `min(ERC20 balance, Permit2 allowance)` — the same funded amount the
-/// ladder posts against. Allowance is the fill-time constraint: a balance
-/// the wallet hasn't approved is not quotable.
-async fn read_funded(wallet: &Wallet, permit2: Address, token: Address) -> anyhow::Result<U256> {
+/// What RFQ may still pledge: funded wallet minus live book commitments.
+/// The venue subtracts the same v1 rows in `reserveReply`; quoting the raw
+/// balance is what produced `invalid` / `insufficient_funding` in dual-run.
+fn quotable_inventory(funded: U256, committed: U256) -> U256 {
+    funded.saturating_sub(committed)
+}
+
+/// `min(ERC20 balance, Permit2 allowance)` minus indexer-side live book
+/// input. Allowance is the fill-time constraint: a balance the wallet hasn't
+/// approved is not quotable. Book commitments are the dual-run constraint:
+/// the ladder already signed those tokens away.
+async fn read_funded(
+    wallet: &Wallet,
+    indexer: &crate::indexer::Indexer,
+    chain_id: u64,
+    permit2: Address,
+    token: Address,
+) -> anyhow::Result<(U256, U256)> {
     let owner = wallet.address();
     let balance = wallet
         .read_uint(token, &Bytes::from(encode_balance_of(owner)))
@@ -639,14 +658,23 @@ async fn read_funded(wallet: &Wallet, permit2: Address, token: Address) -> anyho
         .read_uint(token, &Bytes::from(encode_allowance(owner, permit2)))
         .await
         .context("reading RFQ Permit2 allowance")?;
-    Ok(balance.min(allowance))
+    let funded = balance.min(allowance);
+    let committed = indexer
+        .committed_input(chain_id, &owner.to_string(), &token.to_string())
+        .await
+        .context("reading RFQ committed input")?
+        .parse::<U256>()
+        .context("parsing RFQ committed input")?;
+    Ok((funded, committed))
 }
 
-/// Refresh funded amounts for every `max` token, once a second. A failed
+/// Refresh quotable amounts for every `max` token, once a second. A failed
 /// read leaves the previous value in place; the TTL then fails the side
 /// closed instead of quoting a stale high balance forever.
 async fn inventory_loop(
     wallet: Wallet,
+    indexer: crate::indexer::Indexer,
+    chain_id: u64,
     permit2: Address,
     tokens: Vec<Address>,
     cache: InventoryCache,
@@ -654,8 +682,19 @@ async fn inventory_loop(
     loop {
         let now = unix_now();
         for token in &tokens {
-            match read_funded(&wallet, permit2, *token).await {
-                Ok(funded) => cache.set(*token, funded, now),
+            match read_funded(&wallet, &indexer, chain_id, permit2, *token).await {
+                Ok((funded, committed)) => {
+                    let quotable = quotable_inventory(funded, committed);
+                    if !funded.is_zero() && quotable.is_zero() {
+                        warn!(
+                            token = %token,
+                            funded = %funded,
+                            committed = %committed,
+                            "rfq inventory fully committed to the book; this side stays dark until the ladder releases it"
+                        );
+                    }
+                    cache.set(*token, quotable, now);
+                }
                 Err(e) => warn!(
                     token = %token,
                     error = %format!("{e:#}"),
@@ -953,6 +992,24 @@ mod tests {
             ),
             None,
             "an unread token is not inventable"
+        );
+    }
+
+    #[test]
+    fn quotable_inventory_subtracts_the_live_book() {
+        assert_eq!(
+            quotable_inventory(U256::from(100u64), U256::from(40u64)),
+            U256::from(60u64)
+        );
+        assert_eq!(
+            quotable_inventory(U256::from(100u64), U256::from(100u64)),
+            U256::ZERO,
+            "fully pledged to the ladder is no RFQ inventory"
+        );
+        assert_eq!(
+            quotable_inventory(U256::from(50u64), U256::from(80u64)),
+            U256::ZERO,
+            "over-committed book never goes negative"
         );
     }
 

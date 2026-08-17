@@ -54,8 +54,13 @@ impl TickBudgets {
 
 /// How many enabled sides quote `"max"` liquidity per input token. Sides whose
 /// size fails to parse are skipped here — the quote path warns about them.
+///
+/// Dual-run: an RFQ `"max"` side on the same token counts too, so the ladder
+/// leaves leftover inventory instead of pledging the whole wallet and having
+/// the venue reject every firm quote as `insufficient_funding`.
 pub fn count_max_sides(cfg: &Config) -> HashMap<Address, u32> {
-    cfg.pools
+    let mut counts = cfg
+        .pools
         .iter()
         .flat_map(|pool| {
             [
@@ -73,7 +78,31 @@ pub fn count_max_sides(cfg: &Config) -> HashMap<Address, u32> {
         .fold(HashMap::new(), |mut counts, token| {
             *counts.entry(token).or_insert(0) += 1;
             counts
-        })
+        });
+    if cfg.rfq_active() {
+        for pool in &cfg.pools {
+            if pool.rfq_corridor.is_none() {
+                continue;
+            }
+            if matches!(
+                pool.rfq_buy_capacity_debt(),
+                Ok(Some(crate::config::RfqCapacity::Wallet))
+            ) {
+                if let Ok(token) = pool.debt.parse::<Address>() {
+                    *counts.entry(token).or_insert(0) += 1;
+                }
+            }
+            if matches!(
+                pool.rfq_sell_capacity_collateral(),
+                Ok(Some(crate::config::RfqCapacity::Wallet))
+            ) {
+                if let Ok(token) = pool.collateral.parse::<Address>() {
+                    *counts.entry(token).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    counts
 }
 
 /// One "max" side's grant this tick: no more than its equal target share of the
@@ -652,5 +681,52 @@ mod tests {
         assert_eq!(counts.get(&debt), Some(&2));
         assert_eq!(counts.get(&coll_a1), Some(&1));
         assert_eq!(counts.get(&coll_a2), None);
+    }
+
+    #[test]
+    fn count_max_sides_counts_rfq_wallet_sides_in_dual_run() {
+        let toml = r#"
+            chain_id = 56
+            rpc_url = "http://x"
+            indexer_url = "http://x"
+            permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+            reactor = "0x0000000000000000000000000000000000000000"
+            tick_interval_secs = 5
+            [feed]
+            url = "http://x"
+            staleness_secs = 30
+            [rfq]
+            enabled = true
+            url = "wss://x/v2/maker/stream"
+            maker_id = "mk_test"
+            validation_contract = "0x00000000000000000000000000000000000000f1"
+            [[pools]]
+            rfq_corridor = "cngn-usdt-bsc"
+            collateral = "0x00000000000000000000000000000000000000c1"
+            collateral_decimals = 6
+            debt = "0x00000000000000000000000000000000000000d1"
+            debt_decimals = 18
+            ttl_secs = 60
+            refresh_threshold_bps = 10
+            buy_offset_bps = 1
+            buy_total_liquidity_debt = "max"
+            buy_min_slice_debt = "1"
+            buy_max_orders = 0
+            sell_offset_bps = 1
+            sell_total_liquidity_collateral = "max"
+            sell_min_slice_debt = "1"
+            sell_max_orders = 40
+        "#;
+        let cfg = crate::config::Config::from_toml(toml).unwrap();
+        let counts = count_max_sides(&cfg);
+        let debt: Address = "0x00000000000000000000000000000000000000d1"
+            .parse()
+            .unwrap();
+        let coll: Address = "0x00000000000000000000000000000000000000c1"
+            .parse()
+            .unwrap();
+        // Ladder bid is max (even at 0 orders) + RFQ bid max; ladder ask max + RFQ ask max.
+        assert_eq!(counts.get(&debt), Some(&2));
+        assert_eq!(counts.get(&coll), Some(&2));
     }
 }

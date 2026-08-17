@@ -17,8 +17,9 @@ import type { Bot, Corridor, Settings, Spread } from '../types'
 
 /**
  * Structured settings matching the desktop Stitch app: corridor, signer, spreads,
- * taker leg, endpoints, RFQ, plus a collapsed Experimental card for opt-in knobs
- * (TWAP / inventory-lean). Sizing / tick stay on the Raw config tab.
+ * taker leg, endpoints, plus a collapsed Experimental card for opt-in knobs
+ * (TWAP / inventory-lean). The RFQ card is gated on a raw-config token.
+ * Sizing / tick stay on the Raw config tab.
  *
  * Sends only the fields the operator touched — a partial patch means a concurrent
  * raw edit only loses what this form actually changed.
@@ -209,14 +210,23 @@ export default function SettingsForm({
         onChange={set}
       />
 
-      <RfqCard
-        draft={draft}
-        loaded={loaded}
-        rfqApiKey={rfqApiKey}
-        corridorId={bot.config?.corridorId ?? ''}
-        onChange={set}
-        onApiKey={setRfqApiKey}
-      />
+      {loaded.rfqPanelUnlocked && (
+        <RfqCard
+          botName={bot.name}
+          draft={draft}
+          loaded={loaded}
+          rfqApiKey={rfqApiKey}
+          corridorId={bot.config?.corridorId ?? ''}
+          editable={loaded.editable}
+          onChange={set}
+          onApiKey={setRfqApiKey}
+          onConnected={(next, message) => {
+            setLoaded(next)
+            setDraft(next)
+            onSaved(message)
+          }}
+        />
+      )}
 
       {error && <Banner tone="danger">{error}</Banner>}
 
@@ -566,25 +576,40 @@ function ExperimentalSubsection({
 const DEFAULT_RFQ_URL = 'wss://api.textilecredit.com/v2/maker/stream'
 
 /**
- * Dual-run RFQ: the bot answers the venue's private quote requests beside
- * the public ladder. The maker API key is write-only — typed here, stored
- * owner-only next to stitch.toml, never returned by GET.
+ * Dual-run RFQ. Happy path is Connect: the bot signs MakerEnroll and the
+ * panel writes the credential. Paste fields stay under Advanced for
+ * claim-link leftovers. The key is write-only.
  */
 function RfqCard({
+  botName,
   draft,
   loaded,
   rfqApiKey,
   corridorId,
+  editable,
   onChange,
   onApiKey,
+  onConnected,
 }: {
+  botName: string
   draft: Settings
   loaded: Settings
   rfqApiKey: string
   corridorId: string
+  editable: boolean
   onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void
   onApiKey: (value: string) => void
+  onConnected: (settings: Settings, message: string) => void
 }) {
+  const [connecting, setConnecting] = useState(false)
+  const [connectError, setConnectError] = useState<string | null>(null)
+  const [advanced, setAdvanced] = useState(false)
+  const [enrollment, setEnrollment] = useState<{
+    makerSlug: string
+    environment: string
+    corridors: string[]
+  } | null>(null)
+
   function enable(next: boolean) {
     onChange('rfqEnabled', next)
     if (!next) return
@@ -594,89 +619,151 @@ function RfqCard({
     }
   }
 
+  async function connect() {
+    setConnecting(true)
+    setConnectError(null)
+    try {
+      const res = await api.enrollRfq(botName)
+      setEnrollment(res.enrollment ?? null)
+      onConnected(res.settings, res.message)
+    } catch (e) {
+      setConnectError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setConnecting(false)
+    }
+  }
+
+  const connected = loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
+
   return (
     <Card title="RFQ">
       <div className="space-y-4">
         <Toggle
           checked={draft.rfqEnabled}
-          disabled={!loaded.editable}
+          disabled={!editable}
           onChange={enable}
           label="Answer private quote requests beside the public ladder"
         />
         <p className="text-xs text-faint">
-          Dual-run: the ladder keeps running. Enabling this signs firm,
-          taker-bound orders against the funded wallet. Stay on Dual-run
-          until you mean to go live.
+          Dual-run: the ladder keeps running. Connect signs with this bot&apos;s
+          funding wallet. Textile creates the maker and writes the credential
+          here — you never paste an id or key.
         </p>
-        {draft.rfqEnabled && !loaded.rfqApiKeySet && !rfqApiKey.trim() && (
+
+        {connected ? (
+          <div className="rounded-lg border border-line-soft bg-hover/40 px-3 py-2 text-sm">
+            <p className="font-medium">
+              Connected
+              {enrollment
+                ? ` as ${enrollment.makerSlug} (${enrollment.environment})`
+                : ''}
+            </p>
+            <p className="mt-1 text-xs text-faint">
+              {enrollment?.corridors.length
+                ? `Corridors: ${enrollment.corridors.join(', ')}`
+                : loaded.rfqCorridor
+                  ? `Corridor: ${loaded.rfqCorridor}`
+                  : 'Dual-run is not open on this chain yet.'}
+              {loaded.rfqApiKeySet ? ' · API key saved' : ''}
+            </p>
+          </div>
+        ) : (
           <Banner tone="warning">
-            RFQ will not start until you paste the maker API key. The bot
-            leaves the ladder running either way.
+            Not connected. The ladder keeps running either way.
           </Banner>
         )}
-        <Field
-          label="Stream URL"
-          hint="The venue maker WebSocket. Production is wss://api.textilecredit.com/v2/maker/stream."
+
+        {connectError && <Banner tone="danger">{connectError}</Banner>}
+
+        <Button
+          variant="primary"
+          busy={connecting}
+          disabled={!editable}
+          onClick={() => void connect()}
         >
-          <Input
-            value={draft.rfqUrl}
-            disabled={!loaded.editable}
-            placeholder={DEFAULT_RFQ_URL}
-            onChange={(e) => onChange('rfqUrl', e.target.value)}
-          />
-        </Field>
-        <Field
-          label="Maker id"
-          hint="The Prisma CUID from the admin RFQ page (starts with cl), not the slug."
-        >
-          <Input
-            value={draft.rfqMakerId}
-            disabled={!loaded.editable}
-            placeholder="cl…"
-            autoComplete="off"
-            onChange={(e) => onChange('rfqMakerId', e.target.value)}
-          />
-        </Field>
-        <Field
-          label="Validation contract"
-          hint="PreferredFillerValidation on this chain. BSC: 0xBCA5E344077AaC751A1C548a45F28215bB7ec165."
-        >
-          <Input
-            value={draft.rfqValidationContract}
-            disabled={!loaded.editable}
-            placeholder="0x…"
-            autoComplete="off"
-            onChange={(e) => onChange('rfqValidationContract', e.target.value)}
-          />
-        </Field>
-        <Field
-          label="Corridor slug"
-          hint="Venue corridor this pool quotes. Usually the same as the bot's corridor id."
-        >
-          <Input
-            value={draft.rfqCorridor}
-            disabled={!loaded.editable}
-            placeholder={corridorId || 'cngn-usdt-bsc'}
-            onChange={(e) => onChange('rfqCorridor', e.target.value)}
-          />
-        </Field>
-        <Field
-          label="Maker API key"
-          hint={
-            loaded.rfqApiKeySet
-              ? 'A key is already saved. Paste a new one only to rotate it. The current value is never shown.'
-              : 'The one-time claim key from the venue (tx_live_…). Stored owner-only on disk, never in stitch.toml.'
-          }
-        >
-          <Input
-            type="password"
-            value={rfqApiKey}
-            disabled={!loaded.editable}
-            placeholder={loaded.rfqApiKeySet ? '••••••••' : 'tx_live_…'}
-            autoComplete="off"
-            onChange={(e) => onApiKey(e.target.value)}
-          />
-        </Field>
+          {connected ? 'Reconnect to Textile' : 'Connect to Textile'}
+        </Button>
+
+        <div>
+          <button
+            type="button"
+            className="text-xs text-muted underline hover:text-ink"
+            onClick={() => setAdvanced((v) => !v)}
+          >
+            {advanced ? 'Hide advanced' : 'Advanced'}
+          </button>
+        </div>
+
+        {advanced && (
+          <div className="space-y-4 border-t border-line-soft pt-4">
+            <p className="text-xs text-faint">
+              Claim-link leftovers. Connect is the usual path.
+            </p>
+            <Field
+              label="Stream URL"
+              hint="The venue maker WebSocket. Production is wss://api.textilecredit.com/v2/maker/stream."
+            >
+              <Input
+                value={draft.rfqUrl}
+                disabled={!editable}
+                placeholder={DEFAULT_RFQ_URL}
+                onChange={(e) => onChange('rfqUrl', e.target.value)}
+              />
+            </Field>
+            <Field
+              label="Maker id"
+              hint="The Prisma CUID (starts with cl), not the slug."
+            >
+              <Input
+                value={draft.rfqMakerId}
+                disabled={!editable}
+                placeholder="cl…"
+                autoComplete="off"
+                onChange={(e) => onChange('rfqMakerId', e.target.value)}
+              />
+            </Field>
+            <Field
+              label="Validation contract"
+              hint="PreferredFillerValidation on this chain."
+            >
+              <Input
+                value={draft.rfqValidationContract}
+                disabled={!editable}
+                placeholder="0x…"
+                autoComplete="off"
+                onChange={(e) => onChange('rfqValidationContract', e.target.value)}
+              />
+            </Field>
+            <Field
+              label="Corridor slug"
+              hint="Venue corridor this pool quotes. Usually the same as the bot's corridor id."
+            >
+              <Input
+                value={draft.rfqCorridor}
+                disabled={!editable}
+                placeholder={corridorId || 'cngn-usdt-bsc'}
+                onChange={(e) => onChange('rfqCorridor', e.target.value)}
+              />
+            </Field>
+            <Field
+              label="Maker API key"
+              hint={
+                loaded.rfqApiKeySet
+                  ? 'A key is already saved. Paste a new one only to rotate it. The current value is never shown.'
+                  : 'Claim-link key (tx_live_…). Stored owner-only on disk, never in stitch.toml.'
+              }
+            >
+              <Input
+                type="password"
+                value={rfqApiKey}
+                disabled={!editable}
+                placeholder={loaded.rfqApiKeySet ? '••••••••' : 'tx_live_…'}
+                autoComplete="off"
+                onChange={(e) => onApiKey(e.target.value)}
+              />
+            </Field>
+          </div>
+        )}
       </div>
     </Card>
   )

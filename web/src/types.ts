@@ -114,6 +114,8 @@ export interface Settings {
   leanBaseBps: string
   leanWideBps: string
   editable: boolean
+  /** Raw-config gate. The RFQ card is hidden until this is true. */
+  rfqPanelUnlocked: boolean
   rfqEnabled: boolean
   rfqUrl: string
   rfqMakerId: string
@@ -123,11 +125,18 @@ export interface Settings {
   rfqApiKeySet: boolean
 }
 
+export interface RfqEnrollment {
+  makerSlug: string
+  environment: string
+  corridors: string[]
+}
+
 export interface SaveResult {
   settings: Settings
   restarted: boolean
   restartError: string | null
   message: string
+  enrollment?: RfqEnrollment
 }
 
 export type PanelRuntime = 'docker' | 'process'

@@ -15,6 +15,7 @@
 
 pub mod assets;
 pub mod bots;
+pub mod enroll;
 pub mod logs;
 pub mod origin;
 pub mod session;
@@ -270,6 +271,7 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/migrate", post(bots::migrate_layout))
         .route("/api/bots/{name}/settings", get(settings::show))
         .route("/api/bots/{name}/settings", patch(settings::update))
+        .route("/api/bots/{name}/rfq/enroll", post(enroll::enroll))
         .route("/api/bots/{name}/config", get(settings::raw))
         .route("/api/bots/{name}/config", put(settings::save_raw))
         .route("/api/bots/{name}/signer", put(bots::change_signer))

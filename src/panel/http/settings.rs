@@ -149,6 +149,8 @@ pub struct SettingsBody {
     /// Whether saving will be accepted. False for a bot whose config the panel can
     /// see but not write.
     pub editable: bool,
+    /// Raw-config gate. The Settings RFQ card stays hidden until this is true.
+    pub rfq_panel_unlocked: bool,
     pub rfq_enabled: bool,
     pub rfq_url: String,
     pub rfq_maker_id: String,
@@ -159,7 +161,12 @@ pub struct SettingsBody {
 }
 
 impl SettingsBody {
-    fn from_view(v: &SettingsView, editable: bool, rfq_api_key_set: bool) -> Self {
+    fn from_view(
+        v: &SettingsView,
+        editable: bool,
+        rfq_api_key_set: bool,
+        rfq_panel_unlocked: bool,
+    ) -> Self {
         Self {
             rpc_url: v.rpc_url.clone(),
             feed_url: v.feed_url.clone(),
@@ -182,6 +189,7 @@ impl SettingsBody {
             lean_base_bps: v.lean_base_bps.clone(),
             lean_wide_bps: v.lean_wide_bps.clone(),
             editable,
+            rfq_panel_unlocked,
             rfq_enabled: v.rfq_enabled,
             rfq_url: v.rfq_url.clone(),
             rfq_maker_id: v.rfq_maker_id.clone(),
@@ -196,6 +204,12 @@ fn rfq_key_is_set(config_path: &std::path::Path) -> bool {
     config_path.parent().is_some_and(setup::rfq_api_key_is_set)
 }
 
+fn rfq_panel_unlocked(toml: &str) -> bool {
+    Config::from_toml(toml)
+        .map(|c| c.rfq_panel_unlocked())
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolQuery {
@@ -205,7 +219,7 @@ pub struct PoolQuery {
 }
 
 /// The path the panel reads and writes a bot's config at, refusing bots it can't.
-fn config_path(bot: &Bot) -> Result<PathBuf, ApiError> {
+pub(super) fn config_path(bot: &Bot) -> Result<PathBuf, ApiError> {
     require_editable(bot)?;
     bot.config_panel_path
         .clone()
@@ -249,7 +263,7 @@ impl ConfigLocks {
     }
 }
 
-fn read_toml(path: &std::path::Path) -> Result<String, ApiError> {
+pub(super) fn read_toml(path: &std::path::Path) -> Result<String, ApiError> {
     std::fs::read_to_string(path).map_err(|e| {
         ApiError::new(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -272,6 +286,7 @@ pub async fn show(
         &view,
         bot.is_editable(),
         rfq_key_is_set(&path),
+        rfq_panel_unlocked(&toml),
     ))
     .into_response())
 }
@@ -470,7 +485,7 @@ pub async fn update(
         .map_err(|e| ApiError::internal(&e))?;
     }
 
-    save_and_restart(&state, &bot, &path, &edited, pool).await
+    save_and_restart(&state, &bot, &path, &edited, pool, None).await
 }
 
 /// The raw config, for the fields the form doesn't cover.
@@ -546,19 +561,20 @@ pub async fn save_raw(
         )));
     }
 
-    save_and_restart(&state, &bot, &path, &body.toml, 0).await
+    save_and_restart(&state, &bot, &path, &body.toml, 0, None).await
 }
 
 /// Write the file, then bounce the container.
 ///
 /// The write is atomic (`write_toml_atomic`), so a bot reading its config at the
 /// same moment sees either the old file or the new one, never a truncated one.
-async fn save_and_restart(
+pub(super) async fn save_and_restart(
     state: &AppState,
     bot: &Bot,
     path: &std::path::Path,
     toml: &str,
     pool: usize,
+    extra: Option<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     // Re-discover the bot *under the config lock the caller holds*, before anything
     // else. `bot` was read by the handler before it took that lock, so two overlapping
@@ -730,13 +746,27 @@ async fn save_and_restart(
         ),
     };
 
-    Ok(Json(serde_json::json!({
-        "settings": SettingsBody::from_view(&view, true, rfq_key_is_set(path)),
+    let mut body = serde_json::json!({
+        "settings": SettingsBody::from_view(
+            &view,
+            true,
+            rfq_key_is_set(path),
+            rfq_panel_unlocked(&fresh),
+        ),
         "restarted": restarted,
         "restartError": restart_error,
         "message": message,
-    }))
-    .into_response())
+    });
+    if let (Some(obj), Some(add)) = (
+        body.as_object_mut(),
+        extra.as_ref().and_then(|v| v.as_object()),
+    ) {
+        for (k, v) in add {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+
+    Ok(Json(body).into_response())
 }
 
 /// Apply a safety-relevant change to a *running* bot, all-or-nothing.
@@ -810,7 +840,12 @@ async fn apply_live_change(
         let view =
             setup::read_settings_at(&read_toml(path)?, pool).map_err(ApiError::bad_request)?;
         Ok(Json(serde_json::json!({
-            "settings": SettingsBody::from_view(&view, true, rfq_key_is_set(path)),
+            "settings": SettingsBody::from_view(
+                &view,
+                true,
+                rfq_key_is_set(path),
+                rfq_panel_unlocked(&read_toml(path)?),
+            ),
             "restarted": restarted,
             "restartError": restart_error,
             "message": message,
@@ -1064,6 +1099,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
         assert_eq!(v["rfqEnabled"], false);
+        assert_eq!(v["rfqPanelUnlocked"], false);
         assert_eq!(v["rfqUrl"], "");
         assert_eq!(v["rfqMakerId"], "");
         assert_eq!(v["rfqCorridor"], "");
@@ -1132,6 +1168,30 @@ mod tests {
                 .trim(),
             "tx_live_panel_secret"
         );
+    }
+
+    #[tokio::test]
+    async fn rfq_panel_stays_locked_until_the_raw_config_token() {
+        let h = harness("settings-rfq-panel-gate");
+        seed(&h, "bot-a");
+        let (status, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(Harness::parse(&body)["rfqPanelUnlocked"], false);
+
+        let path = h.root.join("bot-a").join("stitch.toml");
+        let toml = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{toml}\n[experimental]\nrfq_panel = \"{}\"\n",
+                crate::config::RFQ_PANEL_GATE
+            ),
+        )
+        .unwrap();
+
+        let (status, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(Harness::parse(&body)["rfqPanelUnlocked"], true);
     }
 
     #[tokio::test]
@@ -1789,7 +1849,7 @@ mod tests {
         // Save starting from the stale chain-56 snapshot. The claim must land on the
         // chain-1 wallet the file now names, find it busy, and skip the restart. Deriving
         // it from the stale snapshot would claim the unheld chain-56 wallet and restart.
-        let resp = super::save_and_restart(&h.state, &stale, &path, &moved, 0)
+        let resp = super::save_and_restart(&h.state, &stale, &path, &moved, 0, None)
             .await
             .unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -1826,9 +1886,10 @@ mod tests {
         // A stale path pointing at a flat-layout file the bot is not on.
         let stale_path = h.root.join("stitch.bot-a.toml");
 
-        let err = super::save_and_restart(&h.state, &bot, &stale_path, "feed_url = \"x\"\n", 0)
-            .await
-            .expect_err("a save against a path the config no longer sits on must be refused");
+        let err =
+            super::save_and_restart(&h.state, &bot, &stale_path, "feed_url = \"x\"\n", 0, None)
+                .await
+                .expect_err("a save against a path the config no longer sits on must be refused");
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert!(err.message.contains("moved on disk"), "{}", err.message);
         // Nothing was written: the real config is untouched and the orphan wasn't created.

@@ -221,6 +221,12 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  enrollRfq: (name: string) =>
+    request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/rfq/enroll`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
   rawConfig: (name: string) =>
     request<{ toml: string; path: string; editable: boolean }>(
       `/api/bots/${encodeURIComponent(name)}/config`,

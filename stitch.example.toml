@@ -123,9 +123,10 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # validation_contract = "0x0000000000000000000000000000000000000000"  # PreferredFillerValidation (per chain)
 
 # ----- Experimental gates (off by default). Raw tokens; nothing here changes
-# trading behavior. The RFQ Settings card no longer needs rfq_panel.
+# trading behavior. The RFQ Settings card stays hidden until you set this
+# exact token. Later the card ships on for everyone and this gate goes away.
 # [experimental]
-# rfq_panel = ""
+# rfq_panel = "enable-rfq-beta"
 
 # ----- Signer / wallet backend. Omit this whole section to use the local
 # hotwallet (the default, unchanged): the bot signs with STITCH_PRIVATE_KEY /
