@@ -101,6 +101,36 @@ fn default_rfq_api_key_env() -> String {
     "STITCH_RFQ_API_KEY".to_string()
 }
 
+/// Venue maker stream: `wss://` anywhere, or `ws://` only on loopback.
+/// A remote cleartext stream is a signing oracle for whoever can MITM it
+/// (audit H-03): stitch binds the next firm quote to whatever `taker` the
+/// frame names.
+pub fn assert_rfq_stream_url(raw: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(raw.trim())
+        .with_context(|| format!("[rfq].url must be a valid WebSocket URL, got {raw:?}"))?;
+    anyhow::ensure!(parsed.host().is_some(), "[rfq].url must include a host");
+    match parsed.scheme() {
+        "wss" => Ok(()),
+        "ws" => {
+            anyhow::ensure!(
+                host_is_loopback(parsed.host()),
+                "[rfq].url may use ws:// only on localhost, got {raw:?}"
+            );
+            Ok(())
+        }
+        other => anyhow::bail!("[rfq].url must be a ws(s):// URL, got scheme {other:?}"),
+    }
+}
+
+fn host_is_loopback(host: Option<url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 /// The `[experimental]` block. Every field is a raw string read verbatim; the
 /// parser attaches no meaning so an unknown/old gate token can never turn a
 /// feature on by accident.
@@ -604,11 +634,7 @@ impl Config {
         if !rfq.enabled {
             return Ok(());
         }
-        anyhow::ensure!(
-            rfq.url.starts_with("wss://") || rfq.url.starts_with("ws://"),
-            "[rfq].url must be a ws(s):// URL, got {:?}",
-            rfq.url
-        );
+        assert_rfq_stream_url(&rfq.url)?;
         anyhow::ensure!(!rfq.maker_id.trim().is_empty(), "[rfq].maker_id is empty");
         anyhow::ensure!(
             !rfq.api_key_env.trim().is_empty(),
@@ -1001,6 +1027,22 @@ mod tests {
             .to_string()
             .contains("[rfq].url"));
 
+        let remote_ws = base.replace(
+            "wss://api.textilecredit.com/v2/maker/stream",
+            "ws://api.textilecredit.com/v2/maker/stream",
+        );
+        let err = Config::from_toml(&remote_ws).unwrap_err().to_string();
+        assert!(
+            err.contains("localhost"),
+            "remote ws:// must be rejected, got {err}"
+        );
+
+        let local_ws = base.replace(
+            "wss://api.textilecredit.com/v2/maker/stream",
+            "ws://localhost:10000/v2/maker/stream",
+        );
+        assert!(Config::from_toml(&local_ws).is_ok());
+
         let bad_contract = base.replace(
             "0x00000000000000000000000000000000000000aa",
             "not-an-address",
@@ -1086,5 +1128,16 @@ mod tests {
         let cfg = Config::from_toml(toml).expect("buy-only config parses");
         assert!(cfg.pools[0].buy_enabled());
         assert!(!cfg.pools[0].sell_enabled());
+    }
+
+    #[test]
+    fn audit_h03_rfq_stream_url_rejects_remote_cleartext() {
+        assert!(assert_rfq_stream_url("wss://api.textilecredit.com/v2/maker/stream").is_ok());
+        assert!(assert_rfq_stream_url("ws://localhost:10000/v2/maker/stream").is_ok());
+        assert!(assert_rfq_stream_url("ws://127.0.0.1:10000/v2/maker/stream").is_ok());
+        assert!(assert_rfq_stream_url("ws://[::1]:10000/v2/maker/stream").is_ok());
+        assert!(assert_rfq_stream_url("ws://api.textilecredit.com/v2/maker/stream").is_err());
+        assert!(assert_rfq_stream_url("ws://192.168.1.10/v2/maker/stream").is_err());
+        assert!(assert_rfq_stream_url("https://api.textilecredit.com/v2/maker/stream").is_err());
     }
 }

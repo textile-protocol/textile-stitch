@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-use crate::config::{parse_liquidity_amount, parse_min_slice_debt, Config};
+use crate::config::{assert_rfq_stream_url, parse_liquidity_amount, parse_min_slice_debt, Config};
 
 /// How a side's spread is expressed in the config. Editing preserves whichever
 /// form the operator's config already uses rather than switching representation.
@@ -690,6 +690,7 @@ fn require_ws_url(value: &str, field: &str) -> Result<()> {
         parsed.host_str().is_some_and(|h| !h.is_empty()),
         "{field} must include a host"
     );
+    assert_rfq_stream_url(v).with_context(|| format!("{field} rejected"))?;
     Ok(())
 }
 
@@ -1493,6 +1494,18 @@ mod tests {
         patch.rfq_url = Some("https://api.textilecredit.com/v2/maker/stream".into());
         let err = apply_settings(TEMPLATE, &patch).unwrap_err();
         assert!(err.to_string().contains("ws"), "got {err:#}");
+    }
+
+    #[test]
+    fn rfq_rejects_a_remote_cleartext_websocket() {
+        let mut patch = read_settings(TEMPLATE).unwrap().to_patch();
+        patch.rfq_url = Some("ws://api.textilecredit.com/v2/maker/stream".into());
+        let err = apply_settings(TEMPLATE, &patch).unwrap_err();
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("localhost"),
+            "remote ws:// must be rejected, got {full}"
+        );
     }
 
     #[test]

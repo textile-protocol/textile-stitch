@@ -701,7 +701,7 @@ function RfqCard({
             </p>
             <Field
               label="Stream URL"
-              hint="The venue maker WebSocket. Production is wss://api.textilecredit.com/v2/maker/stream."
+              hint="The venue maker WebSocket. Production is wss://. ws:// is allowed only on localhost."
             >
               <Input
                 value={draft.rfqUrl}
