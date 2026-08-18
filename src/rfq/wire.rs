@@ -49,6 +49,15 @@ pub struct SessionDomain {
     pub version: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CorridorPairFrame {
+    pub slug: String,
+    pub chain_id: u64,
+    pub collateral_token: String,
+    pub debt_token: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAcceptedFrame {
@@ -58,6 +67,9 @@ pub struct SessionAcceptedFrame {
     pub heartbeat_timeout_ms: u64,
     /// Corridor slugs the venue routes to this maker.
     pub corridors: Vec<String>,
+    /// Additive: tokens per slug so the bot can bind without `rfq_corridor`.
+    #[serde(default)]
+    pub corridor_pairs: Vec<CorridorPairFrame>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

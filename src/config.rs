@@ -233,9 +233,9 @@ pub struct PoolConfig {
     /// price cNGN, COPM, and KES at once.
     #[serde(default)]
     pub feed_url: Option<String>,
-    /// Venue corridor slug for the RFQ responder (e.g. `"cngn-usdc"`). Set it
-    /// to serve this pool over RFQ; unset, the pool is ladder-only. Only takes
-    /// effect with `[rfq].enabled = true`.
+    /// Optional venue slug override. Unset is fine: when `[rfq].enabled` the
+    /// pool is solicitable and the bot matches quote requests by tokens.
+    /// Kept so existing configs that already set it still parse.
     #[serde(default)]
     pub rfq_corridor: Option<String>,
 
@@ -550,12 +550,11 @@ impl Config {
         Ok(cfg)
     }
 
-    /// True when the RFQ responder should run: the master switch is on AND at
-    /// least one pool names a corridor. Anything less is a no-op — the ladder
-    /// never changes either way.
+    /// True when the RFQ responder should run: the master switch is on and
+    /// there is at least one pool to quote. Anything less is a no-op — the
+    /// ladder never changes either way.
     pub fn rfq_active(&self) -> bool {
-        self.rfq.as_ref().is_some_and(|r| r.enabled)
-            && self.pools.iter().any(|p| p.rfq_corridor.is_some())
+        self.rfq.as_ref().is_some_and(|r| r.enabled) && !self.pools.is_empty()
     }
 
     /// True only for the exact [`RFQ_PANEL_GATE`] token. Read-only surface for
@@ -680,19 +679,18 @@ impl Config {
             .parse::<alloy_primitives::Address>()
             .context("[rfq].validation_contract is not a valid address")?;
         for (idx, pool) in self.pools.iter().enumerate() {
-            let Some(slug) = &pool.rfq_corridor else {
-                continue;
-            };
-            anyhow::ensure!(
-                !slug.trim().is_empty(),
-                "pools[{idx}].rfq_corridor is empty"
-            );
+            if let Some(slug) = &pool.rfq_corridor {
+                anyhow::ensure!(
+                    !slug.trim().is_empty(),
+                    "pools[{idx}].rfq_corridor is empty"
+                );
+            }
             // Surface unparseable capacity at load time. `"max"` is valid —
             // it means live wallet, resolved at runtime.
             pool.rfq_buy_capacity_debt()
-                .with_context(|| format!("pools[{idx}] (rfq corridor {slug})"))?;
+                .with_context(|| format!("pools[{idx}] RFQ capacity"))?;
             pool.rfq_sell_capacity_collateral()
-                .with_context(|| format!("pools[{idx}] (rfq corridor {slug})"))?;
+                .with_context(|| format!("pools[{idx}] RFQ capacity"))?;
         }
         Ok(())
     }
@@ -1022,7 +1020,7 @@ mod tests {
     "#;
 
     #[test]
-    fn rfq_is_inert_unless_enabled_and_a_pool_names_a_corridor() {
+    fn rfq_is_inert_unless_enabled() {
         // Block present but disabled → inactive.
         let toml = format!(
             "{LEAN_POOL_BASE}\n{}",
@@ -1031,17 +1029,8 @@ mod tests {
         let cfg = Config::from_toml(&toml).unwrap();
         assert!(!cfg.rfq_active());
 
-        // Enabled but no pool opted in → still inactive.
+        // Enabled + a pool → active. No rfq_corridor label required.
         let toml = format!("{LEAN_POOL_BASE}\n{RFQ_BLOCK}");
-        let cfg = Config::from_toml(&toml).unwrap();
-        assert!(!cfg.rfq_active());
-
-        // Enabled + a corridor → active. The corridor rides on the pool, so
-        // splice it in before the [rfq] table.
-        let toml = format!(
-            "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
-            LEAN_POOL_BASE
-        );
         let cfg = Config::from_toml(&toml).unwrap();
         assert!(cfg.rfq_active());
         assert_eq!(

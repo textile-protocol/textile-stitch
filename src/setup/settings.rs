@@ -126,7 +126,7 @@ pub struct SettingsView {
     pub rfq_maker_id: String,
     /// PreferredFillerValidation address. Empty when `[rfq]` is absent.
     pub rfq_validation_contract: String,
-    /// This pool's `rfq_corridor` slug. Empty when the pool is not on RFQ.
+    /// Optional leftover `rfq_corridor` slug. Empty on new Connects.
     pub rfq_corridor: String,
 }
 

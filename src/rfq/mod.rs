@@ -10,7 +10,7 @@
 //! target).
 //!
 //! Kill switch: the whole module is spawned from `run()` only when
-//! `[rfq].enabled = true` AND at least one pool sets `rfq_corridor`. Anything
+//! `[rfq].enabled = true` and the bot has at least one pool. Anything
 //! less and no code here executes — a disabled config is behaviorally
 //! identical to a build without the module.
 //!
@@ -203,7 +203,7 @@ fn build_runtime(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    anyhow::ensure!(!books.is_empty(), "no pool sets rfq_corridor");
+    anyhow::ensure!(!books.is_empty(), "no pools to quote over RFQ");
     Ok(RfqRuntime {
         url: rfq.url.clone(),
         api_key,
@@ -222,6 +222,67 @@ fn build_runtime(
         signer,
         reservations_path: config_dir.map(|dir| dir.join(RESERVATIONS_FILE)),
     })
+}
+
+fn same_addr(value: &str, addr: Address) -> bool {
+    value.parse::<Address>().is_ok_and(|parsed| parsed == addr)
+}
+
+fn pair_matches(book: &CorridorBook, token_a: &str, token_b: &str) -> bool {
+    (same_addr(token_a, book.collateral) && same_addr(token_b, book.debt))
+        || (same_addr(token_a, book.debt) && same_addr(token_b, book.collateral))
+}
+
+fn book_for_request<'a>(
+    books: &'a [CorridorBook],
+    req: &QuoteRequestFrame,
+) -> Option<&'a CorridorBook> {
+    books
+        .iter()
+        .find(|b| pair_matches(b, &req.sell_token, &req.buy_token))
+        .or_else(|| books.iter().find(|b| b.slug == req.corridor_id))
+}
+
+/// Map a configured pool onto a venue-assigned slug. Token match wins so a
+/// leftover `rfq_corridor` typo cannot hide a pair the venue already routed.
+fn bind_assigned_book(
+    book: &CorridorBook,
+    accepted: &wire::SessionAcceptedFrame,
+    chain_id: u64,
+) -> Option<CorridorBook> {
+    let from_pair = accepted
+        .corridor_pairs
+        .iter()
+        .find(|p| p.chain_id == chain_id && pair_matches(book, &p.collateral_token, &p.debt_token));
+    let slug = if let Some(pair) = from_pair {
+        Some(pair.slug.clone())
+    } else if !book.slug.is_empty() && accepted.corridors.iter().any(|c| c == &book.slug) {
+        Some(book.slug.clone())
+    } else {
+        None
+    };
+    match slug {
+        Some(slug) => {
+            let mut bound = book.clone();
+            bound.slug = slug;
+            Some(bound)
+        }
+        None => {
+            if book.slug.is_empty() {
+                warn!(
+                    collateral = %book.collateral,
+                    debt = %book.debt,
+                    "pool not assigned by the venue; skipping"
+                );
+            } else {
+                warn!(
+                    corridor = %book.slug,
+                    "configured rfq_corridor not assigned by the venue; skipping"
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Reconnect-forever driver: one authenticated session at a time, exponential
@@ -336,27 +397,14 @@ async fn session_loop_inner(
         accepted,
     } = authed;
 
-    // Serve only corridors the venue actually routed to us; a configured slug
-    // the venue doesn't know is loud, not silent.
+    // Bind each pool to a venue slug: tokens first, then a configured label.
     let books: Vec<CorridorBook> = rt
         .books
         .iter()
-        .filter(|b| {
-            let assigned = accepted.corridors.iter().any(|c| c == &b.slug);
-            if !assigned {
-                warn!(corridor = %b.slug, "configured rfq_corridor not assigned by the venue; skipping");
-            }
-            assigned
-        })
-        .cloned()
+        .filter_map(|b| bind_assigned_book(b, &accepted, rt.chain_id))
         .collect();
     if books.is_empty() {
-        return (
-            Err(anyhow::anyhow!(
-                "the venue assigned none of the configured corridors"
-            )),
-            reservations,
-        );
+        info!("venue assigned no corridors yet; staying connected");
     }
 
     let mut engine = Engine {
@@ -518,7 +566,7 @@ impl Engine {
             })
         };
 
-        let Some(book) = self.books.iter().find(|b| b.slug == req.corridor_id) else {
+        let Some(book) = book_for_request(&self.books, &req) else {
             warn!(corridor = %req.corridor_id, "quote request for an unknown corridor");
             return reject(RejectReason::Busy);
         };
@@ -929,6 +977,76 @@ mod tests {
         assert_eq!(cache.get("http://feed").unwrap().price, 2.0);
     }
 
+    fn test_book() -> CorridorBook {
+        CorridorBook {
+            slug: String::new(),
+            collateral: COLLATERAL.parse().unwrap(),
+            debt: DEBT.parse().unwrap(),
+            collateral_decimals: 6,
+            debt_decimals: 6,
+            buy_spread: Some(Spread::Bps(200)),
+            sell_spread: Some(Spread::Bps(200)),
+            buy_capacity_debt: Some(RfqCapacity::Exact(U256::from(1u64))),
+            sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(1u64))),
+            feed_url: "http://feed".into(),
+        }
+    }
+
+    fn accepted(
+        corridors: &[&str],
+        pairs: Vec<wire::CorridorPairFrame>,
+    ) -> wire::SessionAcceptedFrame {
+        wire::SessionAcceptedFrame {
+            maker_id: "mk".into(),
+            signing_address: "0x00".into(),
+            heartbeat_interval_ms: 1_000,
+            heartbeat_timeout_ms: 5_000,
+            corridors: corridors.iter().map(|s| (*s).to_string()).collect(),
+            corridor_pairs: pairs,
+        }
+    }
+
+    #[test]
+    fn bind_requires_pair_and_chain_not_list_cardinality() {
+        let book = test_book();
+        let one_unrelated = accepted(
+            &["nvda-usdg-robinhood"],
+            vec![wire::CorridorPairFrame {
+                slug: "nvda-usdg-robinhood".into(),
+                chain_id: 4663,
+                collateral_token: "0x0000000000000000000000000000000000000099".into(),
+                debt_token: "0x0000000000000000000000000000000000000098".into(),
+            }],
+        );
+        assert!(
+            bind_assigned_book(&book, &one_unrelated, 8453).is_none(),
+            "one assigned corridor is not a pair match"
+        );
+
+        let tokens_wrong_chain = accepted(
+            &["cngn-usdc-base"],
+            vec![wire::CorridorPairFrame {
+                slug: "cngn-usdc-base".into(),
+                chain_id: 56,
+                collateral_token: COLLATERAL.into(),
+                debt_token: DEBT.into(),
+            }],
+        );
+        assert!(bind_assigned_book(&book, &tokens_wrong_chain, 8453).is_none());
+
+        let tokens_ok = accepted(
+            &["cngn-usdc-base"],
+            vec![wire::CorridorPairFrame {
+                slug: "cngn-usdc-base".into(),
+                chain_id: 8453,
+                collateral_token: COLLATERAL.into(),
+                debt_token: DEBT.into(),
+            }],
+        );
+        let bound = bind_assigned_book(&book, &tokens_ok, 8453).unwrap();
+        assert_eq!(bound.slug, "cngn-usdc-base");
+    }
+
     #[tokio::test]
     async fn quote_expired_releases_inventory_so_the_next_request_can_fill() {
         let mut engine = test_engine();
@@ -1000,11 +1118,20 @@ mod tests {
         assert_eq!(rej.reason, RejectReason::Busy);
 
         let mut req = exact_input_request("rfq_2");
+        req.sell_token = "0x0000000000000000000000000000000000000099".into();
+        req.buy_token = "0x0000000000000000000000000000000000000098".into();
         req.corridor_id = "kes-usdt".into();
         let MakerFrame::QuoteReject(rej) = engine.respond(req, &prices).await else {
             panic!("expected reject");
         };
         assert_eq!(rej.reason, RejectReason::Busy);
+
+        // A mistyped slug still quotes when the tokens match the book.
+        let mut req = exact_input_request("rfq_3");
+        req.corridor_id = "kes-usdt".into();
+        let MakerFrame::QuoteResponse(_) = engine.respond(req, &prices).await else {
+            panic!("tokens should bind the book");
+        };
     }
 
     #[tokio::test]

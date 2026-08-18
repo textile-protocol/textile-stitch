@@ -81,6 +81,10 @@ pub fn count_max_sides(cfg: &Config) -> HashMap<Address, u32> {
         });
     if cfg.rfq_active() {
         for pool in &cfg.pools {
+            // Assignment is the leftover slug Connect writes. A slugless pool
+            // can still quote after session bind, but we cannot reserve RFQ
+            // share for it before that — counting every pool here starves
+            // ladder sides that share the token.
             if pool.rfq_corridor.is_none() {
                 continue;
             }
@@ -728,5 +732,50 @@ mod tests {
         // Ladder bid is max (even at 0 orders) + RFQ bid max; ladder ask max + RFQ ask max.
         assert_eq!(counts.get(&debt), Some(&2));
         assert_eq!(counts.get(&coll), Some(&2));
+    }
+
+    #[test]
+    fn count_max_sides_ignores_slugless_rfq_pools() {
+        let toml = r#"
+            chain_id = 56
+            rpc_url = "http://x"
+            indexer_url = "http://x"
+            permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+            reactor = "0x0000000000000000000000000000000000000000"
+            tick_interval_secs = 5
+            [feed]
+            url = "https://x"
+            staleness_secs = 30
+            [rfq]
+            enabled = true
+            url = "wss://x/v2/maker/stream"
+            maker_id = "mk_test"
+            validation_contract = "0x00000000000000000000000000000000000000f1"
+            [[pools]]
+            collateral = "0x00000000000000000000000000000000000000c1"
+            collateral_decimals = 6
+            debt = "0x00000000000000000000000000000000000000d1"
+            debt_decimals = 18
+            ttl_secs = 60
+            refresh_threshold_bps = 10
+            buy_offset_bps = 1
+            buy_total_liquidity_debt = "max"
+            buy_min_slice_debt = "1"
+            buy_max_orders = 0
+            sell_offset_bps = 1
+            sell_total_liquidity_collateral = "max"
+            sell_min_slice_debt = "1"
+            sell_max_orders = 40
+        "#;
+        let cfg = crate::config::Config::from_toml(toml).unwrap();
+        let counts = count_max_sides(&cfg);
+        let debt: Address = "0x00000000000000000000000000000000000000d1"
+            .parse()
+            .unwrap();
+        let coll: Address = "0x00000000000000000000000000000000000000c1"
+            .parse()
+            .unwrap();
+        assert_eq!(counts.get(&debt), Some(&1));
+        assert_eq!(counts.get(&coll), Some(&1));
     }
 }

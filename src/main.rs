@@ -484,10 +484,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         dry_run,
     };
 
-    // RFQ responder (dual-run pilot): spawned only when `[rfq].enabled` AND a
-    // pool sets `rfq_corridor`. It runs beside the ladder on its own cadence
-    // and WebSocket; with the config off this is a no-op and every tick below
-    // behaves exactly as before.
+    // RFQ responder (dual-run pilot): spawned only when `[rfq].enabled`.
+    // It runs beside the ladder on its own cadence and WebSocket; with the
+    // config off this is a no-op and every tick below behaves exactly as before.
     let rfq_task = stitch_bot::rfq::maybe_spawn(
         &cfg,
         signer.clone(),

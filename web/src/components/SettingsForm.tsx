@@ -640,10 +640,9 @@ function RfqCard({
   }
 
   const connected = loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
-  const live =
-    connected &&
-    loaded.rfqEnabled &&
-    (enrollment?.corridors.length || loaded.rfqCorridor.trim() !== '')
+  // Connect writes rfq_enabled=false until Textile assigns a corridor.
+  // Do not also require the leftover slug — token match is enough once live.
+  const live = connected && loaded.rfqEnabled
   const waiting = connected && !live
 
   return (

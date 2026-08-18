@@ -85,19 +85,17 @@ fn resolve_capacity(
     }
 }
 
-/// Build the corridor book for a pool, or `None` when the pool doesn't opt
-/// into RFQ. Errors mirror config validation (bad addresses) — unreachable
-/// for a config that passed `Config::from_toml`, kept as errors so the
-/// responder can never start on a half-parsed pool.
+/// Build the corridor book for a pool. `rfq_corridor` is an optional label;
+/// the session binds the venue slug from tokens. Errors mirror config
+/// validation (bad addresses) — unreachable for a config that passed
+/// `Config::from_toml`, kept as errors so the responder can never start on
+/// a half-parsed pool.
 pub fn book_from_pool(
     pool: &PoolConfig,
     default_feed_url: &str,
 ) -> anyhow::Result<Option<CorridorBook>> {
-    let Some(slug) = pool.rfq_corridor.clone() else {
-        return Ok(None);
-    };
     Ok(Some(CorridorBook {
-        slug,
+        slug: pool.rfq_corridor.clone().unwrap_or_default(),
         collateral: pool.collateral.parse()?,
         debt: pool.debt.parse()?,
         collateral_decimals: pool.collateral_decimals,
@@ -572,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ladder_only_pool_yields_no_book() {
+    fn a_pool_is_an_rfq_book_without_a_slug() {
         let toml = r#"
             chain_id = 8453
             rpc_url = "http://x"
@@ -594,11 +592,11 @@ mod tests {
             refresh_threshold_bps = 0
         "#;
         let cfg = crate::config::Config::from_toml(toml).unwrap();
-        assert!(book_from_pool(&cfg.pools[0], "http://feed")
+        let book = book_from_pool(&cfg.pools[0], "http://feed")
             .unwrap()
-            .is_none());
+            .expect("every pool is a book");
+        assert!(book.slug.is_empty());
 
-        // Opting in picks up sides, capacity, and the default feed.
         let toml = toml.replace(
             "buy_order_size_debt = \"5000000000\"",
             "buy_order_size_debt = \"5000000000\"\nrfq_corridor = \"cngn-usdc\"",

@@ -113,8 +113,8 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # taker-bound orders against your funded wallet. The ladder above keeps
 # running unchanged either way. The maker API key is never in this file; the
 # panel writes it to rfq-api.key (or set the env var named by api_key_env).
-# Each participating [[pools]] block also needs `rfq_corridor = "<venue slug>"`.
-# Liquidity may be `"max"` (live wallet) or an explicit atomic cap.
+# Pools are the corridors — no extra slug. Liquidity may be `"max"` (live
+# wallet) or an explicit atomic cap. `rfq_corridor` is optional leftover.
 # [rfq]
 # enabled = false                                        # master kill switch
 # url = "wss://api.textilecredit.com/v2/maker/stream"
