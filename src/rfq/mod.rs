@@ -491,7 +491,14 @@ impl Engine {
                 None
             }
             VenueFrame::QuoteExpired(e) => {
-                debug!(rfq_id = %e.rfq_id, "quote expired unselected");
+                // The taker's accept window lapsed without a submit. Drop the
+                // claim now so the next request on this side is not sized
+                // against a quote the venue has already un-counted.
+                if self.reservations.release(&e.rfq_id) {
+                    info!(rfq_id = %e.rfq_id, "quote expired unaccepted; inventory released");
+                } else {
+                    debug!(rfq_id = %e.rfq_id, "quote expired unaccepted; no local reservation");
+                }
                 None
             }
             VenueFrame::Challenge(_) | VenueFrame::SessionAccepted(_) => {
@@ -749,6 +756,7 @@ async fn inventory_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::wire::QuoteExpiredFrame;
     use super::*;
     use crate::config::RfqCapacity;
     use crate::quote::Spread;
@@ -919,6 +927,33 @@ mod tests {
             }),
         );
         assert_eq!(cache.get("http://feed").unwrap().price, 2.0);
+    }
+
+    #[tokio::test]
+    async fn quote_expired_releases_inventory_so_the_next_request_can_fill() {
+        let mut engine = test_engine();
+        let prices = fresh_prices();
+        let first = engine.respond(exact_input_request("rfq_1"), &prices).await;
+        assert!(matches!(first, MakerFrame::QuoteResponse(_)));
+        assert_eq!(engine.reservations.len(), 1);
+
+        let none = engine
+            .dispatch(
+                VenueFrame::QuoteExpired(QuoteExpiredFrame {
+                    rfq_id: "rfq_1".into(),
+                }),
+                &prices,
+            )
+            .await;
+        assert!(none.is_none());
+        assert!(engine.reservations.is_empty());
+
+        let second = engine.respond(exact_input_request("rfq_2"), &prices).await;
+        let MakerFrame::QuoteResponse(resp) = second else {
+            panic!("expected a full-size quote after expiry release, got {second:?}");
+        };
+        assert_eq!(resp.buy_amount, "979902009");
+        assert_eq!(engine.reservations.len(), 1);
     }
 
     #[tokio::test]

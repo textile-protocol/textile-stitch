@@ -6,8 +6,12 @@
 //! deadline passes — INCLUDING quotes the venue reports as lost
 //! (`lost_price`): a losing quote is still a valid signed order the winner's
 //! failure could route to, so its reservation holds until `deadline + skew`,
-//! never until the loss notice. Releases are therefore purely time-based; the
-//! venue's result frames are informational.
+//! never until the loss notice.
+//!
+//! `quoteExpired` is the exception: the taker was handed the winning quote
+//! and its accept window lapsed without a submit. The venue un-counts that
+//! order at the same moment, so this ledger must drop it or the next request
+//! on the same side keeps seeing a ghost reservation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -146,6 +150,17 @@ impl Reservations {
             .fold(U256::ZERO, |sum, r| sum.saturating_add(r.input))
     }
 
+    /// Drop one RFQ's claim immediately. Used when the venue says the
+    /// winning quote expired unaccepted (`quoteExpired`). Missing id is a
+    /// no-op so a duplicate or late frame cannot break the ledger.
+    pub fn release(&mut self, rfq_id: &str) -> bool {
+        let gone = self.by_rfq.remove(rfq_id).is_some();
+        if gone {
+            self.persist();
+        }
+        gone
+    }
+
     /// Drop entries past their release time. Called on the 1s levels tick so
     /// the map can't grow unboundedly between quote bursts.
     pub fn prune(&mut self, now_secs: u64) {
@@ -250,6 +265,18 @@ mod tests {
     }
 
     #[test]
+    fn quote_expired_releases_immediately_not_at_deadline_plus_skew() {
+        let mut r = Reservations::new();
+        r.reserve("rfq_1", "cngn-usdc", true, U256::from(500u64), 1_000);
+        assert!(r.release("rfq_1"));
+        assert_eq!(r.reserved("cngn-usdc", true, 0), U256::ZERO);
+        assert!(!r.release("rfq_1"), "duplicate release is a no-op");
+        r.reserve("rfq_2", "cngn-usdc", false, U256::from(9u64), 1_000);
+        assert!(r.release("rfq_2"));
+        assert_eq!(r.reserved("cngn-usdc", false, 0), U256::ZERO);
+    }
+
+    #[test]
     fn prune_reclaims_expired_entries() {
         let mut r = Reservations::new();
         r.reserve("a", "cngn-usdc", true, U256::from(1u64), 100);
@@ -311,6 +338,17 @@ mod tests {
             U256::ZERO,
             "expired entries must not come back after restart"
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn persist_release_drops_the_entry_from_disk() {
+        let path = tmp_path("release");
+        let mut live = Reservations::with_persist_path(&path);
+        live.reserve("rfq_1", "cngn-usdc", true, U256::from(500u64), 1_000);
+        assert!(live.release("rfq_1"));
+        let restored = Reservations::load(&path, 0).unwrap();
+        assert!(restored.is_empty());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
