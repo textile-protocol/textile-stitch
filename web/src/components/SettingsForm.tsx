@@ -712,7 +712,8 @@ function RfqCard({
           Connect signs with this bot&apos;s funding wallet. Textile creates the
           maker and writes the credential here — you never paste an id or key.
           If Textile has not assigned a corridor yet, reconnect after they
-          enable you.
+          enable you. The venue rejects requests under 1 whole token so the
+          protocol fee cannot round to zero.
         </p>
 
         {waiting ? (

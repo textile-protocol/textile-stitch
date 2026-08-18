@@ -26,6 +26,15 @@ pub fn fee_on(output: U256, fee_bps: u32) -> U256 {
     output * U256::from(fee_bps) / U256::from(BPS_DENOMINATOR)
 }
 
+/// Smallest output whose floored fee is at least 1 atomic unit.
+/// `ceil(10000 / fee_bps)`; a zero fee rate has no floor of its own.
+pub fn min_feeable_output(fee_bps: u32) -> U256 {
+    if fee_bps == 0 {
+        return U256::from(1u8);
+    }
+    U256::from((BPS_DENOMINATOR + u64::from(fee_bps) - 1) / u64::from(fee_bps))
+}
+
 /// An output that fits a gross cap together with its injected fee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FittedOutput {
@@ -154,6 +163,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn min_feeable_output_at_1_bps_is_10000() {
+        assert_eq!(min_feeable_output(1), U256::from(10_000u64));
+        assert_eq!(min_feeable_output(5), U256::from(2_000u64));
+        assert_eq!(fee_on(U256::from(9_999u64), 1), U256::ZERO);
+        assert_eq!(fee_on(U256::from(10_000u64), 1), U256::from(1u8));
     }
 
     #[test]

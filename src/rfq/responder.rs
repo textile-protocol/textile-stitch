@@ -14,7 +14,10 @@ use crate::config::{PoolConfig, RfqCapacity};
 use crate::quote::{ask_price, bid_price, Spread};
 use crate::tick::is_price_usable;
 
-use super::math::{collateral_for_debt, debt_for_collateral, fee_on, max_fitting_output, rate_ray};
+use super::math::{
+    collateral_for_debt, debt_for_collateral, fee_on, max_fitting_output, min_feeable_output,
+    rate_ray,
+};
 use super::wire::{Level, LevelsFrame, QuoteRequestFrame, RejectReason};
 
 /// One RFQ-serving pool, with everything pre-parsed so the hot path never
@@ -217,7 +220,11 @@ pub fn decide_quote(
         // Zero or two amounts — a malformed request.
         _ => return Err(RejectReason::Busy),
     };
-    if input.is_zero() || output.is_zero() {
+    if input.is_zero()
+        || output.is_zero()
+        || fee.is_zero()
+        || output < min_feeable_output(req.fee_bps)
+    {
         return Err(RejectReason::Size);
     }
 
@@ -516,6 +523,17 @@ mod tests {
         assert_eq!(
             decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
             Err(RejectReason::Busy)
+        );
+    }
+
+    #[test]
+    fn output_whose_fee_rounds_to_zero_rejects_as_size() {
+        let mut req = request(COLLATERAL, DEBT);
+        req.sell_amount = Some("9999".into());
+        req.fee_bps = 1;
+        assert_eq!(
+            decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
+            Err(RejectReason::Size)
         );
     }
 
