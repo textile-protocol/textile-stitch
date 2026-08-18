@@ -17,7 +17,7 @@
 // the seeded local feed is flat (see the knobs below). Override STITCH_LOCAL_*
 // only when you deliberately want local convenience over production parity.
 import { spawn } from 'node:child_process'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 import { createPublicClient, createWalletClient, http, parseAbi } from 'viem'
@@ -383,6 +383,39 @@ refresh_threshold_bps = ${STITCH_LOCAL_REFRESH_THRESHOLD_BPS}
 `
 }
 
+const rfqMetaPath = `${CRATE}rfq.local.json`
+const rfqKeyPath = `${CRATE}rfq-api.key`
+const rfqMeta = existsSync(rfqMetaPath)
+  ? JSON.parse(readFileSync(rfqMetaPath, 'utf8'))
+  : null
+const rfqKey = existsSync(rfqKeyPath)
+  ? readFileSync(rfqKeyPath, 'utf8').trim()
+  : ''
+const rfqStream =
+  process.env.RFQ_MAKER_STREAM_URL ||
+  (/app:|blockchain:/.test(
+    `${process.env.INDEXER_URL || ''}${process.env.BLOCKCHAIN_RPC_URL || ''}`
+  )
+    ? 'ws://app:10000/v2/maker/stream'
+    : 'ws://localhost:10000/v2/maker/stream')
+if (rfqMeta?.makerId && rfqMeta.validationContract && rfqKey) {
+  toml += `
+[rfq]
+enabled = true
+url = "${rfqStream}"
+maker_id = "${rfqMeta.makerId}"
+api_key_env = "STITCH_RFQ_API_KEY"
+validation_contract = "${rfqMeta.validationContract}"
+`
+  console.log(
+    `RFQ on — ${rfqMeta.makerSlug || rfqMeta.makerId} → ${rfqStream}`
+  )
+} else {
+  console.log(
+    'RFQ off — run `yarn seed:rfq:local` then restart this bot to quote the venue.'
+  )
+}
+
 const cfgPath = `${CRATE}stitch.local.toml`
 writeFileSync(cfgPath, toml)
 console.log(`Wrote ${cfgPath} — ${pools.length} corridor(s), two-sided:`)
@@ -479,6 +512,7 @@ const bot = spawn(
     env: {
       ...process.env,
       STITCH_PRIVATE_KEY: KEY,
+      ...(rfqKey ? { STITCH_RFQ_API_KEY: rfqKey } : {}),
       RUST_LOG: process.env.RUST_LOG || 'info',
     },
   }

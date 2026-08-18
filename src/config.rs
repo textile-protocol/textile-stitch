@@ -112,7 +112,8 @@ fn default_rfq_api_key_env() -> String {
 /// Venue maker stream: `wss://` anywhere, or `ws://` only on loopback.
 /// A remote cleartext stream is a signing oracle for whoever can MITM it
 /// (audit H-03): stitch binds the next firm quote to whatever `taker` the
-/// frame names.
+/// frame names. Docker Compose sets `STITCH_ALLOW_CLEARTEXT_DOCKER=1` so
+/// `ws://app:10000` (the API service name) is accepted on the local stack.
 pub fn assert_rfq_stream_url(raw: &str) -> anyhow::Result<()> {
     let parsed = url::Url::parse(raw.trim())
         .with_context(|| format!("[rfq].url must be a valid WebSocket URL, got {raw:?}"))?;
@@ -121,13 +122,22 @@ pub fn assert_rfq_stream_url(raw: &str) -> anyhow::Result<()> {
         "wss" => Ok(()),
         "ws" => {
             anyhow::ensure!(
-                host_is_loopback(parsed.host()),
+                host_is_loopback(parsed.host()) || allow_cleartext_docker(),
                 "[rfq].url may use ws:// only on localhost, got {raw:?}"
             );
             Ok(())
         }
         other => anyhow::bail!("[rfq].url must be a ws(s):// URL, got scheme {other:?}"),
     }
+}
+
+/// Docker-internal http/ws (`http://app:8916`, `ws://app:10000`). Off unless
+/// the compose file sets `STITCH_ALLOW_CLEARTEXT_DOCKER=1`.
+fn allow_cleartext_docker() -> bool {
+    matches!(
+        std::env::var("STITCH_ALLOW_CLEARTEXT_DOCKER").as_deref(),
+        Ok("1")
+    )
 }
 
 fn host_is_loopback(host: Option<url::Host<&str>>) -> bool {
@@ -197,7 +207,7 @@ pub fn assert_feed_url(raw: &str, field: &str) -> anyhow::Result<()> {
         "https" => Ok(()),
         "http" => {
             anyhow::ensure!(
-                host_is_loopback(parsed.host()),
+                host_is_loopback(parsed.host()) || allow_cleartext_docker(),
                 "{field} may use http:// only on localhost, got {raw:?}"
             );
             Ok(())
@@ -1338,5 +1348,15 @@ mod tests {
         assert!(assert_rfq_stream_url("ws://api.textilecredit.com/v2/maker/stream").is_err());
         assert!(assert_rfq_stream_url("ws://192.168.1.10/v2/maker/stream").is_err());
         assert!(assert_rfq_stream_url("https://api.textilecredit.com/v2/maker/stream").is_err());
+    }
+
+    #[test]
+    fn docker_cleartext_override_allows_compose_service_hosts() {
+        std::env::set_var("STITCH_ALLOW_CLEARTEXT_DOCKER", "1");
+        let stream = assert_rfq_stream_url("ws://app:10000/v2/maker/stream");
+        let feed = assert_feed_url("http://app:8916/api/price", "[feed].url");
+        std::env::remove_var("STITCH_ALLOW_CLEARTEXT_DOCKER");
+        assert!(stream.is_ok(), "{stream:?}");
+        assert!(feed.is_ok(), "{feed:?}");
     }
 }

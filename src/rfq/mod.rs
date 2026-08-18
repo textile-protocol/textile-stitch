@@ -532,9 +532,33 @@ impl Engine {
         match frame {
             VenueFrame::QuoteRequest(req) => Some(self.respond(req, prices).await),
             VenueFrame::QuoteResult(r) => {
-                // Informational only. A losing quote's reservation still holds
-                // until its deadline + skew — the signed order is out there.
-                info!(rfq_id = %r.rfq_id, result = %r.result, "quote result");
+                // selected stays reserved until quoteExpired or the deadline.
+                // Everything else is a signature the taker will never submit:
+                // losers are not handed out, and no_quote / invalid / late
+                // never produce an executable order.
+                match r.result.as_str() {
+                    "selected" => {
+                        info!(rfq_id = %r.rfq_id, result = %r.result, "quote result");
+                    }
+                    "no_quote" | "lost_price" | "invalid" | "late" => {
+                        if self.reservations.release(&r.rfq_id) {
+                            info!(
+                                rfq_id = %r.rfq_id,
+                                result = %r.result,
+                                "quote result released inventory"
+                            );
+                        } else {
+                            debug!(
+                                rfq_id = %r.rfq_id,
+                                result = %r.result,
+                                "quote result; no local reservation"
+                            );
+                        }
+                    }
+                    _ => {
+                        info!(rfq_id = %r.rfq_id, result = %r.result, "quote result");
+                    }
+                }
                 None
             }
             VenueFrame::QuoteExpired(e) => {
@@ -803,7 +827,7 @@ async fn inventory_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::wire::QuoteExpiredFrame;
+    use super::wire::{QuoteExpiredFrame, QuoteResultFrame};
     use super::*;
     use crate::config::RfqCapacity;
     use crate::quote::Spread;
@@ -1071,6 +1095,57 @@ mod tests {
         };
         assert_eq!(resp.buy_amount, "979902009");
         assert_eq!(engine.reservations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quote_result_releases_inventory_except_selected() {
+        let mut engine = test_engine();
+        let prices = fresh_prices();
+
+        let _ = engine.respond(exact_input_request("rfq_1"), &prices).await;
+        assert_eq!(engine.reservations.len(), 1);
+        let none = engine
+            .dispatch(
+                VenueFrame::QuoteResult(QuoteResultFrame {
+                    rfq_id: "rfq_1".into(),
+                    result: "lost_price".into(),
+                }),
+                &prices,
+            )
+            .await;
+        assert!(none.is_none());
+        assert!(
+            engine.reservations.is_empty(),
+            "lost_price must drop the reservation"
+        );
+
+        let _ = engine.respond(exact_input_request("rfq_2"), &prices).await;
+        let _ = engine
+            .dispatch(
+                VenueFrame::QuoteResult(QuoteResultFrame {
+                    rfq_id: "rfq_2".into(),
+                    result: "no_quote".into(),
+                }),
+                &prices,
+            )
+            .await;
+        assert!(engine.reservations.is_empty());
+
+        let _ = engine.respond(exact_input_request("rfq_3"), &prices).await;
+        let _ = engine
+            .dispatch(
+                VenueFrame::QuoteResult(QuoteResultFrame {
+                    rfq_id: "rfq_3".into(),
+                    result: "selected".into(),
+                }),
+                &prices,
+            )
+            .await;
+        assert_eq!(
+            engine.reservations.len(),
+            1,
+            "selected stays reserved until quoteExpired"
+        );
     }
 
     #[tokio::test]

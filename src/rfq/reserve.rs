@@ -3,15 +3,17 @@
 //! In-flight RFQ inventory reservations.
 //!
 //! Every signed quote is a live claim on the funding wallet until its order
-//! deadline passes — INCLUDING quotes the venue reports as lost
-//! (`lost_price`): a losing quote is still a valid signed order the winner's
-//! failure could route to, so its reservation holds until `deadline + skew`,
-//! never until the loss notice.
+//! deadline passes, unless the venue says the taker will never submit it.
 //!
-//! `quoteExpired` is the exception: the taker was handed the winning quote
-//! and its accept window lapsed without a submit. The venue un-counts that
-//! order at the same moment, so this ledger must drop it or the next request
-//! on the same side keeps seeing a ghost reservation.
+//! `selected` holds until `deadline + skew` or an explicit `quoteExpired`.
+//! `lost_price`, `no_quote`, `invalid`, and `late` release immediately —
+//! those signatures never leave the venue, so keeping them reserved makes
+//! the corridor look empty for the rest of the TTL.
+//!
+//! `quoteExpired` is the selected-quote exception: the taker was handed the
+//! winning quote and its accept window lapsed without a submit. The venue
+//! un-counts that order at the same moment, so this ledger must drop it or
+//! the next request on the same side keeps seeing a ghost reservation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -216,17 +218,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reservations_hold_until_deadline_plus_skew_not_the_loss_notice() {
+    fn reservations_hold_until_deadline_plus_skew_unless_released() {
         let mut r = Reservations::new();
         let deadline = 1_000u64;
         r.reserve("rfq_1", "cngn-usdc", true, U256::from(500u64), deadline);
 
-        // The venue reported lost_price at t=900 — the reservation must NOT
-        // release then: the signed order is live until its deadline.
+        // The ledger itself does not watch venue frames — a selected quote
+        // still claims inventory until deadline + skew if nobody calls release.
         assert_eq!(
             r.reserved("cngn-usdc", true, 900),
             U256::from(500u64),
-            "a losing quote still claims inventory before its deadline"
+            "an unreleased quote still claims inventory before its deadline"
         );
         // Still held through the deadline and the skew window…
         assert_eq!(
