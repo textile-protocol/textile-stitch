@@ -20,7 +20,9 @@
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-use crate::config::{assert_rfq_stream_url, parse_liquidity_amount, parse_min_slice_debt, Config};
+use crate::config::{
+    assert_feed_url, assert_rfq_stream_url, parse_liquidity_amount, parse_min_slice_debt, Config,
+};
 
 /// How a side's spread is expressed in the config. Editing preserves whichever
 /// form the operator's config already uses rather than switching representation.
@@ -371,6 +373,7 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
     // into a config that can't reach its RPC or feed.
     require_url(&patch.rpc_url, "RPC URL")?;
     require_url(&patch.feed_url, "price feed URL")?;
+    assert_feed_url(&patch.feed_url, "price feed URL")?;
 
     let mut doc = toml_str
         .parse::<DocumentMut>()
@@ -1058,6 +1061,15 @@ mod tests {
         view.feed_url = "not-a-url".into();
         let err = apply_settings(TEMPLATE, &patch_from(&view)).unwrap_err();
         assert!(err.to_string().contains("feed"));
+
+        // Remote cleartext is a MITM'd mid (M-05). Loopback http stays legal.
+        let mut view = read_settings(TEMPLATE).unwrap();
+        view.feed_url = "http://8.8.8.8/feed".into();
+        let err = apply_settings(TEMPLATE, &patch_from(&view)).unwrap_err();
+        assert!(
+            err.to_string().contains("localhost"),
+            "remote http:// feed must be rejected, got {err}"
+        );
     }
 
     #[test]

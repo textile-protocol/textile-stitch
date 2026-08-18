@@ -294,7 +294,7 @@ mod tests {
             reactor = "0x0000000000000000000000000000000000000000"
             tick_interval_secs = 5
             [feed]
-            url = "http://x"
+            url = "https://x"
             staleness_secs = 30
             [[pools]]
             collateral = "{COLLATERAL}"
@@ -362,7 +362,7 @@ mod tests {
             reactor = "0x0000000000000000000000000000000000000000"
             tick_interval_secs = 5
             [feed]
-            url = "http://x"
+            url = "https://x"
             staleness_secs = 30
             [[pools]]
             collateral = "0x00000000000000000000000000000000000000a1"
@@ -459,7 +459,7 @@ mod tests {
             reactor = "0x0000000000000000000000000000000000000000"
             tick_interval_secs = 5
             [feed]
-            url = "http://x"
+            url = "https://x"
             staleness_secs = 30
             [[pools]]
             collateral = "0x00000000000000000000000000000000000000a1"

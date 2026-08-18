@@ -581,7 +581,7 @@ mod tests {
             reactor = "0x0000000000000000000000000000000000000000"
             tick_interval_secs = 5
             [feed]
-            url = "http://feed"
+            url = "https://feed"
             staleness_secs = 30
             [[pools]]
             collateral = "0x0000000000000000000000000000000000000001"

@@ -151,7 +151,39 @@ pub struct FeedConfig {
     /// HTTP endpoint returning `{ price, timestamp }`.
     pub url: String,
     /// Stop quoting if the feed hasn't updated within this many seconds.
+    /// The ladder uses this as written. RFQ firm quotes cap it at
+    /// [`RFQ_MAX_STALENESS_SECS`] — see [`rfq_staleness_secs`].
     pub staleness_secs: u64,
+}
+
+/// RFQ firm quotes go dark after this many seconds even when
+/// `[feed].staleness_secs` is wider (shipped templates use 900). The ladder
+/// still uses the configured window.
+pub const RFQ_MAX_STALENESS_SECS: u64 = 60;
+
+/// Tightness of the RFQ staleness gate. Never wider than
+/// [`RFQ_MAX_STALENESS_SECS`]; a tighter operator setting still wins.
+pub fn rfq_staleness_secs(configured: u64) -> u64 {
+    configured.min(RFQ_MAX_STALENESS_SECS)
+}
+
+/// Price feed: `https://` anywhere, or `http://` only on loopback.
+/// A remote cleartext feed is a MITM'd mid (audit M-05).
+pub fn assert_feed_url(raw: &str, field: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(raw.trim())
+        .with_context(|| format!("{field} must be a valid HTTP URL, got {raw:?}"))?;
+    anyhow::ensure!(parsed.host().is_some(), "{field} must include a host");
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            anyhow::ensure!(
+                host_is_loopback(parsed.host()),
+                "{field} may use http:// only on localhost, got {raw:?}"
+            );
+            Ok(())
+        }
+        other => anyhow::bail!("{field} must be an http(s):// URL, got scheme {other:?}"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,7 +568,11 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        assert_feed_url(&self.feed.url, "[feed].url")?;
         for (idx, pool) in self.pools.iter().enumerate() {
+            if let Some(url) = &pool.feed_url {
+                assert_feed_url(url, &format!("pools[{idx}].feed_url"))?;
+            }
             anyhow::ensure!(
                 pool.ttl_secs > LIVE_ORDER_DEADLINE_MARGIN_SECS,
                 "pools[{idx}].ttl_secs ({}) must be greater than the live-order deadline \
@@ -693,7 +729,7 @@ mod tests {
             reactor = "0x0000000000000000000000000000000000000000"
             tick_interval_secs = 5
             [feed]
-            url = "http://x"
+            url = "https://x"
             staleness_secs = 30
             [[pools]]
             collateral = "0x0000000000000000000000000000000000000001"
@@ -773,7 +809,7 @@ mod tests {
             reactor = "0x0000000000000000000000000000000000000000"
             tick_interval_secs = 5
             [feed]
-            url = "http://x"
+            url = "https://x"
             staleness_secs = 30
             [[pools]]
             collateral = "0x0000000000000000000000000000000000000001"
@@ -813,7 +849,7 @@ mod tests {
         reactor = "0x0000000000000000000000000000000000000000"
         tick_interval_secs = 5
         [feed]
-        url = "http://x"
+        url = "https://x"
         staleness_secs = 30
         [[pools]]
         collateral = "0x0000000000000000000000000000000000000001"
@@ -1113,7 +1149,7 @@ mod tests {
             reactor = "0x0000000000000000000000000000000000000000"
             tick_interval_secs = 5
             [feed]
-            url = "http://x"
+            url = "https://x"
             staleness_secs = 30
             [[pools]]
             collateral = "0x0000000000000000000000000000000000000001"
@@ -1128,6 +1164,45 @@ mod tests {
         let cfg = Config::from_toml(toml).expect("buy-only config parses");
         assert!(cfg.pools[0].buy_enabled());
         assert!(!cfg.pools[0].sell_enabled());
+    }
+
+    #[test]
+    fn remote_cleartext_feed_urls_are_rejected() {
+        assert!(assert_feed_url("https://api.textilecredit.com/price", "[feed].url").is_ok());
+        assert!(assert_feed_url("http://localhost/feed", "[feed].url").is_ok());
+        assert!(assert_feed_url("http://127.0.0.1/feed", "[feed].url").is_ok());
+        assert!(assert_feed_url("http://[::1]/feed", "[feed].url").is_ok());
+        let err = assert_feed_url("http://8.8.8.8/feed", "[feed].url")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("localhost"),
+            "remote http:// must be rejected, got {err}"
+        );
+        assert!(assert_feed_url("http://192.168.1.10/feed", "[feed].url").is_err());
+
+        let toml = LEAN_POOL_BASE.replace("url = \"https://x\"", "url = \"http://8.8.8.8/feed\"");
+        let err = Config::from_toml(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains("[feed].url"),
+            "config load must reject a remote cleartext feed, got {err}"
+        );
+    }
+
+    #[test]
+    fn rfq_caps_staleness_without_rejecting_a_900s_template() {
+        assert_eq!(rfq_staleness_secs(900), RFQ_MAX_STALENESS_SECS);
+        assert_eq!(rfq_staleness_secs(30), 30);
+        assert_eq!(rfq_staleness_secs(60), 60);
+
+        let toml = format!(
+            "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
+            LEAN_POOL_BASE.replace("staleness_secs = 30", "staleness_secs = 900")
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert_eq!(cfg.feed.staleness_secs, 900);
+        assert_eq!(rfq_staleness_secs(cfg.feed.staleness_secs), 60);
+        assert!(cfg.rfq_active());
     }
 
     #[test]

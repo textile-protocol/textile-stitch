@@ -14,11 +14,14 @@
 //! less and no code here executes — a disabled config is behaviorally
 //! identical to a build without the module.
 //!
-//! Shared with the ladder: the same feed URLs and staleness rule, the same
+//! Shared with the ladder: the same feed URLs, the same
 //! `quote::bid_price`/`ask_price` spreads, the same [`crate::eip712`] Permit2
 //! digest and the same order-bytes encoder — one pricing and signing story,
-//! two distribution channels. Deliberately NOT shared: the tick loop (RFQ
-//! runs its own 1 s cadence and its own price cache so a slow ladder tick
+//! two distribution channels. RFQ caps staleness at
+//! [`crate::config::RFQ_MAX_STALENESS_SECS`] (60s) so a 900s ladder template
+//! cannot keep firm quotes on a 14-minute-old print; the ladder still uses
+//! `[feed].staleness_secs` as written. Deliberately NOT shared: the tick loop
+//! (RFQ runs its own 1 s cadence and its own price cache so a slow ladder tick
 //! can't blow the reply budget) and the nonce ledger (RFQ nonces live in a
 //! disjoint namespace, see [`nonce`]).
 
@@ -42,7 +45,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::closer::executor::{encode_allowance, encode_balance_of};
-use crate::config::Config;
+use crate::config::{rfq_staleness_secs, Config};
 use crate::eip712::permit2_digest;
 use crate::feed::{HttpFeed, PriceFeed, Quote};
 use crate::rpc::Wallet;
@@ -212,7 +215,7 @@ fn build_runtime(
             .validation_contract
             .parse()
             .context("invalid [rfq].validation_contract")?,
-        staleness_secs: cfg.feed.staleness_secs,
+        staleness_secs: rfq_staleness_secs(cfg.feed.staleness_secs),
         rpc_url: cfg.rpc_url.clone(),
         indexer_url: cfg.indexer_url.clone(),
         books,
@@ -638,17 +641,33 @@ impl PriceCache {
             map.insert(url, quote);
         }
     }
+
+    pub fn invalidate(&self, url: &str) {
+        if let Ok(mut map) = self.0.write() {
+            map.remove(url);
+        }
+    }
 }
 
-/// Refresh one feed URL every second. Failures just leave the last value in
-/// place — the staleness rule decides when that stops being quotable.
+/// Apply one fetch to the RFQ cache. A live quote replaces the last print; a
+/// failed fetch drops it so the next `quoteRequest` is `StaleFeed`, not a
+/// held mid. The ladder tick still keeps last-print + staleness.
+fn on_feed_fetch(cache: &PriceCache, url: &str, result: anyhow::Result<Quote>) {
+    match result {
+        Ok(quote) => cache.set(url.to_string(), quote),
+        Err(e) => {
+            debug!(feed = %url, error = %e, "rfq feed fetch failed");
+            cache.invalidate(url);
+        }
+    }
+}
+
+/// Refresh one feed URL every second. A failed fetch invalidates the cached
+/// quote — RFQ fails closed instead of holding the last print.
 async fn price_loop(url: String, cache: PriceCache) {
     let feed = HttpFeed::new(&url);
     loop {
-        match feed.fetch().await {
-            Ok(quote) => cache.set(url.clone(), quote),
-            Err(e) => debug!(feed = %url, error = %e, "rfq feed fetch failed"),
-        }
+        on_feed_fetch(&cache, &url, feed.fetch().await);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
@@ -867,6 +886,39 @@ mod tests {
         };
         assert_eq!(resp.buy_amount, "520097991");
         assert_eq!(engine.reservations.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_fetch_invalidates_the_rfq_cache() {
+        let cache = PriceCache::default();
+        cache.set(
+            "http://feed".into(),
+            Quote {
+                price: 1.0,
+                timestamp: unix_now(),
+            },
+        );
+        assert!(cache.get("http://feed").is_some());
+
+        on_feed_fetch(
+            &cache,
+            "http://feed",
+            Err(anyhow::anyhow!("feed host down")),
+        );
+        assert!(
+            cache.get("http://feed").is_none(),
+            "a failed fetch must drop the last print, not hold it"
+        );
+
+        on_feed_fetch(
+            &cache,
+            "http://feed",
+            Ok(Quote {
+                price: 2.0,
+                timestamp: unix_now(),
+            }),
+        );
+        assert_eq!(cache.get("http://feed").unwrap().price, 2.0);
     }
 
     #[tokio::test]
