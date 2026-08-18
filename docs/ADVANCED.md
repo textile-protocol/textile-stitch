@@ -552,6 +552,14 @@ If you are running a different corridor, copy `stitch.example.toml` and edit it
 directly. The setup app and `stitch init` are convenience wrappers for the
 supported corridors; any valid `stitch.toml` works with the bot.
 
+### Dual-run RFQ
+
+Connect in the panel settings registers the funding wallet and writes
+`rfq-api.key`. It does **not** put you on a corridor. Textile enables the
+corridor separately. Until they do, `[rfq]` stays off and the public ladder
+keeps running. After they enable you, press Reconnect — do not invent a
+corridor slug in the raw config.
+
 ### Safe Restart Checklist
 
 Before restarting live:

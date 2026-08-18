@@ -197,22 +197,29 @@ pub async fn enroll(
         ));
     }
 
-    let corridor_id = setup::identify_corridor(&current_toml).map(|c| c.id.to_string());
-    let corridor = enrolled
-        .corridors
-        .iter()
-        .find(|c| corridor_id.as_deref() == Some(c.as_str()))
-        .cloned()
-        .or_else(|| enrolled.corridors.first().cloned())
-        .unwrap_or_default();
+    let waiting = enrolled.corridors.is_empty();
+    let corridor = if waiting {
+        String::new()
+    } else {
+        let corridor_id = setup::identify_corridor(&current_toml).map(|c| c.id.to_string());
+        enrolled
+            .corridors
+            .iter()
+            .find(|c| corridor_id.as_deref() == Some(c.as_str()))
+            .cloned()
+            .or_else(|| enrolled.corridors.first().cloned())
+            .unwrap_or_default()
+    };
 
     let current = setup::read_settings_at(&current_toml, 0).map_err(ApiError::bad_request)?;
     let mut patch = current.to_patch();
-    patch.rfq_enabled = Some(true);
+    // No venue corridor yet: register the credential but do not start RFQ
+    // against a missing or stale slug. Reconnect after Textile enables you.
+    patch.rfq_enabled = Some(!waiting);
     patch.rfq_url = Some(enrolled.stream_url.clone());
     patch.rfq_maker_id = Some(enrolled.maker_id.clone());
     patch.rfq_validation_contract = Some(enrolled.validation_contract.clone().unwrap_or_default());
-    patch.rfq_corridor = Some(corridor.clone());
+    patch.rfq_corridor = Some(corridor);
     let edited = setup::apply_settings(&current_toml, &patch)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
@@ -234,15 +241,17 @@ pub async fn enroll(
     )
     .map_err(|e| ApiError::internal(&e))?;
 
-    let dual_run = if enrolled.corridors.is_empty() {
-        " Dual-run is not open on this chain yet."
+    let message = if waiting {
+        format!(
+            "Registered as {} ({}). Textile still has to enable you on a corridor before you receive RFQs. The public ladder keeps running. Reconnect after they enable you.",
+            enrolled.maker_slug, enrolled.environment
+        )
     } else {
-        ""
+        format!(
+            "Connected to Textile as {} ({}).",
+            enrolled.maker_slug, enrolled.environment
+        )
     };
-    let message = format!(
-        "Connected to Textile as {} ({}).{dual_run}",
-        enrolled.maker_slug, enrolled.environment
-    );
 
     save_and_restart(
         &state,
@@ -327,23 +336,29 @@ mod tests {
         .unwrap();
     }
 
-    async fn mock_venue(api_key: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    async fn mock_venue(
+        api_key: &'static str,
+        corridors: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new().route(
             "/v2/maker/enroll",
-            post(move |Json(body): Json<Value>| async move {
-                assert!(body["signature"].as_str().unwrap().starts_with("0x"));
-                assert_eq!(body["chainId"], 56);
-                Json(json!({
-                    "makerId": "clmakerenroll1",
-                    "makerSlug": "stitch-56-f39fd6e5",
-                    "environment": "LIVE",
-                    "apiKey": api_key,
-                    "streamUrl": "wss://api.textilecredit.com/v2/maker/stream",
-                    "validationContract": "0xBCA5E344077AaC751A1C548a45F28215bB7ec165",
-                    "corridors": ["cngn-usdt-bsc"],
-                }))
+            post(move |Json(body): Json<Value>| {
+                let corridors = corridors.clone();
+                async move {
+                    assert!(body["signature"].as_str().unwrap().starts_with("0x"));
+                    assert_eq!(body["chainId"], 56);
+                    Json(json!({
+                        "makerId": "clmakerenroll1",
+                        "makerSlug": "stitch-56-f39fd6e5",
+                        "environment": "LIVE",
+                        "apiKey": api_key,
+                        "streamUrl": "wss://api.textilecredit.com/v2/maker/stream",
+                        "validationContract": "0xBCA5E344077AaC751A1C548a45F28215bB7ec165",
+                        "corridors": corridors,
+                    }))
+                }
             }),
         );
         let handle = tokio::spawn(async move {
@@ -369,7 +384,7 @@ mod tests {
         let h = harness("rfq-enroll-connect");
         seed(&h, "bot-a");
         unlock_rfq_panel(&h, "bot-a");
-        let (venue, _server) = mock_venue("tx_live_enroll_secret").await;
+        let (venue, _server) = mock_venue("tx_live_enroll_secret", vec!["cngn-usdt-bsc"]).await;
 
         let (status, body) = h
             .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
@@ -402,5 +417,39 @@ mod tests {
         assert_eq!(v["rfqApiKeySet"], true);
         assert!(v.get("rfqApiKey").is_none());
         assert!(!body.contains("tx_live_enroll_secret"));
+    }
+
+    #[tokio::test]
+    async fn connect_with_empty_corridors_registers_and_does_not_go_live() {
+        let h = harness("rfq-enroll-waiting");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        let (venue, _server) = mock_venue("tx_live_enroll_secret", vec![]).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["rfqEnabled"], false);
+        assert_eq!(v["settings"]["rfqMakerId"], "clmakerenroll1");
+        assert_eq!(v["settings"]["rfqCorridor"], "");
+        assert_eq!(v["settings"]["rfqApiKeySet"], true);
+        assert_eq!(v["enrollment"]["corridors"], json!([]));
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Textile still has to enable you"),
+            "waiting copy missing: {body}"
+        );
+
+        let toml = std::fs::read_to_string(h.root.join("bot-a").join("stitch.toml")).unwrap();
+        assert!(toml.contains("clmakerenroll1"));
+        let rfq = toml.split("[rfq]").nth(1).unwrap_or("");
+        assert!(
+            !rfq.contains("cngn-usdt-bsc"),
+            "must not write the book corridor into [rfq]: {toml}"
+        );
     }
 }

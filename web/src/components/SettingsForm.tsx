@@ -614,6 +614,12 @@ function RfqCard({
     onChange('rfqEnabled', next)
     if (!next) return
     if (!draft.rfqUrl.trim()) onChange('rfqUrl', DEFAULT_RFQ_URL)
+    const registered =
+      loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
+    const waiting = registered && !draft.rfqCorridor.trim()
+    // A registered bot with no venue corridor is waiting on Textile.
+    // Do not invent a slug from the book corridor — that is not an assignment.
+    if (waiting) return
     if (!draft.rfqCorridor.trim() && corridorId) {
       onChange('rfqCorridor', corridorId)
     }
@@ -634,6 +640,11 @@ function RfqCard({
   }
 
   const connected = loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
+  const live =
+    connected &&
+    loaded.rfqEnabled &&
+    (enrollment?.corridors.length || loaded.rfqCorridor.trim() !== '')
+  const waiting = connected && !live
 
   return (
     <Card title="RFQ">
@@ -645,12 +656,23 @@ function RfqCard({
           label="Answer private quote requests beside the public ladder"
         />
         <p className="text-xs text-faint">
-          Dual-run: the ladder keeps running. Connect signs with this bot&apos;s
-          funding wallet. Textile creates the maker and writes the credential
-          here — you never paste an id or key.
+          Dual-run: the public ladder keeps running. Connect registers this
+          bot&apos;s funding wallet and saves the credential. Textile still has
+          to enable you on a corridor before you receive private quotes — then
+          Reconnect. You never paste an id or key.
         </p>
 
-        {connected ? (
+        {waiting ? (
+          <Banner tone="warning">
+            Registered
+            {enrollment
+              ? ` as ${enrollment.makerSlug} (${enrollment.environment})`
+              : ''}
+            . Textile still has to enable you on a corridor. The ladder keeps
+            running. Reconnect after they do — you will not see private quotes
+            until then.
+          </Banner>
+        ) : live ? (
           <div className="rounded-lg border border-line-soft bg-hover/40 px-3 py-2 text-sm">
             <p className="font-medium">
               Connected
@@ -661,9 +683,7 @@ function RfqCard({
             <p className="mt-1 text-xs text-faint">
               {enrollment?.corridors.length
                 ? `Corridors: ${enrollment.corridors.join(', ')}`
-                : loaded.rfqCorridor
-                  ? `Corridor: ${loaded.rfqCorridor}`
-                  : 'Dual-run is not open on this chain yet.'}
+                : `Corridor: ${loaded.rfqCorridor}`}
               {loaded.rfqApiKeySet ? ' · API key saved' : ''}
             </p>
           </div>
@@ -681,7 +701,11 @@ function RfqCard({
           disabled={!editable}
           onClick={() => void connect()}
         >
-          {connected ? 'Reconnect to Textile' : 'Connect to Textile'}
+          {waiting
+            ? 'Reconnect after Textile enables you'
+            : connected
+              ? 'Reconnect to Textile'
+              : 'Connect to Textile'}
         </Button>
 
         <div>
