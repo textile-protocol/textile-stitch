@@ -24,6 +24,14 @@ use crate::panel::provision;
 use crate::setup;
 use crate::signer::{build_signer, parse_private_key, DynSigner, LocalSigner, SignerConfig};
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EnrollCorridorPair {
+    slug: String,
+    collateral_token: String,
+    debt_token: String,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrollBody {
@@ -44,6 +52,12 @@ struct EnrollResponse {
     validation_contract: Option<String>,
     #[serde(default)]
     corridors: Vec<String>,
+    /// Token metadata for each seated slug. Custom (non-catalog) bots
+    /// match this instead of `identify_corridor`, which is None for them.
+    #[serde(default)]
+    corridor_pairs: Vec<EnrollCorridorPair>,
+    #[serde(default)]
+    flagged: bool,
 }
 
 /// Derive `https://host/v2/maker/enroll` from a stream URL or an API origin.
@@ -201,23 +215,24 @@ pub async fn enroll(
         ));
     }
 
-    let waiting = enrolled.corridors.is_empty();
-    let corridor = if waiting {
-        String::new()
-    } else {
-        let corridor_id = setup::identify_corridor(&current_toml).map(|c| c.id.to_string());
-        enrolled
-            .corridors
-            .iter()
-            .find(|c| corridor_id.as_deref() == Some(c.as_str()))
-            .cloned()
-            .or_else(|| enrolled.corridors.first().cloned())
-            .unwrap_or_default()
-    };
+    let configured = setup::identify_corridor(&current_toml).map(|c| c.id.to_string());
+    let pool = cfg
+        .pools
+        .first()
+        .map(|p| (p.collateral.as_str(), p.debt.as_str()));
+    let corridor = pick_enroll_corridor(
+        enrolled.flagged,
+        configured.as_deref(),
+        pool,
+        &enrolled.corridors,
+        &enrolled.corridor_pairs,
+    );
+    let waiting = corridor.is_none();
+    let corridor = corridor.unwrap_or_default();
 
     let current = setup::read_settings_at(&current_toml, 0).map_err(ApiError::bad_request)?;
-    // Waiting: register the credential but do not start RFQ against a
-    // missing slug, and do not turn the book off until RFQ can quote.
+    // Empty / flagged: keep the credential, do not start RFQ, and restore
+    // the book on an RFQ-default bot so it is not dark.
     let patch = setup::rfq_connect_patch(
         &current,
         enrolled.stream_url.clone(),
@@ -248,9 +263,14 @@ pub async fn enroll(
     )
     .map_err(|e| ApiError::internal(&e))?;
 
-    let message = if waiting {
+    let message = if enrolled.flagged {
         format!(
-            "Registered as {} ({}). Textile still has to enable you on a corridor before you receive private quotes. Reconnect after they enable you.",
+            "Registered as {} ({}). Textile has flagged this maker — you will not receive private quotes.",
+            enrolled.maker_slug, enrolled.environment
+        )
+    } else if waiting {
+        format!(
+            "Registered as {} ({}). No RFQ corridor is live on this chain yet.",
             enrolled.maker_slug, enrolled.environment
         )
     } else if rfq_default {
@@ -277,10 +297,48 @@ pub async fn enroll(
                 "makerSlug": enrolled.maker_slug,
                 "environment": enrolled.environment,
                 "corridors": enrolled.corridors,
+                "flagged": enrolled.flagged,
             }
         })),
     )
     .await
+}
+
+/// Live only when the venue seated the pair this bot is configured for.
+/// A chain-level Dual-run list can include other pairs; binding one of
+/// those slugs would disable the book and then reject every quote.
+///
+/// Token match wins so a custom (non-catalog) pool can still go live.
+/// Catalog-id match is the fallback for older enroll payloads that only
+/// send slugs.
+fn pick_enroll_corridor(
+    flagged: bool,
+    configured: Option<&str>,
+    pool: Option<(&str, &str)>,
+    corridors: &[String],
+    pairs: &[EnrollCorridorPair],
+) -> Option<String> {
+    if flagged {
+        return None;
+    }
+    if let Some((collateral, debt)) = pool {
+        if let Some(pair) = pairs
+            .iter()
+            .find(|p| tokens_match(collateral, debt, &p.collateral_token, &p.debt_token))
+        {
+            return Some(pair.slug.clone());
+        }
+    }
+    configured.and_then(|id| corridors.iter().find(|c| c.as_str() == id).cloned())
+}
+
+fn tokens_match(coll_a: &str, debt_a: &str, coll_b: &str, debt_b: &str) -> bool {
+    (eq_addr(coll_a, coll_b) && eq_addr(debt_a, debt_b))
+        || (eq_addr(coll_a, debt_b) && eq_addr(debt_a, coll_b))
+}
+
+fn eq_addr(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 fn venue_error_message(body: &str) -> Option<String> {
@@ -299,6 +357,101 @@ fn venue_error_message(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pair(slug: &str, collateral: &str, debt: &str) -> EnrollCorridorPair {
+        EnrollCorridorPair {
+            slug: slug.into(),
+            collateral_token: collateral.into(),
+            debt_token: debt.into(),
+        }
+    }
+
+    #[test]
+    fn pick_enroll_corridor_requires_the_configured_pair() {
+        let empty: &[EnrollCorridorPair] = &[];
+        assert_eq!(
+            pick_enroll_corridor(
+                false,
+                Some("cngn-usdt-bsc"),
+                None,
+                &["cngn-usdt-bsc".into()],
+                empty,
+            ),
+            Some("cngn-usdt-bsc".into())
+        );
+        assert_eq!(
+            pick_enroll_corridor(
+                false,
+                Some("cngn-usdt-bsc"),
+                None,
+                &["wars-usdt-bsc".into()],
+                empty,
+            ),
+            None
+        );
+        assert_eq!(
+            pick_enroll_corridor(
+                true,
+                Some("cngn-usdt-bsc"),
+                None,
+                &["cngn-usdt-bsc".into()],
+                empty,
+            ),
+            None
+        );
+        assert_eq!(
+            pick_enroll_corridor(false, None, None, &["cngn-usdt-bsc".into()], empty),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_enroll_corridor_matches_custom_tokens() {
+        let seats = [pair(
+            "ops-custom-bsc",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )];
+        assert_eq!(
+            pick_enroll_corridor(
+                false,
+                None,
+                Some((
+                    "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa",
+                    "0xBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBb",
+                )),
+                &["ops-custom-bsc".into()],
+                &seats,
+            ),
+            Some("ops-custom-bsc".into())
+        );
+        assert_eq!(
+            pick_enroll_corridor(
+                false,
+                None,
+                Some((
+                    "0xcccccccccccccccccccccccccccccccccccccccc",
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )),
+                &["ops-custom-bsc".into()],
+                &seats,
+            ),
+            None
+        );
+        assert_eq!(
+            pick_enroll_corridor(
+                true,
+                None,
+                Some((
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )),
+                &["ops-custom-bsc".into()],
+                &seats,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn enroll_url_from_stream_and_origin() {
@@ -351,6 +504,16 @@ mod tests {
     async fn mock_venue(
         api_key: &'static str,
         corridors: Vec<&'static str>,
+        flagged: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        mock_venue_with_pairs(api_key, corridors, vec![], flagged).await
+    }
+
+    async fn mock_venue_with_pairs(
+        api_key: &'static str,
+        corridors: Vec<&'static str>,
+        corridor_pairs: Vec<Value>,
+        flagged: bool,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -358,6 +521,7 @@ mod tests {
             "/v2/maker/enroll",
             post(move |Json(body): Json<Value>| {
                 let corridors = corridors.clone();
+                let corridor_pairs = corridor_pairs.clone();
                 async move {
                     assert!(body["signature"].as_str().unwrap().starts_with("0x"));
                     assert_eq!(body["chainId"], 56);
@@ -369,6 +533,8 @@ mod tests {
                         "streamUrl": "wss://api.textilecredit.com/v2/maker/stream",
                         "validationContract": "0xBCA5E344077AaC751A1C548a45F28215bB7ec165",
                         "corridors": corridors,
+                        "corridorPairs": corridor_pairs,
+                        "flagged": flagged,
                     }))
                 }
             }),
@@ -396,7 +562,8 @@ mod tests {
         let h = harness("rfq-enroll-connect");
         seed(&h, "bot-a");
         unlock_rfq_panel(&h, "bot-a");
-        let (venue, _server) = mock_venue("tx_live_enroll_secret", vec!["cngn-usdt-bsc"]).await;
+        let (venue, _server) =
+            mock_venue("tx_live_enroll_secret", vec!["cngn-usdt-bsc"], false).await;
 
         let (status, body) = h
             .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
@@ -435,12 +602,75 @@ mod tests {
         assert!(!body.contains("tx_live_enroll_secret"));
     }
 
+    fn rewrite_pool_tokens(h: &Harness, name: &str, collateral: &str, debt: &str) {
+        let path = h.root.join(name).join("stitch.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("0xa8AEA66B361a8d53e8865c62D142167Af28Af058", collateral)
+            .replace("0x55d398326f99059fF775485246999027B3197955", debt);
+        std::fs::write(&path, toml).unwrap();
+        assert!(
+            setup::identify_corridor(&std::fs::read_to_string(&path).unwrap()).is_none(),
+            "rewritten tokens must look custom, not catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_goes_live_on_a_custom_pair_via_tokens() {
+        let h = harness("rfq-enroll-custom");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        rewrite_pool_tokens(
+            &h,
+            "bot-a",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let (venue, _server) = mock_venue_with_pairs(
+            "tx_live_custom",
+            vec!["ops-custom-bsc"],
+            vec![json!({
+                "slug": "ops-custom-bsc",
+                "chainId": 56,
+                "collateralToken": "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa",
+                "debtToken": "0xBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBb",
+            })],
+            false,
+        )
+        .await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["rfqEnabled"], true);
+        assert_eq!(v["settings"]["rfqCorridor"], "ops-custom-bsc");
+    }
+
+    #[tokio::test]
+    async fn connect_does_not_go_live_on_an_unrelated_corridor() {
+        let h = harness("rfq-enroll-unrelated");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        let (venue, _server) = mock_venue("tx_live_unrelated", vec!["wars-usdt-bsc"], false).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["rfqEnabled"], false);
+        assert_eq!(v["settings"]["rfqCorridor"], "");
+        assert_eq!(v["settings"]["bookEnabled"], true);
+    }
+
     #[tokio::test]
     async fn connect_with_empty_corridors_registers_and_does_not_go_live() {
         let h = harness("rfq-enroll-waiting");
         seed(&h, "bot-a");
         unlock_rfq_panel(&h, "bot-a");
-        let (venue, _server) = mock_venue("tx_live_enroll_secret", vec![]).await;
+        let (venue, _server) = mock_venue("tx_live_enroll_secret", vec![], false).await;
 
         let (status, body) = h
             .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
@@ -456,7 +686,7 @@ mod tests {
             v["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("Textile still has to enable you"),
+                .contains("No RFQ corridor is live on this chain"),
             "waiting copy missing: {body}"
         );
 
@@ -479,7 +709,7 @@ mod tests {
             .unwrap()
             .replace("buy_max_orders = 40", "buy_max_orders = 0");
         std::fs::write(&path, toml).unwrap();
-        let (venue, _server) = mock_venue("tx_live_zero_max", vec!["cngn-usdt-bsc"]).await;
+        let (venue, _server) = mock_venue("tx_live_zero_max", vec!["cngn-usdt-bsc"], false).await;
 
         let (status, body) = h
             .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
@@ -507,7 +737,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let (venue, _server) = mock_venue("tx_live_default_gate", vec!["cngn-usdt-bsc"]).await;
+        let (venue, _server) =
+            mock_venue("tx_live_default_gate", vec!["cngn-usdt-bsc"], false).await;
 
         let (status, body) = h
             .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
@@ -519,5 +750,56 @@ mod tests {
         assert!(v["message"].as_str().unwrap().contains("RFQ only"));
         let toml = std::fs::read_to_string(&path).unwrap();
         assert!(toml.contains("book_enabled = false"));
+    }
+
+    #[tokio::test]
+    async fn flagged_rfq_default_reconnect_restores_the_book() {
+        let h = harness("rfq-enroll-flagged-default");
+        seed(&h, "bot-a");
+        let path = h.root.join("bot-a").join("stitch.toml");
+        let toml =
+            setup::apply_rfq_default_preset(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::write(&path, toml).unwrap();
+        let (venue, _server) =
+            mock_venue("tx_live_flagged_default", vec!["cngn-usdt-bsc"], true).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["rfqEnabled"], false);
+        assert_eq!(v["settings"]["bookEnabled"], true);
+        assert_eq!(v["enrollment"]["flagged"], true);
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !toml.contains("book_enabled = false"),
+            "flagged RFQ-default reconnect must restore the book: {toml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_when_flagged_registers_and_does_not_go_live() {
+        let h = harness("rfq-enroll-flagged");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        let (venue, _server) =
+            mock_venue("tx_live_enroll_secret", vec!["cngn-usdt-bsc"], true).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["rfqEnabled"], false);
+        assert_eq!(v["settings"]["rfqCorridor"], "");
+        assert_eq!(v["enrollment"]["flagged"], true);
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("flagged this maker"),
+            "flagged copy missing: {body}"
+        );
     }
 }

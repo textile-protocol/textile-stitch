@@ -723,8 +723,9 @@ pub fn rfq_connect_patch(
         rfq_maker_id: Some(maker_id),
         rfq_validation_contract: Some(validation_contract),
         rfq_corridor: Some(corridor),
-        // Waiting on a venue corridor: keep the book until RFQ can actually quote.
-        book_enabled: (book_off && go_live).then_some(false),
+        // RFQ-default: book off only while RFQ is live. A flagged or empty
+        // corridor reconnect must turn the book back on or the bot is dark.
+        book_enabled: book_off.then_some(!go_live),
         ..SettingsPatch::default()
     }
 }
@@ -1640,6 +1641,27 @@ mod tests {
         assert_eq!(back.buy_sizing.max_orders, "0");
         assert!(back.rfq_enabled);
         assert!(!back.book_enabled);
+    }
+
+    #[test]
+    fn waiting_rfq_default_connect_restores_the_book() {
+        let src = apply_rfq_default_preset(TEMPLATE).unwrap();
+        let current = read_settings(&src).unwrap();
+        assert!(!current.book_enabled);
+        let patch = rfq_connect_patch(
+            &current,
+            "wss://api.textilecredit.com/v2/maker/stream".into(),
+            "clmaker123".into(),
+            "0x00000000000000000000000000000000000000aa".into(),
+            String::new(),
+            true,
+            false,
+        );
+        assert_eq!(patch.book_enabled, Some(true));
+        let out = apply_settings(&src, &patch).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert!(back.book_enabled);
+        assert!(!back.rfq_enabled);
     }
 
     #[test]

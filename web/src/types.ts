@@ -135,6 +135,7 @@ export interface RfqEnrollment {
   makerSlug: string
   environment: string
   corridors: string[]
+  flagged?: boolean
 }
 
 export interface SaveResult {

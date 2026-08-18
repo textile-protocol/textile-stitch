@@ -615,6 +615,7 @@ function RfqCard({
     makerSlug: string
     environment: string
     corridors: string[]
+    flagged?: boolean
   } | null>(null)
 
   const ga = loaded.rfqDefaultUnlocked
@@ -628,7 +629,7 @@ function RfqCard({
     const registered =
       loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
     const waiting = registered && !draft.rfqCorridor.trim()
-    // A registered bot with no venue corridor is waiting on Textile.
+    // A registered bot with no venue corridor is flagged or has no RFQ pair.
     // Do not invent a slug from the book corridor — that is not an assignment.
     if (waiting) return
     if (!draft.rfqCorridor.trim() && corridorId) {
@@ -650,10 +651,11 @@ function RfqCard({
     }
   }
 
-  // Connect writes rfq_enabled=false until Textile assigns a corridor.
-  // Do not also require the leftover slug — token match is enough once live.
+  // Connect writes rfq_enabled=false when the venue returned no corridor
+  // (flagged, or no RFQ pair on this chain). Token match is enough once live.
   const live = connected && loaded.rfqEnabled
   const waiting = connected && !live
+  const flagged = enrollment?.flagged === true
 
   async function switchToRfqOnly() {
     setMigrating(true)
@@ -695,7 +697,9 @@ function RfqCard({
             ) : (
               <span className="mt-2 block text-xs">
                 {waiting
-                  ? 'Reconnect after Textile enables you, then switch.'
+                  ? flagged
+                    ? 'This maker is flagged. You will not receive private quotes until Textile unflags you.'
+                    : 'No RFQ corridor is live on this chain yet.'
                   : 'Connect below to finish the switch.'}
               </span>
             )}
@@ -710,10 +714,9 @@ function RfqCard({
         />
         <p className="text-xs text-faint">
           Connect signs with this bot&apos;s funding wallet. Textile creates the
-          maker and writes the credential here — you never paste an id or key.
-          If Textile has not assigned a corridor yet, reconnect after they
-          enable you. The venue rejects requests under 1 whole token so the
-          protocol fee cannot round to zero.
+          maker, saves the credential, and enables private quotes on this
+          corridor. You never paste an id or key. The venue rejects requests
+          under 1 whole token so the protocol fee cannot round to zero.
         </p>
 
         {waiting ? (
@@ -722,8 +725,10 @@ function RfqCard({
             {enrollment
               ? ` as ${enrollment.makerSlug} (${enrollment.environment})`
               : ''}
-            . Textile still has to enable you on a corridor before you receive
-            private quotes. Reconnect after they do.
+            .{' '}
+            {flagged
+              ? 'Textile has flagged this maker. You will not receive private quotes.'
+              : 'No RFQ corridor is live on this chain yet.'}
           </Banner>
         ) : live ? (
           <div className="rounded-lg border border-line-soft bg-hover/40 px-3 py-2 text-sm">
@@ -759,13 +764,11 @@ function RfqCard({
           disabled={!editable}
           onClick={() => void connect()}
         >
-          {waiting
-            ? 'Reconnect after Textile enables you'
-            : live
-              ? 'Reconnect to Textile'
-              : ga && onBook
-                ? 'Connect and switch to RFQ'
-                : 'Connect to Textile'}
+          {connected
+            ? 'Reconnect to Textile'
+            : ga && onBook
+              ? 'Connect and switch to RFQ'
+              : 'Connect to Textile'}
         </Button>
 
         <div>
