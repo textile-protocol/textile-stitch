@@ -408,6 +408,17 @@ pub async fn create(
         return Err(ApiError::bad_request(format!("{e:#}")));
     }
 
+    // Fleet RFQ-default: new bots start RFQ-only (ladder off, card unlocked).
+    // Existing book bots are left alone until the operator migrates them.
+    let rfq_default = crate::config::rfq_default_flag_in_dir(&state.cfg.bots_dir);
+    if rfq_default {
+        let path = dir.join("stitch.toml");
+        if let Err(e) = setup::stamp_rfq_default_preset(&path) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(ApiError::bad_request(format!("{e:#}")));
+        }
+    }
+
     // The panel writes as root; the bot runs as `stitch` and can't even chmod its
     // own run directory unless it owns these files. Without this every bot the
     // wizard creates exits on startup.
@@ -456,7 +467,9 @@ pub async fn create(
     // the start, leaving the container signing from a wallet nothing claimed.
     let mut started = false;
     let mut start_error = None;
-    if body.start {
+    // RFQ-only has no credential yet. Starting now would launch a bot that
+    // posts neither a book nor private quotes. Create succeeds; Start waits.
+    if body.start && !rfq_default {
         let (_config, bot) = bots::lock_config(&name, &state).await?;
         match bots::claim_for_launch(&bot, &state).await {
             Ok(wallet) => match state.docker.start(&spec.name).await {
@@ -520,6 +533,11 @@ pub async fn create(
                          (Tools → Approve allowances — needs a little gas)."
                             .to_string()
                     },
+                    (None, false) if rfq_default => {
+                        "It's RFQ-only and not started. Connect it to Textile on Settings \
+                         before Start — until then it posts neither a book nor private quotes."
+                            .to_string()
+                    }
                     (None, false) => {
                         "Next: approve Permit2 for its input tokens (Tools → Approve \
                          allowances — needs a little gas), then dry-run before starting."
@@ -1243,5 +1261,64 @@ mod tests {
         let v = Harness::parse(&listed);
         assert_eq!(v["bots"][0]["name"], "bot-a");
         assert_eq!(v["bots"][0]["container"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_fleet_rfq_default_flag_makes_new_bots_rfq_only() {
+        let h = harness("create-rfq-default");
+        std::fs::write(
+            h.root.join(crate::config::PANEL_FLAGS_FILE),
+            format!(
+                "[experimental]\nrfq_default = \"{}\"\n",
+                crate::config::RFQ_DEFAULT_GATE
+            ),
+        )
+        .unwrap();
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({ "name": "bot-a", "corridorId": "cngn-usdt-bsc", "signer": local(TEST_KEY) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(toml.contains("book_enabled = false"), "{toml}");
+        assert!(toml.contains(crate::config::RFQ_DEFAULT_GATE), "{toml}");
+        let (status, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["bookEnabled"], false);
+        assert_eq!(v["rfqDefaultUnlocked"], true);
+        assert_eq!(v["rfqPanelUnlocked"], true);
+    }
+
+    #[tokio::test]
+    async fn a_fleet_rfq_default_flag_does_not_start_before_connect() {
+        let h = harness("create-rfq-default-nostart");
+        std::fs::write(
+            h.root.join(crate::config::PANEL_FLAGS_FILE),
+            format!(
+                "[experimental]\nrfq_default = \"{}\"\n",
+                crate::config::RFQ_DEFAULT_GATE
+            ),
+        )
+        .unwrap();
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({
+                    "name": "bot-a",
+                    "corridorId": "cngn-usdt-bsc",
+                    "signer": local(TEST_KEY),
+                    "start": true,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["bot"]["running"], false, "{body}");
+        let message = v["message"].as_str().unwrap();
+        assert!(message.contains("not started"), "{body}");
+        assert!(message.contains("Connect"), "{body}");
     }
 }

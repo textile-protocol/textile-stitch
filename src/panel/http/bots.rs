@@ -1012,19 +1012,35 @@ pub async fn switch_corridor(
         }
     }
 
+    let outgoing = std::fs::read_to_string(toml_path).ok();
+    let outgoing_cfg = outgoing
+        .as_deref()
+        .and_then(|toml| crate::config::Config::from_toml(toml).ok());
+    let stamp_rfq =
+        crate::config::rfq_default_preset_applies(outgoing_cfg.as_ref(), &state.cfg.bots_dir);
+
     setup::switch_corridor_file(toml_path, corridor.toml_template)
         .map_err(|e| ApiError::bad_request(format!("couldn't switch corridor: {e:#}")))?;
+    if stamp_rfq {
+        setup::stamp_rfq_default_preset(toml_path).map_err(|e| {
+            ApiError::bad_request(format!("couldn't keep RFQ-only after switch: {e:#}"))
+        })?;
+    }
 
     crate::panel::updates::clear_cache();
 
     let where_to = format!("{} on {}", corridor.display_name, corridor.network_label);
-    let message = if was_live {
+    let mut message = if was_live {
         format!(
             "Switched to {where_to}. The bot was stopped — approve tokens for the new corridor, then Start."
         )
     } else {
         format!("Switched to {where_to}. Approve tokens for the new corridor before starting.")
     };
+    if stamp_rfq {
+        message
+            .push_str(" This bot stays RFQ-only — connect it to Textile on Settings before Start.");
+    }
     action_response(&state, &name, Some(message)).await
 }
 
@@ -2998,6 +3014,10 @@ mod tests {
             setup::identify_corridor(&toml).is_some_and(|c| c.id == "wbrl-usdt-celo"),
             "config should now be the wBRL corridor"
         );
+        assert!(
+            !toml.contains("book_enabled = false"),
+            "without the RFQ-default flag a book bot must stay on the ladder after switch"
+        );
         assert_eq!(
             h.docker.state_of("stitch-bot-a"),
             Some(ContainerState::Exited),
@@ -3049,6 +3069,61 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("already on"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn switching_corridor_with_the_fleet_flag_stays_rfq_only() {
+        let h = harness("switch-corridor-rfq-default");
+        seed_panel_bot(&h, "bot-a");
+        std::fs::write(
+            h.root.join(crate::config::PANEL_FLAGS_FILE),
+            format!(
+                "[experimental]\nrfq_default = \"{}\"\n",
+                crate::config::RFQ_DEFAULT_GATE
+            ),
+        )
+        .unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/corridor",
+                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("RFQ-only"), "{body}");
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(
+            setup::identify_corridor(&toml).is_some_and(|c| c.id == "wbrl-usdt-celo"),
+            "config should now be the wBRL corridor"
+        );
+        assert!(toml.contains("book_enabled = false"), "{toml}");
+        assert!(toml.contains(crate::config::RFQ_DEFAULT_GATE), "{toml}");
+    }
+
+    #[tokio::test]
+    async fn switching_an_rfq_only_bot_does_not_turn_the_book_back_on() {
+        let h = harness("switch-corridor-keep-rfq");
+        seed_panel_bot(&h, "bot-a");
+        let path = h.root.join("bot-a/stitch.toml");
+        let stamped =
+            setup::apply_rfq_default_preset(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::write(&path, stamped).unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/corridor",
+                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("RFQ-only"), "{body}");
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("book_enabled = false"), "{toml}");
+        assert!(
+            setup::identify_corridor(&toml).is_some_and(|c| c.id == "wbrl-usdt-celo"),
+            "{toml}"
+        );
     }
 
     #[tokio::test]

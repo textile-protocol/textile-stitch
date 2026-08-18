@@ -8,6 +8,10 @@ permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0xEb5A29F869FF084B3Fce18d3487a38A56feDC59E"  # SETTLEMENT_V3_FILLER_REACTOR (Base)
 tick_interval_secs = 5
 
+# Root-level. Must sit above [feed] / [[pools]] / [rfq] or TOML attaches it
+# to that table and the bot keeps posting a public ladder (default true).
+# book_enabled = false
+
 # Default price feed: used by any pool that doesn't set its own `feed_url`.
 [feed]
 url = "https://your-feed.example/cngn-usdt"
@@ -108,10 +112,9 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # limit_taker_min_profit_debt = "50000"  # skip fills clearing < 0.05 USDC (6dp)
 # limit_taker_max_orders = 10            # per executeBatch
 
-# ----- RFQ responder (dual-run pilot, off by default). Prefer the panel
-# Settings form over editing this by hand. WARNING: enabling it signs firm,
-# taker-bound orders against your funded wallet. The ladder above keeps
-# running unchanged either way. The maker API key is never in this file; the
+# ----- RFQ responder (off by default). Prefer the panel Settings form over
+# editing this by hand. WARNING: enabling it signs firm, taker-bound orders
+# against your funded wallet. The maker API key is never in this file; the
 # panel writes it to rfq-api.key (or set the env var named by api_key_env).
 # Pools are the corridors — no extra slug. Liquidity may be `"max"` (live
 # wallet) or an explicit atomic cap. `rfq_corridor` is optional leftover.
@@ -122,11 +125,14 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # api_key_env = "STITCH_RFQ_API_KEY"                     # env var holding the maker API key
 # validation_contract = "0x0000000000000000000000000000000000000000"  # PreferredFillerValidation (per chain)
 
-# ----- Experimental gates (off by default). Raw tokens; nothing here changes
-# trading behavior. The RFQ Settings card stays hidden until you set this
-# exact token. Later the card ships on for everyone and this gate goes away.
+# ----- Experimental gates (off by default). Raw tokens; a typo fails closed.
+# rfq_panel unlocks the Settings RFQ card. rfq_default turns RFQ into the
+# quoting mode: new bots start RFQ-only, book bots see a migrate nudge, and
+# Connect writes RFQ-only. The same rfq_default token in panel.toml (next to
+# the bot folders) enables that for the whole fleet.
 # [experimental]
 # rfq_panel = "enable-rfq-beta"
+# rfq_default = "enable-rfq"
 
 # ----- Signer / wallet backend. Omit this whole section to use the local
 # hotwallet (the default, unchanged): the bot signs with STITCH_PRIVATE_KEY /

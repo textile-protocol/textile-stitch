@@ -495,6 +495,15 @@ pub fn switch_corridor_file(toml_path: &Path, template: &str) -> Result<()> {
     }
 }
 
+/// Apply [`crate::setup::apply_rfq_default_preset`] to a file just written
+/// from a corridor template (create or switch).
+pub fn stamp_rfq_default_preset(toml_path: &Path) -> Result<()> {
+    let current = std::fs::read_to_string(toml_path)
+        .with_context(|| format!("reading {}", toml_path.display()))?;
+    let next = crate::setup::apply_rfq_default_preset(&current)?;
+    write_toml_atomic(toml_path, &next)
+}
+
 /// Path of the owner-only secret file for a signer, next to stitch.toml.
 fn secret_path(paths: &ConfigPaths, signer: &SignerSetup) -> PathBuf {
     match signer {

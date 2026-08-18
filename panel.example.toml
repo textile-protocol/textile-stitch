@@ -1,0 +1,10 @@
+# Fleet flags for the Stitch panel. Copy this file next to the per-bot
+# folders as `{bots_dir}/panel.toml` and restart the panel.
+#
+# Tokens are exact. A typo fails closed — the feature stays off.
+
+[experimental]
+# RFQ as the default quoting mode: new bots start RFQ-only, existing
+# public-ladder bots see a migrate nudge, and Connect writes RFQ-only.
+# The Settings RFQ card unlocks for every bot in this fleet.
+rfq_default = "enable-rfq"

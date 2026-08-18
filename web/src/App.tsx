@@ -79,7 +79,7 @@ export default function App() {
       <main className="mx-auto max-w-5xl px-6 py-8">
         <Routes>
           <Route path="/" element={<Fleet />} />
-          <Route path="/add" element={<AddBot />} />
+          <Route path="/add" element={<AddBot rfqDefault={session.rfqDefault} />} />
           <Route path="/bots/:name" element={<BotDetail />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

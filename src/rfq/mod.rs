@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! The RFQ responder — Stitch's second, additive leg (dual-run pilot).
+//! The RFQ responder — Stitch's private-quote leg.
 //!
-//! The ladder keeps resting signed orders in the public book exactly as
-//! before; this module ALSO answers the venue's private quote requests over a
-//! WebSocket (`/v2/maker/stream`): publish indicative levels every second,
-//! and reply to each `quoteRequest` with a firm, taker-bound, Permit2-signed
-//! `LimitOrder` within the venue's reply budget (~750 ms hard, <400 ms
-//! target).
+//! Answers the venue's private quote requests over a WebSocket
+//! (`/v2/maker/stream`): publish indicative levels every second, and reply to
+//! each `quoteRequest` with a firm, taker-bound, Permit2-signed `LimitOrder`
+//! within the venue's reply budget (~750 ms hard, <400 ms target). The public
+//! ladder is a separate switch (`book_enabled`); RFQ-only bots skip it.
 //!
 //! Kill switch: the whole module is spawned from `run()` only when
 //! `[rfq].enabled = true` and the bot has at least one pool. Anything

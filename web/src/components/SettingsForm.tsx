@@ -18,8 +18,8 @@ import type { Bot, Corridor, Settings, Spread } from '../types'
 /**
  * Structured settings matching the desktop Stitch app: corridor, signer, spreads,
  * taker leg, endpoints, plus a collapsed Experimental card for opt-in knobs
- * (TWAP / inventory-lean). The RFQ card is gated on a raw-config token.
- * Sizing / tick stay on the Raw config tab.
+ * (TWAP / inventory-lean). The RFQ card is gated on a raw-config or fleet
+ * token. Sizing / tick stay on the Raw config tab.
  *
  * Sends only the fields the operator touched — a partial patch means a concurrent
  * raw edit only loses what this form actually changed.
@@ -216,6 +216,7 @@ export default function SettingsForm({
           draft={draft}
           loaded={loaded}
           rfqApiKey={rfqApiKey}
+          pendingPatch={changedFields(loaded, draft, rfqApiKey)}
           corridorId={bot.config?.corridorId ?? ''}
           editable={loaded.editable}
           onChange={set}
@@ -223,6 +224,7 @@ export default function SettingsForm({
           onConnected={(next, message) => {
             setLoaded(next)
             setDraft(next)
+            setRfqApiKey('')
             onSaved(message)
           }}
         />
@@ -252,7 +254,9 @@ export default function SettingsForm({
           {!dirty
             ? 'No unsaved changes.'
             : bot.running
-              ? 'Saving restarts the bot: it reads its config once at startup. Orders already signed stay on the book until they expire.'
+              ? loaded.bookEnabled
+                ? 'Saving restarts the bot: it reads its config once at startup. Orders already signed stay on the book until they expire.'
+                : 'Saving restarts the bot: it reads its config once at startup. In-flight RFQ quotes stay valid until they expire.'
               : 'The bot is stopped, so this only writes the file. It picks the change up when you start it.'}
         </p>
       </div>
@@ -576,15 +580,16 @@ function ExperimentalSubsection({
 const DEFAULT_RFQ_URL = 'wss://api.textilecredit.com/v2/maker/stream'
 
 /**
- * Dual-run RFQ. Happy path is Connect: the bot signs MakerEnroll and the
- * panel writes the credential. Paste fields stay under Advanced for
- * manual overrides. The key is write-only.
+ * RFQ. Happy path is Connect: the bot signs MakerEnroll and the panel writes
+ * the credential. Paste fields stay under Advanced for manual overrides.
+ * The key is write-only.
  */
 function RfqCard({
   botName,
   draft,
   loaded,
   rfqApiKey,
+  pendingPatch,
   corridorId,
   editable,
   onChange,
@@ -595,6 +600,7 @@ function RfqCard({
   draft: Settings
   loaded: Settings
   rfqApiKey: string
+  pendingPatch: Record<string, unknown>
   corridorId: string
   editable: boolean
   onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void
@@ -602,6 +608,7 @@ function RfqCard({
   onConnected: (settings: Settings, message: string) => void
 }) {
   const [connecting, setConnecting] = useState(false)
+  const [migrating, setMigrating] = useState(false)
   const [connectError, setConnectError] = useState<string | null>(null)
   const [advanced, setAdvanced] = useState(false)
   const [enrollment, setEnrollment] = useState<{
@@ -609,6 +616,10 @@ function RfqCard({
     environment: string
     corridors: string[]
   } | null>(null)
+
+  const ga = loaded.rfqDefaultUnlocked
+  const connected = loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
+  const onBook = loaded.bookEnabled
 
   function enable(next: boolean) {
     onChange('rfqEnabled', next)
@@ -639,26 +650,69 @@ function RfqCard({
     }
   }
 
-  const connected = loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
   // Connect writes rfq_enabled=false until Textile assigns a corridor.
   // Do not also require the leftover slug — token match is enough once live.
   const live = connected && loaded.rfqEnabled
   const waiting = connected && !live
 
+  async function switchToRfqOnly() {
+    setMigrating(true)
+    setConnectError(null)
+    try {
+      // Same patch the Save button would send, plus the book off. Replacing
+      // draft from the server response would otherwise drop unsaved edits.
+      const res = await api.saveSettings(botName, {
+        ...pendingPatch,
+        bookEnabled: false,
+      })
+      onConnected(res.settings, res.message)
+    } catch (e) {
+      setConnectError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setMigrating(false)
+    }
+  }
+
   return (
     <Card title="RFQ">
       <div className="space-y-4">
+        {ga && onBook && (
+          <Banner tone="warning">
+            This bot still posts a public ladder. Textile now quotes privately
+            (RFQ). Switch to RFQ only — it will stop resting orders on the book
+            and only answer private quote requests.
+            {live ? (
+              <span className="mt-3 block">
+                <Button
+                  variant="primary"
+                  busy={migrating}
+                  disabled={!editable}
+                  onClick={() => void switchToRfqOnly()}
+                >
+                  Switch to RFQ only
+                </Button>
+              </span>
+            ) : (
+              <span className="mt-2 block text-xs">
+                {waiting
+                  ? 'Reconnect after Textile enables you, then switch.'
+                  : 'Connect below to finish the switch.'}
+              </span>
+            )}
+          </Banner>
+        )}
+
         <Toggle
           checked={draft.rfqEnabled}
           disabled={!editable}
           onChange={enable}
-          label="Answer private quote requests beside the public ladder"
+          label="Answer private quote requests"
         />
         <p className="text-xs text-faint">
-          Dual-run: the public ladder keeps running. Connect registers this
-          bot&apos;s funding wallet and saves the credential. Textile still has
-          to enable you on a corridor before you receive private quotes — then
-          Reconnect. You never paste an id or key.
+          Connect signs with this bot&apos;s funding wallet. Textile creates the
+          maker and writes the credential here — you never paste an id or key.
+          If Textile has not assigned a corridor yet, reconnect after they
+          enable you.
         </p>
 
         {waiting ? (
@@ -667,9 +721,8 @@ function RfqCard({
             {enrollment
               ? ` as ${enrollment.makerSlug} (${enrollment.environment})`
               : ''}
-            . Textile still has to enable you on a corridor. The ladder keeps
-            running. Reconnect after they do — you will not see private quotes
-            until then.
+            . Textile still has to enable you on a corridor before you receive
+            private quotes. Reconnect after they do.
           </Banner>
         ) : live ? (
           <div className="rounded-lg border border-line-soft bg-hover/40 px-3 py-2 text-sm">
@@ -678,17 +731,22 @@ function RfqCard({
               {enrollment
                 ? ` as ${enrollment.makerSlug} (${enrollment.environment})`
                 : ''}
+              {ga && !onBook ? ' · RFQ only' : ''}
             </p>
             <p className="mt-1 text-xs text-faint">
               {enrollment?.corridors.length
                 ? `Corridors: ${enrollment.corridors.join(', ')}`
-                : `Corridor: ${loaded.rfqCorridor}`}
+                : loaded.rfqCorridor
+                  ? `Corridor: ${loaded.rfqCorridor}`
+                  : 'No corridor assigned yet.'}
               {loaded.rfqApiKeySet ? ' · API key saved' : ''}
             </p>
           </div>
         ) : (
           <Banner tone="warning">
-            Not connected. The ladder keeps running either way.
+            {ga
+              ? 'Not connected. This bot will not quote until you connect to Textile.'
+              : 'Not connected. Connect to start answering private quote requests.'}
           </Banner>
         )}
 
@@ -702,9 +760,11 @@ function RfqCard({
         >
           {waiting
             ? 'Reconnect after Textile enables you'
-            : connected
+            : live
               ? 'Reconnect to Textile'
-              : 'Connect to Textile'}
+              : ga && onBook
+                ? 'Connect and switch to RFQ'
+                : 'Connect to Textile'}
         </Button>
 
         <div>
@@ -798,7 +858,7 @@ function changedFields(
   loaded: Settings,
   draft: Settings,
   rfqApiKey: string,
-): unknown {
+): Record<string, unknown> {
   const patch: Record<string, unknown> = { pool: 0 }
   const keys: (keyof Settings)[] = [
     'rpcUrl',
@@ -820,6 +880,7 @@ function changedFields(
     'rfqMakerId',
     'rfqValidationContract',
     'rfqCorridor',
+    'bookEnabled',
   ]
   for (const key of keys) {
     if (JSON.stringify(loaded[key]) !== JSON.stringify(draft[key])) {

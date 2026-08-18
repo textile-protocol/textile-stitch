@@ -344,6 +344,24 @@ fn run_init(dir: Option<String>) -> anyhow::Result<()> {
     let paths = setup::write_config(&target, corridor, &key)?;
     key.zeroize();
 
+    // Same fleet flag the panel reads: `{dir}/panel.toml` or a parent
+    // `panel.toml` (bots-dir / bot-dir layouts).
+    let flag_dir = paths
+        .dir
+        .parent()
+        .filter(|p| stitch_bot::config::rfq_default_flag_in_dir(p))
+        .map(|p| p.to_path_buf())
+        .or_else(|| {
+            stitch_bot::config::rfq_default_flag_in_dir(&paths.dir).then(|| paths.dir.clone())
+        });
+    if flag_dir.is_some() {
+        let current = std::fs::read_to_string(&paths.toml)?;
+        let next = setup::apply_rfq_default_preset(&current)?;
+        setup::write_toml_atomic(&paths.toml, &next)?;
+        println!("RFQ-default is on — this bot will not rest orders on the public book.");
+        println!("Connect it to Textile (Stitch panel → Settings → RFQ) before going live.");
+    }
+
     println!("\nConfig written to {}", paths.dir.display());
     println!("  {}", paths.toml.display());
     println!("  {}", paths.env.display());
@@ -484,9 +502,13 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         dry_run,
     };
 
-    // RFQ responder (dual-run pilot): spawned only when `[rfq].enabled`.
-    // It runs beside the ladder on its own cadence and WebSocket; with the
-    // config off this is a no-op and every tick below behaves exactly as before.
+    if !cfg.book_enabled {
+        info!("public ladder off — this bot will not rest orders on the book");
+    }
+
+    // RFQ responder: spawned only when `[rfq].enabled`. With the config
+    // off this is a no-op. The public ladder is a separate `book_enabled`
+    // switch.
     let rfq_task = stitch_bot::rfq::maybe_spawn(
         &cfg,
         signer.clone(),
@@ -706,53 +728,58 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
 
             let mut posted_bid = 0usize;
             let mut posted_ask = 0usize;
-            for side in [Side::Bid, Side::Ask] {
-                let price_override = match lean {
-                    Some((LeanMode::Live, decision)) => {
-                        let lean_price = match side {
-                            Side::Bid => decision.bid,
-                            Side::Ask => decision.ask,
-                        };
-                        match lean_price {
-                            Some(price) => Some(price),
-                            // The lean pulled this side (critical inventory or
-                            // a fair jump): stop reposting and let the live
-                            // orders age out through their TTL.
-                            None => continue,
-                        }
-                    }
-                    _ => None,
-                };
-                let outcome = quote_side(
-                    &ctx,
-                    &mut state,
-                    &mut budgets,
-                    pool,
-                    &pair,
-                    debt,
-                    collateral,
-                    side,
-                    mid,
-                    price_override,
-                    guard,
-                    now,
-                )
-                .await;
-                match outcome {
-                    // The nonce ledger could not be persisted; never post on a
-                    // stale ledger. Skip the rest of this pool's tick.
-                    SideOutcome::AbortPool => continue 'pools,
-                    SideOutcome::Done { posted, fills } => {
-                        if fills > 0 {
-                            // Orders of ours filled since the last post: the
-                            // inventory moved, so re-read the share next tick.
-                            if let Some(lean_state) = lean_states.get_mut(&pair) {
-                                lean_state.note_fill(now);
+            // RFQ-only (`book_enabled = false`): do not rest orders on the
+            // public book. Spreads and liquidity still size the RFQ responder;
+            // the taker/closer legs below are unchanged.
+            if cfg.book_enabled {
+                for side in [Side::Bid, Side::Ask] {
+                    let price_override = match lean {
+                        Some((LeanMode::Live, decision)) => {
+                            let lean_price = match side {
+                                Side::Bid => decision.bid,
+                                Side::Ask => decision.ask,
+                            };
+                            match lean_price {
+                                Some(price) => Some(price),
+                                // The lean pulled this side (critical inventory or
+                                // a fair jump): stop reposting and let the live
+                                // orders age out through their TTL.
+                                None => continue,
                             }
                         }
-                        match side {
-                            Side::Bid => posted_bid = posted,
-                            Side::Ask => posted_ask = posted,
+                        _ => None,
+                    };
+                    let outcome = quote_side(
+                        &ctx,
+                        &mut state,
+                        &mut budgets,
+                        pool,
+                        &pair,
+                        debt,
+                        collateral,
+                        side,
+                        mid,
+                        price_override,
+                        guard,
+                        now,
+                    )
+                    .await;
+                    match outcome {
+                        // The nonce ledger could not be persisted; never post on a
+                        // stale ledger. Skip the rest of this pool's tick.
+                        SideOutcome::AbortPool => continue 'pools,
+                        SideOutcome::Done { posted, fills } => {
+                            if fills > 0 {
+                                // Orders of ours filled since the last post: the
+                                // inventory moved, so re-read the share next tick.
+                                if let Some(lean_state) = lean_states.get_mut(&pair) {
+                                    lean_state.note_fill(now);
+                                }
+                            }
+                            match side {
+                                Side::Bid => posted_bid = posted,
+                                Side::Ask => posted_ask = posted,
+                            }
                         }
                     }
                 }

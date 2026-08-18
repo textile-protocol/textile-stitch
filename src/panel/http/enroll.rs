@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use super::settings::{config_path, read_toml, save_and_restart};
 use super::{ApiError, AppState};
-use crate::config::{Config, RFQ_PANEL_GATE};
+use crate::config::{rfq_default_flag_in_dir, Config, RFQ_PANEL_GATE};
 use crate::eip712::{maker_enroll_digest, maker_enroll_environment};
 use crate::panel::provision;
 use crate::setup;
@@ -140,9 +140,13 @@ pub async fn enroll(
     let current_toml = read_toml(&path)?;
     let cfg = Config::from_toml(&current_toml)
         .map_err(|e| ApiError::bad_request(format!("this config isn't valid: {e:#}")))?;
-    if !cfg.rfq_panel_unlocked() {
+    let rfq_default = cfg.rfq_default_unlocked() || rfq_default_flag_in_dir(&state.cfg.bots_dir);
+    if !cfg.rfq_panel_unlocked() && !rfq_default {
         return Err(ApiError::bad_request(format!(
-            "RFQ is locked on this bot. In the raw config set [experimental] rfq_panel = \"{RFQ_PANEL_GATE}\""
+            "RFQ is locked on this bot. In the raw config set [experimental] rfq_panel = \"{RFQ_PANEL_GATE}\", \
+             or drop {gate} in {file} next to the bot folders.",
+            gate = crate::config::RFQ_DEFAULT_GATE,
+            file = crate::config::PANEL_FLAGS_FILE,
         )));
     }
 
@@ -212,14 +216,17 @@ pub async fn enroll(
     };
 
     let current = setup::read_settings_at(&current_toml, 0).map_err(ApiError::bad_request)?;
-    let mut patch = current.to_patch();
-    // No venue corridor yet: register the credential but do not start RFQ
-    // against a missing or stale slug. Reconnect after Textile enables you.
-    patch.rfq_enabled = Some(!waiting);
-    patch.rfq_url = Some(enrolled.stream_url.clone());
-    patch.rfq_maker_id = Some(enrolled.maker_id.clone());
-    patch.rfq_validation_contract = Some(enrolled.validation_contract.clone().unwrap_or_default());
-    patch.rfq_corridor = Some(corridor);
+    // Waiting: register the credential but do not start RFQ against a
+    // missing slug, and do not turn the book off until RFQ can quote.
+    let patch = setup::rfq_connect_patch(
+        &current,
+        enrolled.stream_url.clone(),
+        enrolled.maker_id.clone(),
+        enrolled.validation_contract.clone().unwrap_or_default(),
+        corridor,
+        rfq_default,
+        !waiting,
+    );
     let edited = setup::apply_settings(&current_toml, &patch)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
@@ -243,7 +250,12 @@ pub async fn enroll(
 
     let message = if waiting {
         format!(
-            "Registered as {} ({}). Textile still has to enable you on a corridor before you receive RFQs. The public ladder keeps running. Reconnect after they enable you.",
+            "Registered as {} ({}). Textile still has to enable you on a corridor before you receive private quotes. Reconnect after they enable you.",
+            enrolled.maker_slug, enrolled.environment
+        )
+    } else if rfq_default {
+        format!(
+            "Connected to Textile as {} ({}). This bot now quotes RFQ only — it will not rest orders on the public book.",
             enrolled.maker_slug, enrolled.environment
         )
     } else {
@@ -410,6 +422,10 @@ mod tests {
         assert!(toml.contains("[rfq]"));
         assert!(toml.contains("clmakerenroll1"));
         assert!(!toml.contains("tx_live_enroll_secret"));
+        assert!(
+            !toml.contains("book_enabled = false"),
+            "without the default gate, Connect must leave the public ladder on"
+        );
 
         let (status, body) = h.get("/api/bots/bot-a/settings").await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -451,5 +467,57 @@ mod tests {
             !rfq.contains("cngn-usdt-bsc"),
             "must not write the book corridor into [rfq]: {toml}"
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_does_not_care_about_zero_max_orders() {
+        let h = harness("rfq-enroll-zero-max");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        let path = h.root.join("bot-a").join("stitch.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("buy_max_orders = 40", "buy_max_orders = 0");
+        std::fs::write(&path, toml).unwrap();
+        let (venue, _server) = mock_venue("tx_live_zero_max", vec!["cngn-usdt-bsc"]).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.contains("max orders"),
+            "Connect must not validate ladder sizing: {body}"
+        );
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("buy_max_orders = 0"));
+    }
+
+    #[tokio::test]
+    async fn the_default_gate_makes_connect_rfq_only() {
+        let h = harness("rfq-enroll-default");
+        seed(&h, "bot-a");
+        let path = h.root.join("bot-a").join("stitch.toml");
+        let toml = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{toml}\n[experimental]\nrfq_default = \"{}\"\n",
+                crate::config::RFQ_DEFAULT_GATE
+            ),
+        )
+        .unwrap();
+        let (venue, _server) = mock_venue("tx_live_default_gate", vec!["cngn-usdt-bsc"]).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["bookEnabled"], false);
+        assert_eq!(v["settings"]["rfqDefaultUnlocked"], true);
+        assert!(v["message"].as_str().unwrap().contains("RFQ only"));
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("book_enabled = false"));
     }
 }

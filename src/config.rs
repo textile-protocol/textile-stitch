@@ -63,16 +63,24 @@ pub struct Config {
     /// set `provider = "turnkey" | "mpcvault"` to sign via an MPC wallet.
     #[serde(default)]
     pub signer: Option<crate::signer::SignerConfig>,
-    /// RFQ responder (dual-run pilot). Omitted → the responder never spawns and
-    /// nothing else changes. See [`RfqConfig`].
+    /// RFQ responder. Omitted → the responder never spawns. See [`RfqConfig`].
     #[serde(default)]
     pub rfq: Option<RfqConfig>,
+    /// Post resting orders on the public ladder. Default true (historical).
+    /// Set false for RFQ-only: the bot answers private quotes and does not
+    /// rest orders on the book. Spreads and liquidity still size RFQ.
+    #[serde(default = "default_true")]
+    pub book_enabled: bool,
     /// Raw experimental gates. Values are uninterpreted strings on purpose:
     /// each consumer matches its own exact token, so a typo fails closed
     /// instead of enabling something adjacent.
     #[serde(default)]
     pub experimental: Option<ExperimentalConfig>,
     pub pools: Vec<PoolConfig>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The `[rfq]` block: connection details for the venue's maker quote stream.
@@ -140,11 +148,23 @@ pub struct ExperimentalConfig {
     /// anything else (or omitted) keeps the card hidden.
     #[serde(default)]
     pub rfq_panel: Option<String>,
+    /// RFQ-as-default rollout. Exact token [`RFQ_DEFAULT_GATE`] only. When
+    /// set (here or in the fleet `panel.toml`), new bots start RFQ-only,
+    /// book bots see a migrate-to-RFQ nudge, and Connect writes RFQ-only.
+    #[serde(default)]
+    pub rfq_default: Option<String>,
 }
 
 /// The one token that unlocks the panel's RFQ beta card. Exact, case-sensitive
 /// match — anything else (including a different case) fails closed.
 pub const RFQ_PANEL_GATE: &str = "enable-rfq-beta";
+
+/// The one token that turns RFQ into the default quoting mode. Exact match.
+pub const RFQ_DEFAULT_GATE: &str = "enable-rfq";
+
+/// Filename for the fleet-wide flag, dropped next to the per-bot folders
+/// (`{bots_dir}/panel.toml`). Same `[experimental]` keys as a bot config.
+pub const PANEL_FLAGS_FILE: &str = "panel.toml";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeedConfig {
@@ -551,19 +571,29 @@ impl Config {
     }
 
     /// True when the RFQ responder should run: the master switch is on and
-    /// there is at least one pool to quote. Anything less is a no-op — the
-    /// ladder never changes either way.
+    /// there is at least one pool to quote. The public ladder is a separate
+    /// switch ([`Self::book_enabled`]).
     pub fn rfq_active(&self) -> bool {
         self.rfq.as_ref().is_some_and(|r| r.enabled) && !self.pools.is_empty()
     }
 
-    /// True only for the exact [`RFQ_PANEL_GATE`] token. Read-only surface for
-    /// the panel; nothing in the bot keys off it.
+    /// True only for the exact [`RFQ_PANEL_GATE`] or [`RFQ_DEFAULT_GATE`]
+    /// token. Read-only surface for the panel; nothing in the bot keys off it.
     pub fn rfq_panel_unlocked(&self) -> bool {
+        self.rfq_default_unlocked()
+            || self
+                .experimental
+                .as_ref()
+                .and_then(|e| e.rfq_panel.as_deref())
+                == Some(RFQ_PANEL_GATE)
+    }
+
+    /// True only for the exact [`RFQ_DEFAULT_GATE`] token on this config.
+    pub fn rfq_default_unlocked(&self) -> bool {
         self.experimental
             .as_ref()
-            .and_then(|e| e.rfq_panel.as_deref())
-            == Some(RFQ_PANEL_GATE)
+            .and_then(|e| e.rfq_default.as_deref())
+            == Some(RFQ_DEFAULT_GATE)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -694,6 +724,34 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// True when `toml` sets `[experimental] rfq_default` to the exact gate token.
+/// Used for a fleet `panel.toml` that is not a full bot config.
+pub fn toml_has_rfq_default_gate(toml: &str) -> bool {
+    let Ok(value) = toml::from_str::<toml::Value>(toml) else {
+        return false;
+    };
+    value
+        .get("experimental")
+        .and_then(|e| e.get("rfq_default"))
+        .and_then(|v| v.as_str())
+        == Some(RFQ_DEFAULT_GATE)
+}
+
+/// Fleet-wide RFQ-default switch: `{dir}/panel.toml` with the exact token.
+pub fn rfq_default_flag_in_dir(dir: &std::path::Path) -> bool {
+    let path = dir.join(PANEL_FLAGS_FILE);
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|text| toml_has_rfq_default_gate(&text))
+}
+
+/// Stamp a fresh corridor template as RFQ-only: fleet flag, or this bot
+/// already left the public ladder / carries the per-bot token.
+pub fn rfq_default_preset_applies(cfg: Option<&Config>, bots_dir: &std::path::Path) -> bool {
+    rfq_default_flag_in_dir(bots_dir)
+        || cfg.is_some_and(|c| !c.book_enabled || c.rfq_default_unlocked())
 }
 
 #[cfg(test)]
@@ -992,6 +1050,14 @@ mod tests {
         assert!(!cfg.rfq_active());
         assert!(!cfg.rfq_panel_unlocked());
         assert!(cfg.pools.iter().all(|p| p.rfq_corridor.is_none()));
+        let book = EXAMPLE
+            .find("# book_enabled = false")
+            .expect("example must document book_enabled");
+        let feed = EXAMPLE.find("\n[feed]\n").expect("example has [feed]");
+        assert!(
+            book < feed,
+            "book_enabled must be a root key, before [feed] — after [[pools]] it is ignored"
+        );
     }
 
     #[test]
@@ -1009,6 +1075,75 @@ mod tests {
 
         let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_panel = \"enable-rfq-beta\"\n");
         assert!(Config::from_toml(&toml).unwrap().rfq_panel_unlocked());
+    }
+
+    #[test]
+    fn book_enabled_defaults_on_and_can_be_turned_off() {
+        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert!(cfg.book_enabled, "omitted book_enabled must stay on");
+
+        // Root-level key — appending after [[pools]] would land on the pool.
+        let off = LEAN_POOL_BASE.replace(
+            "tick_interval_secs = 5",
+            "tick_interval_secs = 5\nbook_enabled = false",
+        );
+        assert!(!Config::from_toml(&off).unwrap().book_enabled);
+    }
+
+    #[test]
+    fn rfq_default_gate_only_opens_on_the_exact_token() {
+        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert!(!cfg.rfq_default_unlocked());
+        assert!(!cfg.rfq_panel_unlocked());
+
+        for wrong in ["true", "1", "enable-rfq-beta", "ENABLE-RFQ"] {
+            let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_default = \"{wrong}\"\n");
+            let cfg = Config::from_toml(&toml).unwrap();
+            assert!(!cfg.rfq_default_unlocked(), "{wrong:?} must not unlock");
+        }
+
+        let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_default = \"enable-rfq\"\n");
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert!(cfg.rfq_default_unlocked());
+        assert!(
+            cfg.rfq_panel_unlocked(),
+            "the default gate also unlocks the RFQ card"
+        );
+    }
+
+    #[test]
+    fn a_panel_toml_is_not_a_bot_config_but_still_trips_the_gate() {
+        assert!(!toml_has_rfq_default_gate(""));
+        assert!(!toml_has_rfq_default_gate(
+            "[experimental]\nrfq_panel = \"enable-rfq-beta\"\n"
+        ));
+        assert!(toml_has_rfq_default_gate(
+            "[experimental]\nrfq_default = \"enable-rfq\"\n"
+        ));
+    }
+
+    #[test]
+    fn rfq_default_preset_applies_for_fleet_or_an_already_rfq_only_bot() {
+        let empty = std::env::temp_dir().join("stitch-rfq-preset-applies-empty");
+        let _ = std::fs::create_dir_all(&empty);
+        let book = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert!(!rfq_default_preset_applies(Some(&book), &empty));
+
+        let off = LEAN_POOL_BASE.replace(
+            "tick_interval_secs = 5",
+            "tick_interval_secs = 5\nbook_enabled = false",
+        );
+        let rfq_only = Config::from_toml(&off).unwrap();
+        assert!(rfq_default_preset_applies(Some(&rfq_only), &empty));
+
+        let fleet = std::env::temp_dir().join("stitch-rfq-preset-applies-fleet");
+        let _ = std::fs::create_dir_all(&fleet);
+        std::fs::write(
+            fleet.join(PANEL_FLAGS_FILE),
+            "[experimental]\nrfq_default = \"enable-rfq\"\n",
+        )
+        .unwrap();
+        assert!(rfq_default_preset_applies(Some(&book), &fleet));
     }
 
     const RFQ_BLOCK: &str = r#"

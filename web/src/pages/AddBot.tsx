@@ -98,7 +98,7 @@ function buildCustom(c: CustomState) {
  * reactor, the two tokens, a price feed); Permit2, the indexer, spreads and sizes
  * default and are editable later from the bot's Settings.
  */
-export default function AddBot() {
+export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean }) {
   const navigate = useNavigate()
   const [corridors, setCorridors] = useState<Corridor[] | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -169,7 +169,7 @@ export default function AddBot() {
       const res = await api.createBot({
         name: name.trim(),
         ...(isCustom ? { custom: buildCustom(custom) } : { corridorId }),
-        start,
+        start: rfqDefault ? false : start,
         signer: buildSigner(signer),
       })
       // Clear the secret from component state the moment it's no longer needed.
@@ -192,6 +192,13 @@ export default function AddBot() {
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-bold">Add a bot</h1>
+      {rfqDefault && (
+        <p className="text-sm text-muted">
+          New bots quote via RFQ (private quotes), not the public ladder. After
+          create, open Settings and connect the bot to Textile before starting
+          it.
+        </p>
+      )}
       <Steps current={step} labels={['Corridor', 'Name', 'Wallet']} />
 
       {step === 0 && !editingCustom && (
@@ -417,18 +424,28 @@ export default function AddBot() {
 
             <SignerConflictWarning chainId={chainId} signer={signer} />
 
-            <Toggle
-              checked={start}
-              onChange={setStart}
-              label="Start it immediately"
-            />
-            {!start && (
+            {rfqDefault ? (
               <p className="text-xs text-faint">
-                Left off, the bot is created but stopped. On its page, approve
-                Permit2 for the input tokens (needs a little gas on the operator
-                wallet), then dry-run — that&apos;s the safer order before the
-                first live start.
+                Created stopped. Connect it to Textile on Settings, then
+                approve Permit2, then Start. Starting before Connect posts
+                nothing — no book and no private quotes.
               </p>
+            ) : (
+              <>
+                <Toggle
+                  checked={start}
+                  onChange={setStart}
+                  label="Start it immediately"
+                />
+                {!start && (
+                  <p className="text-xs text-faint">
+                    Left off, the bot is created but stopped. On its page,
+                    approve Permit2 for the input tokens (needs a little gas on
+                    the operator wallet), then dry-run — that&apos;s the safer
+                    order before the first live start.
+                  </p>
+                )}
+              </>
             )}
 
             {error && <Banner tone="danger">{error}</Banner>}

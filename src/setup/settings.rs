@@ -128,6 +128,10 @@ pub struct SettingsView {
     pub rfq_validation_contract: String,
     /// Optional leftover `rfq_corridor` slug. Empty on new Connects.
     pub rfq_corridor: String,
+    /// Whether the public ladder is on. Default true when the key is omitted.
+    pub book_enabled: bool,
+    /// `[experimental] rfq_default` matches the GA token on this file.
+    pub rfq_default_unlocked: bool,
 }
 
 impl SettingsView {
@@ -160,6 +164,7 @@ impl SettingsView {
             rfq_maker_id: None,
             rfq_validation_contract: None,
             rfq_corridor: None,
+            book_enabled: None,
         }
     }
 }
@@ -197,6 +202,8 @@ pub struct SettingsPatch {
     pub rfq_maker_id: Option<String>,
     pub rfq_validation_contract: Option<String>,
     pub rfq_corridor: Option<String>,
+    /// `None` leaves the public ladder alone. `Some(false)` is RFQ-only.
+    pub book_enabled: Option<bool>,
 }
 
 /// Read the first pool's editable values from a `stitch.toml` body.
@@ -272,6 +279,8 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
             .map(|r| r.validation_contract.clone())
             .unwrap_or_default(),
         rfq_corridor: pool.rfq_corridor.clone().unwrap_or_default(),
+        book_enabled: cfg.book_enabled,
+        rfq_default_unlocked: cfg.rfq_default_unlocked(),
     })
 }
 
@@ -448,6 +457,7 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
         apply_optional_f64(pool, "lean_wide_bps", raw, "lean wide")?;
     }
     apply_rfq(&mut doc, patch)?;
+    apply_book_enabled(doc.as_table_mut(), patch.book_enabled);
 
     let edited = doc.to_string();
     // Guard: never hand back something the bot can't load. This is also what
@@ -598,7 +608,15 @@ fn apply_sizing(pool: &mut Table, side: Side, sizing: &SideSizing) -> Result<()>
         let n: u32 = max_orders
             .parse()
             .with_context(|| format!("{} max orders must be a whole number", side.label()))?;
-        anyhow::ensure!(n > 0, "{} max orders must be at least 1", side.label());
+        // 0 is a valid cap (post no slices). The loader only rejects values
+        // above MAX_SUPPORTED_LADDER_ORDERS — reconnect / RFQ must not invent
+        // a "at least 1" rule the bot itself does not have.
+        anyhow::ensure!(
+            n <= crate::config::MAX_SUPPORTED_LADDER_ORDERS,
+            "{} max orders cannot exceed {}",
+            side.label(),
+            crate::config::MAX_SUPPORTED_LADDER_ORDERS
+        );
         set_value(pool, side.max_orders_key(), Value::from(i64::from(n)));
     }
     Ok(())
@@ -666,6 +684,81 @@ fn apply_rfq(doc: &mut DocumentMut, patch: &SettingsPatch) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write `book_enabled = false`, or remove the key when on so a pre-RFQ
+/// template stays byte-identical after a round-trip (the loader default is on).
+fn apply_book_enabled(table: &mut Table, enabled: Option<bool>) {
+    let Some(enabled) = enabled else {
+        return;
+    };
+    if enabled {
+        table.remove("book_enabled");
+    } else {
+        set_value(table, "book_enabled", Value::from(false));
+    }
+}
+
+/// The patch Connect/Reconnect should apply: RFQ fields only. Never rewriting
+/// ladder sizing — that is what produced "buy max orders must be at least 1"
+/// on a reconnect that had no business touching the book.
+pub fn rfq_connect_patch(
+    current: &SettingsView,
+    url: String,
+    maker_id: String,
+    validation_contract: String,
+    corridor: String,
+    book_off: bool,
+    go_live: bool,
+) -> SettingsPatch {
+    SettingsPatch {
+        pool_index: current.pool_index,
+        rpc_url: current.rpc_url.clone(),
+        feed_url: current.feed_url.clone(),
+        buy: current.buy.clone(),
+        sell: current.sell.clone(),
+        taker_enabled: current.taker_enabled,
+        rfq_enabled: Some(go_live),
+        rfq_url: Some(url),
+        rfq_maker_id: Some(maker_id),
+        rfq_validation_contract: Some(validation_contract),
+        rfq_corridor: Some(corridor),
+        // Waiting on a venue corridor: keep the book until RFQ can actually quote.
+        book_enabled: (book_off && go_live).then_some(false),
+        ..SettingsPatch::default()
+    }
+}
+
+/// Stamp a freshly written corridor template with the RFQ-default preset:
+/// public ladder off, and both experimental tokens so the panel card shows
+/// and Connect writes RFQ-only. Spreads and liquidity stay — RFQ uses them.
+pub fn apply_rfq_default_preset(toml_str: &str) -> Result<String> {
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .context("parsing stitch.toml")?;
+    apply_book_enabled(doc.as_table_mut(), Some(false));
+    if doc.get("experimental").and_then(Item::as_table).is_none() {
+        let mut table = Table::new();
+        table.set_implicit(false);
+        doc.insert("experimental", Item::Table(table));
+    }
+    let experimental = doc
+        .get_mut("experimental")
+        .and_then(Item::as_table_mut)
+        .expect("just inserted [experimental]");
+    set_value(
+        experimental,
+        "rfq_panel",
+        Value::from(crate::config::RFQ_PANEL_GATE),
+    );
+    set_value(
+        experimental,
+        "rfq_default",
+        Value::from(crate::config::RFQ_DEFAULT_GATE),
+    );
+    let edited = doc.to_string();
+    Config::from_toml(&edited).context("the RFQ-default preset is not a valid config")?;
+    Ok(edited)
 }
 
 fn rfq_table_mut(doc: &mut DocumentMut) -> &mut Table {
@@ -1271,8 +1364,12 @@ mod tests {
 
         let mut view = base.clone();
         view.sell_sizing.max_orders = "0".into();
-        let err = apply_settings(TEMPLATE, &view.to_patch()).unwrap_err();
-        assert!(err.to_string().contains("at least 1"));
+        let out = apply_settings(TEMPLATE, &view.to_patch()).unwrap();
+        assert_eq!(
+            read_settings(&out).unwrap().sell_sizing.max_orders,
+            "0",
+            "zero max orders is a valid 'post no slices' cap"
+        );
 
         let mut view = base;
         view.buy_sizing.order_size = "1.5".into();
@@ -1518,6 +1615,61 @@ mod tests {
             full.contains("localhost"),
             "remote ws:// must be rejected, got {full}"
         );
+    }
+
+    #[test]
+    fn connecting_rfq_does_not_rewrite_ladder_sizing() {
+        // The reconnect bug: to_patch() re-applied buy_max_orders = 0 and the
+        // writer refused it, even though Connect never asked to touch the book.
+        let src = TEMPLATE.replace("buy_max_orders = 40", "buy_max_orders = 0");
+        let current = read_settings(&src).unwrap();
+        assert_eq!(current.buy_sizing.max_orders, "0");
+        let patch = rfq_connect_patch(
+            &current,
+            "wss://api.textilecredit.com/v2/maker/stream".into(),
+            "clmaker123".into(),
+            "0x00000000000000000000000000000000000000aa".into(),
+            "cngn-usdt-bsc".into(),
+            true,
+            true,
+        );
+        assert!(patch.buy_sizing.is_none());
+        assert!(patch.sell_sizing.is_none());
+        let out = apply_settings(&src, &patch).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert_eq!(back.buy_sizing.max_orders, "0");
+        assert!(back.rfq_enabled);
+        assert!(!back.book_enabled);
+    }
+
+    #[test]
+    fn the_rfq_default_preset_turns_the_book_off_and_unlocks_the_card() {
+        let out = apply_rfq_default_preset(TEMPLATE).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert!(!back.book_enabled);
+        assert!(back.rfq_default_unlocked);
+        assert!(out.contains("rfq_panel"));
+        assert!(out.contains(crate::config::RFQ_DEFAULT_GATE));
+        // Spreads and liquidity stay — RFQ quotes off them.
+        assert_eq!(back.buy.value, "1");
+        assert_eq!(back.buy_sizing.total_liquidity, "max");
+    }
+
+    #[test]
+    fn book_enabled_round_trips_and_omits_the_key_when_on() {
+        let mut patch = read_settings(TEMPLATE).unwrap().to_patch();
+        patch.book_enabled = Some(false);
+        let off = apply_settings(TEMPLATE, &patch).unwrap();
+        assert!(off.contains("book_enabled = false"));
+        assert!(!read_settings(&off).unwrap().book_enabled);
+
+        patch.book_enabled = Some(true);
+        let on = apply_settings(&off, &patch).unwrap();
+        assert!(
+            !on.contains("book_enabled"),
+            "the default (on) must not pin an explicit true: {on}"
+        );
+        assert!(read_settings(&on).unwrap().book_enabled);
     }
 
     #[test]

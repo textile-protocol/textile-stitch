@@ -23,12 +23,14 @@ pub use paths::{
 };
 pub use process::{find_stitch_binary, terminate};
 pub use settings::{
-    apply_settings, read_settings, read_settings_at, read_signer, try_read_signer, PoolPair,
-    SettingsPatch, SettingsView, SideSizing, SignerView, SpreadEdit, SpreadKind,
+    apply_rfq_default_preset, apply_settings, read_settings, read_settings_at, read_signer,
+    rfq_connect_patch, try_read_signer, PoolPair, SettingsPatch, SettingsView, SideSizing,
+    SignerView, SpreadEdit, SpreadKind,
 };
 pub use writer::{
-    apply_signer, render_env, rfq_api_key_is_set, signer_files, switch_corridor_file,
-    switch_corridor_preserving_signer, validate_signer_change, write_config, write_config_signer,
-    write_config_signer_from_toml, write_key, write_rfq_api_key, write_toml_atomic,
-    LocalKeyMaterial, SignerKind, SignerSetup, RFQ_API_KEY_FILE, RFQ_API_KEY_FILE_ENV,
+    apply_signer, render_env, rfq_api_key_is_set, signer_files, stamp_rfq_default_preset,
+    switch_corridor_file, switch_corridor_preserving_signer, validate_signer_change, write_config,
+    write_config_signer, write_config_signer_from_toml, write_key, write_rfq_api_key,
+    write_toml_atomic, LocalKeyMaterial, SignerKind, SignerSetup, RFQ_API_KEY_FILE,
+    RFQ_API_KEY_FILE_ENV,
 };

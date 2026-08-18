@@ -40,6 +40,9 @@ pub struct SessionBody {
     /// per-bot config folders as it exists on the host, so the UI can show an
     /// operator exactly where their bots live on disk.
     config_dir: String,
+    /// Fleet RFQ-default flag (`{bots_dir}/panel.toml`). New bots start RFQ-only
+    /// and the add-bot copy mentions Connect.
+    rfq_default: bool,
 }
 
 fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
@@ -52,6 +55,7 @@ fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
         runtime: state.cfg.runtime.as_str(),
         version: env!("CARGO_PKG_VERSION"),
         config_dir: state.cfg.host_bots_dir.display().to_string(),
+        rfq_default: crate::config::rfq_default_flag_in_dir(&state.cfg.bots_dir),
     }
 }
 
@@ -281,6 +285,7 @@ mod tests {
         assert_eq!(v["passwordLogin"], true);
         assert_eq!(v["tailnetLogin"], false);
         assert_eq!(v["runtime"], "docker");
+        assert_eq!(v["rfqDefault"], false);
     }
 
     #[tokio::test]

@@ -149,8 +149,12 @@ pub struct SettingsBody {
     /// Whether saving will be accepted. False for a bot whose config the panel can
     /// see but not write.
     pub editable: bool,
-    /// Raw-config gate. The Settings RFQ card stays hidden until this is true.
+    /// Raw-config or fleet gate. The Settings RFQ card stays hidden until this is true.
     pub rfq_panel_unlocked: bool,
+    /// RFQ-as-default rollout. New wording, migrate-to-RFQ nudge, RFQ-only Connect.
+    pub rfq_default_unlocked: bool,
+    /// Public ladder. False is RFQ-only.
+    pub book_enabled: bool,
     pub rfq_enabled: bool,
     pub rfq_url: String,
     pub rfq_maker_id: String,
@@ -166,6 +170,7 @@ impl SettingsBody {
         editable: bool,
         rfq_api_key_set: bool,
         rfq_panel_unlocked: bool,
+        rfq_default_unlocked: bool,
     ) -> Self {
         Self {
             rpc_url: v.rpc_url.clone(),
@@ -190,6 +195,8 @@ impl SettingsBody {
             lean_wide_bps: v.lean_wide_bps.clone(),
             editable,
             rfq_panel_unlocked,
+            rfq_default_unlocked,
+            book_enabled: v.book_enabled,
             rfq_enabled: v.rfq_enabled,
             rfq_url: v.rfq_url.clone(),
             rfq_maker_id: v.rfq_maker_id.clone(),
@@ -204,10 +211,15 @@ fn rfq_key_is_set(config_path: &std::path::Path) -> bool {
     config_path.parent().is_some_and(setup::rfq_api_key_is_set)
 }
 
-fn rfq_panel_unlocked(toml: &str) -> bool {
-    Config::from_toml(toml)
-        .map(|c| c.rfq_panel_unlocked())
-        .unwrap_or(false)
+fn rfq_surface(toml: &str, bots_dir: &std::path::Path) -> (bool, bool) {
+    let fleet = crate::config::rfq_default_flag_in_dir(bots_dir);
+    match Config::from_toml(toml) {
+        Ok(c) => {
+            let default = c.rfq_default_unlocked() || fleet;
+            (c.rfq_panel_unlocked() || fleet, default)
+        }
+        Err(_) => (fleet, fleet),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -282,11 +294,13 @@ pub async fn show(
     let toml = read_toml(&path)?;
     // A pool index out of range is the caller's mistake, not a server fault.
     let view = setup::read_settings_at(&toml, query.pool).map_err(ApiError::bad_request)?;
+    let (rfq_panel, rfq_default) = rfq_surface(&toml, &state.cfg.bots_dir);
     Ok(Json(SettingsBody::from_view(
         &view,
         bot.is_editable(),
         rfq_key_is_set(&path),
-        rfq_panel_unlocked(&toml),
+        rfq_panel,
+        rfq_default,
     ))
     .into_response())
 }
@@ -345,6 +359,8 @@ pub struct SettingsUpdate {
     /// Write-only. Omitted or empty leaves the stored key alone. Never returned.
     #[serde(default)]
     pub rfq_api_key: Option<String>,
+    #[serde(default)]
+    pub book_enabled: Option<bool>,
 }
 
 impl SettingsUpdate {
@@ -430,6 +446,9 @@ impl SettingsUpdate {
         }
         if let Some(v) = &self.rfq_corridor {
             patch.rfq_corridor = Some(v.trim().to_string());
+        }
+        if let Some(v) = self.book_enabled {
+            patch.book_enabled = Some(v);
         }
         Ok(patch)
     }
@@ -746,12 +765,14 @@ pub(super) async fn save_and_restart(
         ),
     };
 
+    let (rfq_panel, rfq_default) = rfq_surface(&fresh, &state.cfg.bots_dir);
     let mut body = serde_json::json!({
         "settings": SettingsBody::from_view(
             &view,
             true,
             rfq_key_is_set(path),
-            rfq_panel_unlocked(&fresh),
+            rfq_panel,
+            rfq_default,
         ),
         "restarted": restarted,
         "restartError": restart_error,
@@ -837,14 +858,16 @@ async fn apply_live_change(
     tracing::info!(bot = %pre_save.name, "config saved (live change), restarting");
 
     let response = |restarted: bool, restart_error: serde_json::Value, message: String| {
-        let view =
-            setup::read_settings_at(&read_toml(path)?, pool).map_err(ApiError::bad_request)?;
+        let fresh = read_toml(path)?;
+        let view = setup::read_settings_at(&fresh, pool).map_err(ApiError::bad_request)?;
+        let (rfq_panel, rfq_default) = rfq_surface(&fresh, &state.cfg.bots_dir);
         Ok(Json(serde_json::json!({
             "settings": SettingsBody::from_view(
                 &view,
                 true,
                 rfq_key_is_set(path),
-                rfq_panel_unlocked(&read_toml(path)?),
+                rfq_panel,
+                rfq_default,
             ),
             "restarted": restarted,
             "restartError": restart_error,
@@ -1192,6 +1215,37 @@ mod tests {
         let (status, body) = h.get("/api/bots/bot-a/settings").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(Harness::parse(&body)["rfqPanelUnlocked"], true);
+        assert_eq!(Harness::parse(&body)["rfqDefaultUnlocked"], false);
+        assert_eq!(Harness::parse(&body)["bookEnabled"], true);
+    }
+
+    #[tokio::test]
+    async fn a_fleet_panel_toml_unlocks_rfq_default_for_every_bot() {
+        let h = harness("settings-rfq-fleet-flag");
+        seed(&h, "bot-a");
+        std::fs::write(
+            h.root.join(crate::config::PANEL_FLAGS_FILE),
+            format!(
+                "[experimental]\nrfq_default = \"{}\"\n",
+                crate::config::RFQ_DEFAULT_GATE
+            ),
+        )
+        .unwrap();
+
+        let (status, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["rfqPanelUnlocked"], true);
+        assert_eq!(v["rfqDefaultUnlocked"], true);
+        assert_eq!(v["bookEnabled"], true);
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "bookEnabled": false }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(Harness::parse(&body)["settings"]["bookEnabled"], false);
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(toml.contains("book_enabled = false"));
     }
 
     #[tokio::test]
