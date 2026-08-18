@@ -36,9 +36,9 @@ pub struct CorridorBook {
     pub feed_url: String,
 }
 
-/// Latest funded amounts (`min(balance, Permit2 allowance)`) keyed by token.
-/// Empty / missing entries fail closed for [`RfqCapacity::Wallet`] sides:
-/// no quote, no published level. Exact capacities ignore this map.
+/// Latest funded amounts (`min(balance, Permit2 allowance)` minus the live
+/// book) keyed by token. Empty / missing entries fail closed for every RFQ
+/// side — Exact caps still cannot outrun a missing or smaller wallet.
 #[derive(Debug, Clone, Default)]
 pub struct InventoryView {
     funded: HashMap<Address, U256>,
@@ -54,15 +54,16 @@ impl InventoryView {
     }
 }
 
-/// Tokens a book needs live wallet reads for. Empty when every RFQ side is
-/// an exact cap — the inventory loop is then never spawned.
+/// Tokens a book needs live wallet reads for. Any RFQ side (Exact or Wallet)
+/// needs a reading — Exact is a cap on top of the wallet, not a bypass.
 pub fn wallet_tokens(books: &[CorridorBook]) -> Vec<Address> {
     let mut tokens: Vec<Address> = books
         .iter()
         .flat_map(|book| {
             [
-                matches!(book.buy_capacity_debt, Some(RfqCapacity::Wallet)).then_some(book.debt),
-                matches!(book.sell_capacity_collateral, Some(RfqCapacity::Wallet))
+                book.buy_capacity_debt.is_some().then_some(book.debt),
+                book.sell_capacity_collateral
+                    .is_some()
                     .then_some(book.collateral),
             ]
         })
@@ -79,7 +80,7 @@ fn resolve_capacity(
     inv: &InventoryView,
 ) -> Option<U256> {
     match policy? {
-        RfqCapacity::Exact(v) => Some(v),
+        RfqCapacity::Exact(v) => inv.funded(token).map(|funded| v.min(funded)),
         RfqCapacity::Wallet => inv.funded(token),
     }
 }
@@ -335,6 +336,13 @@ mod tests {
         }
     }
 
+    fn funded_inv() -> InventoryView {
+        InventoryView::new(HashMap::from([
+            (DEBT.parse().unwrap(), U256::from(u64::MAX)),
+            (COLLATERAL.parse().unwrap(), U256::from(u64::MAX)),
+        ]))
+    }
+
     fn decide(
         book: &CorridorBook,
         req: &QuoteRequestFrame,
@@ -342,14 +350,7 @@ mod tests {
         reserved_bid: U256,
         reserved_ask: U256,
     ) -> Result<QuotePlan, RejectReason> {
-        decide_quote(
-            book,
-            req,
-            mid,
-            reserved_bid,
-            reserved_ask,
-            &InventoryView::default(),
-        )
+        decide_quote(book, req, mid, reserved_bid, reserved_ask, &funded_inv())
     }
 
     fn levels(
@@ -359,14 +360,7 @@ mod tests {
         reserved_ask: U256,
         as_of: String,
     ) -> LevelsFrame {
-        levels_for(
-            book,
-            mid,
-            reserved_bid,
-            reserved_ask,
-            as_of,
-            &InventoryView::default(),
-        )
+        levels_for(book, mid, reserved_bid, reserved_ask, as_of, &funded_inv())
     }
 
     fn request(sell_token: &str, buy_token: &str) -> QuoteRequestFrame {
@@ -619,10 +613,24 @@ mod tests {
 
         // No reading yet — fail closed, don't guess the balance.
         assert_eq!(
-            decide(&wallet_book, &req, 1.0, U256::ZERO, U256::ZERO),
+            decide_quote(
+                &wallet_book,
+                &req,
+                1.0,
+                U256::ZERO,
+                U256::ZERO,
+                &InventoryView::default()
+            ),
             Err(RejectReason::Inventory)
         );
-        let dark = levels(&wallet_book, 1.0, U256::ZERO, U256::ZERO, "t0".into());
+        let dark = levels_for(
+            &wallet_book,
+            1.0,
+            U256::ZERO,
+            U256::ZERO,
+            "t0".into(),
+            &InventoryView::default(),
+        );
         assert!(dark.bids.is_empty() && dark.asks.is_empty());
 
         let debt: Address = DEBT.parse().unwrap();
@@ -649,15 +657,39 @@ mod tests {
         let frame = levels_for(&wallet_book, 1.0, U256::ZERO, U256::ZERO, "t1".into(), &inv);
         assert_eq!(frame.asks[0].size, "3000000000");
 
-        // An exact cap ignores a smaller wallet reading — the policy is the cap.
+        // An exact cap used to ignore a smaller wallet and over-sign vs the
+        // ladder (audit M-03). It now mins with the funded reading.
         let exact = book();
+        assert_eq!(
+            decide_quote(
+                &exact,
+                &req,
+                1.0,
+                U256::ZERO,
+                U256::ZERO,
+                &InventoryView::default()
+            ),
+            Err(RejectReason::Inventory),
+            "exact without a wallet reading fails closed"
+        );
+        let thin = InventoryView::new(HashMap::from([
+            (debt, U256::from(100_000u64)),
+            (collateral, U256::from(100_000u64)),
+        ]));
+        assert_eq!(
+            decide_quote(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &thin),
+            Err(RejectReason::Size)
+        );
         assert!(decide_quote(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
     }
 
     #[test]
-    fn wallet_tokens_are_only_the_max_sides() {
+    fn wallet_tokens_cover_every_rfq_side() {
         let exact = book();
-        assert!(wallet_tokens(&[exact.clone()]).is_empty());
+        let tokens = wallet_tokens(&[exact.clone()]);
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&COLLATERAL.parse().unwrap()));
+        assert!(tokens.contains(&DEBT.parse().unwrap()));
 
         let mut both = exact.clone();
         both.buy_capacity_debt = Some(RfqCapacity::Wallet);

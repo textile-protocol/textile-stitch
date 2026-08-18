@@ -233,8 +233,8 @@ async fn run(rt: RfqRuntime) {
         tokio::spawn(price_loop(url, prices.clone()));
     }
 
-    // Live-wallet (`max`) sides: refresh funded amounts off the quote path.
-    // Exact-only configs skip this entirely — no extra RPC.
+    // Every RFQ side (Exact cap or live wallet) refreshes funded amounts
+    // off the quote path. Exact is a cap on top of the wallet, not a bypass.
     let inventory = InventoryCache::default();
     let tokens = wallet_tokens(&rt.books);
     if !tokens.is_empty() {
@@ -741,7 +741,17 @@ mod tests {
                 feed_url: "http://feed".into(),
             }],
             reservations: Reservations::new(),
-            inventory: InventoryCache::default(),
+            inventory: {
+                let cache = InventoryCache::default();
+                let now = unix_now();
+                cache.set(DEBT.parse().unwrap(), U256::from(10_000_000_000u64), now);
+                cache.set(
+                    COLLATERAL.parse().unwrap(),
+                    U256::from(10_000_000_000u64),
+                    now,
+                );
+                cache
+            },
             counter: 0,
             chain_id: 8453,
             permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3"
