@@ -578,7 +578,7 @@ const DEFAULT_RFQ_URL = 'wss://api.textilecredit.com/v2/maker/stream'
 /**
  * Dual-run RFQ. Happy path is Connect: the bot signs MakerEnroll and the
  * panel writes the credential. Paste fields stay under Advanced for
- * claim-link leftovers. The key is write-only.
+ * manual overrides. The key is write-only.
  */
 function RfqCard({
   botName,
@@ -697,11 +697,12 @@ function RfqCard({
         {advanced && (
           <div className="space-y-4 border-t border-line-soft pt-4">
             <p className="text-xs text-faint">
-              Claim-link leftovers. Connect is the usual path.
+              Manual overrides. Use Connect above unless you were given these
+              values to paste.
             </p>
             <Field
-              label="Stream URL"
-              hint="The venue maker WebSocket. Production is wss://. ws:// is allowed only on localhost."
+              label="Quote stream URL"
+              hint="Where the bot listens for private quote requests. Production is wss://. ws:// is allowed only on localhost."
             >
               <Input
                 value={draft.rfqUrl}
@@ -711,8 +712,8 @@ function RfqCard({
               />
             </Field>
             <Field
-              label="Maker id"
-              hint="The Prisma CUID (starts with cl), not the slug."
+              label="Maker ID"
+              hint="Textile's maker record ID (starts with cl or cm). Not the short display name."
             >
               <Input
                 value={draft.rfqMakerId}
@@ -723,8 +724,8 @@ function RfqCard({
               />
             </Field>
             <Field
-              label="Validation contract"
-              hint="PreferredFillerValidation on this chain."
+              label="Fill validation contract"
+              hint="On-chain address that authorizes this maker to fill preferred quotes on this chain."
             >
               <Input
                 value={draft.rfqValidationContract}
@@ -735,8 +736,8 @@ function RfqCard({
               />
             </Field>
             <Field
-              label="Corridor slug"
-              hint="Venue corridor this pool quotes. Usually the same as the bot's corridor id."
+              label="Corridor"
+              hint="Trading corridor this bot quotes on (for example cngn-usdt-celo). Usually matches the bot's corridor."
             >
               <Input
                 value={draft.rfqCorridor}
@@ -746,11 +747,11 @@ function RfqCard({
               />
             </Field>
             <Field
-              label="Maker API key"
+              label="API key"
               hint={
                 loaded.rfqApiKeySet
                   ? 'A key is already saved. Paste a new one only to rotate it. The current value is never shown.'
-                  : 'Claim-link key (tx_live_…). Stored owner-only on disk, never in stitch.toml.'
+                  : 'Starts with tx_live_…. Saved on disk for the panel owner only — never written to stitch.toml.'
               }
             >
               <Input
