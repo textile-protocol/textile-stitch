@@ -10,8 +10,14 @@
 //! venue's result frames are informational.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use alloy_primitives::U256;
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
+
+/// Sibling of `rfq-api.key` / `stitch.toml`. Survives panel restarts.
+pub const RESERVATIONS_FILE: &str = "rfq-reservations.json";
 
 /// Seconds past the order deadline a reservation lingers, covering clock skew
 /// between the maker, the venue, and the chain.
@@ -28,15 +34,85 @@ struct Reservation {
     release_at: u64,
 }
 
+/// On-disk shape. `input` is a decimal string so a U256 never goes through JSON
+/// number (which cannot hold 256-bit values).
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredLedger {
+    version: u32,
+    entries: Vec<StoredEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredEntry {
+    rfq_id: String,
+    corridor: String,
+    bid: bool,
+    input: String,
+    release_at: u64,
+}
+
 /// The reservation ledger. Owned by the responder task; no interior locking.
+/// When `persist_path` is set, every reserve/prune writes the file so a
+/// process restart (deploy, OOM, panel save) cannot forget live signatures.
 #[derive(Debug, Default)]
 pub struct Reservations {
     by_rfq: HashMap<String, Reservation>,
+    persist_path: Option<PathBuf>,
 }
 
 impl Reservations {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Empty ledger that will persist to `path` on the next reserve/prune.
+    pub fn with_persist_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            persist_path: Some(path.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Load a previously persisted ledger. Missing file → empty (first run).
+    /// Present but unreadable / unknown version → error so the responder
+    /// refuses to start rather than quote over forgotten signatures.
+    pub fn load(path: impl Into<PathBuf>, now_secs: u64) -> anyhow::Result<Self> {
+        let path = path.into();
+        if !path.exists() {
+            return Ok(Self::with_persist_path(path));
+        }
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let stored: StoredLedger =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        anyhow::ensure!(
+            stored.version == 1,
+            "unsupported {} version {}",
+            RESERVATIONS_FILE,
+            stored.version
+        );
+        let mut by_rfq = HashMap::new();
+        for entry in stored.entries {
+            let input = entry
+                .input
+                .parse::<U256>()
+                .with_context(|| format!("invalid reservation input {}", entry.input))?;
+            if entry.release_at > now_secs {
+                by_rfq.insert(
+                    entry.rfq_id,
+                    Reservation {
+                        corridor: entry.corridor,
+                        bid: entry.bid,
+                        input,
+                        release_at: entry.release_at,
+                    },
+                );
+            }
+        }
+        Ok(Self {
+            by_rfq,
+            persist_path: Some(path),
+        })
     }
 
     /// Record a quote's claim. `deadline_secs` is the signed order's deadline;
@@ -58,6 +134,7 @@ impl Reservations {
                 release_at: deadline_secs.saturating_add(RELEASE_SKEW_SECS),
             },
         );
+        self.persist();
     }
 
     /// Total input currently reserved on one side of a corridor. Expired
@@ -72,7 +149,42 @@ impl Reservations {
     /// Drop entries past their release time. Called on the 1s levels tick so
     /// the map can't grow unboundedly between quote bursts.
     pub fn prune(&mut self, now_secs: u64) {
+        let before = self.by_rfq.len();
         self.by_rfq.retain(|_, r| r.release_at > now_secs);
+        if self.by_rfq.len() != before {
+            self.persist();
+        }
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        if let Err(e) = self.write(path) {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                path = %path.display(),
+                "RFQ reservations not persisted; a restart will forget live quotes"
+            );
+        }
+    }
+
+    fn write(&self, path: &Path) -> anyhow::Result<()> {
+        let stored = StoredLedger {
+            version: 1,
+            entries: self
+                .by_rfq
+                .iter()
+                .map(|(rfq_id, r)| StoredEntry {
+                    rfq_id: rfq_id.clone(),
+                    corridor: r.corridor.clone(),
+                    bid: r.bid,
+                    input: r.input.to_string(),
+                    release_at: r.release_at,
+                })
+                .collect(),
+        };
+        crate::setup::write_toml_atomic(path, &serde_json::to_string(&stored)?)
     }
 
     pub fn len(&self) -> usize {
@@ -148,5 +260,74 @@ mod tests {
             r.reserved("cngn-usdc", true, 100 + RELEASE_SKEW_SECS),
             U256::from(2u64)
         );
+    }
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "stitch-rfq-res-{}-{}-{}",
+            std::process::id(),
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(RESERVATIONS_FILE)
+    }
+
+    #[test]
+    fn audit_m04_a_fresh_ledger_forgets_quotes_a_restart_must_not() {
+        // The hole: Reservations::new() after a process death is empty, even
+        // though the signed orders are still fillable until deadline + skew.
+        let path = tmp_path("hole");
+        let mut live = Reservations::with_persist_path(&path);
+        live.reserve("rfq_1", "cngn-usdc", true, U256::from(500u64), 1_000);
+        assert!(path.is_file(), "reserve must flush the ledger");
+
+        let forgotten = Reservations::new();
+        assert_eq!(
+            forgotten.reserved("cngn-usdc", true, 0),
+            U256::ZERO,
+            "a restart that constructs Reservations::new() re-opens the hole"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn audit_m04_load_restores_live_quotes_and_drops_expired() {
+        let path = tmp_path("load");
+        let mut live = Reservations::with_persist_path(&path);
+        live.reserve("live", "cngn-usdc", true, U256::from(500u64), 1_000);
+        live.reserve("dead", "cngn-usdc", false, U256::from(9u64), 10);
+
+        let restored = Reservations::load(&path, 10 + RELEASE_SKEW_SECS).unwrap();
+        assert_eq!(
+            restored.reserved("cngn-usdc", true, 10 + RELEASE_SKEW_SECS),
+            U256::from(500u64)
+        );
+        assert_eq!(
+            restored.reserved("cngn-usdc", false, 10 + RELEASE_SKEW_SECS),
+            U256::ZERO,
+            "expired entries must not come back after restart"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_missing_reservations_file_is_an_empty_ledger() {
+        let path = tmp_path("missing");
+        std::fs::remove_file(&path).ok();
+        let loaded = Reservations::load(&path, 0).unwrap();
+        assert!(loaded.is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_corrupt_reservations_file_is_an_error() {
+        let path = tmp_path("corrupt");
+        std::fs::write(&path, "not-json").unwrap();
+        assert!(Reservations::load(&path, 0).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

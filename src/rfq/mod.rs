@@ -52,7 +52,7 @@ use crate::tick::{is_price_usable, is_stale, unix_now};
 
 use nonce::rfq_nonce;
 use order::{build_order, RfqOrderSpec};
-use reserve::Reservations;
+use reserve::{Reservations, RESERVATIONS_FILE};
 use responder::{
     book_from_pool, decide_quote, levels_for, wallet_tokens, CorridorBook, InventoryView,
 };
@@ -77,6 +77,9 @@ pub struct RfqRuntime {
     indexer_url: String,
     books: Vec<CorridorBook>,
     signer: DynSigner,
+    /// `rfq-reservations.json` next to stitch.toml. None only when the process
+    /// has no config dir (env-only key); then the ledger is memory-only.
+    reservations_path: Option<std::path::PathBuf>,
 }
 
 /// How old a wallet reading may be before a `max` side goes dark.
@@ -140,7 +143,7 @@ pub fn maybe_spawn(
             return None;
         }
     };
-    let runtime = match build_runtime(cfg, rfq, api_key, signer) {
+    let runtime = match build_runtime(cfg, rfq, api_key, signer, config_dir) {
         Ok(rt) => rt,
         Err(e) => {
             error!(error = %format!("{e:#}"), "RFQ responder NOT started: invalid configuration");
@@ -187,6 +190,7 @@ fn build_runtime(
     rfq: &crate::config::RfqConfig,
     api_key: String,
     signer: DynSigner,
+    config_dir: Option<&Path>,
 ) -> anyhow::Result<RfqRuntime> {
     let books = cfg
         .pools
@@ -213,6 +217,7 @@ fn build_runtime(
         indexer_url: cfg.indexer_url.clone(),
         books,
         signer,
+        reservations_path: config_dir.map(|dir| dir.join(RESERVATIONS_FILE)),
     })
 }
 
@@ -250,11 +255,28 @@ async fn run(rt: RfqRuntime) {
         ));
     }
 
-    // The reservation ledger outlives sessions: every quote signed before a
-    // disconnect stays fillable until its deadline + skew, so a reconnect
-    // must not forget it — a fresh ledger would re-advertise and re-quote
-    // inventory already committed, and two fills of one balance revert.
-    let mut reservations = Reservations::new();
+    // The reservation ledger outlives sessions AND process restarts: every
+    // quote signed before a disconnect or a panel save stays fillable until
+    // its deadline + skew. A fresh in-memory ledger would re-advertise
+    // inventory already committed (audit M-04). A corrupt file refuses to
+    // quote rather than start empty over live signatures.
+    let mut reservations = match &rt.reservations_path {
+        Some(path) => match Reservations::load(path, unix_now()) {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                error!(
+                    error = %format!("{e:#}"),
+                    path = %path.display(),
+                    "RFQ responder stopping: reservation ledger unreadable"
+                );
+                return;
+            }
+        },
+        None => {
+            warn!("RFQ reservations are memory-only: no config dir to persist them");
+            Reservations::new()
+        }
+    };
     let mut backoff_secs = 1u64;
     loop {
         match session::connect_and_auth(&rt.url, &rt.api_key, &rt.maker_id, &rt.signer).await {
