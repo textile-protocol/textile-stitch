@@ -858,14 +858,15 @@ mod tests {
         );
         let _ = sig;
 
-        // The quote's input is reserved: a second identical request would
-        // need 2 × 979902009 > the 1.5e9 capacity → inventory reject.
+        // The quote's input is reserved: a second identical request used to
+        // inventory-reject (2 × 979902009 > 1.5e9). It now quotes the leftover
+        // so the venue can bundle this slice with other makers.
         let reply = engine.respond(exact_input_request("rfq_2"), &prices).await;
-        let MakerFrame::QuoteReject(rej) = reply else {
-            panic!("expected an inventory reject, got {reply:?}");
+        let MakerFrame::QuoteResponse(resp) = reply else {
+            panic!("expected a leftover quote, got {reply:?}");
         };
-        assert_eq!(rej.reason, RejectReason::Inventory);
-        assert_eq!(engine.reservations.len(), 1);
+        assert_eq!(resp.buy_amount, "520097991");
+        assert_eq!(engine.reservations.len(), 2);
     }
 
     #[tokio::test]

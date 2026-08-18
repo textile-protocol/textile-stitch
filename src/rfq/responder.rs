@@ -234,13 +234,25 @@ pub fn decide_quote(
     let Some(capacity) = capacity else {
         return Err(RejectReason::Inventory);
     };
-    if input > capacity {
-        return Err(RejectReason::Size);
-    }
     let reserved = if bid { reserved_bid } else { reserved_ask };
-    if input > capacity.saturating_sub(reserved) {
+    let available = capacity.saturating_sub(reserved);
+    if available.is_zero() {
         return Err(RejectReason::Inventory);
     }
+    // The venue may ask for more than we can fill (stale levels, or a slice
+    // of a larger RFQ). Quote what remains instead of rejecting — the API
+    // bundles several makers into one taker quote.
+    let (input, output, fee, sell_amount) = if input > available {
+        let input = available;
+        let output = output_for_input(input);
+        let fee = fee_on(output, req.fee_bps);
+        if input.is_zero() || output.is_zero() || fee.is_zero() {
+            return Err(RejectReason::Size);
+        }
+        (input, output, fee, output + fee)
+    } else {
+        (input, output, fee, sell_amount)
+    };
 
     Ok(QuotePlan {
         bid,
@@ -436,23 +448,28 @@ mod tests {
     }
 
     #[test]
-    fn capacity_and_reservations_gate_with_distinct_reasons() {
-        // Bigger than configured capacity outright → size.
+    fn capacity_scales_down_instead_of_rejecting_size() {
+        // Bigger than configured capacity: quote the cap, don't reject.
         let mut req = request(COLLATERAL, DEBT);
         req.sell_amount = Some("100000000000".into()); // maker would pay ~98e9 > 5e9
-        assert_eq!(
-            decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
-            Err(RejectReason::Size)
-        );
+        let plan = decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        assert_eq!(plan.input, U256::from(5_000_000_000u64));
+        assert!(plan.sell_amount < U256::from(100000000000u64));
 
-        // Fits capacity but not what's left after in-flight quotes → inventory.
+        // Fits capacity but nothing left after in-flight quotes → inventory.
         let mut req = request(COLLATERAL, DEBT);
-        req.sell_amount = Some("1000000000".into()); // maker pays ~0.98e9
-        let reserved_bid = U256::from(4_500_000_000u64); // 4.5e9 of 5e9 claimed
+        req.sell_amount = Some("1000000000".into());
+        let fully_reserved = U256::from(5_000_000_000u64);
         assert_eq!(
-            decide(&book(), &req, 1.0, reserved_bid, U256::ZERO),
+            decide(&book(), &req, 1.0, fully_reserved, U256::ZERO),
             Err(RejectReason::Inventory)
         );
+
+        // Partial reservation: quote what's left rather than inventory-reject.
+        let reserved_bid = U256::from(4_500_000_000u64); // 0.5e9 left
+        let plan = decide(&book(), &req, 1.0, reserved_bid, U256::ZERO).unwrap();
+        assert_eq!(plan.input, U256::from(500_000_000u64));
+
         // The ask side's reservations don't bleed into the bid check.
         assert!(decide(&book(), &req, 1.0, U256::ZERO, reserved_bid).is_ok());
     }
@@ -641,13 +658,25 @@ mod tests {
         ]));
         assert!(decide_quote(&wallet_book, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
 
-        // Reservations still eat the live balance.
+        // Reservations eat the live balance; leftover is still quoted.
+        let plan = decide_quote(
+            &wallet_book,
+            &req,
+            1.0,
+            U256::from(1_500_000_000u64),
+            U256::ZERO,
+            &inv,
+        )
+        .unwrap();
+        assert_eq!(plan.input, U256::from(500_000_000u64));
+
+        // Nothing left → inventory.
         assert_eq!(
             decide_quote(
                 &wallet_book,
                 &req,
                 1.0,
-                U256::from(1_500_000_000u64),
+                U256::from(2_000_000_000u64),
                 U256::ZERO,
                 &inv
             ),
@@ -676,9 +705,11 @@ mod tests {
             (debt, U256::from(100_000u64)),
             (collateral, U256::from(100_000u64)),
         ]));
+        let thin_plan = decide_quote(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &thin).unwrap();
         assert_eq!(
-            decide_quote(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &thin),
-            Err(RejectReason::Size)
+            thin_plan.input,
+            U256::from(100_000u64),
+            "thin wallet is quoted as a leftover slice, not size-rejected"
         );
         assert!(decide_quote(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
     }
