@@ -171,6 +171,16 @@ pub fn rfq_api_key_is_set(dir: impl AsRef<Path>) -> bool {
     dir.as_ref().join(RFQ_API_KEY_FILE).is_file()
 }
 
+/// Read the saved maker key. Panel-only — never put this in a response body.
+pub fn read_rfq_api_key(dir: impl AsRef<Path>) -> Result<String> {
+    let path = dir.as_ref().join(RFQ_API_KEY_FILE);
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let key = raw.trim();
+    anyhow::ensure!(!key.is_empty(), "the RFQ API key file is empty");
+    Ok(key.to_string())
+}
+
 /// Keep `STITCH_RFQ_API_KEY_FILE` in `stitch.env` after a signer rewrite, which
 /// otherwise replaces the whole file from the signer template.
 fn point_env_at_rfq_key(paths: &ConfigPaths) -> Result<()> {

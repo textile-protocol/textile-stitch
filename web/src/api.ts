@@ -13,6 +13,7 @@ import type {
   CreateBotResult,
   Fleet,
   MigrationResult,
+  RfqAccessResult,
   SaveResult,
   SessionInfo,
   Settings,
@@ -226,6 +227,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
+
+  requestRfqAccess: (
+    name: string,
+    body: { contactEmail?: string; contactWhatsapp?: string },
+  ) =>
+    request<RfqAccessResult>(
+      `/api/bots/${encodeURIComponent(name)}/rfq/access-request`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+
+  checkRfqAccess: (name: string) =>
+    request<RfqAccessResult>(
+      `/api/bots/${encodeURIComponent(name)}/rfq/access-status`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
 
   rawConfig: (name: string) =>
     request<{ toml: string; path: string; editable: boolean }>(

@@ -26,7 +26,7 @@ use crate::signer::{build_signer, parse_private_key, DynSigner, LocalSigner, Sig
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct EnrollCorridorPair {
+pub(super) struct EnrollCorridorPair {
     slug: String,
     collateral_token: String,
     debt_token: String,
@@ -60,8 +60,8 @@ struct EnrollResponse {
     flagged: bool,
 }
 
-/// Derive `https://host/v2/maker/enroll` from a stream URL or an API origin.
-pub fn maker_enroll_url(stream_or_origin: &str) -> String {
+/// HTTP origin for venue maker routes, derived from a stream URL or API base.
+pub fn maker_venue_origin(stream_or_origin: &str) -> String {
     let trimmed = stream_or_origin.trim();
     let http = if let Some(rest) = trimmed.strip_prefix("wss://") {
         format!("https://{rest}")
@@ -71,25 +71,55 @@ pub fn maker_enroll_url(stream_or_origin: &str) -> String {
         trimmed.to_string()
     };
     let http = http.trim_end_matches('/');
-    if let Some(base) = http.strip_suffix("/v2/maker/stream") {
-        return format!("{base}/v2/maker/enroll");
+    for suffix in [
+        "/v2/maker/stream",
+        "/v2/maker/enroll",
+        "/v2/maker/access-request",
+        "/v2/maker/access-status",
+    ] {
+        if let Some(base) = http.strip_suffix(suffix) {
+            return base.to_string();
+        }
     }
-    if http.ends_with("/v2/maker/enroll") {
-        return http.to_string();
-    }
-    format!("{http}/v2/maker/enroll")
+    http.to_string()
 }
 
-fn enroll_url_from_config(cfg: &Config, override_url: Option<&str>) -> String {
+/// Derive `https://host/v2/maker/enroll` from a stream URL or an API origin.
+pub fn maker_enroll_url(stream_or_origin: &str) -> String {
+    format!("{}/v2/maker/enroll", maker_venue_origin(stream_or_origin))
+}
+
+pub fn maker_access_request_url(stream_or_origin: &str) -> String {
+    format!(
+        "{}/v2/maker/access-request",
+        maker_venue_origin(stream_or_origin)
+    )
+}
+
+pub fn maker_access_status_url(stream_or_origin: &str) -> String {
+    format!(
+        "{}/v2/maker/access-status",
+        maker_venue_origin(stream_or_origin)
+    )
+}
+
+pub(super) fn venue_origin_from_config(cfg: &Config, override_url: Option<&str>) -> String {
     if let Some(url) = override_url.map(str::trim).filter(|u| !u.is_empty()) {
-        return url.to_string();
+        return maker_venue_origin(url);
     }
     if let Some(rfq) = &cfg.rfq {
         if !rfq.url.trim().is_empty() {
-            return maker_enroll_url(&rfq.url);
+            return maker_venue_origin(&rfq.url);
         }
     }
-    maker_enroll_url(&cfg.indexer_url)
+    maker_venue_origin(&cfg.indexer_url)
+}
+
+fn enroll_url_from_config(cfg: &Config, override_url: Option<&str>) -> String {
+    format!(
+        "{}/v2/maker/enroll",
+        venue_origin_from_config(cfg, override_url)
+    )
 }
 
 async fn signer_for_bot(cfg: &Config, config_path: &Path) -> Result<DynSigner, ApiError> {
@@ -270,7 +300,7 @@ pub async fn enroll(
         )
     } else if waiting {
         format!(
-            "Registered as {} ({}). No RFQ corridor is live on this chain yet.",
+            "Registered as {} ({}). Request access so Textile can review this maker. You will not receive private quotes until they approve you.",
             enrolled.maker_slug, enrolled.environment
         )
     } else if rfq_default {
@@ -311,7 +341,7 @@ pub async fn enroll(
 /// Token match wins so a custom (non-catalog) pool can still go live.
 /// Catalog-id match is the fallback for older enroll payloads that only
 /// send slugs.
-fn pick_enroll_corridor(
+pub(super) fn pick_enroll_corridor(
     flagged: bool,
     configured: Option<&str>,
     pool: Option<(&str, &str)>,
@@ -341,7 +371,7 @@ fn eq_addr(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
-fn venue_error_message(body: &str) -> Option<String> {
+pub(super) fn venue_error_message(body: &str) -> Option<String> {
     let v: Value = serde_json::from_str(body).ok()?;
     v.get("error")
         .and_then(|e| e.get("message").or(Some(e)))
@@ -686,7 +716,7 @@ mod tests {
             v["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("No RFQ corridor is live on this chain"),
+                .contains("Request access so Textile can review"),
             "waiting copy missing: {body}"
         );
 

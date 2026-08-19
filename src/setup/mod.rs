@@ -28,9 +28,9 @@ pub use settings::{
     SignerView, SpreadEdit, SpreadKind,
 };
 pub use writer::{
-    apply_signer, render_env, rfq_api_key_is_set, signer_files, stamp_rfq_default_preset,
-    switch_corridor_file, switch_corridor_preserving_signer, validate_signer_change, write_config,
-    write_config_signer, write_config_signer_from_toml, write_key, write_rfq_api_key,
-    write_toml_atomic, LocalKeyMaterial, SignerKind, SignerSetup, RFQ_API_KEY_FILE,
-    RFQ_API_KEY_FILE_ENV,
+    apply_signer, read_rfq_api_key, render_env, rfq_api_key_is_set, signer_files,
+    stamp_rfq_default_preset, switch_corridor_file, switch_corridor_preserving_signer,
+    validate_signer_change, write_config, write_config_signer, write_config_signer_from_toml,
+    write_key, write_rfq_api_key, write_toml_atomic, LocalKeyMaterial, SignerKind, SignerSetup,
+    RFQ_API_KEY_FILE, RFQ_API_KEY_FILE_ENV,
 };

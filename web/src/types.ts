@@ -138,11 +138,21 @@ export interface RfqEnrollment {
   flagged?: boolean
 }
 
+export type RfqAccessStatus = 'NONE' | 'PENDING' | 'APPROVED' | 'REJECTED'
+
 export interface SaveResult {
   settings: Settings
   restarted: boolean
   restartError: string | null
   message: string
+  enrollment?: RfqEnrollment
+  accessStatus?: RfqAccessStatus
+}
+
+export interface RfqAccessResult {
+  message: string
+  accessStatus: RfqAccessStatus
+  settings?: Settings
   enrollment?: RfqEnrollment
 }
 

@@ -13,6 +13,7 @@
 //! never reach a response body: nothing here reads key material, and the wizard
 //! takes it write-only.
 
+pub mod access;
 pub mod assets;
 pub mod bots;
 pub mod enroll;
@@ -272,6 +273,14 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/settings", get(settings::show))
         .route("/api/bots/{name}/settings", patch(settings::update))
         .route("/api/bots/{name}/rfq/enroll", post(enroll::enroll))
+        .route(
+            "/api/bots/{name}/rfq/access-request",
+            post(access::request_access),
+        )
+        .route(
+            "/api/bots/{name}/rfq/access-status",
+            post(access::access_status),
+        )
         .route("/api/bots/{name}/config", get(settings::raw))
         .route("/api/bots/{name}/config", put(settings::save_raw))
         .route("/api/bots/{name}/signer", put(bots::change_signer))
