@@ -16,6 +16,12 @@ tick_interval_secs = 5
 [feed]
 url            = "https://api.textilecredit.com/price?chainId=8453&pair=cngn-usdc"
 staleness_secs = 900
+# cNGN prices off Textile's cron sampler (`/price` restamps once a minute), so
+# a mark is routinely tens of seconds old and a 60s RFQ window would leave the
+# corridor dark between samples. Four sample intervals, so two missed cron
+# ticks still quote. Live-fetched corridors (WETH, XAUT, ...) deliberately do
+# NOT set this and keep the tight default.
+rfq_staleness_secs = 240
 
 [[pools]]
 collateral = "0x46C85152bFe9f96829aA94755D9f915F9B10EF5F"  # cNGN (soft asset, 6dp)

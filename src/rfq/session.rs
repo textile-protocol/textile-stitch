@@ -26,6 +26,53 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// this is startup/reconnect, not the quote path.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 
+/// The api task we reached does not hold the venue engine lease.
+const VENUE_NOT_ENGINE_CODE: u16 = 4005;
+/// The api task we were on is shutting down and has released the lease.
+const VENUE_DRAINING_CODE: u16 = 4006;
+
+/// The venue told us to move, and nothing is wrong with this maker.
+///
+/// Worth its own type because the reconnect policy for it is the opposite of
+/// the policy for a failure: backing off is exactly wrong. These closes happen
+/// during a deploy, when a warm replacement is already accepting sockets, so
+/// every second of backoff is a second of a corridor reporting no makers for
+/// no reason. Everything else still backs off — a venue that is genuinely down
+/// must not be hammered.
+#[derive(Debug, thiserror::Error)]
+#[error("venue handover ({code}): {reason}")]
+pub struct VenueHandover {
+    pub code: u16,
+    pub reason: String,
+}
+
+/// Does this close frame mean "wrong task" rather than "go away"?
+pub fn handover_close(code: u16) -> bool {
+    code == VENUE_NOT_ENGINE_CODE || code == VENUE_DRAINING_CODE
+}
+
+/// Classify a close frame, so both the handshake and the session loop report a
+/// handover the same way.
+pub fn close_error(
+    reason: &Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> anyhow::Error {
+    let code = reason.as_ref().map(|f| u16::from(f.code)).unwrap_or(0);
+    let text = reason
+        .as_ref()
+        .map(|f| f.reason.to_string())
+        .unwrap_or_default();
+    if handover_close(code) {
+        return anyhow::Error::new(VenueHandover { code, reason: text });
+    }
+    anyhow::anyhow!("venue closed the session: {code} {text}")
+}
+
+/// Was this failure a handover instruction anywhere in its chain?
+pub fn is_handover(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<VenueHandover>().is_some())
+}
+
 pub struct AuthedSession {
     pub stream: WsStream,
     pub accepted: SessionAcceptedFrame,
@@ -138,8 +185,14 @@ async fn next_frame(stream: &mut WsStream) -> anyhow::Result<VenueFrame> {
             },
             Message::Ping(payload) => stream.send(Message::Pong(payload)).await?,
             Message::Close(reason) => {
-                warn!(?reason, "venue closed the connection during the handshake");
-                anyhow::bail!("venue closed during handshake: {reason:?}");
+                // A handover close here is the normal overlapping-deploy path:
+                // the ALB handed us a task that isn't the engine. Not a warning.
+                if handover_close(reason.as_ref().map(|f| u16::from(f.code)).unwrap_or(0)) {
+                    debug!(?reason, "venue redirected us during the handshake");
+                } else {
+                    warn!(?reason, "venue closed the connection during the handshake");
+                }
+                return Err(close_error(&reason));
             }
             _ => {}
         }

@@ -115,6 +115,20 @@ fn default_rfq_api_key_env() -> String {
 /// frame names. Docker Compose sets `STITCH_ALLOW_CLEARTEXT_DOCKER=1` so
 /// `ws://app:10000` (the API service name) is accepted on the local stack.
 pub fn assert_rfq_stream_url(raw: &str) -> anyhow::Result<()> {
+    assert_rfq_stream_url_with(raw, allow_cleartext_docker())
+}
+
+/// The rule itself, with the Docker escape hatch as an argument rather than a
+/// process-global read.
+///
+/// Splitting it this way is what keeps the suite deterministic. `cargo test`
+/// runs tests as threads in ONE process, so a test that sets
+/// `STITCH_ALLOW_CLEARTEXT_DOCKER` to exercise the override was also silently
+/// widening this gate for every other test running at that moment — and
+/// `audit_h03_rfq_stream_url_rejects_remote_cleartext`, whose whole job is to
+/// assert the gate is shut, failed roughly one run in ten. Nothing mutates the
+/// environment now; the env read stays at the edge, in `allow_cleartext_docker`.
+fn assert_rfq_stream_url_with(raw: &str, allow_cleartext: bool) -> anyhow::Result<()> {
     let parsed = url::Url::parse(raw.trim())
         .with_context(|| format!("[rfq].url must be a valid WebSocket URL, got {raw:?}"))?;
     anyhow::ensure!(parsed.host().is_some(), "[rfq].url must include a host");
@@ -122,7 +136,7 @@ pub fn assert_rfq_stream_url(raw: &str) -> anyhow::Result<()> {
         "wss" => Ok(()),
         "ws" => {
             anyhow::ensure!(
-                host_is_loopback(parsed.host()) || allow_cleartext_docker(),
+                host_is_loopback(parsed.host()) || allow_cleartext,
                 "[rfq].url may use ws:// only on localhost, got {raw:?}"
             );
             Ok(())
@@ -133,6 +147,10 @@ pub fn assert_rfq_stream_url(raw: &str) -> anyhow::Result<()> {
 
 /// Docker-internal http/ws (`http://app:8916`, `ws://app:10000`). Off unless
 /// the compose file sets `STITCH_ALLOW_CLEARTEXT_DOCKER=1`.
+///
+/// The only place the process environment is consulted for this. Tests drive
+/// the `*_with` functions directly instead of setting the variable, so no test
+/// can change what a concurrently-running test sees.
 fn allow_cleartext_docker() -> bool {
     matches!(
         std::env::var("STITCH_ALLOW_CLEARTEXT_DOCKER").as_deref(),
@@ -181,25 +199,138 @@ pub struct FeedConfig {
     /// HTTP endpoint returning `{ price, timestamp }`.
     pub url: String,
     /// Stop quoting if the feed hasn't updated within this many seconds.
-    /// The ladder uses this as written. RFQ firm quotes cap it at
-    /// [`RFQ_MAX_STALENESS_SECS`] — see [`rfq_staleness_secs`].
+    /// The ladder uses this as written. RFQ firm quotes tighten it — see
+    /// [`rfq_staleness_secs`].
     pub staleness_secs: u64,
+    /// How old a mark firm RFQ quotes may price off, for THIS feed.
+    ///
+    /// Per feed rather than global because the right answer is a property of
+    /// how often the feed republishes, and corridors differ by orders of
+    /// magnitude. cNGN is a cron sample (once a minute, so a mark is routinely
+    /// tens of seconds old and the window has to be wide enough to span it),
+    /// while WETH or XAUT are fetched live per request and are never stale
+    /// unless something has broken — at which point four minutes of drift on
+    /// WETH is a very different risk from four minutes on cNGN.
+    ///
+    /// Absent means [`RFQ_DEFAULT_STALENESS_SECS`], and absent is the safe
+    /// answer: a corridor that has not thought about this gets the tight
+    /// window. Bounded above by [`RFQ_MAX_STALENESS_SECS`] so widening it
+    /// stays a decision with a ceiling rather than an open dial.
+    #[serde(default)]
+    pub rfq_staleness_secs: Option<u64>,
 }
 
-/// RFQ firm quotes go dark after this many seconds even when
-/// `[feed].staleness_secs` is wider (shipped templates use 900). The ladder
-/// still uses the configured window.
-pub const RFQ_MAX_STALENESS_SECS: u64 = 60;
+/// How often Textile's `/price` restamps the cNGN mark: the `sample-cngn-pricing`
+/// cron, once a minute. The cap below is expressed in terms of it, because the
+/// only thing that number has to be right about is how many published marks it
+/// can afford to miss.
+pub const PRICE_FEED_CADENCE_SECS: u64 = 60;
 
-/// Tightness of the RFQ staleness gate. Never wider than
-/// [`RFQ_MAX_STALENESS_SECS`]; a tighter operator setting still wins.
-pub fn rfq_staleness_secs(configured: u64) -> u64 {
-    configured.min(RFQ_MAX_STALENESS_SECS)
+/// What a feed gets if it does not ask: RFQ firm quotes go dark after a minute.
+///
+/// Deliberately the tight value, so a corridor nobody has reasoned about is
+/// never quietly granted a wide window. A feed that genuinely needs more says
+/// so in its own `[feed].rfq_staleness_secs`.
+pub const RFQ_DEFAULT_STALENESS_SECS: u64 = 60;
+
+/// Ceiling on what any feed may request, however wide `[feed].staleness_secs`
+/// is (shipped templates use 900 for the ladder). The ladder keeps its own.
+///
+/// A cron-sampled feed has to clear its publication cadence with room to spare
+/// or the corridor goes dark between marks and the venue reports
+/// `no_makers_online` while the maker is connected and healthy. Textile's
+/// `/price` stamps each cNGN quote with the pricing sampler's `observedAt`; at
+/// 60s against a 3-minute sampler the corridor was quotable for one minute in
+/// three.
+///
+/// Four intervals, not three, and the extra one is not padding. A sample's
+/// `observedAt` is stamped at the top of the tick, *before* the Monierate read
+/// and the Bybit probes, so by the time the row is readable the mark is already
+/// a second or three old. At exactly three intervals the previous mark expires
+/// at the very moment the replacement tick is scheduled, so that write latency
+/// plus any cron jitter lands in a gap where the corridor publishes nothing —
+/// the failure this bound exists to prevent, just narrower. A whole spare
+/// interval keeps the expiry boundary away from a scheduled tick entirely.
+pub const RFQ_MAX_STALENESS_SECS: u64 = PRICE_FEED_CADENCE_SECS * 4;
+
+/// Effective RFQ staleness gate for one feed: the tightest of what the feed
+/// asked for (or the safe default), the ladder's own window, and the ceiling.
+///
+/// Taking the feed rather than a bare number is the point. The previous global
+/// `min(staleness_secs, CAP)` meant raising the cap for cNGN's cron sampler
+/// silently raised it for every RFQ corridor, including live-fetched ones like
+/// WETH and XAUT whose shipped templates also set `staleness_secs = 900`. Those
+/// marks are fresh in normal operation, so the wider window would not show up
+/// day to day — it would show up exactly when their feed broke, letting a maker
+/// keep quoting minutes-old prices on a pair that moves.
+pub fn rfq_staleness_secs(feed: &FeedConfig) -> u64 {
+    let requested = feed
+        .rfq_staleness_secs
+        .unwrap_or_else(|| default_rfq_staleness_secs(&feed.url));
+    feed.staleness_secs
+        .min(requested)
+        .min(RFQ_MAX_STALENESS_SECS)
+}
+
+/// The same rule for a pool that overrides `feed_url`.
+///
+/// A pool on its own feed must NOT inherit the bot-level window: that number
+/// was reasoned about for a different publisher, and inheriting it is how a
+/// cNGN bot carrying one WETH pool would quote that pool off a four-minute-old
+/// mark. Bounded by the ladder's window for the same reason as above.
+pub fn rfq_staleness_secs_for_pool(feed: &FeedConfig, pool: &PoolConfig) -> u64 {
+    let Some(url) = pool.feed_url.as_deref() else {
+        return rfq_staleness_secs(feed);
+    };
+    let requested = pool
+        .rfq_staleness_secs
+        .unwrap_or_else(|| default_rfq_staleness_secs(url));
+    feed.staleness_secs
+        .min(requested)
+        .min(RFQ_MAX_STALENESS_SECS)
+}
+
+/// What a feed gets when its config says nothing, inferred from the feed URL.
+///
+/// Config always wins; this only decides the unset case. It exists because the
+/// tight default is right for a live-fetched feed and wrong for a cron-sampled
+/// one, and the bots already deployed against Textile's cNGN sampler have
+/// configs written before the setting existed. Upgrading Stitch does not
+/// rewrite a mounted `stitch.toml`, so without this those makers would silently
+/// take the 60s default and go dark between samples — the bug this all started
+/// with, reintroduced by an upgrade.
+///
+/// Keyed on the `pair` the feed selects rather than the host, because the pair
+/// is what decides which publisher is behind the endpoint: every corridor uses
+/// the same `/price` shape and differs only there. A self-hosted mirror of the
+/// same endpoint therefore behaves identically, and a non-cNGN pair on the same
+/// host still gets the tight window.
+fn default_rfq_staleness_secs(feed_url: &str) -> u64 {
+    if feed_pair(feed_url).is_some_and(|p| p.starts_with("cngn")) {
+        RFQ_MAX_STALENESS_SECS
+    } else {
+        RFQ_DEFAULT_STALENESS_SECS
+    }
+}
+
+/// The `pair` query parameter of a feed URL, lowercased.
+fn feed_pair(feed_url: &str) -> Option<String> {
+    let query = feed_url.split_once('?')?.1;
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.eq_ignore_ascii_case("pair")).then(|| v.to_ascii_lowercase())
+    })
 }
 
 /// Price feed: `https://` anywhere, or `http://` only on loopback.
 /// A remote cleartext feed is a MITM'd mid (audit M-05).
 pub fn assert_feed_url(raw: &str, field: &str) -> anyhow::Result<()> {
+    assert_feed_url_with(raw, field, allow_cleartext_docker())
+}
+
+/// As [`assert_rfq_stream_url_with`]: the escape hatch is an argument so tests
+/// never have to touch the process environment to exercise it.
+fn assert_feed_url_with(raw: &str, field: &str, allow_cleartext: bool) -> anyhow::Result<()> {
     let parsed = url::Url::parse(raw.trim())
         .with_context(|| format!("{field} must be a valid HTTP URL, got {raw:?}"))?;
     anyhow::ensure!(parsed.host().is_some(), "{field} must include a host");
@@ -207,7 +338,7 @@ pub fn assert_feed_url(raw: &str, field: &str) -> anyhow::Result<()> {
         "https" => Ok(()),
         "http" => {
             anyhow::ensure!(
-                host_is_loopback(parsed.host()) || allow_cleartext_docker(),
+                host_is_loopback(parsed.host()) || allow_cleartext,
                 "{field} may use http:// only on localhost, got {raw:?}"
             );
             Ok(())
@@ -263,6 +394,10 @@ pub struct PoolConfig {
     /// price cNGN, COPM, and KES at once.
     #[serde(default)]
     pub feed_url: Option<String>,
+    /// RFQ freshness window for THIS pool's feed. Only meaningful alongside
+    /// `feed_url` — a pool on the bot-level feed uses the bot-level setting.
+    #[serde(default)]
+    pub rfq_staleness_secs: Option<u64>,
     /// Optional venue slug override. Unset is fine: when `[rfq].enabled` the
     /// pool is solicitable and the bot matches quote requests by tokens.
     /// Kept so existing configs that already set it still parse.
@@ -1323,11 +1458,34 @@ mod tests {
         );
     }
 
+    fn feed(staleness_secs: u64, rfq_staleness: Option<u64>) -> FeedConfig {
+        FeedConfig {
+            url: "https://x".into(),
+            staleness_secs,
+            rfq_staleness_secs: rfq_staleness,
+        }
+    }
+
     #[test]
     fn rfq_caps_staleness_without_rejecting_a_900s_template() {
-        assert_eq!(rfq_staleness_secs(900), RFQ_MAX_STALENESS_SECS);
-        assert_eq!(rfq_staleness_secs(30), 30);
-        assert_eq!(rfq_staleness_secs(60), 60);
+        // A 900s ladder template that says nothing about RFQ gets the tight
+        // default, not the ceiling. This is the whole point of the per-feed
+        // split: raising the ceiling for cNGN must not widen anything else.
+        assert_eq!(
+            rfq_staleness_secs(&feed(900, None)),
+            RFQ_DEFAULT_STALENESS_SECS
+        );
+        // A feed that opts in gets what it asked for...
+        assert_eq!(rfq_staleness_secs(&feed(900, Some(240))), 240);
+        // ...but never past the ceiling.
+        assert_eq!(
+            rfq_staleness_secs(&feed(900, Some(3_600))),
+            RFQ_MAX_STALENESS_SECS
+        );
+        // And the ladder's own window still wins when it is tighter — quoting
+        // firm off a mark the ladder itself considers dead makes no sense.
+        assert_eq!(rfq_staleness_secs(&feed(30, Some(240))), 30);
+        assert_eq!(rfq_staleness_secs(&feed(30, None)), 30);
 
         let toml = format!(
             "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
@@ -1335,28 +1493,203 @@ mod tests {
         );
         let cfg = Config::from_toml(&toml).unwrap();
         assert_eq!(cfg.feed.staleness_secs, 900);
-        assert_eq!(rfq_staleness_secs(cfg.feed.staleness_secs), 60);
+        assert_eq!(cfg.feed.rfq_staleness_secs, None);
+        assert_eq!(
+            rfq_staleness_secs(&cfg.feed),
+            RFQ_DEFAULT_STALENESS_SECS,
+            "a template that never mentions rfq_staleness_secs must stay tight"
+        );
         assert!(cfg.rfq_active());
     }
 
+    /// Bots deployed before `rfq_staleness_secs` existed have configs that
+    /// never mention it, and upgrading Stitch does not rewrite a mounted
+    /// `stitch.toml`. Without an inferred default those makers would take the
+    /// tight 60s on upgrade and go dark between samples — the original bug,
+    /// reintroduced by the fix for it.
+    #[test]
+    fn an_existing_cngn_config_keeps_its_window_without_being_edited() {
+        let cngn = "https://api.textilecredit.com/price?chainId=56&pair=cngn-usdt";
+        assert_eq!(
+            rfq_staleness_secs(&feed(900, None)),
+            RFQ_DEFAULT_STALENESS_SECS,
+            "a feed we know nothing about still gets the tight window"
+        );
+        assert_eq!(
+            rfq_staleness_secs(&FeedConfig {
+                url: cngn.into(),
+                staleness_secs: 900,
+                rfq_staleness_secs: None,
+            }),
+            RFQ_MAX_STALENESS_SECS
+        );
+    }
+
+    /// The inference keys on the pair, not the host, because the pair is what
+    /// selects the publisher — every corridor shares the same `/price` shape.
+    #[test]
+    fn only_cngn_pairs_infer_the_wide_window() {
+        let with = |url: &str| {
+            rfq_staleness_secs(&FeedConfig {
+                url: url.into(),
+                staleness_secs: 900,
+                rfq_staleness_secs: None,
+            })
+        };
+        let host = "https://api.textilecredit.com/price?chainId=1";
+        assert_eq!(
+            with(&format!("{host}&pair=cngn-usdt")),
+            RFQ_MAX_STALENESS_SECS
+        );
+        assert_eq!(
+            with(&format!("{host}&pair=CNGN-USDC")),
+            RFQ_MAX_STALENESS_SECS
+        );
+        // Same host, live-fetched pairs: tight.
+        for pair in ["weth-usdt", "xaut-usdt", "nvda-usdg", "usdc-usdt"] {
+            assert_eq!(
+                with(&format!("{host}&pair={pair}")),
+                RFQ_DEFAULT_STALENESS_SECS,
+                "{pair} is live-fetched and must not inherit the sampler window"
+            );
+        }
+        // No pair at all, and a pair that merely contains "cngn" later on.
+        assert_eq!(with(host), RFQ_DEFAULT_STALENESS_SECS);
+        assert_eq!(
+            with(&format!("{host}&pair=wcngn-usdt")),
+            RFQ_DEFAULT_STALENESS_SECS
+        );
+        // Explicit config still beats the inference, in both directions.
+        assert_eq!(
+            rfq_staleness_secs(&FeedConfig {
+                url: format!("{host}&pair=cngn-usdt"),
+                staleness_secs: 900,
+                rfq_staleness_secs: Some(60),
+            }),
+            60
+        );
+    }
+
+    /// A bot can carry pools on differently paced feeds. The window has to
+    /// follow the pool's feed, or one cNGN pool widens the whole bot.
+    #[test]
+    fn a_pool_on_its_own_feed_does_not_inherit_the_bot_window() {
+        let cngn_feed = FeedConfig {
+            url: "https://api.textilecredit.com/price?chainId=56&pair=cngn-usdt".into(),
+            staleness_secs: 900,
+            rfq_staleness_secs: Some(240),
+        };
+        let toml = format!(
+            "{}\nrfq_corridor = \"cngn-usdt\"\n{RFQ_BLOCK}",
+            LEAN_POOL_BASE.replace("staleness_secs = 30", "staleness_secs = 900")
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        let mut pool = cfg.pools[0].clone();
+
+        // No override: the pool is on the bot's feed, so it takes its window.
+        assert_eq!(rfq_staleness_secs_for_pool(&cngn_feed, &pool), 240);
+
+        // Its own live-fetched feed: tight, even though the bot is on 240.
+        pool.feed_url = Some("https://api.textilecredit.com/price?chainId=1&pair=weth-usdt".into());
+        assert_eq!(
+            rfq_staleness_secs_for_pool(&cngn_feed, &pool),
+            RFQ_DEFAULT_STALENESS_SECS
+        );
+
+        // And it can still say otherwise for itself, within the ceiling.
+        pool.rfq_staleness_secs = Some(3_600);
+        assert_eq!(
+            rfq_staleness_secs_for_pool(&cngn_feed, &pool),
+            RFQ_MAX_STALENESS_SECS
+        );
+    }
+
+    /// The shipped cNGN templates are the ones that need the wide window, and
+    /// they are also the ones a regression would silently darken. Pin that they
+    /// opt in, and that the fast live-fetched corridors do not.
+    #[test]
+    fn only_the_cron_sampled_templates_widen_the_rfq_window() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/setup/templates");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("templates dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let body = std::fs::read_to_string(&path).expect("template readable");
+            let opts_in = body.contains("rfq_staleness_secs");
+            checked += 1;
+            if name.starts_with("cngn-") {
+                assert!(
+                    opts_in,
+                    "{name} prices off the cron sampler and must widen its RFQ window"
+                );
+            } else {
+                assert!(
+                    !opts_in,
+                    "{name} is live-fetched; widening its RFQ window needs its own reasoning"
+                );
+            }
+        }
+        assert!(
+            checked >= 4,
+            "expected the shipped templates, found {checked}"
+        );
+    }
+
+    /// The cap is a freshness gate on a feed that publishes on a cron, so it
+    /// has to clear that cron's period with slack. Textile's `/price` restamps
+    /// cNGN once a minute; a cap at or under that period means the corridor is
+    /// dark between marks and the venue answers `no_makers_online` while the
+    /// maker is connected and quoting — the failure this constant was raised
+    /// to fix.
+    ///
+    /// Strictly greater than three intervals, not `>=`. At exactly three the
+    /// old mark expires the instant the third tick is scheduled, and since
+    /// `observedAt` is stamped before that tick does its fetches, the write
+    /// latency alone opens a gap. The margin has to survive two missed ticks
+    /// *plus* the time it takes the next one to land.
+    #[test]
+    fn rfq_staleness_cap_clears_the_price_feed_cadence() {
+        assert!(
+            RFQ_MAX_STALENESS_SECS > PRICE_FEED_CADENCE_SECS * 3,
+            "cap {RFQ_MAX_STALENESS_SECS}s leaves no room beyond three \
+             {PRICE_FEED_CADENCE_SECS}s intervals for cron jitter and the \
+             sampler's own write latency"
+        );
+    }
+
+    /// Passes `false` explicitly rather than relying on the variable being
+    /// unset: this asserts the gate is SHUT, and reading it from the process
+    /// environment meant a sibling test setting the Docker override could open
+    /// it mid-run. That is exactly what made this test fail ~1 run in 10.
     #[test]
     fn audit_h03_rfq_stream_url_rejects_remote_cleartext() {
-        assert!(assert_rfq_stream_url("wss://api.textilecredit.com/v2/maker/stream").is_ok());
-        assert!(assert_rfq_stream_url("ws://localhost:10000/v2/maker/stream").is_ok());
-        assert!(assert_rfq_stream_url("ws://127.0.0.1:10000/v2/maker/stream").is_ok());
-        assert!(assert_rfq_stream_url("ws://[::1]:10000/v2/maker/stream").is_ok());
-        assert!(assert_rfq_stream_url("ws://api.textilecredit.com/v2/maker/stream").is_err());
-        assert!(assert_rfq_stream_url("ws://192.168.1.10/v2/maker/stream").is_err());
-        assert!(assert_rfq_stream_url("https://api.textilecredit.com/v2/maker/stream").is_err());
+        let check = |u: &str| assert_rfq_stream_url_with(u, false);
+        assert!(check("wss://api.textilecredit.com/v2/maker/stream").is_ok());
+        assert!(check("ws://localhost:10000/v2/maker/stream").is_ok());
+        assert!(check("ws://127.0.0.1:10000/v2/maker/stream").is_ok());
+        assert!(check("ws://[::1]:10000/v2/maker/stream").is_ok());
+        assert!(check("ws://api.textilecredit.com/v2/maker/stream").is_err());
+        assert!(check("ws://192.168.1.10/v2/maker/stream").is_err());
+        assert!(check("https://api.textilecredit.com/v2/maker/stream").is_err());
     }
 
     #[test]
     fn docker_cleartext_override_allows_compose_service_hosts() {
-        std::env::set_var("STITCH_ALLOW_CLEARTEXT_DOCKER", "1");
-        let stream = assert_rfq_stream_url("ws://app:10000/v2/maker/stream");
-        let feed = assert_feed_url("http://app:8916/api/price", "[feed].url");
-        std::env::remove_var("STITCH_ALLOW_CLEARTEXT_DOCKER");
+        let stream = assert_rfq_stream_url_with("ws://app:10000/v2/maker/stream", true);
+        let feed = assert_feed_url_with("http://app:8916/api/price", "[feed].url", true);
         assert!(stream.is_ok(), "{stream:?}");
         assert!(feed.is_ok(), "{feed:?}");
+    }
+
+    /// The override is opt-in and exact: only `1` opens it. Without this the
+    /// argument-passing split above could drift from what the compose stack
+    /// actually sets and nothing would notice.
+    #[test]
+    fn the_docker_override_stays_shut_for_a_compose_host() {
+        assert!(assert_rfq_stream_url_with("ws://app:10000/v2/maker/stream", false).is_err());
+        assert!(assert_feed_url_with("http://app:8916/api/price", "[feed].url", false).is_err());
     }
 }

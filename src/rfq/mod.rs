@@ -16,9 +16,9 @@
 //! Shared with the ladder: the same feed URLs, the same
 //! `quote::bid_price`/`ask_price` spreads, the same [`crate::eip712`] Permit2
 //! digest and the same order-bytes encoder — one pricing and signing story,
-//! two distribution channels. RFQ caps staleness at
-//! [`crate::config::RFQ_MAX_STALENESS_SECS`] (60s) so a 900s ladder template
-//! cannot keep firm quotes on a 14-minute-old print; the ladder still uses
+//! two distribution channels. RFQ tightens staleness per feed (see
+//! [`crate::config::rfq_staleness_secs`]) so a 900s ladder template cannot
+//! keep firm quotes on a 14-minute-old print; the ladder still uses
 //! `[feed].staleness_secs` as written. Deliberately NOT shared: the tick loop
 //! (RFQ runs its own 1 s cadence and its own price cache so a slow ladder tick
 //! can't blow the reply budget) and the nonce ledger (RFQ nonces live in a
@@ -44,7 +44,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::closer::executor::{encode_allowance, encode_balance_of};
-use crate::config::{rfq_staleness_secs, Config};
+use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::eip712::permit2_digest;
 use crate::feed::{HttpFeed, PriceFeed, Quote};
 use crate::rpc::Wallet;
@@ -74,7 +74,6 @@ pub struct RfqRuntime {
     permit2: Address,
     reactor: Address,
     validation_contract: Address,
-    staleness_secs: u64,
     rpc_url: String,
     indexer_url: String,
     books: Vec<CorridorBook>,
@@ -197,7 +196,7 @@ fn build_runtime(
     let books = cfg
         .pools
         .iter()
-        .map(|p| book_from_pool(p, &cfg.feed.url))
+        .map(|p| book_from_pool(p, &cfg.feed.url, rfq_staleness_secs_for_pool(&cfg.feed, p)))
         .collect::<anyhow::Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -214,7 +213,6 @@ fn build_runtime(
             .validation_contract
             .parse()
             .context("invalid [rfq].validation_contract")?,
-        staleness_secs: rfq_staleness_secs(cfg.feed.staleness_secs),
         rpc_url: cfg.rpc_url.clone(),
         indexer_url: cfg.indexer_url.clone(),
         books,
@@ -340,11 +338,11 @@ async fn run(rt: RfqRuntime) {
             Reservations::new()
         }
     };
-    let mut backoff_secs = 1u64;
+    let mut backoff = Backoff::default();
     loop {
         match session::connect_and_auth(&rt.url, &rt.api_key, &rt.maker_id, &rt.signer).await {
             Ok(authed) => {
-                backoff_secs = 1;
+                backoff.reset();
                 let (err, ledger) = session_loop(
                     &rt,
                     &prices,
@@ -354,17 +352,92 @@ async fn run(rt: RfqRuntime) {
                 )
                 .await;
                 reservations = ledger;
-                warn!(
-                    error = %format!("{err:#}"),
-                    "RFQ session ended (superseded, closed, or failed); reconnecting"
-                );
+                if session::is_handover(&err) {
+                    info!(
+                        detail = %format!("{err:#}"),
+                        "RFQ venue handed this session over; reconnecting immediately"
+                    );
+                } else {
+                    warn!(
+                        error = %format!("{err:#}"),
+                        "RFQ session ended (superseded, closed, or failed); reconnecting"
+                    );
+                }
+                backoff.note(&err);
             }
             Err(e) => {
-                warn!(error = %format!("{e:#}"), "RFQ connect/auth failed");
+                if session::is_handover(&e) {
+                    debug!(detail = %format!("{e:#}"), "venue redirected us; retrying immediately");
+                } else {
+                    warn!(error = %format!("{e:#}"), "RFQ connect/auth failed");
+                }
+                backoff.note(&e);
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(30);
+        tokio::time::sleep(backoff.next_delay()).await;
+    }
+}
+
+/// Reconnect pacing, with a fast lane for handovers.
+///
+/// Two different failures wear the same shape here. A venue that is genuinely
+/// down wants exponential backoff, so a fleet of bots doesn't hammer it back
+/// into the ground. A venue that is *moving* — a deploy handing sockets from
+/// the outgoing task to the warm incoming one — wants no delay at all: the
+/// replacement is already accepting, and every second spent sleeping is a
+/// second the corridor reports no makers for no reason. Backing off through a
+/// deploy is most of what used to make one cost minutes.
+///
+/// The fast lane is bounded in attempts rather than time, because the thing it
+/// is riding out is "the ALB handed me the wrong one of N tasks", which is a
+/// couple of retries, not a wait.
+struct Backoff {
+    secs: u64,
+    fast_attempts: u32,
+}
+
+/// Immediate retries allowed after a handover before normal backoff resumes.
+/// Generous for a two-task overlap; still finite, so a venue stuck refusing
+/// every socket can't be spun on forever.
+const HANDOVER_FAST_RETRIES: u32 = 20;
+
+/// Pause between fast-lane retries. Long enough not to spin, short enough that
+/// a handover is invisible next to a WebSocket handshake.
+const HANDOVER_RETRY_MS: u64 = 250;
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            secs: 1,
+            fast_attempts: 0,
+        }
+    }
+}
+
+impl Backoff {
+    /// A session that ran clears both lanes.
+    fn reset(&mut self) {
+        self.secs = 1;
+        self.fast_attempts = 0;
+    }
+
+    /// Record why the last attempt ended, opening or closing the fast lane.
+    fn note(&mut self, err: &anyhow::Error) {
+        if session::is_handover(err) {
+            self.fast_attempts = self.fast_attempts.saturating_add(1);
+        } else {
+            self.fast_attempts = 0;
+        }
+    }
+
+    /// How long to wait before the next attempt, advancing the backoff.
+    fn next_delay(&mut self) -> std::time::Duration {
+        if self.fast_attempts > 0 && self.fast_attempts <= HANDOVER_FAST_RETRIES {
+            return std::time::Duration::from_millis(HANDOVER_RETRY_MS);
+        }
+        let delay = std::time::Duration::from_secs(self.secs);
+        self.secs = (self.secs * 2).min(30);
+        delay
     }
 }
 
@@ -643,7 +716,6 @@ async fn session_loop_inner(
         permit2: rt.permit2,
         reactor: rt.reactor,
         validation_contract: rt.validation_contract,
-        staleness_secs: rt.staleness_secs,
         signer: rt.signer.clone(),
     };
 
@@ -720,8 +792,14 @@ async fn session_loop_inner(
                             stream.send(Message::Pong(payload)).await.context("sending pong")?;
                         }
                         Message::Close(reason) => {
-                            warn!(?reason, "venue sent close (possibly a superseding session)");
-                            anyhow::bail!("venue closed the session: {reason:?}");
+                            if session::handover_close(
+                                reason.as_ref().map(|f| u16::from(f.code)).unwrap_or(0),
+                            ) {
+                                info!(?reason, "venue handing this session over; reconnecting now");
+                            } else {
+                                warn!(?reason, "venue sent close (possibly a superseding session)");
+                            }
+                            return Err(session::close_error(&reason));
                         }
                         _ => {}
                     }
@@ -787,7 +865,6 @@ struct Engine {
     permit2: Address,
     reactor: Address,
     validation_contract: Address,
-    staleness_secs: u64,
     signer: DynSigner,
 }
 
@@ -802,7 +879,7 @@ impl Engine {
             .iter()
             .filter_map(|book| {
                 let quote = prices.get(&book.feed_url)?;
-                if is_stale(quote.timestamp, now_secs, self.staleness_secs)
+                if is_stale(quote.timestamp, now_secs, book.staleness_secs)
                     || !is_price_usable(quote.price)
                 {
                     return None;
@@ -900,7 +977,9 @@ impl Engine {
         let Some(quote) = prices.get(&book.feed_url) else {
             return reject(RejectReason::StaleFeed);
         };
-        if is_stale(quote.timestamp, now_secs, self.staleness_secs) || !is_price_usable(quote.price)
+        // The book's own window, not the runtime's: this is the firm-quote
+        // gate, so it must match the one the levels were published under.
+        if is_stale(quote.timestamp, now_secs, book.staleness_secs) || !is_price_usable(quote.price)
         {
             return reject(RejectReason::StaleFeed);
         }
@@ -1131,6 +1210,78 @@ mod tests {
     const COLLATERAL: &str = "0x0000000000000000000000000000000000000001";
     const DEBT: &str = "0x0000000000000000000000000000000000000002";
 
+    fn handover(code: u16) -> anyhow::Error {
+        anyhow::Error::new(session::VenueHandover {
+            code,
+            reason: "test".into(),
+        })
+    }
+
+    #[test]
+    fn only_the_redirect_codes_count_as_a_handover() {
+        assert!(session::handover_close(4005), "not-the-engine redirects");
+        assert!(session::handover_close(4006), "draining redirects");
+        // Everything in 4000-4004 is the maker's problem, not the task's:
+        // reconnecting instantly would hammer the venue with a credential it
+        // has already rejected.
+        for code in [0u16, 1006, 4000, 4001, 4002, 4003, 4004] {
+            assert!(
+                !session::handover_close(code),
+                "{code} must not open the fast lane"
+            );
+        }
+    }
+
+    #[test]
+    fn is_handover_sees_through_added_context() {
+        let wrapped = handover(4006).context("connecting to venue");
+        assert!(session::is_handover(&wrapped));
+        assert!(!session::is_handover(&anyhow::anyhow!(
+            "503 Service Unavailable"
+        )));
+    }
+
+    #[test]
+    fn a_handover_retries_immediately_while_a_failure_backs_off() {
+        let mut b = Backoff::default();
+
+        // A deploy handover: no sleeping. This is the whole point — the warm
+        // replacement is already accepting sockets.
+        b.note(&handover(4006));
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(250));
+        b.note(&handover(4005));
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(250));
+
+        // A real outage goes back to exponential, and the handover retries it
+        // just made must not have eaten the budget.
+        b.note(&anyhow::anyhow!("503"));
+        assert_eq!(b.next_delay(), std::time::Duration::from_secs(1));
+        b.note(&anyhow::anyhow!("503"));
+        assert_eq!(b.next_delay(), std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_fast_lane_is_finite() {
+        let mut b = Backoff::default();
+        for _ in 0..HANDOVER_FAST_RETRIES {
+            b.note(&handover(4005));
+            assert_eq!(b.next_delay(), std::time::Duration::from_millis(250));
+        }
+        // A venue refusing every socket must not be spun on forever.
+        b.note(&handover(4005));
+        assert_eq!(b.next_delay(), std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_session_that_ran_clears_both_lanes() {
+        let mut b = Backoff::default();
+        b.note(&anyhow::anyhow!("503"));
+        let _ = b.next_delay();
+        let _ = b.next_delay();
+        b.reset();
+        assert_eq!(b.next_delay(), std::time::Duration::from_secs(1));
+    }
+
     fn test_engine() -> Engine {
         let key = SigningKey::from_slice(
             &alloy_primitives::hex::decode(
@@ -1151,6 +1302,7 @@ mod tests {
                 buy_capacity_debt: Some(RfqCapacity::Exact(U256::from(1_500_000_000u64))),
                 sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(1_500_000_000u64))),
                 feed_url: "http://feed".into(),
+                staleness_secs: 240,
             }],
             reservations: Reservations::new(),
             inventory: {
@@ -1175,7 +1327,6 @@ mod tests {
             validation_contract: "0x00000000000000000000000000000000000000f1"
                 .parse()
                 .unwrap(),
-            staleness_secs: 900,
             signer: Arc::new(LocalSigner::new(key)),
         }
     }
@@ -1304,6 +1455,7 @@ mod tests {
             buy_capacity_debt: Some(RfqCapacity::Exact(U256::from(1u64))),
             sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(1u64))),
             feed_url: "http://feed".into(),
+            staleness_secs: 240,
         }
     }
 

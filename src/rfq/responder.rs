@@ -37,6 +37,10 @@ pub struct CorridorBook {
     pub sell_capacity_collateral: Option<RfqCapacity>,
     /// The feed this corridor prices off (pool override or the bot default).
     pub feed_url: String,
+    /// How old a mark this corridor may quote off. Per book, not per bot: one
+    /// bot can carry pools on differently paced feeds, and a single scalar
+    /// would apply a cron-sampled corridor's window to a live-priced one.
+    pub staleness_secs: u64,
 }
 
 /// Latest funded amounts (`min(balance, Permit2 allowance)` minus the live
@@ -96,6 +100,7 @@ fn resolve_capacity(
 pub fn book_from_pool(
     pool: &PoolConfig,
     default_feed_url: &str,
+    staleness_secs: u64,
 ) -> anyhow::Result<Option<CorridorBook>> {
     Ok(Some(CorridorBook {
         slug: pool.rfq_corridor.clone().unwrap_or_default(),
@@ -107,6 +112,7 @@ pub fn book_from_pool(
         sell_spread: pool.sell_spread(),
         buy_capacity_debt: pool.rfq_buy_capacity_debt()?,
         sell_capacity_collateral: pool.rfq_sell_capacity_collateral()?,
+        staleness_secs,
         feed_url: pool
             .feed_url
             .clone()
@@ -350,6 +356,7 @@ mod tests {
             buy_capacity_debt: Some(RfqCapacity::Exact(U256::from(5_000_000_000u64))),
             sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(5_000_000_000u64))),
             feed_url: "http://feed".into(),
+            staleness_secs: 240,
         }
     }
 
@@ -610,7 +617,7 @@ mod tests {
             refresh_threshold_bps = 0
         "#;
         let cfg = crate::config::Config::from_toml(toml).unwrap();
-        let book = book_from_pool(&cfg.pools[0], "http://feed")
+        let book = book_from_pool(&cfg.pools[0], "http://feed", 240)
             .unwrap()
             .expect("every pool is a book");
         assert!(book.slug.is_empty());
@@ -620,7 +627,7 @@ mod tests {
             "buy_order_size_debt = \"5000000000\"\nrfq_corridor = \"cngn-usdc\"",
         );
         let cfg = crate::config::Config::from_toml(&toml).unwrap();
-        let book = book_from_pool(&cfg.pools[0], "http://feed")
+        let book = book_from_pool(&cfg.pools[0], "http://feed", 240)
             .unwrap()
             .expect("book built");
         assert_eq!(book.slug, "cngn-usdc");
