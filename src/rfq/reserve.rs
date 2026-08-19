@@ -152,6 +152,13 @@ impl Reservations {
             .fold(U256::ZERO, |sum, r| sum.saturating_add(r.input))
     }
 
+    /// Corridor slug for a live reservation, if any. Peek before
+    /// [`Self::release`] so a `quoteExpired` flush can wait for that
+    /// book to actually publish, not a sibling with a fresh feed.
+    pub fn corridor(&self, rfq_id: &str) -> Option<&str> {
+        self.by_rfq.get(rfq_id).map(|r| r.corridor.as_str())
+    }
+
     /// Drop one RFQ's claim immediately. Used when the venue says the
     /// winning quote expired unaccepted (`quoteExpired`). Missing id is a
     /// no-op so a duplicate or late frame cannot break the ledger.
@@ -216,6 +223,15 @@ impl Reservations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corridor_peeks_before_release() {
+        let mut r = Reservations::new();
+        r.reserve("rfq_1", "cngn-usdc", true, U256::from(1u64), 1_000);
+        assert_eq!(r.corridor("rfq_1"), Some("cngn-usdc"));
+        assert!(r.release("rfq_1"));
+        assert_eq!(r.corridor("rfq_1"), None);
+    }
 
     #[test]
     fn reservations_hold_until_deadline_plus_skew_unless_released() {

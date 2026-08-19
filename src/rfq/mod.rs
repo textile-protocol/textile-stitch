@@ -33,7 +33,7 @@ pub mod session;
 pub mod time;
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -368,6 +368,234 @@ async fn run(rt: RfqRuntime) {
     }
 }
 
+/// Venue caps post-auth inbound frames at 40/s. Reconnect replay can
+/// deliver many `quoteExpired`s back-to-back. Debounce those into one
+/// levels flush after this quiet window so the last release is in the
+/// snapshot, and we do not emit one book per expiry.
+const LEVELS_REPUBLISH_COALESCE: std::time::Duration = std::time::Duration::from_millis(25);
+const LEVELS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Venue `SESSION_MSGS_PER_SEC` is 40, counted by `admitMessage` on
+/// every JSON frame (levels, quoteResponse, quoteReject). A rolling
+/// window of those sends, not the last batch, is what we budget against.
+const LEVELS_RATE_BUDGET: usize = 40;
+
+#[derive(Clone, Copy, Debug)]
+struct OutboundBatch {
+    at: tokio::time::Instant,
+    frames: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RateWindow {
+    batches: Vec<OutboundBatch>,
+}
+
+/// Interval tick publishes only when nothing is waiting on the expiry
+/// debounce and we have not done an *expiry* flush in the last second.
+/// Ordinary interval sends do not stamp `last` — that would skip the
+/// next tick whenever serialize/send takes any time and collapse the
+/// book to a ~2s cadence. `None` means no expiry flush yet, so the
+/// first tick must emit.
+fn should_emit_interval_levels(last: Option<tokio::time::Instant>, trailing_pending: bool) -> bool {
+    !trailing_pending && last.map(|t| t.elapsed() >= LEVELS_INTERVAL).unwrap_or(true)
+}
+
+fn trailing_due(at: Option<tokio::time::Instant>) -> bool {
+    at.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+}
+
+/// Drop corridors that actually went out. A dark sibling must stay
+/// pending, but a successful send must not be resent on the next
+/// expiry or the pending set grows until a flush blows the 40/s cap.
+fn drop_emitted_pending(pending: &mut HashSet<String>, emitted: &[String]) {
+    for slug in emitted {
+        pending.remove(slug);
+    }
+}
+
+/// Any nonempty expiry send stamps the interval suppressor. A dark
+/// sibling still pending must not look like "no flush happened".
+fn recorded_levels_flush(emitted: &[String]) -> Option<tokio::time::Instant> {
+    (!emitted.is_empty()).then(tokio::time::Instant::now)
+}
+
+/// How long to push the next interval tick after we skip one because
+/// an expiry flush was too recent. Without this the interval keeps its
+/// old phase and the book goes dark for an extra full period.
+fn interval_delay_after_expiry_flush(
+    last: Option<tokio::time::Instant>,
+) -> Option<std::time::Duration> {
+    let remaining = LEVELS_INTERVAL.saturating_sub(last?.elapsed());
+    (remaining > std::time::Duration::ZERO).then_some(remaining)
+}
+
+fn prune_outbound(window: &mut RateWindow) {
+    window.batches.retain(|b| b.at.elapsed() < LEVELS_INTERVAL);
+}
+
+fn record_outbound(window: &mut RateWindow, frames: usize) {
+    prune_outbound(window);
+    if frames > 0 {
+        window.batches.push(OutboundBatch {
+            at: tokio::time::Instant::now(),
+            frames,
+        });
+    }
+}
+
+fn outbound_used(window: &RateWindow) -> usize {
+    window
+        .batches
+        .iter()
+        .filter(|b| b.at.elapsed() < LEVELS_INTERVAL)
+        .map(|b| b.frames)
+        .sum()
+}
+
+/// Skip only when this pending send plus every JSON frame still inside
+/// the 1s window would trip the 40/s cap. Last-batch snapshots miss
+/// earlier expiry flushes and quote replies in the same second.
+fn should_skip_trailing_for_rate_budget(window: &RateWindow, pending: usize) -> bool {
+    outbound_used(window) + pending > LEVELS_RATE_BUDGET
+}
+
+/// When we defer a trailing flush, fire it as soon as enough oldest
+/// batches age out for `pending` to fit. Dropping `trailing_at` would
+/// leave only the interval tick, which inbound can starve under `biased`.
+fn next_trailing_after_budget(window: &RateWindow, pending: usize) -> Option<tokio::time::Instant> {
+    if pending == 0 || pending > LEVELS_RATE_BUDGET {
+        return None;
+    }
+    let mut live: Vec<OutboundBatch> = window
+        .batches
+        .iter()
+        .copied()
+        .filter(|b| b.at.elapsed() < LEVELS_INTERVAL)
+        .collect();
+    live.sort_by_key(|b| b.at);
+    let mut used: usize = live.iter().map(|b| b.frames).sum();
+    if used + pending <= LEVELS_RATE_BUDGET {
+        return None;
+    }
+    for b in live {
+        used = used.saturating_sub(b.frames);
+        if used + pending <= LEVELS_RATE_BUDGET {
+            return Some(b.at + LEVELS_INTERVAL);
+        }
+    }
+    None
+}
+
+async fn send_session_frame(
+    stream: &mut session::WsStream,
+    frame: &MakerFrame,
+    outbound: &mut RateWindow,
+) -> anyhow::Result<()> {
+    stream
+        .send(Message::text(serde_json::to_string(frame)?))
+        .await
+        .context("sending session frame")?;
+    record_outbound(outbound, 1);
+    Ok(())
+}
+
+/// Corridors that would actually go out. Dark / stale feeds are in
+/// `pending` but emit nothing, so the rate budget must not count them.
+fn ready_level_slugs(
+    engine: &Engine,
+    prices: &PriceCache,
+    only: Option<&HashSet<String>>,
+) -> Vec<String> {
+    engine
+        .level_frames(prices, unix_ms_now())
+        .into_iter()
+        .filter_map(|frame| {
+            let MakerFrame::Levels(lvl) = frame else {
+                return None;
+            };
+            if only.is_some_and(|set| !set.contains(&lvl.corridor_id)) {
+                return None;
+            }
+            Some(lvl.corridor_id)
+        })
+        .collect()
+}
+
+/// Sends current books. `only` limits the send to those slugs so an
+/// expiry flush does not re-emit every sibling and trip the 40/s cap
+/// after a normal interval tick. Returns the corridor ids that went out.
+async fn send_level_frames(
+    stream: &mut session::WsStream,
+    engine: &Engine,
+    prices: &PriceCache,
+    only: Option<&HashSet<String>>,
+    outbound: &mut RateWindow,
+) -> anyhow::Result<Vec<String>> {
+    let frames = engine.level_frames(prices, unix_ms_now());
+    let mut emitted = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let MakerFrame::Levels(lvl) = &frame else {
+            continue;
+        };
+        if only.is_some_and(|set| !set.contains(&lvl.corridor_id)) {
+            continue;
+        }
+        emitted.push(lvl.corridor_id.clone());
+        send_session_frame(stream, &frame, outbound).await?;
+    }
+    Ok(emitted)
+}
+
+async fn flush_expired_levels(
+    stream: &mut session::WsStream,
+    engine: &Engine,
+    prices: &PriceCache,
+    pending: &mut HashSet<String>,
+    last_levels_flush: &mut Option<tokio::time::Instant>,
+    outbound: &mut RateWindow,
+) -> anyhow::Result<Option<tokio::time::Instant>> {
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let ready = ready_level_slugs(engine, prices, Some(pending));
+    if let Some(at) = next_trailing_for_dark_pending(pending, &ready) {
+        return Ok(Some(at));
+    }
+    if should_skip_trailing_for_rate_budget(outbound, ready.len()) {
+        return Ok(next_trailing_after_budget(outbound, ready.len()));
+    }
+    let emitted = send_level_frames(stream, engine, prices, Some(pending), outbound).await?;
+    drop_emitted_pending(pending, &emitted);
+    if let Some(at) = recorded_levels_flush(&emitted) {
+        *last_levels_flush = Some(at);
+    }
+    Ok(None)
+}
+
+/// Pending corridors whose feed is still dark keep a trailing retry.
+/// Clearing it after a skipped interval tick would miss a feed that
+/// recovers inside the venue's 1s republish wait.
+fn next_trailing_for_dark_pending(
+    pending: &HashSet<String>,
+    ready: &[String],
+) -> Option<tokio::time::Instant> {
+    if pending.is_empty() || !ready.is_empty() {
+        return None;
+    }
+    Some(tokio::time::Instant::now() + LEVELS_REPUBLISH_COALESCE)
+}
+
+/// Replay can deliver `quoteExpired` for a quote this process already
+/// released. Arm the trailing flush only when a known corridor dropped.
+fn trailing_after_quote_expired(
+    pending: &mut HashSet<String>,
+    slug: Option<String>,
+) -> Option<tokio::time::Instant> {
+    let slug = slug?;
+    pending.insert(slug);
+    Some(tokio::time::Instant::now() + LEVELS_REPUBLISH_COALESCE)
+}
+
 /// One authenticated session: 1 s level publishing + request dispatch, until
 /// the stream dies or the venue goes silent past its own heartbeat timeout.
 /// Takes the cross-session reservation ledger and always hands it back.
@@ -424,28 +652,42 @@ async fn session_loop_inner(
     let heartbeat_timeout =
         std::time::Duration::from_millis(accepted.heartbeat_timeout_ms.max(1_000));
     let mut last_rx = tokio::time::Instant::now();
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut last_levels_flush: Option<tokio::time::Instant> = None;
+    let mut outbound = RateWindow::default();
+    let mut trailing_at: Option<tokio::time::Instant> = None;
+    let mut pending_republish: HashSet<String> = HashSet::new();
+    let mut interval = tokio::time::interval(LEVELS_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // The `?`s live in an inner block so the ledger is handed back to the
     // reconnect driver on every exit path.
     let result: anyhow::Result<()> = async {
         loop {
+            // Once the debounce is due, flush before reading more inbound.
+            // A continuously ready `stream.next()` would otherwise starve
+            // the trailing timer under `biased` and the venue's 1s wait
+            // would finish on a dropped book.
+            if trailing_due(trailing_at) {
+                trailing_at = None;
+                trailing_at = flush_expired_levels(
+                    &mut stream,
+                    &engine,
+                    prices,
+                    &mut pending_republish,
+                    &mut last_levels_flush,
+                    &mut outbound,
+                )
+                .await?;
+                continue;
+            }
             tokio::select! {
-                _ = interval.tick() => {
-                    anyhow::ensure!(
-                        last_rx.elapsed() < heartbeat_timeout,
-                        "venue silent for {:?} (heartbeat timeout)", last_rx.elapsed()
-                    );
-                    let now_ms = unix_ms_now();
-                    engine.reservations.prune(now_ms / 1_000);
-                    for frame in engine.level_frames(prices, now_ms) {
-                        stream
-                            .send(Message::text(serde_json::to_string(&frame)?))
-                            .await
-                            .context("sending levels")?;
-                    }
-                }
+                // Without `biased;`, Tokio randomizes ready branches.
+                // Inbound first so a ready `quoteExpired` beats a ready
+                // levels tick. The other way around published
+                // reservation-reduced depth after the venue had already
+                // dropped the snapshot. A *due* trailing flush is handled
+                // above, so inbound only wins until the debounce fires.
+                biased;
                 msg = stream.next() => {
                     let msg = msg.context("venue closed the stream")??;
                     last_rx = tokio::time::Instant::now();
@@ -458,11 +700,20 @@ async fn session_loop_inner(
                                     continue;
                                 }
                             };
+                            let expired_corridor = match &frame {
+                                VenueFrame::QuoteExpired(e) => engine
+                                    .reservations
+                                    .corridor(&e.rfq_id)
+                                    .map(str::to_owned),
+                                _ => None,
+                            };
                             if let Some(reply) = engine.dispatch(frame, prices).await {
-                                stream
-                                    .send(Message::text(serde_json::to_string(&reply)?))
-                                    .await
-                                    .context("sending quote reply")?;
+                                send_session_frame(&mut stream, &reply, &mut outbound).await?;
+                            }
+                            if let Some(at) =
+                                trailing_after_quote_expired(&mut pending_republish, expired_corridor)
+                            {
+                                trailing_at = Some(at);
                             }
                         }
                         Message::Ping(payload) => {
@@ -474,6 +725,47 @@ async fn session_loop_inner(
                         }
                         _ => {}
                     }
+                }
+                _ = async {
+                    match trailing_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    trailing_at = None;
+                    trailing_at = flush_expired_levels(
+                        &mut stream,
+                        &engine,
+                        prices,
+                        &mut pending_republish,
+                        &mut last_levels_flush,
+                        &mut outbound,
+                    )
+                    .await?;
+                }
+                _ = interval.tick() => {
+                    anyhow::ensure!(
+                        last_rx.elapsed() < heartbeat_timeout,
+                        "venue silent for {:?} (heartbeat timeout)", last_rx.elapsed()
+                    );
+                    engine.reservations.prune(unix_ms_now() / 1_000);
+                    // The first tick is immediate. After an expiry flush,
+                    // emitting every book again in the same second is
+                    // 2×books and trips the 40/s cap. Ordinary interval
+                    // sends do not stamp last_levels_flush, so the next
+                    // tick still fires on cadence.
+                    if !should_emit_interval_levels(last_levels_flush, trailing_at.is_some()) {
+                        if let Some(delay) =
+                            interval_delay_after_expiry_flush(last_levels_flush)
+                        {
+                            interval.reset_after(delay);
+                        }
+                        continue;
+                    }
+                    let emitted =
+                        send_level_frames(&mut stream, &engine, prices, None, &mut outbound)
+                            .await?;
+                    drop_emitted_pending(&mut pending_republish, &emitted);
                 }
             }
         }
@@ -1095,6 +1387,246 @@ mod tests {
         };
         assert_eq!(resp.buy_amount, "979902009");
         assert_eq!(engine.reservations.len(), 1);
+    }
+
+    #[test]
+    fn interval_levels_emit_before_any_flush() {
+        assert!(
+            should_emit_interval_levels(None, false),
+            "a new session must publish on the first interval tick"
+        );
+    }
+
+    #[test]
+    fn trailing_due_only_after_the_deadline() {
+        assert!(!trailing_due(None), "no timer is not due");
+        let later = tokio::time::Instant::now() + LEVELS_INTERVAL;
+        assert!(!trailing_due(Some(later)), "a future deadline must wait");
+        let past = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("tokio clock allows a 1ms rewind");
+        assert!(trailing_due(Some(past)));
+    }
+
+    #[test]
+    fn empty_levels_send_does_not_suppress_interval() {
+        assert!(
+            should_emit_interval_levels(recorded_levels_flush(&[]), false),
+            "sending no frames is not a flush; the next tick must still try"
+        );
+        assert!(
+            !should_emit_interval_levels(recorded_levels_flush(&["cngn-usdc".into()]), false),
+            "an actual send suppresses the immediate interval tick"
+        );
+    }
+
+    #[test]
+    fn partial_expiry_flush_still_suppresses_the_interval() {
+        let mut pending = HashSet::from(["sent".to_string(), "dark".to_string()]);
+        drop_emitted_pending(&mut pending, &["sent".into()]);
+        assert_eq!(pending, HashSet::from(["dark".to_string()]));
+        assert!(
+            recorded_levels_flush(&["sent".into()]).is_some(),
+            "21 published books plus a dark sibling must still stamp the rate budget"
+        );
+    }
+
+    #[test]
+    fn interval_reschedules_to_the_end_of_the_expiry_window() {
+        assert!(
+            interval_delay_after_expiry_flush(None).is_none(),
+            "no expiry flush means the interval keeps its phase"
+        );
+        let just_now = tokio::time::Instant::now();
+        let delay = interval_delay_after_expiry_flush(Some(just_now))
+            .expect("a fresh expiry flush must delay the next tick");
+        assert!(delay <= LEVELS_INTERVAL);
+        assert!(delay > std::time::Duration::ZERO);
+        let aged = tokio::time::Instant::now()
+            .checked_sub(LEVELS_INTERVAL + std::time::Duration::from_millis(1))
+            .expect("tokio clock allows a 1s rewind");
+        assert!(interval_delay_after_expiry_flush(Some(aged)).is_none());
+    }
+
+    fn window_with(batches: &[OutboundBatch]) -> RateWindow {
+        RateWindow {
+            batches: batches.to_vec(),
+        }
+    }
+
+    fn batch(at: tokio::time::Instant, frames: usize) -> OutboundBatch {
+        OutboundBatch { at, frames }
+    }
+
+    #[test]
+    fn trailing_skips_only_when_the_window_would_trip_the_cap() {
+        assert!(
+            !should_skip_trailing_for_rate_budget(&RateWindow::default(), 21),
+            "reconnect replay with no prior send must still flush"
+        );
+        let now = tokio::time::Instant::now();
+        let interval = window_with(&[batch(now, 21)]);
+        assert!(
+            !should_skip_trailing_for_rate_budget(&interval, 1),
+            "one corrected corridor after a 21-book interval must still fit"
+        );
+        assert!(
+            should_skip_trailing_for_rate_budget(&interval, 21),
+            "a second full book in the same second trips the 40/s cap"
+        );
+        let aged = tokio::time::Instant::now()
+            .checked_sub(LEVELS_INTERVAL + std::time::Duration::from_millis(1))
+            .expect("tokio clock allows a 1s rewind");
+        assert!(!should_skip_trailing_for_rate_budget(
+            &window_with(&[batch(aged, 21), batch(aged, 21)]),
+            21
+        ));
+    }
+
+    #[test]
+    fn rate_window_keeps_every_expiry_batch() {
+        let now = tokio::time::Instant::now();
+        let two = window_with(&[batch(now, 14), batch(now, 14)]);
+        assert!(
+            should_skip_trailing_for_rate_budget(&two, 14),
+            "14 + 14 + 14 is 42 and must wait"
+        );
+        let last_only = window_with(&[batch(now, 14)]);
+        assert!(
+            !should_skip_trailing_for_rate_budget(&last_only, 14),
+            "a last-batch snapshot would wrongly allow the third 14"
+        );
+    }
+
+    #[test]
+    fn rate_budget_counts_only_corridors_that_can_emit() {
+        let engine = test_engine();
+        let prices = fresh_prices();
+        let pending = HashSet::from(["cngn-usdc".to_string(), "dark".to_string()]);
+        let ready = ready_level_slugs(&engine, &prices, Some(&pending));
+        assert_eq!(ready, vec!["cngn-usdc".to_string()]);
+        let now = tokio::time::Instant::now();
+        let almost_full = window_with(&[batch(now, 39)]);
+        assert!(
+            should_skip_trailing_for_rate_budget(&almost_full, pending.len()),
+            "counting dark slugs would wrongly defer"
+        );
+        assert!(
+            !should_skip_trailing_for_rate_budget(&almost_full, ready.len()),
+            "one healthy corridor plus 39 must still fit"
+        );
+    }
+
+    #[test]
+    fn dark_pending_keeps_trailing_armed() {
+        assert!(
+            next_trailing_for_dark_pending(&HashSet::from(["cngn-usdc".into()]), &[]).is_some(),
+            "a dark expiry must retry, not wait for the next interval"
+        );
+        assert!(next_trailing_for_dark_pending(&HashSet::new(), &[]).is_none());
+        assert!(next_trailing_for_dark_pending(
+            &HashSet::from(["cngn-usdc".into()]),
+            &["cngn-usdc".into()]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn no_op_quote_expired_does_not_arm_trailing() {
+        let mut pending = HashSet::new();
+        assert!(
+            trailing_after_quote_expired(&mut pending, None).is_none(),
+            "a replay notice with no local reservation must not block the first interval tick"
+        );
+        assert!(pending.is_empty());
+        assert!(trailing_after_quote_expired(&mut pending, Some("cngn-usdc".into())).is_some());
+        assert_eq!(pending, HashSet::from(["cngn-usdc".to_string()]));
+    }
+
+    #[test]
+    fn rate_window_includes_quote_replies() {
+        let now = tokio::time::Instant::now();
+        let window = window_with(&[batch(now, 20), batch(now, 1)]);
+        assert!(
+            should_skip_trailing_for_rate_budget(&window, 20),
+            "20 levels + 1 quote + 20 expiry is 41 and trips admitMessage"
+        );
+    }
+
+    #[test]
+    fn deferred_trailing_waits_until_enough_batches_age_out() {
+        assert!(next_trailing_after_budget(&RateWindow::default(), 21).is_none());
+        let now = tokio::time::Instant::now();
+        let later = now + std::time::Duration::from_millis(10);
+        let window = window_with(&[batch(now, 21), batch(later, 1)]);
+        let due = next_trailing_after_budget(&window, 21).expect("21 + 21 needs room");
+        assert_eq!(due, now + LEVELS_INTERVAL);
+        let three = window_with(&[batch(now, 14), batch(later, 14)]);
+        let due = next_trailing_after_budget(&three, 14).expect("42 needs the first 14 to age out");
+        assert_eq!(due, now + LEVELS_INTERVAL);
+    }
+
+    #[test]
+    fn interval_levels_skip_when_trailing_flush_pending() {
+        let aged = tokio::time::Instant::now()
+            .checked_sub(LEVELS_INTERVAL + std::time::Duration::from_millis(1))
+            .expect("tokio clock allows a 1s rewind");
+        assert!(
+            !should_emit_interval_levels(Some(aged), true),
+            "a pending expiry debounce must win over the interval tick"
+        );
+    }
+
+    #[test]
+    fn interval_levels_skip_when_quote_expired_just_flushed() {
+        let just_now = tokio::time::Instant::now();
+        assert!(
+            !should_emit_interval_levels(Some(just_now), false),
+            "an immediate interval tick must not double the quoteExpired book"
+        );
+        let aged = tokio::time::Instant::now()
+            .checked_sub(LEVELS_INTERVAL + std::time::Duration::from_millis(1))
+            .expect("tokio clock allows a 1s rewind");
+        assert!(should_emit_interval_levels(Some(aged), false));
+    }
+
+    #[tokio::test]
+    async fn quote_expired_restores_published_level_depth() {
+        let mut engine = test_engine();
+        let prices = fresh_prices();
+        let now_ms = unix_ms_now();
+
+        let MakerFrame::Levels(full) = engine.level_frames(&prices, now_ms)[0].clone() else {
+            panic!("expected a levels frame before any quote");
+        };
+        let full_bid: u128 = full.bids[0].size.parse().unwrap();
+
+        let _ = engine.respond(exact_input_request("rfq_1"), &prices).await;
+        let MakerFrame::Levels(reserved) = engine.level_frames(&prices, now_ms)[0].clone() else {
+            panic!("expected a levels frame while reserved");
+        };
+        let reserved_bid: u128 = reserved.bids[0].size.parse().unwrap();
+        assert!(
+            reserved_bid < full_bid,
+            "an open quote must shrink published bid depth"
+        );
+
+        let _ = engine
+            .dispatch(
+                VenueFrame::QuoteExpired(QuoteExpiredFrame {
+                    rfq_id: "rfq_1".into(),
+                }),
+                &prices,
+            )
+            .await;
+        let MakerFrame::Levels(restored) = engine.level_frames(&prices, now_ms)[0].clone() else {
+            panic!("expected a levels frame after quoteExpired");
+        };
+        assert_eq!(
+            restored.bids[0].size.parse::<u128>().unwrap(),
+            full_bid,
+            "quoteExpired must put full depth back on the next levels frame"
+        );
     }
 
     #[tokio::test]
