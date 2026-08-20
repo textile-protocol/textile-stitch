@@ -110,6 +110,26 @@ export default function SettingsForm({
         </Banner>
       )}
 
+      {loaded.rfqPanelUnlocked && (
+        <RfqCard
+          botName={bot.name}
+          draft={draft}
+          loaded={loaded}
+          rfqApiKey={rfqApiKey}
+          pendingPatch={changedFields(loaded, draft, rfqApiKey)}
+          corridorId={bot.config?.corridorId ?? ''}
+          editable={loaded.editable}
+          onChange={set}
+          onApiKey={setRfqApiKey}
+          onConnected={(next, message) => {
+            setLoaded(next)
+            setDraft(next)
+            setRfqApiKey('')
+            onSaved(message)
+          }}
+        />
+      )}
+
       <Card
         title="Spreads"
         action={
@@ -217,26 +237,6 @@ export default function SettingsForm({
         editable={loaded.editable}
         onChange={set}
       />
-
-      {loaded.rfqPanelUnlocked && (
-        <RfqCard
-          botName={bot.name}
-          draft={draft}
-          loaded={loaded}
-          rfqApiKey={rfqApiKey}
-          pendingPatch={changedFields(loaded, draft, rfqApiKey)}
-          corridorId={bot.config?.corridorId ?? ''}
-          editable={loaded.editable}
-          onChange={set}
-          onApiKey={setRfqApiKey}
-          onConnected={(next, message) => {
-            setLoaded(next)
-            setDraft(next)
-            setRfqApiKey('')
-            onSaved(message)
-          }}
-        />
-      )}
 
       {loaded.rfqDefaultUnlocked && (
         <LegacyCard
