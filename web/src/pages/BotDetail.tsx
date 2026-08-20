@@ -19,6 +19,10 @@ import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import VersionRollback from '../components/VersionRollback'
 import { formatTimestamp, shortAddress, shortImage } from '../format'
+import {
+  confirmRemoveContainerOnlyPlan,
+  confirmRemovePlan,
+} from '../removeBot'
 import type { Bot, ConfigBody, MigrationResult, UpdatesStatus } from '../types'
 
 const TABS = ['settings', 'dashboard', 'config', 'logs', 'tools'] as const
@@ -120,29 +124,16 @@ export default function BotDetail() {
     }
   }
 
-  async function remove() {
-    // Cancel aborts. The old first dialog treated Cancel as "keep config", so a
-    // config-only bot (or anyone who Cancelled intending to bail) got a no-op.
-    let deleteConfig: boolean
-    if (bot?.container) {
-      if (!window.confirm(`Remove ${name}'s container?`)) return
-      deleteConfig = window.confirm(
-        `Also delete ${name}'s config and private key?\n\nOK deletes them (cannot be undone). Cancel keeps the files so you can recreate the bot later.`,
-      )
-    } else {
-      if (
-        !window.confirm(
-          `Delete ${name}'s config and private key? There is no container. This cannot be undone.`,
-        )
-      ) {
-        return
-      }
-      deleteConfig = true
-    }
-    setBusy('remove')
+  async function remove(full: boolean) {
+    const plan = full
+      ? confirmRemovePlan({ name, hasContainer: !!bot?.container })
+      : confirmRemoveContainerOnlyPlan(name)
+    if (!plan) return
+
+    setBusy(full ? 'remove' : 'remove-container')
     setError(null)
     try {
-      const res = await api.remove(name, deleteConfig)
+      const res = await api.remove(name, plan.deleteConfig)
       navigate('/', { state: { note: res.message } })
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -303,14 +294,31 @@ export default function BotDetail() {
               </>
             )}
           </div>
-          <Button
-            variant="danger"
-            busy={busy === 'remove'}
-            className="w-full sm:ml-auto sm:w-auto"
-            onClick={() => void remove()}
-          >
-            Remove
-          </Button>
+          <div className="flex w-full flex-col gap-2 sm:ml-auto sm:w-auto sm:flex-row sm:items-center">
+            {bot.container && (
+              <Button
+                busy={busy === 'remove-container'}
+                className="w-full sm:w-auto"
+                onClick={() => void remove(false)}
+                title="Destroy the container but leave config on disk — the bot stays on the fleet as config-only"
+              >
+                Remove container only
+              </Button>
+            )}
+            <Button
+              variant="danger"
+              busy={busy === 'remove'}
+              className="w-full sm:w-auto"
+              onClick={() => void remove(true)}
+              title={
+                bot.container
+                  ? 'Delete the container, config, and private key — gone from the fleet'
+                  : 'Delete config and private key — gone from the fleet'
+              }
+            >
+              {bot.container ? 'Remove' : 'Delete'}
+            </Button>
+          </div>
         </div>
 
         <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">

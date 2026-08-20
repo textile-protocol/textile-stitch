@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link, useLocation } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { ApiError, api } from '../api'
 import {
   Banner,
@@ -12,12 +12,14 @@ import {
   Tag,
 } from '../components/ui'
 import { shortAddress, shortImage } from '../format'
+import { confirmRemovePlan } from '../removeBot'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
 const POLL_MS = 5000
 
 export default function Fleet() {
+  const navigate = useNavigate()
   const [data, setData] = useState<FleetData | null>(null)
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -84,6 +86,36 @@ export default function Fleet() {
     }
   }
 
+  async function remove(bot: Bot) {
+    const plan = confirmRemovePlan({
+      name: bot.name,
+      hasContainer: !!bot.container,
+    })
+    if (!plan) return
+
+    setBusy(`${bot.name}:remove`)
+    setNote(null)
+    setError(null)
+    try {
+      const res = await api.remove(bot.name, plan.deleteConfig)
+      setNote(res.message)
+      // Drop local state so a stale row can't flash back before reload.
+      setData((prev) =>
+        prev
+          ? { ...prev, bots: prev.bots.filter((b) => b.name !== bot.name) }
+          : prev,
+      )
+      await load()
+      await loadUpdates()
+      // Clear any handoff left in history so a refresh doesn't resurrect the note.
+      navigate('.', { replace: true, state: null })
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
   if (!data && error) return <ErrorState error={error} onRetry={() => void load()} />
   if (!data) return <Loading what="the fleet" />
 
@@ -138,6 +170,7 @@ export default function Fleet() {
                   canUpdate.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
                 }
                 onAct={act}
+                onRemove={() => void remove(bot)}
               />
             </li>
           ))}
@@ -153,12 +186,14 @@ function BotRow({
   updateAvailable,
   canUpdate,
   onAct,
+  onRemove,
 }: {
   bot: Bot
   busy: string | null
   updateAvailable: boolean
   canUpdate: boolean
   onAct: (name: string, what: 'start' | 'stop' | 'restart' | 'update') => void
+  onRemove: () => void
 }) {
   const blocking = bot.warnings.filter((w) => w.blocksEditing)
   const advisory = bot.warnings.filter((w) => !w.blocksEditing)
@@ -174,7 +209,7 @@ function BotRow({
           <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
         )}
         {updateAvailable && <Tag>update available</Tag>}
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
           {bot.container ? (
             <>
               {bot.canStop ? (
@@ -223,6 +258,18 @@ function BotRow({
           ) : (
             <Tag>no container</Tag>
           )}
+          <Button
+            variant="danger"
+            busy={busy === `${bot.name}:remove`}
+            onClick={onRemove}
+            title={
+              bot.container
+                ? 'Delete the container, config, and private key — gone from the fleet'
+                : 'Delete config and private key — gone from the fleet'
+            }
+          >
+            {bot.container ? 'Remove' : 'Delete'}
+          </Button>
           <Link to={`/bots/${encodeURIComponent(bot.name)}`}>
             <Button variant="ghost">Open</Button>
           </Link>

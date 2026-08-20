@@ -490,7 +490,12 @@ alone, rather than deleting it and then discovering there's nothing to start.
 Recreate is also how you recover a config-only bot — config on disk, no
 container — which is what you get when the wizard writes the files and then
 create fails, or when someone removes the container and keeps the directory. Add
-Bot refuses that name; Recreate is the button.
+Bot refuses that name; Recreate is the button. To drop it instead, use **Delete**
+on the fleet row (or on the bot page): that wipes the config and private key and
+takes the row off the fleet. **Remove** on a live bot deletes container + config
+in one step; Cancel aborts entirely. Keeping the files without a container is an
+explicit **Remove container only** action on the bot page, and it warns that the
+bot will stay on the fleet as config-only until you Delete or Recreate it.
 
 What doesn't change: **saving settings on a running bot restarts it.** Stitch reads
 its config once at startup, so there's no way to apply a spread change in place.
