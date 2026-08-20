@@ -9,7 +9,7 @@
 use axum::extract::{Path as UrlPath, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::enroll::{
@@ -53,14 +53,35 @@ struct AccessStatusResponse {
     corridor_pairs: Vec<EnrollCorridorPair>,
 }
 
-fn require_contact(email: Option<&str>, whatsapp: Option<&str>) -> Result<(), ApiError> {
-    let has_email = email.map(str::trim).is_some_and(|s| !s.is_empty());
-    let has_wa = whatsapp.map(str::trim).is_some_and(|s| !s.is_empty());
-    if has_email || has_wa {
+/// Body for POST /v2/maker/access-request. The form leaves most of these
+/// blank, and blank has to mean absent: the venue validates them as optional
+/// strings, so a `null` reads as the wrong type and 400s the whole request.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessRequestPayload<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contact_email: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contact_whatsapp: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corridor: Option<&'a str>,
+}
+
+/// Trimmed value, or None when it is missing or blank.
+fn filled(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Email is the channel Textile answers a review on, so it is the required
+/// one. WhatsApp is a bonus number for them to ping.
+fn require_email(email: Option<&str>) -> Result<(), ApiError> {
+    if filled(email).is_some() {
         return Ok(());
     }
     Err(ApiError::bad_request(
-        "add an email address or a WhatsApp number so Textile can contact you",
+        "add an email address so Textile can reply to your access request — WhatsApp is optional",
     ))
 }
 
@@ -87,10 +108,7 @@ pub async fn request_access(
     let current_toml = read_toml(&path)?;
     let cfg = Config::from_toml(&current_toml)
         .map_err(|e| ApiError::bad_request(format!("this config isn't valid: {e:#}")))?;
-    require_contact(
-        body.contact_email.as_deref(),
-        body.contact_whatsapp.as_deref(),
-    )?;
+    require_email(body.contact_email.as_deref())?;
 
     let dir = path.parent().ok_or_else(|| {
         ApiError::internal(&anyhow::anyhow!(
@@ -106,16 +124,18 @@ pub async fn request_access(
     let response = venue_client()?
         .post(&venue)
         .bearer_auth(&api_key)
-        .json(&json!({
-            "contactEmail": body.contact_email.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-            "contactWhatsapp": body.contact_whatsapp.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-            "note": body.note.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-            "corridor": corridor,
-        }))
+        .json(&AccessRequestPayload {
+            contact_email: filled(body.contact_email.as_deref()),
+            contact_whatsapp: filled(body.contact_whatsapp.as_deref()),
+            note: filled(body.note.as_deref()),
+            corridor: filled(corridor.as_deref()),
+        })
         .send()
         .await
         .map_err(|e| {
-            ApiError::bad_request(format!("could not reach Textile access request at {venue}: {e}"))
+            ApiError::bad_request(format!(
+                "could not reach Textile access request at {venue}: {e}"
+            ))
         })?;
     let status = response.status();
     let text = response.text().await.map_err(|e| {
@@ -339,6 +359,16 @@ mod tests {
                             body["contactEmail"].as_str().is_some()
                                 || body["contactWhatsapp"].as_str().is_some()
                         );
+                        // The venue validates these as optional strings, so a
+                        // blank field must be absent rather than null.
+                        assert!(
+                            !body
+                                .as_object()
+                                .expect("object body")
+                                .values()
+                                .any(Value::is_null),
+                            "sent a null field: {body}"
+                        );
                         Json(json!({ "accessStatus": "PENDING", "requestId": "clreq1" }))
                     },
                 ),
@@ -395,19 +425,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_access_needs_contact() {
+    async fn request_access_needs_an_email_and_whatsapp_stays_optional() {
         let h = harness("rfq-access-contact");
         seed(&h, "bot-a");
         unlock_rfq_panel(&h, "bot-a");
         setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
-        let (status, body) = h
-            .post_json("/api/bots/bot-a/rfq/access-request", json!({}))
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(
-            body.contains("email") || body.contains("WhatsApp"),
-            "{body}"
-        );
+        for payload in [json!({}), json!({ "contactWhatsapp": "+15551234567" })] {
+            let (status, body) = h
+                .post_json("/api/bots/bot-a/rfq/access-request", payload)
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("email"), "{body}");
+        }
     }
 
     #[tokio::test]

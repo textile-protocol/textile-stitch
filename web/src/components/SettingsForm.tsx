@@ -816,8 +816,9 @@ function RfqCard({
           <div className="space-y-3 rounded-lg border border-line-soft p-3">
             <p className="text-sm font-bold">Request access</p>
             <p className="text-xs text-faint">
-              Textile needs a way to reach you. Email or WhatsApp — one is
-              enough.
+              Textile replies about the review by email, so that one is
+              required. WhatsApp is optional — add it if you would rather they
+              ping you there.
             </p>
             <Field label="Email">
               <Input
@@ -829,7 +830,7 @@ function RfqCard({
                 onChange={(e) => setContactEmail(e.target.value)}
               />
             </Field>
-            <Field label="WhatsApp">
+            <Field label="WhatsApp (optional)">
               <Input
                 type="tel"
                 value={contactWhatsapp}
@@ -843,7 +844,7 @@ function RfqCard({
               <Button
                 variant="primary"
                 busy={requesting}
-                disabled={!editable}
+                disabled={!editable || !contactEmail.trim()}
                 onClick={() => void requestAccess()}
               >
                 Request access
