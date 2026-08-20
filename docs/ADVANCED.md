@@ -560,6 +560,26 @@ corridor separately. Until they do, `[rfq]` stays off and the public ladder
 keeps running. After they enable you, press Reconnect — do not invent a
 corridor slug in the raw config.
 
+**Inventory when both channels are on.** Keep `book_enabled = true` beside a
+live `[rfq]` and the corridor runs both. Neither one shrinks the other: the
+ladder is sized off `min(balance, allowance)` as if no firm quote existed, and a
+firm quote is priced off the same balance as if the book were empty. Only RFQ's
+own in-flight quotes are netted off, so a `"max"` side really does quote your
+whole wallet twice.
+
+That is deliberate. Reserving half the wallet for each channel halves the depth
+of both, and a taker who hits a corridor where the split guessed wrong sees a
+size nobody can fill. The cost is over-commitment: if a limit order fills at the
+same moment a firm quote does, and together they need more than the wallet holds,
+whichever lands second reverts on the Permit2 pull. The taker broadcasts that
+transaction, so the taker eats the failed swap and its gas — your side is a
+signature that never executed, and you pay nothing. Cheap for you, not for them:
+a maker whose quotes revert is one takers route around.
+
+If you would rather cap the exposure than the depth, give the pool exact sizes
+instead of `"max"` — configured amounts are honoured per channel, so
+`buy_total_liquidity_debt` at half your balance leaves the other half to RFQ.
+
 ### Safe Restart Checklist
 
 Before restarting live:

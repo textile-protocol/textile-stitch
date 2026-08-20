@@ -10,6 +10,13 @@ tick_interval_secs = 5
 
 # Root-level. Must sit above [feed] / [[pools]] / [rfq] or TOML attaches it
 # to that table and the bot keeps posting a public ladder (default true).
+#
+# Leaving it on beside [rfq] runs both channels on the same corridor, and each
+# one quotes the whole wallet: the ladder is sized as if no firm quote existed,
+# and a firm quote is priced as if the book were empty. Nothing is split, so
+# nothing is halved — the cost is that a limit fill landing at the same moment
+# as a firm-quote fill can leave one of the two reverting. Want a hard split
+# instead? Give the sizes below exact amounts rather than "max".
 # book_enabled = false
 
 # Default price feed: used by any pool that doesn't set its own `feed_url`.

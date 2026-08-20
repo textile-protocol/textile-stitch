@@ -21,8 +21,13 @@
 //! keep firm quotes on a 14-minute-old print; the ladder still uses
 //! `[feed].staleness_secs` as written. Deliberately NOT shared: the tick loop
 //! (RFQ runs its own 1 s cadence and its own price cache so a slow ladder tick
-//! can't blow the reply budget) and the nonce ledger (RFQ nonces live in a
-//! disjoint namespace, see [`nonce`]).
+//! can't blow the reply budget), the nonce ledger (RFQ nonces live in a
+//! disjoint namespace, see [`nonce`]) and — the point of dual-run —
+//! **inventory**. RFQ quotes `min(balance, Permit2 allowance)` in full, minus
+//! only its own in-flight quotes ([`reserve`]); a ladder holding the whole
+//! wallet on the book does not shrink a firm quote, and a firm quote does not
+//! shrink the next ladder. Two channels pledging one balance means a fill can
+//! revert when both land at once, which beats halving the depth of both.
 
 pub mod math;
 pub mod nonce;
@@ -75,7 +80,6 @@ pub struct RfqRuntime {
     reactor: Address,
     validation_contract: Address,
     rpc_url: String,
-    indexer_url: String,
     books: Vec<CorridorBook>,
     signer: DynSigner,
     /// `rfq-reservations.json` next to stitch.toml. None only when the process
@@ -214,7 +218,6 @@ fn build_runtime(
             .parse()
             .context("invalid [rfq].validation_contract")?,
         rpc_url: cfg.rpc_url.clone(),
-        indexer_url: cfg.indexer_url.clone(),
         books,
         signer,
         reservations_path: config_dir.map(|dir| dir.join(RESERVATIONS_FILE)),
@@ -305,11 +308,8 @@ async fn run(rt: RfqRuntime) {
     let tokens = wallet_tokens(&rt.books);
     if !tokens.is_empty() {
         let wallet = Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id);
-        let indexer = crate::indexer::Indexer::from_base_url(&rt.indexer_url);
         tokio::spawn(inventory_loop(
             wallet,
-            indexer,
-            rt.chain_id,
             rt.permit2,
             tokens,
             inventory.clone(),
@@ -1121,24 +1121,13 @@ async fn price_loop(url: String, cache: PriceCache) {
     }
 }
 
-/// What RFQ may still pledge: funded wallet minus live book commitments.
-/// The venue subtracts the same v1 rows in `reserveReply`; quoting the raw
-/// balance is what produced `invalid` / `insufficient_funding` in dual-run.
-fn quotable_inventory(funded: U256, committed: U256) -> U256 {
-    funded.saturating_sub(committed)
-}
-
-/// `min(ERC20 balance, Permit2 allowance)` minus indexer-side live book
-/// input. Allowance is the fill-time constraint: a balance the wallet hasn't
-/// approved is not quotable. Book commitments are the dual-run constraint:
-/// the ladder already signed those tokens away.
-async fn read_funded(
-    wallet: &Wallet,
-    indexer: &crate::indexer::Indexer,
-    chain_id: u64,
-    permit2: Address,
-    token: Address,
-) -> anyhow::Result<(U256, U256)> {
+/// What RFQ may pledge: `min(ERC20 balance, Permit2 allowance)`. Allowance is
+/// the fill-time constraint — a balance the wallet hasn't approved is not
+/// quotable. The live ladder is deliberately not subtracted: on a dual-run
+/// corridor both channels quote the whole wallet, and the venue's
+/// `reserveReply` counts firm quotes against firm quotes only. In-flight RFQ
+/// quotes are still netted off, in [`reserve`].
+async fn read_funded(wallet: &Wallet, permit2: Address, token: Address) -> anyhow::Result<U256> {
     let owner = wallet.address();
     let balance = wallet
         .read_uint(token, &Bytes::from(encode_balance_of(owner)))
@@ -1148,14 +1137,7 @@ async fn read_funded(
         .read_uint(token, &Bytes::from(encode_allowance(owner, permit2)))
         .await
         .context("reading RFQ Permit2 allowance")?;
-    let funded = balance.min(allowance);
-    let committed = indexer
-        .committed_input(chain_id, &owner.to_string(), &token.to_string())
-        .await
-        .context("reading RFQ committed input")?
-        .parse::<U256>()
-        .context("parsing RFQ committed input")?;
-    Ok((funded, committed))
+    Ok(balance.min(allowance))
 }
 
 /// Refresh quotable amounts for every `max` token, once a second. A failed
@@ -1163,8 +1145,6 @@ async fn read_funded(
 /// closed instead of quoting a stale high balance forever.
 async fn inventory_loop(
     wallet: Wallet,
-    indexer: crate::indexer::Indexer,
-    chain_id: u64,
     permit2: Address,
     tokens: Vec<Address>,
     cache: InventoryCache,
@@ -1172,19 +1152,8 @@ async fn inventory_loop(
     loop {
         let now = unix_now();
         for token in &tokens {
-            match read_funded(&wallet, &indexer, chain_id, permit2, *token).await {
-                Ok((funded, committed)) => {
-                    let quotable = quotable_inventory(funded, committed);
-                    if !funded.is_zero() && quotable.is_zero() {
-                        warn!(
-                            token = %token,
-                            funded = %funded,
-                            committed = %committed,
-                            "rfq inventory fully committed to the book; this side stays dark until the ladder releases it"
-                        );
-                    }
-                    cache.set(*token, quotable, now);
-                }
+            match read_funded(&wallet, permit2, *token).await {
+                Ok(funded) => cache.set(*token, funded, now),
                 Err(e) => warn!(
                     token = %token,
                     error = %format!("{e:#}"),
@@ -1997,24 +1966,6 @@ mod tests {
             ),
             None,
             "an unread token is not inventable"
-        );
-    }
-
-    #[test]
-    fn quotable_inventory_subtracts_the_live_book() {
-        assert_eq!(
-            quotable_inventory(U256::from(100u64), U256::from(40u64)),
-            U256::from(60u64)
-        );
-        assert_eq!(
-            quotable_inventory(U256::from(100u64), U256::from(100u64)),
-            U256::ZERO,
-            "fully pledged to the ladder is no RFQ inventory"
-        );
-        assert_eq!(
-            quotable_inventory(U256::from(50u64), U256::from(80u64)),
-            U256::ZERO,
-            "over-committed book never goes negative"
         );
     }
 

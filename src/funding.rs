@@ -5,6 +5,13 @@
 //! `min(balance, Permit2 allowance)` minus what the book will hold after earlier
 //! replacements in this tick — with the side's own live input counted as
 //! reusable (a replacement supersedes it).
+//!
+//! Book only. Firm quotes signed over RFQ are deliberately absent from this
+//! budget, and the indexer's `fillerCommittedInput` leaves them out for the
+//! same reason: on a dual-run corridor the ladder and the RFQ responder each
+//! quote the whole wallet. Two channels pledging one balance means a fill can
+//! revert when both land at once, and that is the accepted trade — splitting
+//! the wallet would halve the depth of both.
 
 use std::collections::HashMap;
 
@@ -52,15 +59,15 @@ impl TickBudgets {
     }
 }
 
-/// How many enabled sides quote `"max"` liquidity per input token. Sides whose
-/// size fails to parse are skipped here — the quote path warns about them.
+/// How many enabled ladder sides quote `"max"` liquidity per input token. Sides
+/// whose size fails to parse are skipped here — the quote path warns about them.
 ///
-/// Dual-run: an RFQ `"max"` side on the same token counts too, so the ladder
-/// leaves leftover inventory instead of pledging the whole wallet and having
-/// the venue reject every firm quote as `insufficient_funding`.
+/// Ladder sides only. Dual-run does NOT reserve a share for the RFQ responder:
+/// the two channels quote the same wallet in full and neither shrinks the other
+/// (see the module docs). A maker who does want the wallet split between the
+/// book and RFQ configures exact sizes instead of `"max"`.
 pub fn count_max_sides(cfg: &Config) -> HashMap<Address, u32> {
-    let mut counts = cfg
-        .pools
+    cfg.pools
         .iter()
         .flat_map(|pool| {
             [
@@ -78,35 +85,7 @@ pub fn count_max_sides(cfg: &Config) -> HashMap<Address, u32> {
         .fold(HashMap::new(), |mut counts, token| {
             *counts.entry(token).or_insert(0) += 1;
             counts
-        });
-    if cfg.rfq_active() {
-        for pool in &cfg.pools {
-            // Assignment is the leftover slug Connect writes. A slugless pool
-            // can still quote after session bind, but we cannot reserve RFQ
-            // share for it before that — counting every pool here starves
-            // ladder sides that share the token.
-            if pool.rfq_corridor.is_none() {
-                continue;
-            }
-            if matches!(
-                pool.rfq_buy_capacity_debt(),
-                Ok(Some(crate::config::RfqCapacity::Wallet))
-            ) {
-                if let Ok(token) = pool.debt.parse::<Address>() {
-                    *counts.entry(token).or_insert(0) += 1;
-                }
-            }
-            if matches!(
-                pool.rfq_sell_capacity_collateral(),
-                Ok(Some(crate::config::RfqCapacity::Wallet))
-            ) {
-                if let Ok(token) = pool.collateral.parse::<Address>() {
-                    *counts.entry(token).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-    counts
+        })
 }
 
 /// One "max" side's grant this tick: no more than its equal target share of the
@@ -688,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn count_max_sides_counts_rfq_wallet_sides_in_dual_run() {
+    fn count_max_sides_ignores_rfq_sides_in_dual_run() {
         let toml = r#"
             chain_id = 56
             rpc_url = "http://x"
@@ -729,52 +708,9 @@ mod tests {
         let coll: Address = "0x00000000000000000000000000000000000000c1"
             .parse()
             .unwrap();
-        // Ladder bid is max (even at 0 orders) + RFQ bid max; ladder ask max + RFQ ask max.
-        assert_eq!(counts.get(&debt), Some(&2));
-        assert_eq!(counts.get(&coll), Some(&2));
-    }
-
-    #[test]
-    fn count_max_sides_ignores_slugless_rfq_pools() {
-        let toml = r#"
-            chain_id = 56
-            rpc_url = "http://x"
-            indexer_url = "http://x"
-            permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-            reactor = "0x0000000000000000000000000000000000000000"
-            tick_interval_secs = 5
-            [feed]
-            url = "https://x"
-            staleness_secs = 30
-            [rfq]
-            enabled = true
-            url = "wss://x/v2/maker/stream"
-            maker_id = "mk_test"
-            validation_contract = "0x00000000000000000000000000000000000000f1"
-            [[pools]]
-            collateral = "0x00000000000000000000000000000000000000c1"
-            collateral_decimals = 6
-            debt = "0x00000000000000000000000000000000000000d1"
-            debt_decimals = 18
-            ttl_secs = 60
-            refresh_threshold_bps = 10
-            buy_offset_bps = 1
-            buy_total_liquidity_debt = "max"
-            buy_min_slice_debt = "1"
-            buy_max_orders = 0
-            sell_offset_bps = 1
-            sell_total_liquidity_collateral = "max"
-            sell_min_slice_debt = "1"
-            sell_max_orders = 40
-        "#;
-        let cfg = crate::config::Config::from_toml(toml).unwrap();
-        let counts = count_max_sides(&cfg);
-        let debt: Address = "0x00000000000000000000000000000000000000d1"
-            .parse()
-            .unwrap();
-        let coll: Address = "0x00000000000000000000000000000000000000c1"
-            .parse()
-            .unwrap();
+        // One ladder side per token. The pool also quotes both sides over RFQ
+        // at wallet capacity, and that must not halve either ladder side: on a
+        // dual-run corridor both channels quote the whole balance.
         assert_eq!(counts.get(&debt), Some(&1));
         assert_eq!(counts.get(&coll), Some(&1));
     }
