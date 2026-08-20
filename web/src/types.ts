@@ -116,11 +116,11 @@ export interface Settings {
   leanBaseBps: string
   leanWideBps: string
   editable: boolean
-  /** Raw-config or fleet gate. The RFQ card is hidden until this is true. */
+  /** Always true. Leftover from the RFQ beta gate. */
   rfqPanelUnlocked: boolean
-  /** RFQ-as-default rollout: RFQ-native copy, migrate nudge, RFQ-only Connect. */
+  /** Always true. Leftover from the RFQ-as-default rollout. */
   rfqDefaultUnlocked: boolean
-  /** Public ladder. False is RFQ-only. */
+  /** Public ladder. False is RFQ-only (the production Swap path). */
   bookEnabled: boolean
   rfqEnabled: boolean
   rfqUrl: string
@@ -169,7 +169,7 @@ export interface SessionInfo {
   version: string
   /** Full path to the local config data — where the per-bot config folders live on the host. */
   configDir: string
-  /** Fleet RFQ-default flag (`panel.toml`). New bots start RFQ-only. */
+  /** Always true. New bots start RFQ-only. */
   rfqDefault: boolean
 }
 

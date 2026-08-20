@@ -194,9 +194,8 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
       <h1 className="text-xl font-bold">Add a bot</h1>
       {rfqDefault && (
         <p className="text-sm text-muted">
-          New bots quote via RFQ (private quotes), not the public ladder. After
-          create, open Settings and connect the bot to Textile before starting
-          it.
+          New bots quote Swap via RFQ, not the public ladder. After create,
+          open Settings and connect the bot to Textile before starting it.
         </p>
       )}
       <Steps current={step} labels={['Corridor', 'Name', 'Wallet']} />
@@ -427,8 +426,8 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
             {rfqDefault ? (
               <p className="text-xs text-faint">
                 Created stopped. Connect it to Textile on Settings, then
-                approve Permit2, then Start. Starting before Connect posts
-                nothing — no book and no private quotes.
+                approve Permit2, then Start. Starting before Connect quotes
+                nothing.
               </p>
             ) : (
               <>

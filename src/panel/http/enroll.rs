@@ -7,30 +7,22 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::hex;
 use axum::extract::{Path as UrlPath, State};
 use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::settings::{config_path, read_toml, save_and_restart};
 use super::{ApiError, AppState};
-use crate::config::{rfq_default_flag_in_dir, Config, RFQ_PANEL_GATE};
-use crate::eip712::{maker_enroll_digest, maker_enroll_environment};
+use crate::config::{rfq_default_flag_in_dir, Config};
+use crate::panel::inventory::{Bot, Layout};
 use crate::panel::provision;
 use crate::setup;
-use crate::signer::{build_signer, parse_private_key, DynSigner, LocalSigner, SignerConfig};
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct EnrollCorridorPair {
-    slug: String,
-    collateral_token: String,
-    debt_token: String,
-}
+use crate::signer::{
+    build_signer_with, parse_private_key, DynSigner, LocalSigner, SignerConfig, SignerSecrets,
+};
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -38,88 +30,6 @@ pub struct EnrollBody {
     /// Override the venue enroll URL. Tests use this; the UI does not.
     #[serde(default)]
     pub venue_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EnrollResponse {
-    maker_id: String,
-    maker_slug: String,
-    environment: String,
-    api_key: String,
-    stream_url: String,
-    #[serde(default)]
-    validation_contract: Option<String>,
-    #[serde(default)]
-    corridors: Vec<String>,
-    /// Token metadata for each seated slug. Custom (non-catalog) bots
-    /// match this instead of `identify_corridor`, which is None for them.
-    #[serde(default)]
-    corridor_pairs: Vec<EnrollCorridorPair>,
-    #[serde(default)]
-    flagged: bool,
-}
-
-/// HTTP origin for venue maker routes, derived from a stream URL or API base.
-pub fn maker_venue_origin(stream_or_origin: &str) -> String {
-    let trimmed = stream_or_origin.trim();
-    let http = if let Some(rest) = trimmed.strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("ws://") {
-        format!("http://{rest}")
-    } else {
-        trimmed.to_string()
-    };
-    let http = http.trim_end_matches('/');
-    for suffix in [
-        "/v2/maker/stream",
-        "/v2/maker/enroll",
-        "/v2/maker/access-request",
-        "/v2/maker/access-status",
-    ] {
-        if let Some(base) = http.strip_suffix(suffix) {
-            return base.to_string();
-        }
-    }
-    http.to_string()
-}
-
-/// Derive `https://host/v2/maker/enroll` from a stream URL or an API origin.
-pub fn maker_enroll_url(stream_or_origin: &str) -> String {
-    format!("{}/v2/maker/enroll", maker_venue_origin(stream_or_origin))
-}
-
-pub fn maker_access_request_url(stream_or_origin: &str) -> String {
-    format!(
-        "{}/v2/maker/access-request",
-        maker_venue_origin(stream_or_origin)
-    )
-}
-
-pub fn maker_access_status_url(stream_or_origin: &str) -> String {
-    format!(
-        "{}/v2/maker/access-status",
-        maker_venue_origin(stream_or_origin)
-    )
-}
-
-pub(super) fn venue_origin_from_config(cfg: &Config, override_url: Option<&str>) -> String {
-    if let Some(url) = override_url.map(str::trim).filter(|u| !u.is_empty()) {
-        return maker_venue_origin(url);
-    }
-    if let Some(rfq) = &cfg.rfq {
-        if !rfq.url.trim().is_empty() {
-            return maker_venue_origin(&rfq.url);
-        }
-    }
-    maker_venue_origin(&cfg.indexer_url)
-}
-
-fn enroll_url_from_config(cfg: &Config, override_url: Option<&str>) -> String {
-    format!(
-        "{}/v2/maker/enroll",
-        venue_origin_from_config(cfg, override_url)
-    )
 }
 
 async fn signer_for_bot(cfg: &Config, config_path: &Path) -> Result<DynSigner, ApiError> {
@@ -135,43 +45,55 @@ async fn signer_for_bot(cfg: &Config, config_path: &Path) -> Result<DynSigner, A
             let parsed = parse_private_key(&raw).map_err(ApiError::bad_request)?;
             Ok(Arc::new(LocalSigner::new(parsed)))
         }
-        _ => {
-            let restores = point_remote_signer_env(config_path);
-            let result = build_signer(cfg).await;
-            restores.undo();
-            result.map_err(|e| {
-                ApiError::bad_request(format!("could not build the bot signer: {e:#}"))
-            })
-        }
+        // Remote signers read their secret from the process env, which is right
+        // for the bot (one config per process) and wrong for the panel (one
+        // process, many bots). This used to set the env var, build, and restore
+        // it — but `build_signer` awaits in the middle, so two concurrent
+        // Connects for different bots interleaved: one built against the
+        // other's secret, and the restores wrote a stale bot-specific path
+        // back. Naming the file per call removes the shared channel rather than
+        // trying to serialize writes to it.
+        _ => build_signer_with(cfg, &secrets_beside(config_path))
+            .await
+            .map_err(|e| ApiError::bad_request(format!("could not build the bot signer: {e:#}"))),
     }
 }
 
-struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl EnvRestore {
-    fn undo(self) {
-        for (key, prev) in self.0 {
-            match prev {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
+/// The signer secrets sitting next to this bot's config, if any.
+fn secrets_beside(config_path: &Path) -> SignerSecrets {
+    SignerSecrets {
+        turnkey_api_private_key_file: provision::find_beside(config_path, "turnkey-api.key"),
+        mpcvault_api_token_file: provision::find_beside(config_path, "mpcvault-api.token"),
     }
 }
 
-fn point_remote_signer_env(config_path: &Path) -> EnvRestore {
-    let mut restores = Vec::new();
-    let set = |key: &'static str, path: &Path, restores: &mut Vec<_>| {
-        restores.push((key, std::env::var_os(key)));
-        std::env::set_var(key, path);
-    };
-    if let Some(path) = provision::find_beside(config_path, "turnkey-api.key") {
-        set("TURNKEY_API_PRIVATE_KEY_FILE", &path, &mut restores);
+/// A flat-layout Docker bot cannot see `rfq-api.key`.
+///
+/// `flat_bot_mounts` binds exactly two paths — `stitch.toml` and the signer
+/// secret — so the key Connect writes beside the host config never appears in
+/// the container, and `save_and_restart` restarts rather than recreates, so no
+/// new mount or env arrives either. Connecting anyway would report success,
+/// stamp `book_enabled = false`, and leave the bot with no RFQ *and* no ladder.
+///
+/// Recreating with an extra mount is not the escape hatch: flat layout keeps the
+/// slot-nonce ledger inside the container, which is why Update and Roll back
+/// already refuse it. Migration is the fix, same as those paths.
+///
+/// Docker only. In process mode the child reads the host config directly, so the
+/// sibling key resolves whatever the layout is.
+fn refuse_connect_on_unmigrated_flat_layout(
+    bot: &Bot,
+    runtime: crate::panel::PanelRuntime,
+) -> Result<(), ApiError> {
+    if runtime != crate::panel::PanelRuntime::Docker || bot.layout != Layout::FlatFiles {
+        return Ok(());
     }
-    if let Some(path) = provision::find_beside(config_path, "mpcvault-api.token") {
-        set("MPCVAULT_API_TOKEN_FILE", &path, &mut restores);
-    }
-    EnvRestore(restores)
+    Err(ApiError::conflict(format!(
+        "{} still uses the flat file layout, so its container only mounts stitch.toml and the \
+         signer key — it could not read the maker credential Connect writes. Migrate it to the \
+         per-bot directory layout first, then Connect.",
+        bot.name
+    )))
 }
 
 pub async fn enroll(
@@ -180,100 +102,21 @@ pub async fn enroll(
     Json(body): Json<EnrollBody>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
+    refuse_connect_on_unmigrated_flat_layout(&bot, state.cfg.runtime)?;
     let path = config_path(&bot)?;
     let current_toml = read_toml(&path)?;
     let cfg = Config::from_toml(&current_toml)
         .map_err(|e| ApiError::bad_request(format!("this config isn't valid: {e:#}")))?;
     let rfq_default = cfg.rfq_default_unlocked() || rfq_default_flag_in_dir(&state.cfg.bots_dir);
-    if !cfg.rfq_panel_unlocked() && !rfq_default {
-        return Err(ApiError::bad_request(format!(
-            "RFQ is locked on this bot. In the raw config set [experimental] rfq_panel = \"{RFQ_PANEL_GATE}\", \
-             or drop {gate} in {file} next to the bot folders.",
-            gate = crate::config::RFQ_DEFAULT_GATE,
-            file = crate::config::PANEL_FLAGS_FILE,
-        )));
-    }
 
     let signer = signer_for_bot(&cfg, &path).await?;
-    let address = signer.address();
-    let issued_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| ApiError::internal(&anyhow::anyhow!("{e}")))?
-        .as_millis() as u64;
-    let environment = maker_enroll_environment(cfg.chain_id);
-    let digest = maker_enroll_digest(environment, address, cfg.chain_id, issued_at);
-    let signature = signer
-        .sign_digest(digest)
+    let venue = crate::enroll::enroll_url_from_config(&cfg, body.venue_url.as_deref());
+    let enrolled = crate::enroll::register_maker(&cfg, &signer, &venue)
         .await
-        .map_err(|e| ApiError::bad_request(format!("signing enroll failed: {e:#}")))?;
-
-    let venue = enroll_url_from_config(&cfg, body.venue_url.as_deref());
-    let payload = json!({
-        "chainId": cfg.chain_id,
-        "signingAddress": format!("{address:?}"),
-        "issuedAt": issued_at,
-        "signature": hex::encode_prefixed(signature),
-    });
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| ApiError::internal(&anyhow::anyhow!("enroll HTTP client: {e}")))?;
-    let response = client
-        .post(&venue)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| {
-            ApiError::bad_request(format!("could not reach Textile enroll at {venue}: {e}"))
-        })?;
-    let status = response.status();
-    let text = response.text().await.map_err(|e| {
-        ApiError::bad_request(format!("Textile enroll returned an unreadable body: {e}"))
-    })?;
-    if !status.is_success() {
-        let message = venue_error_message(&text)
-            .unwrap_or_else(|| format!("Textile enroll failed ({status})"));
-        return Err(ApiError::bad_request(message));
-    }
-    let enrolled: EnrollResponse = serde_json::from_str(&text).map_err(|e| {
-        ApiError::bad_request(format!("Textile enroll returned an unexpected body: {e}"))
-    })?;
-    if enrolled.api_key.trim().is_empty() || enrolled.maker_id.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "Textile enroll did not return a maker id and key",
-        ));
-    }
-
-    let configured = setup::identify_corridor(&current_toml).map(|c| c.id.to_string());
-    let pool = cfg
-        .pools
-        .first()
-        .map(|p| (p.collateral.as_str(), p.debt.as_str()));
-    let corridor = pick_enroll_corridor(
-        enrolled.flagged,
-        configured.as_deref(),
-        pool,
-        &enrolled.corridors,
-        &enrolled.corridor_pairs,
-    );
-    let waiting = corridor.is_none();
-    let corridor = corridor.unwrap_or_default();
-
-    let current = setup::read_settings_at(&current_toml, 0).map_err(ApiError::bad_request)?;
-    // Empty / flagged: keep the credential, do not start RFQ, and restore
-    // the book on an RFQ-default bot so it is not dark.
-    let patch = setup::rfq_connect_patch(
-        &current,
-        enrolled.stream_url.clone(),
-        enrolled.maker_id.clone(),
-        enrolled.validation_contract.clone().unwrap_or_default(),
-        corridor,
-        rfq_default,
-        !waiting,
-    );
-    let edited = setup::apply_settings(&current_toml, &patch)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let (edited, outcome) =
+        crate::enroll::apply_enrollment(&current_toml, &cfg, &enrolled, rfq_default)
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
     let dir = path.parent().ok_or_else(|| {
         ApiError::internal(&anyhow::anyhow!(
@@ -293,26 +136,24 @@ pub async fn enroll(
     )
     .map_err(|e| ApiError::internal(&e))?;
 
-    let message = if enrolled.flagged {
-        format!(
-            "Registered as {} ({}). Textile has flagged this maker — you will not receive private quotes.",
+    let message = match outcome {
+        crate::enroll::EnrollOutcome::Flagged => format!(
+            "Registered as {} ({}). Textile has flagged this maker — you will not receive Swap quotes.",
             enrolled.maker_slug, enrolled.environment
-        )
-    } else if waiting {
-        format!(
-            "Registered as {} ({}). Request access so Textile can review this maker. You will not receive private quotes until they approve you.",
+        ),
+        crate::enroll::EnrollOutcome::Waiting => format!(
+            "Registered as {} ({}). Request access so Textile can review this maker. You will \
+             not receive Swap quotes until they approve you.",
             enrolled.maker_slug, enrolled.environment
-        )
-    } else if rfq_default {
-        format!(
-            "Connected to Textile as {} ({}). This bot now quotes RFQ only — it will not rest orders on the public book.",
+        ),
+        crate::enroll::EnrollOutcome::Live if rfq_default => format!(
+            "Connected to Textile as {} ({}). This bot now quotes Swap only — it will not rest orders on the public book.",
             enrolled.maker_slug, enrolled.environment
-        )
-    } else {
-        format!(
+        ),
+        crate::enroll::EnrollOutcome::Live => format!(
             "Connected to Textile as {} ({}).",
             enrolled.maker_slug, enrolled.environment
-        )
+        ),
     };
 
     save_and_restart(
@@ -334,177 +175,14 @@ pub async fn enroll(
     .await
 }
 
-/// Live only when the venue seated the pair this bot is configured for.
-/// A chain-level Dual-run list can include other pairs; binding one of
-/// those slugs would disable the book and then reject every quote.
-///
-/// Token match wins so a custom (non-catalog) pool can still go live.
-/// Catalog-id match is the fallback for older enroll payloads that only
-/// send slugs.
-pub(super) fn pick_enroll_corridor(
-    flagged: bool,
-    configured: Option<&str>,
-    pool: Option<(&str, &str)>,
-    corridors: &[String],
-    pairs: &[EnrollCorridorPair],
-) -> Option<String> {
-    if flagged {
-        return None;
-    }
-    if let Some((collateral, debt)) = pool {
-        if let Some(pair) = pairs
-            .iter()
-            .find(|p| tokens_match(collateral, debt, &p.collateral_token, &p.debt_token))
-        {
-            return Some(pair.slug.clone());
-        }
-    }
-    configured.and_then(|id| corridors.iter().find(|c| c.as_str() == id).cloned())
-}
-
-fn tokens_match(coll_a: &str, debt_a: &str, coll_b: &str, debt_b: &str) -> bool {
-    (eq_addr(coll_a, coll_b) && eq_addr(debt_a, debt_b))
-        || (eq_addr(coll_a, debt_b) && eq_addr(debt_a, coll_b))
-}
-
-fn eq_addr(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
-}
-
-pub(super) fn venue_error_message(body: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(body).ok()?;
-    v.get("error")
-        .and_then(|e| e.get("message").or(Some(e)))
-        .and_then(|m| m.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            v.get("message")
-                .and_then(|m| m.as_str())
-                .map(|s| s.to_string())
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pair(slug: &str, collateral: &str, debt: &str) -> EnrollCorridorPair {
-        EnrollCorridorPair {
-            slug: slug.into(),
-            collateral_token: collateral.into(),
-            debt_token: debt.into(),
-        }
-    }
+    use serde_json::Value;
 
-    #[test]
-    fn pick_enroll_corridor_requires_the_configured_pair() {
-        let empty: &[EnrollCorridorPair] = &[];
-        assert_eq!(
-            pick_enroll_corridor(
-                false,
-                Some("cngn-usdt-bsc"),
-                None,
-                &["cngn-usdt-bsc".into()],
-                empty,
-            ),
-            Some("cngn-usdt-bsc".into())
-        );
-        assert_eq!(
-            pick_enroll_corridor(
-                false,
-                Some("cngn-usdt-bsc"),
-                None,
-                &["wars-usdt-bsc".into()],
-                empty,
-            ),
-            None
-        );
-        assert_eq!(
-            pick_enroll_corridor(
-                true,
-                Some("cngn-usdt-bsc"),
-                None,
-                &["cngn-usdt-bsc".into()],
-                empty,
-            ),
-            None
-        );
-        assert_eq!(
-            pick_enroll_corridor(false, None, None, &["cngn-usdt-bsc".into()], empty),
-            None
-        );
-    }
-
-    #[test]
-    fn pick_enroll_corridor_matches_custom_tokens() {
-        let seats = [pair(
-            "ops-custom-bsc",
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        )];
-        assert_eq!(
-            pick_enroll_corridor(
-                false,
-                None,
-                Some((
-                    "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa",
-                    "0xBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBb",
-                )),
-                &["ops-custom-bsc".into()],
-                &seats,
-            ),
-            Some("ops-custom-bsc".into())
-        );
-        assert_eq!(
-            pick_enroll_corridor(
-                false,
-                None,
-                Some((
-                    "0xcccccccccccccccccccccccccccccccccccccccc",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                )),
-                &["ops-custom-bsc".into()],
-                &seats,
-            ),
-            None
-        );
-        assert_eq!(
-            pick_enroll_corridor(
-                true,
-                None,
-                Some((
-                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                )),
-                &["ops-custom-bsc".into()],
-                &seats,
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn enroll_url_from_stream_and_origin() {
-        assert_eq!(
-            maker_enroll_url("wss://api.textilecredit.com/v2/maker/stream"),
-            "https://api.textilecredit.com/v2/maker/enroll"
-        );
-        assert_eq!(
-            maker_enroll_url("ws://localhost:10000/v2/maker/stream"),
-            "http://localhost:10000/v2/maker/enroll"
-        );
-        assert_eq!(
-            maker_enroll_url("https://api.textilecredit.com"),
-            "https://api.textilecredit.com/v2/maker/enroll"
-        );
-        assert_eq!(
-            maker_enroll_url("https://api.textilecredit.com/v2/maker/enroll"),
-            "https://api.textilecredit.com/v2/maker/enroll"
-        );
-    }
-
-    use super::super::testkit::{harness, Harness, TEST_KEY};
-    use crate::panel::docker::fake::{container, dir_layout_mounts};
+    use super::super::testkit::{harness, harness_process, Harness, TEST_KEY};
+    use crate::panel::docker::fake::{container, dir_layout_mounts, flat_layout_mounts};
     use crate::panel::docker::ContainerState;
     use crate::panel::naming::LABEL_BOT;
     use axum::http::StatusCode;
@@ -521,12 +199,66 @@ mod tests {
         h.docker.add_container(c);
     }
 
+    /// An adopted bot still on the flat file layout: config and key sit in the
+    /// bots root under per-bot names, and the container mounts just those two.
+    fn seed_flat(h: &Harness, name: &str) {
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        std::fs::write(
+            h.root.join(format!("stitch.{name}.toml")),
+            corridor.toml_template,
+        )
+        .unwrap();
+        std::fs::write(h.root.join(format!("stitch.{name}.key")), TEST_KEY).unwrap();
+        let mut c = container(&format!("stitch-{name}"), ContainerState::Running);
+        c.labels.insert(LABEL_BOT.to_string(), name.to_string());
+        c.mounts = flat_layout_mounts(&h.root.display().to_string(), name);
+        h.docker.add_container(c);
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_a_flat_layout_docker_bot() {
+        // The container mounts only stitch.toml and the signer key, so the
+        // rfq-api.key Connect writes beside the host config is invisible to it —
+        // and a restart brings no new mount. Connecting would report success and
+        // leave the bot with neither RFQ nor its ladder.
+        let h = harness("rfq-enroll-flat");
+        seed_flat(&h, "bot1");
+
+        let (status, body) = h.post_json("/api/bots/bot1/rfq/enroll", json!({})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("flat file layout"), "{body}");
+        assert!(body.contains("Migrate"), "{body}");
+        assert!(
+            !h.root.join("rfq-api.key").exists(),
+            "nothing may be written before the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_allows_a_flat_layout_bot_in_process_mode() {
+        // No container, no mounts: the child reads the host config directly, so
+        // the sibling key resolves whatever the layout is. Refusing here would
+        // block a bot that would have quoted.
+        let h = harness_process("rfq-enroll-flat-process");
+        seed_flat(&h, "bot1");
+        let (venue, _server) =
+            mock_venue("tx_live_enroll_secret", vec!["cngn-usdt-bsc"], false).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot1/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     fn unlock_rfq_panel(h: &Harness, name: &str) {
         let path = h.root.join(name).join("stitch.toml");
         let toml = std::fs::read_to_string(&path).unwrap();
         std::fs::write(
             &path,
-            format!("{toml}\n[experimental]\nrfq_panel = \"{RFQ_PANEL_GATE}\"\n"),
+            format!(
+                "{toml}\n[experimental]\nrfq_panel = \"{}\"\n",
+                crate::config::RFQ_PANEL_GATE
+            ),
         )
         .unwrap();
     }
@@ -576,15 +308,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_refuses_when_the_panel_gate_is_locked() {
-        let h = harness("rfq-enroll-locked");
+    async fn connect_does_not_require_a_gate_token() {
+        let h = harness("rfq-enroll-unlocked");
         seed(&h, "bot-a");
-        let (status, body) = h.post_json("/api/bots/bot-a/rfq/enroll", json!({})).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(
-            body.contains(RFQ_PANEL_GATE),
-            "the error must name the raw-config token: {body}"
-        );
+        let (venue, _server) =
+            mock_venue("tx_live_enroll_secret", vec!["cngn-usdt-bsc"], false).await;
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/enroll", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(Harness::parse(&body)["settings"]["rfqEnabled"], true);
     }
 
     #[tokio::test]
@@ -620,8 +353,8 @@ mod tests {
         assert!(toml.contains("clmakerenroll1"));
         assert!(!toml.contains("tx_live_enroll_secret"));
         assert!(
-            !toml.contains("book_enabled = false"),
-            "without the default gate, Connect must leave the public ladder on"
+            toml.contains("book_enabled = false"),
+            "Connect writes RFQ-only"
         );
 
         let (status, body) = h.get("/api/bots/bot-a/settings").await;
@@ -692,7 +425,7 @@ mod tests {
         let v = Harness::parse(&body);
         assert_eq!(v["settings"]["rfqEnabled"], false);
         assert_eq!(v["settings"]["rfqCorridor"], "");
-        assert_eq!(v["settings"]["bookEnabled"], true);
+        assert_eq!(v["settings"]["bookEnabled"], false);
     }
 
     #[tokio::test]
@@ -777,7 +510,7 @@ mod tests {
         let v = Harness::parse(&body);
         assert_eq!(v["settings"]["bookEnabled"], false);
         assert_eq!(v["settings"]["rfqDefaultUnlocked"], true);
-        assert!(v["message"].as_str().unwrap().contains("RFQ only"));
+        assert!(v["message"].as_str().unwrap().contains("Swap only"));
         let toml = std::fs::read_to_string(&path).unwrap();
         assert!(toml.contains("book_enabled = false"));
     }
@@ -799,12 +532,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
         assert_eq!(v["settings"]["rfqEnabled"], false);
-        assert_eq!(v["settings"]["bookEnabled"], true);
+        assert_eq!(v["settings"]["bookEnabled"], false);
         assert_eq!(v["enrollment"]["flagged"], true);
         let toml = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !toml.contains("book_enabled = false"),
-            "flagged RFQ-default reconnect must restore the book: {toml}"
+            toml.contains("book_enabled = false"),
+            "flagged reconnect must not turn the book back on: {toml}"
         );
     }
 

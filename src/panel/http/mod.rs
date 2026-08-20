@@ -362,6 +362,21 @@ pub(crate) mod testkit {
     /// A hardhat test key. Public, funded on nobody's mainnet.
     pub const TEST_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+    /// Catalog templates are RFQ-only. Lifecycle fixtures model leftover book
+    /// bots so Start still works without Connect.
+    pub fn keep_book_on(toml_path: &std::path::Path) {
+        let toml = std::fs::read_to_string(toml_path).expect("reading stitch.toml");
+        let mut next = toml
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("book_enabled"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if toml.ends_with('\n') {
+            next.push('\n');
+        }
+        std::fs::write(toml_path, next).expect("restoring leftover book-on");
+    }
+
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     /// A private temp directory for one test.
@@ -392,6 +407,18 @@ pub(crate) mod testkit {
     /// Same as [`harness`], with a caller-chosen `STITCH_PANEL_BOT_IMAGE`.
     pub fn harness_with_bot_image(tag: &str, bot_image: &str) -> Harness {
         harness_with(tag, bot_image, None)
+    }
+
+    /// A process-runtime panel (the Desktop app and `STITCH_PANEL_RUNTIME=process`).
+    /// Bots run as child processes that inherit the panel env and get their
+    /// `stitch.env` applied, which changes what counts as a live credential.
+    pub fn harness_process(tag: &str) -> Harness {
+        let mut h = harness(tag);
+        let mut cfg = (*h.state.cfg).clone();
+        cfg.runtime = crate::panel::PanelRuntime::Process;
+        h.state.cfg = std::sync::Arc::new(cfg);
+        h.app = router(h.state.clone());
+        h
     }
 
     /// Same as [`harness`], with optional overrides for bot image and docker socket.

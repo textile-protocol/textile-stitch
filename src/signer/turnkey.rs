@@ -18,9 +18,7 @@ use turnkey_client::generated::immutable::common::v1::{HashFunction, PayloadEnco
 use turnkey_client::generated::SignRawPayloadIntentV2;
 use turnkey_client::{TurnkeyClient, TurnkeyP256ApiKey};
 
-use super::{
-    finalize_signature, parse_address, parse_hex32, parse_v, read_env_secret, Signer, TurnkeyConfig,
-};
+use super::{finalize_signature, parse_address, parse_hex32, parse_v, Signer, TurnkeyConfig};
 
 /// Public key of the Turnkey API key pair (not secret).
 const API_PUBLIC_KEY_ENV: &str = "TURNKEY_API_PUBLIC_KEY";
@@ -39,8 +37,17 @@ pub struct TurnkeySigner {
 impl TurnkeySigner {
     /// Build from config + the API key pair in the environment.
     pub fn from_config(cfg: &TurnkeyConfig) -> anyhow::Result<Self> {
+        Self::from_config_with(cfg, &super::SignerSecrets::default())
+    }
+
+    /// [`Self::from_config`] with an explicit API-key file. See
+    /// [`super::SignerSecrets`].
+    pub fn from_config_with(
+        cfg: &TurnkeyConfig,
+        secrets: &super::SignerSecrets,
+    ) -> anyhow::Result<Self> {
         super::validate_signer_api_base_url("turnkey", &cfg.api_base_url)?;
-        let api_key = load_api_key()?;
+        let api_key = load_api_key(secrets.turnkey_api_private_key_file.as_deref())?;
         let client = TurnkeyClient::builder()
             .api_key(api_key)
             .base_url(cfg.api_base_url.clone())
@@ -91,9 +98,13 @@ impl Signer for TurnkeySigner {
     }
 }
 
-fn load_api_key() -> anyhow::Result<TurnkeyP256ApiKey> {
-    let private = read_env_secret(API_PRIVATE_KEY_FILE_ENV, API_PRIVATE_KEY_ENV)
-        .context("Turnkey API private key")?;
+fn load_api_key(private_key_file: Option<&std::path::Path>) -> anyhow::Result<TurnkeyP256ApiKey> {
+    let private = super::read_secret(
+        private_key_file,
+        API_PRIVATE_KEY_FILE_ENV,
+        API_PRIVATE_KEY_ENV,
+    )
+    .context("Turnkey API private key")?;
     let public = std::env::var(API_PUBLIC_KEY_ENV)
         .ok()
         .map(|s| s.trim().to_string())

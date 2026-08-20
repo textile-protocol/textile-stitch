@@ -454,6 +454,97 @@ impl SettingsUpdate {
     }
 }
 
+/// Turning the legacy public ladder back on only means something if a side can
+/// actually post. `quote_side` needs a spread *and* a size (an order size, or a
+/// total-liquidity + min-slice ladder) — see `PoolConfig::buy_enabled`. Flipping
+/// `book_enabled` on a pool with neither would leave the bot running, restarted,
+/// and quoting nothing, which is exactly the silent-idle failure the Start guard
+/// exists to prevent.
+///
+/// Only fires when the operator asks to turn it *on* (`Some(true)`). An ordinary
+/// save on a bot that already has the ladder on is none of this function's
+/// business — refusing there would block edits to an existing config.
+fn refuse_book_on_without_a_postable_side(
+    patch: &setup::SettingsPatch,
+    edited: &str,
+) -> Result<(), ApiError> {
+    if patch.book_enabled != Some(true) {
+        return Ok(());
+    }
+    let cfg = crate::config::Config::from_toml(edited)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // Any pool, not just the edited one: `book_enabled` is bot-wide, so a
+    // multi-pool bot with one postable side does post.
+    if cfg
+        .pools
+        .iter()
+        .any(|p| p.tokens_parse() && (p.buy_postable() || p.sell_postable()))
+    {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "The public ladder needs a spread and a positive size on at least one side before it can \
+         post anything. Set the buy/sell sizing on the Raw config tab (buy_total_liquidity_debt + \
+         buy_min_slice_debt, or buy_order_size_debt — same for the sell side), then turn the \
+         ladder on."
+            .to_string(),
+    ))
+}
+
+/// The mirror of [`refuse_book_on_without_a_postable_side`]: turning the ladder
+/// *off* on a bot whose only working leg was the ladder.
+///
+/// The save restarts the bot, so it comes back with nothing to do — running,
+/// and quoting nothing. Start and Restart already refuse to put a bot in that
+/// state; a Settings save is the third door into it, and the Legacy card makes
+/// it a one-click door.
+///
+/// Scoped to the ladder on→off transition on purpose, and *not* generalised to
+/// every edit that removes a leg. Switching the ladder off is presented as a
+/// migration — "Switch to RFQ only" — where the operator's intent is to keep
+/// trading, so landing dead contradicts what they asked for. Explicitly
+/// toggling a leg off (the RFQ switch, the taker switch) is the opposite: the
+/// operator is saying "stop doing this", and refusing would trap them into
+/// giving the bot another leg first. `disabling_a_taker_next_to_a_live_sibling`
+/// is the case that keeps this honest.
+///
+/// Keyed on the transition, not the resulting state: a bot already RFQ-only
+/// sends `bookEnabled: false` on every ordinary save, and refusing those would
+/// trap the operator in the one screen where they would fix it.
+fn refuse_book_off_that_kills_the_last_leg(
+    patch: &setup::SettingsPatch,
+    current: &str,
+    edited: &str,
+    path: &std::path::Path,
+    runtime: crate::panel::PanelRuntime,
+    incoming_key: bool,
+) -> Result<(), ApiError> {
+    if patch.book_enabled != Some(false) {
+        return Ok(());
+    }
+    let ladder_was_on = crate::config::Config::from_toml(current).is_ok_and(|c| c.book_enabled);
+    if !ladder_was_on {
+        return Ok(());
+    }
+    let cfg = crate::config::Config::from_toml(edited)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // The credential is written further down, after these guards, so a save
+    // that pastes the key *and* leaves the ladder in one go would otherwise be
+    // judged against the disk as it was before the request. That save is the
+    // whole migration in one click, and refusing it would be wrong. The key
+    // only stands in for the credential — `[rfq]` still has to be active and
+    // quotable, or some other leg runnable.
+    if super::bots::config_has_a_live_leg_with(&cfg, path, runtime, incoming_key) {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "Turning the public ladder off would leave this bot with nothing to do: RFQ has no maker \
+         credential yet and no other leg is configured. Connect it to Textile first, then switch \
+         the ladder off."
+            .to_string(),
+    ))
+}
+
 pub async fn update(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
@@ -479,6 +570,20 @@ pub async fn update(
     // "edited config is not valid" alone doesn't name the field that failed.
     let edited = setup::apply_settings(&current_toml, &patch)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    refuse_book_on_without_a_postable_side(&patch, &edited)?;
+    let incoming_rfq_key = body
+        .rfq_api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|k| !k.is_empty());
+    refuse_book_off_that_kills_the_last_leg(
+        &patch,
+        &current_toml,
+        &edited,
+        &path,
+        state.cfg.runtime,
+        incoming_rfq_key,
+    )?;
 
     if let Some(key) = body
         .rfq_api_key
@@ -1122,7 +1227,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
         assert_eq!(v["rfqEnabled"], false);
-        assert_eq!(v["rfqPanelUnlocked"], false);
+        assert_eq!(v["rfqPanelUnlocked"], true);
         assert_eq!(v["rfqUrl"], "");
         assert_eq!(v["rfqMakerId"], "");
         assert_eq!(v["rfqCorridor"], "");
@@ -1194,29 +1299,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfq_panel_stays_locked_until_the_raw_config_token() {
+    async fn rfq_panel_is_always_unlocked() {
         let h = harness("settings-rfq-panel-gate");
         seed(&h, "bot-a");
         let (status, body) = h.get("/api/bots/bot-a/settings").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(Harness::parse(&body)["rfqPanelUnlocked"], false);
-
-        let path = h.root.join("bot-a").join("stitch.toml");
-        let toml = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(
-            &path,
-            format!(
-                "{toml}\n[experimental]\nrfq_panel = \"{}\"\n",
-                crate::config::RFQ_PANEL_GATE
-            ),
-        )
-        .unwrap();
-
-        let (status, body) = h.get("/api/bots/bot-a/settings").await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(Harness::parse(&body)["rfqPanelUnlocked"], true);
-        assert_eq!(Harness::parse(&body)["rfqDefaultUnlocked"], false);
-        assert_eq!(Harness::parse(&body)["bookEnabled"], true);
+        let v = Harness::parse(&body);
+        assert_eq!(v["rfqPanelUnlocked"], true);
+        assert_eq!(v["rfqDefaultUnlocked"], true);
     }
 
     #[tokio::test]
@@ -1237,7 +1327,7 @@ mod tests {
         let v = Harness::parse(&body);
         assert_eq!(v["rfqPanelUnlocked"], true);
         assert_eq!(v["rfqDefaultUnlocked"], true);
-        assert_eq!(v["bookEnabled"], true);
+        assert_eq!(v["bookEnabled"], false);
 
         let (status, body) = h
             .patch_json("/api/bots/bot-a/settings", json!({ "bookEnabled": false }))
@@ -1246,6 +1336,222 @@ mod tests {
         assert_eq!(Harness::parse(&body)["settings"]["bookEnabled"], false);
         let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
         assert!(toml.contains("book_enabled = false"));
+    }
+
+    #[tokio::test]
+    async fn the_legacy_card_can_put_a_migrated_bot_back_on_the_ladder() {
+        // New bots are RFQ-only. Turning `book_enabled` back on has to remove
+        // the key (the config default is true) and restart the bot, so the
+        // ladder is genuinely live rather than just reported as on.
+        let h = harness("settings-book-back-on");
+        seed(&h, "bot-a");
+        let config = h.root.join("bot-a/stitch.toml");
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("book_enabled = false"),
+            "the catalog template ships RFQ-only"
+        );
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "bookEnabled": true }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(Harness::parse(&body)["settings"]["bookEnabled"], true);
+
+        let toml = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !toml.contains("book_enabled"),
+            "on is the absent-key default, not a written true: {toml}"
+        );
+        let cfg = crate::config::Config::from_toml(&toml).unwrap();
+        assert!(cfg.book_enabled);
+        assert!(
+            cfg.pools[0].buy_enabled() && cfg.pools[0].sell_enabled(),
+            "the ladder must actually be postable after the flip"
+        );
+        assert!(
+            h.docker.calls().iter().any(|c| matches!(
+                c,
+                Call::Restart { name, .. } if name == "stitch-bot-a"
+            )),
+            "the running bot has to be restarted to pick the ladder up: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_the_ladder_on_is_refused_when_no_side_can_post() {
+        // A spread with no size rests nothing. Allowing the flip would restart
+        // the bot into quoting neither RFQ nor a book.
+        let h = harness("settings-book-no-size");
+        seed(&h, "bot-a");
+        let config = h.root.join("bot-a/stitch.toml");
+        let stripped = std::fs::read_to_string(&config)
+            .unwrap()
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("buy_total_liquidity_debt")
+                    && !t.starts_with("buy_min_slice_debt")
+                    && !t.starts_with("buy_order_size_debt")
+                    && !t.starts_with("sell_total_liquidity_collateral")
+                    && !t.starts_with("sell_min_slice_debt")
+                    && !t.starts_with("sell_order_size_collateral")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&config, stripped).unwrap();
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "bookEnabled": true }))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("spread and a positive size"), "{body}");
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("book_enabled = false"),
+            "a refused flip must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_the_ladder_off_is_refused_when_it_was_the_only_leg() {
+        // A leftover book bot with no maker credential: switching the ladder
+        // off restarts it into quoting nothing. Start and Restart already
+        // refuse that state; the Settings save is the third door into it.
+        let h = harness("settings-book-off-last-leg");
+        seed(&h, "bot-a");
+        let config = h.root.join("bot-a/stitch.toml");
+        super::super::testkit::keep_book_on(&config);
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "bookEnabled": false }))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("nothing to do"), "{body}");
+        assert!(
+            !std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("book_enabled = false"),
+            "a refused switch must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_the_ladder_off_is_allowed_when_another_leg_survives() {
+        // The taker leg runs independently of both the ladder and RFQ, so this
+        // bot still trades after the switch and the save must go through.
+        let h = harness("settings-book-off-taker");
+        seed(&h, "bot-a");
+        let config = h.root.join("bot-a/stitch.toml");
+        super::super::testkit::keep_book_on(&config);
+        let toml = std::fs::read_to_string(&config).unwrap() + "\nlimit_taker_enabled = true\n";
+        std::fs::write(&config, toml).unwrap();
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "bookEnabled": false }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("book_enabled = false"));
+    }
+
+    #[tokio::test]
+    async fn the_ladder_can_be_switched_off_in_the_same_save_that_writes_the_key() {
+        // The whole migration in one click: paste the credential and leave the
+        // book together. The guard runs before `write_rfq_api_key`, so judging
+        // it against the disk alone would refuse the save that fixes the bot.
+        let h = harness("settings-book-off-with-key");
+        seed(&h, "bot-a");
+        let config = h.root.join("bot-a/stitch.toml");
+        super::super::testkit::keep_book_on(&config);
+        let toml = std::fs::read_to_string(&config).unwrap()
+            + "\n[rfq]\nenabled = true\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\n\
+               maker_id = \"mk_test\"\n\
+               validation_contract = \"0x00000000000000000000000000000000000000aa\"\n";
+        std::fs::write(&config, toml).unwrap();
+
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "bookEnabled": false, "rfqApiKey": "tx_live_secret" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("book_enabled = false"));
+        assert!(
+            setup::rfq_api_key_is_set(h.root.join("bot-a")),
+            "the credential from the same request must be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_rfq_off_is_allowed_even_when_it_was_the_only_leg() {
+        // Deliberate: the operator flipping "Answer Swap quote requests" off is
+        // saying stop, not asking to migrate. Refusing would trap them into
+        // giving the bot another leg first. Start and Restart still refuse to
+        // bring the result back up, which is where that belongs.
+        let h = harness("settings-rfq-off-allowed");
+        seed(&h, "bot-a");
+        let dir = h.root.join("bot-a");
+        let config = dir.join("stitch.toml");
+        let toml = std::fs::read_to_string(&config).unwrap()
+            + "\n[rfq]\nenabled = true\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\n\
+               maker_id = \"mk_test\"\n\
+               validation_contract = \"0x00000000000000000000000000000000000000aa\"\n";
+        std::fs::write(&config, toml).unwrap();
+        setup::write_rfq_api_key(&dir, "tx_live_secret").unwrap();
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "rfqEnabled": false }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_already_dead_bot_can_still_be_edited() {
+        // The trap this guard has to avoid: a bot with no live leg sends its
+        // dead config back on every ordinary save. Settings is where an
+        // operator fixes it, so those saves must go through.
+        let h = harness("settings-dead-bot-editable");
+        seed(&h, "bot-a"); // template: book off, no [rfq], no credential
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "ttlSecs": 90 }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(Harness::parse(&body)["settings"]["ttlSecs"], 90);
+    }
+
+    #[tokio::test]
+    async fn turning_the_ladder_on_is_refused_when_the_sizes_are_zero() {
+        // A present-but-zero size passes a presence check but drafts no orders:
+        // the ladder builder finds nothing above the minimum slice.
+        let h = harness("settings-book-zero-size");
+        seed(&h, "bot-a");
+        let config = h.root.join("bot-a/stitch.toml");
+        let zeroed = std::fs::read_to_string(&config)
+            .unwrap()
+            .replace(
+                "buy_total_liquidity_debt = \"max\"",
+                "buy_total_liquidity_debt = \"0\"",
+            )
+            .replace(
+                "sell_total_liquidity_collateral = \"max\"",
+                "sell_total_liquidity_collateral = \"0\"",
+            );
+        std::fs::write(&config, zeroed).unwrap();
+
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "bookEnabled": true }))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("positive size"), "{body}");
     }
 
     #[tokio::test]

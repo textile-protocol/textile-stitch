@@ -12,13 +12,13 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::enroll::{
-    maker_access_request_url, maker_access_status_url, pick_enroll_corridor, venue_error_message,
-    venue_origin_from_config, EnrollCorridorPair,
-};
 use super::settings::{config_path, read_toml, save_and_restart};
 use super::{ApiError, AppState};
 use crate::config::{rfq_default_flag_in_dir, Config};
+use crate::enroll::{
+    apply_enrollment, maker_access_request_url, maker_access_status_url, venue_error_message,
+    venue_origin_from_config, EnrollCorridorPair, EnrollOutcome, EnrollResponse,
+};
 use crate::setup;
 
 #[derive(Deserialize, Default)]
@@ -229,24 +229,44 @@ pub async fn access_status(
         .into_response());
     }
 
-    let configured = setup::identify_corridor(&current_toml).map(|c| c.id.to_string());
-    let pool = cfg
-        .pools
-        .first()
-        .map(|p| (p.collateral.as_str(), p.debt.as_str()));
-    let corridor = pick_enroll_corridor(
-        reported.flagged,
-        configured.as_deref(),
-        pool,
-        &reported.corridors,
-        &reported.corridor_pairs,
-    );
-    let waiting = corridor.is_none();
-    let corridor = corridor.unwrap_or_default();
-    if waiting {
+    // Seat through the same code Connect uses. Check status is the second door
+    // onto one decision — which pools get a slug, and whether that's enough to
+    // turn RFQ on and the ladder off — and a hand-rolled copy here drifted:
+    // it seated only the first pool and called any slug live, so it could take
+    // the ladder down for a pool that can't quote, or sit at Waiting while a
+    // later pool was the seated one.
+    //
+    // Approval doesn't rotate the key, and the venue may omit fields it isn't
+    // changing, so blanks fall back to what's already in the config rather than
+    // erasing it.
+    let current = setup::read_settings_at(&current_toml, 0).map_err(ApiError::bad_request)?;
+    let enrolled = EnrollResponse {
+        maker_id: if reported.maker_id.trim().is_empty() {
+            current.rfq_maker_id.clone()
+        } else {
+            reported.maker_id.clone()
+        },
+        maker_slug: reported.maker_slug.clone(),
+        environment: reported.environment.clone(),
+        api_key: String::new(),
+        stream_url: reported.stream_url.clone(),
+        validation_contract: Some(
+            reported
+                .validation_contract
+                .clone()
+                .unwrap_or_else(|| current.rfq_validation_contract.clone()),
+        ),
+        corridors: reported.corridors.clone(),
+        corridor_pairs: reported.corridor_pairs.clone(),
+        flagged: reported.flagged,
+    };
+    let (edited, outcome) = apply_enrollment(&current_toml, &cfg, &enrolled, rfq_default)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+
+    if outcome != EnrollOutcome::Live {
         return Ok(Json(json!({
             "message": format!(
-                "Textile approved {} but this bot's pair is not on an RFQ corridor yet.",
+                "Textile approved {} but this bot cannot quote on it yet: no pool is both seated on an RFQ corridor and able to build a book with funds behind it.",
                 reported.maker_slug
             ),
             "accessStatus": "APPROVED",
@@ -259,26 +279,6 @@ pub async fn access_status(
         }))
         .into_response());
     }
-
-    let current = setup::read_settings_at(&current_toml, 0).map_err(ApiError::bad_request)?;
-    let patch = setup::rfq_connect_patch(
-        &current,
-        reported.stream_url.clone(),
-        if reported.maker_id.trim().is_empty() {
-            current.rfq_maker_id.clone()
-        } else {
-            reported.maker_id.clone()
-        },
-        reported
-            .validation_contract
-            .clone()
-            .unwrap_or(current.rfq_validation_contract.clone()),
-        corridor,
-        rfq_default,
-        true,
-    );
-    let edited = setup::apply_settings(&current_toml, &patch)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
     save_and_restart(
         &state,
@@ -305,10 +305,10 @@ pub async fn access_status(
 
 #[cfg(test)]
 mod tests {
-    use super::super::enroll::maker_enroll_url;
     use super::super::testkit::{harness, Harness, TEST_KEY};
     use super::*;
     use crate::config::RFQ_PANEL_GATE;
+    use crate::enroll::maker_enroll_url;
     use crate::panel::docker::fake::{container, dir_layout_mounts};
     use crate::panel::docker::ContainerState;
     use crate::panel::naming::LABEL_BOT;
@@ -498,5 +498,63 @@ mod tests {
         assert_eq!(v["settings"]["rfqEnabled"], true);
         assert_eq!(v["settings"]["rfqCorridor"], "cngn-usdt-bsc");
         assert!(!body.contains("tx_live_enroll_secret"));
+    }
+
+    #[tokio::test]
+    async fn check_status_does_not_go_live_on_a_pool_that_cannot_quote() {
+        // Check status is the second door onto the decision Connect makes, so
+        // it seats through `apply_enrollment` rather than its own copy. An
+        // approval on a pool with no capacity is not a reason to enable RFQ and
+        // take the ladder down: the bot would then quote on neither surface.
+        let h = harness("rfq-access-no-capacity");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
+        let toml_path = h.root.join("bot-a").join("stitch.toml");
+        let toml = std::fs::read_to_string(&toml_path)
+            .unwrap()
+            // No capacity on either side...
+            .replace(
+                "buy_total_liquidity_debt = \"max\"",
+                "buy_total_liquidity_debt = \"0\"",
+            )
+            .replace(
+                "sell_total_liquidity_collateral = \"max\"",
+                "sell_total_liquidity_collateral = \"0\"",
+            )
+            // ...and the ladder on, so "left alone" is observable.
+            .replace("book_enabled = false", "book_enabled = true");
+        std::fs::write(
+            &toml_path,
+            format!(
+                "{toml}\n[rfq]\nenabled = false\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\nmaker_id = \"clmakerenroll1\"\nvalidation_contract = \"0xBCA5E344077AaC751A1C548a45F28215bB7ec165\"\n"
+            ),
+        )
+        .unwrap();
+        let (venue, _server) = mock_access_venue(
+            "tx_live_enroll_secret",
+            "APPROVED",
+            false,
+            vec!["cngn-usdt-bsc"],
+        )
+        .await;
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/rfq/access-status",
+                json!({ "venueUrl": venue }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["accessStatus"], "APPROVED");
+        assert!(
+            v["settings"].is_null(),
+            "nothing is written for a maker that cannot quote yet: {body}"
+        );
+
+        let after = Config::from_toml(&std::fs::read_to_string(&toml_path).unwrap()).unwrap();
+        assert!(!after.rfq_active(), "RFQ stays off");
+        assert!(after.book_enabled, "and the ladder is left alone");
     }
 }

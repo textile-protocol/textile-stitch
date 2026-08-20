@@ -9,14 +9,15 @@
 Stitch is the Textile operator bot for filler-network market making. It runs
 as a single binary named `stitch`.
 
-Stitch does one job for each configured pool by default, plus an optional
-second:
+Stitch quotes Swap by default, plus an optional second job:
 
-- **Market making**: keep live buy and sell quotes for a configured
-  soft-asset/stablecoin pair.
+- **Swap quoting (RFQ)**: answer venue quote requests with firm, taker-bound
+  orders for a configured soft-asset/stablecoin pair. Connect the bot to
+  Textile before going live — a new bot will not Start without that. Connect
+  from the panel's Settings, or with `stitch connect` on the CLI.
 - **Limit-order taking** (opt-in): fill traders' resting limit orders on-chain
   when their price is at or beyond your own quote, priced by the same spreads
-  as your market making.
+  as your Swap quotes.
 
 ## Contents
 
@@ -53,11 +54,12 @@ No Docker and no terminal. [Download the release for your OS](https://github.com
   entry). For a headless server, prefer Option 2.
 
 In the browser: sign in with the password you created, **Add a bot**, pick a
-corridor, paste your operator wallet key, approve allowances, dry-run, then
-Start. Use **Start at login** in Settings if you want the panel (and any bots
-left running) to come back after a reboot — login starts stay in the tray and
-skip the control window. Quit Stitch from the menu / tray / window to stop the
-panel. For unattended 24/7 quoting on a server, use Option 2.
+corridor, paste your operator wallet key, approve allowances, then **Connect**
+the bot to Textile on Settings before Start. Use **Start at login** in Settings
+if you want the panel (and any bots left running) to come back after a reboot
+— login starts stay in the tray and skip the control window. Quit Stitch from
+the menu / tray / window to stop the panel. For unattended 24/7 quoting on a
+server, use Option 2.
 
 ### Option 2 — Server / Docker
 
@@ -109,6 +111,11 @@ Everything else — custom reverse proxy, building from source — is in
 - [Manual install — Windows](docs/install-windows.md)
 - [Manual install — Linux](docs/install-linux.md) — includes the systemd service setup.
 
+Already running a bot on the public ladder?
+[Migrating from the public ladder to Swap (RFQ)](docs/migrate-book-to-rfq.md)
+covers both the panel and the
+[standalone CLI](docs/migrate-book-to-rfq.md#standalone-cli).
+
 ### Install with an AI agent
 
 Your coding agent installs the Stitch panel and opens the web UI. You finish
@@ -154,15 +161,18 @@ The full copyable prompt is in [AI_INSTALL_PROMPT.md](docs/AI_INSTALL_PROMPT.md)
 </details>
 
 Running the binary directly without the panel? `stitch init` writes `stitch.toml`,
-`stitch.env` and an owner-only `stitch.key` for a chosen corridor. The per-OS
-guides cover it.
+`stitch.env` and an owner-only `stitch.key` for a chosen corridor, then
+`stitch connect` registers the wallet with Textile so the bot can quote Swap.
+The per-OS guides cover both.
 
 ## How It Works
 
-Stitch reads `stitch.toml`, polls your configured price feed, signs UniswapX
-limit orders, and posts those signed orders to the Textile indexer. The wallet
-private key is read from `STITCH_PRIVATE_KEY_FILE`, or from `STITCH_PRIVATE_KEY`
-for compatibility. If both are set, `STITCH_PRIVATE_KEY_FILE` takes precedence.
+Stitch reads `stitch.toml`, polls your configured price feed, and answers Swap
+quote requests with firm, taker-bound UniswapX limit orders signed against the
+operator wallet. Connect in the panel registers the maker and writes
+`rfq-api.key`. The wallet private key is read from `STITCH_PRIVATE_KEY_FILE`,
+or from `STITCH_PRIVATE_KEY` for compatibility. If both are set,
+`STITCH_PRIVATE_KEY_FILE` takes precedence.
 
 ### Signer / wallet backend
 
@@ -200,12 +210,18 @@ manual `[signer]` fields below are for CLI and server operators editing
 The operator wallet still needs a little native gas for Permit2 approvals
 (`stitch approve`) no matter which signer you use.
 
-For market making, each configured pool can have:
+For Swap quoting, each configured pool can have:
 
 - a **buy side**, where Stitch spends the stable/debt asset to buy the
   soft/collateral asset below the feed price;
 - a **sell side**, where Stitch spends the soft/collateral asset to sell above
   the feed price.
+
+RFQ prices those quotes off the latest feed print plus your configured
+spreads, capped by your liquidity — no TWAP smoothing and no inventory lean.
+TWAP and lean apply to the public ladder and, when it's on, the limit-order
+taker leg. TTL, refresh, and max-orders are ladder-only (`book_enabled`). New
+bots ship with the book off.
 
 With `limit_taker_enabled = true` on a pool, Stitch also checks the corridor's
 resting trader limit orders every tick and fills the profitable ones on-chain:
@@ -246,6 +262,7 @@ indexer_url = "https://api.textilecredit.com"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor = "0x0000000000000000000000000000000000000000"
 tick_interval_secs = 5
+book_enabled = false
 
 [feed]
 url = "https://your-feed.example/cngn-usdt"

@@ -147,13 +147,29 @@ fn with_rfq_key_env(mut runtime: SignerRuntime, config: &Path) -> SignerRuntime 
 
 /// Read one value out of the `stitch.env` beside a bot's config, undoing the
 /// writer's POSIX single-quoting. Returns `None` when the file or key is absent.
-fn env_value(config: &Path, key: &str) -> Option<String> {
+///
+/// This is the same file the process runtime feeds the child and the Docker
+/// runtime mirrors into container env, so it is the honest answer to "what
+/// will this bot see at start".
+pub(crate) fn env_value(config: &Path, key: &str) -> Option<String> {
+    env_assignment(config, key).filter(|v| !v.is_empty())
+}
+
+/// Like [`env_value`], but keeps a present-but-empty assignment.
+///
+/// `apply_env_file` calls `cmd.env(key, value)` for every line it parses,
+/// blanks included, so `STITCH_RFQ_API_KEY=` in `stitch.env` *overrides* an
+/// inherited variable of the same name with an empty one. A caller deciding
+/// what the child will see has to tell "absent, so inherit" from "explicitly
+/// blanked, so don't".
+pub(crate) fn env_assignment(config: &Path, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(find_beside(config, "stitch.env")?).ok()?;
+    // Last match, not first: `apply_env_file` calls `cmd.env` for every line it
+    // parses, so with the key assigned twice the child keeps the last one.
     text.lines()
         .filter_map(|line| line.split_once('='))
-        .find(|(k, _)| k.trim() == key)
+        .rfind(|(k, _)| k.trim() == key)
         .map(|(_, v)| unquote(v.trim()))
-        .filter(|v| !v.is_empty())
 }
 
 /// Undo `'…'` POSIX single-quoting, including the `'\''` escape the writer emits.

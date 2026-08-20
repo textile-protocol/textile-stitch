@@ -97,6 +97,10 @@ fn resolve_capacity(
 /// validation (bad addresses) — unreachable for a config that passed
 /// `Config::from_toml`, kept as errors so the responder can never start on
 /// a half-parsed pool.
+/// Note: `build_runtime` collects this over every pool with `?`, so any error
+/// here kills the whole responder. `PoolConfig::rfq_book_buildable` mirrors the
+/// fallible steps below so the panel can refuse Start instead of letting a bot
+/// come up and quote nothing — keep the two in step.
 pub fn book_from_pool(
     pool: &PoolConfig,
     default_feed_url: &str,

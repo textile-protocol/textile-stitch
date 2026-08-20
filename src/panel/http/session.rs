@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(v["passwordLogin"], true);
         assert_eq!(v["tailnetLogin"], false);
         assert_eq!(v["runtime"], "docker");
-        assert_eq!(v["rfqDefault"], false);
+        assert_eq!(v["rfqDefault"], true);
     }
 
     #[tokio::test]

@@ -13,7 +13,9 @@ pub mod process;
 pub mod settings;
 pub mod writer;
 
-pub use catalog::{catalog, deployable_catalog, find_corridor, identify_corridor, Corridor};
+pub use catalog::{
+    catalog, deployable_catalog, find_corridor, identify_corridor, identify_pair, Corridor,
+};
 pub use custom::CustomCorridor;
 pub use explorer::{address_explorer_url, explorer_base_url};
 pub use paths::{

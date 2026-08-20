@@ -1,8 +1,10 @@
 # Install — Stitch (Docker / server)
 
 Stitch is the web UI for running several bots on one host. Add a bot with a
-wizard, start and stop it, edit its settings, watch its logs, run Permit2
-approvals — instead of SSHing in and hand-editing `docker-compose.yml`.
+wizard, Connect it to Textile, start and stop it, edit its settings, watch
+its logs, run Permit2 approvals — instead of SSHing in and hand-editing
+`docker-compose.yml`. New bots quote Swap via RFQ and will not Start until
+you Connect.
 
 **Both installs are recommended** — pick by need. On a personal Mac or Windows
 machine, the [desktop app](../README.md#option-1--desktop-app) (`Stitch.dmg` /
@@ -333,8 +335,9 @@ see "two cooks" below.
 
 ### The layout warning
 
-If your compose file mounts the two config files individually, like
-`docker-compose.example.yml` does:
+If your compose file mounts the two config files individually — the layout
+`docker-compose.example.yml` used to ship, and which plenty of running fleets
+still use:
 
 ```yaml
 volumes:

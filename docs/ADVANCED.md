@@ -62,6 +62,9 @@ If both are set for a side, basis points win.
 
 ### TWAP Quoting (Smoothed Center)
 
+Scope: the public ladder and, when it's on, the limit-order taker leg. RFQ
+answers off the latest feed print — it does not smooth.
+
 By default each quote centers on the feed's instantaneous value. For a
 volatile pair like WETH that means the book chases every tick: when the price
 spikes for a few seconds and reverts, the quote either chases the spike (and
@@ -232,6 +235,10 @@ Costs and flows to know:
 - `--dry-run` logs the batches the leg would fill without sending anything.
 
 ### Inventory-Lean Quoting
+
+Scope: the public ladder and, when it's on, the limit-order taker leg. RFQ
+quotes off your configured spreads and liquidity — the lean does not reach
+them yet.
 
 A fixed symmetric spread has a failure mode: one side keeps filling until the
 wallet is 100% soft asset (or 100% stable), and the book goes one-sided until
@@ -552,13 +559,59 @@ If you are running a different corridor, copy `stitch.example.toml` and edit it
 directly. The setup app and `stitch init` are convenience wrappers for the
 supported corridors; any valid `stitch.toml` works with the bot.
 
-### Dual-run RFQ
+### Swap quoting (RFQ)
 
-Connect in the panel settings registers the funding wallet and writes
-`rfq-api.key`. It does **not** put you on a corridor. Textile enables the
-corridor separately. Until they do, `[rfq]` stays off and the public ladder
-keeps running. After they enable you, press Reconnect — do not invent a
-corridor slug in the raw config.
+New bots are RFQ-only: `book_enabled = false`, Settings shows the RFQ card,
+and Create/Start refuse to go live until you Connect. Connect registers the
+funding wallet and writes `rfq-api.key`. It does **not** invent a corridor
+slug. If Textile has not assigned one on this chain yet, `[rfq]` stays off
+and the book stays off. After they enable you, press Reconnect.
+
+Without the panel, `stitch connect --config <path>` does the same thing from
+the terminal — same signature, same credential, same config edit. Moving an
+existing ladder bot over is covered in
+[Migrating from the public ladder to Swap (RFQ)](migrate-book-to-rfq.md).
+
+Do not leave `book_enabled = true` on a bot that quotes Swap. The public
+ladder is hidden from takers; those resting orders still consume inventory
+and RFQ subtracts them before quoting, so Swap gets thinner books and more
+`no_quote`. Limit fills do not need the public ladder — they need
+`limit_taker_enabled`.
+
+If you do need the ladder back — debugging, or a corridor you are running
+off-venue — Settings has a collapsed **Legacy** card at the bottom of the bot
+page with the `book_enabled` switch. It is closed by default and reads the
+config, so a migrated or freshly created bot opens with it off. Saving restarts
+the bot. The panel refuses the switch when no side has both a spread and a size
+(`buy_total_liquidity_debt` + `buy_min_slice_debt`, or `buy_order_size_debt` —
+same for the sell side): the ladder would rest nothing, and you would restart
+into a bot quoting neither book nor RFQ. Sizing lives on the Raw config tab.
+
+### Production cutover (ops)
+
+Web Swap is RFQ. Corridor mode stays `RFQ_BETA` until Limit is deleted —
+`RFQ` calls `ladderRetired()` and kills the v1 book Limit still uses. The
+venue flip does **not** change stitch-bot config.
+
+Before flipping the UI live:
+
+1. Every pair in the public picker has an `RfqCorridor` at `RFQ_BETA`, not
+   `BOOK`.
+2. At least one `ACTIVE` maker is enabled and online on `/v2/maker/stream`
+   per corridor.
+3. Spot-check quote → execute → fill on the live corridors.
+4. Watch `no_quote` rate and `/v2` latency.
+
+Same release window, every production stitch bot on a public pair:
+
+1. Connect (or Reconnect) so `[rfq].enabled = true` and
+   `book_enabled = false`.
+2. Leave `limit_taker_enabled` on if that operator should still fill Limit.
+3. Confirm the maker is `ACTIVE`, corridor-enabled, and online on
+   `/v2/maker/stream`.
+
+Admin `/s/admin/rfq` mode flips do not do this. They do not write stitch
+toml.
 
 **Inventory when both channels are on.** Keep `book_enabled = true` beside a
 live `[rfq]` and the corridor runs both. Neither one shrinks the other: the

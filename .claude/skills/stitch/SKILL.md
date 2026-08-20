@@ -5,9 +5,10 @@ description: Operate Stitch, the Textile operator bot — start, stop, restart, 
 
 # Operate Stitch
 
-Stitch is the Textile operator bot: per-pool market making. New installs use the
-**Stitch panel** (Docker web UI). This skill operates an existing layout and, if
-nothing is set up yet, installs the panel only — bot config happens in the browser.
+Stitch is the Textile operator bot: per-pool Swap quoting via RFQ. New installs
+use the **Stitch panel** (Docker web UI). This skill operates an existing layout
+and, if nothing is set up yet, installs the panel only — bot config happens in
+the browser. New bots need **Connect** on Settings before Start.
 
 ## Always start here
 
@@ -95,7 +96,8 @@ see [Not installed yet](#not-installed-yet).
 - After any change to pricing or sizing (spreads, liquidity, feed), run a
   `--dry-run` before going live again.
 - Don't start live operation or install a service without the operator's
-  explicit go-ahead.
+  explicit go-ahead. A new RFQ-only bot also needs Connect on Settings first
+  — Start without a maker key quotes nothing.
 
 ## Start
 

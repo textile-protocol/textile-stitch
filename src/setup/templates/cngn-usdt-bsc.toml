@@ -8,6 +8,10 @@ permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 reactor         = "0xe03261c0436DB575F92F09EdDF3591E2566B7D97"  # SETTLEMENT_V3_FILLER_REACTOR (BSC)
 tick_interval_secs = 5
 
+# Swap is RFQ. This bot does not rest a public ladder. Connect in the
+# Stitch panel writes [rfq] (maker id, stream URL, credential).
+book_enabled = false
+
 # Textile's own price endpoint. Returns { price, timestamp } where price is
 # debt-per-collateral (USDT per cNGN, e.g. ~0.000728).
 [feed]
@@ -40,3 +44,12 @@ sell_max_orders = 40
 
 ttl_secs = 120
 refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
+
+# Swap quoting. Connect in the Stitch panel writes maker id, stream URL,
+# and rfq-api.key. Leave this block commented until then.
+# [rfq]
+# enabled = false
+# url = "wss://api.textilecredit.com/v2/maker/stream"
+# maker_id = "mk_your_maker_id"
+# api_key_env = "STITCH_RFQ_API_KEY"
+# validation_contract = "0x0000000000000000000000000000000000000000"

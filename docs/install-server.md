@@ -113,7 +113,8 @@ works as “pull the current image and bring Stitch back up.”
 2. Open the URL the installer printed
    (`https://stitch-panel.<your-tailnet>.ts.net`).
 3. Click **Add a bot**, pick a corridor, set the operator wallet, approve
-   Permit2 allowances, dry-run, then **Start**.
+   Permit2 allowances, **Connect** the bot to Textile on Settings, then
+   **Start**. New bots quote Swap via RFQ and will not Start without that.
 
 That is the whole operator path. Logs, settings, start/stop, and approvals all
 live in the browser.

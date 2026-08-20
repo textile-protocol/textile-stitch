@@ -2,15 +2,14 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Stitch — the Textile filler-network operator bot.
 //!
-//! The bot is the buy side of the Settlement v2/v3 market: it keeps live,
-//! funded limit orders to buy collateral (e.g. cNGN) with debt (e.g. USDT),
-//! priced off the operator's own feed, and also closes settlement auctions.
+//! New bots quote Swap via RFQ: they answer venue quote requests with firm,
+//! taker-bound Permit2 orders priced off the operator's feed. The leftover
+//! public ladder (`book_enabled`) and the limit-order taker ([`taker`]) are
+//! separate switches. The bot also closes settlement auctions.
 //!
 //! This is a standalone crate, deliberately not derived from the TypeScript
-//! reference closer. v1 lands the security-critical core first — UniswapX
-//! `LimitOrder` EIP-712 + Permit2 witness signing ([`eip712`], [`signer`]) and
-//! the pricing rule ([`quote`]) — then the feed, indexer client, and auction
-//! closer wire on top.
+//! reference closer. Signing is UniswapX `LimitOrder` EIP-712 + Permit2
+//! witness ([`eip712`], [`signer`]) with the pricing rule in [`quote`].
 
 pub mod approve;
 pub mod banner;
@@ -18,6 +17,7 @@ pub mod cli;
 pub mod closer;
 pub mod config;
 pub mod eip712;
+pub mod enroll;
 pub mod feed;
 pub mod funding;
 pub mod indexer;

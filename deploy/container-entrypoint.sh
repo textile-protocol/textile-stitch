@@ -24,6 +24,18 @@ if [ -n "${STITCH_PRIVATE_KEY:-}" ]; then
   unset STITCH_PRIVATE_KEY
 fi
 
+# The maker credential from `stitch connect`. A new bot quotes Swap over RFQ and
+# rests no public ladder, so without this it starts and serves nothing. Filed the
+# same way as the wallet key rather than left in the environment, which
+# `docker inspect` and /proc expose. Only the default `[rfq].api_key_env` name is
+# handled here; a custom one is the operator's to pass.
+if [ -n "${STITCH_RFQ_API_KEY:-}" ]; then
+  rfq_key_path="${runtime_dir}/rfq-api.key"
+  printf '%s\n' "${STITCH_RFQ_API_KEY}" > "${rfq_key_path}"
+  export STITCH_RFQ_API_KEY_FILE="${rfq_key_path}"
+  unset STITCH_RFQ_API_KEY
+fi
+
 # MPC-wallet credentials (only one signer is used at a time; whichever the
 # config selects). Each secret env var, if present, is written to a 0600 file and
 # the matching *_FILE var is exported, same as the local key above. The Turnkey

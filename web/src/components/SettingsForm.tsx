@@ -13,13 +13,16 @@ import {
 } from './ui'
 import ChangeSigner from './ChangeSigner'
 import { shortAddress } from '../format'
-import type { Bot, Corridor, Settings, Spread } from '../types'
+import type { Bot, Corridor, Settings, Sizing, Spread } from '../types'
 
 /**
  * Structured settings matching the desktop Stitch app: corridor, signer, spreads,
  * taker leg, endpoints, plus a collapsed Experimental card for opt-in knobs
- * (TWAP / inventory-lean). The RFQ card is gated on a raw-config or fleet
- * token. Sizing / tick stay on the Raw config tab.
+ * (TWAP / inventory-lean). The RFQ card is always on — new bots quote Swap
+ * via RFQ. Only the genuinely book-only fields (order lifetime, refresh
+ * threshold) hide when the ladder is off, and the collapsed Legacy card is
+ * where the ladder itself can be put back. Sizing / tick stay on the Raw
+ * config tab.
  *
  * Sends only the fields the operator touched — a partial patch means a concurrent
  * raw edit only loses what this form actually changed.
@@ -132,10 +135,11 @@ export default function SettingsForm({
               onChange={(v) => set('sell', v)}
             />
           </div>
+          {loaded.bookEnabled && (
           <div className="grid gap-4 border-t border-line-soft pt-4 sm:grid-cols-2">
             <Field
               label="Order lifetime (seconds)"
-              hint="How long each resting order stays live. Must be greater than 30 — shorter orders never show as fillable depth. Volatile pairs often use ~60."
+              hint="How long each resting order stays live. Must be greater than 30 — shorter orders never show as fillable depth. Volatile pairs often use ~60. Book only — RFQ uses the venue TTL."
             >
               <Input
                 type="number"
@@ -168,6 +172,7 @@ export default function SettingsForm({
               />
             </Field>
           </div>
+          )}
         </div>
       </Card>
 
@@ -204,6 +209,9 @@ export default function SettingsForm({
         </div>
       </Card>
 
+      {/* TWAP and lean are not book-only: the taker leg prices its fills off
+          the same center, deviation guard and lean decision, so these stay
+          editable on an RFQ-only bot. */}
       <ExperimentalCard
         draft={draft}
         editable={loaded.editable}
@@ -227,6 +235,15 @@ export default function SettingsForm({
             setRfqApiKey('')
             onSaved(message)
           }}
+        />
+      )}
+
+      {loaded.rfqDefaultUnlocked && (
+        <LegacyCard
+          loaded={loaded}
+          draft={draft}
+          editable={loaded.editable}
+          onChange={set}
         />
       )}
 
@@ -450,7 +467,7 @@ function ExperimentalCard({
 
           <ExperimentalSubsection
             title="TWAP / lean"
-            description="Center quotes on a rolling TWAP and/or lean spreads against the wallet's own inventory. Useful on volatile pairs; leave blank unless you want them."
+            description="Center quotes on a rolling TWAP and/or lean spreads against the wallet's own inventory. These price the public ladder and the taker leg — Swap quotes (RFQ) answer off the latest feed print and your spreads. Useful on volatile pairs; leave blank unless you want them."
           >
             <div className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
@@ -503,7 +520,7 @@ function ExperimentalCard({
                   checked={draft.leanEnabled}
                   disabled={!editable}
                   onChange={(v) => onChange('leanEnabled', v)}
-                  label="Lean enabled — quote the live book off inventory-lean prices"
+                  label="Lean enabled — price live quotes and taker fills off inventory-lean prices"
                 />
                 {leanOn && (
                   <Banner tone="warning">
@@ -574,6 +591,113 @@ function ExperimentalSubsection({
       </header>
       {children}
     </section>
+  )
+}
+
+/**
+ * Can this side actually post? Mirrors `PoolConfig::buy_enabled` / `sell_enabled`
+ * on the bot: a spread *and* a size — either a flat order size or a
+ * total-liquidity + min-slice ladder. Without one the ladder rests nothing, so
+ * the card says so instead of offering a switch that does nothing.
+ */
+function sideCanPost(spread: Spread, sizing: Sizing): boolean {
+  const has = (v: string) => v.trim() !== ''
+  return (
+    has(spread.value) &&
+    (has(sizing.orderSize) ||
+      (has(sizing.totalLiquidity) && has(sizing.minSliceDebt)))
+  )
+}
+
+/**
+ * Legacy: the public ladder.
+ *
+ * Collapsed by default and last on the page — Swap is RFQ now, and a bot that
+ * rests orders on the book is quoting into a venue no taker sees. It stays
+ * reachable because leftover book bots exist and an operator may need to put
+ * one back while debugging.
+ *
+ * The toggle reflects the config, so a migrated or new (RFQ-only) bot opens
+ * with it off. Turning it on writes `book_enabled = true` through the normal
+ * Save, which restarts the bot; the API refuses the flip when no side has a
+ * spread and a size, since that would restart into quoting nothing.
+ */
+function LegacyCard({
+  loaded,
+  draft,
+  editable,
+  onChange,
+}: {
+  loaded: Settings
+  draft: Settings
+  editable: boolean
+  onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const canPost =
+    sideCanPost(draft.buy, draft.buySizing) ||
+    sideCanPost(draft.sell, draft.sellSizing)
+  const turningOn = draft.bookEnabled && !loaded.bookEnabled
+  return (
+    <Card>
+      <button
+        type="button"
+        className={`-m-1 flex w-full items-center gap-2 rounded-lg p-1 text-left hover:bg-hover ${open ? 'mb-4' : ''}`}
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span
+          aria-hidden
+          className={`inline-block text-xs text-muted transition-transform ${open ? 'rotate-90' : ''}`}
+        >
+          ▸
+        </span>
+        <h2 className="text-base font-bold">Legacy</h2>
+        <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-muted">
+          {loaded.bookEnabled ? 'ladder on' : 'off'}
+        </span>
+      </button>
+      {open && (
+        <div className="space-y-4">
+          <p className="text-xs text-faint">
+            Before RFQ, Stitch quoted by resting a ladder of signed orders on
+            the public book. Swap no longer reads that book — it asks makers for
+            a firm quote — so a ladder posted today is invisible to takers while
+            still holding your inventory behind live orders. Leave this off
+            unless you know why you want it.
+          </p>
+
+          <Toggle
+            checked={draft.bookEnabled}
+            disabled={!editable}
+            onChange={(v) => onChange('bookEnabled', v)}
+            label="Post a public ladder (book_enabled)"
+          />
+
+          <p className="text-xs text-faint">
+            Sizing lives on the Raw config tab. The ladder also uses the order
+            lifetime and refresh threshold under Spreads, which appear once it
+            is on.
+          </p>
+
+          {turningOn && !canPost && (
+            <Banner tone="danger">
+              No side can post: a ladder needs a spread and a size. Set the
+              sizing on the Raw config tab first — saving this now will be
+              refused.
+            </Banner>
+          )}
+
+          {turningOn && canPost && (
+            <Banner tone="warning">
+              Saving restarts the bot with the ladder on. It will sign and rest
+              orders against your funded balance, and those orders stay live
+              until they expire even if you turn this back off.
+            </Banner>
+          )}
+        </div>
+      )}
+    </Card>
   )
 }
 
@@ -725,9 +849,9 @@ function RfqCard({
       <div className="space-y-4">
         {ga && onBook && (
           <Banner tone="warning">
-            This bot still posts a public ladder. Textile now quotes privately
-            (RFQ). Switch to RFQ only — it will stop resting orders on the book
-            and only answer private quote requests.
+            This bot still posts a public ladder nobody sees on Swap. Switch to
+            RFQ only — it will stop resting unused book orders and quote Swap
+            with its full inventory.
             {live ? (
               <span className="mt-3 block">
                 <Button
@@ -743,7 +867,7 @@ function RfqCard({
               <span className="mt-2 block text-xs">
                 {waiting
                   ? makerFlagged
-                    ? 'This maker is flagged. You will not receive private quotes until Textile unflags you.'
+                    ? 'This maker is flagged. You will not receive Swap quotes until Textile unflags you.'
                     : 'Request access below so Textile can review this maker.'
                   : 'Connect below to finish the switch.'}
               </span>
@@ -755,13 +879,14 @@ function RfqCard({
           checked={draft.rfqEnabled}
           disabled={!editable}
           onChange={enable}
-          label="Answer private quote requests"
+          label="Answer Swap quote requests"
         />
         <p className="text-xs text-faint">
           Connect registers this bot&apos;s funding wallet and saves the
           credential. Textile still has to approve you before you receive
-          private quotes — Request access below, then Check status after they
-          do. You never paste an id or key.
+          Swap quotes — Request access below, then Check status after they
+          do. You never paste an id or key. The venue rejects requests under 1
+          whole token so the protocol fee cannot round to zero.
         </p>
 
         {waiting ? (
@@ -772,12 +897,12 @@ function RfqCard({
               : ''}
             .{' '}
             {makerFlagged
-              ? 'Textile has flagged this maker. You will not receive private quotes.'
+              ? 'Textile has flagged this maker. You will not receive Swap quotes.'
               : rejected
                 ? 'Textile turned this chain down. Request access again if you want another review.'
                 : accessStatus === 'PENDING'
                   ? 'Access requested. Textile will review it. Check status after they approve you.'
-                  : 'Request access so Textile can review this maker. You will not receive private quotes until they approve you.'}
+                  : 'Request access so Textile can review this maker. You will not receive Swap quotes until they approve you.'}
           </Banner>
         ) : live ? (
           <div className="rounded-lg border border-line-soft bg-hover/40 px-3 py-2 text-sm">
@@ -786,7 +911,7 @@ function RfqCard({
               {enrollment
                 ? ` as ${enrollment.makerSlug} (${enrollment.environment})`
                 : ''}
-              {ga && !onBook ? ' · RFQ only' : ''}
+              {ga && !onBook ? ' · Swap only' : ''}
             </p>
             <p className="mt-1 text-xs text-faint">
               {enrollment?.corridors.length
@@ -801,7 +926,7 @@ function RfqCard({
           <Banner tone="warning">
             {ga
               ? 'Not connected. This bot will not quote until you connect to Textile.'
-              : 'Not connected. Connect to start answering private quote requests.'}
+              : 'Not connected. Connect to start answering Swap quote requests.'}
           </Banner>
         )}
 

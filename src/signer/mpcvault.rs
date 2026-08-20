@@ -47,10 +47,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use super::{
-    finalize_signature, parse_address, parse_hex32, parse_v, read_env_secret, MpcVaultConfig,
-    Signer,
-};
+use super::{finalize_signature, parse_address, parse_hex32, parse_v, MpcVaultConfig, Signer};
 
 const API_TOKEN_ENV: &str = "MPCVAULT_API_TOKEN";
 const API_TOKEN_FILE_ENV: &str = "MPCVAULT_API_TOKEN_FILE";
@@ -96,15 +93,44 @@ pub struct MpcVaultSigner {
     operator_address: Address,
     max_concurrent_signs: usize,
     pending: Pending,
+    /// The callback server this signer started, so dropping the signer frees
+    /// the port. The bot holds one signer for its whole life, but the panel
+    /// builds a throwaway one per Connect — and a detached server would keep
+    /// `callback_listen_addr` bound for the panel's lifetime, so the next
+    /// Connect fails to bind. Held for its `Drop`, never read.
+    _callback: CallbackServer,
+}
+
+/// Aborts the callback server task on drop, which drops its listener and
+/// releases the port.
+struct CallbackServer(tokio::task::JoinHandle<()>);
+
+impl Drop for CallbackServer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl MpcVaultSigner {
     /// Build from config + the API token in the env, and start the callback
     /// approval server the client-signer sidecar calls.
     pub async fn from_config(cfg: &MpcVaultConfig) -> anyhow::Result<Self> {
+        Self::from_config_with(cfg, &super::SignerSecrets::default()).await
+    }
+
+    /// [`Self::from_config`] with an explicit token file. See
+    /// [`super::SignerSecrets`].
+    pub async fn from_config_with(
+        cfg: &MpcVaultConfig,
+        secrets: &super::SignerSecrets,
+    ) -> anyhow::Result<Self> {
         super::validate_signer_api_base_url("mpcvault", &cfg.api_base_url)?;
-        let api_token =
-            read_env_secret(API_TOKEN_FILE_ENV, API_TOKEN_ENV).context("MPCVault API token")?;
+        let api_token = super::read_secret(
+            secrets.mpcvault_api_token_file.as_deref(),
+            API_TOKEN_FILE_ENV,
+            API_TOKEN_ENV,
+        )
+        .context("MPCVault API token")?;
         let operator_address = parse_address(&cfg.operator_address)?;
         let timeout = Duration::from_secs(cfg.poll_timeout_secs.max(5));
         let http = reqwest::Client::builder()
@@ -120,7 +146,7 @@ impl MpcVaultSigner {
                 cfg.callback_listen_addr
             )
         })?;
-        start_callback_server(addr, pending.clone()).await?;
+        let callback = CallbackServer(start_callback_server(addr, pending.clone()).await?);
         info!(
             %addr,
             vault = %cfg.vault_uuid,
@@ -136,6 +162,7 @@ impl MpcVaultSigner {
             operator_address,
             max_concurrent_signs: cfg.max_concurrent_signs,
             pending,
+            _callback: callback,
         })
     }
 
@@ -226,7 +253,10 @@ impl Signer for MpcVaultSigner {
     }
 }
 
-async fn start_callback_server(addr: SocketAddr, pending: Pending) -> anyhow::Result<()> {
+async fn start_callback_server(
+    addr: SocketAddr,
+    pending: Pending,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let app = Router::new()
         .route("/health", get(|| async { StatusCode::OK }))
         .fallback(handle_callback)
@@ -234,12 +264,11 @@ async fn start_callback_server(addr: SocketAddr, pending: Pending) -> anyhow::Re
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding MPCVault callback server to {addr}"))?;
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             error!(error = %e, "MPCVault callback server stopped");
         }
-    });
-    Ok(())
+    }))
 }
 
 /// Approve or reject a signing request the sidecar forwards. MPCVault treats
@@ -549,6 +578,33 @@ mod tests {
             assert!(pending.lock().unwrap().contains(&[1u8; 32]));
         }
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_signer_frees_the_callback_port() {
+        // The panel builds a throwaway signer per Connect. A detached server
+        // would hold `callback_listen_addr` for the panel's lifetime, so the
+        // next Connect — and, in process mode, the bot itself — fails to bind.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let pending: Pending = Arc::new(Mutex::new(HashSet::new()));
+        let server = CallbackServer(start_callback_server(addr, pending).await.unwrap());
+        assert!(
+            tokio::net::TcpListener::bind(addr).await.is_err(),
+            "the callback server should hold the port while it lives"
+        );
+
+        drop(server);
+        // The abort has to land before the listener is dropped.
+        for _ in 0..50 {
+            if tokio::net::TcpListener::bind(addr).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("port still bound after the signer was dropped");
     }
 
     #[tokio::test]

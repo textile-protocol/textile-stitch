@@ -42,7 +42,24 @@ printf "STITCH_PRIVATE_KEY_FILE='%s'\n" "$HOME/Stitch/stitch.key" > ~/Stitch/sti
 chmod 600 ~/Stitch/stitch.key ~/Stitch/stitch.env
 ```
 
-## 3. Approve Permit2
+## 3. Connect to Textile
+
+New bots quote Swap via RFQ and do not rest orders on the public book, so they
+need a maker credential before they can quote anything. `stitch connect` signs a
+registration message with the wallet in your env, registers with Textile, and
+writes `rfq-api.key` next to the config.
+
+```bash
+set -a; . ~/Stitch/stitch.env; set +a
+stitch connect --config ~/Stitch/stitch.toml
+```
+
+Skipping this leaves a bot that starts, logs, and serves nothing. If Textile has
+no corridor seated for your pair yet it says so and keeps the credential — re-run
+once they seat you. Moving an existing ladder bot across? See the
+[migration guide](migrate-book-to-rfq.md#standalone-cli).
+
+## 4. Approve Permit2
 
 The operator wallet needs a one-time Permit2 approval for each input token (the
 `debt` token on the buy side, the `collateral` token on the sell side). Without
@@ -60,7 +77,7 @@ pull against orders you actually signed. Use `--exact` to cap the allowance
 instead (only with fixed numeric liquidity), at the cost of re-approving when it's
 spent or you raise liquidity.
 
-## 4. Run
+## 5. Run
 
 ```bash
 stitch --config ~/Stitch/stitch.toml --dry-run   # signs/plans, posts nothing
@@ -70,7 +87,7 @@ stitch --config ~/Stitch/stitch.toml             # live
 Stop a foreground run with `Ctrl-C`; Stitch finishes the current tick first, so
 it never leaves a half-sent fill or dangling order.
 
-## 5. Keep it running
+## 6. Keep it running
 
 For 24/7 operation you can run Stitch under a launchd LaunchAgent (a plist in
 `~/Library/LaunchAgents/` that runs `stitch --config ~/Stitch/stitch.toml` with
@@ -78,7 +95,7 @@ For 24/7 operation you can run Stitch under a launchd LaunchAgent (a plist in
 option on a desktop Mac is the [desktop app](../README.md#option-2--desktop-app),
 which supervises the bot while open.
 
-## 6. Update
+## 7. Update
 
 ```bash
 stitch --update    # in-place, for installer-based installs
@@ -86,7 +103,7 @@ stitch --update    # in-place, for installer-based installs
 
 You can also download a new binary from the latest GitHub Release.
 
-## 7. Stop and uninstall
+## 8. Stop and uninstall
 
 If you set up a LaunchAgent, use the label you installed it under:
 

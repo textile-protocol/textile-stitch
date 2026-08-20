@@ -17,6 +17,7 @@
 //! turn a provider's `{r, s, v?}` into the canonical 65-byte form and verify it
 //! recovers to the configured operator address.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy_primitives::{hex, keccak256, Address, B256};
@@ -62,10 +63,38 @@ pub type DynSigner = Arc<dyn Signer>;
 /// is the local key from `STITCH_PRIVATE_KEY[_FILE]` — identical to the historic
 /// hotwallet behaviour.
 pub async fn build_signer(cfg: &Config) -> anyhow::Result<DynSigner> {
+    build_signer_with(cfg, &SignerSecrets::default()).await
+}
+
+/// Where a remote signer's secret comes from, when the caller knows better than
+/// the process environment does.
+///
+/// The bot runs one config per process, so reading the env is right for it. The
+/// panel is the opposite: one process, many bots, each with its own secret file
+/// beside its own `stitch.toml`. It used to bridge that by setting the env var,
+/// building, and restoring — but `build_signer` awaits in the middle, so two
+/// concurrent Connects for different bots interleave: one builds against the
+/// other's secret, and the restores put a stale bot-specific path back. Passing
+/// the path in removes the shared channel instead of trying to serialize it.
+///
+/// `None` on a field means "ask the environment", which is what every non-panel
+/// caller wants.
+#[derive(Debug, Clone, Default)]
+pub struct SignerSecrets {
+    pub turnkey_api_private_key_file: Option<PathBuf>,
+    pub mpcvault_api_token_file: Option<PathBuf>,
+}
+
+/// [`build_signer`] with explicit secret paths. See [`SignerSecrets`].
+pub async fn build_signer_with(cfg: &Config, secrets: &SignerSecrets) -> anyhow::Result<DynSigner> {
     match cfg.signer.clone().unwrap_or(SignerConfig::Local) {
         SignerConfig::Local => Ok(Arc::new(LocalSigner::from_env()?)),
-        SignerConfig::Turnkey(c) => Ok(Arc::new(turnkey::TurnkeySigner::from_config(&c)?)),
-        SignerConfig::Mpcvault(c) => Ok(Arc::new(mpcvault::MpcVaultSigner::from_config(&c).await?)),
+        SignerConfig::Turnkey(c) => Ok(Arc::new(turnkey::TurnkeySigner::from_config_with(
+            &c, secrets,
+        )?)),
+        SignerConfig::Mpcvault(c) => Ok(Arc::new(
+            mpcvault::MpcVaultSigner::from_config_with(&c, secrets).await?,
+        )),
     }
 }
 
@@ -297,6 +326,24 @@ pub fn parse_address(raw: &str) -> anyhow::Result<Address> {
 /// raw value). Mirrors how the local key is loaded, so MPC credentials can be
 /// mounted as files (the deploy default) or passed inline. Trims trailing
 /// whitespace/newlines a file write tends to add.
+/// A secret from an explicit file when the caller named one, else the env.
+///
+/// An explicit path is the whole answer — if it is unreadable that is an error,
+/// not a reason to fall back to whatever the environment happens to hold, which
+/// on a multi-bot panel could be another bot's credential.
+pub(crate) fn read_secret(
+    file_override: Option<&Path>,
+    file_env: &str,
+    raw_env: &str,
+) -> anyhow::Result<String> {
+    match file_override {
+        Some(path) => std::fs::read_to_string(path)
+            .map(|s| s.trim().to_string())
+            .with_context(|| format!("reading signer secret {}", path.display())),
+        None => read_env_secret(file_env, raw_env),
+    }
+}
+
 pub(crate) fn read_env_secret(file_env: &str, raw_env: &str) -> anyhow::Result<String> {
     if let Ok(path) = std::env::var(file_env) {
         let path = path.trim();
@@ -402,6 +449,32 @@ pub fn finalize_signature(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_explicit_secret_file_beats_the_environment() {
+        // The panel names the file for the bot it is connecting. Falling back to
+        // the env on a multi-bot panel could hand back another bot's credential,
+        // so an explicit path is the whole answer — including when it is
+        // unreadable, which is an error rather than a fallback.
+        let dir = std::env::temp_dir().join("stitch-read-secret-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bot-a.key");
+        std::fs::write(&file, "  from-the-file\n").unwrap();
+
+        assert_eq!(
+            read_secret(Some(&file), "NO_SUCH_FILE_ENV", "NO_SUCH_RAW_ENV").unwrap(),
+            "from-the-file",
+            "the named file wins and is trimmed"
+        );
+        let missing = dir.join("absent.key");
+        let err = read_secret(Some(&missing), "NO_SUCH_FILE_ENV", "NO_SUCH_RAW_ENV")
+            .expect_err("an unreadable named file must not fall through to the env");
+        assert!(err.to_string().contains("absent.key"), "{err}");
+
+        // With no override the env path is unchanged.
+        assert!(read_secret(None, "NO_SUCH_FILE_ENV", "NO_SUCH_RAW_ENV").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use super::*;
     use alloy_primitives::{address, b256};
 

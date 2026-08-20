@@ -149,15 +149,8 @@ pub fn identify_corridor(toml_str: &str) -> Option<&'static Corridor> {
         .pools
         .first()
         .map(|p| (p.collateral.to_lowercase(), p.debt.to_lowercase()));
-    CORRIDORS
-        .iter()
-        .find(|c| {
-            c.chain_id == cfg.chain_id
-                && pair
-                    .as_ref()
-                    .zip(corridor_pair(c))
-                    .is_some_and(|(want, have)| want.0 == have.0 && want.1 == have.1)
-        })
+    pair.as_ref()
+        .and_then(|(collateral, debt)| identify_pair(cfg.chain_id, collateral, debt))
         .or_else(|| {
             // No pool → nothing to disambiguate on, so a chain-only match is the
             // best we can do. A present-but-unmatched pair falls through to None.
@@ -165,6 +158,21 @@ pub fn identify_corridor(toml_str: &str) -> Option<&'static Corridor> {
                 .then(|| CORRIDORS.iter().find(|c| c.chain_id == cfg.chain_id))
                 .flatten()
         })
+}
+
+/// The catalog corridor shipping one specific pair on one chain.
+///
+/// The pair, not the config, is the key — so a bot whose *second* pool is the
+/// catalog one can be identified too. [`identify_corridor`] answers "what preset
+/// is this folder", which is a first-pool question; callers that reason per pool
+/// (enrollment seats each pool separately) need this one instead, or a later
+/// catalog pool is invisible to them.
+pub fn identify_pair(chain_id: u64, collateral: &str, debt: &str) -> Option<&'static Corridor> {
+    let want = (collateral.to_lowercase(), debt.to_lowercase());
+    CORRIDORS.iter().find(|c| {
+        c.chain_id == chain_id
+            && corridor_pair(c).is_some_and(|have| want.0 == have.0 && want.1 == have.1)
+    })
 }
 
 /// The first pool's `(collateral, debt)` token addresses, lowercased, parsed from

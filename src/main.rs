@@ -160,12 +160,16 @@ fn print_help() {
          COMMANDS:\n    \
          approve           Approve the config's input tokens to Permit2, then exit.\n                      \
          Required before going live; uses a max allowance unless --exact.\n    \
+         connect           Register this wallet with Textile and write the maker\n                      \
+         credential, then exit. Required before an RFQ bot can quote.\n    \
          init              Interactively create stitch.toml/.env/.key, then exit.\n\n\
          OPTIONS:\n    \
          --config <path>   Operator config (TOML). Read fresh on every start.\n    \
          --dry-run         Sign/plan without posting orders or sending tx.\n    \
          --exact           With `approve`: approve only the committed liquidity,\n                      \
          not an unlimited allowance (must re-approve as it's spent).\n    \
+         --venue <url>     With `connect`: override the enroll endpoint. Defaults to\n                      \
+         the config's [rfq].url, else its indexer_url.\n    \
          --update          Update to the latest release, then exit.\n    \
          -V, --version     Print version and exit.\n    \
          -h, --help        Print this help and exit.\n\n\
@@ -227,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Update => run_update().await,
         Command::Init { dir } => run_init(dir),
+        Command::Connect { config, venue_url } => run_connect(config, venue_url).await,
         Command::Approve {
             config,
             dry_run,
@@ -344,23 +349,12 @@ fn run_init(dir: Option<String>) -> anyhow::Result<()> {
     let paths = setup::write_config(&target, corridor, &key)?;
     key.zeroize();
 
-    // Same fleet flag the panel reads: `{dir}/panel.toml` or a parent
-    // `panel.toml` (bots-dir / bot-dir layouts).
-    let flag_dir = paths
-        .dir
-        .parent()
-        .filter(|p| stitch_bot::config::rfq_default_flag_in_dir(p))
-        .map(|p| p.to_path_buf())
-        .or_else(|| {
-            stitch_bot::config::rfq_default_flag_in_dir(&paths.dir).then(|| paths.dir.clone())
-        });
-    if flag_dir.is_some() {
-        let current = std::fs::read_to_string(&paths.toml)?;
-        let next = setup::apply_rfq_default_preset(&current)?;
-        setup::write_toml_atomic(&paths.toml, &next)?;
-        println!("RFQ-default is on — this bot will not rest orders on the public book.");
-        println!("Connect it to Textile (Stitch panel → Settings → RFQ) before going live.");
-    }
+    let current = std::fs::read_to_string(&paths.toml)?;
+    let next = setup::apply_rfq_default_preset(&current)?;
+    setup::write_toml_atomic(&paths.toml, &next)?;
+    println!("This bot quotes Swap via RFQ — it will not rest orders on the public book.");
+    println!("Connect it to Textile (`stitch connect`, or the panel's Settings → RFQ)");
+    println!("before going live: until then it has no maker credential and quotes nothing.");
 
     println!("\nConfig written to {}", paths.dir.display());
     println!("  {}", paths.toml.display());
@@ -380,6 +374,7 @@ fn print_next_steps(paths: &setup::ConfigPaths) {
     let env = q(paths.env.display().to_string());
     let toml = q(paths.toml.display().to_string());
     println!("  set -a; . {env}; set +a");
+    println!("  stitch connect --config {toml}");
     println!("  stitch approve --config {toml}");
     println!("  stitch --config {toml} --dry-run");
 }
@@ -392,8 +387,87 @@ fn print_next_steps(paths: &setup::ConfigPaths) {
     let key = q(paths.key.display().to_string());
     let toml = q(paths.toml.display().to_string());
     println!("  $env:STITCH_PRIVATE_KEY_FILE = {key}");
+    println!("  stitch connect --config {toml}");
     println!("  stitch approve --config {toml}");
     println!("  stitch --config {toml} --dry-run");
+}
+
+/// `stitch connect`: register this bot's wallet with Textile, then write the
+/// `[rfq]` block and `rfq-api.key` beside the config.
+///
+/// The panel does the same thing from Settings → RFQ. This exists so the
+/// documented CLI-only install (init → approve → run) is a complete path to a
+/// live bot — without it, `stitch init` writes an RFQ-only config that has no
+/// way to obtain a credential and quotes nothing.
+///
+/// Signing uses the bot's own signer, so a Turnkey/MPCVault bot enrolls the
+/// same wallet it trades from. Re-running is safe: the venue returns the same
+/// maker, and the config is rewritten from the fresh response.
+async fn run_connect(config_path: String, venue_url: Option<String>) -> anyhow::Result<()> {
+    let path = std::path::Path::new(&config_path);
+    let current =
+        std::fs::read_to_string(path).with_context(|| format!("reading config {config_path}"))?;
+    let cfg = Config::from_toml(&current)?;
+    let signer = build_signer(&cfg).await?;
+    println!("Operator wallet: {:?}", signer.address());
+
+    let venue = stitch_bot::enroll::enroll_url_from_config(&cfg, venue_url.as_deref());
+    println!("Registering with {venue} ...");
+    let enrolled = stitch_bot::enroll::register_maker(&cfg, &signer, &venue).await?;
+
+    // Same rule the panel applies: a bot that can quote Swap leaves the public
+    // ladder, because those resting orders are invisible to takers and still
+    // hold inventory RFQ would otherwise quote.
+    let (edited, outcome) = stitch_bot::enroll::apply_enrollment(&current, &cfg, &enrolled, true)?;
+
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    setup::write_rfq_api_key(dir, &enrolled.api_key)?;
+    setup::write_toml_atomic(path, &edited)?;
+
+    println!(
+        "\nRegistered as {} ({}).",
+        enrolled.maker_slug, enrolled.environment
+    );
+    println!("  {}", path.display());
+    println!(
+        "  {} (credential, owner-only)",
+        dir.join(setup::RFQ_API_KEY_FILE).display()
+    );
+    match outcome {
+        stitch_bot::enroll::EnrollOutcome::Live => {
+            println!("\nThis bot now quotes Swap via RFQ. Restart it to pick the change up.");
+        }
+        stitch_bot::enroll::EnrollOutcome::Flagged => {
+            println!(
+                "\nTextile has flagged this maker, so no quote requests will arrive. The \
+                 credential is saved; contact Textile before re-running `stitch connect` — \
+                 re-running rotates the maker key."
+            );
+        }
+        stitch_bot::enroll::EnrollOutcome::Waiting => {
+            // A bot from `stitch init` has the ladder off, so telling that
+            // operator "your ladder keeps running" would hide that the bot is
+            // deliberately dark until Textile approves it.
+            let meanwhile = if cfg.book_enabled {
+                "RFQ stays off and your ladder keeps running."
+            } else {
+                "RFQ stays off, and this bot has no public ladder — it will quote nothing \
+                 until the maker is approved."
+            };
+            println!(
+                "\nRegistered, but no corridor is seated for this maker yet — Textile approves \
+                 makers before they quote. {meanwhile}\n\
+                 Ask Textile to approve this maker (the Stitch panel has a Request access form, \
+                 or mail contact@textilecredit.com with the maker id in [rfq].maker_id), then \
+                 re-run `stitch connect` to pick the seat up.\n\
+                 See docs/migrate-book-to-rfq.md#standalone-cli."
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {

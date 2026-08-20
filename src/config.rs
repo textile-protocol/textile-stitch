@@ -66,9 +66,10 @@ pub struct Config {
     /// RFQ responder. Omitted → the responder never spawns. See [`RfqConfig`].
     #[serde(default)]
     pub rfq: Option<RfqConfig>,
-    /// Post resting orders on the public ladder. Default true (historical).
-    /// Set false for RFQ-only: the bot answers private quotes and does not
-    /// rest orders on the book. Spreads and liquidity still size RFQ.
+    /// Post resting orders on the public ladder. Default true for files that
+    /// omit the key (historical). New bots stamp `false`: they quote Swap via
+    /// RFQ and do not rest orders on the book. Spreads and liquidity still
+    /// size RFQ.
     #[serde(default = "default_true")]
     pub book_enabled: bool,
     /// Raw experimental gates. Values are uninterpreted strings on purpose:
@@ -172,22 +173,21 @@ fn host_is_loopback(host: Option<url::Host<&str>>) -> bool {
 /// feature on by accident.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ExperimentalConfig {
-    /// Unlocks the Settings RFQ card. Exact token [`RFQ_PANEL_GATE`] only;
-    /// anything else (or omitted) keeps the card hidden.
+    /// Leftover gate tokens from the RFQ beta. Ignored: the Settings card
+    /// and RFQ-as-default path are always on.
     #[serde(default)]
     pub rfq_panel: Option<String>,
-    /// RFQ-as-default rollout. Exact token [`RFQ_DEFAULT_GATE`] only. When
-    /// set (here or in the fleet `panel.toml`), new bots start RFQ-only,
-    /// book bots see a migrate-to-RFQ nudge, and Connect writes RFQ-only.
+    /// Leftover gate token from the RFQ-as-default rollout. Ignored.
     #[serde(default)]
     pub rfq_default: Option<String>,
 }
 
-/// The one token that unlocks the panel's RFQ beta card. Exact, case-sensitive
-/// match — anything else (including a different case) fails closed.
+/// Historical token that unlocked the Settings RFQ card. Kept so old files
+/// still parse; the card is always visible now.
 pub const RFQ_PANEL_GATE: &str = "enable-rfq-beta";
 
-/// The one token that turns RFQ into the default quoting mode. Exact match.
+/// Historical token that turned RFQ into the default quoting mode. Kept so
+/// old files still parse; RFQ-only is the only new-bot path now.
 pub const RFQ_DEFAULT_GATE: &str = "enable-rfq";
 
 /// Filename for the fleet-wide flag, dropped next to the per-bot folders
@@ -345,6 +345,19 @@ fn assert_feed_url_with(raw: &str, field: &str, allow_cleartext: bool) -> anyhow
         }
         other => anyhow::bail!("{field} must be an http(s):// URL, got scheme {other:?}"),
     }
+}
+
+/// The closer's subgraph endpoint, held to the feed URL's rules.
+///
+/// Same exposure: an attacker who can rewrite plaintext responses picks which
+/// positions the closer sees, so cleartext is loopback-only here too.
+pub fn assert_subgraph_url(raw: &str, field: &str) -> anyhow::Result<()> {
+    assert_feed_url(raw, field)
+}
+
+/// Predicate form of [`assert_subgraph_url`], for the Start guards.
+fn subgraph_url_usable(raw: &str) -> bool {
+    !raw.trim().is_empty() && assert_subgraph_url(raw, "subgraph_url").is_ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,17 +614,118 @@ impl PoolConfig {
         self.sell_total_liquidity_collateral.is_some() && self.sell_min_slice_debt.is_some()
     }
     /// True when this pool has the blue-leg close parameters wired.
+    ///
+    /// Presence only, on purpose: `main.rs` gates on this and then warns when
+    /// `build_closer_pool` rejects the values, which is how an operator finds
+    /// out their closer config is broken. Use [`Self::closer_runnable`] when
+    /// the answer has to mean "this leg will actually trade".
     pub fn closer_enabled(&self) -> bool {
         self.closer_pool.is_some()
             && self.floor_ray.is_some()
             && self.buffer_ray.is_some()
             && self.window_secs.is_some()
     }
+    /// True when the closer is wired *and* every value parses — i.e. `main.rs`'s
+    /// `build_closer_pool` would succeed. An unparseable `floor_ray` fails on
+    /// every tick, which is the same dead leg as no closer at all, so anything
+    /// deciding whether the bot has real work to do must ask this instead.
+    pub fn closer_runnable(&self) -> bool {
+        // Nonzero, same as the tokens: `close_pool_once` asks the subgraph for
+        // positions in this pool, and the zero address matches none of them —
+        // forever. That is a closer leg that never trades behind a Start guard
+        // that says it will.
+        let address = |s: &String| {
+            s.parse::<alloy_primitives::Address>()
+                .is_ok_and(|a| !a.is_zero())
+        };
+        let ray = |s: &String| s.parse::<U256>().is_ok();
+        self.closer_enabled()
+            && self.tokens_parse()
+            && self.closer_pool.as_ref().is_some_and(address)
+            && self.floor_ray.as_ref().is_some_and(ray)
+            && self.buffer_ray.as_ref().is_some_and(ray)
+    }
+    /// True when both token addresses are usable. `main.rs` resolves `debt` and
+    /// `collateral` at the top of every pool tick and `continue`s past the
+    /// whole pool if either fails, so a pool that doesn't clear this bar runs
+    /// no leg at all — not the ladder, not the taker, not the closer.
+    ///
+    /// The zero address parses but is not a token: every `balanceOf` and
+    /// `allowance` against it reverts or reads zero, so the pool funds nothing
+    /// and `levels_for` publishes no level. That is the same dead pool as an
+    /// unparseable address, and a half-filled template is exactly how it
+    /// happens — so treat it the same rather than let a Start guard call it
+    /// live.
+    pub fn tokens_parse(&self) -> bool {
+        let usable = |s: &str| {
+            s.parse::<alloy_primitives::Address>()
+                .is_ok_and(|a| !a.is_zero())
+        };
+        usable(&self.collateral) && usable(&self.debt)
+    }
     /// True when the taker leg is on and at least one side has a spread to
     /// price fills with.
     pub fn limit_taker_enabled(&self) -> bool {
         self.limit_taker_enabled.unwrap_or(false)
             && (self.buy_spread().is_some() || self.sell_spread().is_some())
+            && self.tokens_parse()
+    }
+    /// True when the bid side would actually rest something: a spread, and a
+    /// size that resolves to a positive amount. [`Self::buy_enabled`] is
+    /// presence-only and is what decides approvals and funding checks; this is
+    /// the stricter question — "will the ladder post" — for anything gating a
+    /// restart on the book being useful.
+    pub fn buy_postable(&self) -> bool {
+        self.buy_spread().is_some()
+            && side_drafts_orders(
+                self.buy_total_liquidity_debt.as_deref(),
+                self.buy_min_slice_debt.as_deref(),
+                self.buy_max_orders,
+                self.buy_order_size_debt.as_deref(),
+                LadderUnits::SameAsSlice,
+            )
+    }
+    /// True when `rfq::responder::book_from_pool` would succeed for this pool.
+    ///
+    /// Mirrors that function's four fallible steps: both token addresses, and
+    /// both capacity strings. Kept in sync deliberately — `build_runtime`
+    /// collects over every pool with `?`, so one pool failing here takes the
+    /// whole responder down, not just its own side.
+    pub fn rfq_book_buildable(&self) -> bool {
+        self.tokens_parse()
+            && self.rfq_buy_capacity_debt().is_ok()
+            && self.rfq_sell_capacity_collateral().is_ok()
+    }
+    /// True when at least one RFQ side would actually publish a level.
+    ///
+    /// A side needs its spread *and* its capacity — `levels_for` destructures
+    /// `(spread, capacity)` as a pair per side and skips the side if either is
+    /// missing. That pairing is already enforced one layer down:
+    /// [`Self::rfq_buy_capacity_debt`] and
+    /// [`Self::rfq_sell_capacity_collateral`] both return `Ok(None)` when their
+    /// side has no spread, so a spreadless side can never report capacity here.
+    /// Pinned by `an_rfq_side_needs_its_spread_and_its_capacity`.
+    ///
+    /// A zero exact capacity is not a capacity: the responder omits that level
+    /// and rejects every request against it, same as a side never configured.
+    /// `Wallet` is the live balance, decided at request time.
+    pub fn rfq_has_usable_capacity(&self) -> bool {
+        let usable = |c: anyhow::Result<Option<RfqCapacity>>| {
+            matches!(c, Ok(Some(RfqCapacity::Wallet)))
+                || matches!(c, Ok(Some(RfqCapacity::Exact(v))) if !v.is_zero())
+        };
+        usable(self.rfq_buy_capacity_debt()) || usable(self.rfq_sell_capacity_collateral())
+    }
+    /// The ask-side counterpart of [`Self::buy_postable`].
+    pub fn sell_postable(&self) -> bool {
+        self.sell_spread().is_some()
+            && side_drafts_orders(
+                self.sell_total_liquidity_collateral.as_deref(),
+                self.sell_min_slice_debt.as_deref(),
+                self.sell_max_orders,
+                self.sell_order_size_collateral.as_deref(),
+                LadderUnits::ConvertedAtPrice,
+            )
     }
     /// The TWAP window when TWAP quoting is on for this pool.
     pub fn twap_window(&self) -> Option<u64> {
@@ -683,6 +797,73 @@ pub enum RfqCapacity {
     Wallet,
 }
 
+/// Is a side's ladder total denominated in the same unit as its minimum slice?
+///
+/// The bid side funds in debt and slices in debt, so `balanced_ladder` sees them
+/// directly. The ask side funds in *collateral* and slices in debt:
+/// `maker::ask_ladder_sizes` converts the total at the live price and both token
+/// decimals before laddering. Comparing those two raw numbers is a category
+/// error — 1000 units of a low-priced collateral is numerically over a 1-unit
+/// debt slice while being worth far less than it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LadderUnits {
+    /// Total and slice share a unit: ask the builder directly.
+    SameAsSlice,
+    /// Total is converted at the live price first, so its size against the slice
+    /// is a runtime question config cannot answer.
+    ConvertedAtPrice,
+}
+
+/// True when a side would actually draft at least one order.
+///
+/// For a ladder this asks [`crate::ladder::balanced_ladder`] itself rather than
+/// re-deriving its preconditions — it returns nothing when `total < min_slice`,
+/// when `min_slice` is 0, and when `max_orders` is 0, and re-implementing that
+/// here is exactly how a guard drifts from the builder.
+///
+/// Two cases are decided at tick time, not in config, and this can only rule out
+/// what is dead whatever that tick brings: `"max"`, which the live wallet sizes,
+/// and an ask total, whose comparison against the slice needs the live price.
+/// For both, that leaves a positive total, a positive slice, and a positive
+/// order budget — the conditions no price or balance can rescue.
+fn side_drafts_orders(
+    total: Option<&str>,
+    min_slice: Option<&str>,
+    max_orders: Option<u32>,
+    order_size: Option<&str>,
+    units: LadderUnits,
+) -> bool {
+    let orders = max_orders.unwrap_or(DEFAULT_MAX_LADDER_ORDERS) as usize;
+    if let Some(raw) = total {
+        let Ok(amount) = parse_liquidity_amount(raw, "total liquidity") else {
+            return false;
+        };
+        let Some(min) = min_slice.and_then(|s| s.trim().parse::<u128>().ok()) else {
+            return false;
+        };
+        let plausible = |t: U256| !t.is_zero() && min > 0 && orders > 0;
+        return match amount {
+            LiquidityAmount::Max => min > 0 && orders > 0,
+            LiquidityAmount::Exact(v) => match units {
+                LadderUnits::SameAsSlice => u128::try_from(v)
+                    .is_ok_and(|t| !crate::ladder::balanced_ladder(t, min, orders).is_empty()),
+                // The conversion is `u128`-bounded too (`u256_to_u128` on the
+                // debt equivalent), but the collateral total itself is only
+                // read as `u128` after conversion, so bound the input the same
+                // way the funded balance is.
+                LadderUnits::ConvertedAtPrice => u128::try_from(v).is_ok() && plausible(v),
+            },
+        };
+    }
+    // No ladder: a flat per-order size, which posts as long as it is positive
+    // *and* fits the quote path's `u128`. `maker.rs` runs the same value through
+    // `parse_input_liquidity`, which drops the side on overflow — so accepting
+    // anything that merely parses as `U256` here would call a side postable that
+    // draws no orders, the exact drift this predicate exists to prevent. The
+    // ladder branch above already bounds the same way.
+    order_size.is_some_and(|raw| raw.trim().parse::<u128>().is_ok_and(|v| v > 0))
+}
+
 /// One RFQ side's capacity policy: the ladder total (`max` → live wallet,
 /// otherwise a hard cap), else the flat order size, else the side is off.
 fn rfq_side_capacity(
@@ -722,27 +903,82 @@ impl Config {
         self.rfq.as_ref().is_some_and(|r| r.enabled) && !self.pools.is_empty()
     }
 
-    /// True only for the exact [`RFQ_PANEL_GATE`] or [`RFQ_DEFAULT_GATE`]
-    /// token. Read-only surface for the panel; nothing in the bot keys off it.
-    pub fn rfq_panel_unlocked(&self) -> bool {
-        self.rfq_default_unlocked()
-            || self
-                .experimental
-                .as_ref()
-                .and_then(|e| e.rfq_panel.as_deref())
-                == Some(RFQ_PANEL_GATE)
+    /// True when the responder could actually answer something: active, and at
+    /// least one pool whose tokens parse and whose buy or sell side resolves to
+    /// a capacity. [`Self::rfq_active`] only asks whether the responder spawns —
+    /// it will happily spawn on pools with no spread or no size, publish no
+    /// usable levels, and reject every request. Anything deciding "does this bot
+    /// have work to do" needs this instead.
+    pub fn rfq_quotable(&self) -> bool {
+        // Three conditions. The pool one is easy to miss: `build_runtime`
+        // collects `book_from_pool` over *every* pool into one `Result`, so a
+        // single unbuildable pool aborts the whole responder even when it has
+        // no RFQ sides of its own. One good pool is not enough.
+        //
+        // The validation contract has to be real too — the venue rejects a
+        // reply signed against the zero address as `unbound_order`, so a bot
+        // with one connects, publishes levels, and never lands a quote.
+        // `validate` refuses that config at load; this keeps the predicate
+        // honest for one that never went through it.
+        self.rfq_active()
+            && self.rfq.as_ref().is_some_and(|r| {
+                r.validation_contract
+                    .parse::<alloy_primitives::Address>()
+                    .is_ok_and(|a| !a.is_zero())
+            })
+            && self.pools.iter().all(|p| p.rfq_book_buildable())
+            && self.pools.iter().any(|p| p.rfq_has_usable_capacity())
     }
 
-    /// True only for the exact [`RFQ_DEFAULT_GATE`] token on this config.
+    /// True when a leg other than the ladder and the RFQ responder has work to
+    /// do. `main.rs` runs the taker and closer legs off the same feed tick but
+    /// independently of both [`Self::book_enabled`] and [`Self::rfq_active`],
+    /// so a bot with either one configured still trades with RFQ off.
+    ///
+    /// The closer needs more than its pool fields being present: `main.rs`
+    /// builds the discoverer only from `subgraph_url` and puts the whole closer
+    /// path behind it, and then `build_closer_pool` still has to parse the
+    /// values. Either one missing is a leg that never trades. Mirror both here —
+    /// this predicate decides whether Start is allowed, and claiming a dead leg
+    /// is how a bot ends up "running" and silently idle.
+    ///
+    /// "Present" has to mean *usable*, not just non-blank. `Discoverer::new`
+    /// validates nothing, so a value like `not-a-url` builds a discoverer whose
+    /// every `open_positions` call fails at send time — a closer that never
+    /// trades behind a panel that says running. `validate` rejects such a URL at
+    /// load, and this keeps the predicate honest for configs that never got
+    /// there.
+    pub fn has_independent_leg(&self) -> bool {
+        let closer_reachable = self
+            .subgraph_url
+            .as_deref()
+            .is_some_and(subgraph_url_usable);
+        self.pools
+            .iter()
+            .any(|p| p.limit_taker_enabled() || (closer_reachable && p.closer_runnable()))
+    }
+
+    /// Settings RFQ card is always visible. Tokens on disk are ignored.
+    pub fn rfq_panel_unlocked(&self) -> bool {
+        true
+    }
+
+    /// RFQ-as-default is always on. New bots are RFQ-only; leftover book
+    /// bots see the migrate nudge. Tokens on disk are ignored.
     pub fn rfq_default_unlocked(&self) -> bool {
-        self.experimental
-            .as_ref()
-            .and_then(|e| e.rfq_default.as_deref())
-            == Some(RFQ_DEFAULT_GATE)
+        true
     }
 
     fn validate(&self) -> anyhow::Result<()> {
         assert_feed_url(&self.feed.url, "[feed].url")?;
+        // `Discoverer::new` takes this string as-is and validates nothing, so a
+        // typo'd endpoint only surfaces as a failed send on every closer tick —
+        // a leg that silently never trades. Catch it at load instead.
+        if let Some(url) = self.subgraph_url.as_deref() {
+            if !url.trim().is_empty() {
+                assert_subgraph_url(url, "subgraph_url")?;
+            }
+        }
         for (idx, pool) in self.pools.iter().enumerate() {
             if let Some(url) = &pool.feed_url {
                 assert_feed_url(url, &format!("pools[{idx}].feed_url"))?;
@@ -771,6 +1007,71 @@ impl Config {
                 anyhow::ensure!(
                     max_orders <= MAX_SUPPORTED_LADDER_ORDERS,
                     "pools[{idx}].sell_max_orders {max_orders} exceeds supported limit {MAX_SUPPORTED_LADDER_ORDERS}"
+                );
+            }
+            // The absolute spread's other representation. A NaN or negative
+            // offset passes `spread_from` and then prices to NaN or the wrong
+            // side, which `is_price_usable` drops — configured, never quotable.
+            for (field, value) in [
+                ("buy_offset_abs", pool.buy_offset_abs),
+                ("sell_offset_abs", pool.sell_offset_abs),
+            ] {
+                if let Some(value) = value {
+                    anyhow::ensure!(
+                        value.is_finite() && value >= 0.0,
+                        "pools[{idx}].{field} must be a finite, non-negative number, got {value}"
+                    );
+                }
+            }
+            // Zero batch limits are configured-but-inert: `.take(0)` yields an
+            // empty batch every tick, so the leg reads as on and never acts.
+            // Reject at load rather than teaching each predicate about them —
+            // the bot binary has the same problem and no Start guard.
+            for (field, value) in [
+                ("limit_taker_max_orders", pool.limit_taker_max_orders),
+                ("max_positions_per_fill", pool.max_positions_per_fill),
+                ("discover_first", pool.discover_first),
+            ] {
+                if let Some(value) = value {
+                    anyhow::ensure!(
+                        value > 0,
+                        "pools[{idx}].{field} must be positive; 0 makes every batch empty. \
+                         Omit it for the default."
+                    );
+                }
+            }
+            // In-window the closer ramps floor→buffer via `buffer_ray -
+            // floor_ray`, an unsigned subtraction. A floor above the buffer
+            // underflows on the first position still inside its window, so
+            // this is a crash, not a mispriced fill.
+            if let (Some(floor), Some(buffer)) = (&pool.floor_ray, &pool.buffer_ray) {
+                if let (Ok(floor), Ok(buffer)) =
+                    (floor.trim().parse::<U256>(), buffer.trim().parse::<U256>())
+                {
+                    anyhow::ensure!(
+                        floor <= buffer,
+                        "pools[{idx}].floor_ray ({floor}) must not exceed buffer_ray ({buffer}); \
+                         the closer fee ramps from the floor up to the buffer"
+                    );
+                }
+            }
+            // `fee_and_principal` divides by the closer window, so zero is a
+            // panic on the first discovered position — not a misconfiguration
+            // that merely quotes nothing. Same bar as `twap_window_secs` below.
+            if let Some(window) = pool.window_secs {
+                anyhow::ensure!(
+                    window > 0,
+                    "pools[{idx}].window_secs must be positive; the closer divides by it"
+                );
+            }
+            // At 10_000 bps the bid collapses to zero, which `is_price_usable`
+            // drops — the side is configured but can never produce a quote.
+            // Mirrors the exclusive bound on `twap_max_deviation_bps`.
+            if let Some(bps) = pool.buy_offset_bps {
+                anyhow::ensure!(
+                    bps < 10_000,
+                    "pools[{idx}].buy_offset_bps {bps} must be below 10000; at 10000 the bid \
+                     prices at zero and no quote is usable"
                 );
             }
             if let Some(window) = pool.twap_window_secs {
@@ -850,9 +1151,24 @@ impl Config {
             !rfq.api_key_env.trim().is_empty(),
             "[rfq].api_key_env is empty"
         );
-        rfq.validation_contract
+        let validation_contract = rfq
+            .validation_contract
             .parse::<alloy_primitives::Address>()
             .context("[rfq].validation_contract is not a valid address")?;
+        // Zero parses but is not the validator. The venue's `validateReply`
+        // requires the deployed preferred-filler contract and rejects every
+        // reply signed against anything else as `unbound_order`, so a zero here
+        // is a responder that connects, publishes levels, and never lands a
+        // quote. The commented `[rfq]` block in the shipped templates carries
+        // the zero address as a placeholder, so uncommenting it lands exactly
+        // here — with a message naming the field instead of silence.
+        anyhow::ensure!(
+            !validation_contract.is_zero(),
+            "[rfq].validation_contract is the zero address — the venue rejects \
+             every reply signed against it as `unbound_order`, so the responder \
+             would run and never land a quote. Connect writes the real address; \
+             don't fill this in by hand"
+        );
         for (idx, pool) in self.pools.iter().enumerate() {
             if let Some(slug) = &pool.rfq_corridor {
                 anyhow::ensure!(
@@ -871,32 +1187,20 @@ impl Config {
     }
 }
 
-/// True when `toml` sets `[experimental] rfq_default` to the exact gate token.
-/// Used for a fleet `panel.toml` that is not a full bot config.
-pub fn toml_has_rfq_default_gate(toml: &str) -> bool {
-    let Ok(value) = toml::from_str::<toml::Value>(toml) else {
-        return false;
-    };
-    value
-        .get("experimental")
-        .and_then(|e| e.get("rfq_default"))
-        .and_then(|v| v.as_str())
-        == Some(RFQ_DEFAULT_GATE)
+/// Historical parser for a fleet `panel.toml` token. Always true now —
+/// RFQ-as-default does not depend on a file.
+pub fn toml_has_rfq_default_gate(_toml: &str) -> bool {
+    true
 }
 
-/// Fleet-wide RFQ-default switch: `{dir}/panel.toml` with the exact token.
-pub fn rfq_default_flag_in_dir(dir: &std::path::Path) -> bool {
-    let path = dir.join(PANEL_FLAGS_FILE);
-    std::fs::read_to_string(path)
-        .ok()
-        .is_some_and(|text| toml_has_rfq_default_gate(&text))
+/// Fleet-wide RFQ-default is always on. `{dir}/panel.toml` is ignored.
+pub fn rfq_default_flag_in_dir(_dir: &std::path::Path) -> bool {
+    true
 }
 
-/// Stamp a fresh corridor template as RFQ-only: fleet flag, or this bot
-/// already left the public ladder / carries the per-bot token.
-pub fn rfq_default_preset_applies(cfg: Option<&Config>, bots_dir: &std::path::Path) -> bool {
-    rfq_default_flag_in_dir(bots_dir)
-        || cfg.is_some_and(|c| !c.book_enabled || c.rfq_default_unlocked())
+/// Stamp a fresh corridor template as RFQ-only. Always.
+pub fn rfq_default_preset_applies(_cfg: Option<&Config>, _bots_dir: &std::path::Path) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -1186,18 +1490,19 @@ mod tests {
     }
 
     #[test]
-    fn the_example_config_keeps_rfq_disabled() {
-        // The kill-switch guarantee: a config written before RFQ existed (the
-        // shipped example documents it commented out) must parse with the
-        // responder fully off and the panel gate locked.
+    fn the_example_config_is_rfq_only_with_the_responder_off() {
+        // Shipped example: book off, [rfq] commented so Connect can write it.
+        // The Settings card is always unlocked.
         let cfg = Config::from_toml(EXAMPLE).expect("example config parses");
         assert!(cfg.rfq.is_none());
         assert!(!cfg.rfq_active());
-        assert!(!cfg.rfq_panel_unlocked());
+        assert!(!cfg.book_enabled);
+        assert!(cfg.rfq_panel_unlocked());
+        assert!(cfg.rfq_default_unlocked());
         assert!(cfg.pools.iter().all(|p| p.rfq_corridor.is_none()));
         let book = EXAMPLE
-            .find("# book_enabled = false")
-            .expect("example must document book_enabled");
+            .find("book_enabled = false")
+            .expect("example must set book_enabled = false");
         let feed = EXAMPLE.find("\n[feed]\n").expect("example has [feed]");
         assert!(
             book < feed,
@@ -1206,20 +1511,643 @@ mod tests {
     }
 
     #[test]
-    fn rfq_panel_gate_only_opens_on_the_exact_token() {
-        // No [experimental] block at all → locked.
+    fn rfq_panel_and_default_are_always_on() {
         let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
-        assert!(!cfg.rfq_panel_unlocked());
+        assert!(cfg.rfq_panel_unlocked());
+        assert!(cfg.rfq_default_unlocked());
+        assert!(toml_has_rfq_default_gate(""));
+        assert!(rfq_default_preset_applies(
+            Some(&cfg),
+            &std::env::temp_dir()
+        ));
+    }
 
-        // Near-misses fail closed: truthy strings, the wrong case, whitespace.
-        for wrong in ["true", "1", "yes", "ENABLE-RFQ-BETA", " enable-rfq-beta"] {
-            let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_panel = \"{wrong}\"\n");
-            let cfg = Config::from_toml(&toml).unwrap();
-            assert!(!cfg.rfq_panel_unlocked(), "{wrong:?} must not unlock");
+    #[test]
+    fn has_independent_leg_tracks_what_main_actually_runs() {
+        // Neither leg configured.
+        let bare = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert!(!bare.has_independent_leg());
+
+        // The taker leg needs nothing beyond its own pool fields.
+        let taker =
+            Config::from_toml(&format!("{LEAN_POOL_BASE}\nlimit_taker_enabled = true\n")).unwrap();
+        assert!(taker.has_independent_leg());
+
+        // Closer fields with no subgraph: `main.rs` never builds the
+        // discoverer, so the whole closer path is dead and Start must not
+        // treat it as a live leg.
+        const CLOSER_FIELDS: &str = concat!(
+            "\ncloser_pool = \"0x0000000000000000000000000000000000000003\"\n",
+            "floor_ray = \"1000000000000000000000000000\"\n",
+            "buffer_ray = \"1000000000000000000000000000\"\n",
+            "window_secs = 60\n"
+        );
+        let orphan_closer = Config::from_toml(&format!("{LEAN_POOL_BASE}{CLOSER_FIELDS}")).unwrap();
+        assert!(orphan_closer.pools[0].closer_enabled());
+        assert!(
+            !orphan_closer.has_independent_leg(),
+            "closer without subgraph_url is a leg that never runs"
+        );
+
+        // With the subgraph the discoverer exists and the leg is real.
+        let with_subgraph = |closer: &str| {
+            Config::from_toml(&format!(
+                "{}{closer}",
+                LEAN_POOL_BASE.replace(
+                    "tick_interval_secs = 5",
+                    "tick_interval_secs = 5\nsubgraph_url = \"https://subgraph\""
+                )
+            ))
+            .unwrap()
+        };
+        assert!(with_subgraph(CLOSER_FIELDS).has_independent_leg());
+
+        // A blank subgraph_url is the same as none.
+        let blank = Config::from_toml(&format!(
+            "{}{CLOSER_FIELDS}",
+            LEAN_POOL_BASE.replace(
+                "tick_interval_secs = 5",
+                "tick_interval_secs = 5\nsubgraph_url = \"  \""
+            )
+        ))
+        .unwrap();
+        assert!(!blank.has_independent_leg());
+
+        // Present but unparseable values: `build_closer_pool` rejects them on
+        // every tick, so the leg is just as dead as a missing subgraph.
+        // (An empty ray is not one of these — alloy parses "" as zero, so
+        // `build_closer_pool` accepts it and the leg does run, just with a
+        // zero floor. Only genuinely unparseable values kill it.)
+        for bad in [
+            CLOSER_FIELDS.replace(
+                "floor_ray = \"1000000000000000000000000000\"",
+                "floor_ray = \"  \"",
+            ),
+            CLOSER_FIELDS.replace(
+                "buffer_ray = \"1000000000000000000000000000\"",
+                "buffer_ray = \"not-a-number\"",
+            ),
+            CLOSER_FIELDS.replace(
+                "closer_pool = \"0x0000000000000000000000000000000000000003\"",
+                "closer_pool = \"0xnope\"",
+            ),
+        ] {
+            let cfg = with_subgraph(&bad);
+            assert!(
+                cfg.pools[0].closer_enabled(),
+                "presence must still hold so main.rs keeps warning: {bad}"
+            );
+            assert!(
+                !cfg.has_independent_leg(),
+                "unparseable closer must not count as a live leg: {bad}"
+            );
         }
+    }
 
-        let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_panel = \"enable-rfq-beta\"\n");
-        assert!(Config::from_toml(&toml).unwrap().rfq_panel_unlocked());
+    #[test]
+    fn a_pool_whose_tokens_do_not_parse_runs_no_leg_at_all() {
+        // `main.rs` resolves debt + collateral at the top of the pool tick and
+        // `continue`s past the whole pool when either fails, so neither the
+        // taker nor the closer ever reaches such a pool.
+        for broken in [
+            LEAN_POOL_BASE.replace(
+                "collateral = \"0x0000000000000000000000000000000000000001\"",
+                "collateral = \"0xnope\"",
+            ),
+            LEAN_POOL_BASE.replace(
+                "debt = \"0x0000000000000000000000000000000000000002\"",
+                "debt = \"not-an-address\"",
+            ),
+        ] {
+            let cfg =
+                Config::from_toml(&format!("{broken}\nlimit_taker_enabled = true\n")).unwrap();
+            assert!(!cfg.pools[0].tokens_parse());
+            assert!(
+                !cfg.pools[0].limit_taker_enabled(),
+                "the taker leg never runs on a pool main.rs skips"
+            );
+            assert!(!cfg.has_independent_leg());
+        }
+    }
+
+    #[test]
+    fn non_finite_absolute_offsets_are_rejected_at_load() {
+        // The bps path is bounded a few lines up; this is the other spread
+        // representation. NaN prices to NaN and negative prices the wrong side
+        // — `is_price_usable` drops both, so the side never quotes.
+        for field in ["buy_offset_abs", "sell_offset_abs"] {
+            for bad in ["nan", "-1.0", "inf"] {
+                let toml = LEAN_POOL_BASE.replace(
+                    "refresh_threshold_bps = 10",
+                    &format!("refresh_threshold_bps = 10\n{field} = {bad}"),
+                );
+                let err = Config::from_toml(&toml).unwrap_err().to_string();
+                assert!(err.contains(field), "{field} = {bad}: {err}");
+            }
+            // Zero is a legitimate spread: quote at the mid.
+            let ok = LEAN_POOL_BASE.replace(
+                "refresh_threshold_bps = 10",
+                &format!("refresh_threshold_bps = 10\n{field} = 0.0"),
+            );
+            assert!(Config::from_toml(&ok).is_ok(), "{field} = 0.0 must load");
+        }
+    }
+
+    #[test]
+    fn zero_batch_limits_are_rejected_at_load() {
+        // `.take(0)` returns an empty batch forever, so these read as a live
+        // leg while nothing can ever be filled or closed.
+        for field in [
+            "limit_taker_max_orders",
+            "max_positions_per_fill",
+            "discover_first",
+        ] {
+            let toml = LEAN_POOL_BASE.replace(
+                "refresh_threshold_bps = 10",
+                &format!("refresh_threshold_bps = 10\n{field} = 0"),
+            );
+            let err = Config::from_toml(&toml).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+            assert!(err.contains("positive"), "{field}: {err}");
+
+            // A positive value, and omitting it entirely, both still load.
+            let ok = toml.replace(&format!("{field} = 0"), &format!("{field} = 5"));
+            assert!(Config::from_toml(&ok).is_ok(), "{field} = 5 must load");
+        }
+        assert!(
+            Config::from_toml(LEAN_POOL_BASE).is_ok(),
+            "defaults still load"
+        );
+    }
+
+    #[test]
+    fn a_closer_floor_above_its_buffer_is_rejected_at_load() {
+        // `fee_and_principal` computes `buffer_ray - floor_ray` on U256 while
+        // the position is still in its window — inverted, that underflows.
+        let closer = |floor: &str, buffer: &str| {
+            LEAN_POOL_BASE.replace(
+                "refresh_threshold_bps = 10",
+                &format!(
+                    "refresh_threshold_bps = 10\n\
+                     closer_pool = \"0x0000000000000000000000000000000000000003\"\n\
+                     floor_ray = \"{floor}\"\n\
+                     buffer_ray = \"{buffer}\"\n\
+                     window_secs = 60"
+                ),
+            )
+        };
+        let err = Config::from_toml(&closer("2000", "1000"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("floor_ray"), "{err}");
+        assert!(err.contains("buffer_ray"), "{err}");
+
+        // Equal is fine — a flat fee with no ramp.
+        assert!(Config::from_toml(&closer("1000", "1000")).is_ok());
+        assert!(Config::from_toml(&closer("1000", "2000")).is_ok());
+    }
+
+    #[test]
+    fn a_zero_closer_window_is_rejected_at_load() {
+        // `fee_and_principal` divides by the window, so zero panics the bot on
+        // the first discovered position. Reject it where twap_window_secs is.
+        let toml = LEAN_POOL_BASE.replace(
+            "refresh_threshold_bps = 10",
+            concat!(
+                "refresh_threshold_bps = 10\n",
+                "closer_pool = \"0x0000000000000000000000000000000000000003\"\n",
+                "floor_ray = \"1000000000000000000000000000\"\n",
+                "buffer_ray = \"1000000000000000000000000000\"\n",
+                "window_secs = 0\n"
+            ),
+        );
+        let err = Config::from_toml(&toml).unwrap_err().to_string();
+        assert!(err.contains("window_secs"), "{err}");
+        assert!(err.contains("positive"), "{err}");
+
+        // A positive window still loads.
+        assert!(Config::from_toml(&toml.replace("window_secs = 0", "window_secs = 60")).is_ok());
+    }
+
+    #[test]
+    fn a_bid_spread_that_prices_at_zero_is_rejected_at_load() {
+        // 10_000 bps takes the bid to zero, which `is_price_usable` drops — the
+        // side reads as configured but can never quote.
+        let err = Config::from_toml(
+            &LEAN_POOL_BASE.replace("buy_offset_bps = 1", "buy_offset_bps = 10000"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("buy_offset_bps"), "{err}");
+
+        // Just under the bound is still a (very wide) usable bid.
+        assert!(Config::from_toml(
+            &LEAN_POOL_BASE.replace("buy_offset_bps = 1", "buy_offset_bps = 9999")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_zero_sized_side_is_not_postable() {
+        // Presence is not a size: the ladder builder finds nothing above the
+        // minimum slice and drafts no orders, so `"0"` must not read as a
+        // ladder that would post.
+        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert!(cfg.pools[0].buy_postable() && cfg.pools[0].sell_postable());
+
+        let zeroed = LEAN_POOL_BASE
+            .replace(
+                "buy_order_size_debt = \"1000000000\"",
+                "buy_order_size_debt = \"0\"",
+            )
+            .replace(
+                "sell_order_size_collateral = \"1000000\"",
+                "sell_order_size_collateral = \"0\"",
+            );
+        let cfg = Config::from_toml(&zeroed).unwrap();
+        assert!(
+            cfg.pools[0].buy_enabled() && cfg.pools[0].sell_enabled(),
+            "presence still holds — approvals and funding key off that"
+        );
+        assert!(!cfg.pools[0].buy_postable());
+        assert!(!cfg.pools[0].sell_postable());
+
+        // "max" is a real size: the live wallet supplies the total.
+        let maxed = LEAN_POOL_BASE.replace(
+            "buy_order_size_debt = \"1000000000\"",
+            "buy_total_liquidity_debt = \"max\"\nbuy_min_slice_debt = \"1000000\"",
+        );
+        assert!(Config::from_toml(&maxed).unwrap().pools[0].buy_postable());
+    }
+
+    #[test]
+    fn the_zero_address_is_not_a_token() {
+        // It parses, but nothing lives there: every `balanceOf` and `allowance`
+        // reads empty, so the pool funds nothing and publishes no level. A
+        // half-filled template is exactly how a bot ends up here, and a Start
+        // guard that called it live would report a bot quoting nothing.
+        const ZERO: &str = "0x0000000000000000000000000000000000000000";
+        assert!(Config::from_toml(LEAN_POOL_BASE).unwrap().pools[0].tokens_parse());
+        for token in [
+            "0x0000000000000000000000000000000000000001", // collateral
+            "0x0000000000000000000000000000000000000002", // debt
+        ] {
+            let toml = LEAN_POOL_BASE.replace(token, ZERO);
+            let cfg = Config::from_toml(&toml).unwrap();
+            assert!(
+                !cfg.pools[0].tokens_parse(),
+                "a zero token is a pool that can never quote"
+            );
+            // Everything gated on the tokens follows: the RFQ book the
+            // responder would build, and the taker leg Start counts as live.
+            assert!(!cfg.pools[0].rfq_book_buildable());
+            assert!(!cfg.pools[0].closer_runnable());
+            let taker =
+                Config::from_toml(&format!("{toml}\nlimit_taker_enabled = true\n")).unwrap();
+            assert!(!taker.pools[0].limit_taker_enabled());
+            assert!(!taker.has_independent_leg());
+        }
+    }
+
+    #[test]
+    fn the_ask_ladder_is_not_judged_in_the_wrong_unit() {
+        // `sell_total_liquidity_collateral` is collateral atomic units;
+        // `sell_min_slice_debt` is debt. `maker::ask_ladder_sizes` converts the
+        // total at the live price *before* laddering, so comparing the two raw
+        // numbers here is a category error in both directions — and config
+        // cannot resolve it, because the price is a tick-time value.
+        let ask = |total: &str, min: &str| {
+            let toml = LEAN_POOL_BASE.replace(
+                "sell_order_size_collateral = \"1000000\"",
+                &format!(
+                    "sell_total_liquidity_collateral = \"{total}\"\nsell_min_slice_debt = \"{min}\""
+                ),
+            );
+            Config::from_toml(&toml)
+                .unwrap_or_else(|e| panic!("config must parse: {e:#}"))
+                .pools[0]
+                .sell_postable()
+        };
+
+        // A total numerically under the slice is *not* dead: a high-priced
+        // collateral converts to far more debt than its own count.
+        assert!(
+            ask("100", "1000"),
+            "only the live price decides whether this clears the slice"
+        );
+        // What no price can rescue: nothing to sell, or no order budget. (A
+        // zero slice never reaches the predicate — `validate` rejects it at
+        // load — so the `min > 0` arm is belt and braces.)
+        assert!(!ask("0", "1000"), "an empty total drafts nothing");
+        let no_budget = LEAN_POOL_BASE.replace(
+            "sell_order_size_collateral = \"1000000\"",
+            "sell_total_liquidity_collateral = \"1000000\"\nsell_min_slice_debt = \"1000\"\nsell_max_orders = 0",
+        );
+        assert!(
+            !Config::from_toml(&no_budget).unwrap().pools[0].sell_postable(),
+            "a zero order budget drafts nothing at any price"
+        );
+
+        // The bid side shares a unit with its slice, so it still asks the
+        // builder directly and a total under one slice really is dead.
+        let bid = |total: &str, min: &str| {
+            let toml = LEAN_POOL_BASE.replace(
+                "buy_order_size_debt = \"1000000000\"",
+                &format!("buy_total_liquidity_debt = \"{total}\"\nbuy_min_slice_debt = \"{min}\""),
+            );
+            Config::from_toml(&toml).unwrap().pools[0].buy_postable()
+        };
+        assert!(!bid("100", "1000"));
+        assert!(bid("1000000", "1000"));
+    }
+
+    #[test]
+    fn a_zero_closer_pool_is_not_a_closer_leg() {
+        // Same as a zero token: it parses, but the subgraph has no positions in
+        // it, so `close_pool_once` loops on an empty set forever.
+        const CLOSER: &str = concat!(
+            "\ncloser_pool = \"{POOL}\"\n",
+            "floor_ray = \"1000000000000000000000000000\"\n",
+            "buffer_ray = \"1000000000000000000000000000\"\n",
+            "window_secs = 60\n"
+        );
+        let with_pool = |pool: &str| {
+            let toml = format!(
+                "{}{}",
+                LEAN_POOL_BASE.replace(
+                    "tick_interval_secs = 5",
+                    "tick_interval_secs = 5\nsubgraph_url = \"https://subgraph\"",
+                ),
+                CLOSER.replace("{POOL}", pool)
+            );
+            Config::from_toml(&toml).unwrap()
+        };
+        assert!(with_pool("0x0000000000000000000000000000000000000003").has_independent_leg());
+        let zero = with_pool("0x0000000000000000000000000000000000000000");
+        assert!(zero.pools[0].closer_enabled(), "presence still holds");
+        assert!(!zero.pools[0].closer_runnable());
+        assert!(
+            !zero.has_independent_leg(),
+            "a closer pointed at the zero address never trades"
+        );
+    }
+
+    #[test]
+    fn a_flat_size_above_u128_is_not_postable() {
+        // `maker.rs` runs the flat size through `parse_input_liquidity`, which
+        // is `u128`-bounded and drops the side on overflow. A value that only
+        // parses as `U256` is therefore a side that draws no orders — and for a
+        // book-only bot, a Start guard that called it postable would report a
+        // running bot posting nothing.
+        let over = "340282366920938463463374607431768211456"; // u128::MAX + 1
+        let toml = LEAN_POOL_BASE.replace(
+            "buy_order_size_debt = \"1000000000\"",
+            &format!("buy_order_size_debt = \"{over}\""),
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert!(
+            !cfg.pools[0].buy_postable(),
+            "a flat size the quote path cannot parse is not a live ladder"
+        );
+        // The boundary itself still posts.
+        let at_max = LEAN_POOL_BASE.replace(
+            "buy_order_size_debt = \"1000000000\"",
+            &format!("buy_order_size_debt = \"{}\"", u128::MAX),
+        );
+        assert!(Config::from_toml(&at_max).unwrap().pools[0].buy_postable());
+    }
+
+    #[test]
+    fn an_rfq_side_needs_its_spread_and_its_capacity() {
+        // `levels_for` destructures `(spread, capacity)` per side and skips the
+        // side when either is missing, so a config with buy capacity but no buy
+        // spread must not read as quotable. The capacity accessors enforce that
+        // themselves — no spread, no capacity — which is what keeps
+        // `rfq_has_usable_capacity` honest without re-checking spreads.
+        let base = LEAN_POOL_BASE
+            .replace("buy_offset_bps = 1\n", "")
+            .replace("buy_order_size_debt = \"1000000000\"\n", "")
+            .replace("sell_offset_bps = 1\n", "")
+            .replace("sell_order_size_collateral = \"1000000\"\n", "");
+        let cfg = |extra: &str| {
+            Config::from_toml(&format!("{base}{extra}"))
+                .unwrap_or_else(|e| panic!("config must parse: {e:#}"))
+        };
+
+        // Size with no spread on the same side: the accessor reports no
+        // capacity at all, so the side cannot claim to be live.
+        let spreadless = cfg("buy_order_size_debt = \"1000000\"\n");
+        assert!(matches!(
+            spreadless.pools[0].rfq_buy_capacity_debt(),
+            Ok(None)
+        ));
+        assert!(!spreadless.pools[0].rfq_has_usable_capacity());
+
+        // Buy size without buy spread, plus a sell spread with no sell size:
+        // neither side is whole, so neither publishes.
+        assert!(
+            !cfg("buy_order_size_debt = \"1000000\"\nsell_offset_bps = 1\n").pools[0]
+                .rfq_has_usable_capacity()
+        );
+
+        // A spread with no size is not a side either.
+        assert!(!cfg("buy_offset_bps = 1\n").pools[0].rfq_has_usable_capacity());
+
+        // One complete side is enough.
+        assert!(
+            cfg("buy_offset_bps = 1\nbuy_order_size_debt = \"1000000\"\n").pools[0]
+                .rfq_has_usable_capacity()
+        );
+        assert!(
+            cfg("sell_offset_bps = 1\nsell_order_size_collateral = \"1000000\"\n").pools[0]
+                .rfq_has_usable_capacity()
+        );
+    }
+
+    #[test]
+    fn a_zero_validation_contract_is_not_quotable() {
+        // The venue's `validateReply` requires the deployed preferred-filler
+        // validator and rejects anything else as `unbound_order`, so a zero
+        // address is a responder that connects, publishes levels, and never
+        // lands a quote — the panel would call it running.
+        const RFQ: &str = concat!(
+            "\n[rfq]\nenabled = true\n",
+            "url = \"wss://api.textilecredit.com/v2/maker/stream\"\n",
+            "maker_id = \"mk_test\"\n",
+            "validation_contract = \"{ADDR}\"\n"
+        );
+        let with_contract = |addr: &str| format!("{LEAN_POOL_BASE}{}", RFQ.replace("{ADDR}", addr));
+
+        let real = "0x00000000000000000000000000000000000000aa";
+        let cfg = Config::from_toml(&with_contract(real)).expect("a real validator loads");
+        assert!(cfg.rfq_quotable());
+
+        // The shipped templates carry the zero address in their commented
+        // `[rfq]` block, so uncommenting it lands here.
+        let zero = "0x0000000000000000000000000000000000000000";
+        let err = Config::from_toml(&with_contract(zero))
+            .expect_err("a zero validator must not load")
+            .to_string();
+        assert!(err.contains("validation_contract"), "{err}");
+        assert!(err.contains("unbound_order"), "{err}");
+
+        // And the predicate agrees for a config that never went through
+        // `validate` — the panel's Start guard reads it directly.
+        let mut hand_edited = cfg;
+        hand_edited.rfq.as_mut().unwrap().validation_contract = zero.to_string();
+        assert!(
+            !hand_edited.rfq_quotable(),
+            "a bot that can never land a quote is not a live RFQ leg"
+        );
+    }
+
+    #[test]
+    fn an_unusable_subgraph_url_is_not_a_closer_leg() {
+        const CLOSER_FIELDS: &str = concat!(
+            "\ncloser_pool = \"0x0000000000000000000000000000000000000003\"\n",
+            "floor_ray = \"1000000000000000000000000000\"\n",
+            "buffer_ray = \"1000000000000000000000000000\"\n",
+            "window_secs = 60\n"
+        );
+        let with_url = |url: &str| {
+            format!(
+                "{}{CLOSER_FIELDS}",
+                LEAN_POOL_BASE.replace(
+                    "tick_interval_secs = 5",
+                    &format!("tick_interval_secs = 5\nsubgraph_url = \"{url}\""),
+                )
+            )
+        };
+
+        // `Discoverer::new` validates nothing, so a non-URL would build a
+        // discoverer whose every request fails at send time. Refuse it at load
+        // rather than run a closer that can never trade.
+        let err = Config::from_toml(&with_url("not-a-url"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("subgraph_url"),
+            "load must name the bad field, got {err}"
+        );
+        assert!(Config::from_toml(&with_url("ftp://subgraph")).is_err());
+        // Remote cleartext is the feed's MITM exposure, same answer.
+        assert!(Config::from_toml(&with_url("http://subgraph")).is_err());
+
+        // The predicate agrees for a config that never went through validate.
+        let mut cfg = Config::from_toml(&with_url("https://subgraph")).unwrap();
+        assert!(cfg.has_independent_leg());
+        cfg.subgraph_url = Some("not-a-url".to_string());
+        assert!(
+            !cfg.has_independent_leg(),
+            "an unreachable subgraph is not a leg Start may count"
+        );
+    }
+
+    #[test]
+    fn a_ladder_that_drafts_no_orders_is_not_postable() {
+        // `balanced_ladder` returns nothing when the total is under one slice,
+        // when the slice is zero, or when the order budget is zero. The
+        // predicate asks the builder rather than re-deriving those rules.
+        let ladder = |total: &str, min: &str, max_orders: &str| {
+            let toml = LEAN_POOL_BASE.replace(
+                "buy_order_size_debt = \"1000000000\"",
+                &format!(
+                    "buy_total_liquidity_debt = \"{total}\"\nbuy_min_slice_debt = \"{min}\"\n{max_orders}"
+                ),
+            );
+            Config::from_toml(&toml)
+                .unwrap_or_else(|e| panic!("config must parse: {e:#}"))
+                .pools[0]
+                .buy_postable()
+        };
+
+        assert!(ladder("1000000", "1000", ""), "a real ladder posts");
+        assert!(
+            !ladder("100", "1000", ""),
+            "a total under one slice drafts nothing"
+        );
+        assert!(
+            !ladder("1000000", "1000", "buy_max_orders = 0"),
+            "a zero order budget drafts nothing"
+        );
+        // `balanced_ladder`'s third dead case, a zero minimum slice, can't get
+        // this far — `parse_min_slice_debt` rejects it at load.
+        let zero_slice = LEAN_POOL_BASE.replace(
+            "buy_order_size_debt = \"1000000000\"",
+            "buy_total_liquidity_debt = \"1000000\"\nbuy_min_slice_debt = \"0\"",
+        );
+        assert!(Config::from_toml(&zero_slice)
+            .unwrap_err()
+            .to_string()
+            .contains("greater than zero"));
+    }
+
+    #[test]
+    fn one_unbuildable_pool_makes_the_whole_bot_unquotable() {
+        // `build_runtime` collects `book_from_pool` over every pool with `?`,
+        // so a malformed extra pool aborts the responder even though it has no
+        // RFQ sides of its own. One good pool is not enough.
+        let second = LEAN_POOL_BASE
+            .split("[[pools]]")
+            .nth(1)
+            .expect("base has a pool");
+        let two_pools = format!("{LEAN_POOL_BASE}\n[[pools]]{second}\n{RFQ_BLOCK}");
+        assert!(Config::from_toml(&two_pools).unwrap().rfq_quotable());
+
+        let broken_second = format!(
+            "{LEAN_POOL_BASE}\n[[pools]]{}\n{RFQ_BLOCK}",
+            second.replace(
+                "collateral = \"0x0000000000000000000000000000000000000001\"",
+                "collateral = \"0xnope\"",
+            )
+        );
+        let cfg = Config::from_toml(&broken_second).unwrap();
+        assert!(cfg.pools[0].rfq_has_usable_capacity(), "pool 1 is fine");
+        assert!(!cfg.pools[1].rfq_book_buildable(), "pool 2 is not");
+        assert!(
+            !cfg.rfq_quotable(),
+            "a pool that aborts build_runtime takes the whole responder with it"
+        );
+    }
+
+    #[test]
+    fn a_zero_rfq_capacity_is_not_quotable() {
+        // "0" resolves to Some(Exact(0)): present, but the responder omits the
+        // level and rejects every request against it.
+        let zero_buy = LEAN_POOL_BASE.replace("sell_offset_bps = 1", "").replace(
+            "buy_order_size_debt = \"1000000000\"",
+            "buy_total_liquidity_debt = \"0\"",
+        );
+        let cfg = Config::from_toml(&format!("{zero_buy}\n{RFQ_BLOCK}")).unwrap();
+        assert!(matches!(
+            cfg.pools[0].rfq_buy_capacity_debt(),
+            Ok(Some(RfqCapacity::Exact(_)))
+        ));
+        assert!(cfg.rfq_active());
+        assert!(
+            !cfg.rfq_quotable(),
+            "a zero capacity is the same as no side at all"
+        );
+    }
+
+    #[test]
+    fn rfq_quotable_needs_a_side_that_can_actually_answer() {
+        // `rfq_active` only asks whether the responder spawns. A pool with no
+        // spread yields a CorridorBook with both capacities None: it publishes
+        // no usable levels and rejects every request.
+        let with_rfq =
+            |pool: &str| Config::from_toml(&format!("{pool}\n{RFQ_BLOCK}")).expect("config parses");
+        assert!(with_rfq(LEAN_POOL_BASE).rfq_quotable());
+
+        let no_spreads = LEAN_POOL_BASE
+            .replace("buy_offset_bps = 1", "")
+            .replace("sell_offset_bps = 1", "");
+        let cfg = with_rfq(&no_spreads);
+        assert!(cfg.rfq_active(), "the responder would still spawn");
+        assert!(
+            !cfg.rfq_quotable(),
+            "but it can answer nothing, so Start must not count it"
+        );
     }
 
     #[test]
@@ -1236,59 +2164,13 @@ mod tests {
     }
 
     #[test]
-    fn rfq_default_gate_only_opens_on_the_exact_token() {
-        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
-        assert!(!cfg.rfq_default_unlocked());
-        assert!(!cfg.rfq_panel_unlocked());
-
-        for wrong in ["true", "1", "enable-rfq-beta", "ENABLE-RFQ"] {
-            let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_default = \"{wrong}\"\n");
-            let cfg = Config::from_toml(&toml).unwrap();
-            assert!(!cfg.rfq_default_unlocked(), "{wrong:?} must not unlock");
-        }
-
-        let toml = format!("{LEAN_POOL_BASE}\n[experimental]\nrfq_default = \"enable-rfq\"\n");
+    fn leftover_gate_tokens_still_parse() {
+        let toml = format!(
+            "{LEAN_POOL_BASE}\n[experimental]\nrfq_panel = \"nope\"\nrfq_default = \"nope\"\n"
+        );
         let cfg = Config::from_toml(&toml).unwrap();
+        assert!(cfg.rfq_panel_unlocked());
         assert!(cfg.rfq_default_unlocked());
-        assert!(
-            cfg.rfq_panel_unlocked(),
-            "the default gate also unlocks the RFQ card"
-        );
-    }
-
-    #[test]
-    fn a_panel_toml_is_not_a_bot_config_but_still_trips_the_gate() {
-        assert!(!toml_has_rfq_default_gate(""));
-        assert!(!toml_has_rfq_default_gate(
-            "[experimental]\nrfq_panel = \"enable-rfq-beta\"\n"
-        ));
-        assert!(toml_has_rfq_default_gate(
-            "[experimental]\nrfq_default = \"enable-rfq\"\n"
-        ));
-    }
-
-    #[test]
-    fn rfq_default_preset_applies_for_fleet_or_an_already_rfq_only_bot() {
-        let empty = std::env::temp_dir().join("stitch-rfq-preset-applies-empty");
-        let _ = std::fs::create_dir_all(&empty);
-        let book = Config::from_toml(LEAN_POOL_BASE).unwrap();
-        assert!(!rfq_default_preset_applies(Some(&book), &empty));
-
-        let off = LEAN_POOL_BASE.replace(
-            "tick_interval_secs = 5",
-            "tick_interval_secs = 5\nbook_enabled = false",
-        );
-        let rfq_only = Config::from_toml(&off).unwrap();
-        assert!(rfq_default_preset_applies(Some(&rfq_only), &empty));
-
-        let fleet = std::env::temp_dir().join("stitch-rfq-preset-applies-fleet");
-        let _ = std::fs::create_dir_all(&fleet);
-        std::fs::write(
-            fleet.join(PANEL_FLAGS_FILE),
-            "[experimental]\nrfq_default = \"enable-rfq\"\n",
-        )
-        .unwrap();
-        assert!(rfq_default_preset_applies(Some(&book), &fleet));
     }
 
     const RFQ_BLOCK: &str = r#"

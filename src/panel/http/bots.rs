@@ -348,6 +348,7 @@ pub async fn start(
     // out from under the claim between here and `docker.start`.
     let launch = lock_and_claim_for_launch(&name, &state).await?;
     super::require_actionable(&launch.bot)?;
+    refuse_rfq_only_start_without_credential(&launch.bot, state.cfg.runtime)?;
     // Start only has work to do on a stopped container. If the bot is already up — two
     // Start requests raced and the config lock let the second re-read it *after* the
     // first started it, or a stale UI click lost that race — `docker start` is at best a
@@ -389,6 +390,106 @@ pub async fn start(
     action_response(&state, &name, None).await
 }
 
+/// RFQ-only bots quote nothing until Connect writes a maker key. Create already
+/// refuses auto-start; the bot page must too.
+///
+/// Only refuse when *every* leg is off. The ladder is one leg, RFQ is another,
+/// and the taker/closer legs run independently of both — so a bot whose Connect
+/// came back flagged (or landed on a chain with no live RFQ corridor) still has
+/// real work to do if it fills resting limit orders, and telling that operator
+/// to Connect again would be wrong twice over.
+fn refuse_rfq_only_start_without_credential(
+    bot: &Bot,
+    runtime: crate::panel::PanelRuntime,
+) -> Result<(), ApiError> {
+    let path = match super::settings::config_path(bot) {
+        Ok(path) => path,
+        Err(_) => return Ok(()),
+    };
+    let Ok(toml) = super::settings::read_toml(&path) else {
+        return Ok(());
+    };
+    let Ok(cfg) = crate::config::Config::from_toml(&toml) else {
+        return Ok(());
+    };
+    if config_has_a_live_leg(&cfg, &path, runtime) {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "Connect this bot to Textile on Settings before Start — until then it quotes nothing."
+            .to_string(),
+    ))
+}
+
+/// Would this config do anything if the bot came up right now?
+///
+/// The ladder is one leg, RFQ another, and the taker/closer legs run
+/// independently of both — so a bot whose Connect came back flagged (or landed
+/// on a chain with no live RFQ corridor) still has real work to do if it fills
+/// resting limit orders. Only "every leg off" is worth refusing over.
+///
+/// Shared by Start, Restart, and the settings save that would turn the ladder
+/// off: all three are ways to leave a bot running and quoting nothing.
+pub(super) fn config_has_a_live_leg(
+    cfg: &crate::config::Config,
+    path: &std::path::Path,
+    runtime: crate::panel::PanelRuntime,
+) -> bool {
+    config_has_a_live_leg_with(cfg, path, runtime, false)
+}
+
+/// As [`config_has_a_live_leg`], but `credential_present` lets a caller say the
+/// maker key is arriving in this same request. The settings save writes
+/// `rfq-api.key` *after* its guards run, so judging that save against the disk
+/// alone would refuse the one request that fixes the bot.
+///
+/// It only stands in for the credential. Everything else — an active, quotable
+/// `[rfq]`, a postable ladder, a runnable taker or closer — is still required,
+/// so a key pasted onto a config with nothing to run is not a live leg.
+pub(super) fn config_has_a_live_leg_with(
+    cfg: &crate::config::Config,
+    path: &std::path::Path,
+    runtime: crate::panel::PanelRuntime,
+    credential_present: bool,
+) -> bool {
+    // `book_enabled` is a switch, not a leg: an adopted or raw-edited config can
+    // have the ladder on with no side that drafts an order. Same bar the
+    // settings guard applies before it will turn the ladder on.
+    let ladder_posts = cfg.book_enabled
+        && cfg
+            .pools
+            .iter()
+            .any(|p| p.tokens_parse() && (p.buy_postable() || p.sell_postable()));
+    if ladder_posts || cfg.has_independent_leg() {
+        return true;
+    }
+    // Ask the same question the RFQ runtime will, not just "did Connect write
+    // rfq-api.key" — but only count sources that actually reach *this* bot's
+    // process. The env answer is runtime-specific, so it's decided here rather
+    // than inside `api_key_configured`.
+    let has_key = cfg.rfq.as_ref().is_some_and(|r| {
+        crate::rfq::api_key_configured(&r.api_key_env, path.parent(), |name| match runtime {
+            // `bot_container_spec` hands the container an explicitly built env
+            // list: it neither sources the bot's stitch.env nor inherits the
+            // panel's own environment. So for Docker the sibling rfq-api.key
+            // (mounted into the run dir, and what `with_rfq_key_env` keys off)
+            // is the only credential that reaches the child — counting env vars
+            // here would green-light a Start that then can't quote.
+            crate::panel::PanelRuntime::Docker => None,
+            // The process runtime applies the bot's stitch.env to the child and
+            // the child inherits the panel's environment. A key present in
+            // stitch.env wins even when blank: `apply_env_file` sets it either
+            // way, so an explicit blank *overrides* the inherited variable and
+            // the child sees nothing.
+            crate::panel::PanelRuntime::Process => {
+                crate::panel::provision::env_assignment(path, name)
+                    .or_else(|| std::env::var(name).ok())
+            }
+        })
+    });
+    cfg.rfq_quotable() && (has_key || credential_present)
+}
+
 pub async fn stop(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -423,6 +524,9 @@ pub async fn restart(
 ) -> Result<Response, ApiError> {
     let launch = lock_and_claim_for_launch(&name, &state).await?;
     super::require_actionable(&launch.bot)?;
+    // Same bar as Start: a bounce that brings the bot back with no live leg
+    // leaves the panel showing "running" over a bot that quotes nothing.
+    refuse_rfq_only_start_without_credential(&launch.bot, state.cfg.runtime)?;
     if launch.bot.state.is_terminal() {
         return Err(ApiError::conflict(format!(
             "{name} is {} — there is nothing to restart, and `docker restart` on a stopped \
@@ -1617,6 +1721,7 @@ mod tests {
         let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
         setup::write_config(root.join(name), corridor, super::super::testkit::TEST_KEY)
             .expect("writing the test bot config");
+        super::super::testkit::keep_book_on(&root.join(name).join("stitch.toml"));
     }
 
     /// A running, panel-native bot with the good layout.
@@ -1799,6 +1904,260 @@ mod tests {
             name: "stitch-bot-a".into(),
             grace_secs: 30,
         }));
+    }
+
+    #[tokio::test]
+    async fn start_refuses_rfq_only_without_a_credential() {
+        let h = harness("start-rfq-noconnect");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        setup::write_config(
+            h.root.join("bot-a"),
+            corridor,
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let mut c = container("stitch-bot-a", ContainerState::Exited);
+        c.labels.insert(LABEL_BOT.to_string(), "bot-a".to_string());
+        c.mounts = dir_layout_mounts(&h.root.join("bot-a").display().to_string());
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Connect this bot"), "{body}");
+    }
+
+    /// An RFQ-only bot whose only credential is `STITCH_RFQ_API_KEY_FILE` in
+    /// its own `stitch.env` — no panel-written `rfq-api.key`.
+    fn seed_env_only_rfq_bot(h: &super::super::testkit::Harness) {
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        let paths = setup::write_config(
+            h.root.join("bot-a"),
+            corridor,
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let toml = std::fs::read_to_string(&paths.toml).unwrap()
+            + "\n[rfq]\nenabled = true\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\n\
+               maker_id = \"mk_test\"\n\
+               validation_contract = \"0x00000000000000000000000000000000000000aa\"\n";
+        std::fs::write(&paths.toml, toml).unwrap();
+        let key_path = h.root.join("bot-a").join("maker.key");
+        std::fs::write(&key_path, "tx_live_secret\n").unwrap();
+        let env = std::fs::read_to_string(&paths.env).unwrap_or_default()
+            + &format!("STITCH_RFQ_API_KEY_FILE='{}'\n", key_path.display());
+        std::fs::write(&paths.env, env).unwrap();
+        assert!(
+            !setup::rfq_api_key_is_set(h.root.join("bot-a")),
+            "this bot must have no panel-written rfq-api.key"
+        );
+        let mut c = container("stitch-bot-a", ContainerState::Exited);
+        c.labels.insert(LABEL_BOT.to_string(), "bot-a".to_string());
+        c.mounts = dir_layout_mounts(&h.root.join("bot-a").display().to_string());
+        h.docker.add_container(c);
+    }
+
+    #[tokio::test]
+    async fn start_accepts_an_rfq_credential_from_stitch_env_in_process_mode() {
+        // Process-mode / Desktop bots are children of the panel: they inherit
+        // its environment and get their own stitch.env applied, so a key held
+        // that way is real and Start must not refuse it.
+        let h = super::super::testkit::harness_process("start-rfq-envkey-process");
+        seed_env_only_rfq_bot(&h);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            h.docker.state_of("stitch-bot-a"),
+            Some(ContainerState::Running)
+        );
+    }
+
+    #[tokio::test]
+    async fn start_honours_a_blank_credential_override_in_stitch_env() {
+        // `apply_env_file` sets every assignment it parses, blanks included, so
+        // `STITCH_RFQ_API_KEY=` in stitch.env *overrides* an inherited variable
+        // with an empty one. The guard must read that as "no key", not fall
+        // back to the panel's own environment.
+        let h = super::super::testkit::harness_process("start-rfq-blank-override");
+        seed_env_only_rfq_bot(&h);
+        let paths = h.root.join("bot-a");
+        std::fs::write(
+            paths.join("stitch.env"),
+            "STITCH_PRIVATE_KEY_FILE='stitch.key'\nSTITCH_RFQ_API_KEY=\n",
+        )
+        .unwrap();
+        std::env::set_var("STITCH_RFQ_API_KEY", "tx_live_inherited");
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        std::env::remove_var("STITCH_RFQ_API_KEY");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Connect this bot"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn restart_refuses_a_bot_with_no_live_leg() {
+        // Restart is another way to leave the panel showing a running bot that
+        // quotes nothing, so it takes the same bar as Start.
+        let h = harness("restart-rfq-noconnect");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        setup::write_config(
+            h.root.join("bot-a"),
+            corridor,
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let mut c = container("stitch-bot-a", ContainerState::Running);
+        c.labels.insert(LABEL_BOT.to_string(), "bot-a".to_string());
+        c.mounts = dir_layout_mounts(&h.root.join("bot-a").display().to_string());
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/restart", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Connect this bot"), "{body}");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "nothing may be bounced: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn start_reads_the_last_duplicate_env_assignment() {
+        // `apply_env_file` calls `cmd.env` per line, so with the key assigned
+        // twice the child keeps the last. A good key followed by a blank means
+        // the child gets nothing, whatever the first line said.
+        let h = super::super::testkit::harness_process("start-rfq-dup-env");
+        seed_env_only_rfq_bot(&h);
+        let paths = h.root.join("bot-a");
+        let good = paths.join("maker.key").display().to_string();
+        std::fs::write(
+            paths.join("stitch.env"),
+            format!(
+                "STITCH_PRIVATE_KEY_FILE='stitch.key'\n\
+                 STITCH_RFQ_API_KEY_FILE='{good}'\n\
+                 STITCH_RFQ_API_KEY_FILE=\n"
+            ),
+        )
+        .unwrap();
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Connect this bot"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn start_refuses_a_book_bot_whose_ladder_cannot_post() {
+        // `book_enabled = true` is a switch, not a leg. An adopted or
+        // raw-edited config can have the ladder on with no side that drafts an
+        // order, and the main loop then posts nothing while the panel says
+        // "running".
+        let h = harness("start-book-no-ladder");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        let paths = setup::write_config(
+            h.root.join("bot-a"),
+            corridor,
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        super::super::testkit::keep_book_on(&paths.toml);
+        let stripped = std::fs::read_to_string(&paths.toml)
+            .unwrap()
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("buy_total_liquidity_debt")
+                    && !t.starts_with("buy_min_slice_debt")
+                    && !t.starts_with("sell_total_liquidity_collateral")
+                    && !t.starts_with("sell_min_slice_debt")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&paths.toml, stripped).unwrap();
+        let mut c = container("stitch-bot-a", ContainerState::Exited);
+        c.labels.insert(LABEL_BOT.to_string(), "bot-a".to_string());
+        c.mounts = dir_layout_mounts(&h.root.join("bot-a").display().to_string());
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn start_refuses_when_the_env_credential_file_is_gone() {
+        // A variable naming a deleted or empty file is not a credential: the
+        // runtime falls past it and declines to spawn the responder, so letting
+        // Start through would leave a "running" bot quoting nothing.
+        let h = super::super::testkit::harness_process("start-rfq-envkey-missing");
+        seed_env_only_rfq_bot(&h);
+        std::fs::remove_file(h.root.join("bot-a").join("maker.key")).unwrap();
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Connect this bot"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn start_ignores_a_stitch_env_rfq_credential_in_docker_mode() {
+        // `bot_container_spec` builds the container env explicitly — it never
+        // sources stitch.env and never inherits the panel's environment. So the
+        // same bot that starts fine as a process cannot load its key in Docker,
+        // and letting Start through would leave it up and silently not quoting.
+        let h = harness("start-rfq-envkey-docker");
+        seed_env_only_rfq_bot(&h);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Connect this bot"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn start_allows_an_unconnected_bot_that_still_takes_limit_orders() {
+        // Connect can come back flagged or land on a chain with no live RFQ
+        // corridor: the maker key is saved but `rfq_enabled` stays false. The
+        // taker leg runs independently of both the ladder and RFQ, so this bot
+        // still fills users' resting orders and must be allowed to start.
+        let h = harness("start-rfq-taker");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        let paths = setup::write_config(
+            h.root.join("bot-a"),
+            corridor,
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let toml = std::fs::read_to_string(&paths.toml).unwrap() + "\nlimit_taker_enabled = true\n";
+        std::fs::write(&paths.toml, toml).unwrap();
+        let mut c = container("stitch-bot-a", ContainerState::Exited);
+        c.labels.insert(LABEL_BOT.to_string(), "bot-a".to_string());
+        c.mounts = dir_layout_mounts(&h.root.join("bot-a").display().to_string());
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            h.docker.state_of("stitch-bot-a"),
+            Some(ContainerState::Running)
+        );
     }
 
     #[tokio::test]
@@ -3015,8 +3374,8 @@ mod tests {
             "config should now be the wBRL corridor"
         );
         assert!(
-            !toml.contains("book_enabled = false"),
-            "without the RFQ-default flag a book bot must stay on the ladder after switch"
+            toml.contains("book_enabled = false"),
+            "switch_corridor stamps RFQ-only for every bot: {toml}"
         );
         assert_eq!(
             h.docker.state_of("stitch-bot-a"),
@@ -3098,7 +3457,6 @@ mod tests {
             "config should now be the wBRL corridor"
         );
         assert!(toml.contains("book_enabled = false"), "{toml}");
-        assert!(toml.contains(crate::config::RFQ_DEFAULT_GATE), "{toml}");
     }
 
     #[tokio::test]

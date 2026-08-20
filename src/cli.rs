@@ -25,6 +25,13 @@ pub enum Command {
     Help,
     /// Interactively create a config in `dir` (or the default dir if None).
     Init { dir: Option<String> },
+    /// Register this bot's wallet with Textile and write `[rfq]` +
+    /// `rfq-api.key`. `venue_url` overrides the enroll endpoint (tests, and
+    /// operators pointed at a private venue).
+    Connect {
+        config: String,
+        venue_url: Option<String>,
+    },
 }
 
 /// Parse a command from an argument iterator (already skipping argv[0]).
@@ -37,6 +44,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
     let mut approve = false;
     let mut exact = false;
     let mut init = false;
+    let mut connect = false;
+    let mut venue_url: Option<String> = None;
     let mut dir: Option<String> = None;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -50,23 +59,62 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
             "--dry-run" => dry_run = true,
             "--exact" => exact = true,
             "init" => init = true,
+            // Verb: `stitch connect --config <path> [--venue <url>]`.
+            "connect" => connect = true,
+            "--venue" => venue_url = Some(it.next().ok_or_else(|| anyhow!("--venue needs a URL"))?),
             "--dir" => dir = Some(it.next().ok_or_else(|| anyhow!("--dir needs a path"))?),
             other => return Err(anyhow!("unknown argument: {other}")),
         }
     }
+    // Verbs are mutually exclusive, and so are their flags. Both used to be
+    // resolved by an if-chain in priority order, which meant a malformed
+    // invocation silently ran the higher-priority one and dropped the rest:
+    // `stitch approve connect --config x --exact` enrolled — issuing a
+    // credential and rewriting the config — while ignoring both the approval
+    // and a flag documented as approve-only. Validate the whole invocation
+    // before dispatching, so a wrong command line is an error rather than the
+    // wrong live operation.
+    let verbs: Vec<&str> = [(init, "init"), (connect, "connect"), (approve, "approve")]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+    if verbs.len() > 1 {
+        return Err(anyhow!("pick one verb, got `{}`", verbs.join("` and `")));
+    }
+    if dir.is_some() && !init {
+        return Err(anyhow!("--dir only applies to `init`"));
+    }
+    if venue_url.is_some() && !connect {
+        return Err(anyhow!("--venue only applies to `connect`"));
+    }
+    if exact && !approve {
+        return Err(anyhow!("--exact only applies to `approve`"));
+    }
+    if dry_run && connect {
+        // `--dry-run` means "read, don't write", and enrollment has no such
+        // shape: the venue round trip *is* the operation.
+        return Err(anyhow!(
+            "--dry-run does not apply to `connect`: enrolling issues a maker credential and \
+             rewrites the config, so there is nothing to simulate"
+        ));
+    }
+    if dry_run && init {
+        return Err(anyhow!("--dry-run does not apply to `init`"));
+    }
+
     if init {
         return Ok(Command::Init { dir });
     }
     let config = config.ok_or_else(|| anyhow!("--config <path> is required"))?;
+    if connect {
+        return Ok(Command::Connect { config, venue_url });
+    }
     if approve {
         return Ok(Command::Approve {
             config,
             dry_run,
             exact,
         });
-    }
-    if exact {
-        return Err(anyhow!("--exact only applies to `approve`"));
     }
     Ok(Command::Run { config, dry_run })
 }
@@ -77,6 +125,67 @@ mod tests {
 
     fn parse_vec(args: &[&str]) -> anyhow::Result<Command> {
         parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn a_malformed_invocation_never_picks_a_verb_for_you() {
+        // These used to resolve by if-chain priority, so the extra verb and the
+        // approve-only flag were dropped and Connect ran — issuing a credential
+        // and rewriting the config off a command line that asked for neither.
+        let err = parse_vec(&["approve", "connect", "--config", "s.toml", "--exact"])
+            .expect_err("two verbs must not silently resolve to one");
+        assert!(err.to_string().contains("connect"), "{err}");
+        assert!(err.to_string().contains("approve"), "{err}");
+
+        // Flags belong to their verb, whichever verb won before.
+        for (args, want) in [
+            (vec!["connect", "--config", "s.toml", "--exact"], "--exact"),
+            (
+                vec!["approve", "--config", "s.toml", "--venue", "http://x"],
+                "--venue",
+            ),
+            (vec!["init", "--dir", "d", "--exact"], "--exact"),
+            (vec!["--config", "s.toml", "--dir", "d"], "--dir"),
+            (vec!["init", "--dry-run"], "--dry-run"),
+        ] {
+            let err = parse_vec(&args).expect_err(&format!("{args:?} must be rejected"));
+            assert!(err.to_string().contains(want), "{args:?}: {err}");
+        }
+
+        // The valid shapes still parse.
+        assert_eq!(
+            parse_vec(&["approve", "--config", "s.toml", "--exact", "--dry-run"]).unwrap(),
+            Command::Approve {
+                config: "s.toml".into(),
+                dry_run: true,
+                exact: true
+            }
+        );
+        assert_eq!(
+            parse_vec(&["init", "--dir", "d"]).unwrap(),
+            Command::Init {
+                dir: Some("d".into())
+            }
+        );
+    }
+
+    #[test]
+    fn connect_refuses_dry_run() {
+        // Enrollment issues a credential and rewrites the config on the venue's
+        // say-so. Accepting `--dry-run` and doing it anyway is the one outcome
+        // an operator who typed that flag did not ask for.
+        let err = parse_vec(&["connect", "--config", "stitch.toml", "--dry-run"])
+            .expect_err("connect must refuse --dry-run");
+        assert!(err.to_string().contains("--dry-run"), "{err}");
+        assert!(err.to_string().contains("connect"), "{err}");
+        // Without it, connect still parses.
+        assert_eq!(
+            parse_vec(&["connect", "--config", "stitch.toml"]).unwrap(),
+            Command::Connect {
+                config: "stitch.toml".into(),
+                venue_url: None
+            }
+        );
     }
 
     #[test]
@@ -199,5 +308,45 @@ mod tests {
     #[test]
     fn init_does_not_require_config() {
         assert!(parse_vec(&["init"]).is_ok());
+    }
+
+    #[test]
+    fn connect_verb_needs_a_config() {
+        assert!(parse_vec(&["connect"]).is_err());
+        assert_eq!(
+            parse_vec(&["connect", "--config", "stitch.toml"]).unwrap(),
+            Command::Connect {
+                config: "stitch.toml".into(),
+                venue_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn connect_verb_accepts_a_venue_override() {
+        assert_eq!(
+            parse_vec(&[
+                "connect",
+                "--config",
+                "stitch.toml",
+                "--venue",
+                "https://api.example/v2/maker/enroll",
+            ])
+            .unwrap(),
+            Command::Connect {
+                config: "stitch.toml".into(),
+                venue_url: Some("https://api.example/v2/maker/enroll".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn venue_without_connect_is_an_error() {
+        assert!(parse_vec(&["--config", "x.toml", "--venue", "https://x"]).is_err());
+    }
+
+    #[test]
+    fn venue_without_value_is_an_error() {
+        assert!(parse_vec(&["connect", "--config", "x.toml", "--venue"]).is_err());
     }
 }

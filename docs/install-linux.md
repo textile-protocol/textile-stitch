@@ -56,7 +56,24 @@ printf "STITCH_PRIVATE_KEY_FILE='%s'\n" "$HOME/Stitch/stitch.key" > ~/Stitch/sti
 chmod 600 ~/Stitch/stitch.key ~/Stitch/stitch.env
 ```
 
-## 3. Approve Permit2
+## 3. Connect to Textile
+
+New bots quote Swap via RFQ and do not rest orders on the public book, so they
+need a maker credential before they can quote anything. `stitch connect` signs a
+registration message with the wallet in your env, registers with Textile, and
+writes `rfq-api.key` next to the config.
+
+```bash
+set -a; . ~/Stitch/stitch.env; set +a
+stitch connect --config ~/Stitch/stitch.toml
+```
+
+Skipping this leaves a bot that starts, logs, and serves nothing. If Textile has
+no corridor seated for your pair yet it says so and keeps the credential — re-run
+once they seat you. Moving an existing ladder bot across? See the
+[migration guide](migrate-book-to-rfq.md#standalone-cli).
+
+## 4. Approve Permit2
 
 The operator wallet needs a one-time Permit2 approval for each input token (the
 `debt` token on the buy side, the `collateral` token on the sell side). Without
@@ -74,7 +91,7 @@ pull against orders you actually signed. To cap the allowance instead (only with
 fixed numeric liquidity), use `--exact` — but then you must re-approve every time
 the allowance is spent or you raise configured liquidity.
 
-## 4. Run
+## 5. Run
 
 ```bash
 stitch --config ~/Stitch/stitch.toml --dry-run   # signs/plans, posts nothing
@@ -84,7 +101,7 @@ stitch --config ~/Stitch/stitch.toml             # live
 Stop a foreground run with `Ctrl-C`; Stitch finishes the current tick first, so
 it never leaves a half-sent fill or dangling order.
 
-## 5. Run as a service (systemd)
+## 6. Run as a service (systemd)
 
 So it restarts after crashes and reboots. System-wide files live in
 `/etc/stitch-bot`, separate from the foreground files in `~/Stitch`.
@@ -99,15 +116,33 @@ sudo install -m 0755 "$(command -v stitch)" /usr/local/bin/stitch
 sudo mkdir -p /etc/stitch-bot
 sudo install -m 0644 ~/Stitch/stitch.toml /etc/stitch-bot/stitch.toml
 sudo install -m 0600 ~/Stitch/stitch.key /etc/stitch-bot/stitch.key
+sudo mkdir -p /etc/credstore && sudo chmod 700 /etc/credstore
+sudo install -m 0600 ~/Stitch/rfq-api.key /etc/credstore/rfq-api.key  # skip for a limit-taker-only bot
 sudo install -m 0644 stitch.env /etc/stitch-bot/stitch.env
 sudo install -m 0644 stitch.service /etc/systemd/system/stitch.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now stitch
 ```
 
-The service template uses `LoadCredential` so the key is injected as a systemd
-credential rather than the process environment. Swap in `LoadCredentialEncrypted`
-if you manage encrypted credentials.
+The service template uses `LoadCredential` so both secrets — the wallet key and
+the `rfq-api.key` from step 3 — are injected as systemd credentials rather than
+through the process environment. Swap in `LoadCredentialEncrypted` if you manage
+encrypted credentials.
+
+Copy `rfq-api.key` if this bot quotes Swap. `DynamicUser=yes` runs the service as
+a transient UID that cannot read a root-owned `0600` file under `/etc`, so the
+bot's "key next to `stitch.toml`" fallback doesn't resolve under systemd — the
+unit points `STITCH_RFQ_API_KEY_FILE` at the staged credential instead. It goes
+in `/etc/credstore` rather than `/etc/stitch-bot` because the unit picks it up
+with `ImportCredential=`, which reads the credential store and stages nothing
+when there's no match. Skip the copy and the service still starts, logs that the
+maker key is missing, and runs without the responder. That's right for a bot that
+only fills resting limit orders, and a bug for anything else.
+
+(`LoadCredential=` would have been the obvious choice, but a missing source file
+fails the unit before `ExecStart` — and an empty `SetCredential=` fallback is not
+a workaround: systemd rejects an empty value with "Invalid syntax, ignoring",
+leaving the mandatory load in place.)
 
 Approve before the first live start (the service won't run until tokens are
 approved), then view logs and restart after config changes:
@@ -119,7 +154,7 @@ journalctl -u stitch -f
 sudo systemctl restart stitch
 ```
 
-## 6. Update
+## 7. Update
 
 ```bash
 stitch --update            # in-place, for installer-based installs
@@ -128,7 +163,7 @@ sudo systemctl restart stitch
 
 You can also download a new binary from the latest GitHub Release.
 
-## 7. Stop and uninstall
+## 8. Stop and uninstall
 
 ```bash
 # stop

@@ -11,6 +11,10 @@ permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Perm
 reactor         = "0x26a1aedaa26affc4fd9f910acfca754a31bc43c6"  # SETTLEMENT_V3_FILLER_REACTOR (Ethereum)
 tick_interval_secs = 5
 
+# Swap is RFQ. This bot does not rest a public ladder. Connect in the
+# Stitch panel writes [rfq] (maker id, stream URL, credential).
+book_enabled = false
+
 # Textile's own price endpoint. Returns { price, timestamp } where price is
 # debt-per-collateral (USDT per WETH, ~3000).
 [feed]
@@ -90,3 +94,12 @@ twap_window_secs = 60                             # ~1 min rolling TWAP. The rev
 # lean_shadow = true
 # lean_enabled = false
 # lean_floor_bps = 3.0
+
+# Swap quoting. Connect in the Stitch panel writes maker id, stream URL,
+# and rfq-api.key. Leave this block commented until then.
+# [rfq]
+# enabled = false
+# url = "wss://api.textilecredit.com/v2/maker/stream"
+# maker_id = "mk_your_maker_id"
+# api_key_env = "STITCH_RFQ_API_KEY"
+# validation_contract = "0x0000000000000000000000000000000000000000"

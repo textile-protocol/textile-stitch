@@ -1,15 +1,28 @@
 # Run two Stitch bots side by side, each with its own config and wallet key.
 #
 # One container = one bot = one signer = one corridor. To add more, copy a
-# service block, point it at another stitch.<name>.toml + key, and give it a
+# service block, point it at another bots/<name> directory, and give it a
 # unique container_name.
+#
+# One directory per bot, not one shared folder of stitch.<name>.toml files:
+# `stitch connect` writes `rfq-api.key` next to the config it was given, so two
+# bots sharing a directory would overwrite each other's maker credential.
 #
 # Copy this file to docker-compose.yml (or run it directly with
 # `docker compose -f docker-compose.example.yml ...`) and adjust the paths.
 #
-# Prereqs in this directory (see docs/install-docker.md):
-#   - stitch.bot1.toml, stitch.bot2.toml   copy from stitch.example.toml
-#   - stitch.bot1.key,  stitch.bot2.key    one wallet per bot, chmod 600
+# Prereqs (see docs/install-docker.md):
+#   - bots/bot1/stitch.toml, bots/bot2/stitch.toml   copy from stitch.example.toml
+#   - bots/bot1/stitch.key,  bots/bot2/stitch.key    one wallet per bot, chmod 600
+#   - the container runs as uid 1000 and a bind mount keeps host ownership:
+#       sudo chown -R 1000 ./bots      # Linux only; Docker Desktop maps this for you
+#
+# Connect each bot to Textile before its first start. New bots quote Swap over
+# RFQ and rest no public ladder, so without a maker credential a container
+# starts and serves nothing. This writes bots/<name>/rfq-api.key, which the bot
+# picks up from beside its config on every later run:
+#   docker compose -f docker-compose.example.yml run --rm bot1 \
+#     stitch connect --config /home/stitch/run/stitch.toml
 #
 # Approve Permit2 once per bot before the first live start:
 #   docker compose -f docker-compose.example.yml run --rm bot1 \
@@ -37,12 +50,12 @@ services:
     <<: *stitch
     container_name: stitch-bot1
     volumes:
-      - ./stitch.bot1.toml:/home/stitch/run/stitch.toml:ro
-      - ./stitch.bot1.key:/home/stitch/run/stitch.key:ro
+      # The whole bot directory, writable: `stitch connect` rewrites stitch.toml
+      # and drops rfq-api.key beside it, and both have to survive the container.
+      - ./bots/bot1:/home/stitch/run
 
   bot2:
     <<: *stitch
     container_name: stitch-bot2
     volumes:
-      - ./stitch.bot2.toml:/home/stitch/run/stitch.toml:ro
-      - ./stitch.bot2.key:/home/stitch/run/stitch.key:ro
+      - ./bots/bot2:/home/stitch/run

@@ -468,7 +468,7 @@ pub async fn create(
     let mut started = false;
     let mut start_error = None;
     // RFQ-only has no credential yet. Starting now would launch a bot that
-    // posts neither a book nor private quotes. Create succeeds; Start waits.
+    // quotes nothing until Connect. Create succeeds; Start waits.
     if body.start && !rfq_default {
         let (_config, bot) = bots::lock_config(&name, &state).await?;
         match bots::claim_for_launch(&bot, &state).await {
@@ -535,7 +535,7 @@ pub async fn create(
                     },
                     (None, false) if rfq_default => {
                         "It's RFQ-only and not started. Connect it to Textile on Settings \
-                         before Start — until then it posts neither a book nor private quotes."
+                         before Start — until then it quotes nothing."
                             .to_string()
                     }
                     (None, false) => {
@@ -552,7 +552,7 @@ pub async fn create(
 
 #[cfg(test)]
 mod tests {
-    use super::super::testkit::{harness, Harness, TEST_KEY};
+    use super::super::testkit::{harness, keep_book_on, Harness, TEST_KEY};
     use crate::panel::docker::fake::Call;
     use axum::http::StatusCode;
     use serde_json::json;
@@ -735,14 +735,17 @@ mod tests {
                 "name": "bot-a",
                 "corridorId": "cngn-usdt-bsc",
                 "signer": local(TEST_KEY),
-                "start": true,
             }),
         )
         .await;
-        // Turn the taker on and keep it running — that's what can_transact keys on.
+        // Leftover book + taker, then Start — that's what can_transact keys on.
+        // New bots are RFQ-only and refuse Start without Connect.
         let path = h.root.join("bot-a/stitch.toml");
+        keep_book_on(&path);
         let toml = std::fs::read_to_string(&path).unwrap() + "\nlimit_taker_enabled = true\n";
         std::fs::write(&path, toml).unwrap();
+        let (status, body) = h.post_json("/api/bots/bot-a/start", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
 
         let (status, body) = h
             .post_json(
@@ -791,14 +794,14 @@ mod tests {
         assert!(h.docker.exists("stitch-bot-a"));
         let v = Harness::parse(&body);
         assert_eq!(v["bot"]["running"], false);
-        assert!(v["message"].as_str().unwrap().contains("dry-run"), "{body}");
         assert!(
-            v["message"].as_str().unwrap().contains("Permit2"),
-            "create message should name Permit2: {body}"
+            v["message"].as_str().unwrap().contains("Connect"),
+            "create message should say Connect before Start: {body}"
         );
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
         assert!(
-            v["message"].as_str().unwrap().contains("gas"),
-            "create message should mention gas: {body}"
+            toml.contains("book_enabled = false"),
+            "create must stamp RFQ-only: {toml}"
         );
         assert_eq!(
             v["needsPermit2Approval"], true,
@@ -848,7 +851,16 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let v = Harness::parse(&body);
-        assert_eq!(v["bot"]["running"], true);
+        assert_eq!(v["bot"]["running"], false);
+        assert!(v["message"].as_str().unwrap().contains("Connect"), "{body}");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Start(n) if n == "stitch-bot-a")),
+            "{:?}",
+            h.docker.calls()
+        );
     }
 
     #[tokio::test]
@@ -902,8 +914,8 @@ mod tests {
             "{body}"
         );
         assert!(
-            v["message"].as_str().unwrap().contains("wallet is busy"),
-            "{body}"
+            v["message"].as_str().unwrap().contains("Connect"),
+            "start on create is refused until Connect, not a wallet race: {body}"
         );
         assert!(
             !h.docker
@@ -1264,16 +1276,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fleet_rfq_default_flag_makes_new_bots_rfq_only() {
+    async fn create_always_stamps_rfq_only() {
         let h = harness("create-rfq-default");
-        std::fs::write(
-            h.root.join(crate::config::PANEL_FLAGS_FILE),
-            format!(
-                "[experimental]\nrfq_default = \"{}\"\n",
-                crate::config::RFQ_DEFAULT_GATE
-            ),
-        )
-        .unwrap();
         let (status, body) = h
             .post_json(
                 "/api/bots",
@@ -1283,7 +1287,6 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
         assert!(toml.contains("book_enabled = false"), "{toml}");
-        assert!(toml.contains(crate::config::RFQ_DEFAULT_GATE), "{toml}");
         let (status, body) = h.get("/api/bots/bot-a/settings").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
@@ -1293,16 +1296,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fleet_rfq_default_flag_does_not_start_before_connect() {
+    async fn create_does_not_start_before_connect() {
         let h = harness("create-rfq-default-nostart");
-        std::fs::write(
-            h.root.join(crate::config::PANEL_FLAGS_FILE),
-            format!(
-                "[experimental]\nrfq_default = \"{}\"\n",
-                crate::config::RFQ_DEFAULT_GATE
-            ),
-        )
-        .unwrap();
         let (status, body) = h
             .post_json(
                 "/api/bots",

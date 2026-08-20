@@ -159,9 +159,66 @@ pub fn maybe_spawn(
         url = %runtime.url,
         maker_id = %runtime.maker_id,
         corridors = ?runtime.books.iter().map(|b| b.slug.as_str()).collect::<Vec<_>>(),
-        "starting RFQ responder (dual-run: the ladder is unchanged)"
+        "starting RFQ responder"
     );
     Some(tokio::spawn(run(runtime)))
+}
+
+/// True when a maker credential is configured for this bot, checking every
+/// source [`load_rfq_api_key`] accepts. `env` looks a variable up in the
+/// environment the bot will actually start with — the panel passes the bot's
+/// own `stitch.env` plus the inherited process env, which is what the process
+/// and Docker runtimes hand the child.
+///
+/// Lives next to `load_rfq_api_key` so the panel's Start guard cannot drift
+/// from what the runtime accepts — same order, same standard. In particular a
+/// variable that *names* a file is only a credential if that file reads back
+/// non-blank: `read_env_secret` errors on an unreadable path and the loader
+/// falls straight past it, so a guard that accepted the bare variable would
+/// wave through a bot that then can't spawn its responder.
+///
+/// Only the process runtime consults the environment (see the Start guard), and
+/// there the panel and the bot share a filesystem view, so reading the path here
+/// answers the same question the child will ask.
+pub fn api_key_configured(
+    api_key_env: &str,
+    config_dir: Option<&Path>,
+    env: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let value = |name: &str| {
+        env(name)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    // `read_env_secret` *returns* out of the `_FILE` branch the moment that
+    // variable holds a non-blank path — success or failure. So a set `_FILE`
+    // is the whole env answer: it never falls back to the raw variable, only
+    // onward to the sibling file. Mirror that exactly, or the guard accepts a
+    // raw key the loader will never reach.
+    if let Some(path) = value(&format!("{api_key_env}_FILE")) {
+        // The process runtime gives the child the bot directory as its working
+        // directory, so a relative path in `stitch.env` resolves there — not
+        // against wherever the panel happens to be running. Resolving it the
+        // panel's way would both refuse a key the bot can read and accept a
+        // same-named file next to the panel that the bot cannot.
+        let path = Path::new(&path);
+        let resolved = match (path.is_relative(), config_dir) {
+            (true, Some(dir)) => dir.join(path),
+            _ => path.to_path_buf(),
+        };
+        if file_holds_secret(&resolved) {
+            return true;
+        }
+    } else if value(api_key_env).is_some() {
+        return true;
+    }
+    config_dir.is_some_and(|dir| file_holds_secret(&dir.join(crate::setup::RFQ_API_KEY_FILE)))
+}
+
+/// A secret file counts only when it reads back non-blank — the same bar
+/// `load_rfq_api_key` applies before it will use one.
+fn file_holds_secret(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|s| !s.trim().is_empty())
 }
 
 /// Resolve the maker API key without ever logging it.
@@ -1980,6 +2037,140 @@ mod tests {
         std::fs::write(dir.join("rfq-api.key"), "  tx_live_from_file  \n").unwrap();
         let key = load_rfq_api_key("STITCH_RFQ_API_KEY_UNSET_FOR_TEST", Some(&dir)).unwrap();
         assert_eq!(key, "tx_live_from_file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unstaged_credential_is_no_key_rather_than_a_hard_error() {
+        // `deploy/stitch.service` picks the maker key up with `ImportCredential=`,
+        // which stages nothing when the credential store has no match — so
+        // `STITCH_RFQ_API_KEY_FILE` points at a path that does not exist. The
+        // loader has to read that as "no key" so `maybe_spawn` logs, skips the
+        // responder, and leaves the bot's other legs running. A bot still
+        // waiting on `stitch connect`, or a limit-taker-only one, lands here.
+        let dir = std::env::temp_dir().join(format!(
+            "stitch-rfq-key-{}-{}",
+            std::process::id(),
+            "unstaged"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let var = "STITCH_RFQ_API_KEY_UNSTAGED_CRED_TEST";
+        // No sibling `rfq-api.key` either, which is the systemd layout.
+        std::env::set_var(format!("{var}_FILE"), dir.join("never-staged"));
+        let err = load_rfq_api_key(var, Some(&dir))
+            .expect_err("an unstaged credential is not a usable key");
+        assert!(err.to_string().contains(var), "{err}");
+
+        // An empty staged file reads the same way, so a hand-rolled unit that
+        // provisions a blank source degrades identically.
+        let blank = dir.join("blank-credential");
+        std::fs::write(&blank, "").unwrap();
+        std::env::set_var(format!("{var}_FILE"), &blank);
+        assert!(load_rfq_api_key(var, Some(&dir)).is_err());
+
+        std::env::remove_var(format!("{var}_FILE"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn api_key_configured_matches_what_the_loader_would_accept() {
+        let dir = std::env::temp_dir().join(format!("stitch-rfq-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("maker.key");
+        std::fs::write(&good, "tx_live_secret\n").unwrap();
+        let blank = dir.join("blank.key");
+        std::fs::write(&blank, "   \n").unwrap();
+        let missing = dir.join("gone.key");
+        let none = |_: &str| None;
+        let only =
+            |name: &'static str, value: String| move |n: &str| (n == name).then(|| value.clone());
+
+        // Nothing anywhere.
+        assert!(!api_key_configured("K", Some(&dir), none));
+
+        // A readable, non-blank file the variable points at.
+        assert!(api_key_configured(
+            "K",
+            None,
+            only("K_FILE", good.display().to_string())
+        ));
+
+        // A path that doesn't resolve is not a credential: `read_env_secret`
+        // errors and the loader falls past it, so accepting it here would let a
+        // bot start and then decline to spawn its responder.
+        assert!(!api_key_configured(
+            "K",
+            None,
+            only("K_FILE", missing.display().to_string())
+        ));
+        assert!(!api_key_configured(
+            "K",
+            None,
+            only("K_FILE", blank.display().to_string())
+        ));
+
+        // A set _FILE is the whole env answer: `read_env_secret` returns out of
+        // that branch either way, so a broken path does NOT fall back to the raw
+        // variable — only onward to the sibling file.
+        let broken_plus_raw = |missing: String| {
+            move |n: &str| match n {
+                "K_FILE" => Some(missing.clone()),
+                "K" => Some("tx_live_secret".to_string()),
+                _ => None,
+            }
+        };
+        assert!(!api_key_configured(
+            "K",
+            None,
+            broken_plus_raw(missing.display().to_string())
+        ));
+        // ...and with a sibling present it resolves there, as the loader does.
+        let sibling_dir = dir.join("with-sibling");
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        std::fs::write(
+            sibling_dir.join(crate::setup::RFQ_API_KEY_FILE),
+            "tx_live_sib\n",
+        )
+        .unwrap();
+        assert!(api_key_configured(
+            "K",
+            Some(&sibling_dir),
+            broken_plus_raw(missing.display().to_string())
+        ));
+
+        // A blank _FILE is not "set" at all — `read_env_secret` trims it and
+        // does fall through to the raw variable there.
+        let blank_file_plus_raw = |n: &str| match n {
+            "K_FILE" => Some("   ".to_string()),
+            "K" => Some("tx_live_secret".to_string()),
+            _ => None,
+        };
+        assert!(api_key_configured("K", None, blank_file_plus_raw));
+
+        // A relative path resolves against the bot directory, because that is
+        // the child's working directory. Without a config dir there is nothing
+        // to resolve against and it stays relative to the caller.
+        let relative = only("K_FILE", "maker.key".to_string());
+        assert!(api_key_configured("K", Some(&dir), relative));
+        let elsewhere = dir.join("no-key-here");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(!api_key_configured(
+            "K",
+            Some(&elsewhere),
+            only("K_FILE", "maker.key".to_string())
+        ));
+
+        // The raw variable alone, and blank values that don't count.
+        assert!(api_key_configured("K", None, only("K", "tx_live".into())));
+        assert!(!api_key_configured("K", None, only("K", "   ".into())));
+
+        // The panel-written sibling, which must also be non-blank.
+        std::fs::write(dir.join(crate::setup::RFQ_API_KEY_FILE), "tx_live_sib\n").unwrap();
+        assert!(api_key_configured("K", Some(&dir), none));
+        std::fs::write(dir.join(crate::setup::RFQ_API_KEY_FILE), "\n").unwrap();
+        assert!(!api_key_configured("K", Some(&dir), none));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

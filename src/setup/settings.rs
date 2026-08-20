@@ -723,40 +723,20 @@ pub fn rfq_connect_patch(
         rfq_maker_id: Some(maker_id),
         rfq_validation_contract: Some(validation_contract),
         rfq_corridor: Some(corridor),
-        // RFQ-default: book off only while RFQ is live. A flagged or empty
-        // corridor reconnect must turn the book back on or the bot is dark.
-        book_enabled: book_off.then_some(!go_live),
+        // RFQ-only: turn the book off when RFQ can quote. Waiting keeps the
+        // current book flag (new bots are already off) and does not start RFQ.
+        book_enabled: (book_off && go_live).then_some(false),
         ..SettingsPatch::default()
     }
 }
 
-/// Stamp a freshly written corridor template with the RFQ-default preset:
-/// public ladder off, and both experimental tokens so the panel card shows
-/// and Connect writes RFQ-only. Spreads and liquidity stay — RFQ uses them.
+/// Stamp a freshly written corridor template as RFQ-only: public ladder off.
+/// Spreads and liquidity stay — RFQ uses them.
 pub fn apply_rfq_default_preset(toml_str: &str) -> Result<String> {
     let mut doc = toml_str
         .parse::<DocumentMut>()
         .context("parsing stitch.toml")?;
     apply_book_enabled(doc.as_table_mut(), Some(false));
-    if doc.get("experimental").and_then(Item::as_table).is_none() {
-        let mut table = Table::new();
-        table.set_implicit(false);
-        doc.insert("experimental", Item::Table(table));
-    }
-    let experimental = doc
-        .get_mut("experimental")
-        .and_then(Item::as_table_mut)
-        .expect("just inserted [experimental]");
-    set_value(
-        experimental,
-        "rfq_panel",
-        Value::from(crate::config::RFQ_PANEL_GATE),
-    );
-    set_value(
-        experimental,
-        "rfq_default",
-        Value::from(crate::config::RFQ_DEFAULT_GATE),
-    );
     let edited = doc.to_string();
     Config::from_toml(&edited).context("the RFQ-default preset is not a valid config")?;
     Ok(edited)
@@ -1644,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_rfq_default_connect_restores_the_book() {
+    fn waiting_rfq_default_connect_keeps_the_book_off() {
         let src = apply_rfq_default_preset(TEMPLATE).unwrap();
         let current = read_settings(&src).unwrap();
         assert!(!current.book_enabled);
@@ -1657,21 +1637,21 @@ mod tests {
             true,
             false,
         );
-        assert_eq!(patch.book_enabled, Some(true));
+        assert_eq!(patch.book_enabled, None);
         let out = apply_settings(&src, &patch).unwrap();
         let back = read_settings(&out).unwrap();
-        assert!(back.book_enabled);
+        assert!(!back.book_enabled);
         assert!(!back.rfq_enabled);
     }
 
     #[test]
-    fn the_rfq_default_preset_turns_the_book_off_and_unlocks_the_card() {
+    fn the_rfq_default_preset_turns_the_book_off() {
         let out = apply_rfq_default_preset(TEMPLATE).unwrap();
         let back = read_settings(&out).unwrap();
         assert!(!back.book_enabled);
         assert!(back.rfq_default_unlocked);
-        assert!(out.contains("rfq_panel"));
-        assert!(out.contains(crate::config::RFQ_DEFAULT_GATE));
+        assert!(!out.contains("rfq_panel"));
+        assert!(!out.contains(crate::config::RFQ_DEFAULT_GATE));
         // Spreads and liquidity stay — RFQ quotes off them.
         assert_eq!(back.buy.value, "1");
         assert_eq!(back.buy_sizing.total_liquidity, "max");

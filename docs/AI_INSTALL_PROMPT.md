@@ -144,7 +144,8 @@ After install — tell me this and stop:
   2. Pick a corridor
   3. Paste the operator wallet key (or configure Turnkey / MPCVault) in the UI
   4. Approve tokens
-  5. Dry run, then start
+  5. Connect the bot to Textile on Settings
+  6. Then Start — new bots quote Swap via RFQ and refuse Start without Connect
 - Do not offer to configure a bot from the terminal unless I explicitly ask later.
 - Point me at docs/install-panel.md only if I need advanced deploy options
   (custom reverse proxy, building from source).
