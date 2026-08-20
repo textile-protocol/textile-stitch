@@ -104,6 +104,17 @@ pub struct RfqConfig {
     /// its taker through this contract, so an off-venue observer can't fill a
     /// quote that lost.
     pub validation_contract: String,
+    /// This bot's name on the venue, so one funding wallet can run several —
+    /// per chain, or several on one chain, even over the same corridor. The
+    /// venue only ever supersedes a session when the same id reconnects, so
+    /// two bots sharing a wallet must not share this.
+    ///
+    /// Unset is fine and is the usual case: `rfq_instance_id` then falls back
+    /// to `rfq-instance-id` next to stitch.toml, generated once on first
+    /// connect. Set it when you want the venue's logs to name your bots
+    /// ("bsc-cngn", "base-majors") rather than a random id.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 fn default_rfq_api_key_env() -> String {

@@ -126,10 +126,24 @@ impl Poster<'_> {
                 }
             }
             Err(e) => {
-                warn!(label, error = %e, "batch post failed");
+                let spent_nonces = spent_nonces_from_error(&e.to_string());
+                // A spent nonce is what a filled slot looks like from here, not
+                // a fault: the caller rotates exactly those slots and the next
+                // tick reposts. Logging it as a failure next to real ones (dead
+                // RPC, unfunded batch) sent operators hunting for a bug in the
+                // routine aftermath of a fill.
+                if spent_nonces.is_empty() {
+                    warn!(label, error = %e, "batch post failed");
+                } else {
+                    info!(
+                        label,
+                        slots = spent_nonces.len(),
+                        "batch hit filled slots; rotating those nonces and reposting next tick"
+                    );
+                }
                 PostResult {
                     posted: 0,
-                    spent_nonces: spent_nonces_from_error(&e.to_string()),
+                    spent_nonces,
                     deadline,
                 }
             }

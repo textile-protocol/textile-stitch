@@ -134,6 +134,17 @@ pub struct SessionFrame {
     pub issued_at: u64,
     /// 65-byte EIP-712 signature over the MakerSession struct, 0x-hex.
     pub signature: String,
+    /// Which bot this is, so one funding wallet can run several — per chain,
+    /// or several on one chain, even quoting the same corridor. The venue
+    /// supersedes a session only when the same instance id reconnects, so this
+    /// value must be stable across restarts and distinct per process.
+    ///
+    /// Outside the signature deliberately: it grants nothing (the venue still
+    /// takes a session's corridors from its own registry), so it can only split
+    /// this maker's own footprint. Omitted by older builds, which the venue
+    /// then treats as one session per credential chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,10 +343,29 @@ mod tests {
             challenge: "0x2222…".into(),
             issued_at: 1_754_388_000_000,
             signature: "0xsig".into(),
+            instance_id: Some("bsc-cngn".into()),
         });
         let v = serde_json::to_value(&session).unwrap();
         assert!(v["issuedAt"].is_u64());
         assert_eq!(v["issuedAt"], 1_754_388_000_000u64);
+        assert_eq!(v["instanceId"], "bsc-cngn");
+    }
+
+    #[test]
+    fn a_bot_without_an_instance_id_omits_the_field() {
+        // The venue reads a missing instanceId as "one session per credential
+        // chain", which is what an older build got. Sending `null` instead
+        // would be a different thing to have to interpret.
+        let session = MakerFrame::Session(SessionFrame {
+            maker_id: "mk_test".into(),
+            signing_address: "0x7099…".into(),
+            challenge: "0x2222…".into(),
+            issued_at: 1,
+            signature: "0xsig".into(),
+            instance_id: None,
+        });
+        let v = serde_json::to_value(&session).unwrap();
+        assert!(v.get("instanceId").is_none());
     }
 
     #[test]

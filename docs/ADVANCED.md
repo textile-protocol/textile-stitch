@@ -633,6 +633,54 @@ If you would rather cap the exposure than the depth, give the pool exact sizes
 instead of `"max"` — configured amounts are honoured per channel, so
 `buy_total_liquidity_debt` at half your balance leaves the other half to RFQ.
 
+### Several bots on one wallet
+
+You can point as many bots at the venue as you like from one funding wallet: one
+per chain, several splitting a chain's corridors, or several on the same
+corridor. The venue identifies a session by the *bot*, not the wallet, so they
+do not evict each other.
+
+Each bot needs its own config directory, which is what the panel already gives
+them. On first connect a bot writes `rfq-instance-id` beside its `stitch.toml`
+and reuses it forever after — that stable id is what lets a restart reclaim its
+own venue session immediately instead of waiting out the heartbeat timeout.
+Name them yourself if you would rather read `bsc-cngn` than a random id in the
+venue's logs:
+
+```toml
+[rfq]
+instance_id = "bsc-cngn"
+```
+
+**Never share a config directory between two running bots.** They would share
+the instance id, the venue would treat the second connect as the first one
+restarting, and the two would take the session off each other about once a
+second — each looking healthy from its own side while the corridor goes dark.
+The bot says so directly after a few cycles:
+
+```
+ERROR another process keeps taking this RFQ session over — check for a second
+Stitch running the same maker id and funding wallet on this chain
+```
+
+The venue picks one bot per RFQ, so two bots on one corridor are a live/standby
+pair rather than two counterparties: the freshest book wins, and if it goes dark
+the sibling answers the next request.
+
+**What splitting costs.** Bots sharing a wallet share its balance, its Permit2
+allowance and its nonce bitmap, and each nets only *its own* in-flight quotes.
+So together they can publish more indicative depth than the wallet backs; the
+venue rejects the surplus when the quote is admitted rather than filling it, and
+you will see the odd extra spent-nonce rotation. Nothing overspends — the venue
+checks funding and reserves nonces per wallet under one lock — but the quality
+of your quoting is better with fewer bots.
+
+If your only reason to split is quoting two pairs on one chain, put both in one
+bot as two `[[pools]]` blocks instead: one nonce ledger, one reservation ledger,
+none of the above. Separate processes earn their keep when you want independent
+risk limits, separate restarts, separate feeds, or a staged rollout of a new
+pair.
+
 ### Safe Restart Checklist
 
 Before restarting live:

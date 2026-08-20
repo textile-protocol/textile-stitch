@@ -26,6 +26,8 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// this is startup/reconnect, not the quote path.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 
+/// Another session took this maker identity over on this chain.
+const VENUE_SUPERSEDED_CODE: u16 = 4001;
 /// The api task we reached does not hold the venue engine lease.
 const VENUE_NOT_ENGINE_CODE: u16 = 4005;
 /// The api task we were on is shutting down and has released the lease.
@@ -46,9 +48,30 @@ pub struct VenueHandover {
     pub reason: String,
 }
 
+/// Another socket claimed this maker identity, so the venue closed ours.
+///
+/// Once, this is the standby-failover handoff working as intended. Over and
+/// over it means two processes are quoting as one identity on one chain, and
+/// neither ever stays connected long enough to be routed — the venue counts the
+/// maker as online while every corridor it should be quoting sits dark. Typed
+/// so the reconnect loop can say that out loud instead of logging its
+/// hundredth "session ended" line.
+#[derive(Debug, thiserror::Error)]
+#[error("venue superseded this session ({code}): {reason}")]
+pub struct VenueSuperseded {
+    pub code: u16,
+    pub reason: String,
+}
+
 /// Does this close frame mean "wrong task" rather than "go away"?
 pub fn handover_close(code: u16) -> bool {
     code == VENUE_NOT_ENGINE_CODE || code == VENUE_DRAINING_CODE
+}
+
+/// Was this failure another session taking our identity?
+pub fn is_superseded(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<VenueSuperseded>().is_some())
 }
 
 /// Classify a close frame, so both the handshake and the session loop report a
@@ -63,6 +86,9 @@ pub fn close_error(
         .unwrap_or_default();
     if handover_close(code) {
         return anyhow::Error::new(VenueHandover { code, reason: text });
+    }
+    if code == VENUE_SUPERSEDED_CODE {
+        return anyhow::Error::new(VenueSuperseded { code, reason: text });
     }
     anyhow::anyhow!("venue closed the session: {code} {text}")
 }
@@ -83,11 +109,12 @@ pub async fn connect_and_auth(
     url: &str,
     api_key: &str,
     maker_id: &str,
+    instance_id: Option<&str>,
     signer: &DynSigner,
 ) -> anyhow::Result<AuthedSession> {
     tokio::time::timeout(
         std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        handshake(url, api_key, maker_id, signer),
+        handshake(url, api_key, maker_id, instance_id, signer),
     )
     .await
     .context("venue handshake timed out")?
@@ -97,6 +124,7 @@ async fn handshake(
     url: &str,
     api_key: &str,
     maker_id: &str,
+    instance_id: Option<&str>,
     signer: &DynSigner,
 ) -> anyhow::Result<AuthedSession> {
     let mut request = url
@@ -148,6 +176,7 @@ async fn handshake(
         challenge: challenge.challenge.clone(),
         issued_at,
         signature: alloy_primitives::hex::encode_prefixed(signature),
+        instance_id: instance_id.map(str::to_string),
     });
     stream
         .send(Message::text(serde_json::to_string(&session)?))
@@ -162,6 +191,7 @@ async fn handshake(
     };
     info!(
         maker_id,
+        instance_id = ?instance_id,
         signing_address = %signer.address(),
         corridors = ?accepted.corridors,
         domain = %challenge.domain.name,

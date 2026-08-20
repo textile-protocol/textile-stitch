@@ -45,6 +45,7 @@ use std::sync::{Arc, RwLock};
 use alloy_primitives::{Address, Bytes, U256};
 use anyhow::Context as _;
 use futures_util::{SinkExt, StreamExt};
+use rand::RngCore;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
@@ -75,6 +76,8 @@ pub struct RfqRuntime {
     url: String,
     api_key: String,
     maker_id: String,
+    /// This bot's name on the venue; `None` keeps the pre-instance behaviour.
+    instance_id: Option<String>,
     chain_id: u64,
     permit2: Address,
     reactor: Address,
@@ -158,6 +161,7 @@ pub fn maybe_spawn(
     info!(
         url = %runtime.url,
         maker_id = %runtime.maker_id,
+        instance_id = ?runtime.instance_id,
         corridors = ?runtime.books.iter().map(|b| b.slug.as_str()).collect::<Vec<_>>(),
         "starting RFQ responder"
     );
@@ -221,6 +225,56 @@ fn file_holds_secret(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|s| !s.trim().is_empty())
 }
 
+/// Where a generated instance id is remembered, next to stitch.toml.
+pub const INSTANCE_ID_FILE: &str = "rfq-instance-id";
+
+/// This bot's name on the venue.
+///
+/// Order: `[rfq].instance_id`, then `rfq-instance-id` beside the config,
+/// generating and persisting one on first use. Persisted rather than fresh per
+/// process on purpose — the venue supersedes a session only when the same id
+/// reconnects, so a stable id means a restart reclaims its own socket at once,
+/// while a fresh one each time would leave the old session to time out and let
+/// restarts pile sockets up.
+///
+/// `None` when there is nowhere to persist to (an env-only deployment) and
+/// nothing was configured: the venue then falls back to one session per
+/// credential chain, which is the behaviour that predates instance ids. Better
+/// that than an id that changes on every restart.
+fn resolve_instance_id(configured: Option<&str>, config_dir: Option<&Path>) -> Option<String> {
+    if let Some(name) = configured.map(str::trim).filter(|n| !n.is_empty()) {
+        return Some(name.to_string());
+    }
+    let path = config_dir?.join(INSTANCE_ID_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Some(existing);
+        }
+    }
+    let generated = format!("stitch-{:016x}", rand::rngs::OsRng.next_u64());
+    match std::fs::write(&path, format!("{generated}\n")) {
+        Ok(()) => {
+            info!(
+                path = %path.display(),
+                instance_id = %generated,
+                "generated this bot's RFQ instance id"
+            );
+            Some(generated)
+        }
+        Err(e) => {
+            // Unwritable config dir: an id we cannot remember is worse than
+            // none, because it would change on every restart.
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "could not persist an RFQ instance id; falling back to one session per chain"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the maker API key without ever logging it.
 ///
 /// Order: `{NAME}_FILE` (preferred, same as the wallet), then `{NAME}`, then
@@ -267,6 +321,7 @@ fn build_runtime(
         url: rfq.url.clone(),
         api_key,
         maker_id: rfq.maker_id.clone(),
+        instance_id: resolve_instance_id(rfq.instance_id.as_deref(), config_dir),
         chain_id: cfg.chain_id,
         permit2: cfg.permit2.parse().context("invalid permit2 address")?,
         reactor: cfg.reactor.parse().context("invalid reactor address")?,
@@ -396,10 +451,19 @@ async fn run(rt: RfqRuntime) {
         }
     };
     let mut backoff = Backoff::default();
+    let mut supersedes: u32 = 0;
     loop {
-        match session::connect_and_auth(&rt.url, &rt.api_key, &rt.maker_id, &rt.signer).await {
+        match session::connect_and_auth(
+            &rt.url,
+            &rt.api_key,
+            &rt.maker_id,
+            rt.instance_id.as_deref(),
+            &rt.signer,
+        )
+        .await
+        {
             Ok(authed) => {
-                backoff.reset();
+                let started = tokio::time::Instant::now();
                 let (err, ledger) = session_loop(
                     &rt,
                     &prices,
@@ -409,22 +473,42 @@ async fn run(rt: RfqRuntime) {
                 )
                 .await;
                 reservations = ledger;
+                // Acceptance alone is not health. A duplicate identity is
+                // accepted and then closed inside a second, every second, so
+                // clearing the backoff here pinned the bot to a 1 Hz retry
+                // loop against a venue that will keep closing it.
+                let lived = started.elapsed();
+                if is_healthy_session(lived) {
+                    backoff.reset();
+                }
+                supersedes = next_supersede_streak(supersedes, lived, &err);
                 if session::is_handover(&err) {
                     info!(
                         detail = %format!("{err:#}"),
                         "RFQ venue handed this session over; reconnecting immediately"
                     );
+                } else if session::is_superseded(&err) {
+                    log_supersede(supersedes, &rt.maker_id, &err);
                 } else {
                     warn!(
                         error = %format!("{err:#}"),
-                        "RFQ session ended (superseded, closed, or failed); reconnecting"
+                        "RFQ session ended (closed or failed); reconnecting"
                     );
                 }
                 backoff.note(&err);
             }
             Err(e) => {
+                // A failed attempt is an ending too, and has to run through the
+                // same transition: a handshake that fails between two short
+                // supersedes breaks the streak, exactly as a session that ran
+                // would. Zero duration because nothing ever served.
+                supersedes = next_supersede_streak(supersedes, std::time::Duration::ZERO, &e);
                 if session::is_handover(&e) {
                     debug!(detail = %format!("{e:#}"), "venue redirected us; retrying immediately");
+                } else if session::is_superseded(&e) {
+                    // Taken over before the session was even accepted — same
+                    // duplicate-identity story, so say the same thing.
+                    log_supersede(supersedes, &rt.maker_id, &e);
                 } else {
                     warn!(error = %format!("{e:#}"), "RFQ connect/auth failed");
                 }
@@ -432,6 +516,62 @@ async fn run(rt: RfqRuntime) {
             }
         }
         tokio::time::sleep(backoff.next_delay()).await;
+    }
+}
+
+/// A session must last this long to count as healthy enough to clear the
+/// reconnect backoff. The duplicate-identity loop cycles in about a second, and
+/// a real session lasts hours, so anything under this is "we are being closed
+/// as fast as we connect" rather than "we were serving and something broke".
+const HEALTHY_SESSION: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Consecutive supersedes before this stops looking like a failover and starts
+/// looking like a misconfiguration worth an error line.
+const SUPERSEDE_ALERT_THRESHOLD: u32 = 3;
+
+fn is_healthy_session(lived: std::time::Duration) -> bool {
+    lived >= HEALTHY_SESSION
+}
+
+/// Consecutive supersedes of sessions that never got going — the flap streak.
+///
+/// A session that *ran* before being taken over resets it, because that is a
+/// standby failover doing its job, and three of those spread over days is not a
+/// flap. Only "accepted, then closed before it could serve" counts, which is the
+/// shape a second process quoting as the same identity produces. Any other way
+/// of ending (a handover, a dead socket, a silent venue) also clears it: the
+/// alert is for the clean-cut duplicate case, not a general error tally.
+fn next_supersede_streak(previous: u32, lived: std::time::Duration, err: &anyhow::Error) -> u32 {
+    if session::is_superseded(err) && !is_healthy_session(lived) {
+        previous.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// One supersede is the standby handoff. A run of them is two processes sharing
+/// one bot identity, which the operator has to fix — nothing the bot retries
+/// will resolve it, so say what to look for.
+///
+/// The advice has to name the thing that actually collides. The venue supersedes
+/// on `(maker id, funding wallet, instance id)`; sharing a wallet or a chain is
+/// fine and supported, so telling someone to split API keys per chain would not
+/// stop a same-chain collision.
+fn log_supersede(count: u32, maker_id: &str, err: &anyhow::Error) {
+    if count >= SUPERSEDE_ALERT_THRESHOLD {
+        error!(
+            count,
+            maker_id,
+            error = %format!("{err:#}"),
+            "another process keeps taking this RFQ session over — two bots are using one \
+             instance id. Give each its own [rfq].instance_id, or its own config directory \
+             so each generates its own rfq-instance-id"
+        );
+    } else {
+        warn!(
+            error = %format!("{err:#}"),
+            "RFQ session superseded by another session; reconnecting"
+        );
     }
 }
 
@@ -854,7 +994,11 @@ async fn session_loop_inner(
                             ) {
                                 info!(?reason, "venue handing this session over; reconnecting now");
                             } else {
-                                warn!(?reason, "venue sent close (possibly a superseding session)");
+                                // The reconnect driver classifies and logs this
+                                // close (supersede vs plain failure) with the
+                                // code and reason in the error; a warn here just
+                                // doubled every line.
+                                debug!(?reason, "venue closed the session");
                             }
                             return Err(session::close_error(&reason));
                         }
@@ -1232,6 +1376,7 @@ mod tests {
     use crate::tick::unix_now;
     use alloy_primitives::U256;
     use k256::ecdsa::SigningKey;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
     const COLLATERAL: &str = "0x0000000000000000000000000000000000000001";
     const DEBT: &str = "0x0000000000000000000000000000000000000002";
@@ -1265,6 +1410,134 @@ mod tests {
         assert!(!session::is_handover(&anyhow::anyhow!(
             "503 Service Unavailable"
         )));
+    }
+
+    #[test]
+    fn a_supersede_close_is_classified_as_one() {
+        let err = session::close_error(&Some(CloseFrame {
+            code: 4001u16.into(),
+            reason: "superseded".into(),
+        }));
+        assert!(session::is_superseded(&err));
+        // And not as a handover: reconnecting instantly against a venue that
+        // keeps handing our identity to someone else is the flap loop.
+        assert!(!session::is_handover(&err));
+        assert!(session::is_superseded(&err.context("reading venue frame")));
+
+        let unauthorized = session::close_error(&Some(CloseFrame {
+            code: 4000u16.into(),
+            reason: "unauthorized".into(),
+        }));
+        assert!(!session::is_superseded(&unauthorized));
+    }
+
+    fn superseded() -> anyhow::Error {
+        session::close_error(&Some(CloseFrame {
+            code: 4001u16.into(),
+            reason: "superseded".into(),
+        }))
+    }
+
+    const SHORT: std::time::Duration = std::time::Duration::from_secs(1);
+    const LONG: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+    #[test]
+    fn the_flap_streak_only_counts_sessions_that_never_got_going() {
+        // The flap: accepted, superseded a second later, over and over.
+        let mut streak = 0;
+        for expected in 1..=4 {
+            streak = next_supersede_streak(streak, SHORT, &superseded());
+            assert_eq!(streak, expected);
+        }
+        assert!(streak >= SUPERSEDE_ALERT_THRESHOLD, "the alert fires");
+    }
+
+    #[test]
+    fn a_standby_takeover_after_a_real_session_is_not_a_flap() {
+        // Three isolated failovers over days, each after a session that served
+        // for an hour. Counting those hit the duplicate-process alert with
+        // nothing wrong — the streak has to reset when a session actually ran.
+        let mut streak = 0;
+        for _ in 0..3 {
+            streak = next_supersede_streak(streak, LONG, &superseded());
+            assert_eq!(streak, 0);
+            assert!(streak < SUPERSEDE_ALERT_THRESHOLD);
+        }
+    }
+
+    #[test]
+    fn a_healthy_session_clears_a_streak_in_progress() {
+        let mut streak = next_supersede_streak(0, SHORT, &superseded());
+        streak = next_supersede_streak(streak, SHORT, &superseded());
+        assert_eq!(streak, 2);
+        streak = next_supersede_streak(streak, LONG, &superseded());
+        assert_eq!(streak, 0, "the duplicate went away; start over");
+    }
+
+    #[test]
+    fn any_other_ending_clears_the_streak() {
+        let mut streak = next_supersede_streak(0, SHORT, &superseded());
+        assert_eq!(streak, 1);
+        streak = next_supersede_streak(streak, SHORT, &handover(4006));
+        assert_eq!(streak, 0, "a deploy handover is not a duplicate identity");
+        streak = next_supersede_streak(1, SHORT, &anyhow::anyhow!("503"));
+        assert_eq!(streak, 0, "nor is a dead socket");
+    }
+
+    #[test]
+    fn a_failed_handshake_breaks_the_streak_too() {
+        // The reconnect driver runs its Err path through the same transition,
+        // with a zero duration because nothing served. Two short supersedes, a
+        // handshake failure, then one more supersede must not read as three in
+        // a row.
+        let mut streak = next_supersede_streak(0, SHORT, &superseded());
+        streak = next_supersede_streak(streak, SHORT, &superseded());
+        assert_eq!(streak, 2);
+        streak = next_supersede_streak(
+            streak,
+            std::time::Duration::ZERO,
+            &anyhow::anyhow!("connecting to venue: 503"),
+        );
+        assert_eq!(streak, 0);
+        streak = next_supersede_streak(streak, SHORT, &superseded());
+        assert_eq!(streak, 1, "the alert stays quiet");
+        assert!(streak < SUPERSEDE_ALERT_THRESHOLD);
+    }
+
+    #[test]
+    fn being_superseded_during_a_handshake_still_counts() {
+        // Taken over before acceptance is the same duplicate-identity story, so
+        // the zero duration must not exempt it.
+        let streak = next_supersede_streak(2, std::time::Duration::ZERO, &superseded());
+        assert_eq!(streak, 3);
+    }
+
+    #[test]
+    fn only_a_session_that_lasted_clears_the_backoff() {
+        // The flap loop: accepted, superseded ~1s later, over and over. Health
+        // has to mean "it ran", or the backoff never grows and the bot retries
+        // at 1 Hz forever.
+        assert!(!is_healthy_session(std::time::Duration::from_millis(900)));
+        assert!(!is_healthy_session(
+            HEALTHY_SESSION - std::time::Duration::from_millis(1)
+        ));
+        assert!(is_healthy_session(HEALTHY_SESSION));
+        assert!(is_healthy_session(std::time::Duration::from_secs(3_600)));
+    }
+
+    #[test]
+    fn an_unreset_backoff_walks_a_supersede_loop_out_to_the_ceiling() {
+        // Same shape as the reconnect driver when every session dies instantly:
+        // note(err) with no reset in between.
+        let mut b = Backoff::default();
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            b.note(&anyhow::anyhow!(
+                "venue closed the session: 4001 superseded"
+            ));
+            delays.push(b.next_delay().as_secs());
+        }
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30]);
     }
 
     #[test]
@@ -2024,6 +2297,77 @@ mod tests {
             None,
             "an unread token is not inventable"
         );
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "stitch-instance-{}-{}-{tag}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_configured_name_is_the_instance_id() {
+        let dir = temp_dir("configured");
+        assert_eq!(
+            resolve_instance_id(Some("  bsc-cngn  "), Some(&dir)).as_deref(),
+            Some("bsc-cngn"),
+            "trimmed, so a stray space in stitch.toml is not a different bot"
+        );
+        assert!(
+            !dir.join(INSTANCE_ID_FILE).exists(),
+            "a configured name needs nothing persisted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_generated_instance_id_survives_a_restart() {
+        // The property that matters: the same bot reconnecting reclaims its own
+        // venue session. A fresh id per process would leave the old socket to
+        // time out and let restarts pile sockets up.
+        let dir = temp_dir("generated");
+        let first = resolve_instance_id(None, Some(&dir)).expect("generated");
+        let second = resolve_instance_id(None, Some(&dir)).expect("reused");
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(INSTANCE_ID_FILE))
+                .unwrap()
+                .trim(),
+            first
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_bots_generate_different_instance_ids() {
+        // Separate config directories are separate bots, which is the whole
+        // point: they must not collide and evict each other at the venue.
+        let a = temp_dir("bot-a");
+        let b = temp_dir("bot-b");
+        assert_ne!(
+            resolve_instance_id(None, Some(&a)),
+            resolve_instance_id(None, Some(&b))
+        );
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn an_empty_or_absent_source_falls_back_to_no_instance_id() {
+        // No config dir and nothing configured: the venue's own fallback (one
+        // session per credential chain) beats an id that changes every restart.
+        assert_eq!(resolve_instance_id(None, None), None);
+        assert_eq!(resolve_instance_id(Some("   "), None), None);
+
+        // An empty file is treated as absent, and replaced.
+        let dir = temp_dir("empty-file");
+        std::fs::write(dir.join(INSTANCE_ID_FILE), "\n").unwrap();
+        assert!(resolve_instance_id(None, Some(&dir)).is_some());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
