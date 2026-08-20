@@ -8,11 +8,8 @@
 export type RemovePlan = { deleteConfig: boolean } | null
 
 /**
- * Ask what to remove.
- *
- * - No container: one confirm, always deletes config (the only thing left).
- * - Has container: one confirm for a full delete (container + config + key).
- *   Detail pages can also offer {@link confirmRemoveContainerOnlyPlan}.
+ * Ask what to remove. Always deletes config (and the container when there is
+ * one). Cancel aborts — nothing is removed.
  */
 export function confirmRemovePlan(opts: {
   name: string
@@ -38,22 +35,4 @@ export function confirmRemovePlan(opts: {
     return null
   }
   return { deleteConfig: true }
-}
-
-/**
- * Detail-only escape hatch: destroy the container, keep files on disk.
- *
- * The bot reappears on the fleet as config-only so Recreate can bring it back.
- * Explicit about that, because Cancel-means-keep on the main Remove path is how
- * operators ended up with zombies they couldn't see how to delete.
- */
-export function confirmRemoveContainerOnlyPlan(name: string): RemovePlan {
-  if (
-    !window.confirm(
-      `Remove ${name}'s container but keep its config and private key?\n\n${name} will stay on the fleet as config-only until you Delete it (or Recreate the container).`,
-    )
-  ) {
-    return null
-  }
-  return { deleteConfig: false }
 }

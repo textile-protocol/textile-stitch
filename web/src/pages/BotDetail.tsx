@@ -19,10 +19,7 @@ import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import VersionRollback from '../components/VersionRollback'
 import { formatTimestamp, shortAddress, shortImage } from '../format'
-import {
-  confirmRemoveContainerOnlyPlan,
-  confirmRemovePlan,
-} from '../removeBot'
+import { confirmRemovePlan } from '../removeBot'
 import type { Bot, ConfigBody, MigrationResult, UpdatesStatus } from '../types'
 
 const TABS = ['settings', 'dashboard', 'config', 'logs', 'tools'] as const
@@ -124,13 +121,14 @@ export default function BotDetail() {
     }
   }
 
-  async function remove(full: boolean) {
-    const plan = full
-      ? confirmRemovePlan({ name, hasContainer: !!bot?.container })
-      : confirmRemoveContainerOnlyPlan(name)
+  async function remove() {
+    const plan = confirmRemovePlan({
+      name,
+      hasContainer: !!bot?.container,
+    })
     if (!plan) return
 
-    setBusy(full ? 'remove' : 'remove-container')
+    setBusy('remove')
     setError(null)
     try {
       const res = await api.remove(name, plan.deleteConfig)
@@ -294,31 +292,19 @@ export default function BotDetail() {
               </>
             )}
           </div>
-          <div className="flex w-full flex-col gap-2 sm:ml-auto sm:w-auto sm:flex-row sm:items-center">
-            {bot.container && (
-              <Button
-                busy={busy === 'remove-container'}
-                className="w-full sm:w-auto"
-                onClick={() => void remove(false)}
-                title="Destroy the container but leave config on disk — the bot stays on the fleet as config-only"
-              >
-                Remove container only
-              </Button>
-            )}
-            <Button
-              variant="danger"
-              busy={busy === 'remove'}
-              className="w-full sm:w-auto"
-              onClick={() => void remove(true)}
-              title={
-                bot.container
-                  ? 'Delete the container, config, and private key — gone from the fleet'
-                  : 'Delete config and private key — gone from the fleet'
-              }
-            >
-              {bot.container ? 'Remove' : 'Delete'}
-            </Button>
-          </div>
+          <Button
+            variant="danger"
+            busy={busy === 'remove'}
+            className="w-full sm:ml-auto sm:w-auto"
+            onClick={() => void remove()}
+            title={
+              bot.container
+                ? 'Delete the container, config, and private key — gone from the fleet'
+                : 'Delete config and private key — gone from the fleet'
+            }
+          >
+            {bot.container ? 'Remove' : 'Delete'}
+          </Button>
         </div>
 
         <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
