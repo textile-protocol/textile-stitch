@@ -57,6 +57,9 @@ pub struct BotBody {
     /// Why not, when it can't. Same reason as `migrateBlockedReason`: the operator
     /// should read it before clicking, not after.
     pub approve_blocked_reason: Option<String>,
+    /// The bot that must be stopped to unblock approval. Often this bot, but a
+    /// sibling on the same wallet when that sibling is the one that can broadcast.
+    pub approve_blocked_by: Option<String>,
     pub config: Option<ConfigBody>,
     pub warnings: Vec<WarningBody>,
 }
@@ -133,6 +136,7 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
         migrate_blocked_reason: migrate_check.err().map(|e| format!("{e:#}")),
         can_approve: approve_check.is_ok(),
         approve_blocked_reason: approve_check.err().map(|e| format!("{e:#}")),
+        approve_blocked_by: super::logs::approve_blocked_by(bot, fleet),
         config: bot.config.as_ref().map(ConfigBody::from),
         warnings: bot.warnings.iter().map(WarningBody::from).collect(),
     }

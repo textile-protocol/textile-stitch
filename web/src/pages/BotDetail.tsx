@@ -99,11 +99,14 @@ export default function BotDetail() {
   // Pins keep an Update button even when no newer digest was detected.
   const canUpdate = botUpdate?.canUpdate ?? updateAvailable
 
-  async function act(what: 'start' | 'stop' | 'restart' | 'recreate' | 'update') {
+  async function act(
+    what: 'start' | 'stop' | 'restart' | 'recreate' | 'update',
+    target = name,
+  ) {
     if (
       what === 'recreate' &&
       !window.confirm(
-        `Recreate ${name}'s container? It's replaced with a fresh one on the current image, using the same config directory.`,
+        `Recreate ${target}'s container? It's replaced with a fresh one on the current image, using the same config directory.`,
       )
     ) {
       return
@@ -111,13 +114,13 @@ export default function BotDetail() {
     if (what === 'update') {
       if (bot?.canMigrate || bot?.layout === 'flat-files') {
         setError(
-          `${name} still uses the flat layout. Migrate first so the nonce ledger isn't lost on recreate.`,
+          `${target} still uses the flat layout. Migrate first so the nonce ledger isn't lost on recreate.`,
         )
         return
       }
       if (
         !window.confirm(
-          `Update ${name} to ${updates?.bot.targetImage ?? 'the panel bot image'}?\n\nThe container is recreated (brief gap in quoting). Config and key stay.`,
+          `Update ${target} to ${updates?.bot.targetImage ?? 'the panel bot image'}?\n\nThe container is recreated (brief gap in quoting). Config and key stay.`,
         )
       ) {
         return
@@ -126,8 +129,11 @@ export default function BotDetail() {
     setBusy(what)
     setError(null)
     try {
-      const res = what === 'update' ? await api.updateBot(name) : await api[what](name)
-      setBot(res.bot)
+      const res =
+        what === 'update' ? await api.updateBot(target) : await api[what](target)
+      // Stopping a sibling to unblock approval returns *that* bot. Keep this
+      // page on the selected one and re-read so canApprove can flip.
+      setBot(target === name ? res.bot : await api.bot(name))
       setNote(res.message)
       void loadUpdates()
     } catch (e) {
@@ -431,12 +437,13 @@ export default function BotDetail() {
               bot={bot.name}
               canApprove={bot.canApprove}
               approveBlockedReason={bot.approveBlockedReason}
+              approveBlockedBy={bot.approveBlockedBy}
               highlightPermit2={showPermit2Banner}
               onApproved={() => {
                 setShowPermit2Banner(false)
                 setApprovedAt((n) => n + 1)
               }}
-              onStopForApproval={() => void act('stop')}
+              onStopForApproval={(target) => void act('stop', target)}
             />
           </Card>
           {/*

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ApiError, AppState};
 use crate::panel::docker::{LogLine, LogOptions, LogSource, RunEvent};
-use crate::panel::inventory::{Bot, Fleet, WalletId};
+use crate::panel::inventory::{Bot, Fleet, WalletId, Warning};
 use crate::panel::provision::{self, one_shot_spec, signer_runtime_at, OneShot};
 
 /// Ceiling on the replay a client can ask for. A tail of a million lines is a
@@ -240,6 +240,35 @@ pub fn approve_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
     no_live_sibling_on_the_wallet(bot, fleet)
 }
 
+/// The live bot that must be stopped before an approval can run, if any.
+///
+/// Same cases as [`approve_check`]: this bot is itself transacting, or a sibling
+/// on the same wallet is. The UI Stop button has to name that bot — stopping the
+/// selected one does nothing when the sibling is the one spending nonces.
+pub fn approve_blocked_by(bot: &Bot, fleet: &Fleet) -> Option<String> {
+    if can_transact(bot) {
+        return stoppable_name(bot);
+    }
+    stoppable_name(live_sibling_on_wallet(
+        &bot.name,
+        bot.wallet().as_ref()?,
+        fleet,
+    )?)
+}
+
+/// A Stop target the panel can actually aim at.
+///
+/// Duplicate names collapse into one fleet row, and [`super::require_actionable`]
+/// then 409s every lifecycle action. Offering that name as the recovery button
+/// would send the operator into a dead end.
+fn stoppable_name(bot: &Bot) -> Option<String> {
+    if bot.warnings.iter().any(Warning::blocks_actions) {
+        None
+    } else {
+        Some(bot.name.clone())
+    }
+}
+
 /// Refuse when a *different* bot on the same operator wallet is live and can
 /// broadcast from it.
 ///
@@ -269,9 +298,7 @@ pub fn no_live_sibling_on_wallet_id(
     wallet: &WalletId,
     fleet: &Fleet,
 ) -> anyhow::Result<()> {
-    match fleet.bots().iter().find(|other| {
-        other.name != name && other.wallet().as_ref() == Some(wallet) && can_transact(other)
-    }) {
+    match live_sibling_on_wallet(name, wallet, fleet) {
         None => Ok(()),
         Some(other) => anyhow::bail!(
             "{name} shares its operator wallet ({wallet}) with {}, which is {} and can broadcast \
@@ -282,6 +309,12 @@ pub fn no_live_sibling_on_wallet_id(
             other.name
         ),
     }
+}
+
+fn live_sibling_on_wallet<'a>(name: &str, wallet: &WalletId, fleet: &'a Fleet) -> Option<&'a Bot> {
+    fleet.bots().iter().find(|other| {
+        other.name != name && other.wallet().as_ref() == Some(wallet) && can_transact(other)
+    })
 }
 
 /// Whether this bot is itself a live transactor on its wallet.
@@ -776,6 +809,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["canApprove"], false);
+        assert_eq!(v["approveBlockedBy"], "bot-a");
         assert!(
             v["approveBlockedReason"]
                 .as_str()
@@ -828,6 +862,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["canApprove"], true);
         assert!(v["approveBlockedReason"].is_null(), "{body}");
+        assert!(v["approveBlockedBy"].is_null(), "{body}");
     }
 
     #[tokio::test]
@@ -847,6 +882,40 @@ mod tests {
         assert!(body.contains("shares its operator wallet"), "{body}");
         assert!(body.contains("bot-b"), "{body}");
         assert!(h.docker.one_shot_specs().is_empty());
+
+        let (status, body) = h.get("/api/bots/bot-a").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canApprove"], false);
+        assert_eq!(v["approveBlockedBy"], "bot-b");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_named_sibling_does_not_get_a_stop_target() {
+        // Two containers collapsed into one fleet row. Stop by that name 409s
+        // (require_actionable), so naming it as the recovery button is a dead end.
+        // The reason still says who is blocking; the button just isn't offered.
+        let h = harness("approve-sibling-dupe");
+        seed_transacting(&h, "bot-a", ContainerState::Exited);
+        seed_transacting(&h, "bot-b", ContainerState::Running);
+        let mut rival = container("other-bot-b", ContainerState::Running);
+        rival
+            .labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot-b".to_string());
+        rival.mounts = dir_layout_mounts(&h.root.join("bot-b").display().to_string());
+        h.docker.add_container(rival);
+
+        let (status, body) = h.get("/api/bots/bot-a").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canApprove"], false);
+        assert!(v["approveBlockedBy"].is_null(), "{body}");
+        assert!(
+            v["approveBlockedReason"]
+                .as_str()
+                .is_some_and(|r| r.contains("bot-b")),
+            "{body}"
+        );
     }
 
     #[tokio::test]

@@ -52,6 +52,8 @@ export interface Bot {
   migrateBlockedReason: string | null
   canApprove: boolean
   approveBlockedReason: string | null
+  /** Bot that must be stopped to unblock approval — this one, or a sibling. */
+  approveBlockedBy: string | null
   config: ConfigBody | null
   warnings: WarningBody[]
 }

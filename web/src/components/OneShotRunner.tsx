@@ -29,6 +29,7 @@ export default function OneShotRunner({
   bot,
   canApprove,
   approveBlockedReason,
+  approveBlockedBy,
   highlightPermit2 = false,
   onApproved,
   onStopForApproval,
@@ -36,18 +37,20 @@ export default function OneShotRunner({
   bot: string
   canApprove: boolean
   approveBlockedReason: string | null
+  /** Live bot spending this wallet's nonce. Stop that one, not necessarily `bot`. */
+  approveBlockedBy: string | null
   /** After create: surface the Permit2 + gas requirement up front. */
   highlightPermit2?: boolean
   /** Fired when `stitch approve` exits successfully. */
   onApproved?: () => void
   /**
-   * Stop the bot so an approval can run. Approve is refused while the bot's own
-   * process could broadcast, which is a dead end for a bot that is crash-looping
-   * *because* a token is unapproved: it can't start without the approval and
-   * can't be approved while it keeps trying. Stopping is the way out, so offer it
-   * here rather than making the operator find the Stop button and know why.
+   * Stop the bot named by `approveBlockedBy` so an approval can run. Approve is
+   * refused while any process on this wallet could broadcast, which is a dead
+   * end for a bot crash-looping *because* a token is unapproved. Stopping is the
+   * way out — and it has to be the bot the backend named, not always this page's
+   * bot. A sibling on the same wallet blocks approval just as hard.
    */
-  onStopForApproval?: () => void
+  onStopForApproval?: (target: string) => void
 }) {
   const [lines, setLines] = useState<LogLine[]>([])
   const [running, setRunning] = useState<string | null>(null)
@@ -159,9 +162,14 @@ export default function OneShotRunner({
         <Banner tone="warning">
           <div className="space-y-2">
             <p>{approveBlockedReason}</p>
-            {onStopForApproval && (
-              <Button variant="secondary" onClick={onStopForApproval}>
-                Stop {bot} so it can be approved
+            {onStopForApproval && approveBlockedBy && (
+              <Button
+                variant="secondary"
+                onClick={() => onStopForApproval(approveBlockedBy)}
+              >
+                {approveBlockedBy === bot
+                  ? `Stop ${bot} so it can be approved`
+                  : `Stop ${approveBlockedBy} so ${bot} can be approved`}
               </Button>
             )}
           </div>

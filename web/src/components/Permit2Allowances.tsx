@@ -65,7 +65,11 @@ export default function Permit2Allowances({
 
   return (
     <div className="space-y-3">
-      {data.readError ? (
+      {error ? (
+        <Banner tone="danger">
+          Latest check failed, so the rows below may be stale: {error}
+        </Banner>
+      ) : data.readError ? (
         <Banner tone="warning">
           Couldn&apos;t read allowances from the chain, so the rows below say
           unknown rather than guessing: {data.readError}
