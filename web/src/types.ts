@@ -294,3 +294,25 @@ export interface BotVersions {
   /** Why the list is empty, when asking the registry failed. */
   listingError: string | null
 }
+
+export interface TokenAllowance {
+  token: string
+  symbol: string
+  /** Every corridor on this bot that spends the token. */
+  corridors: string[]
+  reasons: string[]
+  required: string
+  usesMaxLiquidity: boolean
+  /** Current Permit2 allowance, decimal. Null when the read failed. */
+  allowance: string | null
+  /** Null means unknown, not "no" — the chain read failed. */
+  approved: boolean | null
+}
+
+export interface Allowances {
+  operatorAddress: string | null
+  permit2: string
+  chainId: number
+  tokens: TokenAllowance[]
+  readError: string | null
+}

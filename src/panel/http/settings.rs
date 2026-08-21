@@ -339,6 +339,14 @@ pub async fn show(
 pub struct SettingsUpdate {
     #[serde(default)]
     pub pool: Option<usize>,
+    /// The pair the client believes `pool` names. Required once a bot has more
+    /// than one, for the same reason the delete takes it: an index only means
+    /// something against the list the client read, and a concurrent add, remove
+    /// or replace renumbers it under them.
+    #[serde(default)]
+    pub collateral: Option<String>,
+    #[serde(default)]
+    pub debt: Option<String>,
     #[serde(default)]
     pub rpc_url: Option<String>,
     #[serde(default)]
@@ -590,6 +598,12 @@ pub async fn update(
     let current_toml = read_toml(&path)?;
 
     let pool = body.pool.unwrap_or(0);
+    confirm_pool_identity(
+        &current_toml,
+        pool,
+        body.collateral.as_deref(),
+        body.debt.as_deref(),
+    )?;
     let current = setup::read_settings_at(&current_toml, pool).map_err(ApiError::bad_request)?;
     let patch = body.onto(&current)?;
     // `apply_settings` re-validates through the real loader, so an invalid value
@@ -683,8 +697,8 @@ pub async fn add_pool(
         .len()
         .saturating_sub(1);
     let note = format!(
-        "Added {} on {}. Approve Permit2 on the new tokens. RFQ only answers corridors this maker \
-         key is enrolled on.",
+        "Added {} on {}. Next: approve its tokens under Tools → Permit2 allowances, then enroll \
+         this bot's maker key on the corridor so RFQ quotes it.",
         corridor.display_name, corridor.network_label
     );
     save_and_restart(
@@ -696,6 +710,49 @@ pub async fn add_pool(
         Some(serde_json::json!({ "note": note })),
     )
     .await
+}
+
+/// Refuse a pool-scoped write whose index no longer names the pair the client
+/// meant.
+///
+/// A pool index is only meaningful against the list the client last read: an
+/// add, a remove or a config replace renumbers it, so a write that names only
+/// an index can land on a corridor the operator never opened — writing one
+/// pair's spreads onto another. Single-pool bots can't be renumbered into
+/// (removing the last pool is refused), so they may still omit the pair.
+fn confirm_pool_identity(
+    toml_str: &str,
+    pool: usize,
+    collateral: Option<&str>,
+    debt: Option<&str>,
+) -> Result<(), ApiError> {
+    let cfg = Config::from_toml(toml_str).map_err(ApiError::bad_request)?;
+    if cfg.pools.len() < 2 {
+        return Ok(());
+    }
+    let target = cfg.pools.get(pool).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "config has {} pools, so there is no pool {pool}",
+            cfg.pools.len()
+        ))
+    })?;
+    let (Some(collateral), Some(debt)) = (collateral, debt) else {
+        return Err(ApiError::bad_request(
+            "this bot quotes more than one corridor, so a settings write has to say which pair \
+             it is editing. Reload the page and try again."
+                .to_string(),
+        ));
+    };
+    if !target.collateral.eq_ignore_ascii_case(collateral.trim())
+        || !target.debt.eq_ignore_ascii_case(debt.trim())
+    {
+        return Err(ApiError::conflict(
+            "the corridor at that position is not the pair you were editing — this bot's \
+             corridors changed since the page loaded. Nothing was written; reload and try again."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// The pairs a config quotes, in order, for comparing one config against
@@ -3309,6 +3366,68 @@ mod tests {
             2,
             "nothing was removed"
         );
+    }
+
+    /// A save carries a pool index chosen against the list the client read. If
+    /// someone else's remove renumbers it first, writing by index alone would
+    /// put one corridor's spreads on another.
+    #[tokio::test]
+    async fn saving_a_pool_by_a_renumbered_index_is_refused() {
+        let h = harness("settings-save-renumbered");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Exited);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pools = crate::config::Config::from_toml(
+            &std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap(),
+        )
+        .unwrap()
+        .pools
+        .clone();
+
+        // Naming pool 1 but sending pool 0's pair: the list moved under us.
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({
+                    "pool": 1,
+                    "collateral": pools[0].collateral,
+                    "debt": pools[0].debt,
+                    "ttlSecs": 300,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("reload"), "{body}");
+
+        // Multi-corridor writes have to say which pair they mean at all.
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "pool": 1, "ttlSecs": 300 }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("which pair"), "{body}");
+
+        // The honest write lands.
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({
+                    "pool": 1,
+                    "collateral": pools[1].collateral,
+                    "debt": pools[1].debt,
+                    "ttlSecs": 300,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(Harness::parse(&body)["settings"]["ttlSecs"], 300);
     }
 
     /// Two clients that both confirmed "remove pool 0" against a three-pool

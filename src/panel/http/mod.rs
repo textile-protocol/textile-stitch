@@ -14,6 +14,7 @@
 //! takes it write-only.
 
 pub mod access;
+pub mod allowances;
 pub mod assets;
 pub mod bots;
 pub mod enroll;
@@ -291,6 +292,7 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             delete(settings::remove_pool),
         )
         .route("/api/bots/{name}/logs", get(logs::tail))
+        .route("/api/bots/{name}/allowances", get(allowances::allowances))
         .route("/api/bots/{name}/approve", post(logs::approve))
         .route("/api/bots/{name}/dry-run", post(logs::dry_run))
         .route("/api/compose-export", get(bots::compose_export))

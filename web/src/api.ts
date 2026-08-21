@@ -7,6 +7,7 @@
 
 import type {
   ActionResult,
+  Allowances,
   Bot,
   BotVersions,
   Corridor,
@@ -221,6 +222,12 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),
+
+  /** Per-token Permit2 allowance status across every corridor this bot quotes. */
+  allowances: (name: string) =>
+    request<Allowances>(
+      `/api/bots/${encodeURIComponent(name)}/allowances`,
+    ),
 
   enrollRfq: (name: string) =>
     request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/rfq/enroll`, {

@@ -413,9 +413,14 @@ function CorridorsCard({
 
   async function add() {
     if (!discardUnsavedOk()) return
+    const chosen = addable.find((c) => c.id === addChoice)
     if (
       !window.confirm(
-        `Add this corridor to ${bot.name}?\n\nThe bot stays on this chain and keeps its signer. A running bot restarts. Approve Permit2 on the new tokens. RFQ only answers corridors this maker key is enrolled on.`,
+        `Add ${chosen?.displayName ?? 'this corridor'} to ${bot.name}?\n\n` +
+          `It quotes from the same chain, wallet and signer as the pairs already here, with its own price feed and spreads. A running bot restarts to pick it up.\n\n` +
+          `Two things to do afterwards:\n` +
+          `  1. Approve the new tokens — Tools → Permit2 allowances\n` +
+          `  2. Enroll this bot's maker key on the corridor, or RFQ won't quote it`,
       )
     ) {
       return
@@ -463,7 +468,9 @@ function CorridorsCard({
   async function applySwitch() {
     if (
       !window.confirm(
-        `Replace ${bot.name}'s whole config with a different corridor?\n\nThis drops every pool and writes the preset (your signer is kept). A running bot is stopped — approve Permit2 for the new corridor's tokens before starting.`,
+        `Replace ${bot.name}'s whole config with a different corridor?\n\n` +
+          `Every pair currently configured is dropped and the corridor's preset is written in its place. Your signer is kept; spreads and sizing reset. A running bot is stopped.\n\n` +
+          `Before starting it again, approve the new corridor's tokens under Tools → Permit2 allowances.`,
       )
     ) {
       return
@@ -485,8 +492,8 @@ function CorridorsCard({
     <Card title="Corridors">
       <p className="text-sm text-ink">
         {settings.poolCount === 1
-          ? 'This bot quotes one pair. Add another corridor on the same chain to quote both from one wallet.'
-          : `This bot quotes ${settings.poolCount} pairs on this chain. The fields below edit the selected one.`}
+          ? 'This bot quotes one pair. Add a second corridor on the same chain and one process quotes both, from one wallet and one nonce.'
+          : `This bot quotes ${settings.poolCount} pairs from one wallet. Pick one to edit its spreads, sizing and feed.`}
       </p>
       <ul className="mt-3 space-y-2">
         {settings.pools.map((p) => {
@@ -516,6 +523,7 @@ function CorridorsCard({
       {settings.editable && addable.length > 0 && !adding && (
         <div className="mt-3">
           <Button
+            disabled={saving}
             onClick={() => {
               setAddChoice(addable[0]!.id)
               setAdding(true)
@@ -530,8 +538,8 @@ function CorridorsCard({
       {adding && (
         <div className="mt-3 space-y-3">
           <Field
-            label="Add"
-            hint="Appends a [[pools]] block. Same chain, same wallet, own price feed."
+            label="Corridor to add"
+            hint="Only pairs the venue lists on this bot's chain. It gets its own price feed and spreads; the wallet and signer stay shared."
           >
             <Select
               value={addChoice}
@@ -548,7 +556,7 @@ function CorridorsCard({
             <Button
               variant="primary"
               busy={busy === 'add'}
-              disabled={!addChoice}
+              disabled={!addChoice || saving}
               onClick={() => void add()}
             >
               Add corridor
@@ -570,7 +578,7 @@ function CorridorsCard({
           <Button
             variant="danger"
             busy={busy === 'remove'}
-            disabled={!selected}
+            disabled={!selected || saving}
             onClick={() => void remove()}
           >
             Remove {selected?.pair ?? 'this corridor'}
@@ -582,6 +590,7 @@ function CorridorsCard({
         <div className="mt-4 border-t border-line-soft pt-3">
           <Button
             variant="ghost"
+            disabled={saving}
             onClick={() => {
               setSwitchChoice(bot.config?.corridorId ?? switchable[0]!.id)
               setSwitching(true)
@@ -614,7 +623,7 @@ function CorridorsCard({
             <Button
               variant="primary"
               busy={busy === 'switch'}
-              disabled={!switchChoice}
+              disabled={!switchChoice || saving}
               onClick={() => void applySwitch()}
             >
               Replace config
@@ -1337,7 +1346,14 @@ function changedFields(
   draft: Settings,
   rfqApiKey: string,
 ): Record<string, unknown> {
-  const patch: Record<string, unknown> = { pool: loaded.poolIndex }
+  // The pair goes with the index: the panel refuses a multi-corridor write
+  // whose index has been renumbered by someone else's add or remove.
+  const editing = loaded.pools.find((p) => p.index === loaded.poolIndex)
+  const patch: Record<string, unknown> = {
+    pool: loaded.poolIndex,
+    collateral: editing?.collateral ?? loaded.pair.collateral,
+    debt: editing?.debt ?? loaded.pair.debt,
+  }
   const keys: (keyof Settings)[] = [
     'rpcUrl',
     'feedUrl',

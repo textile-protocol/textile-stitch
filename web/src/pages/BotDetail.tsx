@@ -14,6 +14,7 @@ import {
 import ComposeExportLink from '../components/ComposeExportLink'
 import LogViewer from '../components/LogViewer'
 import OneShotRunner from '../components/OneShotRunner'
+import Permit2Allowances from '../components/Permit2Allowances'
 import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
@@ -45,6 +46,9 @@ export default function BotDetail() {
     needsPermit2?: boolean
   } | null
   const [note, setNote] = useState<string | null>(handoff?.note ?? null)
+  // Bumped after a successful approve so the allowance rows re-read the chain
+  // instead of still showing what was missing a moment ago.
+  const [approvedAt, setApprovedAt] = useState(0)
   const [showPermit2Banner, setShowPermit2Banner] = useState(
     () => !!handoff?.needsPermit2,
   )
@@ -401,13 +405,25 @@ export default function BotDetail() {
 
       {tab === 'tools' && (
         <>
+          {/*
+            Above the runs: what needs approving is the thing an operator came
+            here to find out, and it decides whether they press the button at
+            all.
+          */}
+          <Card title="Permit2 allowances">
+            <Permit2Allowances bot={bot.name} refreshKey={approvedAt} />
+          </Card>
           <Card title="One-off runs">
             <OneShotRunner
               bot={bot.name}
               canApprove={bot.canApprove}
               approveBlockedReason={bot.approveBlockedReason}
               highlightPermit2={showPermit2Banner}
-              onApproved={() => setShowPermit2Banner(false)}
+              onApproved={() => {
+                setShowPermit2Banner(false)
+                setApprovedAt((n) => n + 1)
+              }}
+              onStopForApproval={() => void act('stop')}
             />
           </Card>
           {/*
