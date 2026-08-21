@@ -72,13 +72,13 @@ export default function BotSwitcher({ name }: { name: string }) {
   }
 
   return (
-    <div className="relative min-w-0 max-w-full" ref={rootRef}>
-      <h1 className="min-w-0 max-w-full text-xl font-bold">
+    <div className="relative shrink-0" ref={rootRef}>
+      <h1 className="text-xl font-bold">
         <button
           ref={triggerRef}
           type="button"
           onClick={() => setOpen((v) => !v)}
-          className={`inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-lg px-2 py-0.5 -mx-2 transition hover:bg-hover ${
+          className={`inline-flex items-center gap-1.5 rounded-lg px-2 py-0.5 -mx-2 transition hover:bg-hover ${
             open ? 'bg-hover' : ''
           }`}
           aria-label={`Switch bot, current: ${name}`}
@@ -123,9 +123,10 @@ export default function BotSwitcher({ name }: { name: string }) {
   )
 }
 
-/** Full name when it fits; wrap on a phone; ellipsis after two lines. */
-const TITLE_TEXT = 'min-w-0 break-all [overflow-wrap:anywhere] line-clamp-2'
-const TITLE = `min-w-0 max-w-full text-xl font-bold ${TITLE_TEXT}`
+// One line always. Wide enough for `stitch-ethereum-20` (18); ~50% past that
+// (27ch) is the truncate cap.
+const TITLE_TEXT = 'max-w-[27ch] truncate whitespace-nowrap'
+const TITLE = `shrink-0 text-xl font-bold ${TITLE_TEXT}`
 
 function Chevron({ open }: { open: boolean }) {
   return (
