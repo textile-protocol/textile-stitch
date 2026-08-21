@@ -290,15 +290,27 @@ pub fn rfq_staleness_secs(feed: &FeedConfig) -> u64 {
 /// cNGN bot carrying one WETH pool would quote that pool off a four-minute-old
 /// mark. Bounded by the ladder's window for the same reason as above.
 pub fn rfq_staleness_secs_for_pool(feed: &FeedConfig, pool: &PoolConfig) -> u64 {
-    let Some(url) = pool.feed_url.as_deref() else {
-        return rfq_staleness_secs(feed);
-    };
-    let requested = pool
-        .rfq_staleness_secs
-        .unwrap_or_else(|| default_rfq_staleness_secs(url));
-    feed.staleness_secs
-        .min(requested)
+    requested_rfq_staleness_secs(feed, pool)
+        .min(feed.staleness_secs)
         .min(RFQ_MAX_STALENESS_SECS)
+}
+
+/// What a pool asks for, before the bot-level window and the ceiling clamp it.
+///
+/// Split out because `[feed].staleness_secs` is a bot-wide floor — the ladder
+/// tick reads it directly for every pool — so a corridor that needs a wider
+/// window than the bot allows quotes nothing at all rather than quoting late.
+/// Callers that add a pool compare this against the bot's window to catch that
+/// before it is written.
+pub fn requested_rfq_staleness_secs(feed: &FeedConfig, pool: &PoolConfig) -> u64 {
+    match pool.feed_url.as_deref() {
+        Some(url) => pool
+            .rfq_staleness_secs
+            .unwrap_or_else(|| default_rfq_staleness_secs(url)),
+        None => feed
+            .rfq_staleness_secs
+            .unwrap_or_else(|| default_rfq_staleness_secs(&feed.url)),
+    }
 }
 
 /// What a feed gets when its config says nothing, inferred from the feed URL.

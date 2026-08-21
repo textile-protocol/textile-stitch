@@ -92,6 +92,28 @@ fn resolve_capacity(
     }
 }
 
+/// Remaining size this side can still sign.
+///
+/// `corridor_reserved` is this pool's own in-flight quotes — those eat the
+/// configured Exact cap. `token_reserved` is every live claim that pays the
+/// same wallet token, including siblings. Two Exact-100 pools on a 1_000
+/// wallet must not let a 100 claim on A zero B's cap.
+fn available_capacity(
+    policy: Option<RfqCapacity>,
+    token: Address,
+    corridor_reserved: U256,
+    token_reserved: U256,
+    inv: &InventoryView,
+) -> Option<U256> {
+    let capacity = resolve_capacity(policy, token, inv)?;
+    let funded = inv.funded(token)?;
+    Some(
+        capacity
+            .saturating_sub(corridor_reserved)
+            .min(funded.saturating_sub(token_reserved)),
+    )
+}
+
 /// Build the corridor book for a pool. `rfq_corridor` is an optional label;
 /// the session binds the venue slug from tokens. Errors mirror config
 /// validation (bad addresses) — unreachable for a config that passed
@@ -153,6 +175,8 @@ pub fn decide_quote(
     mid: f64,
     reserved_bid: U256,
     reserved_ask: U256,
+    token_reserved_bid: U256,
+    token_reserved_ask: U256,
     inventory: &InventoryView,
 ) -> Result<QuotePlan, RejectReason> {
     // Token orientation. sellToken = what the taker sells = maker's output.
@@ -238,19 +262,29 @@ pub fn decide_quote(
         return Err(RejectReason::Size);
     }
 
-    // Capacity: configured cap or the latest funded wallet reading, minus
-    // what in-flight quotes already claim. A `max` side with no fresh
+    // Capacity: this pool's Exact cap minus its own claims, then the wallet
+    // minus every claim that pays the same token. A `max` side with no fresh
     // reading fails closed (inventory) rather than guessing.
-    let capacity = if bid {
-        resolve_capacity(book.buy_capacity_debt, book.debt, inventory)
+    let available = if bid {
+        available_capacity(
+            book.buy_capacity_debt,
+            book.debt,
+            reserved_bid,
+            token_reserved_bid,
+            inventory,
+        )
     } else {
-        resolve_capacity(book.sell_capacity_collateral, book.collateral, inventory)
+        available_capacity(
+            book.sell_capacity_collateral,
+            book.collateral,
+            reserved_ask,
+            token_reserved_ask,
+            inventory,
+        )
     };
-    let Some(capacity) = capacity else {
+    let Some(available) = available else {
         return Err(RejectReason::Inventory);
     };
-    let reserved = if bid { reserved_bid } else { reserved_ask };
-    let available = capacity.saturating_sub(reserved);
     if available.is_zero() {
         return Err(RejectReason::Inventory);
     }
@@ -290,15 +324,22 @@ pub fn levels_for(
     mid: f64,
     reserved_bid: U256,
     reserved_ask: U256,
+    token_reserved_bid: U256,
+    token_reserved_ask: U256,
     as_of: String,
     inventory: &InventoryView,
 ) -> LevelsFrame {
     let mut bids = Vec::new();
-    if let (Some(spread), Some(capacity)) = (
+    if let (Some(spread), Some(remaining)) = (
         book.buy_spread,
-        resolve_capacity(book.buy_capacity_debt, book.debt, inventory),
+        available_capacity(
+            book.buy_capacity_debt,
+            book.debt,
+            reserved_bid,
+            token_reserved_bid,
+            inventory,
+        ),
     ) {
-        let remaining = capacity.saturating_sub(reserved_bid);
         let price = bid_price(mid, spread);
         if !remaining.is_zero() && is_price_usable(price) {
             let size = collateral_for_debt(
@@ -317,11 +358,16 @@ pub fn levels_for(
         }
     }
     let mut asks = Vec::new();
-    if let (Some(spread), Some(capacity)) = (
+    if let (Some(spread), Some(remaining)) = (
         book.sell_spread,
-        resolve_capacity(book.sell_capacity_collateral, book.collateral, inventory),
+        available_capacity(
+            book.sell_capacity_collateral,
+            book.collateral,
+            reserved_ask,
+            token_reserved_ask,
+            inventory,
+        ),
     ) {
-        let remaining = capacity.saturating_sub(reserved_ask);
         let price = ask_price(mid, spread);
         if !remaining.is_zero() && is_price_usable(price) {
             let rate = rate_ray(price, book.debt_decimals, book.collateral_decimals);
@@ -378,7 +424,16 @@ mod tests {
         reserved_bid: U256,
         reserved_ask: U256,
     ) -> Result<QuotePlan, RejectReason> {
-        decide_quote(book, req, mid, reserved_bid, reserved_ask, &funded_inv())
+        decide_quote(
+            book,
+            req,
+            mid,
+            reserved_bid,
+            reserved_ask,
+            reserved_bid,
+            reserved_ask,
+            &funded_inv(),
+        )
     }
 
     fn levels(
@@ -388,7 +443,56 @@ mod tests {
         reserved_ask: U256,
         as_of: String,
     ) -> LevelsFrame {
-        levels_for(book, mid, reserved_bid, reserved_ask, as_of, &funded_inv())
+        levels_for(
+            book,
+            mid,
+            reserved_bid,
+            reserved_ask,
+            reserved_bid,
+            reserved_ask,
+            as_of,
+            &funded_inv(),
+        )
+    }
+
+    fn decide_inv(
+        book: &CorridorBook,
+        req: &QuoteRequestFrame,
+        mid: f64,
+        reserved_bid: U256,
+        reserved_ask: U256,
+        inventory: &InventoryView,
+    ) -> Result<QuotePlan, RejectReason> {
+        decide_quote(
+            book,
+            req,
+            mid,
+            reserved_bid,
+            reserved_ask,
+            reserved_bid,
+            reserved_ask,
+            inventory,
+        )
+    }
+
+    fn levels_inv(
+        book: &CorridorBook,
+        mid: f64,
+        reserved_bid: U256,
+        reserved_ask: U256,
+        as_of: String,
+        inventory: &InventoryView,
+    ) -> LevelsFrame {
+        levels_for(
+            book,
+            mid,
+            reserved_bid,
+            reserved_ask,
+            reserved_bid,
+            reserved_ask,
+            as_of,
+            inventory,
+        )
     }
 
     fn request(sell_token: &str, buy_token: &str) -> QuoteRequestFrame {
@@ -657,7 +761,7 @@ mod tests {
 
         // No reading yet — fail closed, don't guess the balance.
         assert_eq!(
-            decide_quote(
+            decide_inv(
                 &wallet_book,
                 &req,
                 1.0,
@@ -667,7 +771,7 @@ mod tests {
             ),
             Err(RejectReason::Inventory)
         );
-        let dark = levels_for(
+        let dark = levels_inv(
             &wallet_book,
             1.0,
             U256::ZERO,
@@ -683,10 +787,10 @@ mod tests {
             (debt, U256::from(2_000_000_000u64)),
             (collateral, U256::from(3_000_000_000u64)),
         ]));
-        assert!(decide_quote(&wallet_book, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
+        assert!(decide_inv(&wallet_book, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
 
         // Reservations eat the live balance; leftover is still quoted.
-        let plan = decide_quote(
+        let plan = decide_inv(
             &wallet_book,
             &req,
             1.0,
@@ -699,7 +803,7 @@ mod tests {
 
         // Nothing left → inventory.
         assert_eq!(
-            decide_quote(
+            decide_inv(
                 &wallet_book,
                 &req,
                 1.0,
@@ -710,14 +814,14 @@ mod tests {
             Err(RejectReason::Inventory)
         );
 
-        let frame = levels_for(&wallet_book, 1.0, U256::ZERO, U256::ZERO, "t1".into(), &inv);
+        let frame = levels_inv(&wallet_book, 1.0, U256::ZERO, U256::ZERO, "t1".into(), &inv);
         assert_eq!(frame.asks[0].size, "3000000000");
 
         // An exact cap used to ignore a smaller wallet and over-sign vs the
         // ladder (audit M-03). It now mins with the funded reading.
         let exact = book();
         assert_eq!(
-            decide_quote(
+            decide_inv(
                 &exact,
                 &req,
                 1.0,
@@ -732,13 +836,60 @@ mod tests {
             (debt, U256::from(100_000u64)),
             (collateral, U256::from(100_000u64)),
         ]));
-        let thin_plan = decide_quote(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &thin).unwrap();
+        let thin_plan = decide_inv(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &thin).unwrap();
         assert_eq!(
             thin_plan.input,
             U256::from(100_000u64),
             "thin wallet is quoted as a leftover slice, not size-rejected"
         );
-        assert!(decide_quote(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
+        assert!(decide_inv(&exact, &req, 1.0, U256::ZERO, U256::ZERO, &inv).is_ok());
+
+        // Two Exact-100 pools on a 1_000 wallet (6dp): a sibling's 100 claim
+        // must not zero this pool's own cap. Amounts stay above the 1 bps
+        // fee-dust floor so a leftover slice is still quotable.
+        let mut capped = book();
+        capped.buy_capacity_debt = Some(RfqCapacity::Exact(U256::from(100_000_000u64)));
+        let fat = InventoryView::new(HashMap::from([
+            (debt, U256::from(1_000_000_000u64)),
+            (collateral, U256::from(1_000_000_000u64)),
+        ]));
+        let sibling_claim = U256::from(100_000_000u64);
+        let leftover = decide_quote(
+            &capped,
+            &req,
+            1.0,
+            U256::ZERO,
+            U256::ZERO,
+            sibling_claim,
+            U256::ZERO,
+            &fat,
+        )
+        .unwrap();
+        assert_eq!(
+            leftover.input,
+            U256::from(100_000_000u64),
+            "this pool's Exact cap is still fully available; the sibling claim only shrinks the wallet"
+        );
+        let wallet_tight = InventoryView::new(HashMap::from([
+            (debt, U256::from(150_000_000u64)),
+            (collateral, U256::from(150_000_000u64)),
+        ]));
+        let squeezed = decide_quote(
+            &capped,
+            &req,
+            1.0,
+            U256::ZERO,
+            U256::ZERO,
+            sibling_claim,
+            U256::ZERO,
+            &wallet_tight,
+        )
+        .unwrap();
+        assert_eq!(
+            squeezed.input,
+            U256::from(50_000_000u64),
+            "wallet 150 minus the sibling's 100 leaves 50, below this pool's Exact 100"
+        );
     }
 
     #[test]

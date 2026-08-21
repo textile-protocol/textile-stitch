@@ -269,6 +269,23 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ corridorId }) },
     ),
 
+  /** Append a same-chain catalog corridor as another [[pools]] entry. */
+  addPool: (name: string, corridorId: string) =>
+    request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/pools`, {
+      method: 'POST',
+      body: JSON.stringify({ corridorId }),
+    }),
+
+  /** Drop one [[pools]] entry. The bot must keep at least one. */
+  // The pair is not redundant with the index: an index only means anything
+  // against the list this client rendered, and a concurrent removal renumbers
+  // it. The panel refuses when the indexed pool is no longer that pair.
+  removePool: (name: string, index: number, collateral: string, debt: string) =>
+    request<SaveResult>(
+      `/api/bots/${encodeURIComponent(name)}/pools/${index}?collateral=${encodeURIComponent(collateral)}&debt=${encodeURIComponent(debt)}`,
+      { method: 'DELETE' },
+    ),
+
   /** Registry digest check: which bots (and the panel) are behind. */
   updates: (refresh = false) =>
     request<UpdatesStatus>(`/api/updates${refresh ? '?refresh=1' : ''}`),

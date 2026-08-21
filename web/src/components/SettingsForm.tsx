@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ApiError, api } from '../api'
 import {
   Banner,
@@ -40,16 +40,36 @@ export default function SettingsForm({
   const [loadError, setLoadError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  // A pool add, remove or switch is in flight in CorridorsCard. It renumbers
+  // pools, so a Save that raced it would PATCH this pool index against whatever
+  // corridor ends up at it — the removed pool's spreads landing on the pool
+  // that survived.
+  const [poolsChanging, setPoolsChanging] = useState(false)
+  const [pool, setPool] = useState(0)
 
-  // Reload when the bot's corridor changes (switch replaces stitch.toml wholesale).
+  // Reload when the bot's first-pool corridor changes (switch replaces stitch.toml)
+  // or when the operator picks a different pool to edit.
   const corridorId = bot.config?.corridorId ?? ''
+  // SettingsForm is reused across bots. A leftover pool 1+ on a one-pool bot
+  // 400s the load and leaves only ErrorState — no control to get back.
+  const poolKey = `${bot.name}:${corridorId}`
+  const [poolOwner, setPoolOwner] = useState(poolKey)
+  if (poolOwner !== poolKey) {
+    setPoolOwner(poolKey)
+    setPool(0)
+  }
+  const activePool = poolOwner === poolKey ? pool : 0
+  // Which pool the form is on *now*, readable from an in-flight request's
+  // continuation. `activePool` is captured per render, so a promise started
+  // before a switch can't see it moved.
+  const activePoolRef = useRef(activePool)
+  activePoolRef.current = activePool
   useEffect(() => {
     let cancelled = false
     setLoaded(null)
     setLoadError(null)
-    // Desktop edits pool 0 only; multi-pool configs keep other pools via raw TOML.
     api
-      .settings(bot.name, 0)
+      .settings(bot.name, activePool)
       .then((s) => {
         if (cancelled) return
         setLoaded(s)
@@ -61,7 +81,7 @@ export default function SettingsForm({
     return () => {
       cancelled = true
     }
-  }, [bot.name, corridorId])
+  }, [bot.name, corridorId, activePool])
 
   if (loadError) return <ErrorState error={loadError} />
   if (!loaded || !draft) return <Loading what="the settings" />
@@ -74,6 +94,7 @@ export default function SettingsForm({
     setDraft((prev) => (prev ? { ...prev, [key]: value } : prev))
 
   async function save() {
+    const saving = activePool
     setBusy(true)
     setError(null)
     try {
@@ -81,6 +102,14 @@ export default function SettingsForm({
         bot.name,
         changedFields(loaded!, draft!, rfqApiKey),
       )
+      // A save carries a restart, so the pool picker can move before it
+      // answers. Writing this response then would put another corridor's
+      // settings in the form while the list still highlights the one we left,
+      // and the reload for that pool has already been and gone.
+      if (saving !== activePoolRef.current) {
+        onSaved(res.message)
+        return
+      }
       setLoaded(res.settings)
       setDraft(res.settings)
       setRfqApiKey('')
@@ -92,9 +121,39 @@ export default function SettingsForm({
     }
   }
 
+  function applyPoolResult(res: { settings: Settings; message: string }) {
+    setPool(res.settings.poolIndex)
+    setLoaded(res.settings)
+    setDraft(res.settings)
+    setRfqApiKey('')
+    onSaved(res.message)
+  }
+
   return (
     <div className="space-y-4">
-      <CorridorCard bot={bot} onSwitched={onSaved} />
+      <CorridorsCard
+        bot={bot}
+        settings={loaded}
+        dirty={dirty}
+        saving={busy}
+        onBusyChange={setPoolsChanging}
+        onSelectPool={(index) => {
+          if (busy) return
+          if (index === activePool) return
+          if (
+            dirty &&
+            !window.confirm('Discard unsaved settings for this corridor?')
+          ) {
+            return
+          }
+          setPool(index)
+        }}
+        onPoolsChanged={applyPoolResult}
+        onSwitched={(message) => {
+          setPool(0)
+          onSaved(message)
+        }}
+      />
 
       <ChangeSigner
         bot={bot.name}
@@ -103,13 +162,6 @@ export default function SettingsForm({
         onChanged={onSaved}
       />
 
-      {loaded.poolCount > 1 && (
-        <Banner tone="warning">
-          This config has {loaded.poolCount} pools. The fields below edit pool 1
-          only — change the others in Raw config.
-        </Banner>
-      )}
-
       {loaded.rfqPanelUnlocked && (
         <RfqCard
           botName={bot.name}
@@ -117,11 +169,15 @@ export default function SettingsForm({
           loaded={loaded}
           rfqApiKey={rfqApiKey}
           pendingPatch={changedFields(loaded, draft, rfqApiKey)}
-          corridorId={bot.config?.corridorId ?? ''}
+          corridorId={
+            loaded.pools.find((p) => p.index === loaded.poolIndex)
+              ?.corridorId ?? ''
+          }
           editable={loaded.editable}
           onChange={set}
           onApiKey={setRfqApiKey}
           onConnected={(next, message) => {
+            setPool(next.poolIndex)
             setLoaded(next)
             setDraft(next)
             setRfqApiKey('')
@@ -134,7 +190,8 @@ export default function SettingsForm({
         title="Spreads"
         action={
           <span className="text-xs text-faint">
-            {shortAddress(loaded.pair.collateral)} / {shortAddress(loaded.pair.debt)}
+            {loaded.pools.find((p) => p.index === loaded.poolIndex)?.pair ??
+              `${shortAddress(loaded.pair.collateral)} / ${shortAddress(loaded.pair.debt)}`}
           </span>
         }
       >
@@ -253,7 +310,7 @@ export default function SettingsForm({
         <Button
           variant="primary"
           busy={busy}
-          disabled={!dirty || !loaded.editable}
+          disabled={!dirty || !loaded.editable || poolsChanging}
           onClick={() => void save()}
         >
           {bot.running ? 'Save and restart' : 'Save'}
@@ -282,21 +339,43 @@ export default function SettingsForm({
 }
 
 /**
- * Current corridor with a deliberate "Switch corridor…" affordance. Switching
- * replaces stitch.toml with the preset (signer preserved) and stops a running bot.
+ * Every [[pools]] entry on this bot, plus add / remove / replace.
+ *
+ * Add appends a same-chain catalog corridor so one process quotes two pairs.
+ * Switch still replaces the whole file — keep it as the escape hatch.
  */
-function CorridorCard({
+function CorridorsCard({
   bot,
+  settings,
+  dirty,
+  saving,
+  onBusyChange,
+  onSelectPool,
+  onPoolsChanged,
   onSwitched,
 }: {
   bot: Bot
+  settings: Settings
+  dirty: boolean
+  // A settings save is in flight, so the form is pinned to its pool.
+  saving: boolean
+  // Report add/remove/switch progress up, so the parent can lock Save while
+  // the pool list is being renumbered underneath it.
+  onBusyChange: (busy: boolean) => void
+  onSelectPool: (index: number) => void
+  onPoolsChanged: (res: { settings: Settings; message: string }) => void
   onSwitched: (message: string) => void
 }) {
   const [corridors, setCorridors] = useState<Corridor[] | null>(null)
+  const [adding, setAdding] = useState(false)
+  const [addChoice, setAddChoice] = useState('')
   const [switching, setSwitching] = useState(false)
-  const [choice, setChoice] = useState('')
-  const [busy, setBusy] = useState(false)
+  const [switchChoice, setSwitchChoice] = useState('')
+  const [busy, setBusy] = useState<'add' | 'remove' | 'switch' | null>(null)
   const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    onBusyChange(busy !== null)
+  }, [busy, onBusyChange])
 
   useEffect(() => {
     let cancelled = false
@@ -313,58 +392,217 @@ function CorridorCard({
     }
   }, [])
 
-  // Corridors a bot can actually be moved onto. Pending ones ship a preset
-  // with a placeholder reactor, and the API refuses them anyway.
-  const switchable = (corridors ?? []).filter((c) => !c.pendingDeploy)
+  const chainId = bot.config?.chainId
+  const already = new Set(
+    settings.pools.map((p) => p.corridorId).filter((id): id is string => !!id),
+  )
+  const live = (corridors ?? []).filter((c) => !c.pendingDeploy)
+  const addable = live.filter(
+    (c) => chainId != null && c.chainId === chainId && !already.has(c.id),
+  )
+  const switchable = live
 
-  const current =
-    bot.config?.corridorLabel ??
-    (bot.config?.corridorId ? bot.config.corridorId : 'Custom corridor')
+  const selected =
+    settings.pools.find((p) => p.index === settings.poolIndex) ?? settings.pools[0]
 
-  async function apply() {
+  function discardUnsavedOk() {
+    return (
+      !dirty || window.confirm('Discard unsaved settings for this corridor?')
+    )
+  }
+
+  async function add() {
+    if (!discardUnsavedOk()) return
     if (
       !window.confirm(
-        `Switch ${bot.name} to a different corridor?\n\nThis replaces stitch.toml with the preset (your signer is kept). A running bot is stopped — approve Permit2 for the new corridor's tokens (needs a little gas) before starting.`,
+        `Add this corridor to ${bot.name}?\n\nThe bot stays on this chain and keeps its signer. A running bot restarts. Approve Permit2 on the new tokens. RFQ only answers corridors this maker key is enrolled on.`,
       )
     ) {
       return
     }
-    setBusy(true)
+    setBusy('add')
     setError(null)
     try {
-      const res = await api.switchCorridor(bot.name, choice)
+      const res = await api.addPool(bot.name, addChoice)
+      setAdding(false)
+      onPoolsChanged(res)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function remove() {
+    if (settings.poolCount < 2 || !selected) return
+    if (!discardUnsavedOk()) return
+    if (
+      !window.confirm(
+        `Remove ${selected.pair} from ${bot.name}?\n\nSpreads for that pair are dropped. A running bot restarts.`,
+      )
+    ) {
+      return
+    }
+    setBusy('remove')
+    setError(null)
+    try {
+      const res = await api.removePool(
+        bot.name,
+        selected.index,
+        selected.collateral,
+        selected.debt,
+      )
+      onPoolsChanged(res)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function applySwitch() {
+    if (
+      !window.confirm(
+        `Replace ${bot.name}'s whole config with a different corridor?\n\nThis drops every pool and writes the preset (your signer is kept). A running bot is stopped — approve Permit2 for the new corridor's tokens before starting.`,
+      )
+    ) {
+      return
+    }
+    setBusy('switch')
+    setError(null)
+    try {
+      const res = await api.switchCorridor(bot.name, switchChoice)
       setSwitching(false)
       onSwitched(res.message)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
-      setBusy(false)
+      setBusy(null)
     }
   }
 
   return (
-    <Card title="Corridor">
-      <p className="text-sm text-ink">{current}</p>
-      {corridors && switchable.length >= 2 && !switching && (
+    <Card title="Corridors">
+      <p className="text-sm text-ink">
+        {settings.poolCount === 1
+          ? 'This bot quotes one pair. Add another corridor on the same chain to quote both from one wallet.'
+          : `This bot quotes ${settings.poolCount} pairs on this chain. The fields below edit the selected one.`}
+      </p>
+      <ul className="mt-3 space-y-2">
+        {settings.pools.map((p) => {
+          const selectedPool = p.index === settings.poolIndex
+          return (
+            <li key={`${p.index}-${p.corridorId ?? p.pair}`}>
+              <button
+                type="button"
+                onClick={() => onSelectPool(p.index)}
+                disabled={saving && !selectedPool}
+                className={`flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left text-sm disabled:cursor-not-allowed disabled:opacity-50 ${
+                  selectedPool
+                    ? 'border-accent bg-accent/10 font-bold'
+                    : 'border-line-soft hover:bg-hover'
+                }`}
+              >
+                <span>{p.pair}</span>
+                {selectedPool && (
+                  <span className="text-xs font-normal text-muted">editing</span>
+                )}
+              </button>
+            </li>
+          )
+        })}
+      </ul>
+
+      {settings.editable && addable.length > 0 && !adding && (
         <div className="mt-3">
           <Button
             onClick={() => {
-              setChoice(bot.config?.corridorId ?? switchable[0]!.id)
-              setSwitching(true)
+              setAddChoice(addable[0]!.id)
+              setAdding(true)
+              setSwitching(false)
               setError(null)
             }}
           >
-            Switch corridor…
+            Add corridor…
+          </Button>
+        </div>
+      )}
+      {adding && (
+        <div className="mt-3 space-y-3">
+          <Field
+            label="Add"
+            hint="Appends a [[pools]] block. Same chain, same wallet, own price feed."
+          >
+            <Select
+              value={addChoice}
+              onChange={(e) => setAddChoice(e.target.value)}
+            >
+              {addable.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.displayName} — {c.networkLabel}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <div className="flex gap-2">
+            <Button
+              variant="primary"
+              busy={busy === 'add'}
+              disabled={!addChoice}
+              onClick={() => void add()}
+            >
+              Add corridor
+            </Button>
+            <Button
+              onClick={() => {
+                setAdding(false)
+                setError(null)
+              }}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {settings.editable && settings.poolCount > 1 && (
+        <div className="mt-3">
+          <Button
+            variant="danger"
+            busy={busy === 'remove'}
+            disabled={!selected}
+            onClick={() => void remove()}
+          >
+            Remove {selected?.pair ?? 'this corridor'}
+          </Button>
+        </div>
+      )}
+
+      {corridors && switchable.length >= 2 && !switching && (
+        <div className="mt-4 border-t border-line-soft pt-3">
+          <Button
+            variant="ghost"
+            onClick={() => {
+              setSwitchChoice(bot.config?.corridorId ?? switchable[0]!.id)
+              setSwitching(true)
+              setAdding(false)
+              setError(null)
+            }}
+          >
+            Replace entire config…
           </Button>
         </div>
       )}
       {switching && corridors && (
         <div className="mt-3 space-y-3">
           <Field
-            label="Switch to"
-            hint="Replaces this bot's config with the corridor preset. Spreads and endpoints reset; the signer stays."
+            label="Replace with"
+            hint="Drops every pool and writes the corridor preset. Spreads reset; the signer stays."
           >
-            <Select value={choice} onChange={(e) => setChoice(e.target.value)}>
+            <Select
+              value={switchChoice}
+              onChange={(e) => setSwitchChoice(e.target.value)}
+            >
               {switchable.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.displayName} — {c.networkLabel}
@@ -372,15 +610,14 @@ function CorridorCard({
               ))}
             </Select>
           </Field>
-          {error && <Banner tone="danger">{error}</Banner>}
           <div className="flex gap-2">
             <Button
               variant="primary"
-              busy={busy}
-              disabled={!choice || choice === bot.config?.corridorId}
-              onClick={() => void apply()}
+              busy={busy === 'switch'}
+              disabled={!switchChoice}
+              onClick={() => void applySwitch()}
             >
-              Switch corridor
+              Replace config
             </Button>
             <Button
               onClick={() => {
@@ -393,6 +630,7 @@ function CorridorCard({
           </div>
         </div>
       )}
+      {error && <Banner tone="danger">{error}</Banner>}
     </Card>
   )
 }
@@ -1099,7 +1337,7 @@ function changedFields(
   draft: Settings,
   rfqApiKey: string,
 ): Record<string, unknown> {
-  const patch: Record<string, unknown> = { pool: 0 }
+  const patch: Record<string, unknown> = { pool: loaded.poolIndex }
   const keys: (keyof Settings)[] = [
     'rpcUrl',
     'feedUrl',

@@ -175,6 +175,16 @@ impl DockerApi for BollardDocker {
         }
     }
 
+    async fn local_image_labels(
+        &self,
+        image: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        match self.docker.inspect_image(image).await {
+            Ok(info) => Ok(info.config.and_then(|c| c.labels).unwrap_or_default()),
+            Err(_) => Ok(Default::default()),
+        }
+    }
+
     async fn schedule_image_swap(
         &self,
         name: &str,

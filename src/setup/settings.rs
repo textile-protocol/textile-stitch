@@ -21,7 +21,8 @@ use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::config::{
-    assert_feed_url, assert_rfq_stream_url, parse_liquidity_amount, parse_min_slice_debt, Config,
+    assert_feed_url, assert_rfq_stream_url, parse_liquidity_amount, parse_min_slice_debt,
+    requested_rfq_staleness_secs, Config,
 };
 
 /// How a side's spread is expressed in the config. Editing preserves whichever
@@ -73,6 +74,21 @@ pub struct PoolPair {
     pub debt_decimals: u8,
 }
 
+/// One `[[pools]]` entry, labelled for a picker. Catalog pairs get a name;
+/// anything else is a custom corridor and we show shortened addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSummary {
+    pub index: usize,
+    pub pair: String,
+    pub corridor_id: Option<String>,
+    pub corridor_label: Option<String>,
+    /// The pool's tokens as written in the config. An index is not a stable
+    /// name for a pool — removing one renumbers the rest — so a client that
+    /// wants to act on *this* pool sends these back and the panel checks them.
+    pub collateral: String,
+    pub debt: String,
+}
+
 /// The current editable settings, read from a `stitch.toml` for form prefill.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsView {
@@ -86,9 +102,10 @@ pub struct SettingsView {
     pub taker_enabled: bool,
     /// Which pool the pool-scoped fields above were read from.
     pub pool_index: usize,
-    /// How many pools the config has. A caller editing one pool warns when there
-    /// is more than one.
+    /// How many pools the config has.
     pub pool_count: usize,
+    /// Every pool on this bot, in file order. The form edits one at a time.
+    pub pools: Vec<PoolSummary>,
     pub pair: PoolPair,
     pub buy_sizing: SideSizing,
     pub sell_sizing: SideSizing,
@@ -236,6 +253,7 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
         taker_enabled: pool.limit_taker_enabled.unwrap_or(false),
         pool_index,
         pool_count,
+        pools: summarize_pools(&cfg),
         pair: PoolPair {
             collateral: pool.collateral.clone(),
             collateral_decimals: pool.collateral_decimals,
@@ -466,6 +484,185 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
     // restating here.
     Config::from_toml(&edited).context("the edited config is not valid")?;
     Ok(edited)
+}
+
+/// Append one catalog corridor as a new `[[pools]]` entry on an existing bot.
+///
+/// One bot is one chain, one RPC, one reactor, one wallet. Adding a second
+/// corridor is how you quote two pairs without a second process (and a second
+/// nonce ledger) on that wallet. The incoming template must be the same
+/// `chain_id` and must carry exactly one pool. The new pool always gets its
+/// own `feed_url` so it does not inherit the bot-level `[feed]` (which prices
+/// the first corridor).
+pub fn add_pool_from_template(toml_str: &str, template: &str) -> Result<String> {
+    let current = Config::from_toml(toml_str).context("current stitch.toml is not valid")?;
+    let incoming = Config::from_toml(template).context("corridor template is not valid")?;
+
+    anyhow::ensure!(
+        current.chain_id != 0 && incoming.chain_id != 0,
+        "a corridor needs a real chain id — 0 is not a network"
+    );
+    anyhow::ensure!(
+        incoming.chain_id == current.chain_id,
+        "that corridor is on chain {}, this bot is on chain {}. One bot quotes one chain — add a \
+         second bot for the other network.",
+        incoming.chain_id,
+        current.chain_id
+    );
+    anyhow::ensure!(
+        incoming.pools.len() == 1,
+        "the corridor template must have exactly one [[pools]] entry"
+    );
+    let incoming_pool = &incoming.pools[0];
+    let already = current.pools.iter().any(|p| {
+        same_token_pair(
+            &p.collateral,
+            &p.debt,
+            &incoming_pool.collateral,
+            &incoming_pool.debt,
+        )
+    });
+    anyhow::ensure!(!already, "this bot already quotes that pair");
+
+    let feed_url = incoming_pool
+        .feed_url
+        .clone()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| incoming.feed.url.clone());
+    anyhow::ensure!(!feed_url.is_empty(), "corridor template has no price feed");
+    assert_feed_url(&feed_url, "price feed URL")?;
+
+    let incoming_doc = template
+        .parse::<DocumentMut>()
+        .context("parsing corridor template")?;
+    let incoming_tables = incoming_doc
+        .get("pools")
+        .and_then(Item::as_array_of_tables)
+        .context("corridor template has no [[pools]]")?;
+    let mut new_table = incoming_tables
+        .get(0)
+        .context("corridor template has no [[pools]]")?
+        .clone();
+    set_value(&mut new_table, "feed_url", Value::from(feed_url.as_str()));
+
+    // A pool that overrides the feed needs its own RFQ window too, or it
+    // inherits the bot-level `[feed].rfq_staleness_secs` (cNGN's 240s) even
+    // when the URL is a live-fetched pair. Copy the incoming feed's setting
+    // when the pool doesn't already name one.
+    if new_table.get("rfq_staleness_secs").is_none() {
+        if let Some(secs) = incoming.feed.rfq_staleness_secs {
+            set_value(
+                &mut new_table,
+                "rfq_staleness_secs",
+                Value::from(i64::try_from(secs).context("rfq_staleness_secs is too large")?),
+            );
+        }
+    }
+
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .context("parsing stitch.toml")?;
+    let pools = doc
+        .get_mut("pools")
+        .and_then(Item::as_array_of_tables_mut)
+        .context("config has no [[pools]]")?;
+    pools.push(new_table);
+
+    let edited = doc.to_string();
+    let validated = Config::from_toml(&edited).context("the edited config is not valid")?;
+
+    // `[feed].staleness_secs` is bot-wide: the ladder tick reads it for every
+    // pool, and `rfq_staleness_secs_for_pool` takes the minimum with it. A
+    // corridor that needs a wider window than this bot allows would be written
+    // and then sit dark between marks, so refuse instead of quoting nothing.
+    let added = validated
+        .pools
+        .last()
+        .context("the edited config lost the new pool")?;
+    let requested = requested_rfq_staleness_secs(&validated.feed, added);
+    anyhow::ensure!(
+        validated.feed.staleness_secs >= requested,
+        "that corridor prices off a feed that can be up to {requested}s old, but this bot treats \
+         a mark older than {}s as stale, so the new pair would never quote. Widen \
+         [feed].staleness_secs to at least {requested} — it applies to every pool on this bot — \
+         or run that corridor on its own bot.",
+        validated.feed.staleness_secs
+    );
+
+    Ok(edited)
+}
+
+/// RFQ matching is order-insensitive (`pair_matches`). A custom pool that
+/// lists the catalog tokens swapped is the same venue book.
+fn same_token_pair(a_coll: &str, a_debt: &str, b_coll: &str, b_debt: &str) -> bool {
+    (a_coll.eq_ignore_ascii_case(b_coll) && a_debt.eq_ignore_ascii_case(b_debt))
+        || (a_coll.eq_ignore_ascii_case(b_debt) && a_debt.eq_ignore_ascii_case(b_coll))
+}
+
+/// Drop one `[[pools]]` entry. A bot must keep at least one.
+pub fn remove_pool(toml_str: &str, index: usize) -> Result<String> {
+    let current = Config::from_toml(toml_str).context("current stitch.toml is not valid")?;
+    anyhow::ensure!(
+        current.pools.len() > 1,
+        "a bot needs at least one [[pools]] entry"
+    );
+    anyhow::ensure!(
+        index < current.pools.len(),
+        "config has {} pools, so there is no pool {index}",
+        current.pools.len()
+    );
+
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .context("parsing stitch.toml")?;
+    let pools = doc
+        .get_mut("pools")
+        .and_then(Item::as_array_of_tables_mut)
+        .context("config has no [[pools]]")?;
+    pools.remove(index);
+
+    let edited = doc.to_string();
+    Config::from_toml(&edited).context("the edited config is not valid")?;
+    Ok(edited)
+}
+
+fn summarize_pools(cfg: &Config) -> Vec<PoolSummary> {
+    cfg.pools
+        .iter()
+        .enumerate()
+        .map(|(index, p)| {
+            let identified = super::catalog::identify_pair(cfg.chain_id, &p.collateral, &p.debt);
+            PoolSummary {
+                index,
+                pair: identified
+                    .map(|c| c.display_name.to_string())
+                    .unwrap_or_else(|| {
+                        format!("{} / {}", short_addr(&p.collateral), short_addr(&p.debt))
+                    }),
+                corridor_id: identified.map(|c| c.id.to_string()),
+                corridor_label: identified
+                    .map(|c| format!("{} — {}", c.display_name, c.network_label)),
+                collateral: p.collateral.clone(),
+                debt: p.debt.clone(),
+            }
+        })
+        .collect()
+}
+
+fn short_addr(addr: &str) -> String {
+    // Character indices, not bytes: `Config::from_toml` accepts a custom
+    // token string that is not an ASCII address, and Settings still has to
+    // render a label instead of panicking mid-codepoint.
+    let chars: Vec<char> = addr.chars().collect();
+    if chars.len() > 10 {
+        format!(
+            "{}…{}",
+            chars[..6].iter().collect::<String>(),
+            chars[chars.len() - 4..].iter().collect::<String>()
+        )
+    } else {
+        addr.to_string()
+    }
 }
 
 /// Write the feed URL where the bot will actually read it for *this* pool, and
@@ -1694,5 +1891,124 @@ mod tests {
         let back = read_settings(&out).unwrap();
         assert_eq!(back.buy.value, "11");
         assert_eq!(back.twap_window_secs, "120");
+    }
+
+    const CELO: &str = include_str!("templates/cngn-usdt-celo.toml");
+    const WBRL: &str = include_str!("templates/wbrl-usdt-celo.toml");
+
+    #[test]
+    fn adding_wbrl_to_a_celo_bot_stamps_its_own_feed() {
+        let out = add_pool_from_template(CELO, WBRL).unwrap();
+        let cfg = Config::from_toml(&out).unwrap();
+        assert_eq!(cfg.pools.len(), 2);
+        assert_eq!(cfg.chain_id, 42220);
+        assert!(
+            cfg.pools[1]
+                .feed_url
+                .as_deref()
+                .is_some_and(|u| u.contains("wbrl-usdt")),
+            "the new pool must not inherit the bot-level cNGN feed: {out}"
+        );
+        assert!(
+            !cfg.pools[0]
+                .feed_url
+                .as_deref()
+                .is_some_and(|u| u.contains("wbrl")),
+            "the first pool must keep pricing cNGN: {out}"
+        );
+        let view = read_settings_at(&out, 1).unwrap();
+        assert_eq!(view.pool_count, 2);
+        assert_eq!(view.pools[1].corridor_id.as_deref(), Some("wbrl-usdt-celo"));
+        assert_eq!(view.pools[0].corridor_id.as_deref(), Some("cngn-usdt-celo"));
+    }
+
+    #[test]
+    fn adding_a_corridor_on_another_chain_is_refused() {
+        let err = add_pool_from_template(TEMPLATE, WBRL).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("chain"), "{msg}");
+        assert!(msg.contains("56"), "{msg}");
+        assert!(msg.contains("42220"), "{msg}");
+    }
+
+    #[test]
+    fn adding_a_pair_the_bot_already_quotes_is_refused() {
+        let err = add_pool_from_template(CELO, CELO).unwrap_err();
+        assert!(err.to_string().contains("already quotes"));
+    }
+
+    /// `[feed].staleness_secs` is bot-wide, so a corridor whose feed is sampled
+    /// less often than that window would be written and never quote. Adding it
+    /// has to fail loudly instead.
+    #[test]
+    fn adding_a_corridor_wider_than_the_bots_staleness_window_is_refused() {
+        // A custom Celo bot on a 30s window. cNGN's sampler asks for 240s.
+        let tight = WBRL.replace("staleness_secs = 900", "staleness_secs = 30");
+        assert!(tight.contains("staleness_secs = 30"), "fixture");
+
+        let err = add_pool_from_template(&tight, CELO).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("240s"), "{msg}");
+        assert!(msg.contains("30s"), "{msg}");
+        assert!(msg.contains("staleness_secs"), "{msg}");
+
+        // The same bot on the shipped 900s window takes it.
+        assert!(add_pool_from_template(WBRL, CELO).is_ok());
+    }
+
+    #[test]
+    fn adding_the_same_pair_in_reverse_token_order_is_refused() {
+        let swapped = CELO
+            .replace(
+                "collateral = \"0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f\"",
+                "collateral = \"0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e\"",
+            )
+            .replace(
+                "debt = \"0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e\"",
+                "debt = \"0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f\"",
+            );
+        let err = add_pool_from_template(&swapped, CELO).unwrap_err();
+        assert!(err.to_string().contains("already quotes"), "{}", err);
+    }
+
+    #[test]
+    fn removing_the_last_pool_is_refused() {
+        let err = remove_pool(CELO, 0).unwrap_err();
+        assert!(err.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn custom_token_labels_do_not_panic_on_multibyte_strings() {
+        assert_eq!(short_addr("0x1234"), "0x1234");
+        assert_eq!(
+            short_addr("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"),
+            "0x4806…3D5e"
+        );
+        let weird = "トークンアドレスが十文字を超える値です";
+        let labelled = short_addr(weird);
+        assert!(labelled.contains('…'), "{labelled}");
+        assert!(labelled.starts_with("トークン"), "{labelled}");
+
+        let custom = TEMPLATE.replace("0xa8AEA66B361a8d53e8865c62D142167Af28Af058", weird);
+        let view = read_settings(&custom).unwrap();
+        assert!(
+            view.pools[0].pair.contains('…'),
+            "unidentified custom tokens must still render a shortened label: {}",
+            view.pools[0].pair
+        );
+    }
+
+    #[test]
+    fn remove_drops_the_chosen_pool() {
+        let two = add_pool_from_template(CELO, WBRL).unwrap();
+        let after = remove_pool(&two, 1).unwrap();
+        let cfg = Config::from_toml(&after).unwrap();
+        assert_eq!(cfg.pools.len(), 1);
+        assert_eq!(
+            read_settings(&after).unwrap().pools[0]
+                .corridor_id
+                .as_deref(),
+            Some("cngn-usdt-celo")
+        );
     }
 }

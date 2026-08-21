@@ -681,6 +681,54 @@ none of the above. Separate processes earn their keep when you want independent
 risk limits, separate restarts, separate feeds, or a staged rollout of a new
 pair.
 
+In the Stitch panel, open the bot → Settings → Corridors → **Add corridor…**.
+The picker only offers live catalog pairs on this bot's chain. It copies that
+corridor's `[[pools]]` block and stamps `feed_url` on it so the new pair does
+not inherit the bot-level `[feed]` (which still prices the first corridor).
+A running bot restarts. Add pulls the current stitch image and refuses if this
+bot is still on an older digest (use **Update**) — a restart keeps the old
+binary, which still reserves RFQ per corridor and can double-sign a shared
+token. Approve Permit2 on the new tokens, and enroll the maker key on that
+corridor or RFQ will ignore it.
+
+By hand, leave `[rfq]`, `chain_id`, `rpc_url`, and `reactor` alone and append
+a second block. This is a Celo cNGN bot picking up wBRL:
+
+```toml
+[[pools]]
+collateral = "0xD76f5Faf6888e24D9F04Bf92a0c8B921FE4390e0"  # wBRL, 18dp
+collateral_decimals = 18
+debt = "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"        # USDT on Celo, 6dp
+debt_decimals = 6
+feed_url = "https://api.textilecredit.com/price?chainId=42220&pair=wbrl-usdt"
+
+buy_offset_bps = 1
+buy_total_liquidity_debt = "max"
+buy_min_slice_debt = "10000000"
+buy_max_orders = 40
+sell_offset_bps = 1
+sell_total_liquidity_collateral = "max"
+sell_min_slice_debt = "10000000"
+sell_max_orders = 40
+ttl_secs = 120
+refresh_threshold_bps = 10
+```
+
+The Raw config tab enforces the same image check as **Add corridor…**: a save
+that grows the pool list is refused unless the panel can prove this bot's
+container is on the current stitch image. That is the same restart-keeps-the-old
+-binary problem, so the by-hand path does not get to skip it.
+
+Check `[feed].staleness_secs` before you add a pair whose feed is sampled rather
+than fetched live. That window is bot-wide — the ladder tick applies it to every
+pool, and the RFQ window is the tighter of it and the pool's own
+`rfq_staleness_secs`. A bot on 30 seconds cannot host cNGN, which publishes
+every four minutes: the pair would sit dark between marks. **Add corridor…**
+refuses that combination rather than writing a pool that never quotes.
+
+Do not start a second process on the same wallet for this. The venue can host
+two maker sessions; the chain cannot host two broadcasters on one nonce.
+
 ### Safe Restart Checklist
 
 Before restarting live:

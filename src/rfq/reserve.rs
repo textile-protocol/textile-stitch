@@ -38,6 +38,9 @@ struct Reservation {
     input: U256,
     /// Unix seconds after which the reservation no longer counts.
     release_at: u64,
+    /// Maker-pays token, lowercased. `None` on ledgers written before we
+    /// stored it — those still count via corridor + side.
+    input_token: Option<String>,
 }
 
 /// On-disk shape. `input` is a decimal string so a U256 never goes through JSON
@@ -55,6 +58,9 @@ struct StoredEntry {
     bid: bool,
     input: String,
     release_at: u64,
+    /// Absent on v1 files written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_token: Option<String>,
 }
 
 /// The reservation ledger. Owned by the responder task; no interior locking.
@@ -111,6 +117,7 @@ impl Reservations {
                         bid: entry.bid,
                         input,
                         release_at: entry.release_at,
+                        input_token: normalize_token_opt(entry.input_token),
                     },
                 );
             }
@@ -131,6 +138,20 @@ impl Reservations {
         input: U256,
         deadline_secs: u64,
     ) {
+        self.reserve_paying(rfq_id, corridor, bid, input, deadline_secs, None::<String>);
+    }
+
+    /// Same as [`Self::reserve`], tagging the claim with the token the maker
+    /// pays so a later pool removal cannot drop it from that token's total.
+    pub fn reserve_paying(
+        &mut self,
+        rfq_id: impl Into<String>,
+        corridor: impl Into<String>,
+        bid: bool,
+        input: U256,
+        deadline_secs: u64,
+        input_token: Option<impl AsRef<str>>,
+    ) {
         self.by_rfq.insert(
             rfq_id.into(),
             Reservation {
@@ -138,6 +159,7 @@ impl Reservations {
                 bid,
                 input,
                 release_at: deadline_secs.saturating_add(RELEASE_SKEW_SECS),
+                input_token: normalize_token_opt(input_token.map(|t| t.as_ref().to_string())),
             },
         );
         self.persist();
@@ -150,6 +172,191 @@ impl Reservations {
             .values()
             .filter(|r| r.corridor == corridor && r.bid == bid && r.release_at > now_secs)
             .fold(U256::ZERO, |sum, r| sum.saturating_add(r.input))
+    }
+
+    /// Sum of [`Self::reserved`] across every named corridor on one side.
+    ///
+    /// Two pools that pay the same token (Celo cNGN and wBRL both bid USDT)
+    /// share one wallet claim. Dedupes slugs so two unbound books with an
+    /// empty label cannot count the same entries twice.
+    pub fn reserved_across<'a, I>(&self, corridors: I, bid: bool, now_secs: u64) -> U256
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut seen = std::collections::HashSet::new();
+        corridors.into_iter().fold(U256::ZERO, |sum, corridor| {
+            if !seen.insert(corridor) {
+                return sum;
+            }
+            sum.saturating_add(self.reserved(corridor, bid, now_secs))
+        })
+    }
+
+    /// Fill `input_token` on tokenless entries for `corridor`. Bids get
+    /// `bid_token`, asks get `ask_token`. No-op on already-tagged rows.
+    /// Persists when anything changed.
+    pub fn tag_corridor_tokens(
+        &mut self,
+        corridor: &str,
+        bid_token: Option<&str>,
+        ask_token: Option<&str>,
+    ) -> usize {
+        let n = self.tag_corridor_tokens_mem(corridor, bid_token, ask_token);
+        if n > 0 {
+            self.persist();
+        }
+        n
+    }
+
+    /// Stamp every live book so an upgrade that still has the quoted pool
+    /// writes the token before anyone can remove it.
+    pub fn tag_books<'a, I>(&mut self, books: I) -> usize
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    {
+        let mut n = 0;
+        for (slug, bid_token, ask_token) in books {
+            if slug.is_empty() {
+                continue;
+            }
+            n += self.tag_corridor_tokens_mem(slug, Some(bid_token), Some(ask_token));
+        }
+        if n > 0 {
+            self.persist();
+        }
+        n
+    }
+
+    /// Stamp tokenless claims we can attribute to a pool about to disappear.
+    ///
+    /// `known_slugs` are labels that belong to that pool (`rfq_corridor`,
+    /// catalog id). Venue-assigned slugs that match neither are left alone —
+    /// guessing the owner can stamp a kept pool's ask with the removed
+    /// pool's collateral. Session start (`tag_books`) covers those while
+    /// the book is still live.
+    ///
+    /// The write is fallible here, unlike [`Self::persist`] elsewhere. The
+    /// caller decides whether the pool may go by counting what is left
+    /// tokenless *in memory*, so a swallowed write error would let it act on a
+    /// stamp the restarted bot never reads — the untagged claim would come
+    /// back and go missing from the corridors that remain.
+    pub fn tag_for_removed_pool(
+        &mut self,
+        known_slugs: &[&str],
+        bid_token: &str,
+        ask_token: &str,
+    ) -> anyhow::Result<usize> {
+        let mut n = 0;
+        for slug in known_slugs {
+            let slug = slug.trim();
+            if slug.is_empty() {
+                continue;
+            }
+            n += self.tag_corridor_tokens_mem(slug, Some(bid_token), Some(ask_token));
+        }
+        if n > 0 {
+            if let Some(path) = &self.persist_path {
+                self.write(path)
+                    .with_context(|| format!("writing {}", path.display()))?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Live rows that still have no `input_token`. Those disappear from a
+    /// shared-token total once their corridor slug is gone, so a remove must
+    /// not proceed while any remain.
+    pub fn live_tokenless_count(&self, now_secs: u64) -> usize {
+        self.by_rfq
+            .values()
+            .filter(|r| r.release_at > now_secs && r.input_token.is_none())
+            .count()
+    }
+
+    fn tag_corridor_tokens_mem(
+        &mut self,
+        corridor: &str,
+        bid_token: Option<&str>,
+        ask_token: Option<&str>,
+    ) -> usize {
+        let mut n = 0;
+        for r in self.by_rfq.values_mut() {
+            if r.input_token.is_some() || r.corridor != corridor {
+                continue;
+            }
+            let raw = if r.bid { bid_token } else { ask_token };
+            let Some(token) = normalize_token_opt(raw.map(str::to_string)) else {
+                continue;
+            };
+            r.input_token = Some(token);
+            n += 1;
+        }
+        n
+    }
+
+    /// Live claim on `token` — every tagged reservation paying it, plus
+    /// untagged (pre-token) entries on `fallback_slugs` for this side.
+    ///
+    /// Tagged entries stay in the total after their corridor is removed from
+    /// the live books. Untagged entries still need a matching slug — call
+    /// [`Self::tag_for_removed_pool`] or [`Self::tag_books`] before that slug
+    /// can disappear.
+    pub fn reserved_paying<'a, I>(
+        &self,
+        token: &str,
+        fallback_slugs: I,
+        bid: bool,
+        now_secs: u64,
+    ) -> U256
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let token = normalize_token(token);
+        if token.is_empty() {
+            return self.reserved_across(fallback_slugs, bid, now_secs);
+        }
+        let fallback: std::collections::HashSet<&str> = fallback_slugs.into_iter().collect();
+        self.by_rfq.values().fold(U256::ZERO, |sum, r| {
+            if r.release_at <= now_secs {
+                return sum;
+            }
+            if let Some(t) = &r.input_token {
+                if t == &token {
+                    return sum.saturating_add(r.input);
+                }
+                return sum;
+            }
+            if r.bid == bid && fallback.contains(r.corridor.as_str()) {
+                return sum.saturating_add(r.input);
+            }
+            sum
+        })
+    }
+
+    /// Whether any live untagged claim belongs to no book we can see.
+    ///
+    /// [`Self::reserved_paying`] counts an untagged row only against a slug it
+    /// was handed, so these are dropped from every total. They are real signed
+    /// quotes, and nothing about them says which token they spend: the row's
+    /// side names a leg of a book we can't identify, and the amount is
+    /// denominated in that book's token, whose decimals we don't know either.
+    /// So there is no amount to add — summing one token's units into another's
+    /// balance would under-count as easily as over-count.
+    ///
+    /// A caller that can't account for a claim must not size against the
+    /// balance it may have spent. The window is narrow by construction —
+    /// untagged rows only exist until a session start tags them or they
+    /// expire — and it closes on its own.
+    pub fn has_unattributable_claim<'a, I>(&self, known_slugs: I, now_secs: u64) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let known: std::collections::HashSet<&str> = known_slugs.into_iter().collect();
+        self.by_rfq.values().any(|r| {
+            r.release_at > now_secs
+                && r.input_token.is_none()
+                && !known.contains(r.corridor.as_str())
+        })
     }
 
     /// Corridor slug for a live reservation, if any. Peek before
@@ -205,6 +412,7 @@ impl Reservations {
                     bid: r.bid,
                     input: r.input.to_string(),
                     release_at: r.release_at,
+                    input_token: r.input_token.clone(),
                 })
                 .collect(),
         };
@@ -218,6 +426,14 @@ impl Reservations {
     pub fn is_empty(&self) -> bool {
         self.by_rfq.is_empty()
     }
+}
+
+fn normalize_token(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn normalize_token_opt(raw: Option<String>) -> Option<String> {
+    raw.map(|s| normalize_token(&s)).filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -270,6 +486,43 @@ mod tests {
         assert_eq!(r.reserved("cngn-usdc", false, 0), U256::from(7u64));
         assert_eq!(r.reserved("kes-usdt", true, 0), U256::from(9u64));
         assert_eq!(r.reserved("kes-usdt", false, 0), U256::ZERO);
+        assert_eq!(
+            r.reserved_across(["cngn-usdc", "kes-usdt"], true, 0),
+            U256::from(134u64)
+        );
+        assert_eq!(
+            r.reserved_across(["cngn-usdc", "cngn-usdc"], true, 0),
+            U256::from(125u64),
+            "a repeated slug must not double-count"
+        );
+    }
+
+    #[test]
+    fn a_tagged_claim_survives_after_its_corridor_is_gone() {
+        let mut r = Reservations::new();
+        r.reserve_paying(
+            "rfq_cngn",
+            "cngn-usdt-celo",
+            true,
+            U256::from(400u64),
+            1_000,
+            Some("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"),
+        );
+        assert_eq!(
+            r.reserved_paying(
+                "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+                ["wbrl-usdt-celo"],
+                true,
+                0
+            ),
+            U256::from(400u64),
+            "USDT claims stay after cNGN is dropped from the live books"
+        );
+        assert_eq!(
+            r.reserved_across(["wbrl-usdt-celo"], true, 0),
+            U256::ZERO,
+            "slug-only totals must not invent a wBRL claim"
+        );
     }
 
     #[test]
@@ -355,6 +608,209 @@ mod tests {
             restored.reserved("cngn-usdc", false, 10 + RELEASE_SKEW_SECS),
             U256::ZERO,
             "expired entries must not come back after restart"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn tag_for_removed_pool_stamps_a_tokenless_claim() {
+        let mut r = Reservations::new();
+        r.reserve(
+            "rfq_cngn",
+            "cngn-usdt-celo",
+            true,
+            U256::from(400u64),
+            1_000,
+        );
+        assert_eq!(
+            r.tag_for_removed_pool(
+                &["cngn-usdt-celo"],
+                "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+                "0x00000000000000000000000000000000000000c1",
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            r.reserved_paying(
+                "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+                ["wbrl-usdt-celo"],
+                true,
+                0
+            ),
+            U256::from(400u64),
+            "the leftover cNGN bid must still count against USDT after the slug is gone"
+        );
+    }
+
+    #[test]
+    fn live_tokenless_count_ignores_tagged_and_expired_rows() {
+        let mut r = Reservations::new();
+        r.reserve("rfq_live", "venue-cngn", true, U256::from(10u64), 1_000);
+        r.reserve("rfq_dead", "venue-old", true, U256::from(10u64), 1);
+        r.reserve_paying(
+            "rfq_tagged",
+            "cngn-usdt-celo",
+            true,
+            U256::from(10u64),
+            1_000,
+            Some("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"),
+        );
+        assert_eq!(r.live_tokenless_count(10 + RELEASE_SKEW_SECS), 1);
+        r.tag_for_removed_pool(
+            &["venue-cngn"],
+            "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+            "0x00000000000000000000000000000000000000c1",
+        )
+        .unwrap();
+        assert_eq!(r.live_tokenless_count(10 + RELEASE_SKEW_SECS), 0);
+    }
+
+    /// The caller gates the removal on the in-memory count, so a write that
+    /// didn't land has to be an error — otherwise the pool goes and the restart
+    /// reloads the untagged claim.
+    #[test]
+    fn tag_for_removed_pool_reports_a_failed_write() {
+        let dir = std::env::temp_dir().join(format!("stitch-tag-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RESERVATIONS_FILE);
+        let mut r = Reservations::with_persist_path(&path);
+        r.reserve(
+            "rfq_cngn",
+            "cngn-usdt-celo",
+            true,
+            U256::from(400u64),
+            1_000,
+        );
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        let original = perms.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let out = r.tag_for_removed_pool(
+            &["cngn-usdt-celo"],
+            "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+            "0x00000000000000000000000000000000000000c1",
+        );
+        std::fs::set_permissions(&dir, original).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(out.is_err(), "a failed write must not report success");
+    }
+
+    /// A claim signed under a corridor nothing names is still live, and its
+    /// side says nothing about which of *our* tokens it spent — the side names
+    /// a leg of a book we can't identify. So it is a flag, not an amount.
+    #[test]
+    fn an_unattributable_claim_is_flagged_whatever_its_side() {
+        let mut r = Reservations::new();
+        r.reserve(
+            "rfq_gone",
+            "venue-dropped",
+            false,
+            U256::from(400u64),
+            1_000,
+        );
+        let now = 10 + RELEASE_SKEW_SECS;
+
+        assert!(r.has_unattributable_claim(["cngn-usdt-celo"], now));
+        // An ask-side orphan still counts: a remaining pool sizing its bid may
+        // be sizing the very token that ask paid.
+        assert!(r.has_unattributable_claim(["cngn-usdt-celo"], now));
+        // Known book: `reserved_paying` can place it, so it is not orphaned.
+        assert!(!r.has_unattributable_claim(["venue-dropped"], now));
+        // Expired rows are nobody's problem.
+        assert!(!r.has_unattributable_claim(["other"], 2_000));
+
+        // A tagged row is attributable by definition, even on an unknown slug.
+        let mut tagged = Reservations::new();
+        tagged.reserve_paying(
+            "rfq_tagged",
+            "venue-dropped-too",
+            true,
+            U256::from(9u64),
+            1_000,
+            Some("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"),
+        );
+        assert!(!tagged.has_unattributable_claim(["cngn-usdt-celo"], now));
+    }
+
+    #[test]
+    fn tag_for_removed_pool_does_not_guess_a_venue_slug() {
+        let mut r = Reservations::new();
+        r.reserve("rfq_kept", "venue-wbrl", false, U256::from(50u64), 1_000);
+        assert_eq!(
+            r.tag_for_removed_pool(
+                &["cngn-usdt-celo"],
+                "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+                "0x00000000000000000000000000000000000000c1",
+            )
+            .unwrap(),
+            0,
+            "a kept pool's venue slug must not inherit the removed pool's tokens"
+        );
+        assert_eq!(
+            r.reserved_paying(
+                "0x00000000000000000000000000000000000000c1",
+                std::iter::empty(),
+                false,
+                0
+            ),
+            U256::ZERO,
+            "the unidentified ask must not be stamped as the removed collateral"
+        );
+    }
+
+    #[test]
+    fn tag_books_backfills_a_tokenless_file() {
+        let path = tmp_path("tag-books");
+        let mut live = Reservations::with_persist_path(&path);
+        live.reserve(
+            "rfq_cngn",
+            "cngn-usdt-celo",
+            true,
+            U256::from(400u64),
+            1_000,
+        );
+        live.tag_books([(
+            "cngn-usdt-celo",
+            "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+            "0x00000000000000000000000000000000000000c1",
+        )]);
+        let restored = Reservations::load(&path, 0).unwrap();
+        assert_eq!(
+            restored.reserved_paying(
+                "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+                std::iter::empty(),
+                true,
+                0
+            ),
+            U256::from(400u64)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_token_tag_survives_a_restart() {
+        let path = tmp_path("token");
+        let mut live = Reservations::with_persist_path(&path);
+        live.reserve_paying(
+            "rfq_cngn",
+            "cngn-usdt-celo",
+            true,
+            U256::from(400u64),
+            1_000,
+            Some("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"),
+        );
+        let restored = Reservations::load(&path, 0).unwrap();
+        assert_eq!(
+            restored.reserved_paying(
+                "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+                std::iter::empty(),
+                true,
+                0
+            ),
+            U256::from(400u64)
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

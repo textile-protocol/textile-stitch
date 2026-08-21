@@ -91,6 +91,16 @@ export interface Pair {
   debtDecimals: number
 }
 
+export interface PoolSummary {
+  index: number
+  pair: string
+  corridorId: string | null
+  corridorLabel: string | null
+  /** Sent back on removal: the index alone is not a stable name for a pool. */
+  collateral: string
+  debt: string
+}
+
 export interface Settings {
   rpcUrl: string
   feedUrl: string
@@ -99,6 +109,7 @@ export interface Settings {
   takerEnabled: boolean
   poolIndex: number
   poolCount: number
+  pools: PoolSummary[]
   pair: Pair
   buySizing: Sizing
   sellSizing: Sizing

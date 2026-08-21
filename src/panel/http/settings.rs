@@ -24,8 +24,9 @@ use serde::{Deserialize, Serialize};
 use super::logs::{self, WalletClaim};
 use super::{require_editable, ApiError, AppState};
 use crate::config::Config;
-use crate::panel::docker::STOP_GRACE_SECS;
+use crate::panel::docker::{ContainerState, STOP_GRACE_SECS};
 use crate::panel::inventory::{Bot, WalletId};
+use crate::panel::naming::{LABEL_RFQ_RESERVATIONS, RFQ_RESERVATIONS_TOKEN};
 use crate::setup::{
     self, PoolPair, SettingsPatch, SettingsView, SideSizing, SpreadEdit, SpreadKind,
 };
@@ -123,6 +124,30 @@ impl From<&PoolPair> for PairBody {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PoolSummaryBody {
+    pub index: usize,
+    pub pair: String,
+    pub corridor_id: Option<String>,
+    pub corridor_label: Option<String>,
+    pub collateral: String,
+    pub debt: String,
+}
+
+impl From<&setup::PoolSummary> for PoolSummaryBody {
+    fn from(p: &setup::PoolSummary) -> Self {
+        Self {
+            index: p.index,
+            pair: p.pair.clone(),
+            corridor_id: p.corridor_id.clone(),
+            corridor_label: p.corridor_label.clone(),
+            collateral: p.collateral.clone(),
+            debt: p.debt.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingsBody {
     pub rpc_url: String,
     pub feed_url: String,
@@ -131,6 +156,7 @@ pub struct SettingsBody {
     pub taker_enabled: bool,
     pub pool_index: usize,
     pub pool_count: usize,
+    pub pools: Vec<PoolSummaryBody>,
     pub pair: PairBody,
     pub buy_sizing: SizingBody,
     pub sell_sizing: SizingBody,
@@ -180,6 +206,7 @@ impl SettingsBody {
             taker_enabled: v.taker_enabled,
             pool_index: v.pool_index,
             pool_count: v.pool_count,
+            pools: v.pools.iter().map(PoolSummaryBody::from).collect(),
             pair: PairBody::from(&v.pair),
             buy_sizing: SizingBody::from(&v.buy_sizing),
             sell_sizing: SizingBody::from(&v.sell_sizing),
@@ -612,6 +639,394 @@ pub async fn update(
     save_and_restart(&state, &bot, &path, &edited, pool, None).await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddPoolBody {
+    pub corridor_id: String,
+}
+
+/// Append a same-chain catalog corridor as another `[[pools]]` entry. Restarts
+/// a running bot so it quotes the new pair; a stopped bot stays stopped.
+pub async fn add_pool(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    Json(body): Json<AddPoolBody>,
+) -> Result<Response, ApiError> {
+    let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
+    let path = config_path(&bot)?;
+    let current_toml = read_toml(&path)?;
+
+    let corridor = setup::find_corridor(&body.corridor_id).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "there is no corridor called \"{}\". Ask /api/corridors for the list.",
+            body.corridor_id
+        ))
+    })?;
+    if corridor.pending_deploy {
+        return Err(ApiError::bad_request(format!(
+            "the {} corridor on {} isn't deployed yet, so a bot can't quote it.",
+            corridor.display_name, corridor.network_label
+        )));
+    }
+    if corridor.chain_id == 0 {
+        return Err(ApiError::bad_request(
+            "that corridor has no chain id — 0 is not a network".to_string(),
+        ));
+    }
+
+    let edited = setup::add_pool_from_template(&current_toml, corridor.toml_template)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    require_token_aware_image(&state, &bot).await?;
+    let new_index = Config::from_toml(&edited)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+        .pools
+        .len()
+        .saturating_sub(1);
+    let note = format!(
+        "Added {} on {}. Approve Permit2 on the new tokens. RFQ only answers corridors this maker \
+         key is enrolled on.",
+        corridor.display_name, corridor.network_label
+    );
+    save_and_restart(
+        &state,
+        &bot,
+        &path,
+        &edited,
+        new_index,
+        Some(serde_json::json!({ "note": note })),
+    )
+    .await
+}
+
+/// The pairs a config quotes, in order, for comparing one config against
+/// another. Lowercased so a re-typed address doesn't read as a different pool.
+fn pool_pairs(cfg: Config) -> Vec<(String, String)> {
+    cfg.pools
+        .iter()
+        .map(|p| (p.collateral.to_lowercase(), p.debt.to_lowercase()))
+        .collect()
+}
+
+/// Refuse a change to a bot's pool list unless the image it would run declares
+/// that it reserves RFQ capacity per wallet token.
+///
+/// Both directions need this, for the same reason: add and remove only
+/// **restart** the container, so the binary that comes back is the one that was
+/// already there. An older responder reserves per corridor slug and ignores the
+/// `input_token` field, which is wrong in both directions — a new pool on a
+/// shared token (USDT) lets it sign the full wallet balance once per corridor,
+/// and a removed pool's live claims stay invisible to the corridors that
+/// remain, however carefully the panel stamped them on the way out. Recreate is
+/// the path that swaps the image, and it drops the in-container slot-nonce
+/// ledger, so we never do it as a side effect here: the operator goes through
+/// Update.
+///
+/// The question is what the binary *can do*, so ask the image, not the tag.
+/// Comparing the container against `STITCH_PANEL_BOT_IMAGE` only proves it runs
+/// what was configured, and production pins that to a `sha-*` tag which can be
+/// older than the panel by design — an equal digest there would wave through
+/// exactly the responder this refuses.
+async fn require_token_aware_image(state: &AppState, bot: &Bot) -> Result<(), ApiError> {
+    // The process runtime runs one binary — this panel's — so there is no
+    // image to interrogate, and no older binary to come back.
+    if state.cfg.runtime != crate::panel::PanelRuntime::Docker {
+        return Ok(());
+    }
+    // A restart keeps the container's own image. With no container, Start
+    // creates one from the configured image, so that is the binary at stake —
+    // pull it if it isn't here yet, or its labels can't be read at all.
+    let image = match bot.image_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => match bot.image.as_deref().filter(|s| !s.is_empty()) {
+            Some(image) => image.to_string(),
+            None => {
+                state
+                    .docker
+                    .ensure_image(&state.cfg.bot_image, false)
+                    .await
+                    .map_err(|e| {
+                        ApiError::conflict(format!(
+                            "couldn't fetch {} to check what it supports ({e:#}). Try again when \
+                             the registry is reachable.",
+                            state.cfg.bot_image
+                        ))
+                    })?;
+                state.cfg.bot_image.clone()
+            }
+        },
+    };
+    let labels = state
+        .docker
+        .local_image_labels(&image)
+        .await
+        .map_err(|e| ApiError::conflict(format!("couldn't inspect {image} ({e:#})")))?;
+    if labels.get(LABEL_RFQ_RESERVATIONS).map(String::as_str) == Some(RFQ_RESERVATIONS_TOKEN) {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "{} runs a stitch image that doesn't declare per-token RFQ reservations, so it may track \
+         them per corridor and sign against inventory another corridor already committed. Use \
+         Update on this bot first — a restart keeps the image it has.",
+        bot.name
+    )))
+}
+
+/// Which pool the caller believes it is deleting.
+///
+/// An index is not a stable name: removing a pool renumbers the rest, so two
+/// clients that both confirmed "remove pool 0" against a three-pool config
+/// would, serialized behind the config lock, delete the original 0 and 1. The
+/// tokens come from the `pools` list the client rendered, and a mismatch means
+/// that list is stale.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovePoolQuery {
+    pub collateral: String,
+    pub debt: String,
+}
+
+/// Drop one `[[pools]]` entry. A bot must keep at least one.
+pub async fn remove_pool(
+    State(state): State<AppState>,
+    UrlPath((name, index)): UrlPath<(String, usize)>,
+    Query(expected): Query<RemovePoolQuery>,
+) -> Result<Response, ApiError> {
+    let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
+    let path = config_path(&bot)?;
+    let current_toml = read_toml(&path)?;
+    let current = Config::from_toml(&current_toml).map_err(ApiError::bad_request)?;
+    let removed = current.pools.get(index).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "config has {} pools, so there is no pool {index}",
+            current.pools.len()
+        ))
+    })?;
+    let labelled = setup::identify_pair(current.chain_id, &removed.collateral, &removed.debt)
+        .map(|c| c.display_name.to_string())
+        .unwrap_or_else(|| format!("pool {index}"));
+
+    // The index is resolved under the config lock, but it was chosen against
+    // whatever list the client last read. An earlier removal renumbers the
+    // rest, so confirm this is still the pool they meant.
+    if !removed
+        .collateral
+        .eq_ignore_ascii_case(expected.collateral.trim())
+        || !removed.debt.eq_ignore_ascii_case(expected.debt.trim())
+    {
+        return Err(ApiError::conflict(format!(
+            "pool {index} is {labelled} now, not the pair you asked to remove — {}'s corridors \
+             changed since this page loaded. Nothing was removed; reload and try again.",
+            bot.name
+        )));
+    }
+
+    // Edit the TOML before touching the container. `remove_pool` is what
+    // enforces "a bot keeps at least one pool", and stopping first would leave
+    // the bot down on a request that removes nothing. Same for the image
+    // check — refuse before the stop, not after it.
+    let edited = setup::remove_pool(&current_toml, index)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    require_token_aware_image(&state, &bot).await?;
+
+    // The running process has its own in-memory ledger and will persist it.
+    // Tagging on disk while it is alive can be overwritten by a quote/prune
+    // before the later restart. Stop first, tag, write, then start back.
+    //
+    // A paused bot is refused instead: its claims are still in memory, a paused
+    // process can't act on SIGTERM so the stop degenerates into a kill after
+    // the grace period, and unpausing would write the pre-tag ledger back over
+    // the stamp anyway. The layout migration refuses a paused container for the
+    // same reason.
+    if matches!(bot.state, ContainerState::Paused) {
+        return Err(ApiError::conflict(format!(
+            "{} is paused, so its RFQ claims are still in memory and it can't be shut down \
+             gracefully. Stop it before removing a corridor — nothing was removed.",
+            bot.name
+        )));
+    }
+    let container = bot.container_name.clone();
+    // Every state we stop here wants to be up, so "we stopped it" always
+    // implies "start it back" — on the happy path and on the rollback.
+    let must_quiesce = bot.state.wants_to_be_up();
+    let _wallet = if must_quiesce {
+        match state.wallet_locks.try_claim_for(&bot) {
+            Some(held) => held,
+            None => {
+                return Err(ApiError::conflict(format!(
+                    "{}'s operator wallet is busy — an approval or launch is running against it. \
+                     Nothing was removed; wait for that to finish and try again.",
+                    bot.name
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    if must_quiesce {
+        let name = container
+            .as_deref()
+            .ok_or_else(|| ApiError::conflict(format!("{} has no container to stop", bot.name)))?;
+        state
+            .docker
+            .stop(name, STOP_GRACE_SECS)
+            .await
+            .map_err(|e| {
+                ApiError::conflict(format!(
+                    "couldn't stop {} before tagging RFQ reservations: {e:#}",
+                    bot.name
+                ))
+            })?;
+    }
+
+    // From here on the bot may be stopped, so every failure has to put it back
+    // before it answers — otherwise a request that changed nothing leaves the
+    // bot down.
+    let stopped = must_quiesce.then_some(container.as_deref()).flatten();
+    if let Err(e) = tag_reservations_before_pool_removal(&path, &current, index) {
+        return Err(start_back_after_failure(&state, &bot, stopped, e).await);
+    }
+
+    let next_index = index.saturating_sub(1).min(
+        Config::from_toml(&edited)
+            .map(|c| c.pools.len().saturating_sub(1))
+            .unwrap_or(0),
+    );
+    if let Err(e) = setup::write_toml_atomic(&path, &edited) {
+        return Err(start_back_after_failure(&state, &bot, stopped, format!("{e:#}")).await);
+    }
+
+    let mut restarted = false;
+    let mut restart_error = None;
+    if must_quiesce {
+        if let Some(name) = container.as_deref() {
+            match state.docker.start(name).await {
+                Ok(()) => restarted = true,
+                Err(e) => restart_error = Some(format!("{e:#}")),
+            }
+        }
+    }
+
+    let fresh = read_toml(&path)?;
+    let view = setup::read_settings_at(&fresh, next_index).map_err(ApiError::bad_request)?;
+    let (rfq_panel, rfq_default) = rfq_surface(&fresh, &state.cfg.bots_dir);
+    let message = match &restart_error {
+        Some(e) => format!(
+            "Removed {labelled}. The config was saved, but starting {} failed: {e}. Start it \
+             yourself to apply the change.",
+            bot.name
+        ),
+        None if restarted => format!("Removed {labelled}. Saved and restarted {}.", bot.name),
+        None => format!("Removed {labelled}."),
+    };
+    Ok(Json(serde_json::json!({
+        "settings": SettingsBody::from_view(
+            &view,
+            true,
+            rfq_key_is_set(&path),
+            rfq_panel,
+            rfq_default,
+        ),
+        "restarted": restarted,
+        "restartError": restart_error,
+        "message": message,
+    }))
+    .into_response())
+}
+
+/// Report a failed removal, having first put a bot we stopped back up.
+///
+/// Removal quiesces the bot before it touches the reservation ledger, so a
+/// failure after that point owns the container's state: nothing was removed,
+/// and leaving it stopped would turn a rejected request into an outage. Pass
+/// `stopped: None` when nothing was stopped.
+async fn start_back_after_failure(
+    state: &AppState,
+    bot: &Bot,
+    stopped: Option<&str>,
+    problem: String,
+) -> ApiError {
+    if let Some(name) = stopped {
+        if let Err(start_err) = state.docker.start(name).await {
+            return ApiError::conflict(format!(
+                "{problem} Also failed to start {} again ({start_err:#}).",
+                bot.name
+            ));
+        }
+    }
+    ApiError::conflict(problem)
+}
+
+/// Stamp tokenless RFQ claims we can attribute to the pool about to disappear.
+///
+/// Unmatched live tokenless rows (upgrade-era venue slugs, stopped bot that
+/// never ran `tag_books`) stay invisible to the remaining pools after the
+/// slug is gone. Refuse rather than guess.
+fn tag_reservations_before_pool_removal(
+    toml_path: &std::path::Path,
+    cfg: &Config,
+    index: usize,
+) -> Result<(), String> {
+    let Some(removed) = cfg.pools.get(index) else {
+        return Ok(());
+    };
+    let Some(dir) = toml_path.parent() else {
+        return Ok(());
+    };
+    let path = dir.join(crate::rfq::reserve::RESERVATIONS_FILE);
+    if !path.exists() {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut ledger = crate::rfq::reserve::Reservations::load(&path, now).map_err(|e| {
+        format!(
+            "couldn't read RFQ reservations ({e:#}). Not removing a corridor while claims may \
+             still be live."
+        )
+    })?;
+    let known = pool_reservation_slugs(cfg.chain_id, removed);
+    let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
+    ledger
+        .tag_for_removed_pool(&known_refs, &removed.debt, &removed.collateral)
+        .map_err(|e| {
+            format!(
+                "couldn't write the tagged RFQ reservations ({e:#}). Not removing a corridor while \
+                 the claims on disk are still untagged — a restart would reload them without a \
+                 token and hide them from the remaining pools."
+            )
+        })?;
+    if ledger.live_tokenless_count(now) > 0 {
+        return Err(
+            "this bot has RFQ reservations from before token-wide accounting whose corridor we \
+             cannot attribute. Start it once on the current image so those claims get tagged, or \
+             wait until they expire — removing a corridor now can hide them from the remaining \
+             pools."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn pool_reservation_slugs(chain_id: u64, pool: &crate::config::PoolConfig) -> Vec<String> {
+    let mut slugs = Vec::new();
+    if let Some(slug) = pool
+        .rfq_corridor
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        slugs.push(slug.to_string());
+    }
+    if let Some(corridor) = setup::identify_pair(chain_id, &pool.collateral, &pool.debt) {
+        if !slugs.iter().any(|s| s == corridor.id) {
+            slugs.push(corridor.id.to_string());
+        }
+    }
+    slugs
+}
+
 /// The raw config, for the fields the form doesn't cover.
 pub async fn raw(
     State(state): State<AppState>,
@@ -660,7 +1075,7 @@ pub async fn save_raw(
     let path = config_path(&bot)?;
     // The same parse the bot does at startup. Rejecting here is the whole point of
     // the escape hatch being server-validated rather than a blind file write.
-    Config::from_toml(&body.toml).map_err(|e| {
+    let incoming = Config::from_toml(&body.toml).map_err(|e| {
         ApiError::bad_request(format!(
             "that config isn't valid, and the bot would fail to start on it: {e:#}"
         ))
@@ -683,6 +1098,16 @@ pub async fn save_raw(
              live in the TOML. Use Change signer instead — it takes the credentials, writes them, \
              and rebuilds the container with the matching runtime."
         )));
+    }
+
+    // The raw editor is the documented by-hand path for editing `[[pools]]`, so
+    // any change to the pool list carries the same image gate as Add and
+    // Remove. Not just growth: dropping or swapping a pair leaves its live
+    // claims behind under a slug that no longer names a book, and only a binary
+    // that accounts per token counts those against the pools that remain.
+    let pools_before = Config::from_toml(&current).map(pool_pairs).ok();
+    if pools_before.as_deref() != Some(&pool_pairs(incoming)) {
+        require_token_aware_image(&state, &bot).await?;
     }
 
     save_and_restart(&state, &bot, &path, &body.toml, 0, None).await
@@ -887,8 +1312,23 @@ pub(super) async fn save_and_restart(
         body.as_object_mut(),
         extra.as_ref().and_then(|v| v.as_object()),
     ) {
+        let note = add.get("note").and_then(|v| v.as_str()).map(str::to_string);
         for (k, v) in add {
+            if k == "note" {
+                continue;
+            }
             obj.insert(k.clone(), v.clone());
+        }
+        if let Some(note) = note.filter(|n| !n.is_empty()) {
+            let current = obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            obj.insert(
+                "message".to_string(),
+                serde_json::Value::String(format!("{current} {note}")),
+            );
         }
     }
 
@@ -1186,12 +1626,45 @@ mod tests {
     }
 
     fn seed_in_state(h: &Harness, name: &str, state: ContainerState) {
-        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        seed_corridor_in_state(h, name, "cngn-usdt-bsc", state);
+    }
+
+    /// Delete a pool the way the UI does: naming the pair it means, read from
+    /// the `pools` list the client rendered. The index alone is not a stable
+    /// name for a pool.
+    async fn delete_pool(h: &Harness, bot: &str, index: usize) -> (StatusCode, String) {
+        let (_, body) = h.get(&format!("/api/bots/{bot}/settings")).await;
+        let v = Harness::parse(&body);
+        let pool = v["pools"]
+            .as_array()
+            .and_then(|pools| pools.iter().find(|p| p["index"] == index))
+            .unwrap_or_else(|| panic!("bot has no pool {index}: {body}"))
+            .clone();
+        h.delete(&format!(
+            "/api/bots/{bot}/pools/{index}?collateral={}&debt={}",
+            pool["collateral"].as_str().unwrap(),
+            pool["debt"].as_str().unwrap(),
+        ))
+        .await
+    }
+
+    fn seed_corridor_in_state(h: &Harness, name: &str, corridor_id: &str, state: ContainerState) {
+        let corridor = setup::find_corridor(corridor_id).unwrap();
         setup::write_config(h.root.join(name), corridor, TEST_KEY).unwrap();
         let mut c = container(&format!("stitch-{name}"), state);
+        // Panel-created bots launch from STITCH_PANEL_BOT_IMAGE. The generic
+        // fixture defaults to `:latest`; the harness uses `:test`.
+        c.image = h.state.cfg.bot_image.clone();
         c.labels.insert(LABEL_BOT.to_string(), name.to_string());
         c.mounts = dir_layout_mounts(&h.root.join(name).display().to_string());
         h.docker.add_container(c);
+        // Current images declare per-token RFQ reservations; the pool-list gate
+        // refuses one that doesn't. Tests for that clear this again.
+        h.docker.set_image_label(
+            &format!("sha256:id-stitch-{name}"),
+            crate::panel::naming::LABEL_RFQ_RESERVATIONS,
+            crate::panel::naming::RFQ_RESERVATIONS_TOKEN,
+        );
     }
 
     /// A running bot whose taker leg is on, so its own process broadcasts from the
@@ -1217,6 +1690,8 @@ mod tests {
         assert!(v["ttlSecs"].as_u64().unwrap() > 0);
         // Present even when the operator hasn't touched it — templates set it.
         assert!(v["refreshThresholdBps"].as_u64().is_some());
+        assert_eq!(v["pools"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(v["pools"][0]["corridorId"], "cngn-usdt-bsc");
     }
 
     #[tokio::test]
@@ -2406,6 +2881,88 @@ mod tests {
         assert_eq!(v["restarted"], true);
     }
 
+    /// The by-hand path documented in ADVANCED.md goes through the raw editor,
+    /// so it has to hit the same image gate as Add — a restart keeps the old
+    /// per-corridor binary either way.
+    #[tokio::test]
+    async fn the_raw_editor_is_refused_when_a_second_pool_lands_on_a_stale_image() {
+        let h = harness("raw-add-pool-stale");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        let path = h.root.join("bot-a/stitch.toml");
+        let one_pool = std::fs::read_to_string(&path).unwrap();
+        let two_pools = setup::add_pool_from_template(
+            &one_pool,
+            setup::find_corridor("wbrl-usdt-celo")
+                .unwrap()
+                .toml_template,
+        )
+        .unwrap();
+        h.docker.clear_image_labels("sha256:id-stitch-bot-a");
+
+        let (status, body) = h
+            .put_json("/api/bots/bot-a/config", json!({ "toml": two_pools }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Update"), "{body}");
+        assert_eq!(
+            one_pool,
+            std::fs::read_to_string(&path).unwrap(),
+            "a refused raw save must not write the second pool"
+        );
+    }
+
+    /// Dropping a pool by hand leaves its live claims under a slug that no
+    /// longer names a book, and only a token-aware binary counts those against
+    /// the pools that remain. So a raw removal is gated too, not just growth.
+    #[tokio::test]
+    async fn the_raw_editor_is_refused_when_a_pool_is_dropped_on_a_stale_image() {
+        let h = harness("raw-drop-pool-stale");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        let path = h.root.join("bot-a/stitch.toml");
+        let one_pool = std::fs::read_to_string(&path).unwrap();
+        let two_pools = setup::add_pool_from_template(
+            &one_pool,
+            setup::find_corridor("wbrl-usdt-celo")
+                .unwrap()
+                .toml_template,
+        )
+        .unwrap();
+        std::fs::write(&path, &two_pools).unwrap();
+        h.docker.clear_image_labels("sha256:id-stitch-bot-a");
+
+        // Back to one pool, by hand.
+        let (status, body) = h
+            .put_json("/api/bots/bot-a/config", json!({ "toml": one_pool }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Update"), "{body}");
+        assert_eq!(
+            two_pools,
+            std::fs::read_to_string(&path).unwrap(),
+            "a refused raw save must not drop the pool"
+        );
+    }
+
+    /// Same raw save, current image: allowed. The gate keys on the pool list
+    /// changing, so an ordinary raw edit must not start demanding a pull.
+    #[tokio::test]
+    async fn the_raw_editor_still_edits_one_pool_without_an_image_check() {
+        let h = harness("raw-edit-no-gate");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        let path = h.root.join("bot-a/stitch.toml");
+        // Old binary, but the pool list isn't changing, so the gate is not this
+        // save's business.
+        h.docker.clear_image_labels("sha256:id-stitch-bot-a");
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("tick_interval_secs = 5", "tick_interval_secs = 45");
+
+        let (status, body) = h
+            .put_json("/api/bots/bot-a/config", json!({ "toml": edited }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     #[tokio::test]
     async fn a_bot_whose_config_is_outside_the_root_cannot_be_edited() {
         let h = harness("settings-foreign");
@@ -2425,5 +2982,563 @@ mod tests {
         let (status, body) = h.get("/api/bots/bot-a/settings?pool=9").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("pool"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn adding_a_same_chain_pool_rewrites_toml_and_restarts() {
+        let h = harness("settings-add-pool");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["poolCount"], 2);
+        assert_eq!(v["settings"]["poolIndex"], 1);
+        assert_eq!(v["settings"]["pools"][1]["corridorId"], "wbrl-usdt-celo");
+        assert_eq!(v["restarted"], true);
+        assert!(v["message"].as_str().unwrap().contains("wBRL"), "{body}");
+        assert!(v["message"].as_str().unwrap().contains("Permit2"), "{body}");
+
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        let cfg = crate::config::Config::from_toml(&toml).unwrap();
+        assert_eq!(cfg.pools.len(), 2);
+        assert!(
+            cfg.pools[1]
+                .feed_url
+                .as_deref()
+                .is_some_and(|u| u.contains("wbrl-usdt")),
+            "new pool must stamp its own feed: {toml}"
+        );
+        assert!(
+            h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_pool_is_refused_when_the_image_does_not_declare_per_token_reservations() {
+        let h = harness("settings-add-pool-old-binary");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        h.docker.clear_image_labels("sha256:id-stitch-bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Update"), "{body}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap(),
+            "a refused add must not write the second pool"
+        );
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "must not restart the old image: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    /// The flip side of the pin: a container on an image that is nothing like
+    /// the configured one is fine as long as it declares the feature. A
+    /// locally built or side-loaded current binary is not a reason to refuse.
+    #[tokio::test]
+    async fn adding_a_pool_is_allowed_on_an_unrecognised_image_that_declares_the_feature() {
+        let h = harness("settings-add-pool-local-build");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        h.docker
+            .set_container_image("stitch-bot-a", "stitch:my-local-build");
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(
+            crate::config::Config::from_toml(&toml).unwrap().pools.len(),
+            2
+        );
+    }
+
+    /// Production pins `STITCH_PANEL_BOT_IMAGE` to a `sha-*` tag, so the
+    /// container can match the configured image exactly and still be an old
+    /// per-corridor binary. Identity is not capability.
+    #[tokio::test]
+    async fn adding_a_pool_is_refused_on_a_pinned_pre_feature_image() {
+        let h = harness("settings-add-pool-old-pin");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        // Exactly what the panel is configured to run, and locally identical.
+        h.docker
+            .set_container_image("stitch-bot-a", h.state.cfg.bot_image.as_str());
+        h.docker.clear_image_labels("sha256:id-stitch-bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Update"), "{body}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap()
+        );
+    }
+
+    /// A bot with no container would be created from the configured image, so
+    /// that is the binary at stake. Its labels can only be read once it is on
+    /// the host, and an unreachable registry is not permission to guess.
+    #[tokio::test]
+    async fn adding_a_pool_to_a_containerless_bot_is_refused_when_the_image_cannot_be_fetched() {
+        let h = harness("settings-add-pool-no-registry");
+        let corridor = setup::find_corridor("cngn-usdt-celo").unwrap();
+        setup::write_config(h.root.join("bot-a"), corridor, TEST_KEY).unwrap();
+        h.docker.fail_image("registry unreachable");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("registry"), "{body}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_pool_on_process_runtime_ignores_a_stale_container_tag() {
+        let h = super::super::testkit::harness_process("settings-add-pool-process");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        h.docker.set_container_image(
+            "stitch-bot-a",
+            "ghcr.io/textile-protocol/textile-stitch:old",
+        );
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(
+            crate::config::Config::from_toml(&toml).unwrap().pools.len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_pool_on_another_chain_is_refused() {
+        let h = harness("settings-add-pool-chain");
+        seed(&h, "bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("chain"), "{body}");
+        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn adding_a_duplicate_pair_is_refused() {
+        let h = harness("settings-add-pool-dup");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "cngn-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("already quotes"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn adding_the_same_pair_reversed_is_refused() {
+        let h = harness("settings-add-pool-reversed");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Exited);
+        let path = h.root.join("bot-a/stitch.toml");
+        let toml = std::fs::read_to_string(&path).unwrap();
+        let swapped = toml
+            .replace(
+                "collateral = \"0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f\"",
+                "collateral = \"0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e\"",
+            )
+            .replace(
+                "debt = \"0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e\"",
+                "debt = \"0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f\"",
+            );
+        std::fs::write(&path, swapped).unwrap();
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "cngn-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("already quotes"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn removing_the_last_pool_is_refused() {
+        let h = harness("settings-remove-last-pool");
+        seed(&h, "bot-a");
+        let (status, body) = delete_pool(&h, "bot-a", 0).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("at least one"), "{body}");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Stop { .. })),
+            "a refused remove must not stop a running bot: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    /// Remove restarts the same binary too, and an old responder ignores the
+    /// `input_token` stamp the panel just wrote — so the removed pool's live
+    /// claims would vanish from the corridors that remain.
+    #[tokio::test]
+    async fn removing_a_pool_is_refused_on_a_stale_bot_image() {
+        let h = harness("settings-remove-pool-stale-image");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        h.docker.clear_image_labels("sha256:id-stitch-bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = delete_pool(&h, "bot-a", 1).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Update"), "{body}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap()
+        );
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Stop { .. })),
+            "the image check must refuse before the stop: {:?}",
+            h.docker.calls()
+        );
+    }
+
+    /// The bot is already stopped by the time the config write runs, so a write
+    /// failure owns putting it back — nothing was removed.
+    #[tokio::test]
+    async fn a_failed_write_starts_the_bot_back_up() {
+        let h = harness("settings-remove-pool-write-fails");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Make the atomic write fail: `write_toml_atomic` writes a temp file
+        // beside the config, so a read-only config dir stops it.
+        let dir = h.root.join("bot-a");
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        let original = perms.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let (status, body) = delete_pool(&h, "bot-a", 1).await;
+        std::fs::set_permissions(&dir, original).unwrap();
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let calls = h.docker.calls();
+        let stop = calls
+            .iter()
+            .position(|c| matches!(c, Call::Stop { name, .. } if name == "stitch-bot-a"));
+        let start = calls
+            .iter()
+            .position(|c| matches!(c, Call::Start(name) if name == "stitch-bot-a"));
+        assert!(stop.is_some(), "it stopped the bot: {calls:?}");
+        assert!(
+            start.is_some_and(|s| s > stop.unwrap()),
+            "a failed write must start it back: {calls:?}"
+        );
+        assert_eq!(
+            crate::config::Config::from_toml(
+                &std::fs::read_to_string(dir.join("stitch.toml")).unwrap()
+            )
+            .unwrap()
+            .pools
+            .len(),
+            2,
+            "nothing was removed"
+        );
+    }
+
+    /// Two clients that both confirmed "remove pool 0" against a three-pool
+    /// list must not remove two different pools. The second request's index has
+    /// been renumbered under it by the first.
+    #[tokio::test]
+    async fn removing_a_pool_by_a_renumbered_index_is_refused() {
+        let h = harness("settings-remove-pool-renumbered");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Exited);
+        for corridor in ["wbrl-usdt-celo", "wars-usdt-celo"] {
+            let (status, body) = h
+                .post_json("/api/bots/bot-a/pools", json!({ "corridorId": corridor }))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let path = h.root.join("bot-a/stitch.toml");
+        let three = crate::config::Config::from_toml(&std::fs::read_to_string(&path).unwrap())
+            .unwrap()
+            .pools
+            .clone();
+        assert_eq!(three.len(), 3);
+
+        // Both clients loaded the same list and picked pool 0. The first wins.
+        let (status, body) = delete_pool(&h, "bot-a", 0).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // The second replays its request: index 0, naming the pair it saw.
+        let (status, body) = h
+            .delete(&format!(
+                "/api/bots/bot-a/pools/0?collateral={}&debt={}",
+                three[0].collateral, three[0].debt
+            ))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("reload"), "{body}");
+        let left = crate::config::Config::from_toml(&std::fs::read_to_string(&path).unwrap())
+            .unwrap()
+            .pools
+            .clone();
+        assert_eq!(left.len(), 2, "only the first removal may land");
+        assert!(
+            left.iter().any(|p| p.collateral == three[1].collateral),
+            "the pool that was renumbered to 0 must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_pool_from_a_paused_bot_is_refused() {
+        let h = harness("settings-remove-pool-paused");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Paused);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = delete_pool(&h, "bot-a", 1).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("paused"), "{body}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap(),
+            "a paused bot's config must not change"
+        );
+        let calls = h.docker.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::Stop { .. })),
+            "a paused container must not be stopped: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::Start(_))),
+            "and must never be started: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_pool_rewrites_toml() {
+        let h = harness("settings-remove-pool");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Exited);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = delete_pool(&h, "bot-a", 1).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["settings"]["poolCount"], 1);
+        assert_eq!(v["settings"]["pools"][0]["corridorId"], "cngn-usdt-celo");
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert_eq!(
+            crate::config::Config::from_toml(&toml).unwrap().pools.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_pool_stops_a_running_bot_before_tagging() {
+        let h = harness("settings-remove-pool-stop");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Running);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        h.docker
+            .set_container_image("stitch-bot-a", h.state.cfg.bot_image.as_str());
+
+        let path = h
+            .root
+            .join("bot-a")
+            .join(crate::rfq::reserve::RESERVATIONS_FILE);
+        let mut ledger = crate::rfq::reserve::Reservations::with_persist_path(&path);
+        ledger.reserve(
+            "rfq_cngn",
+            "cngn-usdt-celo",
+            true,
+            alloy_primitives::U256::from(400u64),
+            4_000_000_000,
+        );
+
+        let (status, body) = delete_pool(&h, "bot-a", 0).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let calls = h.docker.calls();
+        let stop = calls
+            .iter()
+            .position(|c| matches!(c, Call::Stop { name, .. } if name == "stitch-bot-a"));
+        let start = calls
+            .iter()
+            .position(|c| matches!(c, Call::Start(name) if name == "stitch-bot-a"));
+        assert!(stop.is_some(), "must stop before tagging: {calls:?}");
+        assert!(start.is_some(), "must start after the write: {calls:?}");
+        assert!(
+            stop.unwrap() < start.unwrap(),
+            "stop must precede start: {calls:?}"
+        );
+        let restored = crate::rfq::reserve::Reservations::load(&path, 0).unwrap();
+        assert_eq!(
+            restored.reserved_paying(
+                "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+                ["wbrl-usdt-celo"],
+                true,
+                0
+            ),
+            alloy_primitives::U256::from(400u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_pool_is_refused_when_a_tokenless_venue_slug_is_unmatched() {
+        let h = harness("settings-remove-pool-unmatched");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Exited);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let path = h
+            .root
+            .join("bot-a")
+            .join(crate::rfq::reserve::RESERVATIONS_FILE);
+        let mut ledger = crate::rfq::reserve::Reservations::with_persist_path(&path);
+        ledger.reserve(
+            "rfq_venue",
+            "venue-cngn-unknown",
+            true,
+            alloy_primitives::U256::from(400u64),
+            4_000_000_000,
+        );
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = delete_pool(&h, "bot-a", 0).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("tagged"), "{body}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap(),
+            "an unmatched live claim must block the remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_pool_tags_tokenless_reservations() {
+        let h = harness("settings-remove-pool-tag");
+        seed_corridor_in_state(&h, "bot-a", "cngn-usdt-celo", ContainerState::Exited);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let path = h
+            .root
+            .join("bot-a")
+            .join(crate::rfq::reserve::RESERVATIONS_FILE);
+        let mut ledger = crate::rfq::reserve::Reservations::with_persist_path(&path);
+        ledger.reserve(
+            "rfq_cngn",
+            "cngn-usdt-celo",
+            true,
+            alloy_primitives::U256::from(400u64),
+            4_000_000_000,
+        );
+
+        let (status, body) = delete_pool(&h, "bot-a", 0).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let restored = crate::rfq::reserve::Reservations::load(&path, 0).unwrap();
+        assert_eq!(
+            restored.reserved_paying(
+                "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+                ["wbrl-usdt-celo"],
+                true,
+                0
+            ),
+            alloy_primitives::U256::from(400u64),
+            "removing cNGN must stamp the leftover USDT claim so wBRL still sees it"
+        );
     }
 }

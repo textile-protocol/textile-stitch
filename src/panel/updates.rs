@@ -212,13 +212,20 @@ pub fn is_behind(local_digests: &[String], remote_digest: &str) -> bool {
     if local_digests.is_empty() || remote_digest.is_empty() {
         return false;
     }
-    let remote = remote_digest.trim();
-    let remote_norm = remote.strip_prefix("sha256:").unwrap_or(remote);
-    !local_digests.iter().any(|d| {
-        let suffix = d.rsplit_once('@').map(|(_, dig)| dig).unwrap_or(d.as_str());
-        let suffix = suffix.strip_prefix("sha256:").unwrap_or(suffix);
-        suffix == remote_norm
-    })
+    let remote_norm = digest_suffix(remote_digest.trim());
+    !local_digests
+        .iter()
+        .any(|d| digest_suffix(d) == remote_norm)
+}
+
+/// The bare `sha256` hex of a digest, whether it arrives as `repo@sha256:…`,
+/// `sha256:…`, or already bare.
+fn digest_suffix(digest: &str) -> &str {
+    let after_at = digest
+        .rsplit_once('@')
+        .map(|(_, dig)| dig)
+        .unwrap_or(digest);
+    after_at.strip_prefix("sha256:").unwrap_or(after_at)
 }
 
 /// Find the panel's own container among the host list.

@@ -25,9 +25,9 @@ pub use paths::{
 };
 pub use process::{find_stitch_binary, terminate};
 pub use settings::{
-    apply_rfq_default_preset, apply_settings, read_settings, read_settings_at, read_signer,
-    rfq_connect_patch, try_read_signer, PoolPair, SettingsPatch, SettingsView, SideSizing,
-    SignerView, SpreadEdit, SpreadKind,
+    add_pool_from_template, apply_rfq_default_preset, apply_settings, read_settings,
+    read_settings_at, read_signer, remove_pool, rfq_connect_patch, try_read_signer, PoolPair,
+    PoolSummary, SettingsPatch, SettingsView, SideSizing, SignerView, SpreadEdit, SpreadKind,
 };
 pub use writer::{
     apply_signer, read_rfq_api_key, render_env, rfq_api_key_is_set, signer_files,

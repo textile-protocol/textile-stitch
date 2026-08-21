@@ -30,7 +30,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 
@@ -285,6 +285,11 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/config", put(settings::save_raw))
         .route("/api/bots/{name}/signer", put(bots::change_signer))
         .route("/api/bots/{name}/corridor", post(bots::switch_corridor))
+        .route("/api/bots/{name}/pools", post(settings::add_pool))
+        .route(
+            "/api/bots/{name}/pools/{index}",
+            delete(settings::remove_pool),
+        )
         .route("/api/bots/{name}/logs", get(logs::tail))
         .route("/api/bots/{name}/approve", post(logs::approve))
         .route("/api/bots/{name}/dry-run", post(logs::dry_run))
@@ -481,6 +486,17 @@ pub(crate) mod testkit {
 
         pub async fn put_json(&self, path: &str, body: serde_json::Value) -> (StatusCode, String) {
             self.json("PUT", path, body).await
+        }
+
+        pub async fn delete(&self, path: &str) -> (StatusCode, String) {
+            self.send(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
         }
 
         async fn json(

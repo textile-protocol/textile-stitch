@@ -906,6 +906,7 @@ async fn session_loop_inner(
 
     let mut engine = Engine {
         books,
+        configured: rt.books.clone(),
         reservations,
         inventory: inventory.clone(),
         counter: 0,
@@ -915,6 +916,10 @@ async fn session_loop_inner(
         validation_contract: rt.validation_contract,
         signer: rt.signer.clone(),
     };
+    // Upgrade path: a ledger written before `input_token` existed loads as
+    // tokenless. Stamp every bound book now, while the quoted pool is still
+    // here, so a later remove cannot drop that claim from the shared total.
+    engine.tag_loaded_books();
 
     // Venue liveness: it pings on heartbeat_interval; nothing at all for the
     // whole timeout means the link is dead even if TCP hasn't noticed.
@@ -1059,6 +1064,13 @@ async fn session_loop_inner(
 /// outlive sockets. Everything price-shaped delegates to [`responder`].
 struct Engine {
     books: Vec<CorridorBook>,
+    /// Every pool as configured, including the ones the venue did not assign.
+    ///
+    /// `books` only holds what is quotable this session. A pool the venue
+    /// dropped still owns any live claim signed under it, so its slug has to
+    /// stay visible to tagging and to shared-token accounting — otherwise that
+    /// claim goes missing from the corridors that are still quoting.
+    configured: Vec<CorridorBook>,
     reservations: Reservations,
     inventory: InventoryCache,
     counter: u64,
@@ -1070,6 +1082,71 @@ struct Engine {
 }
 
 impl Engine {
+    /// Write `input_token` onto tokenless rows that match any book we know.
+    ///
+    /// Both lists, because they name a pool differently: `books` carries the
+    /// venue-assigned slug a quote was signed under, `configured` the
+    /// `rfq_corridor` label from the config. A pool the venue no longer assigns
+    /// is missing from `books` entirely, and its label is the only handle left
+    /// on a claim it still owns.
+    fn tag_loaded_books(&mut self) {
+        let tags: Vec<(String, String, String)> = self
+            .books
+            .iter()
+            .chain(&self.configured)
+            .filter(|b| !b.slug.is_empty())
+            .map(|b| {
+                (
+                    b.slug.clone(),
+                    format!("{:#x}", b.debt),
+                    format!("{:#x}", b.collateral),
+                )
+            })
+            .collect();
+        self.reservations.tag_books(
+            tags.iter()
+                .map(|(slug, debt, collat)| (slug.as_str(), debt.as_str(), collat.as_str())),
+        );
+    }
+
+    /// Every slug that names a pool we can attribute a claim to.
+    fn known_slugs(&self) -> impl Iterator<Item = &str> {
+        self.books
+            .iter()
+            .chain(&self.configured)
+            .map(|b| b.slug.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// In-flight claim on the token this side pays. Tagged reservations
+    /// count even after their pool is removed; untagged (pre-token) ones
+    /// still need a live book whose slug shares this token.
+    fn reserved_on(&self, book: &CorridorBook, bid: bool, now_secs: u64) -> U256 {
+        let token = if bid { book.debt } else { book.collateral };
+        let slugs = self
+            .books
+            .iter()
+            .chain(&self.configured)
+            .filter_map(|other| {
+                let other_token = if bid { other.debt } else { other.collateral };
+                (other_token == token).then_some(other.slug.as_str())
+            });
+        // A claim we can't pin to any book may have spent this token, and its
+        // amount is in units we can't convert — the row's side names a leg of a
+        // book we can't identify. Saturating takes every book dark until it is
+        // tagged or expires, which is the only honest answer:
+        // `available_capacity` subtracts this from the funded balance, so MAX
+        // leaves nothing to publish and nothing to sign.
+        if self
+            .reservations
+            .has_unattributable_claim(self.known_slugs(), now_secs)
+        {
+            return U256::MAX;
+        }
+        self.reservations
+            .reserved_paying(&format!("{token:#x}"), slugs, bid, now_secs)
+    }
+
     /// Levels for every corridor with a fresh feed. A stale/missing feed
     /// publishes nothing — the venue's >5 s gap rule takes the corridor dark,
     /// which is exactly the stale-feed behavior we want.
@@ -1090,6 +1167,8 @@ impl Engine {
                     quote.price,
                     self.reservations.reserved(&book.slug, true, now_secs),
                     self.reservations.reserved(&book.slug, false, now_secs),
+                    self.reserved_on(book, true, now_secs),
+                    self.reserved_on(book, false, now_secs),
                     format_iso_ms(now_ms),
                     &inventory,
                 )))
@@ -1223,6 +1302,8 @@ impl Engine {
             quote.price,
             self.reservations.reserved(&book.slug, true, now_secs),
             self.reservations.reserved(&book.slug, false, now_secs),
+            self.reserved_on(&book, true, now_secs),
+            self.reserved_on(&book, false, now_secs),
             &self.inventory.view(now_secs),
         ) {
             Ok(plan) => plan,
@@ -1255,12 +1336,13 @@ impl Engine {
 
         // The reservation starts the moment the signed order exists — even if
         // the send fails, the signature may have left the process.
-        self.reservations.reserve(
+        self.reservations.reserve_paying(
             req.rfq_id.clone(),
             book.slug.clone(),
             plan.bid,
             plan.input,
             deadline_secs,
+            Some(format!("{:#x}", plan.input_token)),
         );
 
         MakerFrame::QuoteResponse(QuoteResponseFrame {
@@ -1603,6 +1685,7 @@ mod tests {
                 feed_url: "http://feed".into(),
                 staleness_secs: 240,
             }],
+            configured: Vec::new(),
             reservations: Reservations::new(),
             inventory: {
                 let cache = InventoryCache::default();
@@ -1628,6 +1711,136 @@ mod tests {
                 .unwrap(),
             signer: Arc::new(LocalSigner::new(key)),
         }
+    }
+
+    #[test]
+    fn a_shared_debt_token_shares_bid_reservations_across_pools() {
+        let mut engine = test_engine();
+        let mut sibling = engine.books[0].clone();
+        sibling.slug = "wbrl-usdt-celo".into();
+        sibling.collateral = "0x0000000000000000000000000000000000000003"
+            .parse()
+            .unwrap();
+        engine.books.push(sibling);
+        engine
+            .reservations
+            .reserve("rfq_cngn", "cngn-usdc", true, U256::from(400u64), 1_000);
+
+        assert_eq!(
+            engine.reserved_on(&engine.books[0], true, 0),
+            U256::from(400u64)
+        );
+        assert_eq!(
+            engine.reserved_on(&engine.books[1], true, 0),
+            U256::from(400u64),
+            "a wBRL bid must see the live cNGN USDT claim"
+        );
+        assert_eq!(engine.reserved_on(&engine.books[0], false, 0), U256::ZERO);
+        assert_eq!(
+            engine.reserved_on(&engine.books[1], false, 0),
+            U256::ZERO,
+            "asks pay different collaterals, so they stay separate"
+        );
+    }
+
+    /// A pool the venue stopped assigning is absent from `books`, so its live
+    /// claim used to be invisible to both tagging and the shared-token total.
+    /// The configured list keeps its slug in view.
+    #[test]
+    fn a_configured_but_unassigned_pool_still_owns_its_claim() {
+        let mut engine = test_engine();
+        // Same USDT debt, so a bid on it competes for the same balance.
+        let mut unassigned = engine.books[0].clone();
+        unassigned.slug = "cngn-usdt-celo".into();
+        unassigned.collateral = "0x0000000000000000000000000000000000000003"
+            .parse()
+            .unwrap();
+        engine.configured.push(unassigned);
+        engine.reservations.reserve(
+            "rfq_dropped",
+            "cngn-usdt-celo",
+            true,
+            U256::from(400u64),
+            1_000,
+        );
+
+        assert_eq!(
+            engine.reserved_on(&engine.books[0], true, 0),
+            U256::from(400u64),
+            "the quoting book must see the unassigned pool's live claim"
+        );
+
+        // And session start can stamp it, since the label is still known.
+        engine.tag_loaded_books();
+        assert_eq!(engine.reservations.live_tokenless_count(0), 0);
+    }
+
+    /// Nothing names the corridor a claim was signed under — not a live book,
+    /// not the config. It spent *something*, so nothing may be sized against a
+    /// balance it might have spent.
+    #[test]
+    fn an_unattributable_claim_takes_every_book_dark() {
+        let mut engine = test_engine();
+        engine.reservations.reserve(
+            "rfq_orphan",
+            "venue-slug-nobody-configured",
+            true,
+            U256::from(400u64),
+            1_000,
+        );
+
+        // Nothing says which of our tokens it spent, or in what units, so both
+        // sides saturate and the book goes dark until it expires.
+        assert_eq!(engine.reserved_on(&engine.books[0], true, 0), U256::MAX);
+        assert_eq!(engine.reserved_on(&engine.books[0], false, 0), U256::MAX);
+    }
+
+    #[test]
+    fn a_removed_pool_still_counts_against_the_shared_token() {
+        let mut engine = test_engine();
+        let mut sibling = engine.books[0].clone();
+        sibling.slug = "wbrl-usdt-celo".into();
+        sibling.collateral = "0x0000000000000000000000000000000000000003"
+            .parse()
+            .unwrap();
+        engine.books.push(sibling);
+        engine.reservations.reserve_paying(
+            "rfq_cngn",
+            "cngn-usdc",
+            true,
+            U256::from(400u64),
+            1_000,
+            Some(DEBT),
+        );
+        engine.books.remove(0);
+
+        assert_eq!(
+            engine.reserved_on(&engine.books[0], true, 0),
+            U256::from(400u64),
+            "a leftover cNGN USDT signature must still shrink the wBRL bid"
+        );
+    }
+
+    #[test]
+    fn a_tokenless_claim_is_tagged_from_the_live_book_before_removal() {
+        let mut engine = test_engine();
+        let mut sibling = engine.books[0].clone();
+        sibling.slug = "wbrl-usdt-celo".into();
+        sibling.collateral = "0x0000000000000000000000000000000000000003"
+            .parse()
+            .unwrap();
+        engine.books.push(sibling);
+        engine
+            .reservations
+            .reserve("rfq_cngn", "cngn-usdc", true, U256::from(400u64), 1_000);
+        engine.tag_loaded_books();
+        engine.books.remove(0);
+
+        assert_eq!(
+            engine.reserved_on(&engine.books[0], true, 0),
+            U256::from(400u64),
+            "upgrade-era tokenless claims must be stamped before the pool can vanish"
+        );
     }
 
     fn fresh_prices() -> PriceCache {

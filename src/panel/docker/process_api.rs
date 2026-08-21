@@ -987,6 +987,15 @@ impl DockerApi for ProcessRuntime {
         Ok(Vec::new())
     }
 
+    async fn local_image_labels(
+        &self,
+        _image: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        // There is no image: every bot runs the binary this panel was shipped
+        // with, so callers skip this runtime rather than reading a label.
+        Ok(Default::default())
+    }
+
     async fn schedule_image_swap(
         &self,
         _name: &str,

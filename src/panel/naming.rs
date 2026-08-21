@@ -29,6 +29,24 @@ pub const LABEL_LAYOUT: &str = "com.textile.stitch.layout";
 /// the source of truth; this is a hint for listing without parsing every TOML.
 pub const LABEL_CORRIDOR: &str = "com.textile.stitch.corridor";
 
+/// Image label declaring how the bot binary accounts for RFQ reservations.
+///
+/// Set on the *image* by `packages/stitch-bot/Dockerfile`, not on containers.
+/// A bot that quotes more than one pool is only safe on a binary that reserves
+/// against the wallet token rather than the corridor slug, and the panel has no
+/// other way to ask: `STITCH_PANEL_BOT_IMAGE` is pinned to a `sha-*` tag in
+/// production, so comparing a container against it proves the bot is running
+/// what was configured, not that what was configured is new enough.
+///
+/// Presence is coextensive with the feature, because the label ships in the
+/// same commit that made reservations token-aware — an image without it predates
+/// that change.
+pub const LABEL_RFQ_RESERVATIONS: &str = "com.textile.stitch.rfq-reservations";
+
+/// The value [`LABEL_RFQ_RESERVATIONS`] carries on an image that reserves per
+/// wallet token.
+pub const RFQ_RESERVATIONS_TOKEN: &str = "token";
+
 /// Compose's own service label, present on containers `docker compose` created.
 /// The panel reads it to adopt an existing hand-written fleet.
 pub const LABEL_COMPOSE_SERVICE: &str = "com.docker.compose.service";

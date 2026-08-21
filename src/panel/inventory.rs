@@ -165,8 +165,8 @@ impl Warning {
                 )
             }
             Warning::MultiPool { pools } => format!(
-                "This config has {pools} pools. The settings form edits one pool at a time; \
-                 use the raw config editor to change the others."
+                "This bot quotes {pools} corridors on this chain. Pick which one to edit in \
+                 Settings."
             ),
             Warning::DuplicateName { containers } => format!(
                 "More than one container claims this bot name ({}). Rename or remove one \

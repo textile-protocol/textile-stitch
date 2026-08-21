@@ -370,6 +370,15 @@ pub trait DockerApi: Send + Sync {
     /// without pulling on every status poll.
     async fn local_image_digests(&self, image: &str) -> Result<Vec<String>>;
 
+    /// Labels baked into a local image, empty when it isn't on the host or
+    /// carries none.
+    ///
+    /// The bot image declares what its binary can do this way (see
+    /// [`LABEL_RFQ_RESERVATIONS`](crate::panel::naming::LABEL_RFQ_RESERVATIONS)).
+    /// Asking the image beats inferring capability from the tag it was pulled
+    /// under, which in production is a `sha-*` pin that says nothing.
+    async fn local_image_labels(&self, image: &str) -> Result<HashMap<String, String>>;
+
     /// Schedule replacing a live container with `new_image`, preserving its
     /// create config (env, binds, network mode, restart policy).
     ///

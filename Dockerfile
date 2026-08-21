@@ -18,6 +18,13 @@ RUN apt-get update \
   && mkdir -p /home/stitch/run \
   && chown -R stitch:stitch /home/stitch
 
+# Declares that this binary reserves RFQ capacity against the wallet token, not
+# the corridor slug — the panel refuses to put a second pool on a bot whose
+# image does not say so, because an older responder would sign a shared token's
+# whole balance once per corridor. Production pins STITCH_PANEL_BOT_IMAGE to a
+# `sha-*` tag, so the panel cannot infer this from the tag it was given.
+LABEL com.textile.stitch.rfq-reservations="token"
+
 COPY --from=builder /src/target/release/stitch /usr/local/bin/stitch
 COPY deploy/container-entrypoint.sh /usr/local/bin/stitch-container-entrypoint
 

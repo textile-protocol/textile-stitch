@@ -123,6 +123,11 @@ struct FakeState {
     list_calls_left: Option<usize>,
     /// Digests `local_image_digests` returns for a given image reference.
     image_digests: HashMap<String, Vec<String>>,
+    /// Applied onto `image_digests` after a successful `require_fresh_image`,
+    /// standing in for a registry pull that moved a mutable tag.
+    fresh_image_digests: HashMap<String, Vec<String>>,
+    /// Labels `local_image_labels` returns for a given image reference.
+    image_labels: HashMap<String, HashMap<String, String>>,
     /// When set, `schedule_image_swap` fails with this message.
     swap_error: Option<String>,
 }
@@ -204,6 +209,32 @@ impl FakeDocker {
             .lock()
             .unwrap()
             .image_digests
+            .insert(image.to_string(), digests);
+    }
+
+    /// A label `local_image_labels` reports for `image`.
+    pub fn set_image_label(&self, image: &str, key: &str, value: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .image_labels
+            .entry(image.to_string())
+            .or_default()
+            .insert(key.to_string(), value.to_string());
+    }
+
+    /// Drop every label on `image`, standing in for a pre-feature build.
+    pub fn clear_image_labels(&self, image: &str) {
+        self.state.lock().unwrap().image_labels.remove(image);
+    }
+
+    /// Digests a successful `require_fresh_image` writes for `image`, as if
+    /// the pull replaced a stale cached tag.
+    pub fn set_fresh_image_digests(&self, image: &str, digests: Vec<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .fresh_image_digests
             .insert(image.to_string(), digests);
     }
 
@@ -302,14 +333,31 @@ impl DockerApi for FakeDocker {
 
     async fn require_fresh_image(&self, image: &str) -> Result<()> {
         // Same failure surface as a hard pull — the fake has no local-fallback
-        // path to model separately.
-        self.ensure_image(image, true).await
+        // path to model separately. A seeded fresh digest then replaces the
+        // cached tag, the way a real pull moves `:latest`.
+        self.ensure_image(image, true).await?;
+        let mut st = self.state.lock().unwrap();
+        if let Some(d) = st.fresh_image_digests.get(image).cloned() {
+            st.image_digests.insert(image.to_string(), d);
+        }
+        Ok(())
     }
 
     async fn local_image_digests(&self, image: &str) -> Result<Vec<String>> {
         let mut st = self.state.lock().unwrap();
         st.calls.push(Call::LocalImageDigests(image.to_string()));
         Ok(st.image_digests.get(image).cloned().unwrap_or_default())
+    }
+
+    async fn local_image_labels(&self, image: &str) -> Result<HashMap<String, String>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .image_labels
+            .get(image)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn schedule_image_swap(

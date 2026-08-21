@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.216"
+version = "0.1.217"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; quotes Swap via RFQ firm quotes and optionally fills resting limit orders."
 license = "AGPL-3.0-or-later"
