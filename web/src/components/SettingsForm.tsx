@@ -986,18 +986,26 @@ function RfqCard({
           </div>
         )}
 
-        <Button
-          variant="primary"
-          busy={connecting}
-          disabled={!editable}
-          onClick={() => void connect()}
-        >
-          {connected
-            ? 'Reconnect to Textile'
-            : ga && onBook
-              ? 'Connect and switch to RFQ'
-              : 'Connect to Textile'}
-        </Button>
+        <div className="space-y-1">
+          <Button
+            variant={connected ? 'ghost' : 'primary'}
+            busy={connecting}
+            disabled={!editable}
+            onClick={() => void connect()}
+          >
+            {connected
+              ? 'Reconnect to Textile'
+              : ga && onBook
+                ? 'Connect and switch to RFQ'
+                : 'Connect to Textile'}
+          </Button>
+          {connected && (
+            <p className="text-xs text-faint">
+              Optional. Only if the session is stuck — not part of switching
+              to RFQ.
+            </p>
+          )}
+        </div>
 
         <div>
           <button
