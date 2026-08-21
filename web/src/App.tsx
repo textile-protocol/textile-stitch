@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import { Link, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { ApiError, api, setUnauthorizedHandler } from './api'
 import OverflowMenu from './components/OverflowMenu'
 import TextileIcon from './components/TextileIcon'
@@ -80,7 +80,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Fleet />} />
           <Route path="/add" element={<AddBot rfqDefault={session.rfqDefault} />} />
-          <Route path="/bots/:name" element={<BotDetail />} />
+          <Route path="/bots/:name" element={<BotDetailPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
@@ -89,6 +89,12 @@ export default function App() {
       </footer>
     </div>
   )
+}
+
+/** Fresh instance per bot so settings, tools, and banners don't leak across names. */
+function BotDetailPage() {
+  const { name } = useParams()
+  return <BotDetail key={name} />
 }
 
 function Header({

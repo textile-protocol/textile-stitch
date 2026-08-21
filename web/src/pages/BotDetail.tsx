@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { BOT_TABS, TAB_LABEL, botPath, parseBotTab, type BotTab } from '../botRoutes'
 import { ApiError, api } from '../api'
 import {
   Banner,
@@ -11,6 +12,7 @@ import {
   Tag,
   Warnings,
 } from '../components/ui'
+import BotSwitcher from '../components/BotSwitcher'
 import ComposeExportLink from '../components/ComposeExportLink'
 import LogViewer from '../components/LogViewer'
 import OneShotRunner from '../components/OneShotRunner'
@@ -23,20 +25,10 @@ import { formatTimestamp, shortAddress, shortImage } from '../format'
 import { confirmRemovePlan } from '../removeBot'
 import type { Bot, ConfigBody, MigrationResult, UpdatesStatus } from '../types'
 
-const TABS = ['settings', 'dashboard', 'config', 'logs', 'tools'] as const
-type Tab = (typeof TABS)[number]
-
-const TAB_LABEL: Record<Tab, string> = {
-  settings: 'Settings',
-  dashboard: 'Dashboard',
-  config: 'Raw config',
-  logs: 'Logs',
-  tools: 'Tools',
-}
-
 export default function BotDetail() {
   const { name = '' } = useParams()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [bot, setBot] = useState<Bot | null>(null)
   const [error, setError] = useState<string | null>(null)
   // The wizard redirects here with what it just did, so its confirmation survives
@@ -54,16 +46,32 @@ export default function BotDetail() {
   )
   const [busy, setBusy] = useState<string | null>(null)
   // After create, land on Tools so Approve allowances is the next obvious step.
-  const [tab, setTab] = useState<Tab>(() =>
-    handoff?.needsPermit2 ? 'tools' : 'settings',
-  )
+  // Tab lives in `?tab=` so switching bots from the title keeps the same section.
+  const fallbackTab: BotTab = handoff?.needsPermit2 ? 'tools' : 'settings'
+  const tab = parseBotTab(searchParams.get('tab'), fallbackTab)
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
 
-  const load = useCallback(async () => {
+  useEffect(() => {
+    const raw = searchParams.get('tab')
+    if (raw === tab) return
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.set('tab', tab)
+        return next
+      },
+      { replace: true },
+    )
+  }, [searchParams, setSearchParams, tab])
+
+  const load = useCallback(async (signal?: { cancelled: boolean }) => {
     try {
-      setBot(await api.bot(name))
+      const next = await api.bot(name)
+      if (signal?.cancelled) return
+      setBot(next)
       setError(null)
     } catch (e) {
+      if (signal?.cancelled) return
       setError(e instanceof ApiError ? e.message : String(e))
     }
   }, [name])
@@ -78,8 +86,12 @@ export default function BotDetail() {
   }, [])
 
   useEffect(() => {
-    void load()
+    const signal = { cancelled: false }
+    void load(signal)
     void loadUpdates()
+    return () => {
+      signal.cancelled = true
+    }
   }, [load, loadUpdates])
 
   const botUpdate = updates?.bots.find((b) => b.name === name)
@@ -152,7 +164,7 @@ export default function BotDetail() {
         <Link to="/" className="text-sm text-muted hover:text-ink">
           ← Fleet
         </Link>
-        <h1 className="text-xl font-bold">{bot.name}</h1>
+        <BotSwitcher name={bot.name} />
         <StatePill state={bot.state} status={bot.status} />
         {bot.config?.corridorLabel && (
           <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
@@ -213,13 +225,13 @@ export default function BotDetail() {
             </p>
             <p>
               Open{' '}
-              <button
-                type="button"
+              <Link
+                to={botPath(name, 'tools')}
+                replace
                 className="font-bold underline hover:no-underline"
-                onClick={() => setTab('tools')}
               >
                 Tools → Approve allowances
-              </button>
+              </Link>
               , then dry-run, then Start.
             </p>
           </div>
@@ -347,11 +359,12 @@ export default function BotDetail() {
           className="flex flex-nowrap gap-x-0.5 overflow-x-auto border-b border-line-soft [scrollbar-width:none] [-ms-overflow-style:none] sm:gap-x-1 [&::-webkit-scrollbar]:hidden"
           aria-label="Bot sections"
         >
-          {TABS.map((t) => (
-            <button
+          {BOT_TABS.map((t) => (
+            <Link
               key={t}
-              type="button"
-              onClick={() => setTab(t)}
+              to={botPath(name, t)}
+              replace
+              aria-current={tab === t ? 'page' : undefined}
               className={`-mb-px shrink-0 border-b-2 px-2.5 py-2 text-xs font-bold transition sm:px-3 sm:text-sm ${
                 tab === t
                   ? 'border-accent text-ink'
@@ -359,7 +372,7 @@ export default function BotDetail() {
               }`}
             >
               {TAB_LABEL[t]}
-            </button>
+            </Link>
           ))}
         </nav>
         <div

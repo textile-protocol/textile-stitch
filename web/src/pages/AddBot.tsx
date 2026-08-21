@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ApiError, api } from '../api'
+import { botPath } from '../botRoutes'
 import {
   Banner,
   Button,
@@ -174,7 +175,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
       })
       // Clear the secret from component state the moment it's no longer needed.
       setSigner(emptySigner)
-      navigate(`/bots/${encodeURIComponent(res.bot.name)}`, {
+      navigate(botPath(res.bot.name, res.needsPermit2Approval ? 'tools' : 'settings'), {
         state: {
           note: res.message,
           // From the create API — not `bot.running`. Docker can report running
