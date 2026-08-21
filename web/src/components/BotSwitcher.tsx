@@ -64,25 +64,29 @@ export default function BotSwitcher({ name }: { name: string }) {
   // No other bot to open: plain title, no button, no chevron.
   // `!bots` is for the type checker — `others.length === 0` already covers null.
   if (!bots || others.length === 0) {
-    return <h1 className="text-xl font-bold">{name}</h1>
+    return (
+      <h1 className={TITLE} title={name}>
+        {name}
+      </h1>
+    )
   }
 
   return (
-    <div className="relative min-w-0" ref={rootRef}>
-      <h1 className="min-w-0 text-xl font-bold">
+    <div className="relative min-w-0 max-w-full" ref={rootRef}>
+      <h1 className="min-w-0 max-w-full text-xl font-bold">
         <button
           ref={triggerRef}
           type="button"
           onClick={() => setOpen((v) => !v)}
-          className={`inline-flex max-w-full items-center gap-1.5 rounded-lg px-2 py-0.5 -mx-2 transition hover:bg-hover ${
+          className={`inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-lg px-2 py-0.5 -mx-2 transition hover:bg-hover ${
             open ? 'bg-hover' : ''
           }`}
           aria-label={`Switch bot, current: ${name}`}
           aria-expanded={open}
           aria-controls={panelId}
-          title="Switch bot"
+          title={name}
         >
-          <span className="truncate">{name}</span>
+          <span className={TITLE_TEXT}>{name}</span>
           <Chevron open={open} />
         </button>
       </h1>
@@ -118,6 +122,10 @@ export default function BotSwitcher({ name }: { name: string }) {
     </div>
   )
 }
+
+/** Full name when it fits; wrap on a phone; ellipsis after two lines. */
+const TITLE_TEXT = 'min-w-0 break-all [overflow-wrap:anywhere] line-clamp-2'
+const TITLE = `min-w-0 max-w-full text-xl font-bold ${TITLE_TEXT}`
 
 function Chevron({ open }: { open: boolean }) {
   return (
