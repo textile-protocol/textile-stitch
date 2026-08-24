@@ -7,10 +7,13 @@ const INITIAL_IFRAME_HEIGHT_PX = 480
 const EMBED_HEIGHT_SOURCE = 'textile-stitch-dashboard'
 const EMBED_HEIGHT_TYPE = 'embed-height'
 
-function dashboardUrl(operatorAddress: string): string {
+function dashboardUrl(operatorAddress: string, botName?: string): string {
   const url = new URL(DATAROOM_STITCH_DASHBOARD)
   url.searchParams.set('bot', operatorAddress)
   url.searchParams.set('embed', '1')
+  // Browsers often skip navigating an iframe when only the query changes.
+  // The panel bot name makes the URL unique per switch so the frame reloads.
+  if (botName) url.searchParams.set('panel', botName)
   return url.toString()
 }
 
@@ -35,10 +38,13 @@ function isEmbedHeightMessage(
  */
 export default function StitchDashboardEmbed({
   operatorAddress,
+  botName,
 }: {
   operatorAddress: string | null | undefined
+  botName?: string
 }) {
   const [heightPx, setHeightPx] = useState(INITIAL_IFRAME_HEIGHT_PX)
+  const frameKey = `${botName ?? ''}:${operatorAddress ?? ''}`
 
   useEffect(() => {
     if (!operatorAddress) return
@@ -53,7 +59,7 @@ export default function StitchDashboardEmbed({
 
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [operatorAddress])
+  }, [operatorAddress, botName])
 
   if (!operatorAddress) {
     return (
@@ -67,8 +73,9 @@ export default function StitchDashboardEmbed({
   return (
     <section className="overflow-hidden rounded-xl border border-line-soft bg-[#22242a]">
       <iframe
+        key={frameKey}
         title="Stitch dashboard"
-        src={dashboardUrl(operatorAddress)}
+        src={dashboardUrl(operatorAddress, botName)}
         className="block w-full border-0"
         style={{ height: heightPx, overflow: 'hidden' }}
       />

@@ -161,6 +161,12 @@ export default function BotDetail() {
     }
   }
 
+  // Never paint the previous bot while the URL name has moved on. The
+  // dashboard iframe in particular will keep the old document if we do.
+  if (bot && bot.name !== name) {
+    if (error) return <ErrorState error={error} onRetry={() => void load()} />
+    return <Loading what={name} />
+  }
   if (!bot && error) return <ErrorState error={error} onRetry={() => void load()} />
   if (!bot) return <Loading what={name} />
 
@@ -468,7 +474,11 @@ export default function BotDetail() {
       )}
 
       {tab === 'dashboard' && (
-        <StitchDashboardEmbed operatorAddress={bot.config?.operatorAddress} />
+        <StitchDashboardEmbed
+          key={name}
+          botName={name}
+          operatorAddress={bot.config?.operatorAddress}
+        />
       )}
     </div>
   )
