@@ -118,8 +118,6 @@ pub enum Warning {
     /// Compose also manages this container, and `docker compose up -d` can undo
     /// what the panel does.
     ComposeManaged { project: Option<String> },
-    /// The config has more than one pool; the settings form edits one at a time.
-    MultiPool { pools: usize },
     /// Two containers resolve to the same bot name, so actions would be
     /// ambiguous.
     DuplicateName { containers: Vec<String> },
@@ -164,10 +162,6 @@ impl Warning {
                      compose file from the panel to keep the two in agreement."
                 )
             }
-            Warning::MultiPool { pools } => format!(
-                "This bot quotes {pools} corridors on this chain. Pick which one to edit in \
-                 Settings."
-            ),
             Warning::DuplicateName { containers } => format!(
                 "More than one container claims this bot name ({}). Rename or remove one \
                  before using the panel's controls on it.",
@@ -186,7 +180,6 @@ impl Warning {
             Warning::ConfigInvalid { .. } => "configInvalid",
             Warning::ConfigNotMounted => "configNotMounted",
             Warning::ComposeManaged { .. } => "composeManaged",
-            Warning::MultiPool { .. } => "multiPool",
             Warning::DuplicateName { .. } => "duplicateName",
         }
     }
@@ -550,14 +543,6 @@ fn bot_from_container(c: &ContainerInfo, cfg: &PanelConfig) -> Bot {
         .as_ref()
         .and_then(|p| read_summary(p, &mut warnings));
 
-    if let Some(summary) = &config {
-        if summary.pools > 1 {
-            warnings.push(Warning::MultiPool {
-                pools: summary.pools,
-            });
-        }
-    }
-
     Bot {
         name,
         origin,
@@ -598,13 +583,6 @@ fn bot_from_config_dir(name: &str, cfg: &PanelConfig) -> Bot {
     let panel_path = cfg.bot_dir(name).join("stitch.toml");
     let mut warnings = Vec::new();
     let config = read_summary(&panel_path, &mut warnings);
-    if let Some(summary) = &config {
-        if summary.pools > 1 {
-            warnings.push(Warning::MultiPool {
-                pools: summary.pools,
-            });
-        }
-    }
     Bot {
         name: name.to_string(),
         origin: Origin::ConfigOnly,
@@ -718,6 +696,28 @@ fn read_summary(path: &Path, warnings: &mut Vec<Warning>) -> Option<ConfigSummar
     }
 }
 
+/// Fleet / detail subtitle. One pool keeps the pair name; several pools would
+/// otherwise show whichever corridor `identify_corridor` keys off first.
+fn fleet_corridor_label(
+    pools: usize,
+    corridor: Option<&setup::Corridor>,
+    chain_id: u64,
+) -> Option<String> {
+    let network = corridor.map(|c| c.network_label).or_else(|| {
+        setup::catalog()
+            .iter()
+            .find(|c| c.chain_id == chain_id)
+            .map(|c| c.network_label)
+    });
+    if pools > 1 {
+        return Some(match network {
+            Some(net) => format!("{pools} corridors on {net}"),
+            None => format!("{pools} corridors"),
+        });
+    }
+    corridor.map(|c| format!("{} on {}", c.display_name, c.network_label))
+}
+
 /// Summarise a config body. Parsing goes through the bot's own loader, so a
 /// config the panel shows as valid is one the bot can start with.
 ///
@@ -730,7 +730,7 @@ pub fn summarise(toml_str: &str, config_path: &Path) -> Result<ConfigSummary> {
     let signer = setup::read_signer(toml_str);
     Ok(ConfigSummary {
         corridor_id: corridor.map(|c| c.id.to_string()),
-        corridor_label: corridor.map(|c| format!("{} on {}", c.display_name, c.network_label)),
+        corridor_label: fleet_corridor_label(parsed.pools.len(), corridor, parsed.chain_id),
         chain_id: parsed.chain_id,
         pools: parsed.pools.len(),
         operator_address: operator_address(&signer, config_path),
@@ -1333,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_pool_config_warns_that_the_form_edits_one_pool() {
+    fn a_multi_pool_config_is_labeled_as_several_corridors() {
         let (cfg, root) = test_cfg("multipool");
         let dir = root.join("bot-multi");
         let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
@@ -1351,11 +1351,13 @@ mod tests {
 
         let fleet = discover(&[], &cfg);
         let bot = fleet.get("bot-multi").unwrap();
-        assert_eq!(bot.config.as_ref().unwrap().pools, 2);
-        assert!(bot
-            .warnings
-            .iter()
-            .any(|w| matches!(w, Warning::MultiPool { pools: 2 })));
+        let summary = bot.config.as_ref().unwrap();
+        assert_eq!(summary.pools, 2);
+        assert_eq!(
+            summary.corridor_label.as_deref(),
+            Some("2 corridors on BNB Smart Chain")
+        );
+        assert!(bot.warnings.is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 }
