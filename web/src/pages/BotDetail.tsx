@@ -367,12 +367,14 @@ export default function BotDetail() {
 
       {/*
         Five labels don't fit a phone width. Scroll horizontally in a clipped
-        strip (not the page) so they stay one line; a right-edge fade hints
-        that more tabs sit off-screen.
+        strip (not the page) so they stay one line; overflow-y-hidden is
+        required because overflow-x:auto otherwise computes overflow-y to
+        auto and the strip pans vertically on touch. A right-edge fade
+        hints that more tabs sit off-screen.
       */}
       <div className="relative">
         <nav
-          className="flex flex-nowrap gap-x-0.5 overflow-x-auto border-b border-line-soft [scrollbar-width:none] [-ms-overflow-style:none] sm:gap-x-1 [&::-webkit-scrollbar]:hidden"
+          className="flex flex-nowrap gap-x-0.5 overflow-x-auto overflow-y-hidden overscroll-x-contain [touch-action:pan-x_pan-y] border-b border-line-soft [scrollbar-width:none] [-ms-overflow-style:none] sm:gap-x-1 [&::-webkit-scrollbar]:hidden"
           aria-label="Bot sections"
         >
           {BOT_TABS.map((t) => (
