@@ -269,7 +269,11 @@ export default function BotDetail() {
                     Start
                   </Button>
                 )}
-                {/* See Fleet.tsx: Restart needs a live process, exactly like Stop. */}
+                {/*
+                  Same precondition as Stop: there has to be a process to bounce.
+                  `docker restart` on a stopped container starts it, so an enabled
+                  Restart next to Start is a second Start wearing the wrong label.
+                */}
                 <Button
                   busy={busy === 'restart'}
                   disabled={!bot.canStop}

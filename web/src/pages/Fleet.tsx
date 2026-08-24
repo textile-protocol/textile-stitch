@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 import { ApiError, api } from '../api'
 import {
   Banner,
@@ -12,14 +12,12 @@ import {
   Tag,
 } from '../components/ui'
 import { shortAddress, shortImage } from '../format'
-import { confirmRemovePlan } from '../removeBot'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
 const POLL_MS = 5000
 
 export default function Fleet() {
-  const navigate = useNavigate()
   const [data, setData] = useState<FleetData | null>(null)
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -53,7 +51,7 @@ export default function Fleet() {
     return () => clearInterval(timer)
   }, [load, loadUpdates])
 
-  async function act(name: string, what: 'start' | 'stop' | 'restart' | 'update') {
+  async function act(name: string, what: 'start' | 'stop' | 'update') {
     if (what === 'update') {
       const bot = data?.bots.find((b) => b.name === name)
       // Recreate drops an in-container nonce ledger. Flat-layout bots must migrate
@@ -79,36 +77,6 @@ export default function Fleet() {
       if (res.message) setNote(res.message)
       await load()
       await loadUpdates()
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  async function remove(bot: Bot) {
-    const plan = confirmRemovePlan({
-      name: bot.name,
-      hasContainer: !!bot.container,
-    })
-    if (!plan) return
-
-    setBusy(`${bot.name}:remove`)
-    setNote(null)
-    setError(null)
-    try {
-      const res = await api.remove(bot.name, plan.deleteConfig)
-      setNote(res.message)
-      // Drop local state so a stale row can't flash back before reload.
-      setData((prev) =>
-        prev
-          ? { ...prev, bots: prev.bots.filter((b) => b.name !== bot.name) }
-          : prev,
-      )
-      await load()
-      await loadUpdates()
-      // Clear any handoff left in history so a refresh doesn't resurrect the note.
-      navigate('.', { replace: true, state: null })
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -170,7 +138,6 @@ export default function Fleet() {
                   canUpdate.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
                 }
                 onAct={act}
-                onRemove={() => void remove(bot)}
               />
             </li>
           ))}
@@ -186,30 +153,34 @@ function BotRow({
   updateAvailable,
   canUpdate,
   onAct,
-  onRemove,
 }: {
   bot: Bot
   busy: string | null
   updateAvailable: boolean
   canUpdate: boolean
-  onAct: (name: string, what: 'start' | 'stop' | 'restart' | 'update') => void
-  onRemove: () => void
+  onAct: (name: string, what: 'start' | 'stop' | 'update') => void
 }) {
   const blocking = bot.warnings.filter((w) => w.blocksEditing)
   const advisory = bot.warnings.filter((w) => !w.blocksEditing)
 
   return (
     <Card className="!p-4">
-      <div className="flex flex-wrap items-center gap-3">
-        <Link to={`/bots/${encodeURIComponent(bot.name)}`} className="font-bold">
-          {bot.name}
-        </Link>
-        <StatePill state={bot.state} status={bot.status} />
-        {bot.config?.corridorLabel && (
-          <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
-        )}
-        {updateAvailable && <Tag>update available</Tag>}
-        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+          <Link to={`/bots/${encodeURIComponent(bot.name)}`} className="font-bold">
+            {bot.name}
+          </Link>
+          <StatePill state={bot.state} status={bot.status} />
+          {bot.config?.corridorLabel && (
+            <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
+          )}
+          {updateAvailable && <Tag>update available</Tag>}
+        </div>
+        <div
+          className={`grid w-full gap-2 sm:ml-auto sm:flex sm:w-auto sm:flex-wrap sm:items-center [&_button]:w-full [&_button]:justify-center sm:[&_button]:w-auto ${
+            bot.container && canUpdate ? 'grid-cols-2' : 'grid-cols-1'
+          }`}
+        >
           {bot.container ? (
             <>
               {bot.canStop ? (
@@ -228,23 +199,6 @@ function BotRow({
                   Start
                 </Button>
               )}
-              {/*
-                Same precondition as Stop: there has to be a process to bounce.
-                `docker restart` on a stopped container *starts* it, so an enabled
-                Restart next to Start is a second Start wearing the wrong label.
-              */}
-              <Button
-                busy={busy === `${bot.name}:restart`}
-                disabled={!bot.canStop}
-                onClick={() => onAct(bot.name, 'restart')}
-                title={
-                  bot.canStop
-                    ? 'Stop and start it again, with the full tick grace period'
-                    : `${bot.name} is ${bot.state} — there is nothing to restart. Use Start.`
-                }
-              >
-                Restart
-              </Button>
               {canUpdate && (
                 <Button
                   variant="primary"
@@ -258,21 +212,6 @@ function BotRow({
           ) : (
             <Tag>no container</Tag>
           )}
-          <Button
-            variant="danger"
-            busy={busy === `${bot.name}:remove`}
-            onClick={onRemove}
-            title={
-              bot.container
-                ? 'Delete the container, config, and private key — gone from the fleet'
-                : 'Delete config and private key — gone from the fleet'
-            }
-          >
-            {bot.container ? 'Remove' : 'Delete'}
-          </Button>
-          <Link to={`/bots/${encodeURIComponent(bot.name)}`}>
-            <Button variant="ghost">Open</Button>
-          </Link>
         </div>
       </div>
 
