@@ -21,7 +21,7 @@ import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import VersionRollback from '../components/VersionRollback'
-import { formatTimestamp, shortAddress, shortImage } from '../format'
+import { formatTimestamp, imageLabel, shortAddress, shortImage } from '../format'
 import { confirmRemovePlan } from '../removeBot'
 import type { Bot, ConfigBody, MigrationResult, UpdatesStatus } from '../types'
 
@@ -210,7 +210,7 @@ export default function BotDetail() {
         ) : (
           <Banner tone="info">
             This bot is on a pinned image (
-            {shortImage(bot.image)}). Update moves it to{' '}
+            {imageLabel(bot.image, bot.version)}). Update moves it to{' '}
             {shortImage(updates?.bot.targetImage ?? null)}; config stays on disk.
           </Banner>
         ))}
@@ -344,7 +344,7 @@ export default function BotDetail() {
           <Detail label="Layout">{bot.layout}</Detail>
           <Detail label="Image">
             <span className="font-mono" title={bot.image ?? undefined}>
-              {shortImage(bot.image)}
+              {imageLabel(bot.image, bot.version)}
             </span>
           </Detail>
           <Detail label="Created">{formatTimestamp(bot.createdUnix)}</Detail>

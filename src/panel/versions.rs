@@ -62,6 +62,9 @@ pub struct PublishedVersion {
     pub published_at: Option<String>,
     /// Commit subject for that build. Best effort, same as `published_at`.
     pub subject: Option<String>,
+    /// GitHub release that names this commit, e.g. `v0.1.226`. The registry tag
+    /// stays `sha-*`; this is what the picker should show.
+    pub version: Option<String>,
 }
 
 /// True when `tag` names exactly one build forever.
@@ -222,8 +225,24 @@ struct CacheEntry {
 
 static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
 
+struct ReleaseCacheEntry {
+    at: Instant,
+    repo: String,
+    /// Short-sha prefix → `v0.1.226`.
+    by_sha: HashMap<String, String>,
+}
+
+static RELEASE_CACHE: Mutex<Option<ReleaseCacheEntry>> = Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RELEASES: std::cell::RefCell<Option<HashMap<String, String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub fn clear_cache() {
     *CACHE.lock().unwrap() = None;
+    *RELEASE_CACHE.lock().unwrap() = None;
 }
 
 /// The `limit` most recently published versions of `image`'s repository, newest
@@ -259,7 +278,10 @@ pub async fn list_published(image: &str, limit: usize) -> Result<Vec<PublishedVe
     let tags = fetch_tags(&client, api_host, repo, token.as_deref()).await?;
     // Before the tags are cut down to ten, not after: which ten are the newest
     // is decided from the commit order, so it has to be known first.
-    let commits = commit_metadata(&client, registry, repo).await;
+    let (commits, releases) = tokio::join!(
+        commit_metadata(&client, registry, repo),
+        release_metadata(&client, registry, repo),
+    );
     let recent = recent_tags(&tags, &commits, limit);
     let digests = fetch_digests(&client, api_host, repo, token.as_deref(), &recent).await;
 
@@ -273,6 +295,7 @@ pub async fn list_published(image: &str, limit: usize) -> Result<Vec<PublishedVe
                 digest,
                 published_at: commit.map(|c| c.date.clone()),
                 subject: commit.map(|c| c.subject.clone()),
+                version: lookup_release(&releases, short_sha(&tag)),
                 tag,
             }
         })
@@ -454,6 +477,202 @@ fn subject_line(message: &str) -> String {
         .to_string()
 }
 
+/// GitHub `v*` tags keyed by short-sha, for turning a `sha-*` image into the
+/// release number operators actually recognize.
+///
+/// Same best-effort rules as [`commit_metadata`]: a private repo, a rate limit,
+/// or a registry that isn't GHCR yields an empty map and the UI keeps showing
+/// the image ref. Cached on its own so the fleet page can ask without listing
+/// every published digest.
+pub async fn release_index(image: &str) -> HashMap<String, String> {
+    let parsed = parse_image_ref(image);
+    let Some(registry) = parsed.registry.as_deref() else {
+        return HashMap::new();
+    };
+    let client = match reqwest::Client::builder()
+        .user_agent(concat!("stitch-panel/", env!("CARGO_PKG_VERSION")))
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    release_metadata(&client, registry, &parsed.repository).await
+}
+
+/// The release tag for a running image, when one can be attributed.
+///
+/// Order: an image already tagged `vX.Y.Z`, then a `sha-*` tag looked up in
+/// `releases`, then the OCI revision label (what `:latest` / a bare digest
+/// still carries), then an OCI version label that is itself a release tag.
+pub fn version_for_image(
+    releases: &HashMap<String, String>,
+    image: Option<&str>,
+    labels: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(image) = image {
+        let parsed = parse_image_ref(image);
+        if is_release_tag(&parsed.tag) {
+            return Some(display_release(&parsed.tag));
+        }
+        if let Some(sha) = parsed.tag.strip_prefix("sha-") {
+            if let Some(version) = lookup_release(releases, sha) {
+                return Some(version);
+            }
+        }
+    }
+    if let Some(revision) = labels.get("org.opencontainers.image.revision") {
+        if let Some(version) = lookup_release(releases, revision) {
+            return Some(version);
+        }
+    }
+    labels
+        .get("org.opencontainers.image.version")
+        .filter(|value| is_release_tag(value))
+        .map(|value| display_release(value))
+}
+
+/// True when `tag` is a cargo-dist / GitHub release (`v0.1.226` or `0.1.226`).
+///
+/// Refuses `latest`, branch names, and `sha-*` — those are channels or commits,
+/// not a version number.
+pub fn is_release_tag(tag: &str) -> bool {
+    let rest = tag.strip_prefix('v').unwrap_or(tag);
+    let mut parts = rest.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(major), Some(minor), Some(patch), None) => {
+            is_digits(major) && is_digits(minor) && is_digits(patch)
+        }
+        _ => false,
+    }
+}
+
+fn is_digits(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
+}
+
+fn display_release(tag: &str) -> String {
+    if tag.starts_with('v') {
+        tag.to_string()
+    } else {
+        format!("v{tag}")
+    }
+}
+
+fn lookup_release(releases: &HashMap<String, String>, sha: &str) -> Option<String> {
+    let hex = sha.strip_prefix("sha-").unwrap_or(sha);
+    if hex.len() < 7 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    releases.get(&hex[..hex.len().min(40)]).cloned()
+}
+
+async fn release_metadata(
+    client: &reqwest::Client,
+    registry: &str,
+    repo: &str,
+) -> HashMap<String, String> {
+    #[cfg(test)]
+    {
+        let _ = (client, registry, repo);
+        let override_index = TEST_RELEASES.with(|cell| cell.borrow().clone());
+        if let Some(index) = override_index {
+            return index;
+        }
+        return HashMap::new();
+    }
+    #[cfg(not(test))]
+    {
+        fetch_release_tags(client, registry, repo).await
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+async fn fetch_release_tags(
+    client: &reqwest::Client,
+    registry: &str,
+    repo: &str,
+) -> HashMap<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Tag {
+        name: String,
+        commit: TagCommit,
+    }
+    #[derive(serde::Deserialize)]
+    struct TagCommit {
+        sha: String,
+    }
+
+    if registry != "ghcr.io" || repo.matches('/').count() != 1 {
+        return HashMap::new();
+    }
+    if let Ok(guard) = RELEASE_CACHE.lock() {
+        if let Some(entry) = guard.as_ref() {
+            if entry.repo == repo && entry.at.elapsed() < CACHE_TTL {
+                return entry.by_sha.clone();
+            }
+        }
+    }
+
+    let mut by_sha = HashMap::new();
+    for page in 1..=5 {
+        let url = format!("https://api.github.com/repos/{repo}/tags?per_page=100&page={page}");
+        let Ok(res) = client.get(&url).send().await else {
+            break;
+        };
+        let Ok(res) = res.error_for_status() else {
+            break;
+        };
+        let Ok(tags) = res.json::<Vec<Tag>>().await else {
+            break;
+        };
+        let count = tags.len();
+        merge_release_tags(
+            &mut by_sha,
+            tags.into_iter()
+                .filter(|tag| is_release_tag(&tag.name))
+                .map(|tag| (tag.commit.sha, display_release(&tag.name))),
+        );
+        if count < 100 {
+            break;
+        }
+    }
+
+    if let Ok(mut guard) = RELEASE_CACHE.lock() {
+        *guard = Some(ReleaseCacheEntry {
+            at: Instant::now(),
+            repo: repo.to_string(),
+            by_sha: by_sha.clone(),
+        });
+    }
+    by_sha
+}
+
+fn merge_release_tags(
+    into: &mut HashMap<String, String>,
+    tags: impl IntoIterator<Item = (String, String)>,
+) {
+    for (sha, version) in tags {
+        if sha.len() < 7 {
+            continue;
+        }
+        for len in 7..=sha.len() {
+            into.entry(sha[..len].to_string())
+                .or_insert_with(|| version.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn set_test_release_index(index: HashMap<String, String>) {
+    TEST_RELEASES.with(|cell| *cell.borrow_mut() = Some(index));
+}
+
+#[cfg(test)]
+pub fn clear_test_release_index() {
+    TEST_RELEASES.with(|cell| *cell.borrow_mut() = None);
+}
+
 /// Index commits by every short-sha length a tag might use.
 ///
 /// `docker/metadata-action` publishes a 7-char prefix by default but the length
@@ -488,6 +707,7 @@ mod tests {
             digest: digest.map(str::to_string),
             published_at: None,
             subject: None,
+            version: None,
         }
     }
 
@@ -679,6 +899,70 @@ mod tests {
         // Position is what ordering reads, and the endpoint answers newest first.
         assert_eq!(index["14cd877"].position, 0);
         assert_eq!(index["94e838e"].position, 1);
+    }
+
+    #[test]
+    fn release_tags_are_the_semver_operators_read() {
+        assert!(is_release_tag("v0.1.226"));
+        assert!(is_release_tag("0.1.226"));
+        assert!(!is_release_tag("latest"));
+        assert!(!is_release_tag("sha-14cd877"));
+        assert!(!is_release_tag("main"));
+        assert_eq!(display_release("0.1.226"), "v0.1.226");
+        assert_eq!(display_release("v0.1.226"), "v0.1.226");
+    }
+
+    #[test]
+    fn a_running_image_resolves_to_its_release() {
+        let mut releases = HashMap::new();
+        merge_release_tags(
+            &mut releases,
+            [(
+                "24e9192cce6d0000000000000000000000000000".into(),
+                "v0.1.226".into(),
+            )],
+        );
+        assert_eq!(
+            version_for_image(
+                &releases,
+                Some("ghcr.io/textile-protocol/textile-stitch:sha-24e9192"),
+                &HashMap::new(),
+            )
+            .as_deref(),
+            Some("v0.1.226")
+        );
+        // :latest / a bare digest: only the OCI revision still names the commit.
+        let labels = HashMap::from([(
+            "org.opencontainers.image.revision".into(),
+            "24e9192cce6d0000000000000000000000000000".into(),
+        )]);
+        assert_eq!(
+            version_for_image(
+                &releases,
+                Some("sha256:2f7391aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4ab8b"),
+                &labels,
+            )
+            .as_deref(),
+            Some("v0.1.226")
+        );
+        assert_eq!(
+            version_for_image(
+                &HashMap::new(),
+                Some("ghcr.io/textile-protocol/textile-stitch:v0.1.200"),
+                &HashMap::new(),
+            )
+            .as_deref(),
+            Some("v0.1.200")
+        );
+        // Channel tags and unknown digests stay unresolved — the UI keeps the image ref.
+        assert_eq!(
+            version_for_image(
+                &releases,
+                Some("ghcr.io/textile-protocol/textile-stitch:latest"),
+                &HashMap::new(),
+            ),
+            None
+        );
     }
 
     #[test]

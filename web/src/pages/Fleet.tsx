@@ -11,7 +11,7 @@ import {
   StatePill,
   Tag,
 } from '../components/ui'
-import { shortAddress, shortImage } from '../format'
+import { imageLabel, shortAddress } from '../format'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
@@ -228,7 +228,7 @@ function BotRow({
         )}
         {bot.config && <Tag>{bot.config.signer}</Tag>}
         <span className="ml-auto font-mono" title={bot.image ?? undefined}>
-          {shortImage(bot.image)}
+          {imageLabel(bot.image, bot.version)}
         </span>
       </div>
 

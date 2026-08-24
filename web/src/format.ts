@@ -94,6 +94,18 @@ export function shortImage(image: string | null): string {
   return shortenDigest(name)
 }
 
+/**
+ * What to show for a bot image: the release (`v0.1.226`) when we have one,
+ * otherwise the shortened Docker ref.
+ */
+export function imageLabel(
+  image: string | null | undefined,
+  version?: string | null,
+): string {
+  if (version) return version
+  return shortImage(image ?? null)
+}
+
 /** `sha256:ce1d74…2fef60` — keeps the prefix and enough hex to tell digests apart. */
 function shortenDigest(ref: string): string {
   const at = ref.lastIndexOf('@')

@@ -46,6 +46,8 @@ export interface Bot {
    */
   canStop: boolean
   image: string | null
+  /** GitHub release for the running image, e.g. `v0.1.226`. */
+  version: string | null
   createdUnix: number | null
   editable: boolean
   canMigrate: boolean
@@ -259,6 +261,8 @@ export interface UpdatesStatus {
 export interface BotVersion {
   /** Registry tag, e.g. `sha-14cd877`. */
   tag: string
+  /** GitHub release for this build, e.g. `v0.1.226`. */
+  version: string | null
   /** Full reference a rollback would recreate the bot on. */
   image: string
   digest: string | null

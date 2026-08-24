@@ -44,6 +44,9 @@ pub struct BotBody {
     /// frontend never has to keep its own list of Docker states in sync.
     pub can_stop: bool,
     pub image: Option<String>,
+    /// GitHub release for the running image (`v0.1.226`), when one can be
+    /// attributed. The image field stays the Docker ref; the UI shows this.
+    pub version: Option<String>,
     pub created_unix: Option<i64>,
     /// Whether the panel can edit this bot's config at all.
     pub editable: bool,
@@ -130,6 +133,7 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
         running: bot.state.is_running(),
         can_stop: bot.container_name.is_some() && !bot.state.is_terminal(),
         image: bot.image.clone(),
+        version: None,
         created_unix: bot.created_unix,
         editable: bot.is_editable(),
         can_migrate: migrate_check.is_ok(),
@@ -140,6 +144,26 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
         config: bot.config.as_ref().map(ConfigBody::from),
         warnings: bot.warnings.iter().map(WarningBody::from).collect(),
     }
+}
+
+async fn with_version(mut body: BotBody, bot: &Bot, state: &AppState) -> BotBody {
+    body.version = running_version(state, bot).await;
+    body
+}
+
+async fn running_version(state: &AppState, bot: &Bot) -> Option<String> {
+    let releases = crate::panel::versions::release_index(&state.cfg.bot_image).await;
+    let lookup = bot
+        .image_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .or(bot.image.as_deref())?;
+    let labels = state
+        .docker
+        .local_image_labels(lookup)
+        .await
+        .unwrap_or_default();
+    crate::panel::versions::version_for_image(&releases, bot.image.as_deref(), &labels)
 }
 
 #[derive(Serialize)]
@@ -156,11 +180,10 @@ pub async fn list(State(state): State<AppState>) -> Result<Response, ApiError> {
     let fleet = state.fleet().await?;
     // Discovery already yields name order (BTreeMap), but sort here too so the
     // fleet page stays alphabetical even if that ever changes.
-    let mut bots: Vec<BotBody> = fleet
-        .bots()
-        .iter()
-        .map(|b| to_body(b, &state, &fleet))
-        .collect();
+    let mut bots = Vec::new();
+    for b in fleet.bots() {
+        bots.push(with_version(to_body(b, &state, &fleet), b, &state).await);
+    }
     bots.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(FleetBody {
         bots,
@@ -175,7 +198,7 @@ pub async fn show(
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
     let (bot, fleet) = state.bot_and_fleet(&name).await?;
-    Ok(Json(to_body(&bot, &state, &fleet)).into_response())
+    Ok(Json(with_version(to_body(&bot, &state, &fleet), &bot, &state).await).into_response())
 }
 
 /// A lifecycle action's result. Carries the bot's new state so the UI doesn't
@@ -194,7 +217,7 @@ async fn action_response(
 ) -> Result<Response, ApiError> {
     let (bot, fleet) = state.bot_and_fleet(name).await?;
     Ok(Json(ActionBody {
-        bot: to_body(&bot, state, &fleet),
+        bot: with_version(to_body(&bot, state, &fleet), &bot, state).await,
         message,
     })
     .into_response())
@@ -1680,7 +1703,7 @@ pub async fn migrate_layout(
 
     let (fresh, fresh_fleet) = state.bot_and_fleet(&name).await?;
     Ok(Json(serde_json::json!({
-        "bot": to_body(&fresh, &state, &fresh_fleet),
+        "bot": with_version(to_body(&fresh, &state, &fresh_fleet), &fresh, &state).await,
         "message": report.message(),
         "movedFiles": report.moved,
         "ledgersRecovered": report.ledgers_recovered,
@@ -1817,6 +1840,31 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["canStop"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_bot_reports_its_release_version() {
+        let h = harness("bot-version");
+        seed_panel_bot(&h, "bot-a");
+        h.docker.set_container_image(
+            "stitch-bot-a",
+            "ghcr.io/textile-protocol/textile-stitch:sha-24e9192",
+        );
+        crate::panel::versions::set_test_release_index(std::collections::HashMap::from([(
+            "24e9192".into(),
+            "v0.1.226".into(),
+        )]));
+        struct ResetReleases;
+        impl Drop for ResetReleases {
+            fn drop(&mut self) {
+                crate::panel::versions::clear_test_release_index();
+            }
+        }
+        let _reset = ResetReleases;
+        let (status, body) = h.get("/api/bots/bot-a").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["version"], "v0.1.226", "{body}");
     }
 
     #[tokio::test]

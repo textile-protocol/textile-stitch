@@ -66,6 +66,7 @@ export default function VersionRollback({
   const ranked = data.ordering === 'commit'
   const currentIndex = versions.findIndex((v) => v.current)
   const selected = versions.find((v) => v.tag === chosen) ?? null
+  const labelOf = (version: BotVersion) => version.version ?? version.tag
   const selectedIndex = versions.findIndex((v) => v.tag === chosen)
   const goingForward =
     ranked && currentIndex !== -1 && selectedIndex !== -1 && selectedIndex < currentIndex
@@ -84,7 +85,7 @@ export default function VersionRollback({
       : 'The bot stays stopped, because it is not up now.'
     if (
       !window.confirm(
-        `Roll ${bot.name} back to ${version.tag}?\n\n` +
+        `Roll ${bot.name} back to ${labelOf(version)}?\n\n` +
           (published ? `${published}\n\n` : '') +
           'This recreates its container on older code. Everything fixed since that build — ' +
           'pricing, nonce handling, security — is gone until you update again.\n\n' +
@@ -101,7 +102,7 @@ export default function VersionRollback({
     try {
       const res = await api.rollback(bot.name, version.tag)
       setChosen(null)
-      onRolledBack(res.message ?? `${bot.name} was rolled back to ${version.tag}.`)
+      onRolledBack(res.message ?? `${bot.name} was rolled back to ${labelOf(version)}.`)
       // The "running now" marker has moved; re-ask rather than guess.
       await load()
     } catch (e) {
@@ -160,7 +161,9 @@ export default function VersionRollback({
                   />
                   <span className="min-w-0 flex-1">
                     <span className="flex flex-wrap items-center gap-2">
-                      <span className="font-mono text-xs">{v.tag}</span>
+                      <span className="font-mono text-xs" title={v.tag}>
+                        {labelOf(v)}
+                      </span>
                       {ranked && i === 0 && <Tag>newest</Tag>}
                       {v.current && <Tag>running now</Tag>}
                       <span className="text-xs text-faint">
@@ -241,7 +244,7 @@ export default function VersionRollback({
             disabled={!selected || !data.canRollBack}
             onClick={() => selected && void rollBack(selected)}
           >
-            {selected ? `Roll back to ${selected.tag}` : 'Pick a version'}
+            {selected ? `Roll back to ${labelOf(selected)}` : 'Pick a version'}
           </Button>
         </>
       )}
