@@ -146,13 +146,12 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
     }
 }
 
-async fn with_version(mut body: BotBody, bot: &Bot, state: &AppState) -> BotBody {
-    body.version = running_version(state, bot).await;
+async fn with_version(mut body: BotBody, bot: &Bot, state: &AppState, wait: bool) -> BotBody {
+    body.version = running_version(state, bot, wait).await;
     body
 }
 
-async fn running_version(state: &AppState, bot: &Bot) -> Option<String> {
-    let releases = crate::panel::versions::release_index(&state.cfg.bot_image).await;
+async fn running_version(state: &AppState, bot: &Bot, wait: bool) -> Option<String> {
     let lookup = bot
         .image_id
         .as_deref()
@@ -163,6 +162,35 @@ async fn running_version(state: &AppState, bot: &Bot) -> Option<String> {
         .local_image_labels(lookup)
         .await
         .unwrap_or_default();
+    let repo_digests = if bot
+        .image
+        .as_deref()
+        .is_none_or(crate::panel::updates::is_content_digest_ref)
+    {
+        state
+            .docker
+            .local_image_digests(lookup)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let source = crate::panel::versions::release_lookup_image(
+        bot.image.as_deref(),
+        &repo_digests,
+        &state.cfg.bot_image,
+    );
+    let needed_sha = crate::panel::versions::release_sha_hint(bot.image.as_deref(), &labels);
+    let releases = if wait {
+        crate::panel::versions::release_index_await(
+            &source,
+            needed_sha.as_deref(),
+            crate::panel::versions::DETAIL_RELEASE_WAIT,
+        )
+        .await
+    } else {
+        crate::panel::versions::release_index(&source, needed_sha.as_deref())
+    };
     crate::panel::versions::version_for_image(&releases, bot.image.as_deref(), &labels)
 }
 
@@ -182,7 +210,7 @@ pub async fn list(State(state): State<AppState>) -> Result<Response, ApiError> {
     // fleet page stays alphabetical even if that ever changes.
     let mut bots = Vec::new();
     for b in fleet.bots() {
-        bots.push(with_version(to_body(b, &state, &fleet), b, &state).await);
+        bots.push(with_version(to_body(b, &state, &fleet), b, &state, false).await);
     }
     bots.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(FleetBody {
@@ -198,7 +226,7 @@ pub async fn show(
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
     let (bot, fleet) = state.bot_and_fleet(&name).await?;
-    Ok(Json(with_version(to_body(&bot, &state, &fleet), &bot, &state).await).into_response())
+    Ok(Json(with_version(to_body(&bot, &state, &fleet), &bot, &state, true).await).into_response())
 }
 
 /// A lifecycle action's result. Carries the bot's new state so the UI doesn't
@@ -217,7 +245,7 @@ async fn action_response(
 ) -> Result<Response, ApiError> {
     let (bot, fleet) = state.bot_and_fleet(name).await?;
     Ok(Json(ActionBody {
-        bot: with_version(to_body(&bot, state, &fleet), &bot, state).await,
+        bot: with_version(to_body(&bot, state, &fleet), &bot, state, true).await,
         message,
     })
     .into_response())
@@ -1703,7 +1731,7 @@ pub async fn migrate_layout(
 
     let (fresh, fresh_fleet) = state.bot_and_fleet(&name).await?;
     Ok(Json(serde_json::json!({
-        "bot": with_version(to_body(&fresh, &state, &fresh_fleet), &fresh, &state).await,
+        "bot": with_version(to_body(&fresh, &state, &fresh_fleet), &fresh, &state, true).await,
         "message": report.message(),
         "movedFiles": report.moved,
         "ledgersRecovered": report.ledgers_recovered,
@@ -1865,6 +1893,33 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
         assert_eq!(v["version"], "v0.1.226", "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_forked_bot_resolves_releases_from_its_own_repository() {
+        let h = harness("bot-version-fork");
+        seed_panel_bot(&h, "bot-a");
+        h.docker
+            .set_container_image("stitch-bot-a", "ghcr.io/someone/fork:sha-24e9192");
+        crate::panel::versions::set_test_release_index_for_repo(
+            "textile-protocol/textile-stitch",
+            std::collections::HashMap::from([("24e9192".into(), "v0.1.226".into())]),
+        );
+        crate::panel::versions::set_test_release_index_for_repo(
+            "someone/fork",
+            std::collections::HashMap::from([("24e9192".into(), "v9.9.9".into())]),
+        );
+        struct ResetReleases;
+        impl Drop for ResetReleases {
+            fn drop(&mut self) {
+                crate::panel::versions::clear_test_release_index();
+            }
+        }
+        let _reset = ResetReleases;
+        let (status, body) = h.get("/api/bots/bot-a").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["version"], "v9.9.9", "{body}");
     }
 
     #[tokio::test]

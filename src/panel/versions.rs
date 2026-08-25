@@ -21,14 +21,19 @@
 //! quietly undo the pin.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+#[cfg(not(test))]
+use std::sync::atomic::Ordering;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::future::join_all;
 use serde::Serialize;
 
-use super::updates::{distribution_api_host, is_behind, parse_image_ref, registry_token};
+use super::updates::{
+    distribution_api_host, is_behind, is_content_digest_ref, parse_image_ref, registry_token,
+};
 
 /// How many published versions the rollback picker offers.
 pub const ROLLBACK_CHOICES: usize = 10;
@@ -47,6 +52,16 @@ const PAGE_SIZE: usize = 1000;
 const MAX_PAGES: usize = 20;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Failed GitHub listings and "this SHA is not in the index yet" (container
+/// workflow published `sha-*` before `release.yml` cut the `v*` tag) retry
+/// faster than a complete hit. The full [`CACHE_TTL`] would pin a just-released
+/// bot to the SHA fallback for 15 minutes.
+const RETRY_TTL: Duration = Duration::from_secs(30);
+
+/// Generation token for the refresh currently running for a cache key.
+#[cfg_attr(test, allow(dead_code))]
+static RELEASE_REFRESH_GEN: AtomicU64 = AtomicU64::new(1);
 
 /// One published build, as the rollback picker shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -225,24 +240,51 @@ struct CacheEntry {
 
 static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
 
+#[derive(Clone)]
+#[cfg_attr(test, allow(dead_code))]
 struct ReleaseCacheEntry {
     at: Instant,
     repo: String,
     /// Short-sha prefix → `v0.1.226`.
     by_sha: HashMap<String, String>,
+    /// False when the GitHub listing errored mid-page. Empty-and-ok is a real
+    /// repo with no `v*` tags; empty-and-failed should be retried soon.
+    fetched_ok: bool,
+    /// Complete fetches that still lacked the SHA we were looking for. Caps
+    /// the 30s retry so a never-released commit doesn't scan GitHub forever.
+    miss_streak: u32,
 }
 
-static RELEASE_CACHE: Mutex<Option<ReleaseCacheEntry>> = Mutex::new(None);
+static RELEASE_CACHE: LazyLock<Mutex<HashMap<String, ReleaseCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RELEASE_INFLIGHT: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 thread_local! {
-    static TEST_RELEASES: std::cell::RefCell<Option<HashMap<String, String>>> =
-        const { std::cell::RefCell::new(None) };
+    static TEST_RELEASES: std::cell::RefCell<TestReleaseIndex> =
+        std::cell::RefCell::new(TestReleaseIndex::default());
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct TestReleaseIndex {
+    /// Used when no per-repo override is set — the original single-map helper.
+    any: Option<HashMap<String, String>>,
+    by_repo: HashMap<String, HashMap<String, String>>,
+}
+
+#[cfg(test)]
+impl TestReleaseIndex {
+    fn for_repo(&self, repo: &str) -> Option<HashMap<String, String>> {
+        self.by_repo.get(repo).cloned().or_else(|| self.any.clone())
+    }
 }
 
 pub fn clear_cache() {
     *CACHE.lock().unwrap() = None;
-    *RELEASE_CACHE.lock().unwrap() = None;
+    RELEASE_CACHE.lock().unwrap().clear();
+    RELEASE_INFLIGHT.lock().unwrap().clear();
 }
 
 /// The `limit` most recently published versions of `image`'s repository, newest
@@ -280,7 +322,7 @@ pub async fn list_published(image: &str, limit: usize) -> Result<Vec<PublishedVe
     // is decided from the commit order, so it has to be known first.
     let (commits, releases) = tokio::join!(
         commit_metadata(&client, registry, repo),
-        release_metadata(&client, registry, repo),
+        published_release_index(&client, registry, repo),
     );
     let recent = recent_tags(&tags, &commits, limit);
     let digests = fetch_digests(&client, api_host, repo, token.as_deref(), &recent).await;
@@ -480,24 +522,246 @@ fn subject_line(message: &str) -> String {
 /// GitHub `v*` tags keyed by short-sha, for turning a `sha-*` image into the
 /// release number operators actually recognize.
 ///
-/// Same best-effort rules as [`commit_metadata`]: a private repo, a rate limit,
-/// or a registry that isn't GHCR yields an empty map and the UI keeps showing
-/// the image ref. Cached on its own so the fleet page can ask without listing
-/// every published digest.
-pub async fn release_index(image: &str) -> HashMap<String, String> {
+/// Returns the last cached map immediately — never waits on GitHub. A cold or
+/// expired cache (or one that doesn't yet contain `needed_sha`) kicks a
+/// background refresh; the caller already has Docker labels as a fallback, so
+/// the fleet page stays up when GH is slow. Same best-effort rules as
+/// [`commit_metadata`]: a private repo, a rate limit, or a registry that isn't
+/// GHCR yields an empty map and the UI keeps showing the image ref.
+pub fn release_index(image: &str, needed_sha: Option<&str>) -> HashMap<String, String> {
     let parsed = parse_image_ref(image);
-    let Some(registry) = parsed.registry.as_deref() else {
-        return HashMap::new();
-    };
-    let client = match reqwest::Client::builder()
-        .user_agent(concat!("stitch-panel/", env!("CARGO_PKG_VERSION")))
-        .timeout(REQUEST_TIMEOUT)
-        .build()
+    let repo = parsed.repository;
+
+    #[cfg(test)]
     {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
+        let _ = needed_sha;
+        let override_index = TEST_RELEASES.with(|cell| cell.borrow().for_repo(&repo));
+        if let Some(index) = override_index {
+            return index;
+        }
+        return HashMap::new();
+    }
+
+    #[cfg(not(test))]
+    {
+        let Some(registry) = parsed.registry.clone() else {
+            return HashMap::new();
+        };
+        let key = release_cache_key(&registry, &repo);
+        let cached = cached_releases(&key);
+        if cached
+            .as_ref()
+            .is_none_or(|entry| should_refresh_releases(entry, needed_sha))
+        {
+            spawn_release_refresh(registry, repo, needed_sha.map(str::to_string));
+        }
+        cached.map(|entry| entry.by_sha).unwrap_or_default()
+    }
+}
+
+/// How long a one-shot detail/action read will wait for the first GitHub fill.
+///
+/// The fleet list never waits — it polls. Bot detail loads once, so a cold
+/// cache would otherwise pin the SHA fallback for the whole visit.
+pub const DETAIL_RELEASE_WAIT: Duration = Duration::from_secs(2);
+
+/// Same as [`release_index`], but if this repo has never been cached, wait up
+/// to `wait` for the background fill so a one-shot page can show the version.
+pub async fn release_index_await(
+    image: &str,
+    needed_sha: Option<&str>,
+    wait: Duration,
+) -> HashMap<String, String> {
+    let first = release_index(image, needed_sha);
+    #[cfg(test)]
+    {
+        let _ = wait;
+        first
+    }
+    #[cfg(not(test))]
+    {
+        let parsed = parse_image_ref(image);
+        let Some(registry) = parsed.registry.as_deref() else {
+            return first;
+        };
+        let key = release_cache_key(registry, &parsed.repository);
+        let cached = cached_releases(&key);
+        if let Some(entry) = cached.as_ref() {
+            if !should_refresh_releases(entry, needed_sha) {
+                return entry.by_sha.clone();
+            }
+        }
+        wait_for_release_cache(&key, cached.as_ref().map(|entry| entry.at), wait)
+            .await
+            .unwrap_or(first)
+    }
+}
+
+/// Which image's GitHub repo to ask for release tags.
+///
+/// A named running image (including a fork) owns its own tags. A bare
+/// `sha256:…` id has no repo in the string — RepoDigests name it, and only
+/// then does the panel's configured image stand in.
+pub fn release_lookup_image(
+    running_image: Option<&str>,
+    repo_digests: &[String],
+    configured: &str,
+) -> String {
+    if let Some(image) = running_image.filter(|s| !s.is_empty()) {
+        if !is_content_digest_ref(image) && parse_image_ref(image).registry.is_some() {
+            return image.to_string();
+        }
+    }
+    if let Some(named) = named_repo_from_digests(repo_digests) {
+        return named;
+    }
+    configured.to_string()
+}
+
+/// The commit a `sha-*` tag or OCI revision still names, when we have one.
+///
+/// Passed to [`release_index`] so a cache that predates the matching `v*` tag
+/// is refreshed instead of pinning the SHA fallback for the full TTL.
+pub fn release_sha_hint(image: Option<&str>, labels: &HashMap<String, String>) -> Option<String> {
+    if let Some(image) = image {
+        let parsed = parse_image_ref(image);
+        if let Some(sha) = parsed.tag.strip_prefix("sha-") {
+            return Some(sha.to_string());
+        }
+    }
+    labels.get("org.opencontainers.image.revision").cloned()
+}
+
+fn named_repo_from_digests(digests: &[String]) -> Option<String> {
+    digests.iter().find_map(|digest| {
+        let (name, _) = digest.rsplit_once('@')?;
+        parse_image_ref(name)
+            .registry
+            .is_some()
+            .then(|| name.to_string())
+    })
+}
+
+fn release_cache_key(registry: &str, repo: &str) -> String {
+    format!("{registry}/{repo}")
+}
+
+#[cfg(not(test))]
+fn cached_releases(key: &str) -> Option<ReleaseCacheEntry> {
+    RELEASE_CACHE.lock().ok()?.get(key).cloned()
+}
+
+#[cfg(not(test))]
+async fn wait_for_release_cache(
+    key: &str,
+    older_than: Option<Instant>,
+    wait: Duration,
+) -> Option<HashMap<String, String>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(entry) = cached_releases(key) {
+            if older_than.is_none_or(|at| entry.at > at) {
+                return Some(entry.by_sha);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(not(test))]
+fn should_refresh_releases(entry: &ReleaseCacheEntry, needed_sha: Option<&str>) -> bool {
+    let needed_present = needed_sha
+        .map(|sha| lookup_release(&entry.by_sha, sha).is_some())
+        .unwrap_or(true);
+    entry.at.elapsed() >= refresh_ttl(entry.fetched_ok, needed_present, entry.miss_streak)
+}
+
+fn refresh_ttl(fetched_ok: bool, needed_sha_present: bool, miss_streak: u32) -> Duration {
+    if !fetched_ok {
+        RETRY_TTL
+    } else if needed_sha_present {
+        CACHE_TTL
+    } else {
+        match miss_streak {
+            0 | 1 => RETRY_TTL,
+            2 => Duration::from_secs(60),
+            3 => Duration::from_secs(120),
+            _ => CACHE_TTL,
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn spawn_release_refresh(registry: String, repo: String, needed_sha: Option<String>) {
+    let key = release_cache_key(&registry, &repo);
+    let Some(gen) = begin_release_refresh(&key) else {
+        return;
     };
-    release_metadata(&client, registry, &parsed.repository).await
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        end_release_refresh(&key, gen);
+        return;
+    };
+    handle.spawn(async move {
+        let client = match reqwest::Client::builder()
+            .user_agent(concat!("stitch-panel/", env!("CARGO_PKG_VERSION")))
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                end_release_refresh(&key, gen);
+                return;
+            }
+        };
+        let (by_sha, fetched_ok) = pull_release_tags(&client, &registry, &repo).await;
+        let still_missing = needed_sha
+            .as_deref()
+            .is_some_and(|sha| lookup_release(&by_sha, sha).is_none());
+        if let Ok(mut guard) = RELEASE_CACHE.lock() {
+            let prev_miss = guard.get(&key).map(|e| e.miss_streak).unwrap_or(0);
+            let miss_streak = if !fetched_ok {
+                prev_miss
+            } else if still_missing {
+                prev_miss.saturating_add(1)
+            } else {
+                0
+            };
+            guard.insert(
+                key.clone(),
+                ReleaseCacheEntry {
+                    at: Instant::now(),
+                    repo,
+                    by_sha,
+                    fetched_ok,
+                    miss_streak,
+                },
+            );
+        }
+        end_release_refresh(&key, gen);
+    });
+}
+
+#[cfg(not(test))]
+fn begin_release_refresh(key: &str) -> Option<u64> {
+    let mut guard = RELEASE_INFLIGHT.lock().ok()?;
+    if guard.contains_key(key) {
+        return None;
+    }
+    let gen = RELEASE_REFRESH_GEN.fetch_add(1, Ordering::Relaxed);
+    guard.insert(key.to_string(), gen);
+    Some(gen)
+}
+
+#[cfg(not(test))]
+fn end_release_refresh(key: &str, gen: u64) {
+    if let Ok(mut guard) = RELEASE_INFLIGHT.lock() {
+        if guard.get(key) == Some(&gen) {
+            guard.remove(key);
+        }
+    }
 }
 
 /// The release tag for a running image, when one can be attributed.
@@ -567,32 +831,30 @@ fn lookup_release(releases: &HashMap<String, String>, sha: &str) -> Option<Strin
     releases.get(&hex[..hex.len().min(40)]).cloned()
 }
 
-async fn release_metadata(
+async fn published_release_index(
     client: &reqwest::Client,
     registry: &str,
     repo: &str,
 ) -> HashMap<String, String> {
     #[cfg(test)]
     {
-        let _ = (client, registry, repo);
-        let override_index = TEST_RELEASES.with(|cell| cell.borrow().clone());
-        if let Some(index) = override_index {
-            return index;
-        }
-        return HashMap::new();
+        let _ = (client, registry);
+        TEST_RELEASES
+            .with(|cell| cell.borrow().for_repo(repo))
+            .unwrap_or_default()
     }
     #[cfg(not(test))]
     {
-        fetch_release_tags(client, registry, repo).await
+        pull_release_tags(client, registry, repo).await.0
     }
 }
 
 #[cfg_attr(test, allow(dead_code))]
-async fn fetch_release_tags(
+async fn pull_release_tags(
     client: &reqwest::Client,
     registry: &str,
     repo: &str,
-) -> HashMap<String, String> {
+) -> (HashMap<String, String>, bool) {
     #[derive(serde::Deserialize)]
     struct Tag {
         name: String,
@@ -604,17 +866,11 @@ async fn fetch_release_tags(
     }
 
     if registry != "ghcr.io" || repo.matches('/').count() != 1 {
-        return HashMap::new();
-    }
-    if let Ok(guard) = RELEASE_CACHE.lock() {
-        if let Some(entry) = guard.as_ref() {
-            if entry.repo == repo && entry.at.elapsed() < CACHE_TTL {
-                return entry.by_sha.clone();
-            }
-        }
+        return (HashMap::new(), true);
     }
 
     let mut by_sha = HashMap::new();
+    let mut fetched_ok = false;
     for page in 1..=5 {
         let url = format!("https://api.github.com/repos/{repo}/tags?per_page=100&page={page}");
         let Ok(res) = client.get(&url).send().await else {
@@ -634,18 +890,17 @@ async fn fetch_release_tags(
                 .map(|tag| (tag.commit.sha, display_release(&tag.name))),
         );
         if count < 100 {
+            fetched_ok = true;
             break;
+        }
+        if page == 5 {
+            // Hit the page cap with a full last page — we have a usable prefix,
+            // but it isn't the complete tag list.
+            fetched_ok = true;
         }
     }
 
-    if let Ok(mut guard) = RELEASE_CACHE.lock() {
-        *guard = Some(ReleaseCacheEntry {
-            at: Instant::now(),
-            repo: repo.to_string(),
-            by_sha: by_sha.clone(),
-        });
-    }
-    by_sha
+    (by_sha, fetched_ok)
 }
 
 fn merge_release_tags(
@@ -665,12 +920,19 @@ fn merge_release_tags(
 
 #[cfg(test)]
 pub fn set_test_release_index(index: HashMap<String, String>) {
-    TEST_RELEASES.with(|cell| *cell.borrow_mut() = Some(index));
+    TEST_RELEASES.with(|cell| cell.borrow_mut().any = Some(index));
+}
+
+#[cfg(test)]
+pub fn set_test_release_index_for_repo(repo: &str, index: HashMap<String, String>) {
+    TEST_RELEASES.with(|cell| {
+        cell.borrow_mut().by_repo.insert(repo.to_string(), index);
+    });
 }
 
 #[cfg(test)]
 pub fn clear_test_release_index() {
-    TEST_RELEASES.with(|cell| *cell.borrow_mut() = None);
+    TEST_RELEASES.with(|cell| *cell.borrow_mut() = TestReleaseIndex::default());
 }
 
 /// Index commits by every short-sha length a tag might use.
@@ -962,6 +1224,60 @@ mod tests {
                 &HashMap::new(),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn release_lookup_uses_the_running_image_repo_not_the_panel_default() {
+        let configured = "ghcr.io/textile-protocol/textile-stitch:latest";
+        assert_eq!(
+            release_lookup_image(Some("ghcr.io/someone/fork:sha-24e9192"), &[], configured,),
+            "ghcr.io/someone/fork:sha-24e9192"
+        );
+        // Bare id: RepoDigests name the repo. The configured image is last resort.
+        assert_eq!(
+            release_lookup_image(
+                Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                &["ghcr.io/someone/fork@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()],
+                configured,
+            ),
+            "ghcr.io/someone/fork"
+        );
+        assert_eq!(
+            release_lookup_image(
+                Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                &[],
+                configured,
+            ),
+            configured
+        );
+    }
+
+    #[test]
+    fn release_cache_keys_are_per_registry_and_repository() {
+        assert_ne!(
+            release_cache_key("ghcr.io", "textile-protocol/textile-stitch"),
+            release_cache_key("ghcr.io", "someone/fork")
+        );
+        assert_eq!(
+            release_cache_key("ghcr.io", "someone/fork"),
+            "ghcr.io/someone/fork"
+        );
+    }
+
+    #[test]
+    fn a_missing_release_or_failed_fetch_retries_sooner_than_a_hit() {
+        assert_eq!(refresh_ttl(true, true, 0), CACHE_TTL);
+        assert_eq!(refresh_ttl(true, false, 1), RETRY_TTL);
+        assert_eq!(refresh_ttl(true, false, 4), CACHE_TTL);
+        assert_eq!(refresh_ttl(false, true, 0), RETRY_TTL);
+        assert_eq!(
+            release_sha_hint(
+                Some("ghcr.io/textile-protocol/textile-stitch:sha-24e9192"),
+                &HashMap::new(),
+            )
+            .as_deref(),
+            Some("24e9192")
         );
     }
 
