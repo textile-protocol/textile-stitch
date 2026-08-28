@@ -7,6 +7,7 @@
 pub mod catalog;
 pub mod custom;
 pub mod explorer;
+pub mod import_toml;
 pub mod macos;
 pub mod paths;
 pub mod process;
@@ -18,6 +19,7 @@ pub use catalog::{
 };
 pub use custom::CustomCorridor;
 pub use explorer::{address_explorer_url, explorer_base_url};
+pub use import_toml::validate_imported_toml;
 pub use paths::{
     app_state_dir, config_paths, default_dir, has_operator_files, home_dir, is_configured,
     legacy_gui_dirs, operator_address, operator_address_from_key, remember_config_dir,

@@ -262,6 +262,11 @@ pub struct CreateRequest {
     /// When present it takes precedence over `corridor_id`.
     #[serde(default)]
     pub custom: Option<CustomCorridor>,
+    /// A full `stitch.toml` to write as-is (admin-generated or hand-edited).
+    /// Mutually exclusive with `custom`. Validated through the same parser the
+    /// bot uses; `[signer]` and other secret keys are refused.
+    #[serde(default)]
+    pub toml: Option<String>,
     pub signer: SignerRequest,
     /// Start the bot immediately. Off by default: the recommended path is to
     /// approve Permit2 (costs a little gas) and dry-run first.
@@ -290,6 +295,30 @@ impl CreateRequest {
     /// pending preset, or invalid custom details) is refused before anything is
     /// written.
     fn resolve_corridor(&self) -> Result<ResolvedCorridor, ApiError> {
+        if self.custom.is_some() && self.toml.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+            return Err(ApiError::bad_request(
+                "send either custom corridor fields or a stitch.toml, not both",
+            ));
+        }
+
+        if let Some(raw) = self
+            .toml
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let toml = setup::validate_imported_toml(raw)
+                .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+            let cfg = crate::config::Config::from_toml(&toml)
+                .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+            return Ok(ResolvedCorridor {
+                toml,
+                container_label: None,
+                display_name: "a custom corridor".to_string(),
+                network_label: format!("chain {}", cfg.chain_id),
+            });
+        }
+
         if let Some(custom) = &self.custom {
             let toml = custom
                 .render()
@@ -1153,6 +1182,84 @@ mod tests {
             !h.root.join("bot-a").exists(),
             "the claimed directory must be released"
         );
+    }
+
+    fn imported_toml() -> String {
+        r#"
+chain_id        = 42220
+rpc_url         = "https://forno.celo.org"
+indexer_url     = "https://api.textilecredit.com"
+permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor         = "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"
+tick_interval_secs = 5
+
+[feed]
+url            = "https://api.textilecredit.com/price?chainId=42220&pair=cngn-usdt"
+staleness_secs = 900
+
+[[pools]]
+collateral = "0x1111111111111111111111111111111111111111"
+collateral_decimals = 6
+debt = "0x2222222222222222222222222222222222222222"
+debt_decimals = 6
+buy_offset_bps = 5
+sell_offset_bps = 5
+ttl_secs = 60
+"#
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_imported_toml_writes_the_file_verbatim() {
+        let h = harness("create-import-toml");
+        let toml_body = imported_toml();
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({ "name": "bot-a", "toml": toml_body, "signer": local(TEST_KEY) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let written = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(
+            written.contains("0x1111111111111111111111111111111111111111"),
+            "{written}"
+        );
+        assert!(crate::config::Config::from_toml(&written).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_imported_toml_with_a_signer_is_refused() {
+        let h = harness("create-import-signer");
+        let toml_body =
+            imported_toml() + "\n[signer]\nbackend = \"local\"\nprivate_key = \"0xabc\"\n";
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({ "name": "bot-a", "toml": toml_body, "signer": local(TEST_KEY) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("signer"), "{body}");
+        assert!(!h.root.join("bot-a").exists());
+    }
+
+    #[tokio::test]
+    async fn custom_fields_and_toml_together_are_refused() {
+        let h = harness("create-import-both");
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({
+                    "name": "bot-a",
+                    "custom": custom_body(),
+                    "toml": imported_toml(),
+                    "signer": local(TEST_KEY)
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("not both"), "{body}");
     }
 
     #[tokio::test]

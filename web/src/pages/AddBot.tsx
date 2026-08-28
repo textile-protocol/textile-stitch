@@ -109,6 +109,9 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   const [custom, setCustom] = useState<CustomState>(emptyCustom)
   // Within the corridor step, the custom picker swaps the list for the form.
   const [editingCustom, setEditingCustom] = useState(false)
+  const [customMode, setCustomMode] = useState<'fields' | 'toml'>('fields')
+  const [importedToml, setImportedToml] = useState('')
+  const [importError, setImportError] = useState<string | null>(null)
   const [name, setName] = useState('')
   const [signer, setSigner] = useState<SignerState>(emptySigner)
   const [start, setStart] = useState(false)
@@ -135,10 +138,13 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   const corridor = corridors.find((c) => c.id === corridorId)
   // The chain the new bot will trade on, for the shared-wallet check. Comes from
   // the preset, or from the custom form once a chain id is typed.
+  const importedChainId = chainIdFromToml(importedToml)
   const chainId = isCustom
-    ? Number.isInteger(Number(custom.chainId)) && Number(custom.chainId) > 0
-      ? Number(custom.chainId)
-      : undefined
+    ? customMode === 'toml'
+      ? importedChainId
+      : Number.isInteger(Number(custom.chainId)) && Number(custom.chainId) > 0
+        ? Number(custom.chainId)
+        : undefined
     : corridor?.chainId
 
   async function submit() {
@@ -169,7 +175,11 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
     try {
       const res = await api.createBot({
         name: name.trim(),
-        ...(isCustom ? { custom: buildCustom(custom) } : { corridorId }),
+        ...(isCustom
+          ? customMode === 'toml'
+            ? { toml: importedToml }
+            : { custom: buildCustom(custom) }
+          : { corridorId }),
         start: rfqDefault ? false : start,
         signer: buildSigner(signer),
       })
@@ -281,6 +291,45 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
       {step === 0 && editingCustom && (
         <Card title="Custom corridor details">
           <div className="space-y-4">
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setCustomMode('fields')}
+                className={`rounded-full px-3 py-1 text-sm ${
+                  customMode === 'fields'
+                    ? 'bg-accent text-on-accent'
+                    : 'bg-hover text-muted'
+                }`}
+              >
+                Enter the fields
+              </button>
+              <button
+                type="button"
+                onClick={() => setCustomMode('toml')}
+                className={`rounded-full px-3 py-1 text-sm ${
+                  customMode === 'toml'
+                    ? 'bg-accent text-on-accent'
+                    : 'bg-hover text-muted'
+                }`}
+              >
+                Import stitch.toml
+              </button>
+            </div>
+
+            {customMode === 'toml' ? (
+              <TomlImport
+                value={importedToml}
+                error={importError}
+                onChange={(next) => {
+                  setImportedToml(next)
+                  setImportError(null)
+                }}
+                onError={setImportError}
+                onBack={() => setEditingCustom(false)}
+                onNext={() => setStep(1)}
+              />
+            ) : (
+              <>
             <p className="text-sm text-muted">
               Just the essentials. Permit2, the indexer, spreads and order sizes
               use safe defaults you can change later on the bot&apos;s Settings
@@ -385,6 +434,8 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
                 Next
               </Button>
             </div>
+              </>
+            )}
           </div>
         </Card>
       )}
@@ -465,6 +516,80 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
         </Card>
       )}
     </div>
+  )
+}
+
+const MAX_TOML_BYTES = 64 * 1024
+
+function chainIdFromToml(toml: string): number | undefined {
+  const match = toml.match(/^\s*chain_id\s*=\s*(\d+)/m)
+  if (!match) return undefined
+  const value = Number(match[1])
+  return Number.isInteger(value) && value > 0 ? value : undefined
+}
+
+function TomlImport({
+  value,
+  error,
+  onChange,
+  onError,
+  onBack,
+  onNext,
+}: {
+  value: string
+  error: string | null
+  onChange: (next: string) => void
+  onError: (message: string | null) => void
+  onBack: () => void
+  onNext: () => void
+}) {
+  const ready = value.trim().length > 0 && value.length <= MAX_TOML_BYTES
+
+  const onFile = async (file: File | undefined) => {
+    if (!file) return
+    if (file.size > MAX_TOML_BYTES) {
+      onError(`File is larger than ${MAX_TOML_BYTES / 1024} KiB`)
+      return
+    }
+    onChange(await file.text())
+  }
+
+  return (
+    <>
+      <p className="text-sm text-muted">
+        Paste a stitch.toml from the corridor admin (or a shipped preset). The
+        file is validated on the server before anything is written. It must not
+        include a [signer] section — the next step collects the wallet.
+      </p>
+      <Field label="File">
+        <input
+          type="file"
+          accept=".toml,text/plain,application/toml"
+          className="text-sm"
+          onChange={(event) => void onFile(event.target.files?.[0])}
+        />
+      </Field>
+      <Field
+        label="stitch.toml"
+        hint="Or paste the file contents here."
+      >
+        <textarea
+          value={value}
+          rows={16}
+          spellCheck={false}
+          placeholder={'chain_id = 42220\nrpc_url = "https://…"\n…'}
+          onChange={(event) => onChange(event.target.value)}
+          className="w-full rounded-lg border border-line-soft bg-canvas p-3 font-mono text-xs leading-relaxed"
+        />
+      </Field>
+      {error && <Banner tone="danger">{error}</Banner>}
+      <div className="flex justify-between">
+        <Button onClick={onBack}>Back</Button>
+        <Button variant="primary" onClick={onNext} disabled={!ready}>
+          Next
+        </Button>
+      </div>
+    </>
   )
 }
 
