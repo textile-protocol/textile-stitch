@@ -9,6 +9,10 @@
 //
 //   node packages/stitch-bot/scripts/run-local.mjs
 //
+// Prices come from the app's `/api/price` endpoint, for setup as well as for
+// the bot — there is no on-chain oracle to read any more. That makes the feed a
+// hard prerequisite, so we wait for it before sizing anything.
+//
 // Env: STITCH_PRIVATE_KEY, FEED_URL (base), INDEXER_URL, BLOCKCHAIN_RPC_URL.
 // Production-like defaults are intentional: a short fill window, one book of
 // inventory, and max liquidity. Two defaults bend to the local chain instead of
@@ -51,7 +55,6 @@ const nonNegativeIntEnv = (name, fallback) => {
 const FEED_WAIT_SECONDS = positiveIntEnv('FEED_WAIT_SECONDS', 600)
 const FEED_PROBE_TIMEOUT_MS = positiveIntEnv('FEED_PROBE_TIMEOUT_MS', 8000)
 const FEED_STALENESS_SECS = positiveIntEnv('FEED_STALENESS_SECS', 900)
-const ORACLE_REFRESH_SECONDS = positiveIntEnv('ORACLE_REFRESH_SECONDS', 300)
 const STITCH_LOCAL_TTL_SECS = positiveIntEnv('STITCH_LOCAL_TTL_SECS', 120)
 // refresh_threshold_bps is a price-move gate: it re-signs a side (rotating its
 // Permit2 nonce) only once the feed moves that many bps. The local feed is a
@@ -80,24 +83,30 @@ if (!REACTOR) {
   process.exit(1)
 }
 
-// Same corridor map as the app's /api/price endpoint.
+// Same corridor keys as the app's /api/price endpoint. A corridor with no
+// registry row answers 404 there and is skipped below.
+//
+// Each leg lists its address keys in preference order, matching the local
+// seeds: the per-corridor collateral keys were written by the retired
+// corridor deploy, so on a fresh chain only `SETTLEMENT_V3_CNGN_MOCK` exists
+// and a single-key lookup would skip the pair the seed just registered.
 const CORRIDORS = {
   'cngn-usdt': {
-    oracle: 'SETTLEMENT_V3_USDT_CNGN_ORACLE',
-    soft: 'SETTLEMENT_V3_CNGN_MOCK',
-    stable: 'SETTLEMENT_V3_USDT',
+    soft: ['SETTLEMENT_V3_CNGN_MOCK'],
+    stable: ['SETTLEMENT_V3_USDT'],
   },
   'cngn-usdc': {
-    oracle: 'SETTLEMENT_V3_USDC_CNGN_ORACLE',
-    soft: 'SETTLEMENT_V3_CNGN_USDC_COLLATERAL',
-    stable: 'SETTLEMENT_V3_USDC',
+    soft: ['SETTLEMENT_V3_CNGN_USDC_COLLATERAL', 'SETTLEMENT_V3_CNGN_MOCK'],
+    stable: ['SETTLEMENT_V3_USDC'],
   },
   'copm-usdt': {
-    oracle: 'SETTLEMENT_V3_USDT_COPM_ORACLE',
-    soft: 'SETTLEMENT_V3_COPM_USDT_COLLATERAL',
-    stable: 'SETTLEMENT_V3_USDT',
+    soft: ['SETTLEMENT_V3_COPM_USDT_COLLATERAL'],
+    stable: ['SETTLEMENT_V3_USDT'],
   },
 }
+
+/** First address key that resolves to a deployed token, or undefined. */
+const pickAddress = (keys) => keys.map((key) => addrs[key]).find(Boolean)
 
 const chain = {
   id: 31337,
@@ -114,141 +123,109 @@ const erc20 = parseAbi([
   'function burn(address,uint256)',
   'function approve(address,uint256) returns (bool)',
 ])
-const oracleAbi = parseAbi(['function buyRate() view returns (uint256)'])
-const pushOracleAbi = parseAbi([
-  'function owner() view returns (address)',
-  'function lastBuyPriceRay() view returns (uint256)',
-  'function lastSellPriceRay() view returns (uint256)',
-  'function update(uint256 buyRay, uint256 sellRay)',
-])
-
-// Local PushOracles go stale 30 min after their last update (no keepalive job
-// runs locally), and then every read — including the /s/trade rate and this
-// bot's feed — reverts. Re-push each forward oracle's current price unchanged
-// (Δ=0, so no breaker trips); refreshing the forward side unsticks the reverse
-// inverter too. Impersonation only works on a test node, so this is local-only.
-const ZERO = '0x0000000000000000000000000000000000000000'
-async function refreshOracles() {
-  const oracles = [
-    ...new Set(
-      Object.entries(addrs)
-        .filter(
-          ([k, v]) =>
-            /^SETTLEMENT_V3_.*_ORACLE$/.test(k) &&
-            typeof v === 'string' &&
-            v &&
-            v.toLowerCase() !== ZERO
-        )
-        .map(([, v]) => v.toLowerCase())
-    ),
-  ]
-  let refreshed = 0
-  for (const oracle of oracles) {
-    let owner, buy, sell
-    try {
-      // Probe: a forward PushOracle exposes owner()/lastBuyPriceRay(); an
-      // OracleInverter reverts. Inverters derive from a forward, so skip them.
-      ;[owner, buy, sell] = await Promise.all([
-        pub.readContract({
-          address: oracle,
-          abi: pushOracleAbi,
-          functionName: 'owner',
-        }),
-        pub.readContract({
-          address: oracle,
-          abi: pushOracleAbi,
-          functionName: 'lastBuyPriceRay',
-        }),
-        pub.readContract({
-          address: oracle,
-          abi: pushOracleAbi,
-          functionName: 'lastSellPriceRay',
-        }),
-      ])
-    } catch {
-      continue // not a forward PushOracle — nothing to push
-    }
-    try {
-      await pub.request({
-        method: 'hardhat_setBalance',
-        params: [owner, '0x56BC75E2D63100000'],
-      })
-      await pub.request({
-        method: 'hardhat_impersonateAccount',
-        params: [owner],
-      })
-      const w = createWalletClient({
-        account: owner,
-        chain,
-        transport: http(RPC),
-      })
-      const hash = await w.writeContract({
-        address: oracle,
-        abi: pushOracleAbi,
-        functionName: 'update',
-        args: [buy, sell],
-      })
-      await pub.waitForTransactionReceipt({ hash })
-      await pub.request({
-        method: 'hardhat_stopImpersonatingAccount',
-        params: [owner],
-      })
-      refreshed += 1
-    } catch (e) {
-      console.warn(
-        `  oracle ${oracle} push failed: ${String(e.shortMessage || e).slice(0, 70)}`
-      )
-    }
-  }
-  return refreshed
-}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-// Keep oracles fresh: once now, then well inside the 30-min staleness window.
-console.log(`Refreshing oracles… (${await refreshOracles()} forward oracles)`)
+// A bot with no reachable feed silently skips every pool ("feed fetch failed")
+// and posts nothing. Make sure the app's price endpoint is up before starting.
+let lastFeedError = ''
+async function feedReachable() {
+  try {
+    // The web dev server (8916) serves /api/price after a cold Vite build, and
+    // the first response does 3 chain reads — well over a 1.5s budget — so give
+    // each probe room. The app's healthcheck only gates the API on :10000, not
+    // this web port, so we must wait it out here.
+    const url = `${FEED_BASE}?pair=cngn-usdt`
+    const r = await fetch(url, {
+      signal: AbortSignal.timeout(FEED_PROBE_TIMEOUT_MS),
+    })
+    if (r.ok) {
+      lastFeedError = ''
+      return true
+    }
+    const body = await r.text().catch(() => '')
+    lastFeedError = `${r.status} ${r.statusText}${
+      body ? `: ${body.slice(0, 240)}` : ''
+    }`
+    return false
+  } catch (error) {
+    lastFeedError = error instanceof Error ? error.message : String(error)
+    return false
+  }
+}
+let feedUp = false
+for (let i = 0; i < FEED_WAIT_SECONDS; i++) {
+  if (await feedReachable()) {
+    feedUp = true
+    break
+  }
+  if (i > 0 && i % 15 === 0) {
+    const detail = lastFeedError ? `; last error: ${lastFeedError}` : ''
+    console.log(`  still waiting for the price endpoint… (${i}s${detail})`)
+  }
+  await sleep(1000)
+}
+if (!feedUp) {
+  const detail = lastFeedError ? ` Last error: ${lastFeedError}.` : ''
+  console.error(
+    `\nPrice endpoint did not respond at ${FEED_BASE}?pair=cngn-usdt after ` +
+      `${FEED_WAIT_SECONDS}s.${detail} ` +
+      `The app container can be healthy before the Redwood web dev server ` +
+      `serves /api/price; increase FEED_WAIT_SECONDS if this host is still ` +
+      `building.`
+  )
+  process.exit(1)
+}
+console.log(`Using price endpoint ${FEED_BASE}.\n`)
 
-// Resolve every deployed corridor: decimals + the current price, and tally how
-// much of each token the operator must hold (bid → stable, ask → soft).
+/**
+ * Human stable-per-soft for a corridor (USDT per cNGN), from the same endpoint
+ * the bot itself quotes off. Throws when the corridor has no registry row —
+ * /api/price answers 4xx and the caller skips that corridor.
+ */
+async function corridorPrice(key) {
+  const url = `${FEED_BASE}?pair=${key}`
+  const r = await fetch(url, {
+    signal: AbortSignal.timeout(FEED_PROBE_TIMEOUT_MS),
+  })
+  if (!r.ok) {
+    const body = await r.text().catch(() => '')
+    throw new Error(
+      `${r.status} ${r.statusText}${body ? `: ${body.slice(0, 120)}` : ''}`
+    )
+  }
+  const { price } = await r.json()
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error(`feed returned a non-positive price (${price})`)
+  }
+  return price
+}
+
+// Resolve every registered corridor: decimals + the current price, and tally
+// how much of each token the operator must hold (bid → stable, ask → soft).
 const pools = []
 const need = {} // tokenAddr → bigint atomic
 const addNeed = (token, amt) => {
   need[token] = (need[token] || 0n) + amt
 }
 for (const [key, c] of Object.entries(CORRIDORS)) {
-  const oracle = addrs[c.oracle]
-  const soft = addrs[c.soft]
-  const stable = addrs[c.stable]
-  if (!oracle || !soft || !stable) continue // corridor not deployed locally
-  const read = () =>
-    Promise.all([
+  const soft = pickAddress(c.soft)
+  const stable = pickAddress(c.stable)
+  if (!soft || !stable) continue // tokens not deployed locally
+  try {
+    const [softDec, stableDec, price] = await Promise.all([
       pub.readContract({ address: soft, abi: erc20, functionName: 'decimals' }),
       pub.readContract({
         address: stable,
         abi: erc20,
         functionName: 'decimals',
       }),
-      pub.readContract({
-        address: oracle,
-        abi: oracleAbi,
-        functionName: 'buyRate',
-      }),
+      // Human stable per soft — the same number the bot quotes off, and the
+      // convention askSoftHuman below divides a USD notional by.
+      corridorPrice(key),
     ])
-  try {
-    // A just-refreshed inverter can momentarily revert on a cold start; retry once.
-    const [softDec, stableDec, br] = await read().catch(async () => {
-      await sleep(800)
-      return read()
-    })
     const sd = Number(softDec)
     const dd = Number(stableDec)
-    // human stable per soft (USDC per cNGN) — the convention askSoftHuman below
-    // divides a USD notional by. run-local prices off the INVERTER oracle, whose
-    // buyRate() is RAY * (atomic debt per atomic collateral), e.g. ~7.28e11 for
-    // cNGN/USDC. So br/1e27 is the atomic stable-per-soft rate; multiply by
-    // 10**(sd-dd) to lift it to human units. (The old code inverted this as
-    // 1e27/br, collapsing every ask to 1 soft token and posting zero sell depth.)
-    const price = (Number(br) / 1e27) * 10 ** (sd - dd) // human stable per soft
     const bidSizeAtomic = BigInt(TOTAL_ORDER_SIZE_USD) * 10n ** BigInt(dd) // stable
     const minBidSizeAtomic = BigInt(MIN_ORDER_SIZE_USD) * 10n ** BigInt(dd)
     const askSoftHuman = Math.max(1, Math.round(TOTAL_ORDER_SIZE_USD / price))
@@ -271,12 +248,16 @@ for (const [key, c] of Object.entries(CORRIDORS)) {
     })
   } catch (e) {
     console.warn(
-      `  skip ${key}: oracle read failed (${String(e.shortMessage || e).slice(0, 48)})`
+      `  skip ${key}: ${String(e.shortMessage || e.message || e).slice(0, 96)}`
     )
   }
 }
 if (pools.length === 0) {
-  console.error('No corridors deployed locally.')
+  console.error(
+    'No quotable corridors. The tokens must be deployed (yarn deploy:v3:local) ' +
+      'and the corridor registered — `yarn rw exec seedFillerOrderLocal` writes ' +
+      'the local cNGN/USDT row, or add one at /s/admin/corridors.'
+  )
   process.exit(1)
 }
 
@@ -407,9 +388,7 @@ maker_id = "${rfqMeta.makerId}"
 api_key_env = "STITCH_RFQ_API_KEY"
 validation_contract = "${rfqMeta.validationContract}"
 `
-  console.log(
-    `RFQ on — ${rfqMeta.makerSlug || rfqMeta.makerId} → ${rfqStream}`
-  )
+  console.log(`RFQ on — ${rfqMeta.makerSlug || rfqMeta.makerId} → ${rfqStream}`)
 } else {
   console.log(
     'RFQ off — run `yarn seed:rfq:local` then restart this bot to quote the venue.'
@@ -436,66 +415,6 @@ console.log(
 )
 console.log('')
 
-// A bot with no reachable feed silently skips every pool ("feed fetch failed")
-// and posts nothing. Make sure the app's price endpoint is up before starting.
-let lastFeedError = ''
-async function feedReachable() {
-  try {
-    // The web dev server (8916) serves /api/price after a cold Vite build, and
-    // the first response does 3 chain reads — well over a 1.5s budget — so give
-    // each probe room. The app's healthcheck only gates the API on :10000, not
-    // this web port, so we must wait it out here.
-    const url = `${FEED_BASE}?pair=cngn-usdt`
-    const r = await fetch(url, {
-      signal: AbortSignal.timeout(FEED_PROBE_TIMEOUT_MS),
-    })
-    if (r.ok) {
-      lastFeedError = ''
-      return true
-    }
-    const body = await r.text().catch(() => '')
-    lastFeedError = `${r.status} ${r.statusText}${
-      body ? `: ${body.slice(0, 240)}` : ''
-    }`
-    return false
-  } catch (error) {
-    lastFeedError = error instanceof Error ? error.message : String(error)
-    return false
-  }
-}
-let feedUp = false
-for (let i = 0; i < FEED_WAIT_SECONDS; i++) {
-  if (await feedReachable()) {
-    feedUp = true
-    break
-  }
-  if (i > 0 && i % 15 === 0) {
-    const detail = lastFeedError ? `; last error: ${lastFeedError}` : ''
-    console.log(`  still waiting for the price endpoint… (${i}s${detail})`)
-  }
-  await sleep(1000)
-}
-if (!feedUp) {
-  const detail = lastFeedError ? ` Last error: ${lastFeedError}.` : ''
-  console.error(
-    `\nPrice endpoint did not respond at ${FEED_BASE}?pair=cngn-usdt after ` +
-      `${FEED_WAIT_SECONDS}s.${detail} ` +
-      `The app container can be healthy before the Redwood web dev server ` +
-      `serves /api/price; increase FEED_WAIT_SECONDS if this host is still ` +
-      `building.`
-  )
-  process.exit(1)
-}
-console.log(`Using price endpoint ${FEED_BASE}.\n`)
-
-// Keep local oracles fresh inside the production-like feed staleness window.
-const refreshTimer = setInterval(
-  () => {
-    refreshOracles().catch(() => {})
-  },
-  ORACLE_REFRESH_SECONDS * 1000
-)
-
 const bot = spawn(
   'cargo',
   [
@@ -518,7 +437,6 @@ const bot = spawn(
   }
 )
 function cleanup(code) {
-  clearInterval(refreshTimer)
   process.exit(code ?? 0)
 }
 bot.on('exit', cleanup)
