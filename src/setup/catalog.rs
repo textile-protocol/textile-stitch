@@ -26,6 +26,36 @@ pub struct Corridor {
     pub pending_deploy: bool,
 }
 
+/// A corridor the panel can offer, from either source: a shipped preset or a row
+/// the Textile API lists.
+///
+/// Owned rather than `&'static`, because a corridor fetched at runtime has no
+/// static lifetime to borrow from. Every caller that used to hold a
+/// `&'static Corridor` — create, switch, add-pool — takes one of these instead,
+/// so the two sources are indistinguishable downstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorridorEntry {
+    pub id: String,
+    pub display_name: String,
+    pub network_label: String,
+    pub chain_id: u64,
+    pub toml_template: String,
+    pub pending_deploy: bool,
+}
+
+impl From<&Corridor> for CorridorEntry {
+    fn from(c: &Corridor) -> Self {
+        Self {
+            id: c.id.to_string(),
+            display_name: c.display_name.to_string(),
+            network_label: c.network_label.to_string(),
+            chain_id: c.chain_id,
+            toml_template: c.toml_template.to_string(),
+            pending_deploy: c.pending_deploy,
+        }
+    }
+}
+
 const CORRIDORS: &[Corridor] = &[
     Corridor {
         id: "cngn-usdt-bsc",
@@ -173,6 +203,86 @@ pub fn identify_pair(chain_id: u64, collateral: &str, debt: &str) -> Option<&'st
         c.chain_id == chain_id
             && corridor_pair(c).is_some_and(|have| want.0 == have.0 && want.1 == have.1)
     })
+}
+
+/// Who a pool's corridor is: the id Textile knows it by, plus how to name it.
+///
+/// Owned, because it comes from either the embedded catalog (`&'static`) or the
+/// config file itself (runtime strings) and callers must not care which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorridorIdentity {
+    pub id: String,
+    pub display_name: String,
+    pub network_label: String,
+}
+
+impl From<&Corridor> for CorridorIdentity {
+    fn from(c: &Corridor) -> Self {
+        Self {
+            id: c.id.to_string(),
+            display_name: c.display_name.to_string(),
+            network_label: c.network_label.to_string(),
+        }
+    }
+}
+
+/// What one pool's corridor is — the identity the file carries, else whatever
+/// the shipped catalog recognises the pair as.
+///
+/// The stamp wins because it is the only one that can be right for a corridor
+/// listed after this release: the catalog cannot name a market it doesn't ship.
+/// The catalog stays as the fallback for presets and hand-written configs,
+/// which carry no stamp. A pool with neither is a custom corridor and has no
+/// identity to report — that's `None`, and callers already render it from the
+/// token addresses.
+pub fn pool_identity(chain_id: u64, pool: &crate::config::PoolConfig) -> Option<CorridorIdentity> {
+    stamped_identity(pool).or_else(|| {
+        identify_pair(chain_id, &pool.collateral, &pool.debt).map(CorridorIdentity::from)
+    })
+}
+
+/// The identity written into the pool, if it carries a usable one.
+///
+/// All three fields are required together. A file with an id but no names would
+/// otherwise produce a corridor labeled with a raw database id, which is worse
+/// in the UI than falling through to the address pair.
+fn stamped_identity(pool: &crate::config::PoolConfig) -> Option<CorridorIdentity> {
+    let field = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(CorridorIdentity {
+        id: field(&pool.corridor_id)?,
+        display_name: field(&pool.corridor_name)?,
+        network_label: field(&pool.corridor_network)?,
+    })
+}
+
+/// The bot's corridor identity: its first pool's.
+///
+/// The stamped counterpart to [`identify_corridor`], and what every caller that
+/// asks "which corridor is this bot" should use. Same first-pool rule, same
+/// `None` for a config that names no corridor we can identify.
+pub fn config_identity(toml_str: &str) -> Option<CorridorIdentity> {
+    let cfg = crate::config::Config::from_toml(toml_str).ok()?;
+    pool_identity(cfg.chain_id, cfg.pools.first()?)
+}
+
+/// The chain and first pool's `(collateral, debt)` a `stitch.toml` quotes, all
+/// lowercased. `None` when the file doesn't parse or has no pool to key on.
+///
+/// Used to line a remote corridor up against the shipped presets: two configs
+/// describe the same market exactly when this matches.
+pub fn pair_of_config(toml_str: &str) -> Option<(u64, String, String)> {
+    let cfg = crate::config::Config::from_toml(toml_str).ok()?;
+    let pool = cfg.pools.first()?;
+    Some((
+        cfg.chain_id,
+        pool.collateral.to_lowercase(),
+        pool.debt.to_lowercase(),
+    ))
 }
 
 /// The first pool's `(collateral, debt)` token addresses, lowercased, parsed from
@@ -363,5 +473,124 @@ mod tests {
             Some(42220),
             "a pool-less config still resolves to a chain-only match"
         );
+    }
+
+    /// A config for a pair the catalog will never ship, optionally carrying the
+    /// corridor identity Textile's renderer stamps into it.
+    fn novel_config(identity: &str) -> String {
+        format!(
+            r#"
+chain_id = 42220
+rpc_url = "https://forno.celo.org"
+indexer_url = "https://api.textilecredit.com"
+permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor = "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"
+tick_interval_secs = 5
+
+[feed]
+url = "https://api.textilecredit.com/price?chainId=42220&pair=aaa-usdt"
+staleness_secs = 900
+
+[[pools]]
+collateral = "0x1111111111111111111111111111111111111111"
+collateral_decimals = 6
+debt = "0x2222222222222222222222222222222222222222"
+debt_decimals = 6
+{identity}
+buy_offset_bps = 5
+buy_total_liquidity_debt = "max"
+buy_min_slice_debt = "10000000"
+buy_max_orders = 40
+sell_offset_bps = 5
+sell_total_liquidity_collateral = "max"
+sell_min_slice_debt = "10000000"
+sell_max_orders = 40
+ttl_secs = 60
+refresh_threshold_bps = 0
+"#
+        )
+    }
+
+    const STAMP: &str = r#"corridor_id = "cmnovelcorridor"
+corridor_name = "AAA → USDT"
+corridor_network = "Celo""#;
+
+    #[test]
+    fn a_corridor_the_catalog_never_shipped_still_names_itself() {
+        // The reason the stamp exists: the catalog compiled into this binary
+        // cannot identify a market listed after the release, so without it the
+        // panel shows raw addresses and the access request names no corridor.
+        let toml = novel_config(STAMP);
+        assert!(
+            identify_corridor(&toml).is_none(),
+            "the catalog genuinely doesn't know this pair"
+        );
+        let identity = config_identity(&toml).expect("the file names itself");
+        assert_eq!(identity.id, "cmnovelcorridor");
+        assert_eq!(identity.display_name, "AAA → USDT");
+        assert_eq!(identity.network_label, "Celo");
+    }
+
+    #[test]
+    fn an_unstamped_config_still_falls_back_to_the_catalog() {
+        // Shipped presets and hand-written configs carry no stamp, and must keep
+        // resolving exactly as before.
+        let preset = find_corridor("cngn-usdt-celo").unwrap();
+        let identity = config_identity(preset.toml_template).expect("the preset resolves");
+        assert_eq!(identity.id, "cngn-usdt-celo");
+        assert_eq!(identity.display_name, preset.display_name);
+        assert_eq!(identity.network_label, preset.network_label);
+    }
+
+    #[test]
+    fn a_custom_corridor_has_no_identity_to_report() {
+        // Neither stamped nor shipped: callers render it from the addresses.
+        assert!(config_identity(&novel_config("")).is_none());
+    }
+
+    #[test]
+    fn a_half_written_stamp_falls_through_rather_than_showing_a_raw_id() {
+        // An id with no names would label the corridor with a database row id,
+        // which reads worse than the address pair it would otherwise fall back
+        // to. All three or none.
+        let toml = novel_config(r#"corridor_id = "cmnovelcorridor""#);
+        assert!(config_identity(&toml).is_none());
+
+        let blank = novel_config(
+            "corridor_id = \"cmnovelcorridor\"\ncorridor_name = \"  \"\ncorridor_network = \"Celo\"",
+        );
+        assert!(config_identity(&blank).is_none(), "a blank name is no name");
+    }
+
+    #[test]
+    fn a_stamp_wins_over_the_catalog_for_the_same_pair() {
+        // Textile renamed a corridor, or reused a pair under a new row. The file
+        // is the more recent truth; the catalog is only ever the fallback.
+        let preset = find_corridor("cngn-usdt-celo").unwrap();
+        let stamp = concat!(
+            "collateral_decimals = 6\n",
+            "corridor_id = \"cmrowid\"\n",
+            "corridor_name = \"cNGN => USDT\"\n",
+            "corridor_network = \"Celo\"",
+        );
+        let stamped = preset
+            .toml_template
+            .replace("collateral_decimals = 6", stamp);
+        let identity = config_identity(&stamped).expect("resolves");
+        assert_eq!(identity.id, "cmrowid");
+        assert_eq!(identity.display_name, "cNGN => USDT");
+    }
+
+    #[test]
+    fn each_pool_carries_its_own_identity() {
+        // A multi-pool bot must not stamp pool 0's corridor onto the others —
+        // that is the same mistake `identify_pair` exists to avoid.
+        let cfg = crate::config::Config::from_toml(&novel_config(STAMP)).unwrap();
+        assert_eq!(
+            pool_identity(cfg.chain_id, &cfg.pools[0]).map(|c| c.id),
+            Some("cmnovelcorridor".to_string())
+        );
+        let unstamped = crate::config::Config::from_toml(&novel_config("")).unwrap();
+        assert!(pool_identity(unstamped.chain_id, &unstamped.pools[0]).is_none());
     }
 }

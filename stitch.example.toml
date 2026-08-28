@@ -119,6 +119,17 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # limit_taker_min_profit_debt = "50000"  # skip fills clearing < 0.05 USDC (6dp)
 # limit_taker_max_orders = 10            # per executeBatch
 
+# ----- Which corridor this pool is. Written by whatever generated the file
+# (the panel's Add-a-bot step, or the corridor admin) and read back for the
+# labels you see in the panel and for the corridor named on an access request.
+# The bot itself ignores them. Absent is fine — Stitch then recognises the pair
+# from the corridors shipped in its own release, which is all it could do before
+# these keys existed. Don't invent values: an id Textile doesn't know is worse
+# than none.
+# corridor_id = "cmb3k1x0000abcd"
+# corridor_name = "cNGN / USDT"
+# corridor_network = "Celo"
+
 # ----- Swap quoting (RFQ). Prefer the panel Settings form over editing this
 # by hand. Connect writes maker id, stream URL, and rfq-api.key. WARNING:
 # enabling it signs firm, taker-bound orders against your funded wallet.

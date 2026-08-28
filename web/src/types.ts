@@ -76,6 +76,17 @@ export interface Corridor {
   pendingDeploy: boolean
 }
 
+export interface CorridorList {
+  corridors: Corridor[]
+  /**
+   * `api` when Textile's corridor registry answered, `embedded` when the panel
+   * fell back to the corridors compiled into this build.
+   */
+  source: 'api' | 'embedded'
+  /** Why the registry is missing, in operator words. Null when it isn't. */
+  warning: string | null
+}
+
 export interface Spread {
   kind: 'bps' | 'abs'
   value: string

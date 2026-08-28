@@ -163,26 +163,33 @@ async fn read_allowance(
     Ok(U256::from_be_slice(&out[out.len() - 32..]))
 }
 
-/// Ticker per token address, taken from the corridor catalog.
+/// The two tickers in a corridor's display name, collateral first.
 ///
-/// A corridor's `display_name` is `"<collateral> / <debt>"`, which is the only
-/// place the panel knows tickers at all — the config carries addresses. A pool
-/// the catalog doesn't recognise contributes nothing and falls back to an
-/// address.
+/// Shipped presets write `"cNGN / USDT"`; Textile's registry writes
+/// `"cNGN → USDT"`. Both are "collateral <separator> debt", so accept either
+/// rather than silently falling back to addresses on half the corridors.
+fn split_pair_name(display_name: &str) -> Option<(&str, &str)> {
+    ["/", "→", "->"]
+        .iter()
+        .find_map(|sep| display_name.split_once(*sep))
+        .map(|(collateral, debt)| (collateral.trim(), debt.trim()))
+        .filter(|(collateral, debt)| !collateral.is_empty() && !debt.is_empty())
+}
+
+/// Ticker per token address, from the corridor's display name.
+///
+/// That name is the only place the panel knows tickers at all — the config
+/// carries addresses. A pool with no identity contributes nothing and falls back
+/// to an address.
 fn token_symbols(cfg: &Config) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for pool in &cfg.pools {
-        let Some(corridor) =
-            crate::setup::identify_pair(cfg.chain_id, &pool.collateral, &pool.debt)
-        else {
+        let Some(corridor) = crate::setup::pool_identity(cfg.chain_id, pool) else {
             continue;
         };
-        if let Some((collateral, debt)) = corridor.display_name.split_once(" / ") {
-            out.insert(
-                pool.collateral.to_lowercase(),
-                collateral.trim().to_string(),
-            );
-            out.insert(pool.debt.to_lowercase(), debt.trim().to_string());
+        if let Some((collateral, debt)) = split_pair_name(&corridor.display_name) {
+            out.insert(pool.collateral.to_lowercase(), collateral.to_string());
+            out.insert(pool.debt.to_lowercase(), debt.to_string());
         }
     }
     out
@@ -193,8 +200,8 @@ fn token_symbols(cfg: &Config) -> std::collections::HashMap<String, String> {
 fn token_corridors(cfg: &Config) -> std::collections::HashMap<String, Vec<String>> {
     let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for pool in &cfg.pools {
-        let label = crate::setup::identify_pair(cfg.chain_id, &pool.collateral, &pool.debt)
-            .map(|c| c.display_name.to_string())
+        let label = crate::setup::pool_identity(cfg.chain_id, pool)
+            .map(|c| c.display_name)
             .unwrap_or_else(|| {
                 format!(
                     "{} / {}",

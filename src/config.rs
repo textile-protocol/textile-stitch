@@ -439,6 +439,26 @@ pub struct PoolConfig {
     /// Kept so existing configs that already set it still parse.
     #[serde(default)]
     pub rfq_corridor: Option<String>,
+    /// Which corridor this pool is, stamped by whoever rendered the file.
+    ///
+    /// Identity used to be *recomputed* — match the pair against the corridor
+    /// catalog compiled into the binary — which stops working the moment the
+    /// corridor list outlives the release: a market listed after this build
+    /// isn't in that catalog, so the panel would show raw token addresses and
+    /// send an access request naming no corridor. Carrying it in the file fixes
+    /// that for good, survives an API outage, and needs nothing async.
+    ///
+    /// Absent on shipped presets and hand-written configs; the catalog lookup is
+    /// still the fallback, so nothing regresses when it isn't here. The bot
+    /// itself never reads these — they're for the panel's labels and the venue.
+    #[serde(default)]
+    pub corridor_id: Option<String>,
+    /// The pair as Textile displays it, e.g. `cNGN → USDT`.
+    #[serde(default)]
+    pub corridor_name: Option<String>,
+    /// The network as Textile displays it, e.g. `Celo`.
+    #[serde(default)]
+    pub corridor_network: Option<String>,
 
     // ----- Buy side (bid below mid — "buy low"). Configure a spread (one of
     // bps / abs) and a size to enable it; omit to run sell-only. The operator

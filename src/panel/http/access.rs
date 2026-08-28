@@ -119,7 +119,10 @@ pub async fn request_access(
     let api_key = read_bot_key(dir).await?;
     let origin = venue_origin_from_config(&cfg, body.venue_url.as_deref());
     let venue = maker_access_request_url(&origin);
-    let corridor = setup::identify_corridor(&current_toml).map(|c| c.id.to_string());
+    // The identity the config carries, falling back to the catalog. Recomputing
+    // it from the catalog alone would name no corridor for a market listed after
+    // this Stitch release — leaving Textile to guess which one to seat.
+    let corridor = setup::config_identity(&current_toml).map(|c| c.id);
 
     let response = venue_client()?
         .post(&venue)
@@ -406,6 +409,106 @@ mod tests {
             axum::serve(listener, app).await.ok();
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// A venue that records the corridor each access request named, so a test
+    /// can assert Textile is told which market to seat.
+    async fn recording_access_venue(
+        expect_key: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Option<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorder = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v2/maker/access-request",
+            post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let recorder = recorder.clone();
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        assert_eq!(auth, format!("Bearer {expect_key}"));
+                        *recorder.lock().unwrap() = Some(body["corridor"].clone());
+                        Json(json!({ "accessStatus": "PENDING", "requestId": "clreq1" }))
+                    }
+                },
+            ),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), seen, handle)
+    }
+
+    /// The shipped cNGN/USDT BSC preset, restamped as a corridor Textile listed
+    /// after this release: same pair, but named by a registry row id the catalog
+    /// has never seen.
+    fn seed_registry_corridor(h: &Harness, name: &str) {
+        seed(h, name);
+        let path = h.root.join(name).join("stitch.toml");
+        let toml = std::fs::read_to_string(&path).unwrap();
+        let stamp = concat!(
+            "collateral_decimals = 6\n",
+            "corridor_id = \"cmregistryrow\"\n",
+            "corridor_name = \"cNGN / USDT\"\n",
+            "corridor_network = \"BNB Smart Chain\"",
+        );
+        std::fs::write(&path, toml.replace("collateral_decimals = 6", stamp)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_access_request_names_the_corridor_the_config_carries() {
+        // Without the stamp the panel would have to recompute the corridor from
+        // the catalog compiled into it, which cannot name a market listed after
+        // this release — so Textile would get a request with no corridor on it
+        // and no way to know which market to seat.
+        let h = harness("rfq-access-corridor");
+        seed_registry_corridor(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
+        let (venue, seen, _server) = recording_access_venue("tx_live_enroll_secret").await;
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/rfq/access-request",
+                json!({ "venueUrl": venue, "contactEmail": "desk@example.com" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(json!("cmregistryrow")),
+            "the registry id, not the catalog slug it happens to share a pair with"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstamped_bot_still_names_its_catalog_corridor() {
+        let h = harness("rfq-access-preset-corridor");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
+        let (venue, seen, _server) = recording_access_venue("tx_live_enroll_secret").await;
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/rfq/access-request",
+                json!({ "venueUrl": venue, "contactEmail": "desk@example.com" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(json!("cngn-usdt-bsc")),
+            "the catalog fallback still works for a shipped preset"
+        );
     }
 
     #[test]

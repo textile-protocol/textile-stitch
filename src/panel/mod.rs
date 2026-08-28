@@ -21,6 +21,7 @@
 pub mod auth;
 pub mod compose;
 pub mod config;
+pub mod corridors;
 pub mod docker;
 pub mod http;
 pub mod inventory;
@@ -31,6 +32,7 @@ pub mod updates;
 pub mod versions;
 
 pub use config::{AuthMode, PanelConfig, PanelRuntime};
+pub use corridors::CorridorCatalog;
 pub use docker::{DockerApi, STOP_GRACE_SECS};
 pub use inventory::{discover, Bot, Fleet, Layout, Origin, Warning};
 pub use naming::{container_name, validate_bot_id};

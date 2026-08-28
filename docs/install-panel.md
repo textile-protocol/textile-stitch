@@ -545,10 +545,20 @@ Everything is read from the environment at startup. Nothing is stored.
 | `STITCH_PANEL_ALLOW_INSECURE_BIND` | off | Permit a routable bind. You own the consequences. |
 | `STITCH_PANEL_TRUST_IDENTITY_HEADER` | off | Believe `Tailscale-User-Login`. Required for tailnet-login auth, never inferred from the bind. Also requires `STITCH_PANEL_IDENTITY_PROXY_ONLY=1`. |
 | `STITCH_PANEL_IDENTITY_PROXY_ONLY` | off | Attest that an authenticated reverse proxy is the sole peer on the listener (sets and strips the identity header). Required with `TRUST_IDENTITY_HEADER`. The sidecar layout in `docker-compose.panel.yml` sets both for you. |
+| `STITCH_PANEL_CORRIDOR_API` | `https://api.textilecredit.com` | Where the Add-a-bot wizard reads the corridor list from. Set to `off` to pin the panel to the corridors compiled into the binary and never call out. |
 | `RUST_LOG` | `info` | Log verbosity. |
 
 At least one of `STITCH_PANEL_TAILNET_USERS` and `STITCH_PANEL_PASSWORD_HASH` must
 be set. There is no anonymous mode.
+
+The corridor list is Textile's, not the binary's: the wizard asks
+`STITCH_PANEL_CORRIDOR_API` which corridors are listed and writes the config that
+comes back with the one you pick, so a corridor listed on the site is selectable
+on your next page load with no Stitch upgrade. The request is unauthenticated and
+carries nothing about you. When it fails the panel falls back to the corridors
+built into this release and says so above the picker — the wizard still works,
+it's just older. Corridors Stitch ships a tuned preset for (cNGN/USDT and
+friends) keep that preset's spreads rather than the generic ones the API renders.
 
 `STITCH_PANEL_HOST_BOTS_DIR` matters more than it looks: bind mounts are resolved
 by the Docker daemon on the host, so a path that's correct inside the panel

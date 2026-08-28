@@ -212,7 +212,8 @@ impl Warning {
 /// load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigSummary {
-    /// Catalog corridor id, when the config matches a shipped corridor.
+    /// The corridor id: stamped into the config when it was written from a
+    /// known corridor, else the shipped catalog's id for the pair.
     pub corridor_id: Option<String>,
     /// Human label, e.g. "cNGN / USDT on BNB Smart Chain".
     pub corridor_label: Option<String>,
@@ -697,17 +698,17 @@ fn read_summary(path: &Path, warnings: &mut Vec<Warning>) -> Option<ConfigSummar
 }
 
 /// Fleet / detail subtitle. One pool keeps the pair name; several pools would
-/// otherwise show whichever corridor `identify_corridor` keys off first.
+/// otherwise show whichever corridor `config_identity` keys off first.
 fn fleet_corridor_label(
     pools: usize,
-    corridor: Option<&setup::Corridor>,
+    corridor: Option<&setup::CorridorIdentity>,
     chain_id: u64,
 ) -> Option<String> {
-    let network = corridor.map(|c| c.network_label).or_else(|| {
+    let network = corridor.map(|c| c.network_label.clone()).or_else(|| {
         setup::catalog()
             .iter()
             .find(|c| c.chain_id == chain_id)
-            .map(|c| c.network_label)
+            .map(|c| c.network_label.to_string())
     });
     if pools > 1 {
         return Some(match network {
@@ -726,11 +727,18 @@ fn fleet_corridor_label(
 /// canonical `stitch.key` would either miss it or pick up an unrelated bot's.
 pub fn summarise(toml_str: &str, config_path: &Path) -> Result<ConfigSummary> {
     let parsed = crate::config::Config::from_toml(toml_str)?;
-    let corridor = setup::identify_corridor(toml_str);
+    // Stamped identity first, catalog second — a corridor listed after this
+    // release is in no catalog this binary carries, and reporting it as null
+    // would take the Fleet label and the RFQ corridor prefill down with it.
+    let corridor = setup::config_identity(toml_str);
     let signer = setup::read_signer(toml_str);
     Ok(ConfigSummary {
-        corridor_id: corridor.map(|c| c.id.to_string()),
-        corridor_label: fleet_corridor_label(parsed.pools.len(), corridor, parsed.chain_id),
+        corridor_id: corridor.as_ref().map(|c| c.id.clone()),
+        corridor_label: fleet_corridor_label(
+            parsed.pools.len(),
+            corridor.as_ref(),
+            parsed.chain_id,
+        ),
         chain_id: parsed.chain_id,
         pools: parsed.pools.len(),
         operator_address: operator_address(&signer, config_path),

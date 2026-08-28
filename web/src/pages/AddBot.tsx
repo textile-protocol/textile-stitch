@@ -94,14 +94,21 @@ function buildCustom(c: CustomState) {
  * pre-filled or read back — the API has no route that returns key material
  * (Create wallet returns a phrase once at generation time only).
  *
- * The corridor step also offers "Custom": a short form for a pair the catalog
- * doesn't ship yet. It collects only what can't be defaulted (chain, RPC,
- * reactor, the two tokens, a price feed); Permit2, the indexer, spreads and sizes
- * default and are editable later from the bot's Settings.
+ * The corridor list comes from Textile, not from this build: a corridor listed
+ * on the site shows up here on the next page load, with the config already
+ * generated for it. When the panel can't reach Textile it serves the corridors
+ * compiled into it and says so.
+ *
+ * The step also offers "Custom": a short form for a pair Textile doesn't list at
+ * all. It collects only what can't be defaulted (chain, RPC, reactor, the two
+ * tokens, a price feed); Permit2, the indexer, spreads and sizes default and are
+ * editable later from the bot's Settings.
  */
 export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean }) {
   const navigate = useNavigate()
   const [corridors, setCorridors] = useState<Corridor[] | null>(null)
+  // Set when the panel served its built-in list because Textile was unreachable.
+  const [catalogWarning, setCatalogWarning] = useState<string | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
 
   const [step, setStep] = useState(0)
@@ -124,6 +131,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
       .corridors()
       .then((r) => {
         setCorridors(r.corridors)
+        setCatalogWarning(r.warning)
         // Pending corridors are listed but can't be built, so never preselect
         // one — the Next button would be dead on arrival.
         setCorridorId(r.corridors.find((c) => !c.pendingDeploy)?.id ?? '')
@@ -213,6 +221,11 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
 
       {step === 0 && !editingCustom && (
         <Card title="Which corridor should it quote?">
+          {catalogWarning && (
+            <div className="mb-3">
+              <Banner tone="warning">{catalogWarning}</Banner>
+            </div>
+          )}
           <div className="space-y-3">
             {corridors.map((c) => (
               <label

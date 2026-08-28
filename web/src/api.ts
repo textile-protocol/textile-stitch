@@ -10,7 +10,7 @@ import type {
   Allowances,
   Bot,
   BotVersions,
-  Corridor,
+  CorridorList,
   CreateBotResult,
   Fleet,
   MigrationResult,
@@ -140,7 +140,7 @@ export const api = {
 
   fleet: () => request<Fleet>('/api/bots'),
   bot: (name: string) => request<Bot>(`/api/bots/${encodeURIComponent(name)}`),
-  corridors: () => request<{ corridors: Corridor[] }>('/api/corridors'),
+  corridors: () => request<CorridorList>('/api/corridors'),
 
   createBot: (body: unknown) =>
     request<CreateBotResult>('/api/bots', json(body)),

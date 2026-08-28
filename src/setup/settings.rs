@@ -631,16 +631,21 @@ fn summarize_pools(cfg: &Config) -> Vec<PoolSummary> {
         .iter()
         .enumerate()
         .map(|(index, p)| {
-            let identified = super::catalog::identify_pair(cfg.chain_id, &p.collateral, &p.debt);
+            // Prefers the identity stamped into the pool, so a corridor listed
+            // after this release still names itself instead of degrading to a
+            // pair of raw addresses.
+            let identified = super::catalog::pool_identity(cfg.chain_id, p);
             PoolSummary {
                 index,
                 pair: identified
-                    .map(|c| c.display_name.to_string())
+                    .as_ref()
+                    .map(|c| c.display_name.clone())
                     .unwrap_or_else(|| {
                         format!("{} / {}", short_addr(&p.collateral), short_addr(&p.debt))
                     }),
-                corridor_id: identified.map(|c| c.id.to_string()),
+                corridor_id: identified.as_ref().map(|c| c.id.clone()),
                 corridor_label: identified
+                    .as_ref()
                     .map(|c| format!("{} — {}", c.display_name, c.network_label)),
                 collateral: p.collateral.clone(),
                 debt: p.debt.clone(),

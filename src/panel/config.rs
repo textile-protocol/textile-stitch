@@ -132,6 +132,13 @@ pub struct PanelConfig {
     pub bot_uid: u32,
     /// Docker Engine vs local process supervision.
     pub runtime: PanelRuntime,
+    /// Textile API origin the wizard reads the corridor list from.
+    ///
+    /// `None` turns the fetch off and pins the panel to the corridors compiled
+    /// into this binary — set `STITCH_PANEL_CORRIDOR_API=off` for a panel that
+    /// must never call home. Tests default to `None` so no suite depends on the
+    /// network.
+    pub corridor_api_url: Option<String>,
 }
 
 impl PanelConfig {
@@ -187,6 +194,7 @@ impl PanelConfig {
             bot_image: string_var("STITCH_PANEL_BOT_IMAGE", DEFAULT_BOT_IMAGE),
             bot_uid: uid_var("STITCH_PANEL_BOT_UID", default_uid)?,
             runtime,
+            corridor_api_url: corridor_api_from_env()?,
         })
     }
 
@@ -239,8 +247,33 @@ impl PanelConfig {
             bot_image: DEFAULT_BOT_IMAGE.to_string(),
             bot_uid: current_uid(),
             runtime: PanelRuntime::Docker,
+            // No suite may depend on Textile being reachable. Tests that want
+            // the remote catalog point this at their own mock server.
+            corridor_api_url: None,
         }
     }
+}
+
+/// The corridor-list origin: Textile's API by default, an operator-chosen origin
+/// when set, or nothing at all for `off` / `none` / an empty value.
+///
+/// Validated here rather than at first use so a typo fails at startup with a
+/// clear message, instead of silently degrading every wizard load to the
+/// built-in list minutes later.
+fn corridor_api_from_env() -> Result<Option<String>> {
+    let raw = match std::env::var("STITCH_PANEL_CORRIDOR_API") {
+        Err(_) => return Ok(Some(crate::setup::DEFAULT_CORRIDOR_API.to_string())),
+        Ok(v) => v.trim().to_string(),
+    };
+    if raw.is_empty() || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let parsed = url::Url::parse(&raw)
+        .with_context(|| format!("STITCH_PANEL_CORRIDOR_API must be a URL, not {raw:?}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("STITCH_PANEL_CORRIDOR_API must be an http(s) URL, not {raw:?}");
+    }
+    Ok(Some(raw))
 }
 
 fn runtime_from_env() -> Result<PanelRuntime> {

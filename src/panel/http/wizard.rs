@@ -2,10 +2,12 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Adding a bot.
 //!
-//! The corridor list and the file writing both come from [`crate::setup`], the
-//! same code the desktop wizard runs, so a config created here is byte-identical
-//! to one created there. This module only translates JSON into a
-//! [`setup::SignerSetup`] and then creates the container.
+//! The corridor list comes from [`crate::panel::corridors`] — Textile's registry
+//! when it answers, the presets compiled into this binary when it doesn't — and
+//! the file writing from [`crate::setup`], the same code the desktop wizard
+//! runs, so a config created here is byte-identical to one created there. This
+//! module only translates JSON into a [`setup::SignerSetup`] and then creates
+//! the container.
 //!
 //! Secrets are write-only. They arrive in the request body, go through the writer
 //! into an owner-only file, and are never read back by any route.
@@ -17,38 +19,56 @@ use serde::{Deserialize, Serialize};
 
 use super::{bots, ApiError, AppState};
 use crate::panel::{naming, provision};
-use crate::setup::{self, CustomCorridor, LocalKeyMaterial, SignerSetup};
+use crate::setup::{self, CorridorEntry, CustomCorridor, LocalKeyMaterial, SignerSetup};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CorridorBody {
-    pub id: &'static str,
-    pub display_name: &'static str,
-    pub network_label: &'static str,
+    pub id: String,
+    pub display_name: String,
+    pub network_label: String,
     pub chain_id: u64,
-    /// The `stitch.toml` this corridor ships, so the wizard can show exactly what
-    /// it is about to write.
-    pub toml_template: &'static str,
+    /// The `stitch.toml` this corridor writes, so the wizard can show exactly
+    /// what it is about to do.
+    pub toml_template: String,
     /// Listed for visibility, but not yet selectable: the corridor's contracts
     /// aren't deployed, so its template still carries a placeholder reactor and
     /// `create` refuses it.
     pub pending_deploy: bool,
 }
 
-/// The corridors a new bot can be created for, in display order.
-pub async fn corridors() -> Response {
-    let list: Vec<_> = setup::catalog()
-        .iter()
-        .map(|c| CorridorBody {
+impl From<CorridorEntry> for CorridorBody {
+    fn from(c: CorridorEntry) -> Self {
+        Self {
             id: c.id,
             display_name: c.display_name,
             network_label: c.network_label,
             chain_id: c.chain_id,
             toml_template: c.toml_template,
             pending_deploy: c.pending_deploy,
-        })
+        }
+    }
+}
+
+/// The corridors a new bot can be created for, in display order.
+///
+/// Textile's corridor registry decides the list; the presets compiled into this
+/// binary are the offline fallback and fill in what the registry doesn't carry
+/// (testnets). `source` says which one the operator is looking at, and `warning`
+/// says why when it's the fallback — see [`crate::panel::corridors`].
+pub async fn corridors(State(state): State<AppState>) -> Response {
+    let listing = state.corridors.list().await;
+    let list: Vec<CorridorBody> = listing
+        .corridors
+        .into_iter()
+        .map(CorridorBody::from)
         .collect();
-    Json(serde_json::json!({ "corridors": list })).into_response()
+    Json(serde_json::json!({
+        "corridors": list,
+        "source": listing.source.as_str(),
+        "warning": listing.warning,
+    }))
+    .into_response()
 }
 
 /// Generate a fresh hot wallet for the "Create wallet" step.
@@ -280,9 +300,10 @@ pub struct CreateRequest {
 struct ResolvedCorridor {
     /// The rendered `stitch.toml` body.
     toml: String,
-    /// The catalog id, used as the container's corridor label. `None` for a
-    /// custom corridor, which has no catalog entry (the panel then shows it as
-    /// "Custom corridor", derived from the config, not this label).
+    /// The corridor's id — a shipped preset's slug, or a row id from Textile's
+    /// registry — used as the container's corridor label. `None` for a custom
+    /// corridor, which is in neither list (the panel then shows it as "Custom
+    /// corridor", derived from the config, not this label).
     container_label: Option<String>,
     /// Human strings for the response message ("set up for {display} on {network}").
     display_name: String,
@@ -290,11 +311,16 @@ struct ResolvedCorridor {
 }
 
 impl CreateRequest {
-    /// Resolve the corridor source. Pure request-body work — no filesystem — so
-    /// it runs before the directory is claimed, and a bad corridor (unknown id,
-    /// pending preset, or invalid custom details) is refused before anything is
-    /// written.
-    fn resolve_corridor(&self) -> Result<ResolvedCorridor, ApiError> {
+    /// Resolve the corridor source. No filesystem work — it runs before the
+    /// directory is claimed, so a bad corridor (unknown id, pending preset, or
+    /// invalid custom details) is refused before anything is written.
+    ///
+    /// Takes the catalog because a corridor id can now name a row in Textile's
+    /// registry rather than a preset compiled in here.
+    async fn resolve_corridor(
+        &self,
+        catalog: &crate::panel::CorridorCatalog,
+    ) -> Result<ResolvedCorridor, ApiError> {
         if self.custom.is_some() && self.toml.as_ref().is_some_and(|s| !s.trim().is_empty()) {
             return Err(ApiError::bad_request(
                 "send either custom corridor fields or a stitch.toml, not both",
@@ -342,7 +368,7 @@ impl CreateRequest {
                      list.",
                 )
             })?;
-        let corridor = setup::find_corridor(id).ok_or_else(|| {
+        let corridor = catalog.find(id).await.ok_or_else(|| {
             ApiError::bad_request(format!(
                 "there is no corridor called \"{id}\". Ask /api/corridors for the list."
             ))
@@ -361,10 +387,10 @@ impl CreateRequest {
         }
 
         Ok(ResolvedCorridor {
-            toml: corridor.toml_template.to_string(),
-            container_label: Some(corridor.id.to_string()),
-            display_name: corridor.display_name.to_string(),
-            network_label: corridor.network_label.to_string(),
+            toml: corridor.toml_template,
+            container_label: Some(corridor.id),
+            display_name: corridor.display_name,
+            network_label: corridor.network_label,
         })
     }
 }
@@ -382,10 +408,10 @@ pub async fn create(
     let name = body.name.trim().to_string();
     naming::validate_bot_id(&name).map_err(ApiError::bad_request)?;
 
-    // A catalog preset or the custom form — either way this resolves to the toml
-    // to write, and refuses an unknown/pending/invalid corridor before the
-    // directory is claimed.
-    let corridor = body.resolve_corridor()?;
+    // A listed corridor, a shipped preset, or the custom form — either way this
+    // resolves to the toml to write, and refuses an unknown/pending/invalid
+    // corridor before the directory is claimed.
+    let corridor = body.resolve_corridor(&state.corridors).await?;
 
     let fleet = state.fleet().await?;
     if fleet.contains(&name) {
@@ -581,13 +607,74 @@ pub async fn create(
 
 #[cfg(test)]
 mod tests {
-    use super::super::testkit::{harness, keep_book_on, Harness, TEST_KEY};
+    use super::super::testkit::{
+        harness, harness_with_corridor_api, keep_book_on, Harness, TEST_KEY,
+    };
     use crate::panel::docker::fake::Call;
     use axum::http::StatusCode;
+    use axum::{routing::post, Json, Router};
     use serde_json::json;
 
     fn local(key: &str) -> serde_json::Value {
         json!({ "kind": "local", "privateKey": key })
+    }
+
+    /// A corridor on a market the shipped catalog doesn't have — the case the
+    /// whole feature exists for: listed on the site, unknown to this binary.
+    /// Carries the `corridor_*` identity Textile's renderer stamps in, because
+    /// that is the only thing that can tell this binary what the pair is.
+    const NOVEL_TEMPLATE: &str = r#"
+chain_id = 42220
+rpc_url = "https://forno.celo.org"
+indexer_url = "https://api.textilecredit.com"
+permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor = "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"
+tick_interval_secs = 5
+
+[feed]
+url = "https://api.textilecredit.com/price?chainId=42220&pair=aaa-usdt"
+staleness_secs = 900
+
+[[pools]]
+collateral = "0x1111111111111111111111111111111111111111"
+collateral_decimals = 6
+debt = "0x2222222222222222222222222222222222222222"
+debt_decimals = 6
+corridor_id = "cmnovelcorridor"
+corridor_name = "AAA / USDT"
+corridor_network = "Celo"
+buy_offset_bps = 5
+buy_total_liquidity_debt = "max"
+buy_min_slice_debt = "10000000"
+buy_max_orders = 40
+sell_offset_bps = 5
+sell_total_liquidity_collateral = "max"
+sell_min_slice_debt = "10000000"
+sell_max_orders = 40
+ttl_secs = 60
+refresh_threshold_bps = 0
+"#;
+
+    /// Textile's GraphQL, listing exactly one corridor the catalog doesn't ship.
+    async fn mock_corridor_api() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/graphql",
+            post(|| async {
+                Json(json!({ "data": { "stitchCorridors": [{
+                    "id": "cmnovelcorridor",
+                    "displayName": "AAA → USDT",
+                    "networkLabel": "Celo",
+                    "chainId": 42220,
+                    "tomlTemplate": NOVEL_TEMPLATE,
+                }]}}))
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), handle)
     }
 
     #[tokio::test]
@@ -650,6 +737,134 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"));
+    }
+
+    #[tokio::test]
+    async fn the_corridor_list_comes_from_textile_when_it_answers() {
+        let (api, _server) = mock_corridor_api().await;
+        let h = harness_with_corridor_api("corridors-api", &api);
+
+        let (status, body) = h.get("/api/corridors").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["source"], "api");
+        assert!(v["warning"].is_null(), "nothing went wrong: {body}");
+
+        let list = v["corridors"].as_array().unwrap();
+        // A corridor listed on the site but not shipped in this binary — the
+        // whole point — and it arrives ready to write.
+        let novel = list
+            .iter()
+            .find(|c| c["id"] == "cmnovelcorridor")
+            .expect("the API's corridor is offered");
+        assert_eq!(novel["displayName"], "AAA → USDT");
+        assert_eq!(novel["chainId"], 42220);
+        assert!(novel["tomlTemplate"]
+            .as_str()
+            .unwrap()
+            .contains("[[pools]]"));
+        // Presets the API doesn't list stay reachable — otherwise the testnet
+        // corridor would disappear the moment the panel could reach Textile.
+        assert!(list.iter().any(|c| c["id"] == "cngn-usdt-bsc-testnet"));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_textile_falls_back_to_the_shipped_list() {
+        let h = harness_with_corridor_api("corridors-offline", "http://127.0.0.1:1");
+
+        let (status, body) = h.get("/api/corridors").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["source"], "embedded");
+        assert!(
+            v["warning"].as_str().unwrap().contains("built-in"),
+            "the operator is told the list may be stale: {body}"
+        );
+        assert!(!v["corridors"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bot_can_be_created_on_a_corridor_only_the_api_knows() {
+        let (api, _server) = mock_corridor_api().await;
+        let h = harness_with_corridor_api("create-api-corridor", &api);
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({
+                    "name": "bot-a",
+                    "corridorId": "cmnovelcorridor",
+                    "signer": local(TEST_KEY),
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // The config written is the one the API rendered, not a preset that
+        // happened to share the chain.
+        let written = std::fs::read_to_string(h.root.join("bot-a").join("stitch.toml")).unwrap();
+        assert!(
+            written.contains("0x1111111111111111111111111111111111111111"),
+            "{written}"
+        );
+        let cfg = crate::config::Config::from_toml(&written).unwrap();
+        assert_eq!(cfg.chain_id, 42220);
+
+        // And it can still say which corridor it is afterwards. The catalog
+        // compiled into this binary has never heard of this pair, so without the
+        // identity in the file the bot would report a null corridor id — taking
+        // its Fleet label and the corridor on its access request with it.
+        let identity =
+            crate::setup::config_identity(&written).expect("the bot knows its own corridor");
+        assert_eq!(identity.id, "cmnovelcorridor");
+        assert_eq!(identity.display_name, "AAA / USDT");
+        assert_eq!(identity.network_label, "Celo");
+    }
+
+    #[tokio::test]
+    async fn a_corridor_id_the_api_does_not_list_is_still_refused() {
+        let (api, _server) = mock_corridor_api().await;
+        let h = harness_with_corridor_api("create-unknown-corridor", &api);
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({
+                    "name": "bot-a",
+                    "corridorId": "cmnotathing",
+                    "signer": local(TEST_KEY),
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("there is no corridor called"), "{body}");
+        assert!(!h.root.join("bot-a").exists(), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn a_shipped_preset_still_resolves_while_textile_answers() {
+        // Ids the panel handed out before are still ids the panel must accept —
+        // switch and add-pool send them back, and a preset market keeps its
+        // preset id even when the API lists the same pair.
+        let (api, _server) = mock_corridor_api().await;
+        let h = harness_with_corridor_api("create-preset-with-api", &api);
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({
+                    "name": "bot-a",
+                    "corridorId": "cngn-usdt-celo",
+                    "signer": local(TEST_KEY),
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let written = std::fs::read_to_string(h.root.join("bot-a").join("stitch.toml")).unwrap();
+        assert!(
+            written.contains("0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f"),
+            "the preset's cNGN: {written}"
+        );
     }
 
     #[tokio::test]

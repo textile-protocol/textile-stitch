@@ -1131,12 +1131,16 @@ pub async fn switch_corridor(
         .as_ref()
         .ok_or_else(|| ApiError::conflict(format!("{name} has no editable config path")))?;
 
-    let corridor = setup::find_corridor(&body.corridor_id).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "there is no corridor called \"{}\". Ask /api/corridors for the list.",
-            body.corridor_id
-        ))
-    })?;
+    let corridor = state
+        .corridors
+        .find(&body.corridor_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "there is no corridor called \"{}\". Ask /api/corridors for the list.",
+                body.corridor_id
+            ))
+        })?;
 
     // Same refusal as create: a pending corridor's preset still carries a zero
     // reactor, so switching onto it would turn a working bot into one that
@@ -1148,7 +1152,7 @@ pub async fn switch_corridor(
         )));
     }
 
-    if bot.config.as_ref().and_then(|c| c.corridor_id.as_deref()) == Some(corridor.id) {
+    if bot.config.as_ref().and_then(|c| c.corridor_id.as_deref()) == Some(corridor.id.as_str()) {
         return Err(ApiError::bad_request(format!(
             "{name} is already on the {} corridor",
             corridor.display_name
@@ -1178,7 +1182,7 @@ pub async fn switch_corridor(
     let stamp_rfq =
         crate::config::rfq_default_preset_applies(outgoing_cfg.as_ref(), &state.cfg.bots_dir);
 
-    setup::switch_corridor_file(toml_path, corridor.toml_template)
+    setup::switch_corridor_file(toml_path, &corridor.toml_template)
         .map_err(|e| ApiError::bad_request(format!("couldn't switch corridor: {e:#}")))?;
     if stamp_rfq {
         setup::stamp_rfq_default_preset(toml_path).map_err(|e| {

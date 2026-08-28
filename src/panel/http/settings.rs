@@ -670,12 +670,16 @@ pub async fn add_pool(
     let path = config_path(&bot)?;
     let current_toml = read_toml(&path)?;
 
-    let corridor = setup::find_corridor(&body.corridor_id).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "there is no corridor called \"{}\". Ask /api/corridors for the list.",
-            body.corridor_id
-        ))
-    })?;
+    let corridor = state
+        .corridors
+        .find(&body.corridor_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "there is no corridor called \"{}\". Ask /api/corridors for the list.",
+                body.corridor_id
+            ))
+        })?;
     if corridor.pending_deploy {
         return Err(ApiError::bad_request(format!(
             "the {} corridor on {} isn't deployed yet, so a bot can't quote it.",
@@ -688,7 +692,7 @@ pub async fn add_pool(
         ));
     }
 
-    let edited = setup::add_pool_from_template(&current_toml, corridor.toml_template)
+    let edited = setup::add_pool_from_template(&current_toml, &corridor.toml_template)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     require_token_aware_image(&state, &bot).await?;
     let new_index = Config::from_toml(&edited)

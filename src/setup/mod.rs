@@ -11,11 +11,13 @@ pub mod import_toml;
 pub mod macos;
 pub mod paths;
 pub mod process;
+pub mod remote;
 pub mod settings;
 pub mod writer;
 
 pub use catalog::{
-    catalog, deployable_catalog, find_corridor, identify_corridor, identify_pair, Corridor,
+    catalog, config_identity, deployable_catalog, find_corridor, identify_corridor, identify_pair,
+    pair_of_config, pool_identity, Corridor, CorridorEntry, CorridorIdentity,
 };
 pub use custom::CustomCorridor;
 pub use explorer::{address_explorer_url, explorer_base_url};
@@ -26,6 +28,7 @@ pub use paths::{
     remembered_config_dir, ConfigPaths,
 };
 pub use process::{find_stitch_binary, terminate};
+pub use remote::{fetch_corridors, DEFAULT_CORRIDOR_API};
 pub use settings::{
     add_pool_from_template, apply_rfq_default_preset, apply_settings, read_settings,
     read_settings_at, read_signer, remove_pool, rfq_connect_patch, try_read_signer, PoolPair,

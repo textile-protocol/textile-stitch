@@ -63,12 +63,17 @@ pub struct AppState {
     /// One lock per bot config, so two saves can't each read the same file and write
     /// a complete one back. See [`settings::ConfigLocks`].
     pub config_locks: Arc<settings::ConfigLocks>,
+    /// Which corridors the wizard offers — Textile's list when it answers, the
+    /// embedded presets when it doesn't. See [`crate::panel::corridors`].
+    pub corridors: Arc<crate::panel::CorridorCatalog>,
 }
 
 impl AppState {
     pub fn new(cfg: PanelConfig, docker: Arc<dyn DockerApi>) -> Self {
+        let corridors = crate::panel::CorridorCatalog::new(cfg.corridor_api_url.clone());
         Self {
             cfg: Arc::new(cfg),
+            corridors,
             docker,
             files: None,
             sessions: Arc::new(Sessions::new()),
@@ -414,6 +419,19 @@ pub(crate) mod testkit {
     /// Same as [`harness`], with a caller-chosen `STITCH_PANEL_BOT_IMAGE`.
     pub fn harness_with_bot_image(tag: &str, bot_image: &str) -> Harness {
         harness_with(tag, bot_image, None)
+    }
+
+    /// A panel whose wizard reads its corridors from `api_base` instead of the
+    /// binary. Tests default to no API at all, so this is the only way a suite
+    /// exercises the remote path — and it always points at a local mock.
+    pub fn harness_with_corridor_api(tag: &str, api_base: &str) -> Harness {
+        let mut h = harness(tag);
+        let mut cfg = (*h.state.cfg).clone();
+        cfg.corridor_api_url = Some(api_base.to_string());
+        h.state.corridors = crate::panel::CorridorCatalog::new(cfg.corridor_api_url.clone());
+        h.state.cfg = std::sync::Arc::new(cfg);
+        h.app = router(h.state.clone());
+        h
     }
 
     /// A process-runtime panel (the Desktop app and `STITCH_PANEL_RUNTIME=process`).

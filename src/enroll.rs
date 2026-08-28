@@ -216,17 +216,22 @@ pub fn apply_enrollment(
         .pools
         .iter()
         .map(|p| {
+            let configured = setup::pool_identity(cfg.chain_id, p).map(|c| c.id);
             pick_enroll_corridor(
                 enrolled.flagged,
-                // The catalog fallback is per *pool*, matched on that pool's own
-                // pair. A legacy enroll response carries `corridors` with no
-                // `corridorPairs`, so the slug has to come from the catalog —
+                // The fallback is per *pool*, from that pool's own identity. A
+                // legacy enroll response carries `corridors` with no
+                // `corridorPairs`, so the slug has to come from somewhere else —
                 // but keyed on the bot (`identify_corridor` reads pool 0) it
                 // would either stamp pool 0's slug onto unrelated pairs, whose
                 // books then collide under one corridor id, or leave a bot whose
                 // *second* pool is the catalog one stuck at Waiting. Keyed on
-                // the pair, a pool gets a slug only if it is that corridor.
-                setup::identify_pair(cfg.chain_id, &p.collateral, &p.debt).map(|c| c.id),
+                // the pool, a pool gets a slug only if it is that corridor.
+                //
+                // `pool_identity`, not `identify_pair`: a corridor listed after
+                // this release has no catalog entry, and against a legacy venue
+                // that pool would never be seated at all.
+                configured.as_deref(),
                 Some((p.collateral.as_str(), p.debt.as_str())),
                 &enrolled.corridors,
                 &enrolled.corridor_pairs,
