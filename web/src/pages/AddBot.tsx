@@ -330,12 +330,6 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
               />
             ) : (
               <>
-            <p className="text-sm text-muted">
-              Just the essentials. Permit2, the indexer, spreads and order sizes
-              use safe defaults you can change later on the bot&apos;s Settings
-              page (or Tools → Edit raw config).
-            </p>
-
             <Field
               label="Chain ID"
               hint="The EVM chain the pair trades on, e.g. 42220 for Celo."
