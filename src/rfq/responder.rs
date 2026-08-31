@@ -319,6 +319,10 @@ pub fn decide_quote(
 /// remaining capacity (configured minus reserved), priced off the same
 /// spreads as the ladder. Sizes are collateral atomic on BOTH sides, so bid
 /// capacity (debt) converts at the bid price.
+fn order_cap(token: Address, caps: &[(Address, U256)]) -> Option<U256> {
+    caps.iter().find(|(t, _)| *t == token).map(|(_, cap)| *cap)
+}
+
 pub fn levels_for(
     book: &CorridorBook,
     mid: f64,
@@ -328,6 +332,7 @@ pub fn levels_for(
     token_reserved_ask: U256,
     as_of: String,
     inventory: &InventoryView,
+    order_caps: &[(Address, U256)],
 ) -> LevelsFrame {
     let mut bids = Vec::new();
     if let (Some(spread), Some(remaining)) = (
@@ -338,7 +343,11 @@ pub fn levels_for(
             reserved_bid,
             token_reserved_bid,
             inventory,
-        ),
+        )
+        .map(|remaining| match order_cap(book.debt, order_caps) {
+            Some(cap) => remaining.min(cap),
+            None => remaining,
+        }),
     ) {
         let price = bid_price(mid, spread);
         if !remaining.is_zero() && is_price_usable(price) {
@@ -366,7 +375,11 @@ pub fn levels_for(
             reserved_ask,
             token_reserved_ask,
             inventory,
-        ),
+        )
+        .map(|remaining| match order_cap(book.collateral, order_caps) {
+            Some(cap) => remaining.min(cap),
+            None => remaining,
+        }),
     ) {
         let price = ask_price(mid, spread);
         if !remaining.is_zero() && is_price_usable(price) {
@@ -452,6 +465,7 @@ mod tests {
             reserved_ask,
             as_of,
             &funded_inv(),
+            &[],
         )
     }
 
@@ -492,6 +506,7 @@ mod tests {
             reserved_ask,
             as_of,
             inventory,
+            &[],
         )
     }
 
@@ -700,6 +715,28 @@ mod tests {
         );
         assert!(frame.asks.is_empty());
         assert_eq!(frame.bids.len(), 1);
+    }
+
+    #[test]
+    fn vault_order_caps_apply_after_reservations() {
+        let b = book();
+        let cap = U256::from(1_000_000_000u64);
+        let reserved = U256::from(400_000_000u64);
+        let caps = [(b.collateral, cap)];
+        let frame = levels_for(
+            &b,
+            1.0,
+            U256::ZERO,
+            reserved,
+            U256::ZERO,
+            reserved,
+            "t".into(),
+            &funded_inv(),
+            &caps,
+        );
+        // Remaining after reservation is 5e9 − 400e6. Cap is 1e9. Publish the
+        // cap, not cap − reserved (600e6 if the wallet was clamped first).
+        assert_eq!(frame.asks[0].size, "1000000000");
     }
 
     #[test]

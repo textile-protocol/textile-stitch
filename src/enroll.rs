@@ -145,18 +145,31 @@ pub async fn register_maker(
         .context("reading the clock for the enroll timestamp")?
         .as_millis() as u64;
     let environment = maker_enroll_environment(cfg.chain_id);
-    let digest = maker_enroll_digest(environment, address, cfg.chain_id, issued_at);
+    let funding_wallet = match &cfg.vault {
+        Some(vault) => vault.address.parse().context("invalid [vault].address")?,
+        None => address,
+    };
+    let digest = maker_enroll_digest(
+        environment,
+        address,
+        funding_wallet,
+        cfg.chain_id,
+        issued_at,
+    );
     let signature = signer
         .sign_digest(digest)
         .await
         .context("signing the enroll digest")?;
 
-    let payload = json!({
+    let mut payload = json!({
         "chainId": cfg.chain_id,
         "signingAddress": format!("{address:?}"),
         "issuedAt": issued_at,
         "signature": hex::encode_prefixed(signature),
     });
+    if let Some(vault) = &cfg.vault {
+        payload["fundingWallet"] = json!(vault.address);
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(ENROLL_TIMEOUT_SECS))

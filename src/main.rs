@@ -249,6 +249,12 @@ async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow:
         &std::fs::read_to_string(&config_path)
             .with_context(|| format!("reading config {config_path}"))?,
     )?;
+    if cfg.vault.is_some() {
+        anyhow::bail!(
+            "[vault] is set — OperatorAdmin must approve Permit2 on the vault. \
+             `stitch approve` only signs from the strategy key and will not move vault allowances."
+        );
+    }
     let signer = build_signer(&cfg).await?;
     let permit2: Address = cfg.permit2.parse().context("invalid permit2 address")?;
     let wallet = Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id);
@@ -512,25 +518,36 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // silently revert on fill). In dry-run we only warn, so signing can still be
     // exercised offline. A flaky RPC shouldn't hard-block dry-run, but a live
     // start stays cautious and surfaces the error.
-    match unapproved_tokens(&wallet, permit2, &cfg).await {
-        Ok(missing) if !missing.is_empty() => {
-            for m in &missing {
-                warn!(token = %m.token, reasons = ?m.reasons, "input token not approved to Permit2");
+    //
+    // Vault mode is different: Permit2 pulls from the OperatorVault, which
+    // OperatorAdmin already approved. `unapproved_tokens` inspects the strategy
+    // EOA, so a vault bot would exit here even when the vault is ready.
+    if cfg.vault.is_some() {
+        info!(
+            "[vault] is set — skipping strategy-wallet Permit2 preflight; \
+             OperatorAdmin must have approved Permit2 on the vault"
+        );
+    } else {
+        match unapproved_tokens(&wallet, permit2, &cfg).await {
+            Ok(missing) if !missing.is_empty() => {
+                for m in &missing {
+                    warn!(token = %m.token, reasons = ?m.reasons, "input token not approved to Permit2");
+                }
+                if dry_run {
+                    warn!("missing Permit2 approvals: orders would post but fail to fill. Run `stitch approve` before going live.");
+                } else {
+                    anyhow::bail!(
+                        "missing Permit2 approvals for {} token(s); run `stitch approve` first, or pass --dry-run to test without them",
+                        missing.len()
+                    );
+                }
             }
-            if dry_run {
-                warn!("missing Permit2 approvals: orders would post but fail to fill. Run `stitch approve` before going live.");
-            } else {
-                anyhow::bail!(
-                    "missing Permit2 approvals for {} token(s); run `stitch approve` first, or pass --dry-run to test without them",
-                    missing.len()
-                );
+            Ok(_) => info!("Permit2 approvals present for all enabled sides"),
+            Err(e) if dry_run => {
+                warn!(error = %e, "could not verify Permit2 approvals; continuing dry-run")
             }
+            Err(e) => return Err(e).context("verifying Permit2 approvals"),
         }
-        Ok(_) => info!("Permit2 approvals present for all enabled sides"),
-        Err(e) if dry_run => {
-            warn!(error = %e, "could not verify Permit2 approvals; continuing dry-run")
-        }
-        Err(e) => return Err(e).context("verifying Permit2 approvals"),
     }
 
     let discoverer = cfg

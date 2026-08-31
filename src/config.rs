@@ -77,7 +77,17 @@ pub struct Config {
     /// instead of enabling something adjacent.
     #[serde(default)]
     pub experimental: Option<ExperimentalConfig>,
+    /// Passive OperatorVault maker. When set, RFQ orders fund from this vault
+    /// and the bot key is the strategy signer only. The public ladder stays
+    /// off — vault makers do not rest on the book.
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
     pub pools: Vec<PoolConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VaultConfig {
+    pub address: String,
 }
 
 fn default_true() -> bool {
@@ -1177,6 +1187,18 @@ impl Config {
                 crate::signer::SignerConfig::Local => {}
             }
         }
+        if let Some(vault) = &self.vault {
+            let address = vault
+                .address
+                .parse::<alloy_primitives::Address>()
+                .context("[vault].address is not a valid address")?;
+            anyhow::ensure!(!address.is_zero(), "[vault].address is the zero address");
+            anyhow::ensure!(
+                !self.book_enabled,
+                "[vault] is set — the public ladder must stay off (book_enabled = false). \
+                 OperatorAdmin approves Permit2 on the vault; stitch approve does not."
+            );
+        }
         self.validate_rfq()?;
         Ok(())
     }
@@ -2190,6 +2212,27 @@ mod tests {
         assert!(
             !cfg.rfq_quotable(),
             "but it can answer nothing, so Start must not count it"
+        );
+    }
+
+    #[test]
+    fn vault_mode_requires_the_ladder_off() {
+        let on = format!(
+            "{LEAN_POOL_BASE}\n[vault]\naddress = \"0x00000000000000000000000000000000000000aa\"\n"
+        );
+        let err = Config::from_toml(&on).expect_err("vault + default book_enabled must fail");
+        assert!(err.to_string().contains("book_enabled"));
+
+        let off = LEAN_POOL_BASE.replace(
+            "tick_interval_secs = 5",
+            "tick_interval_secs = 5\nbook_enabled = false",
+        );
+        let ok =
+            format!("{off}\n[vault]\naddress = \"0x00000000000000000000000000000000000000aa\"\n");
+        let cfg = Config::from_toml(&ok).expect("vault + book off parses");
+        assert_eq!(
+            cfg.vault.as_ref().unwrap().address.to_lowercase(),
+            "0x00000000000000000000000000000000000000aa"
         );
     }
 

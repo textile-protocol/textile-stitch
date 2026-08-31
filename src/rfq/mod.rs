@@ -58,6 +58,13 @@ use crate::signer::DynSigner;
 use crate::taker::encode_order_bytes;
 use crate::tick::{is_price_usable, is_stale, unix_now};
 
+use crate::vault::{
+    address_from_word, apply_vault_order_policy, clamp_vault_deadline, encode_close_only,
+    encode_corridor_asset, encode_liquid_settlement, encode_max_order_input_corridor,
+    encode_max_order_input_settlement, encode_max_order_lifetime, encode_paused,
+    encode_quotable_corridor, encode_quotable_settlement, encode_settlement_asset,
+    encode_trading_epoch, trading_nonce, vault_nonce_low, VaultQuotePolicy,
+};
 use nonce::rfq_nonce;
 use order::{build_order, RfqOrderSpec};
 use reserve::{Reservations, RESERVATIONS_FILE};
@@ -88,6 +95,12 @@ pub struct RfqRuntime {
     /// `rfq-reservations.json` next to stitch.toml. None only when the process
     /// has no config dir (env-only key); then the ledger is memory-only.
     reservations_path: Option<std::path::PathBuf>,
+    /// OperatorVault this bot quotes for. `None` is the EOA sign+fund path.
+    vault: Option<Address>,
+    /// Live `tradingEpoch()` for vault nonces. Unused when `vault` is None.
+    trading_epoch: Arc<RwLock<u64>>,
+    /// Per-order caps and lifetime. Unused when `vault` is None.
+    vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
 }
 
 /// How old a wallet reading may be before a `max` side goes dark.
@@ -333,6 +346,13 @@ fn build_runtime(
         books,
         signer,
         reservations_path: config_dir.map(|dir| dir.join(RESERVATIONS_FILE)),
+        vault: cfg
+            .vault
+            .as_ref()
+            .map(|v| v.address.parse().context("invalid [vault].address"))
+            .transpose()?,
+        trading_epoch: Arc::new(RwLock::new(0)),
+        vault_policy: Arc::new(RwLock::new(None)),
     })
 }
 
@@ -418,13 +438,16 @@ async fn run(rt: RfqRuntime) {
     // off the quote path. Exact is a cap on top of the wallet, not a bypass.
     let inventory = InventoryCache::default();
     let tokens = wallet_tokens(&rt.books);
-    if !tokens.is_empty() {
+    if !tokens.is_empty() || rt.vault.is_some() {
         let wallet = Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id);
         tokio::spawn(inventory_loop(
             wallet,
             rt.permit2,
             tokens,
             inventory.clone(),
+            rt.vault,
+            rt.trading_epoch.clone(),
+            rt.vault_policy.clone(),
         ));
     }
 
@@ -772,7 +795,7 @@ async fn send_session_frame(
 /// Corridors that would actually go out. Dark / stale feeds are in
 /// `pending` but emit nothing, so the rate budget must not count them.
 fn ready_level_slugs(
-    engine: &Engine,
+    engine: &mut Engine,
     prices: &PriceCache,
     only: Option<&HashSet<String>>,
 ) -> Vec<String> {
@@ -796,7 +819,7 @@ fn ready_level_slugs(
 /// after a normal interval tick. Returns the corridor ids that went out.
 async fn send_level_frames(
     stream: &mut session::WsStream,
-    engine: &Engine,
+    engine: &mut Engine,
     prices: &PriceCache,
     only: Option<&HashSet<String>>,
     outbound: &mut RateWindow,
@@ -818,7 +841,7 @@ async fn send_level_frames(
 
 async fn flush_expired_levels(
     stream: &mut session::WsStream,
-    engine: &Engine,
+    engine: &mut Engine,
     prices: &PriceCache,
     pending: &mut HashSet<String>,
     last_levels_flush: &mut Option<tokio::time::Instant>,
@@ -915,6 +938,10 @@ async fn session_loop_inner(
         reactor: rt.reactor,
         validation_contract: rt.validation_contract,
         signer: rt.signer.clone(),
+        vault: rt.vault,
+        trading_epoch: rt.trading_epoch.clone(),
+        vault_policy: rt.vault_policy.clone(),
+        nonce_salt: rand::random(),
     };
     // Upgrade path: a ledger written before `input_token` existed loads as
     // tokenless. Stamp every bound book now, while the quoted pool is still
@@ -945,7 +972,7 @@ async fn session_loop_inner(
                 trailing_at = None;
                 trailing_at = flush_expired_levels(
                     &mut stream,
-                    &engine,
+                    &mut engine,
                     prices,
                     &mut pending_republish,
                     &mut last_levels_flush,
@@ -1019,7 +1046,7 @@ async fn session_loop_inner(
                     trailing_at = None;
                     trailing_at = flush_expired_levels(
                         &mut stream,
-                        &engine,
+                        &mut engine,
                         prices,
                         &mut pending_republish,
                         &mut last_levels_flush,
@@ -1047,7 +1074,7 @@ async fn session_loop_inner(
                         continue;
                     }
                     let emitted =
-                        send_level_frames(&mut stream, &engine, prices, None, &mut outbound)
+                        send_level_frames(&mut stream, &mut engine, prices, None, &mut outbound)
                             .await?;
                     drop_emitted_pending(&mut pending_republish, &emitted);
                 }
@@ -1079,9 +1106,36 @@ struct Engine {
     reactor: Address,
     validation_contract: Address,
     signer: DynSigner,
+    vault: Option<Address>,
+    trading_epoch: Arc<RwLock<u64>>,
+    vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
+    /// Per-process namespace for vault nonces. Two bots sharing one vault can
+    /// sign in the same millisecond with equal counters; without this the
+    /// nonces collide and the venue rejects the second reply `nonce_reserved`.
+    nonce_salt: u64,
 }
 
 impl Engine {
+    fn sync_vault_epoch(&mut self) {
+        if self.vault.is_none() {
+            return;
+        }
+        let Ok(epoch) = self.trading_epoch.read() else {
+            return;
+        };
+        let epoch = *epoch;
+        // `trading_epoch` starts at 0 until the first inventory RPC. Treat
+        // that sentinel as "not loaded" so a restart does not clear the
+        // on-disk ledger when the real epoch (always ≥ 1) arrives.
+        if epoch == 0 {
+            return;
+        }
+        // The ledger persists the epoch its claims were signed under, so a
+        // bump that happened while the process was down is caught the same
+        // way as a live one.
+        self.reservations.sync_vault_epoch(epoch);
+    }
+
     /// Write `input_token` onto tokenless rows that match any book we know.
     ///
     /// Both lists, because they name a pool differently: `books` carries the
@@ -1150,12 +1204,30 @@ impl Engine {
     /// Levels for every corridor with a fresh feed. A stale/missing feed
     /// publishes nothing — the venue's >5 s gap rule takes the corridor dark,
     /// which is exactly the stale-feed behavior we want.
-    fn level_frames(&self, prices: &PriceCache, now_ms: u64) -> Vec<MakerFrame> {
+    fn level_frames(&mut self, prices: &PriceCache, now_ms: u64) -> Vec<MakerFrame> {
+        self.sync_vault_epoch();
         let now_secs = now_ms / 1_000;
         let inventory = self.inventory.view(now_secs);
+        let policy = self.vault_policy.read().ok().and_then(|g| *g);
+        if self.vault.is_some() && policy.is_none() {
+            return Vec::new();
+        }
+        let order_caps: Vec<(Address, U256)> = policy
+            .map(|policy| {
+                vec![
+                    (policy.settlement, policy.max_input_settlement),
+                    (policy.corridor, policy.max_input_corridor),
+                ]
+            })
+            .unwrap_or_default();
         self.books
             .iter()
             .filter_map(|book| {
+                if let Some(policy) = policy {
+                    if !policy.matches_pair(book.debt, book.collateral) {
+                        return None;
+                    }
+                }
                 let quote = prices.get(&book.feed_url)?;
                 if is_stale(quote.timestamp, now_secs, book.staleness_secs)
                     || !is_price_usable(quote.price)
@@ -1171,6 +1243,7 @@ impl Engine {
                     self.reserved_on(book, false, now_secs),
                     format_iso_ms(now_ms),
                     &inventory,
+                    &order_caps,
                 )))
             })
             .collect()
@@ -1231,6 +1304,7 @@ impl Engine {
     /// Firm-quote path. Every early exit is a reject frame so the venue never
     /// waits out the reply deadline on our account.
     async fn respond(&mut self, req: QuoteRequestFrame, prices: &PriceCache) -> MakerFrame {
+        self.sync_vault_epoch();
         let reject = |reason| {
             MakerFrame::QuoteReject(QuoteRejectFrame {
                 rfq_id: req.rfq_id.clone(),
@@ -1286,9 +1360,22 @@ impl Engine {
         if now_ms >= reply_by_ms {
             return reject(RejectReason::Busy);
         }
-        let deadline_secs = max_expires_ms / 1_000;
+        let mut deadline_secs = max_expires_ms / 1_000;
         if deadline_secs <= now_secs {
             return reject(RejectReason::Busy);
+        }
+        if self.vault.is_some() {
+            let Some(policy) = self.vault_policy.read().ok().and_then(|g| *g) else {
+                warn!("vault policy not loaded yet");
+                return reject(RejectReason::Busy);
+            };
+            let Some(clamped) =
+                clamp_vault_deadline(now_secs, deadline_secs, policy.max_lifetime_secs)
+            else {
+                warn!("vault maxOrderLifetime leaves no usable deadline");
+                return reject(RejectReason::Busy);
+            };
+            deadline_secs = clamped;
         }
         let expires_ms = (now_ms + req.quote_ttl_ms).min(deadline_secs * 1_000);
         let Ok(taker) = req.taker.parse::<Address>() else {
@@ -1309,9 +1396,46 @@ impl Engine {
             Ok(plan) => plan,
             Err(reason) => return reject(reason),
         };
+        let plan = if self.vault.is_some() {
+            let Some(policy) = self.vault_policy.read().ok().and_then(|g| *g) else {
+                return reject(RejectReason::Busy);
+            };
+            if !policy.matches_pair(plan.input_token, plan.output_token) {
+                warn!(
+                    input = %plan.input_token,
+                    output = %plan.output_token,
+                    "vault quote is not the settlement/corridor pair"
+                );
+                return reject(RejectReason::Busy);
+            }
+            let cap = policy.max_input_for(plan.input_token);
+            if plan.input > cap {
+                warn!(
+                    input = %plan.input,
+                    cap = %cap,
+                    "vault quote exceeds maxOrderInput"
+                );
+                return reject(RejectReason::Busy);
+            }
+            plan
+        } else {
+            plan
+        };
 
-        let maker = self.signer.address();
-        let nonce = rfq_nonce(now_ms, self.counter);
+        let maker = self.vault.unwrap_or_else(|| self.signer.address());
+        let nonce = if self.vault.is_some() {
+            let epoch = self.trading_epoch.read().ok().map(|g| *g).unwrap_or(0);
+            if epoch == 0 {
+                warn!("vault tradingEpoch not loaded yet");
+                return reject(RejectReason::Busy);
+            }
+            trading_nonce(
+                epoch,
+                vault_nonce_low(self.nonce_salt, now_ms, self.counter),
+            )
+        } else {
+            rfq_nonce(now_ms, self.counter)
+        };
         self.counter += 1;
         let order = build_order(&RfqOrderSpec {
             reactor: self.reactor,
@@ -1353,7 +1477,7 @@ impl Engine {
             expires_at: format_iso_ms(expires_ms),
             encoded_order: alloy_primitives::hex::encode_prefixed(encode_order_bytes(&order)),
             signature: alloy_primitives::hex::encode_prefixed(signature),
-            signer: maker.to_string(),
+            signer: self.signer.address().to_string(),
         })
     }
 }
@@ -1431,21 +1555,158 @@ async fn inventory_loop(
     permit2: Address,
     tokens: Vec<Address>,
     cache: InventoryCache,
+    vault: Option<Address>,
+    trading_epoch: Arc<RwLock<u64>>,
+    vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
 ) {
+    let mut vault_pair: Option<(Address, Address, Address, u64)> = None;
     loop {
-        let now = unix_now();
-        for token in &tokens {
-            match read_funded(&wallet, permit2, *token).await {
-                Ok(funded) => cache.set(*token, funded, now),
+        if vault_pair.is_none() {
+            if let Some(address) = vault {
+                match read_vault_assets(&wallet, address).await {
+                    Ok(pair) => vault_pair = Some((address, pair.0, pair.1, pair.2)),
+                    Err(e) => warn!(
+                        error = %format!("{e:#}"),
+                        "vault asset read failed; RFQ inventory stays dark"
+                    ),
+                }
+            }
+        }
+        if let Some((address, settlement, corridor, max_lifetime)) = vault_pair {
+            match read_vault_inventory(&wallet, permit2, address, settlement, corridor).await {
+                Ok((settlement_qty, corridor_qty, epoch, max_settlement, max_corridor)) => {
+                    // Stamp after the RPC batch. A pre-read clock can already
+                    // exceed INVENTORY_TTL_SECS on a slow endpoint, which would
+                    // keep both sides dark forever.
+                    let now = unix_now();
+                    cache.set(settlement, settlement_qty, now);
+                    cache.set(corridor, corridor_qty, now);
+                    if let Ok(mut slot) = trading_epoch.write() {
+                        *slot = epoch;
+                    }
+                    if let Ok(mut slot) = vault_policy.write() {
+                        *slot = Some(VaultQuotePolicy {
+                            settlement,
+                            corridor,
+                            max_input_settlement: max_settlement,
+                            max_input_corridor: max_corridor,
+                            max_lifetime_secs: max_lifetime,
+                        });
+                    }
+                }
                 Err(e) => warn!(
-                    token = %token,
                     error = %format!("{e:#}"),
-                    "rfq inventory refresh failed; last reading kept until TTL"
+                    "vault inventory refresh failed; last reading kept until TTL"
                 ),
+            }
+        } else if vault.is_none() {
+            for token in &tokens {
+                match read_funded(&wallet, permit2, *token).await {
+                    Ok(funded) => cache.set(*token, funded, unix_now()),
+                    Err(e) => warn!(
+                        token = %token,
+                        error = %format!("{e:#}"),
+                        "rfq inventory refresh failed; last reading kept until TTL"
+                    ),
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+async fn read_vault_assets(
+    wallet: &Wallet,
+    vault: Address,
+) -> anyhow::Result<(Address, Address, u64)> {
+    let settlement = address_from_word(
+        wallet
+            .read_uint(vault, &Bytes::from(encode_settlement_asset()))
+            .await
+            .context("reading vault settlementAsset")?,
+    );
+    let corridor = address_from_word(
+        wallet
+            .read_uint(vault, &Bytes::from(encode_corridor_asset()))
+            .await
+            .context("reading vault corridorAsset")?,
+    );
+    anyhow::ensure!(
+        !settlement.is_zero() && !corridor.is_zero(),
+        "vault assets unset"
+    );
+    let max_lifetime = wallet
+        .read_uint(vault, &Bytes::from(encode_max_order_lifetime()))
+        .await
+        .context("reading maxOrderLifetime")?
+        .to::<u64>();
+    anyhow::ensure!(max_lifetime > 0, "vault maxOrderLifetime is zero");
+    Ok((settlement, corridor, max_lifetime))
+}
+
+async fn read_vault_inventory(
+    wallet: &Wallet,
+    permit2: Address,
+    vault: Address,
+    settlement: Address,
+    corridor: Address,
+) -> anyhow::Result<(U256, U256, u64, U256, U256)> {
+    let settlement_qty = wallet
+        .read_uint(vault, &Bytes::from(encode_quotable_settlement()))
+        .await
+        .context("reading quotableSettlement")?;
+    // Quotable prices liquid + yield-adapter holdings, but validateEnvelope
+    // admits settlement input only up to min(quotable, liquid). Publishing the
+    // larger number signs sizes the vault will reject.
+    let liquid_settlement = wallet
+        .read_uint(vault, &Bytes::from(encode_liquid_settlement()))
+        .await
+        .context("reading liquidSettlement")?;
+    let settlement_qty = settlement_qty.min(liquid_settlement);
+    let corridor_qty = wallet
+        .read_uint(vault, &Bytes::from(encode_quotable_corridor()))
+        .await
+        .context("reading quotableCorridor")?;
+    let max_settlement = wallet
+        .read_uint(vault, &Bytes::from(encode_max_order_input_settlement()))
+        .await
+        .context("reading maxOrderInputSettlement")?;
+    let max_corridor = wallet
+        .read_uint(vault, &Bytes::from(encode_max_order_input_corridor()))
+        .await
+        .context("reading maxOrderInputCorridor")?;
+    let close_only = !wallet
+        .read_uint(vault, &Bytes::from(encode_close_only()))
+        .await
+        .context("reading closeOnly")?
+        .is_zero();
+    let paused = !wallet
+        .read_uint(vault, &Bytes::from(encode_paused()))
+        .await
+        .context("reading paused")?
+        .is_zero();
+    let epoch = wallet
+        .read_uint(vault, &Bytes::from(encode_trading_epoch()))
+        .await
+        .context("reading tradingEpoch")?
+        .to::<u64>();
+    let settlement_allowance = wallet
+        .read_uint(settlement, &Bytes::from(encode_allowance(vault, permit2)))
+        .await
+        .context("reading vault settlement Permit2 allowance")?;
+    let corridor_allowance = wallet
+        .read_uint(corridor, &Bytes::from(encode_allowance(vault, permit2)))
+        .await
+        .context("reading vault corridor Permit2 allowance")?;
+    let (settlement_qty, corridor_qty) =
+        apply_vault_order_policy(settlement_qty, corridor_qty, close_only, paused);
+    Ok((
+        settlement_qty.min(settlement_allowance),
+        corridor_qty.min(corridor_allowance),
+        epoch,
+        max_settlement,
+        max_corridor,
+    ))
 }
 
 #[cfg(test)]
@@ -1710,6 +1971,10 @@ mod tests {
                 .parse()
                 .unwrap(),
             signer: Arc::new(LocalSigner::new(key)),
+            vault: None,
+            trading_epoch: Arc::new(RwLock::new(0)),
+            vault_policy: Arc::new(RwLock::new(None)),
+            nonce_salt: 7,
         }
     }
 
@@ -1889,7 +2154,7 @@ mod tests {
         assert_eq!(
             resp.signer,
             engine.signer.address().to_string(),
-            "signer field is the funding wallet"
+            "EOA maker: signer field is the funding wallet"
         );
 
         // The signature is a real Permit2 witness sig by the funding wallet
@@ -1920,6 +2185,211 @@ mod tests {
         };
         assert_eq!(resp.buy_amount, "520097991");
         assert_eq!(engine.reservations.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_vault_quote_funds_from_the_vault_and_signs_as_strategy() {
+        let vault: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let mut engine = test_engine();
+        engine.vault = Some(vault);
+        *engine.trading_epoch.write().unwrap() = 3;
+        *engine.vault_policy.write().unwrap() = Some(VaultQuotePolicy {
+            settlement: DEBT.parse().unwrap(),
+            corridor: COLLATERAL.parse().unwrap(),
+            max_input_settlement: U256::MAX,
+            max_input_corridor: U256::MAX,
+            max_lifetime_secs: 120,
+        });
+        let prices = fresh_prices();
+
+        let reply = engine
+            .respond(exact_input_request("rfq_vault"), &prices)
+            .await;
+        let MakerFrame::QuoteResponse(resp) = reply else {
+            panic!("expected a firm quote, got {reply:?}");
+        };
+        assert_eq!(
+            resp.signer,
+            engine.signer.address().to_string(),
+            "frame.signer is the strategy EOA, not the vault"
+        );
+        let order_bytes = alloy_primitives::hex::decode(&resp.encoded_order).unwrap();
+        let swapper_word: [u8; 32] = order_bytes[7 * 32..8 * 32].try_into().unwrap();
+        let swapper = Address::from_slice(&swapper_word[12..]);
+        assert_eq!(swapper, vault, "swapper is the vault");
+        let nonce_word: [u8; 32] = order_bytes[8 * 32..9 * 32].try_into().unwrap();
+        let nonce = U256::from_be_bytes::<32>(nonce_word);
+        assert_eq!(nonce >> 128, U256::from(3u64), "nonce embeds tradingEpoch");
+        assert_eq!(
+            nonce & (U256::from(1u8) << nonce::RFQ_NONCE_BIT),
+            U256::ZERO,
+            "vault nonces do not use the EOA RFQ namespace bit"
+        );
+    }
+
+    #[test]
+    fn an_uninitialized_vault_epoch_does_not_clear_loaded_reservations() {
+        let mut engine = test_engine();
+        engine.vault = Some(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+        );
+        engine
+            .reservations
+            .reserve("rfq_disk", "cngn-usdc", true, U256::from(100u64), 9_999_999);
+        engine.sync_vault_epoch();
+        assert_eq!(
+            engine.reservations.len(),
+            1,
+            "epoch 0 is the pre-RPC sentinel, not a transition"
+        );
+        assert!(engine.reservations.vault_epoch().is_none());
+        *engine.trading_epoch.write().unwrap() = 1;
+        engine.sync_vault_epoch();
+        assert_eq!(
+            engine.reservations.len(),
+            1,
+            "first real epoch must keep the loaded ledger"
+        );
+        assert_eq!(engine.reservations.vault_epoch(), Some(1));
+    }
+
+    #[test]
+    fn a_vault_epoch_bump_drops_live_reservations() {
+        let mut engine = test_engine();
+        engine.vault = Some(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+        );
+        *engine.trading_epoch.write().unwrap() = 1;
+        engine.sync_vault_epoch();
+        engine
+            .reservations
+            .reserve("rfq_old", "cngn-usdc", true, U256::from(100u64), 9_999_999);
+        assert_eq!(engine.reservations.len(), 1);
+        *engine.trading_epoch.write().unwrap() = 2;
+        engine.sync_vault_epoch();
+        assert!(
+            engine.reservations.is_empty(),
+            "a new tradingEpoch must drop quotes signed under the last one"
+        );
+    }
+
+    #[test]
+    fn vault_level_caps_survive_an_open_reservation() {
+        let mut engine = test_engine();
+        engine.vault = Some(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+        );
+        *engine.vault_policy.write().unwrap() = Some(VaultQuotePolicy {
+            settlement: DEBT.parse().unwrap(),
+            corridor: COLLATERAL.parse().unwrap(),
+            max_input_settlement: U256::MAX,
+            max_input_corridor: U256::from(1_000_000_000u64),
+            max_lifetime_secs: 120,
+        });
+        engine.reservations.reserve(
+            "rfq_open",
+            "cngn-usdc",
+            false,
+            U256::from(400_000_000u64),
+            unix_now() + 60,
+        );
+        let prices = fresh_prices();
+        let MakerFrame::Levels(frame) = engine.level_frames(&prices, unix_ms_now())[0].clone()
+        else {
+            panic!("expected levels");
+        };
+        assert_eq!(
+            frame.asks[0].size, "1000000000",
+            "per-order cap applies after the reservation, not to the wallet first"
+        );
+    }
+
+    const OTHER: &str = "0x0000000000000000000000000000000000000004";
+
+    fn off_pair_book() -> CorridorBook {
+        CorridorBook {
+            slug: "other-usdc".into(),
+            collateral: OTHER.parse().unwrap(),
+            debt: DEBT.parse().unwrap(),
+            collateral_decimals: 6,
+            debt_decimals: 6,
+            buy_spread: Some(Spread::Bps(200)),
+            sell_spread: Some(Spread::Bps(200)),
+            buy_capacity_debt: Some(RfqCapacity::Exact(U256::from(1_500_000_000u64))),
+            sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(1_500_000_000u64))),
+            feed_url: "http://feed".into(),
+            staleness_secs: 240,
+        }
+    }
+
+    #[test]
+    fn vault_levels_skip_books_outside_the_pair() {
+        let mut engine = test_engine();
+        engine.vault = Some(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+        );
+        engine.books.push(off_pair_book());
+        let prices = fresh_prices();
+        assert!(
+            engine.level_frames(&prices, unix_ms_now()).is_empty(),
+            "no policy yet → publish nothing"
+        );
+        *engine.vault_policy.write().unwrap() = Some(VaultQuotePolicy {
+            settlement: DEBT.parse().unwrap(),
+            corridor: COLLATERAL.parse().unwrap(),
+            max_input_settlement: U256::MAX,
+            max_input_corridor: U256::MAX,
+            max_lifetime_secs: 120,
+        });
+        let frames = engine.level_frames(&prices, unix_ms_now());
+        assert_eq!(frames.len(), 1, "off-pair book must stay unpublished");
+        let MakerFrame::Levels(frame) = &frames[0] else {
+            panic!("expected levels, got {frames:?}");
+        };
+        assert_eq!(frame.corridor_id, "cngn-usdc");
+    }
+
+    #[tokio::test]
+    async fn vault_quote_rejects_a_book_that_shares_only_one_asset() {
+        let mut engine = test_engine();
+        engine.vault = Some(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+        );
+        *engine.trading_epoch.write().unwrap() = 3;
+        *engine.vault_policy.write().unwrap() = Some(VaultQuotePolicy {
+            settlement: DEBT.parse().unwrap(),
+            corridor: COLLATERAL.parse().unwrap(),
+            max_input_settlement: U256::MAX,
+            max_input_corridor: U256::MAX,
+            max_lifetime_secs: 120,
+        });
+        engine.books.push(off_pair_book());
+        engine.inventory.set(
+            OTHER.parse().unwrap(),
+            U256::from(10_000_000_000u64),
+            unix_now(),
+        );
+        let mut req = exact_input_request("rfq_off");
+        req.corridor_id = "other-usdc".into();
+        req.sell_token = OTHER.into();
+        req.buy_token = DEBT.into();
+        let reply = engine.respond(req, &fresh_prices()).await;
+        let MakerFrame::QuoteReject(rej) = reply else {
+            panic!("expected reject, got {reply:?}");
+        };
+        assert_eq!(rej.reason, RejectReason::Busy);
     }
 
     #[test]
@@ -2164,10 +2634,10 @@ mod tests {
 
     #[test]
     fn rate_budget_counts_only_corridors_that_can_emit() {
-        let engine = test_engine();
+        let mut engine = test_engine();
         let prices = fresh_prices();
         let pending = HashSet::from(["cngn-usdc".to_string(), "dark".to_string()]);
-        let ready = ready_level_slugs(&engine, &prices, Some(&pending));
+        let ready = ready_level_slugs(&mut engine, &prices, Some(&pending));
         assert_eq!(ready, vec!["cngn-usdc".to_string()]);
         let now = tokio::time::Instant::now();
         let almost_full = window_with(&[batch(now, 39)]);

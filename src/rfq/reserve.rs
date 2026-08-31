@@ -49,6 +49,10 @@ struct Reservation {
 struct StoredLedger {
     version: u32,
     entries: Vec<StoredEntry>,
+    /// `tradingEpoch` the entries were signed under. Absent on files written
+    /// before vault mode, and for plain EOA makers (no epoch to bind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_epoch: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,6 +74,9 @@ struct StoredEntry {
 pub struct Reservations {
     by_rfq: HashMap<String, Reservation>,
     persist_path: Option<PathBuf>,
+    /// Last synced vault `tradingEpoch`. Persisted so a restart can tell
+    /// whether the loaded claims were signed under the current epoch.
+    vault_epoch: Option<u64>,
 }
 
 impl Reservations {
@@ -125,6 +132,7 @@ impl Reservations {
         Ok(Self {
             by_rfq,
             persist_path: Some(path),
+            vault_epoch: stored.vault_epoch,
         })
     }
 
@@ -377,6 +385,29 @@ impl Reservations {
         gone
     }
 
+    /// Bind the ledger to the vault's on-chain `tradingEpoch`. A bump
+    /// invalidates every outstanding signature, so a mismatch drops every
+    /// claim — whether the bump happened live or while the process was down
+    /// (the ledger persists the epoch it was written under). A ledger with no
+    /// recorded epoch (pre-epoch file) keeps its entries: they cannot be
+    /// attributed, and keeping them only under-quotes until they expire,
+    /// while wrongly dropping a live claim would double-spend inventory.
+    pub fn sync_vault_epoch(&mut self, epoch: u64) {
+        if self.vault_epoch == Some(epoch) {
+            return;
+        }
+        if self.vault_epoch.is_some() {
+            self.by_rfq.clear();
+        }
+        self.vault_epoch = Some(epoch);
+        self.persist();
+    }
+
+    /// Last synced epoch — restart diagnostics and tests.
+    pub fn vault_epoch(&self) -> Option<u64> {
+        self.vault_epoch
+    }
+
     /// Drop entries past their release time. Called on the 1s levels tick so
     /// the map can't grow unboundedly between quote bursts.
     pub fn prune(&mut self, now_secs: u64) {
@@ -403,6 +434,7 @@ impl Reservations {
     fn write(&self, path: &Path) -> anyhow::Result<()> {
         let stored = StoredLedger {
             version: 1,
+            vault_epoch: self.vault_epoch,
             entries: self
                 .by_rfq
                 .iter()
@@ -788,6 +820,52 @@ mod tests {
             U256::from(400u64)
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_epoch_bump_across_a_restart_drops_the_loaded_ledger() {
+        let path = tmp_path("epoch-restart");
+        let mut live = Reservations::with_persist_path(&path);
+        live.sync_vault_epoch(4);
+        live.reserve("rfq_old", "cngn-usdt-celo", true, U256::from(400u64), 1_000);
+
+        // Same epoch after restart: the claims are still live signatures.
+        let mut same = Reservations::load(&path, 0).unwrap();
+        same.sync_vault_epoch(4);
+        assert_eq!(same.len(), 1, "same epoch must keep loaded claims");
+
+        // The vault bumped to 5 while the process was down: every loaded
+        // signature is dead, and must not subtract inventory.
+        let mut bumped = Reservations::load(&path, 0).unwrap();
+        bumped.sync_vault_epoch(5);
+        assert!(bumped.is_empty(), "a stale-epoch ledger must be dropped");
+        assert_eq!(bumped.vault_epoch(), Some(5));
+
+        // And the drop persists: a second restart loads the new epoch, empty.
+        let reloaded = Reservations::load(&path, 0).unwrap();
+        assert!(reloaded.is_empty());
+        assert_eq!(reloaded.vault_epoch(), Some(5));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_ledger_without_an_epoch_keeps_its_claims_on_first_sync() {
+        // Pre-epoch file (or in-memory EOA ledger): the claims cannot be
+        // attributed to an epoch, and keeping them only under-quotes.
+        let mut r = Reservations::new();
+        r.reserve(
+            "rfq_legacy",
+            "cngn-usdt-celo",
+            true,
+            U256::from(400u64),
+            1_000,
+        );
+        r.sync_vault_epoch(3);
+        assert_eq!(r.len(), 1);
+        // A live bump after binding still clears.
+        r.sync_vault_epoch(4);
+        assert!(r.is_empty());
+        let _ = r;
     }
 
     #[test]

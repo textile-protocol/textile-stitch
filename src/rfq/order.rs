@@ -30,8 +30,9 @@ pub fn encode_taker_validation(taker: Address, exclusive_until: u64) -> Bytes {
 #[derive(Debug, Clone)]
 pub struct RfqOrderSpec {
     pub reactor: Address,
-    /// The funding wallet: swapper, recipient, and signer are all this one
-    /// address (same-address sign + fund).
+    /// The funding wallet: swapper and recipient. For an EOA maker this is
+    /// also the signer. For an OperatorVault this is the vault; the bot key
+    /// signs and the venue attaches the risk co-signature.
     pub maker: Address,
     pub nonce: U256,
     /// Unix seconds; must be ≤ the request's maxExpiresAt.

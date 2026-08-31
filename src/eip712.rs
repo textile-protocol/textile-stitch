@@ -173,7 +173,7 @@ const SESSION_DOMAIN_VERSION: &str = "1";
 /// challenge must never enroll.
 const ENROLL_DOMAIN_TYPE: &str = "EIP712Domain(string name,string version,uint256 chainId)";
 const MAKER_ENROLL_TYPE: &str =
-    "MakerEnroll(address signingAddress,uint256 chainId,uint256 issuedAt)";
+    "MakerEnroll(address signingAddress,address fundingWallet,uint256 chainId,uint256 issuedAt)";
 
 /// Mainnet FX chains — keep in lockstep with `LIVE_FX_CHAIN_IDS` on the venue.
 const LIVE_FX_CHAIN_IDS: &[u64] = &[1, 137, 56, 8453, 42220];
@@ -190,6 +190,7 @@ pub fn maker_enroll_environment(chain_id: u64) -> &'static str {
 pub fn maker_enroll_digest(
     environment: &str,
     signing_address: Address,
+    funding_wallet: Address,
     chain_id: u64,
     issued_at_ms: u64,
 ) -> B256 {
@@ -203,6 +204,7 @@ pub fn maker_enroll_digest(
     let struct_hash = hash_words(&[
         b256_word(k(MAKER_ENROLL_TYPE)),
         addr_word(signing_address),
+        addr_word(funding_wallet),
         u256_word(U256::from(chain_id)),
         u256_word(U256::from(issued_at_ms)),
     ]);
@@ -399,43 +401,31 @@ mod tests {
 
     #[test]
     fn maker_enroll_digest_matches_the_venue_golden_vector() {
-        let digest = maker_enroll_digest(
-            "LIVE",
-            address!("1111111111111111111111111111111111111111"),
-            56,
-            1_754_388_000_000,
-        );
+        let signer = address!("1111111111111111111111111111111111111111");
+        let digest = maker_enroll_digest("LIVE", signer, signer, 56, 1_754_388_000_000);
         assert_eq!(
             digest,
-            b256!("6e5b7d7d1f37b729d30a62c2181b668dab82a4f28bf5266fd3ef7ccaf44fcbd4")
+            b256!("91aa4bc9c15b2f68dc58114929cbaf11f8ddceff6b757692980ac8bcb53fa6a1")
         );
     }
 
     #[test]
     fn maker_enroll_binds_environment_and_chain() {
-        let base = maker_enroll_digest(
-            "LIVE",
-            address!("1111111111111111111111111111111111111111"),
-            56,
-            1_754_388_000_000,
+        let signer = address!("1111111111111111111111111111111111111111");
+        let vault = address!("2222222222222222222222222222222222222222");
+        let base = maker_enroll_digest("LIVE", signer, signer, 56, 1_754_388_000_000);
+        assert_ne!(
+            base,
+            maker_enroll_digest("TEST", signer, signer, 56, 1_754_388_000_000,)
         );
         assert_ne!(
             base,
-            maker_enroll_digest(
-                "TEST",
-                address!("1111111111111111111111111111111111111111"),
-                56,
-                1_754_388_000_000,
-            )
+            maker_enroll_digest("LIVE", signer, signer, 8453, 1_754_388_000_000,)
         );
         assert_ne!(
             base,
-            maker_enroll_digest(
-                "LIVE",
-                address!("1111111111111111111111111111111111111111"),
-                8453,
-                1_754_388_000_000,
-            )
+            maker_enroll_digest("LIVE", signer, vault, 56, 1_754_388_000_000,),
+            "fundingWallet is bound so a captured EOA enroll cannot retarget a vault"
         );
     }
 

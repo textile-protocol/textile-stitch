@@ -41,3 +41,4 @@ pub mod twap;
 pub mod tx;
 pub mod types;
 pub mod update;
+pub mod vault;
