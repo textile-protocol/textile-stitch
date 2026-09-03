@@ -32,6 +32,10 @@ const VENUE_SUPERSEDED_CODE: u16 = 4001;
 const VENUE_NOT_ENGINE_CODE: u16 = 4005;
 /// The api task we were on is shutting down and has released the lease.
 const VENUE_DRAINING_CODE: u16 = 4006;
+/// Our seat list went stale: a corridor was listed (or left Book mode) after we
+/// authenticated. Reconnecting is what picks it up — the venue hands the
+/// corridor pairs down in SessionAccepted and nothing refreshes them in place.
+const VENUE_SEATS_CHANGED_CODE: u16 = 4007;
 
 /// The venue told us to move, and nothing is wrong with this maker.
 ///
@@ -63,9 +67,13 @@ pub struct VenueSuperseded {
     pub reason: String,
 }
 
-/// Does this close frame mean "wrong task" rather than "go away"?
+/// Does this close frame mean "reconnect now" rather than "go away"?
+///
+/// Two shapes, same policy: the task is wrong (4005/4006), or our seat list is
+/// (4007). In all three the socket and the credential are fine and the venue
+/// wants us straight back, so backing off is exactly wrong.
 pub fn handover_close(code: u16) -> bool {
-    code == VENUE_NOT_ENGINE_CODE || code == VENUE_DRAINING_CODE
+    code == VENUE_NOT_ENGINE_CODE || code == VENUE_DRAINING_CODE || code == VENUE_SEATS_CHANGED_CODE
 }
 
 /// Was this failure another session taking our identity?

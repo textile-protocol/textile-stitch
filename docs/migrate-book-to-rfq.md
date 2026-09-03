@@ -26,11 +26,15 @@ every new maker starts registered and dark:
 
 1. **Connect.** The bot signs `MakerEnroll` with its funding wallet and gets a
    maker id and key back. No corridor is enabled yet.
-2. **Request access.** Tell Textile who you are — email or WhatsApp. That sends
-   ops a dossier (wallet, chain, maker id, corridor, contact) with Approve and
-   Reject.
-3. **They approve**, which unflags the maker and seats every RFQ-capable
-   corridor on that chain.
+2. **Request access.** Tell Textile who you are. An email address you own is
+   required (placeholder and throwaway domains are refused); WhatsApp is
+   optional. That sends ops a dossier (wallet, chain, maker id, corridor,
+   contact) with Approve and Reject, and sends *you* a link to confirm the
+   address. Click it — the request is reviewed either way, but it shows up as
+   unverified until you do. You ask once: the same request covers every bot
+   you run on this wallet.
+3. **They approve**, which seats the maker on every RFQ corridor on every
+   chain — including pairs Textile lists later. You get an email saying so.
 4. **Check status.** Your bot picks the seat up and goes live. This does not
    rotate your key.
 
@@ -47,10 +51,10 @@ book bot is never dark in the gap. That is the whole reason to leave the ladder
    with its own funding wallet; Textile registers the maker and the panel writes
    `rfq-api.key` beside the config. You never paste an id or key.
 3. Ask Textile to seat the maker. Newer panels have a **Request access** form
-   in the RFQ card — an email address or a WhatsApp number — and the card then
-   reads "Access requested". If your panel has no such form, mail
-   `contact@textilecredit.com` with the maker id from `[rfq].maker_id`, the
-   chain, and the pair.
+   in the RFQ card — an email address you own, WhatsApp optional — and the
+   card then reads "Access requested". Confirm the address from the link they
+   email you. If your panel has no such form, mail `contact@textilecredit.com`
+   with the maker id from `[rfq].maker_id`, the chain, and the pair.
 4. Wait for approval. When it lands, press **Check status** if your panel has
    it — otherwise press **Reconnect**, which re-enrolls and picks the seat up
    (it rotates the maker key; Check status does not). Either way the card goes
@@ -215,8 +219,8 @@ defaults to true) and restart.
 
 Either way, leave `[rfq]` in place. `enabled = false` parks the responder
 without discarding your maker id, so switching back is one edit rather than
-another enrollment — and it keeps your seat, which you would otherwise have to
-be approved for again.
+another enrollment. Your approval is not lost either way: it is per maker, not
+per pair, so switching back never needs a second review.
 
 Orders you already signed stay live on the book until they expire, whichever
 direction you move.

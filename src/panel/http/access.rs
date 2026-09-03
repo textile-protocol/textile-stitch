@@ -3,7 +3,10 @@
 //! Request Textile to seat this maker, and poll until they do.
 //!
 //! Connect only registers a key. This is the last setup step: the panel
-//! posts contact details to the venue, which emails ops. Check status
+//! posts contact details to the venue, which emails ops. Asked once per
+//! maker — approval covers every RFQ corridor on every chain, including
+//! pairs listed later. The email is required and the venue mails a confirm
+//! link beside the review; the request is reviewed either way. Check status
 //! applies corridors once approved, without rotating the key.
 
 use axum::extract::{Path as UrlPath, State};
@@ -51,6 +54,37 @@ struct AccessStatusResponse {
     corridors: Vec<String>,
     #[serde(default)]
     corridor_pairs: Vec<EnrollCorridorPair>,
+    #[serde(default)]
+    contact_email: Option<String>,
+    /// False until the operator clicks the confirm link. Older venues omit
+    /// it, and "omitted" must not read as "not confirmed".
+    #[serde(default)]
+    email_verified: Option<bool>,
+}
+
+/// What the venue says back to a filed request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessRequestResponse {
+    #[serde(default)]
+    contact_email: Option<String>,
+    #[serde(default)]
+    email_verified: Option<bool>,
+}
+
+/// The line under "Request sent" / "still pending": only nags about the
+/// confirm link while the venue actually says it is unconfirmed.
+fn verify_hint(contact_email: Option<&str>, email_verified: Option<bool>) -> String {
+    match (email_verified, contact_email) {
+        (Some(false), Some(email)) => format!(
+            " Confirm your email: we sent a link to {email}. Request access again to resend it."
+        ),
+        (Some(false), None) => {
+            " Confirm your email: we sent you a link. Request access again to resend it."
+                .to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Body for POST /v2/maker/access-request. The form leaves most of these
@@ -75,13 +109,13 @@ fn filled(value: Option<&str>) -> Option<&str> {
 }
 
 /// Email is the channel Textile answers a review on, so it is the required
-/// one. WhatsApp is a bonus number for them to ping.
+/// one — and the one they ask you to confirm. WhatsApp is a bonus number.
 fn require_email(email: Option<&str>) -> Result<(), ApiError> {
     if filled(email).is_some() {
         return Ok(());
     }
     Err(ApiError::bad_request(
-        "add an email address so Textile can reply to your access request — WhatsApp is optional",
+        "add an email address you own so Textile can reply to your access request — WhatsApp is optional",
     ))
 }
 
@@ -151,10 +185,25 @@ pub async fn request_access(
             .unwrap_or_else(|| format!("Textile access request failed ({status})"));
         return Err(ApiError::bad_request(message));
     }
+    let filed: AccessRequestResponse =
+        serde_json::from_str(&text).unwrap_or(AccessRequestResponse {
+            contact_email: None,
+            email_verified: None,
+        });
+    let hint = verify_hint(
+        filed
+            .contact_email
+            .as_deref()
+            .or(filled(body.contact_email.as_deref())),
+        filed.email_verified,
+    );
 
     Ok(Json(json!({
-        "message": "Request sent. Textile will review it and email you if they need anything.",
+        "message": format!(
+            "Request sent. Textile reviews it and approves you for every Swap pair at once.{hint}"
+        ),
         "accessStatus": "PENDING",
+        "emailVerified": filed.email_verified,
     }))
     .into_response())
 }
@@ -209,19 +258,28 @@ pub async fn access_status(
     })?;
 
     if reported.access_status != "APPROVED" || reported.flagged {
-        let message = if reported.flagged || reported.access_status == "REJECTED" {
+        let message = if reported.flagged {
             format!(
-                "Textile rejected {}. You will not receive private quotes.",
+                "Textile blocked {}. You will not receive private quotes.",
+                reported.maker_slug
+            )
+        } else if reported.access_status == "REJECTED" {
+            format!(
+                "Textile turned {} down. You can request access again.",
                 reported.maker_slug
             )
         } else if reported.access_status == "PENDING" {
-            "Textile still has your request. Nothing to do until they approve it.".to_string()
+            format!(
+                "Textile still has your request. Nothing to do until they approve it.{}",
+                verify_hint(reported.contact_email.as_deref(), reported.email_verified)
+            )
         } else {
             "No access request yet. Send one so Textile can review this maker.".to_string()
         };
         return Ok(Json(json!({
             "message": message,
             "accessStatus": reported.access_status,
+            "emailVerified": reported.email_verified,
             "enrollment": {
                 "makerSlug": reported.maker_slug,
                 "environment": reported.environment,
@@ -358,10 +416,7 @@ mod tests {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("");
                         assert_eq!(auth, format!("Bearer {expect_key}"));
-                        assert!(
-                            body["contactEmail"].as_str().is_some()
-                                || body["contactWhatsapp"].as_str().is_some()
-                        );
+                        assert!(body["contactEmail"].as_str().is_some());
                         // The venue validates these as optional strings, so a
                         // blank field must be absent rather than null.
                         assert!(
@@ -372,7 +427,12 @@ mod tests {
                                 .any(Value::is_null),
                             "sent a null field: {body}"
                         );
-                        Json(json!({ "accessStatus": "PENDING", "requestId": "clreq1" }))
+                        Json(json!({
+                            "accessStatus": "PENDING",
+                            "requestId": "clreq1",
+                            "contactEmail": body["contactEmail"],
+                            "emailVerified": false,
+                        }))
                     },
                 ),
             )
@@ -564,6 +624,20 @@ mod tests {
         assert!(!body.contains("tx_live_enroll_secret"), "{body}");
         let v = Harness::parse(&body);
         assert_eq!(v["accessStatus"], "PENDING");
+        assert_eq!(v["emailVerified"], false);
+        assert!(
+            v["message"].as_str().unwrap().contains("desk@example.com"),
+            "tells them where the confirm link went: {body}"
+        );
+    }
+
+    #[test]
+    fn the_verify_hint_only_nags_while_unconfirmed() {
+        assert!(verify_hint(Some("a@b.c"), Some(false)).contains("a@b.c"));
+        assert_eq!(verify_hint(Some("a@b.c"), Some(true)), "");
+        // An older venue that does not report it must not read as unconfirmed.
+        assert_eq!(verify_hint(Some("a@b.c"), None), "");
+        assert!(verify_hint(None, Some(false)).contains("Confirm your email"));
     }
 
     #[tokio::test]

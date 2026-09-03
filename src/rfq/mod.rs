@@ -1735,6 +1735,7 @@ mod tests {
     fn only_the_redirect_codes_count_as_a_handover() {
         assert!(session::handover_close(4005), "not-the-engine redirects");
         assert!(session::handover_close(4006), "draining redirects");
+        assert!(session::handover_close(4007), "stale seats redirect");
         // Everything in 4000-4004 is the maker's problem, not the task's:
         // reconnecting instantly would hammer the venue with a credential it
         // has already rejected.

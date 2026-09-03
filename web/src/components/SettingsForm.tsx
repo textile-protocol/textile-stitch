@@ -1131,9 +1131,10 @@ function RfqCard({
         <p className="text-xs text-faint">
           Connect registers this bot&apos;s funding wallet and saves the
           credential. Textile still has to approve you before you receive
-          Swap quotes — Request access below, then Check status after they
-          do. You never paste an id or key. The venue rejects requests under 1
-          whole token so the protocol fee cannot round to zero.
+          Swap quotes — Request access below (once, for every pair), then
+          Check status after they do. You never paste an id or key. The venue
+          rejects requests under 1 whole token so the protocol fee cannot
+          round to zero.
         </p>
 
         {waiting ? (
@@ -1144,9 +1145,9 @@ function RfqCard({
               : ''}
             .{' '}
             {makerFlagged
-              ? 'Textile has flagged this maker. You will not receive Swap quotes.'
+              ? 'Textile has blocked this maker. You will not receive Swap quotes.'
               : rejected
-                ? 'Textile turned this chain down. Request access again if you want another review.'
+                ? 'Textile turned this maker down. Request access again if you want another review.'
                 : accessStatus === 'PENDING'
                   ? 'Access requested. Textile will review it. Check status after they approve you.'
                   : 'Request access so Textile can review this maker. You will not receive Swap quotes until they approve you.'}
@@ -1188,9 +1189,10 @@ function RfqCard({
           <div className="space-y-3 rounded-lg border border-line-soft p-3">
             <p className="text-sm font-bold">Request access</p>
             <p className="text-xs text-faint">
-              Textile replies about the review by email, so that one is
-              required. WhatsApp is optional — add it if you would rather they
-              ping you there.
+              One request covers every Swap pair, on every chain, including
+              pairs Textile lists later. They reply by email, so use an
+              address you own — they send a link to confirm it. WhatsApp is
+              optional.
             </p>
             <Field label="Email">
               <Input

@@ -178,6 +178,8 @@ export interface SaveResult {
 export interface RfqAccessResult {
   message: string
   accessStatus: RfqAccessStatus
+  /** False until the confirm link is clicked; absent from older venues. */
+  emailVerified?: boolean | null
   settings?: Settings
   enrollment?: RfqEnrollment
 }
