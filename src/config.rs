@@ -1216,8 +1216,7 @@ impl Config {
             }
             anyhow::ensure!(
                 !self.book_enabled,
-                "[vault] is set — the public ladder must stay off (book_enabled = false). \
-                 OperatorAdmin approves Permit2 on the vault; stitch approve does not."
+                "[vault] is set — the public ladder must stay off (book_enabled = false)."
             );
         }
         self.validate_rfq()?;

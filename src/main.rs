@@ -249,11 +249,17 @@ async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow:
         &std::fs::read_to_string(&config_path)
             .with_context(|| format!("reading config {config_path}"))?,
     )?;
+    // A vault approves Permit2 for both legs in its own constructor and has no
+    // operator-admin approval method, so there is nothing to send here and
+    // nothing an operator could do by hand. Succeed rather than bail: setup
+    // scripts run `approve` unconditionally, and aborting sent operators
+    // looking for a vault method that does not exist.
     if cfg.vault.is_some() {
-        anyhow::bail!(
-            "[vault] is set — OperatorAdmin must approve Permit2 on the vault. \
-             `stitch approve` only signs from the strategy key and will not move vault allowances."
+        info!(
+            "[vault] is set — the vault approved Permit2 for both legs in its \
+             constructor, so there is nothing to approve. Nothing sent."
         );
+        return Ok(());
     }
     let signer = build_signer(&cfg).await?;
     let permit2: Address = cfg.permit2.parse().context("invalid permit2 address")?;
@@ -520,12 +526,13 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // start stays cautious and surfaces the error.
     //
     // Vault mode is different: Permit2 pulls from the OperatorVault, which
-    // OperatorAdmin already approved. `unapproved_tokens` inspects the strategy
-    // EOA, so a vault bot would exit here even when the vault is ready.
+    // approved both legs in its own constructor. `unapproved_tokens` inspects
+    // the strategy EOA, so a vault bot would exit here even when the vault is
+    // ready.
     if cfg.vault.is_some() {
         info!(
             "[vault] is set — skipping strategy-wallet Permit2 preflight; \
-             OperatorAdmin must have approved Permit2 on the vault"
+             the vault approved Permit2 in its constructor"
         );
     } else {
         match unapproved_tokens(&wallet, permit2, &cfg).await {
