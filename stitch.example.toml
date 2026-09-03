@@ -145,8 +145,9 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 
 # ----- OperatorVault maker. The bot key is the strategy signer; the vault is
 # the UniswapX swapper/recipient. Connect then registers fundingWallet = vault.
-# OperatorAdmin approves Permit2 on the vault — `stitch approve` will not.
-# The public ladder must stay off.
+# The vault approves Permit2 for both legs in its constructor, so there is no
+# approval step here — `stitch approve` is for an EOA maker and is a no-op for
+# a vault. The public ladder must stay off.
 # [vault]
 # address = "0xYourOperatorVault"
 # order_executor = "0x0000000000000000000000000000000000000000"  # optional: the chain's VaultOrderExecutor, once the venue lists one
