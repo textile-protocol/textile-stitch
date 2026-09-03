@@ -88,6 +88,14 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct VaultConfig {
     pub address: String,
+    /// The chain's VaultOrderExecutor. Listed beside the taker as a preferred
+    /// filler, so the taker can fill through the executor, which unstakes
+    /// yield-deployed settlement before the Permit2 pull. The executor only
+    /// accepts the bound taker as caller, so listing it does not open the
+    /// order up. The venue rejects the two-entry binding on a chain where it
+    /// has no executor, so leave this unset until ops publishes the address.
+    #[serde(default)]
+    pub order_executor: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1193,6 +1201,19 @@ impl Config {
                 .parse::<alloy_primitives::Address>()
                 .context("[vault].address is not a valid address")?;
             anyhow::ensure!(!address.is_zero(), "[vault].address is the zero address");
+            if let Some(executor) = &vault.order_executor {
+                let executor = executor
+                    .parse::<alloy_primitives::Address>()
+                    .context("[vault].order_executor is not a valid address")?;
+                anyhow::ensure!(
+                    !executor.is_zero(),
+                    "[vault].order_executor is the zero address"
+                );
+                anyhow::ensure!(
+                    executor != address,
+                    "[vault].order_executor is the vault itself"
+                );
+            }
             anyhow::ensure!(
                 !self.book_enabled,
                 "[vault] is set — the public ladder must stay off (book_enabled = false). \
@@ -2234,6 +2255,39 @@ mod tests {
             cfg.vault.as_ref().unwrap().address.to_lowercase(),
             "0x00000000000000000000000000000000000000aa"
         );
+        assert!(cfg.vault.as_ref().unwrap().order_executor.is_none());
+    }
+
+    #[test]
+    fn vault_order_executor_is_optional_and_checked() {
+        let base = LEAN_POOL_BASE.replace(
+            "tick_interval_secs = 5",
+            "tick_interval_secs = 5\nbook_enabled = false",
+        );
+        let vault = |executor: &str| {
+            format!(
+                "{base}\n[vault]\naddress = \"0x00000000000000000000000000000000000000aa\"\n\
+                 order_executor = \"{executor}\"\n"
+            )
+        };
+
+        let cfg = Config::from_toml(&vault("0x00000000000000000000000000000000000000ee"))
+            .expect("vault + executor parses");
+        assert_eq!(
+            cfg.vault.unwrap().order_executor.unwrap().to_lowercase(),
+            "0x00000000000000000000000000000000000000ee"
+        );
+
+        let zero = Config::from_toml(&vault("0x0000000000000000000000000000000000000000"))
+            .expect_err("a zero executor must fail");
+        assert!(zero.to_string().contains("order_executor"));
+
+        let self_ref = Config::from_toml(&vault("0x00000000000000000000000000000000000000aa"))
+            .expect_err("the vault is not its own executor");
+        assert!(self_ref.to_string().contains("vault itself"));
+
+        let junk = Config::from_toml(&vault("not-an-address")).expect_err("junk must fail");
+        assert!(junk.to_string().contains("order_executor"));
     }
 
     #[test]

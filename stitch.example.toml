@@ -149,6 +149,7 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # The public ladder must stay off.
 # [vault]
 # address = "0xYourOperatorVault"
+# order_executor = "0x0000000000000000000000000000000000000000"  # optional: the chain's VaultOrderExecutor, once the venue lists one
 
 # ----- Leftover experimental tokens. Ignored. The Settings RFQ card and
 # RFQ-as-default path are always on. Old files may still carry these keys.

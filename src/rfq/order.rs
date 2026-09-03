@@ -10,19 +10,26 @@ use alloy_primitives::{Address, Bytes, U256};
 
 use crate::types::OrderParams;
 
-/// `abi.encode(address[] preferredFillers, uint256 exclusiveUntil)` with a
-/// single preferred filler — the PreferredFillerValidation payload that binds
-/// the signed order to the requesting taker. `exclusive_until` covers the
-/// whole order lifetime (== deadline), so there is no post-exclusivity window
-/// in which a lost quote becomes open-market fillable.
-pub fn encode_taker_validation(taker: Address, exclusive_until: u64) -> Bytes {
-    let mut out = Vec::with_capacity(4 * 32);
+/// `abi.encode(address[] preferredFillers, uint256 exclusiveUntil)` — the
+/// PreferredFillerValidation payload that binds the signed order to the
+/// requesting taker. `exclusive_until` covers the whole order lifetime
+/// (== deadline), so there is no post-exclusivity window in which a lost
+/// quote becomes open-market fillable.
+///
+/// The list is the taker alone, or the taker plus the chain's
+/// VaultOrderExecutor: the reactor names the executor as the filler when the
+/// taker fills through it, and the executor itself re-checks that its caller
+/// is the bound taker. The venue accepts exactly those two shapes.
+pub fn encode_preferred_filler_validation(fillers: &[Address], exclusive_until: u64) -> Bytes {
+    let mut out = Vec::with_capacity((3 + fillers.len()) * 32);
     // Head: [offset to address[], exclusiveUntil].
     out.extend_from_slice(&U256::from(0x40u64).to_be_bytes::<32>());
     out.extend_from_slice(&U256::from(exclusive_until).to_be_bytes::<32>());
-    // Tail: address[] {taker}.
-    out.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
-    out.extend_from_slice(&taker.into_word().0);
+    // Tail: address[] {fillers}.
+    out.extend_from_slice(&U256::from(fillers.len() as u64).to_be_bytes::<32>());
+    for filler in fillers {
+        out.extend_from_slice(&filler.into_word().0);
+    }
     Bytes::from(out)
 }
 
@@ -47,6 +54,20 @@ pub struct RfqOrderSpec {
     pub validation_contract: Address,
     /// The taker the order is bound to.
     pub taker: Address,
+    /// The chain's VaultOrderExecutor, listed beside the taker so a vault
+    /// order whose settlement sits in the yield adapter can be filled through
+    /// it. `None` binds the taker alone (every EOA maker, and a vault with no
+    /// executor configured).
+    pub order_executor: Option<Address>,
+}
+
+impl RfqOrderSpec {
+    /// The preferred-filler binding: the taker, plus the executor when set.
+    fn preferred_fillers(&self) -> Vec<Address> {
+        std::iter::once(self.taker)
+            .chain(self.order_executor)
+            .collect()
+    }
 }
 
 /// Assemble the [`OrderParams`] for a firm quote. The venue fee is
@@ -64,7 +85,10 @@ pub fn build_order(spec: &RfqOrderSpec) -> OrderParams {
         output_amount: spec.output_amount,
         recipient: spec.maker,
         additional_validation_contract: spec.validation_contract,
-        additional_validation_data: encode_taker_validation(spec.taker, spec.deadline_secs),
+        additional_validation_data: encode_preferred_filler_validation(
+            &spec.preferred_fillers(),
+            spec.deadline_secs,
+        ),
     }
 }
 
@@ -78,12 +102,28 @@ mod tests {
         // abi.encode(address[] {taker}, uint256 exclusiveUntil): head is the
         // array offset (0x40) then the uint, tail is [length, element].
         let taker = address!("3333333333333333333333333333333333333333");
-        let data = encode_taker_validation(taker, 0x0102);
+        let data = encode_preferred_filler_validation(&[taker], 0x0102);
         let expected = hex::decode(concat!(
             "0000000000000000000000000000000000000000000000000000000000000040",
             "0000000000000000000000000000000000000000000000000000000000000102",
             "0000000000000000000000000000000000000000000000000000000000000001",
             "0000000000000000000000003333333333333333333333333333333333333333",
+        ))
+        .unwrap();
+        assert_eq!(data.to_vec(), expected);
+    }
+
+    #[test]
+    fn a_two_filler_binding_appends_the_executor_to_the_array() {
+        let taker = address!("3333333333333333333333333333333333333333");
+        let executor = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let data = encode_preferred_filler_validation(&[taker, executor], 0x0102);
+        let expected = hex::decode(concat!(
+            "0000000000000000000000000000000000000000000000000000000000000040",
+            "0000000000000000000000000000000000000000000000000000000000000102",
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            "0000000000000000000000003333333333333333333333333333333333333333",
+            "000000000000000000000000eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         ))
         .unwrap();
         assert_eq!(data.to_vec(), expected);
@@ -102,6 +142,7 @@ mod tests {
             output_amount: U256::from(2_000u64),
             validation_contract: address!("6666666666666666666666666666666666666666"),
             taker: address!("3333333333333333333333333333333333333333"),
+            order_executor: None,
         };
         let order = build_order(&spec);
         assert_eq!(order.swapper, spec.maker);
@@ -112,7 +153,7 @@ mod tests {
         );
         assert_eq!(
             order.additional_validation_data,
-            encode_taker_validation(spec.taker, spec.deadline_secs),
+            encode_preferred_filler_validation(&[spec.taker], spec.deadline_secs),
             "exclusiveUntil == deadline, per spec"
         );
         assert_eq!(order.deadline, U256::from(1_900_000_000u64));
@@ -121,5 +162,29 @@ mod tests {
         // that RFQ orders flow through the same bytes path as taker fills).
         let bytes = crate::taker::encode_order_bytes(&order);
         assert!(bytes.len() % 32 == 0 && !bytes.is_empty());
+    }
+
+    #[test]
+    fn a_vault_order_with_an_executor_binds_taker_then_executor() {
+        let executor = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let spec = RfqOrderSpec {
+            reactor: address!("1111111111111111111111111111111111111111"),
+            maker: address!("2222222222222222222222222222222222222222"),
+            nonce: U256::from(7u64),
+            deadline_secs: 1_900_000_000,
+            input_token: address!("4444444444444444444444444444444444444444"),
+            input_amount: U256::from(1_000u64),
+            output_token: address!("5555555555555555555555555555555555555555"),
+            output_amount: U256::from(2_000u64),
+            validation_contract: address!("6666666666666666666666666666666666666666"),
+            taker: address!("3333333333333333333333333333333333333333"),
+            order_executor: Some(executor),
+        };
+        let order = build_order(&spec);
+        assert_eq!(
+            order.additional_validation_data,
+            encode_preferred_filler_validation(&[spec.taker, executor], spec.deadline_secs),
+            "the taker stays bound; the executor is the second entry"
+        );
     }
 }

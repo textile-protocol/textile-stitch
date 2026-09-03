@@ -97,6 +97,9 @@ pub struct RfqRuntime {
     reservations_path: Option<std::path::PathBuf>,
     /// OperatorVault this bot quotes for. `None` is the EOA sign+fund path.
     vault: Option<Address>,
+    /// VaultOrderExecutor to list beside the taker on vault orders. Always
+    /// `None` without a vault.
+    vault_order_executor: Option<Address>,
     /// Live `tradingEpoch()` for vault nonces. Unused when `vault` is None.
     trading_epoch: Arc<RwLock<u64>>,
     /// Per-order caps and lifetime. Unused when `vault` is None.
@@ -350,6 +353,12 @@ fn build_runtime(
             .vault
             .as_ref()
             .map(|v| v.address.parse().context("invalid [vault].address"))
+            .transpose()?,
+        vault_order_executor: cfg
+            .vault
+            .as_ref()
+            .and_then(|v| v.order_executor.as_deref())
+            .map(|a| a.parse().context("invalid [vault].order_executor"))
             .transpose()?,
         trading_epoch: Arc::new(RwLock::new(0)),
         vault_policy: Arc::new(RwLock::new(None)),
@@ -939,6 +948,7 @@ async fn session_loop_inner(
         validation_contract: rt.validation_contract,
         signer: rt.signer.clone(),
         vault: rt.vault,
+        vault_order_executor: rt.vault_order_executor,
         trading_epoch: rt.trading_epoch.clone(),
         vault_policy: rt.vault_policy.clone(),
         nonce_salt: rand::random(),
@@ -1107,6 +1117,9 @@ struct Engine {
     validation_contract: Address,
     signer: DynSigner,
     vault: Option<Address>,
+    /// Listed beside the taker on every vault order when set — see
+    /// `[vault].order_executor`.
+    vault_order_executor: Option<Address>,
     trading_epoch: Arc<RwLock<u64>>,
     vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
     /// Per-process namespace for vault nonces. Two bots sharing one vault can
@@ -1448,6 +1461,7 @@ impl Engine {
             output_amount: plan.output,
             validation_contract: self.validation_contract,
             taker,
+            order_executor: self.vault_order_executor,
         });
         let digest = permit2_digest(&order, self.permit2, self.chain_id);
         let signature = match self.signer.sign_digest(digest).await {
@@ -1973,6 +1987,7 @@ mod tests {
                 .unwrap(),
             signer: Arc::new(LocalSigner::new(key)),
             vault: None,
+            vault_order_executor: None,
             trading_epoch: Arc::new(RwLock::new(0)),
             vault_policy: Arc::new(RwLock::new(None)),
             nonce_salt: 7,
