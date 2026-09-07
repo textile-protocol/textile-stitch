@@ -87,6 +87,15 @@ impl Rpc {
         parse_quantity(&self.call("eth_gasPrice", json!([])).await?)
     }
 
+    /// Native-token balance of `addr` at the latest block, in wei.
+    pub async fn get_balance(&self, addr: Address) -> anyhow::Result<U256> {
+        parse_quantity(
+            &self
+                .call("eth_getBalance", json!([addr.to_string(), "latest"]))
+                .await?,
+        )
+    }
+
     pub async fn max_priority_fee(&self) -> anyhow::Result<U256> {
         parse_quantity(&self.call("eth_maxPriorityFeePerGas", json!([])).await?)
     }
@@ -253,6 +262,67 @@ mod tests {
         assert_eq!(parse_quantity(&json!("0x1a")).unwrap(), U256::from(26u8));
         assert_eq!(parse_quantity(&json!("0x0")).unwrap(), U256::ZERO);
         assert_eq!(parse_quantity(&json!("0x")).unwrap(), U256::ZERO);
+    }
+
+    /// A JSON-RPC node that answers every call with one fixed body.
+    async fn fixed_node(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn get_balance_parses_a_hex_quantity() {
+        let url = fixed_node(r#"{"jsonrpc":"2.0","id":1,"result":"0xde0b6b3a7640000"}"#).await;
+        let bal = Rpc::new(url)
+            .get_balance(address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"))
+            .await
+            .unwrap();
+        assert_eq!(bal, U256::from(1_000_000_000_000_000_000u128));
+    }
+
+    #[tokio::test]
+    async fn get_balance_reads_a_bare_0x_as_zero() {
+        let url = fixed_node(r#"{"jsonrpc":"2.0","id":1,"result":"0x"}"#).await;
+        let bal = Rpc::new(url)
+            .get_balance(address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"))
+            .await
+            .unwrap();
+        assert_eq!(bal, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn get_balance_surfaces_an_rpc_error() {
+        let url = fixed_node(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"header not found"}}"#,
+        )
+        .await;
+        let err = Rpc::new(url)
+            .get_balance(address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("rpc eth_getBalance error"),
+            "{err:#}"
+        );
     }
 
     #[test]

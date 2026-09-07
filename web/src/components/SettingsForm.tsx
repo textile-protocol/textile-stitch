@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { Link } from 'react-router-dom'
 import { ApiError, api } from '../api'
 import {
   Banner,
@@ -72,8 +73,19 @@ export default function SettingsForm({
       .settings(bot.name, activePool)
       .then((s) => {
         if (cancelled) return
-        setLoaded(s)
-        setDraft(s)
+        // New RFQ-only bots default to answering Swap quotes, so the operator
+        // can skip ticking the box and go straight to Connect. Display-only:
+        // nothing persists until Connect writes the [rfq] block with the venue
+        // credential (a fresh bot has no maker id to enable against). Seeding
+        // both loaded and draft keeps the form clean rather than dirty. Only on
+        // this initial load — later refreshes reflect what the operator chose.
+        const connected = s.rfqApiKeySet && s.rfqMakerId.trim() !== ''
+        const seeded =
+          s.rfqDefaultUnlocked && !connected && !s.rfqEnabled
+            ? { ...s, rfqEnabled: true }
+            : s
+        setLoaded(seeded)
+        setDraft(seeded)
       })
       .catch((e) => {
         if (!cancelled) setLoadError(e instanceof ApiError ? e.message : String(e))
@@ -367,11 +379,9 @@ function CorridorsCard({
   onSwitched: (message: string) => void
 }) {
   const [corridors, setCorridors] = useState<Corridor[] | null>(null)
-  const [adding, setAdding] = useState(false)
-  const [addChoice, setAddChoice] = useState('')
   const [switching, setSwitching] = useState(false)
   const [switchChoice, setSwitchChoice] = useState('')
-  const [busy, setBusy] = useState<'add' | 'remove' | 'switch' | null>(null)
+  const [busy, setBusy] = useState<'remove' | 'switch' | null>(null)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => {
     onBusyChange(busy !== null)
@@ -409,33 +419,6 @@ function CorridorsCard({
     return (
       !dirty || window.confirm('Discard unsaved settings for this corridor?')
     )
-  }
-
-  async function add() {
-    if (!discardUnsavedOk()) return
-    const chosen = addable.find((c) => c.id === addChoice)
-    if (
-      !window.confirm(
-        `Add ${chosen?.displayName ?? 'this corridor'} to ${bot.name}?\n\n` +
-          `It quotes from the same chain, wallet and signer as the pairs already here, with its own price feed and spreads. A running bot restarts to pick it up.\n\n` +
-          `Two things to do afterwards:\n` +
-          `  1. Approve the new tokens — Tools → Permit2 allowances\n` +
-          `  2. Enroll this bot's maker key on the corridor, or RFQ won't quote it`,
-      )
-    ) {
-      return
-    }
-    setBusy('add')
-    setError(null)
-    try {
-      const res = await api.addPool(bot.name, addChoice)
-      setAdding(false)
-      onPoolsChanged(res)
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setBusy(null)
-    }
   }
 
   async function remove() {
@@ -520,56 +503,25 @@ function CorridorsCard({
         })}
       </ul>
 
-      {settings.editable && addable.length > 0 && !adding && (
+      {/* One add path, and it is the wizard's. This card used to call addPool
+          on its own and then tell the operator, in a confirm dialog, to go and
+          enroll the bot's maker key by hand: a pool with an empty
+          `rfq_corridor` answers nothing while the fleet page shows the bot
+          healthy. The wizard does the enrolment itself, so this hands over to
+          it rather than offering a second, quieter way to get it wrong. */}
+      {settings.editable && addable.length > 0 && (
         <div className="mt-3">
-          <Button
-            disabled={saving}
-            onClick={() => {
-              setAddChoice(addable[0]!.id)
-              setAdding(true)
-              setSwitching(false)
-              setError(null)
-            }}
+          <Link
+            to={`/add?bot=${encodeURIComponent(bot.name)}&chain=${chainId}`}
+            className="inline-block"
           >
-            Add corridor…
-          </Button>
-        </div>
-      )}
-      {adding && (
-        <div className="mt-3 space-y-3">
-          <Field
-            label="Corridor to add"
-            hint="Only pairs the venue lists on this bot's chain. It gets its own price feed and spreads; the wallet and signer stay shared."
-          >
-            <Select
-              value={addChoice}
-              onChange={(e) => setAddChoice(e.target.value)}
-            >
-              {addable.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.displayName} — {c.networkLabel}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <div className="flex gap-2">
-            <Button
-              variant="primary"
-              busy={busy === 'add'}
-              disabled={!addChoice || saving}
-              onClick={() => void add()}
-            >
-              Add corridor
-            </Button>
-            <Button
-              onClick={() => {
-                setAdding(false)
-                setError(null)
-              }}
-            >
-              Cancel
-            </Button>
-          </div>
+            <Button disabled={saving}>Add another corridor…</Button>
+          </Link>
+          <p className="mt-2 text-sm text-muted">
+            Only pairs Textile lists on this bot&apos;s network. The new corridor
+            gets its own price feed and spreads; the wallet and signer stay
+            shared.
+          </p>
         </div>
       )}
 
@@ -594,7 +546,6 @@ function CorridorsCard({
             onClick={() => {
               setSwitchChoice(bot.config?.corridorId ?? switchable[0]!.id)
               setSwitching(true)
-              setAdding(false)
               setError(null)
             }}
           >
@@ -644,7 +595,8 @@ function CorridorsCard({
   )
 }
 
-function SpreadField({
+// Exported so the add-bot wizard's Spread step is literally this field.
+export function SpreadField({
   label,
   hint,
   value,
@@ -663,7 +615,9 @@ function SpreadField({
       <Input
         value={value.value}
         disabled={disabled}
-        placeholder={value.kind === 'bps' ? '25' : '0.0015'}
+        // "3" is the wizard's Normal quick pick, so the empty field and the
+        // chips suggest the same scale.
+        placeholder={value.kind === 'bps' ? '3' : '0.0015'}
         onChange={(e) => onChange({ ...value, value: e.target.value })}
       />
     </Field>

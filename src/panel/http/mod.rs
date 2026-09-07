@@ -18,8 +18,12 @@ pub mod allowances;
 pub mod assets;
 pub mod bots;
 pub mod enroll;
+pub mod funding;
 pub mod logs;
+#[cfg(test)]
+pub(crate) mod mock_chain;
 pub mod origin;
+pub mod quote_proof;
 pub mod session;
 pub mod settings;
 pub mod updates;
@@ -66,14 +70,20 @@ pub struct AppState {
     /// Which corridors the wizard offers — Textile's list when it answers, the
     /// embedded presets when it doesn't. See [`crate::panel::corridors`].
     pub corridors: Arc<crate::panel::CorridorCatalog>,
+    /// Dollar prices for each chain's gas token, cached a minute, for the
+    /// funding check. See [`crate::panel::native_price`].
+    pub native_prices: Arc<crate::panel::native_price::NativePrices>,
 }
 
 impl AppState {
     pub fn new(cfg: PanelConfig, docker: Arc<dyn DockerApi>) -> Self {
         let corridors = crate::panel::CorridorCatalog::new(cfg.corridor_api_url.clone());
+        let native_prices =
+            crate::panel::native_price::NativePrices::new(cfg.coingecko_api_url.clone());
         Self {
             cfg: Arc::new(cfg),
             corridors,
+            native_prices,
             docker,
             files: None,
             sessions: Arc::new(Sessions::new()),
@@ -298,6 +308,11 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         )
         .route("/api/bots/{name}/logs", get(logs::tail))
         .route("/api/bots/{name}/allowances", get(allowances::allowances))
+        .route("/api/bots/{name}/funding", get(funding::funding))
+        .route(
+            "/api/bots/{name}/quote-proof",
+            post(quote_proof::quote_proof),
+        )
         .route("/api/bots/{name}/approve", post(logs::approve))
         .route("/api/bots/{name}/dry-run", post(logs::dry_run))
         .route("/api/compose-export", get(bots::compose_export))

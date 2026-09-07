@@ -2039,6 +2039,51 @@ mod tests {
         assert!(body.contains("Connect this bot"), "{body}");
     }
 
+    /// The sequencing the onboarding wizard relies on: a bot that has
+    /// Connected (it holds a credential) but whose access request Textile has
+    /// not approved yet carries `[rfq] enabled = false`, and Start is still
+    /// refused. The wizard's waiting screen owns the start after approval; it
+    /// must not be possible to start earlier and quote into nothing.
+    #[tokio::test]
+    async fn start_still_refused_while_access_pending() {
+        let h = harness("start-rfq-pending");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        setup::write_config(
+            h.root.join("bot-a"),
+            corridor,
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
+        let toml_path = h.root.join("bot-a").join("stitch.toml");
+        let toml = std::fs::read_to_string(&toml_path).unwrap();
+        std::fs::write(
+            &toml_path,
+            format!(
+                "{toml}\n[rfq]\nenabled = false\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\nmaker_id = \"clmakerenroll1\"\nvalidation_contract = \"0xBCA5E344077AaC751A1C548a45F28215bB7ec165\"\n"
+            ),
+        )
+        .unwrap();
+        let mut c = container("stitch-bot-a", ContainerState::Exited);
+        c.labels.insert(LABEL_BOT.to_string(), "bot-a".to_string());
+        c.mounts = dir_layout_mounts(&h.root.join("bot-a").display().to_string());
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/start", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Connect this bot"), "{body}");
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Start { .. })),
+            "nothing was started: {:?}",
+            h.docker.calls()
+        );
+    }
+
     /// An RFQ-only bot whose only credential is `STITCH_RFQ_API_KEY_FILE` in
     /// its own `stitch.env` — no panel-written `rfq-api.key`.
     fn seed_env_only_rfq_bot(h: &super::super::testkit::Harness) {

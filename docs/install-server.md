@@ -107,12 +107,12 @@ a Tailscale sidecar, and prints the URL. No checkout, no compile.
 Re-running the installer is safe: an existing `.env` is left alone, so it also
 works as “pull the current image and bring Stitch back up.”
 
-## 4. Open the panel and add a bot
+## 4. Open the panel and add a corridor
 
 1. Join the same Tailscale network on your laptop or phone.
 2. Open the URL the installer printed
    (`https://stitch-panel.<your-tailnet>.ts.net`).
-3. Click **Add a bot**, pick a corridor, set the operator wallet, approve
+3. Click **Add corridor**, pick one from the list, set the operator wallet, approve
    Permit2 allowances, **Connect** the bot to Textile on Settings, then
    **Start**. New bots quote Swap via RFQ and will not Start without that.
 

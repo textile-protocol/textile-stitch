@@ -1,0 +1,675 @@
+// Wizard step 6: fund the bot's wallet, then start it without another click.
+//
+// The screen polls GET /funding until the server's gate passes (one token side
+// worth the floor, plus gas), then hands over to the shared start runner:
+// approve spending on chain, check Textile access, start, confirm it stays up.
+// Nothing about progress is kept in the browser. On a reload the step asks the
+// server again and lands where it should: a running bot goes straight through,
+// an approved-but-stopped one starts, an unfunded one shows the checklist.
+
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
+import { ApiError, api } from '../../api'
+import { formatAmount, formatClock, formatUsd, groupAddress, shortAddress } from '../../format'
+import { Banner, Button, Card, Spinner } from '../ui'
+import ProgressList, { type ProgressRow } from './ProgressList'
+import { INITIAL_FUND, gateReasons, reduceFund } from './fundMachine'
+import { errorText, useStartSequence, type StartOutcome } from './useStartSequence'
+import { fund, progress as progressCopy } from './wizardCopy'
+import type { Funding, FundingToken, LogLevel } from '../../types'
+
+/** What the step reports when it is finished. Re-exported for the wizard. */
+export type FundOutcome = StartOutcome
+
+export interface FundStepProps {
+  /** The created bot's name. */
+  bot: string
+  /**
+   * Called exactly once when this step is finished. `live`: the bot is running.
+   * `waiting`: funded and approved on chain, Textile's access decision is
+   * outstanding (the panel refuses Start until then). `rejected`: Textile said
+   * no. A caller that only wants to move on can ignore the argument.
+   */
+  onStarted: (outcome: FundOutcome) => void
+  /**
+   * Rail Back. Disabled while approve or start is running. The only way out of
+   * this step other than finishing it: the wizard ends at a live bot or at one
+   * waiting for Textile, never at "I'll do it later".
+   */
+  onBack?: () => void
+  /**
+   * Forget this bot and take the wizard back to its first step. Offered
+   * throughout, not only in the states this bot cannot be finished from (it is
+   * gone, its config can't be read, it has no wallet address, its pair can't
+   * be valued): Back from here goes to Connect, whose Continue returns here,
+   * so this is the only control that can break a step the operator is stuck
+   * on. Not a way out of the wizard: it starts the wizard again, and the bot
+   * it forgets keeps its wallet, its money and its Textile request. Falls back
+   * to `onBack`.
+   */
+  onStartOver?: () => void
+}
+
+const LEVEL_CLASS: Record<LogLevel, string> = {
+  error: 'text-danger',
+  warn: 'text-warning',
+  info: 'text-ink',
+  debug: 'text-muted',
+  trace: 'text-faint',
+  plain: 'text-muted',
+}
+
+/** Default floors for the intro before the first read arrives. */
+const DEFAULT_MIN_TOKEN_USD = 20
+const DEFAULT_MIN_GAS_USD = 1
+
+export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundStepProps) {
+  const [state, dispatch] = useReducer(reduceFund, INITIAL_FUND)
+  const startedRef = useRef(false)
+  const autoRanRef = useRef(false)
+  const mountedRef = useRef(true)
+  const [copied, setCopied] = useState(false)
+  const [copyError, setCopyError] = useState<string | null>(null)
+  const [showOutput, setShowOutput] = useState(false)
+  const [stopping, setStopping] = useState(false)
+  const [stopError, setStopError] = useState<string | null>(null)
+  const [checkingNow, setCheckingNow] = useState(false)
+
+  // Through a ref so a parent's inline arrow doesn't change the identity of
+  // `report` on every render, which would restart the loading effect.
+  const onStartedRef = useRef(onStarted)
+  onStartedRef.current = onStarted
+  const report = useCallback((outcome: FundOutcome) => {
+    if (startedRef.current) return
+    startedRef.current = true
+    onStartedRef.current(outcome)
+  }, [])
+
+  const runner = useStartSequence(bot, {
+    onFunding: (funding) => dispatch({ type: 'funding', funding, at: Date.now() }),
+    onOutcome: report,
+  })
+  const { run: startRun, reset: resetRun } = runner
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  /** Hand over to the runner once, per pass of the gate. */
+  const triggerRun = useCallback(() => {
+    if (autoRanRef.current) return
+    autoRanRef.current = true
+    dispatch({ type: 'run' })
+    startRun()
+  }, [startRun])
+
+  // First read: the bot and its wallet together. A bot that is already running
+  // goes straight through; one with a live process that is not quoting
+  // (restarting, paused) is handed to the runner, which sorts it out from the
+  // chain and the config.
+  useEffect(() => {
+    if (state.phase !== 'loading') return
+    let cancelled = false
+    void (async () => {
+      try {
+        const [current, funding] = await Promise.all([api.bot(bot), api.funding(bot)])
+        if (cancelled) return
+        dispatch({ type: 'loaded', bot: current, funding, at: Date.now() })
+        if (current.running) {
+          report({ kind: 'live' })
+        } else if (current.canStop || funding.gate.passes) {
+          triggerRun()
+        }
+      } catch (e) {
+        if (cancelled) return
+        if (e instanceof ApiError && e.status === 404) dispatch({ type: 'gone' })
+        else if (e instanceof ApiError && e.status === 409) {
+          dispatch({ type: 'unreadable', message: e.message })
+        } else dispatch({ type: 'fetch-failed', message: errorText(e), at: Date.now() })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [state.phase, bot, report, triggerRun])
+
+  /** One wallet read. Used by the poll and by Check now. */
+  const refresh = useCallback(async () => {
+    try {
+      const funding = await api.funding(bot)
+      if (!mountedRef.current) return
+      dispatch({ type: 'funding', funding, at: Date.now() })
+      if (funding.gate.passes) triggerRun()
+    } catch (e) {
+      if (!mountedRef.current) return
+      if (e instanceof ApiError && e.status === 404) dispatch({ type: 'gone' })
+      else dispatch({ type: 'fetch-failed', message: errorText(e), at: Date.now() })
+    }
+  }, [bot, triggerRun])
+
+  // This corridor quotes against something the panel has no dollar price for,
+  // so both rows come back unvalued and the gate refuses whatever the wallet
+  // holds. Nothing about that changes with time: it is the pair, not a feed.
+  const unpriceable = state.funding?.gate.unpriceable === true
+
+  // The poll. Stops the moment the runner takes over (it reads funding itself)
+  // and while a load is in flight. Also stops on an unvaluable pair: the answer
+  // is the same every time, and the step ends on it below rather than polling
+  // a wallet that can never clear the gate.
+  useEffect(() => {
+    if (state.phase !== 'checking' || unpriceable) return
+    const timer = window.setInterval(() => void refresh(), state.pollMs)
+    return () => clearInterval(timer)
+  }, [state.phase, state.pollMs, unpriceable, refresh])
+
+  async function copyAddress(address: string) {
+    try {
+      await navigator.clipboard.writeText(address)
+      setCopyError(null)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 2000)
+    } catch {
+      setCopyError(fund.copyFailed)
+    }
+  }
+
+  async function checkNow() {
+    setCheckingNow(true)
+    await refresh()
+    if (mountedRef.current) setCheckingNow(false)
+  }
+
+  function retry() {
+    autoRanRef.current = false
+    startedRef.current = false
+    setStopError(null)
+    resetRun()
+    dispatch({ type: 'retry' })
+  }
+
+  async function stopBlocking(target: string) {
+    setStopping(true)
+    setStopError(null)
+    try {
+      await api.stop(target)
+      if (!mountedRef.current) return
+      retry()
+    } catch (e) {
+      if (!mountedRef.current) return
+      setStopError(errorText(e))
+    } finally {
+      if (mountedRef.current) setStopping(false)
+    }
+  }
+
+  const funding = state.funding
+  const minToken = funding?.gate.minTokenUsd ?? DEFAULT_MIN_TOKEN_USD
+  const minGas = funding?.gate.minGasUsd ?? DEFAULT_MIN_GAS_USD
+  const network = funding?.networkLabel ?? (funding ? `chain ${funding.chainId}` : 'this network')
+  const gasSymbol = funding?.gas.symbol ?? 'gas'
+  const seq = runner.state
+  const failure = seq.failure
+  const busy = runner.active
+  const finished = seq.stage === 'done' && seq.outcome !== null
+
+  if (state.phase === 'gone') {
+    return (
+      <Card title={fund.title}>
+        <div className="space-y-4">
+          <Banner tone="danger">{fund.gone}</Banner>
+          <div className="flex justify-between">
+            <Button onClick={onStartOver ?? onBack}>{fund.startOver}</Button>
+          </div>
+        </div>
+      </Card>
+    )
+  }
+
+  // A 409: the panel can't edit this bot's config, which is permanent, not a
+  // hiccup. Nothing here can be funded or started, so the only useful control
+  // is the one the `gone` branch offers: drop the resume record and set a bot
+  // up again. Without it a stale record reopened this same dead screen on
+  // every later visit to /add, and the only way out was to leave the wizard.
+  if (state.phase === 'unreadable') {
+    return (
+      <Card title={fund.title}>
+        <div className="space-y-4">
+          <Banner tone="danger">{fund.unreadable(state.loadError ?? '')}</Banner>
+          <div className="flex flex-wrap items-center gap-3">
+            {onBack && <Button onClick={onBack}>{fund.back}</Button>}
+            <Button variant="primary" onClick={onStartOver ?? onBack}>
+              {fund.startOver}
+            </Button>
+          </div>
+        </div>
+      </Card>
+    )
+  }
+
+  // A pair the panel can't value in dollars: the gate refuses forever, so this
+  // ends the step instead of polling. Without it the screen asked for money
+  // that would not help, on a five-second loop, and the only control was Back
+  // to Connect, whose Continue came straight back here. Terminal, like `gone`
+  // and `unreadable`, and for the same reason: nothing here can be finished.
+  // Only while the step is still watching: once the runner has the wheel the
+  // bot is being approved and started, and that progress is what to show.
+  if (state.phase === 'checking' && unpriceable && funding) {
+    const symbols = funding.tokens.map((t) => t.symbol)
+    return (
+      <Card title={fund.title}>
+        <div className="space-y-4">
+          <Banner tone="warning">
+            <div className="space-y-2">
+              <p className="font-bold">{fund.unpriceableTitle}</p>
+              <p>{fund.unpriceable(symbols)}</p>
+              <p>{fund.unpriceableNext}</p>
+            </div>
+          </Banner>
+          <div className="flex flex-wrap items-center gap-3">
+            <Button variant="primary" onClick={onStartOver ?? onBack}>
+              {fund.startOver}
+            </Button>
+          </div>
+        </div>
+      </Card>
+    )
+  }
+
+  const reasons = funding ? gateReasons(funding, fund) : []
+  const address = funding?.operatorAddress ?? null
+  const explorerHost = hostOf(funding?.explorerUrl ?? null)
+
+  const rows: ProgressRow[] = [
+    {
+      key: 'approve',
+      title: progressCopy.approveTitle(seq.approveTokens, seq.progress.approve),
+      sub: seq.progress.approve === 'skipped' ? undefined : progressCopy.approveSub,
+      state: seq.progress.approve,
+      children:
+        seq.approveLines.length > 0 ? (
+          <ApproveOutput
+            lines={seq.approveLines}
+            expanded={showOutput}
+            onToggle={() => setShowOutput((v) => !v)}
+          />
+        ) : seq.stage === 'approve-busy' ? (
+          <p className="mt-1 text-xs text-muted">{progressCopy.walletBusy}</p>
+        ) : undefined,
+    },
+    { key: 'access', title: progressCopy.accessTitle, state: seq.progress.access },
+    {
+      key: 'start',
+      title: progressCopy.startTitle,
+      state: seq.progress.start,
+      children:
+        seq.stage === 'start-busy' ? (
+          <p className="mt-1 text-xs text-muted">{progressCopy.startBusy}</p>
+        ) : undefined,
+    },
+    {
+      key: 'verify',
+      title: progressCopy.verifyTitle,
+      sub: progressCopy.verifySub,
+      state: seq.progress.verify,
+    },
+  ]
+
+  return (
+    <Card title={fund.title}>
+      <div className="space-y-4">
+        <p className="text-sm text-muted">{fund.intro(minToken, minGas)}</p>
+
+        {!funding && !state.loadError && (
+          <div className="flex items-center gap-2 py-4 text-sm text-muted">
+            <Spinner /> {fund.statusFirst}
+          </div>
+        )}
+
+        {funding && address && (
+          <div className="rounded-lg border border-line-soft bg-canvas p-4">
+            <p className="text-sm font-bold">{fund.addressLabel(network)}</p>
+            {/* Groups are separate spans with a margin, not spaces in the text:
+                a select-and-copy of the line yields the exact address. */}
+            <p className="mt-2 break-all font-mono text-base tabular-nums">
+              {groupAddress(address).map((group, i) => (
+                <span key={i} className={i > 0 ? 'ml-1.5' : ''}>
+                  {group}
+                </span>
+              ))}
+            </p>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <Button variant="primary" onClick={() => void copyAddress(address)}>
+                {copied ? fund.copied : fund.copyAddress}
+              </Button>
+              {funding.explorerUrl && explorerHost && (
+                <a
+                  className="text-sm text-accent underline"
+                  href={funding.explorerUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {fund.viewOn(explorerHost)}
+                </a>
+              )}
+            </div>
+            {copyError && <p className="mt-2 text-xs text-danger">{copyError}</p>}
+            <p className="mt-3 text-sm font-bold text-warning">{fund.chainWarning(network)}</p>
+          </div>
+        )}
+
+        {/* No wallet address to show, so nothing can arrive and the gate can
+            never pass for this bot. Same ending as the 409 above: start the
+            wizard again rather than leave it. */}
+        {funding && !address && (
+          <Banner tone="warning">
+            <div className="space-y-2">
+              <p>{fund.noOperator}</p>
+              <Button variant="secondary" onClick={onStartOver ?? onBack}>
+                {fund.startOver}
+              </Button>
+            </div>
+          </Banner>
+        )}
+
+        {funding && (
+          <ul className="divide-y divide-line-soft rounded-lg border border-line-soft">
+            {orderedTokens(funding).map((t) => (
+              <TokenRow key={t.token} token={t} funding={funding} />
+            ))}
+            <GasRow funding={funding} />
+          </ul>
+        )}
+
+        {funding && (
+          <div className="space-y-1">
+            <p className="text-sm">
+              {fund.gate(
+                funding.gate.minTokenUsd,
+                funding.tokens.map((t) => t.symbol),
+                funding.gate.minGasUsd,
+                funding.gas.symbol,
+              )}
+            </p>
+            {state.phase === 'checking' && reasons.length > 0 && (
+              <ul className="list-disc space-y-0.5 pl-5 text-sm text-muted">
+                {reasons.map((r) => (
+                  <li key={r}>{r}</li>
+                ))}
+              </ul>
+            )}
+            {(state.phase === 'running' || finished) && (
+              <p className="text-sm font-bold text-success">{fund.fundsFound}</p>
+            )}
+          </div>
+        )}
+
+        {state.loadError && state.phase === 'checking' && (
+          <Banner tone="warning">{fund.readError(state.loadError)}</Banner>
+        )}
+        {funding?.readError && !state.loadError && state.phase === 'checking' && (
+          <Banner tone="warning">{fund.readError(funding.readError)}</Banner>
+        )}
+
+        {state.phase === 'checking' && (
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-faint">
+              {state.lastCheckedAt
+                ? fund.status(Math.round(state.pollMs / 1000), formatClock(state.lastCheckedAt))
+                : fund.statusFirst}
+            </p>
+            <Button variant="ghost" busy={checkingNow} onClick={() => void checkNow()}>
+              {fund.checkNow}
+            </Button>
+          </div>
+        )}
+
+        {(state.phase === 'running' || finished) && <ProgressList rows={rows} />}
+
+        {failure && failure.stage === 'approve' && failure.blockedBy && (
+          <Banner tone="warning">
+            <div className="space-y-2">
+              <p>{failure.message}</p>
+              <Button
+                variant="secondary"
+                busy={stopping}
+                onClick={() => void stopBlocking(failure.blockedBy ?? bot)}
+              >
+                {progressCopy.stopBot(failure.blockedBy)}
+              </Button>
+              {stopError && <p className="text-xs">{stopError}</p>}
+            </div>
+          </Banner>
+        )}
+
+        {failure && failure.stage === 'approve' && !failure.blockedBy && (
+          <Banner tone="danger">
+            <p>{progressCopy.approveFailed(failure.message)}</p>
+            <p className="mt-1 text-xs opacity-80">{progressCopy.approveFailedHint(gasSymbol)}</p>
+          </Banner>
+        )}
+
+        {/* Both failure banners carry their own evidence and their own control.
+            Nothing links out to the bot page: following a link from here leaves
+            a bot that is neither live nor waiting, which is the one ending the
+            wizard must not have. */}
+        {failure && failure.stage === 'start' && (
+          <Banner tone="danger">
+            <p>{progressCopy.startFailed(failure.message)}</p>
+            {failure.needsRecreate && (
+              <p className="mt-1 text-xs opacity-80">{progressCopy.recreate}</p>
+            )}
+          </Banner>
+        )}
+
+        {failure && failure.stage === 'verify' && (
+          <Banner tone="danger">
+            <p>{progressCopy.verifyFailed}</p>
+            {failure.logTail && (
+              <p className="mt-1 whitespace-pre-wrap break-all font-mono text-xs opacity-80">
+                {failure.logTail}
+              </p>
+            )}
+            {!failure.logTail && failure.message && (
+              <p className="mt-1 text-xs opacity-80">{failure.message}</p>
+            )}
+          </Banner>
+        )}
+
+        {/* Back, a fresh start, and Retry. There is no way to leave the wizard
+            from here: it ends at a running bot, or at the Waiting screen. The
+            fresh start begins the wizard again rather than abandoning this bot,
+            which keeps its money and its Textile request.
+
+            It is offered ONLY where this step cannot finish on its own, which
+            here means a failure the operator has already retried. On the
+            ordinary waiting-for-money screen nothing is stuck, and a fresh
+            start there would leave a created, funded, enrolled bot at neither
+            ending, one orphan per press. The states that genuinely dead-end
+            (gone, unreadable, unpriceable, no address) each carry their own
+            start-over button above. */}
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            {onBack && (
+              <Button onClick={onBack} disabled={busy}>
+                {fund.back}
+              </Button>
+            )}
+            {onStartOver && !busy && failure && (
+              <button
+                type="button"
+                className="text-xs text-muted underline"
+                onClick={onStartOver}
+              >
+                {fund.differentBot}
+              </button>
+            )}
+          </div>
+          {failure && (
+            <Button variant="primary" onClick={retry}>
+              {fund.retry}
+            </Button>
+          )}
+        </div>
+      </div>
+    </Card>
+  )
+}
+
+/** Stable side first, then soft tokens, so the rows read "dollars, local, gas". */
+function orderedTokens(f: Funding): FundingToken[] {
+  return [...f.tokens].sort((a, b) =>
+    a.role === b.role ? 0 : a.role === 'stable' ? -1 : 1,
+  )
+}
+
+function hostOf(url: string | null): string | null {
+  if (!url) return null
+  try {
+    return new URL(url).host
+  } catch {
+    return null
+  }
+}
+
+function TokenRow({ token: t, funding }: { token: FundingToken; funding: Funding }) {
+  const soft = funding.tokens.find((x) => x.role === 'soft')?.symbol ?? t.symbol
+  const min = funding.gate.minTokenUsd
+  const hint =
+    t.funded === true
+      ? fund.fundedHint
+      : t.role === 'stable'
+        ? fund.stableHint(min, t.symbol, soft)
+        : fund.softHint(min, t.symbol)
+  const pill: Pill =
+    t.balance === null
+      ? { tone: 'warning', label: fund.pill.unknown }
+      : t.funded === true
+        ? { tone: 'success', label: fund.pill.funded, done: true }
+        : t.funded === null
+          ? { tone: 'warning', label: fund.pill.unknown }
+          : t.balance === '0'
+            ? { tone: 'muted', label: fund.pill.empty }
+            : { tone: 'muted', label: fund.pill.low }
+  return (
+    <li className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-3 py-2.5">
+      <StatusPill pill={pill} />
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-bold text-ink">{t.symbol}</span>
+          <span className="font-mono text-xs text-faint" title={t.token}>
+            {shortAddress(t.token)}
+          </span>
+        </div>
+        <p className="text-xs text-faint">{hint}</p>
+        {/* The server's own reason, verbatim: it knows whether a feed is down
+            or the pair simply has no dollar price, and the note used to invent
+            "Trying again" for both. */}
+        {t.price === null && t.balance !== null && t.balance !== '0' && (
+          <p className="text-xs text-warning">{fund.priceError(t.symbol, t.priceError)}</p>
+        )}
+      </div>
+      <div className="text-right tabular-nums">
+        <p className="text-sm">
+          {t.balanceText !== null ? `${formatAmount(t.balanceText)} ${t.symbol}` : '—'}
+        </p>
+        <p className="text-xs text-muted">{formatUsd(t.usd)}</p>
+      </div>
+    </li>
+  )
+}
+
+function GasRow({ funding }: { funding: Funding }) {
+  const g = funding.gas
+  const min = funding.gate.minGasUsd
+  const approxAmount =
+    g.price !== null && g.price > 0 ? formatAmount(String(min / g.price), 3) : null
+  const hint =
+    g.ok === true
+      ? fund.gasOkHint
+      : g.price === null && g.balance !== null
+        ? fund.gasHintUnpriced(g.symbol)
+        : fund.gasHint(min, approxAmount, g.symbol)
+  const pill: Pill =
+    g.balance === null || g.ok === null
+      ? { tone: 'warning', label: fund.pill.unknown }
+      : g.ok
+        ? { tone: 'success', label: fund.pill.ok, done: true }
+        : { tone: 'muted', label: fund.pill.addGas }
+  return (
+    <li className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-3 py-2.5">
+      <StatusPill pill={pill} />
+      <div className="min-w-0">
+        <p className="text-sm font-bold text-ink">
+          {g.symbol} <span className="font-normal text-faint">for gas</span>
+        </p>
+        <p className="text-xs text-faint">{hint}</p>
+      </div>
+      <div className="text-right tabular-nums">
+        <p className="text-sm">
+          {g.balanceText !== null ? `${formatAmount(g.balanceText)} ${g.symbol}` : '—'}
+        </p>
+        <p className="text-xs text-muted">
+          {formatUsd(g.usd)}
+          {g.priceSource === 'fallback' && g.usd !== null ? ` ${fund.estimated}` : ''}
+        </p>
+      </div>
+    </li>
+  )
+}
+
+interface Pill {
+  tone: 'success' | 'warning' | 'muted'
+  label: string
+  done?: boolean
+}
+
+function StatusPill({ pill }: { pill: Pill }) {
+  const tone = {
+    success: 'bg-success-bg text-success',
+    warning: 'bg-warning-bg text-warning',
+    muted: 'bg-hover text-muted',
+  }[pill.tone]
+  return (
+    <span
+      className={`inline-flex w-24 shrink-0 items-center justify-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-bold ${tone}`}
+    >
+      {pill.done && <span aria-hidden>✓</span>}
+      {pill.label}
+    </span>
+  )
+}
+
+/** The approve run's output: the last three lines, or all of them on request. */
+function ApproveOutput({
+  lines,
+  expanded,
+  onToggle,
+}: {
+  lines: { text: string; level: LogLevel }[]
+  expanded: boolean
+  onToggle: () => void
+}) {
+  const shown = expanded ? lines : lines.slice(-3)
+  return (
+    <div className="mt-2 space-y-1">
+      <div
+        className={`overflow-auto rounded-lg bg-canvas p-2 font-mono text-xs leading-relaxed ${
+          expanded ? 'max-h-72' : 'max-h-24'
+        }`}
+      >
+        {shown.map((line, i) => (
+          <div key={i} className={`whitespace-pre-wrap break-all ${LEVEL_CLASS[line.level]}`}>
+            {line.text}
+          </div>
+        ))}
+      </div>
+      {lines.length > 3 && (
+        <button type="button" className="text-xs text-muted underline" onClick={onToggle}>
+          {expanded ? progressCopy.hideOutput : progressCopy.showOutput}
+        </button>
+      )}
+    </div>
+  )
+}

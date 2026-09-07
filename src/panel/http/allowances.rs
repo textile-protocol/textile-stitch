@@ -146,7 +146,7 @@ pub async fn allowances(
     .into_response())
 }
 
-async fn read_allowance(
+pub(super) async fn read_allowance(
     rpc: &Rpc,
     token: Address,
     owner: Address,
@@ -166,10 +166,16 @@ async fn read_allowance(
 /// The two tickers in a corridor's display name, collateral first.
 ///
 /// Shipped presets write `"cNGN / USDT"`; Textile's registry writes
-/// `"cNGN → USDT"`. Both are "collateral <separator> debt", so accept either
-/// rather than silently falling back to addresses on half the corridors.
-fn split_pair_name(display_name: &str) -> Option<(&str, &str)> {
-    ["/", "→", "->"]
+/// `"cNGN → USDT"` on its older rows and `"cNGN ↔ USDT"` on its newer ones
+/// (`wMXN ↔ USDT`, listed 2026-09-06 — five of the twelve live corridors use
+/// the double arrow). Every one of them is "collateral <separator> debt", so
+/// accept them all rather than silently falling back to addresses on half the
+/// corridors: an unsplit name costs the operator a raw `0x4806…3d5e` where a
+/// ticker belongs, and an extra `symbol()` call on every funding poll.
+pub(super) fn split_pair_name(display_name: &str) -> Option<(&str, &str)> {
+    // "<->" before "->": splitting the long arrow on the short one would leave
+    // a stray "<" glued to the collateral ticker.
+    ["/", "↔", "⇄", "<->", "→", "->"]
         .iter()
         .find_map(|sep| display_name.split_once(*sep))
         .map(|(collateral, debt)| (collateral.trim(), debt.trim()))
@@ -181,7 +187,7 @@ fn split_pair_name(display_name: &str) -> Option<(&str, &str)> {
 /// That name is the only place the panel knows tickers at all — the config
 /// carries addresses. A pool with no identity contributes nothing and falls back
 /// to an address.
-fn token_symbols(cfg: &Config) -> std::collections::HashMap<String, String> {
+pub(super) fn token_symbols(cfg: &Config) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for pool in &cfg.pools {
         let Some(corridor) = crate::setup::pool_identity(cfg.chain_id, pool) else {
@@ -197,7 +203,7 @@ fn token_symbols(cfg: &Config) -> std::collections::HashMap<String, String> {
 
 /// Which corridors spend each token. A shared token (USDT on both cNGN and
 /// wBRL) lists both, so it is obvious that one approval serves several pairs.
-fn token_corridors(cfg: &Config) -> std::collections::HashMap<String, Vec<String>> {
+pub(super) fn token_corridors(cfg: &Config) -> std::collections::HashMap<String, Vec<String>> {
     let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for pool in &cfg.pools {
         let label = crate::setup::pool_identity(cfg.chain_id, pool)
@@ -229,7 +235,7 @@ fn dedupe(values: &[String]) -> Vec<String> {
     out
 }
 
-fn short_token(addr: &str) -> String {
+pub(super) fn short_token(addr: &str) -> String {
     // Character indices, not bytes: a custom pool's token string need not be an
     // ASCII address, and a label must not panic mid-codepoint.
     let chars: Vec<char> = addr.chars().collect();
@@ -341,6 +347,31 @@ mod tests {
         // The operator address still comes back, so the UI can name the wallet
         // the approvals would come from.
         assert!(v["operatorAddress"].as_str().is_some_and(|a| a.len() == 42));
+    }
+
+    /// Every separator the live registry and the shipped presets actually use.
+    /// The double arrow is the one that mattered: the corridors listed with it
+    /// were falling back to raw addresses everywhere a ticker was shown.
+    #[test]
+    fn pair_names_split_on_every_separator_the_registry_uses() {
+        for name in [
+            "wMXN ↔ USDT",
+            "wMXN ⇄ USDT",
+            "wMXN <-> USDT",
+            "wMXN → USDT",
+            "wMXN -> USDT",
+            "wMXN / USDT",
+            "wMXN/USDT",
+        ] {
+            assert_eq!(
+                split_pair_name(name),
+                Some(("wMXN", "USDT")),
+                "failed to split {name:?}"
+            );
+        }
+        assert_eq!(split_pair_name("wMXN USDT"), None);
+        assert_eq!(split_pair_name("/ USDT"), None);
+        assert_eq!(split_pair_name("wMXN ↔ "), None);
     }
 
     #[test]

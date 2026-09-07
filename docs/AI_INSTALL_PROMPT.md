@@ -140,8 +140,8 @@ Install procedure:
 After install — tell me this and stop:
 - Stitch panel is up at <URL>.
 - Next steps are in the web UI, not in this chat:
-  1. Add a bot
-  2. Pick a corridor
+  1. Add corridor
+  2. Pick the corridor you want to quote
   3. Paste the operator wallet key (or configure Turnkey / MPCVault) in the UI
   4. Approve tokens
   5. Connect the bot to Textile on Settings

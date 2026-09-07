@@ -659,6 +659,17 @@ pub struct AddPoolBody {
     pub corridor_id: String,
 }
 
+/// A chain's operator-facing name, from the shipped catalog. Falls back to the
+/// number for a chain this binary ships no corridor on, which is the only case
+/// where an operator has to see one.
+fn network_name(chain_id: u64) -> String {
+    setup::catalog()
+        .iter()
+        .find(|c| c.chain_id == chain_id)
+        .map(|c| c.network_label.to_string())
+        .unwrap_or_else(|| format!("chain {chain_id}"))
+}
+
 /// Append a same-chain catalog corridor as another `[[pools]]` entry. Restarts
 /// a running bot so it quotes the new pair; a stopped bot stays stopped.
 pub async fn add_pool(
@@ -688,8 +699,56 @@ pub async fn add_pool(
     }
     if corridor.chain_id == 0 {
         return Err(ApiError::bad_request(
-            "that corridor has no chain id — 0 is not a network".to_string(),
+            "that corridor has no chain id, and 0 is not a network".to_string(),
         ));
+    }
+
+    // The bot's own chain, read from the file about to be edited. Same number
+    // the fleet reports as `config.chainId`, so a refusal here agrees with what
+    // the operator was looking at when they picked.
+    let bot_chain = Config::from_toml(&current_toml)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+        .chain_id;
+    // The template decides, because it is the text that gets written.
+    // `corridor.chain_id` is only the listing's claim about it, and for an
+    // API-sourced corridor the two arrive as independent fields that nothing
+    // reconciles (`setup::remote::usable`).
+    let template_chain = setup::pair_of_config(&corridor.toml_template)
+        .map(|(chain_id, _, _)| chain_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "the config Textile lists for {} can't be read, so the panel can't tell which \
+                 network it belongs to.",
+                corridor.display_name
+            ))
+        })?;
+    // A row that claims one network while shipping a config for another is
+    // lying to the picker, which filters on `chainId` alone. Refuse it even
+    // when the config would happen to fit this bot: the pool would carry the
+    // wrong network label forever.
+    if corridor.chain_id != template_chain {
+        return Err(ApiError::bad_request(format!(
+            "the corridor list says {} is on {}, but the config it ships is for {}. The panel \
+             won't write a corridor it can't place. Try again in a minute, or tell Textile.",
+            corridor.display_name,
+            network_name(corridor.chain_id),
+            network_name(template_chain),
+        )));
+    }
+    // `add_pool_from_template` refuses this too, and must keep doing so: it is
+    // the invariant on the bytes. This one exists to say it in networks rather
+    // than chain numbers, to an operator who never chose a number.
+    if template_chain != bot_chain {
+        return Err(ApiError::bad_request(format!(
+            "{} runs on {}. {} runs on {}. One bot quotes one chain: its wallet, its RPC and the \
+             contract it settles through are all on that network. Set up a separate bot on {} \
+             for this corridor.",
+            corridor.display_name,
+            corridor.network_label,
+            bot.name,
+            network_name(bot_chain),
+            corridor.network_label,
+        )));
     }
 
     let edited = setup::add_pool_from_template(&current_toml, &corridor.toml_template)
@@ -1673,7 +1732,7 @@ async fn restart_after_save(
 
 #[cfg(test)]
 mod tests {
-    use super::super::testkit::{harness, Harness, TEST_KEY};
+    use super::super::testkit::{harness, harness_with_corridor_api, Harness, TEST_KEY};
     use crate::panel::docker::fake::{container, dir_layout_mounts, Call};
     use crate::panel::docker::ContainerState;
     use crate::panel::naming::LABEL_BOT;
@@ -3229,6 +3288,147 @@ mod tests {
         assert!(body.contains("chain"), "{body}");
         let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
         assert_eq!(before, after);
+    }
+
+    /// The operator picked a network name, never a number, so the refusal has
+    /// to come back in the same words.
+    #[tokio::test]
+    async fn adding_a_pool_on_another_chain_names_both_networks() {
+        let h = harness("settings-add-pool-chain-names");
+        seed(&h, "bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Celo"), "{body}");
+        assert!(body.contains("BNB Smart Chain"), "{body}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap()
+        );
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
+    }
+
+    /// Ordering pin, not a bug fix: the chain refusal already lands before the
+    /// image check today. Keep it there, so a cross-chain pick never comes back
+    /// as a registry error about updating the bot.
+    #[tokio::test]
+    async fn a_cross_chain_add_is_refused_before_the_image_is_checked() {
+        let h = harness("settings-add-pool-chain-before-image");
+        seed(&h, "bot-a");
+        h.docker.clear_image_labels("sha256:id-stitch-bot-a");
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "wbrl-usdt-celo" }),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Celo"), "{body}");
+    }
+
+    /// A listing whose `chainId` disagrees with the config it ships. The picker
+    /// filters on `chainId` alone, so this row is offered on a BSC bot; the
+    /// template is BSC too, so the merge layer happily writes it and the pool
+    /// carries "Celo" forever. Only the handler sees both numbers.
+    ///
+    /// The tokens are novel on purpose: `corridors::merge` swaps a remote entry
+    /// for any shipped preset quoting the same market, which would erase the
+    /// disagreement before the handler ever sees it.
+    #[tokio::test]
+    async fn a_corridor_listed_under_the_wrong_network_is_refused() {
+        const BSC_TEMPLATE_LISTED_AS_CELO: &str = r#"
+chain_id = 56
+rpc_url = "https://bsc-dataseed.binance.org"
+indexer_url = "https://api.textilecredit.com"
+permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor = "0xa9AA0a64769cBed4d3B1Ceb4Df01CdE915C235b3"
+tick_interval_secs = 5
+
+[feed]
+url = "https://api.textilecredit.com/price?chainId=56&pair=aaa-usdt"
+staleness_secs = 900
+
+[[pools]]
+collateral = "0x1111111111111111111111111111111111111111"
+collateral_decimals = 6
+debt = "0x2222222222222222222222222222222222222222"
+debt_decimals = 6
+corridor_id = "cmwrongnetwork"
+corridor_name = "AAA / USDT"
+corridor_network = "Celo"
+buy_offset_bps = 5
+buy_total_liquidity_debt = "max"
+buy_min_slice_debt = "10000000"
+buy_max_orders = 40
+sell_offset_bps = 5
+sell_total_liquidity_collateral = "max"
+sell_min_slice_debt = "10000000"
+sell_max_orders = 40
+ttl_secs = 60
+refresh_threshold_bps = 0
+"#;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/graphql",
+            axum::routing::post(|| async {
+                axum::Json(json!({ "data": { "stitchCorridors": [{
+                    "id": "cmwrongnetwork",
+                    "displayName": "AAA / USDT",
+                    "networkLabel": "Celo",
+                    "chainId": 42220,
+                    "tomlTemplate": BSC_TEMPLATE_LISTED_AS_CELO,
+                }]}}))
+            }),
+        );
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let h = harness_with_corridor_api("settings-add-pool-lying-row", &format!("http://{addr}"));
+        seed(&h, "bot-a");
+        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/pools",
+                json!({ "corridorId": "cmwrongnetwork" }),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Celo"), "{body}");
+        assert!(body.contains("BNB Smart Chain"), "{body}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap(),
+            "a corridor the panel can't place must not be written"
+        );
+        assert!(
+            !h.docker
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Restart { .. })),
+            "{:?}",
+            h.docker.calls()
+        );
     }
 
     #[tokio::test]

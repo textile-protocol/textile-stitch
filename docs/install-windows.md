@@ -23,7 +23,7 @@ $env:PANEL_PASSWORD = 'choose-a-long-password'
 irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.ps1 | iex
 ```
 
-Open `http://127.0.0.1:8420`, log in, add a bot in the UI. Tailscale server mode
+Open `http://127.0.0.1:8420`, log in, add a corridor in the UI. Tailscale server mode
 is Linux-only — use `install-panel.sh` on a Linux host for that.
 
 ## Standalone bot binary

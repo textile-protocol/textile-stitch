@@ -756,7 +756,7 @@ else
   fi
 fi
 say ''
-say 'In the web UI: Add a bot, pick a corridor, paste your operator wallet key,'
+say 'In the web UI: Add corridor, pick one, paste your operator wallet key,'
 say 'approve tokens, then start. The installer does not configure bots for you.'
 say ''
 say "Logs:    cd $PANEL_DIR && docker compose -f $COMPOSE_FILE logs -f panel"

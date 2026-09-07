@@ -330,7 +330,7 @@ The operator wallet or vault still needs a little native gas for Permit2
 approvals (`stitch approve`) regardless of the signer.
 
 **Desktop / panel.** If you use `stitch-desktop` or the server panel, you don't
-need to edit any of this by hand. Add a bot and Settings both have a **Signer**
+need to edit any of this by hand. Add corridor and Settings both have a **Signer**
 dropdown (hot wallet / Turnkey / MPCVault) that collects the fields below, writes
 the `[signer]` section, stores each secret in an owner-only file, and points
 `stitch.env` at it. Changing the signer in Settings rewrites all three and

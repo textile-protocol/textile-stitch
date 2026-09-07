@@ -139,6 +139,14 @@ pub struct PanelConfig {
     /// must never call home. Tests default to `None` so no suite depends on the
     /// network.
     pub corridor_api_url: Option<String>,
+    /// CoinGecko origin the funding check prices native gas from when Textile's
+    /// own `/native-price` doesn't answer.
+    ///
+    /// `None` turns that second lookup off — set `STITCH_PANEL_COINGECKO_API=off`
+    /// for a panel that must never call anyone but Textile. Tests default to
+    /// `None` so no suite depends on the network; the gas price then falls back
+    /// to a deliberately low built-in figure.
+    pub coingecko_api_url: Option<String>,
 }
 
 impl PanelConfig {
@@ -195,6 +203,7 @@ impl PanelConfig {
             bot_uid: uid_var("STITCH_PANEL_BOT_UID", default_uid)?,
             runtime,
             corridor_api_url: corridor_api_from_env()?,
+            coingecko_api_url: coingecko_api_from_env()?,
         })
     }
 
@@ -250,6 +259,7 @@ impl PanelConfig {
             // No suite may depend on Textile being reachable. Tests that want
             // the remote catalog point this at their own mock server.
             corridor_api_url: None,
+            coingecko_api_url: None,
         }
     }
 }
@@ -272,6 +282,28 @@ fn corridor_api_from_env() -> Result<Option<String>> {
         .with_context(|| format!("STITCH_PANEL_CORRIDOR_API must be a URL, not {raw:?}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         bail!("STITCH_PANEL_CORRIDOR_API must be an http(s) URL, not {raw:?}");
+    }
+    Ok(Some(raw))
+}
+
+/// The CoinGecko origin for the gas-price fallback: the public API by default,
+/// an operator-chosen origin when set, or nothing for `off` / `none` / empty.
+fn coingecko_api_from_env() -> Result<Option<String>> {
+    let raw = match std::env::var("STITCH_PANEL_COINGECKO_API") {
+        Err(_) => {
+            return Ok(Some(
+                crate::panel::native_price::DEFAULT_COINGECKO_API.to_string(),
+            ))
+        }
+        Ok(v) => v.trim().to_string(),
+    };
+    if raw.is_empty() || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let parsed = url::Url::parse(&raw)
+        .with_context(|| format!("STITCH_PANEL_COINGECKO_API must be a URL, not {raw:?}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("STITCH_PANEL_COINGECKO_API must be an http(s) URL, not {raw:?}");
     }
     Ok(Some(raw))
 }

@@ -27,6 +27,7 @@ pub mod http;
 pub mod inventory;
 pub mod migrate;
 pub mod naming;
+pub mod native_price;
 pub mod provision;
 pub mod updates;
 pub mod versions;

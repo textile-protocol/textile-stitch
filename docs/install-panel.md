@@ -1,7 +1,7 @@
 # Install — Stitch (Docker / server)
 
-Stitch is the web UI for running several bots on one host. Add a bot with a
-wizard, Connect it to Textile, start and stop it, edit its settings, watch
+Stitch is the web UI for running several bots on one host. Add a corridor with a
+wizard, Connect the bot to Textile, start and stop it, edit its settings, watch
 its logs, run Permit2 approvals — instead of SSHing in and hand-editing
 `docker-compose.yml`. New bots quote Swap via RFQ and will not Start until
 you Connect.
@@ -437,7 +437,7 @@ it; the compose export is there for when you want to go back.
 
 | Task | Before | With Stitch |
 |------|--------|----------------|
-| Add a bot | copy a service block, write a toml, chmod the key | wizard: corridor, name, key |
+| Add corridor | copy a service block, write a toml, chmod the key | wizard: corridor, name, key |
 | Change a spread | ssh, edit toml, `docker compose restart` | edit the field, Save (restarts for you) |
 | Permit2 approve | `docker compose run --rm bot1 stitch approve …` | Approve allowances, output streamed |
 | Dry run | same, with `--dry-run` | Dry run button |

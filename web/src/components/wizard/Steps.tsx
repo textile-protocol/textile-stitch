@@ -1,0 +1,68 @@
+// The wizard's step rail, and the three label sets it can show.
+//
+// The rail is the only thing on screen that tells an operator how much road is
+// left, so the three sets are deliberately different lengths: five pills for
+// adding a corridor to a bot that already exists, nine for setting up a
+// separate bot from the same start. Live is the last label in every set, even
+// while the Waiting screen is up: waiting is a state on the way there, not a
+// destination of its own.
+
+/** No bot on the picked chain, so the Where step never happens. Today's flow. */
+export const LABELS = [
+  'Corridor',
+  'Spread',
+  'Sources',
+  'Name',
+  'Wallet',
+  'Connect',
+  'Fund',
+  'Live',
+]
+
+/** The operator saw the Where step and chose a separate bot. */
+export const WHERE_LABELS = [
+  'Corridor',
+  'Where',
+  'Spread',
+  'Sources',
+  'Name',
+  'Wallet',
+  'Connect',
+  'Fund',
+  'Live',
+]
+
+/**
+ * Adding to a bot that already exists. Name, Wallet and Connect are gone: it
+ * has a name, a wallet and a maker identity, and Textile's approval covers
+ * every corridor on that maker. Sources is Price feed alone, because the RPC
+ * belongs to the bot and cannot differ per corridor. The writes run under the
+ * Live pill rather than earning one of their own.
+ */
+export const SHORT_LABELS = ['Corridor', 'Where', 'Price feed', 'Spread', 'Live']
+
+export default function Steps({
+  current,
+  labels,
+}: {
+  current: number
+  labels: string[]
+}) {
+  return (
+    <ol className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+      {labels.map((label, i) => (
+        <li key={label} className="flex items-center gap-2">
+          <span
+            className={`flex size-6 items-center justify-center rounded-full text-xs font-bold ${
+              i <= current ? 'bg-accent text-on-accent' : 'bg-hover text-faint'
+            }`}
+          >
+            {i + 1}
+          </span>
+          <span className={i === current ? 'font-bold' : 'text-muted'}>{label}</span>
+          {i < labels.length - 1 && <span className="text-faint">→</span>}
+        </li>
+      ))}
+    </ol>
+  )
+}

@@ -242,6 +242,6 @@ the default install):
 - **Manual / CLI**: the per-OS guides under `docs/install-*.md`, or `stitch init`
   for a single foreground bot.
 
-Once the panel is up, tell the operator to finish in the web UI (Add a bot →
-corridor → wallet → approve → dry run → start). Run `/stitch` again later only if
+Once the panel is up, tell the operator to finish in the web UI (Add corridor →
+pick one → wallet → approve → dry run → start). Run `/stitch` again later only if
 they want terminal help against an existing layout.

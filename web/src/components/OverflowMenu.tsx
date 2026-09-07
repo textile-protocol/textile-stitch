@@ -89,7 +89,7 @@ export default function OverflowMenu({
             Export compose
           </ComposeExportLink>
           <Link to="/add" className={ITEM} onClick={() => setOpen(false)}>
-            Add a bot
+            Add corridor
           </Link>
           {session.passwordLogin && (
             <>

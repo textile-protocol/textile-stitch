@@ -81,6 +81,61 @@ export function shortAddress(address: string): string {
 }
 
 /**
+ * A full address in 4-character groups, for reading aloud or checking against
+ * a wallet screen. Returned as pieces, not one spaced string: the caller puts
+ * visual gaps between the spans with CSS, so a select-and-copy of the rendered
+ * text still yields the exact address.
+ */
+export function groupAddress(address: string): string[] {
+  const hex = address.startsWith('0x') ? address.slice(2) : address
+  const groups: string[] = []
+  for (let i = 0; i < hex.length; i += 4) groups.push(hex.slice(i, i + 4))
+  if (groups.length === 0) return [address]
+  if (address.startsWith('0x')) groups[0] = `0x${groups[0] ?? ''}`
+  return groups
+}
+
+/** A dollar amount, or a dash when there isn't one. */
+export function formatUsd(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—'
+  return new Intl.NumberFormat(undefined, {
+    style: 'currency',
+    currency: 'USD',
+    maximumFractionDigits: 2,
+  }).format(n)
+}
+
+/**
+ * A rate for a headline: enough digits to tell 1,368.73 from 1,368.61, no wei
+ * tail. Six significant digits also keeps a sub-cent rate like 0.000730533
+ * readable.
+ */
+export function formatRate(n: number): string {
+  if (!Number.isFinite(n)) return String(n)
+  return new Intl.NumberFormat(undefined, { maximumSignificantDigits: 6 }).format(n)
+}
+
+/**
+ * A decimal string from the API (`1368.726683`) as a locale number with at
+ * most `maxSig` significant digits. Returns the text unchanged when it isn't
+ * a number, so an odd server value shows as what it is.
+ */
+export function formatAmount(text: string, maxSig = 6): string {
+  const n = Number(text)
+  if (text.trim() === '' || !Number.isFinite(n)) return text
+  return new Intl.NumberFormat(undefined, { maximumSignificantDigits: maxSig }).format(n)
+}
+
+/** A wall-clock time such as `14:02:11`, for "last checked" lines. */
+export function formatClock(ms: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(ms))
+}
+
+/**
  * An image reference short enough for a fleet row or detail cell.
  *
  * Drops the registry path, then centre-truncates a content digest so a bare

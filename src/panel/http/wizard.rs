@@ -292,6 +292,18 @@ pub struct CreateRequest {
     /// approve Permit2 (costs a little gas) and dry-run first.
     #[serde(default)]
     pub start: bool,
+    /// The wizard's Spread and Sources steps, folded into the corridor's
+    /// template before it is written so a bot is created fully configured in
+    /// one step. Every field is optional: absent keeps the template's value.
+    /// Spreads are in bps.
+    #[serde(default)]
+    pub buy_spread_bps: Option<String>,
+    #[serde(default)]
+    pub sell_spread_bps: Option<String>,
+    #[serde(default)]
+    pub rpc_url: Option<String>,
+    #[serde(default)]
+    pub feed_url: Option<String>,
 }
 
 /// Where a new bot's `stitch.toml` comes from — a shipped preset or the custom
@@ -395,6 +407,50 @@ impl CreateRequest {
     }
 }
 
+/// Fold the wizard's Spread and Sources choices into a corridor template.
+///
+/// Pure string-to-string, validated by `apply_settings` (which re-parses the
+/// result through the bot's own config parser), so a bad spread or URL is
+/// refused before the create claims a directory. No override returns the
+/// template untouched, byte for byte — which is also what every pre-wizard
+/// client (the desktop app, older panels) gets.
+///
+/// Only the pool's spreads and the top-level RPC / feed URLs are touched:
+/// `to_patch` leaves every `[rfq]` field and `book_enabled` as "don't touch",
+/// so this can neither write a half-empty `[rfq]` block nor fight the
+/// RFQ-only stamp that runs after the write.
+fn apply_wizard_overrides(toml: &str, req: &CreateRequest) -> Result<String, ApiError> {
+    let none = req.buy_spread_bps.is_none()
+        && req.sell_spread_bps.is_none()
+        && req.rpc_url.is_none()
+        && req.feed_url.is_none();
+    if none {
+        return Ok(toml.to_string());
+    }
+    fn bad(e: anyhow::Error) -> ApiError {
+        ApiError::bad_request(format!("{e:#}"))
+    }
+    let view = setup::read_settings(toml).map_err(bad)?;
+    let mut patch = view.to_patch();
+    let bps = |value: &str| setup::SpreadEdit {
+        kind: setup::SpreadKind::Bps,
+        value: value.trim().to_string(),
+    };
+    if let Some(v) = &req.buy_spread_bps {
+        patch.buy = bps(v);
+    }
+    if let Some(v) = &req.sell_spread_bps {
+        patch.sell = bps(v);
+    }
+    if let Some(v) = &req.rpc_url {
+        patch.rpc_url = v.trim().to_string();
+    }
+    if let Some(v) = &req.feed_url {
+        patch.feed_url = v.trim().to_string();
+    }
+    setup::apply_settings(toml, &patch).map_err(bad)
+}
+
 /// Create a bot: write its config, then create its container.
 ///
 /// Ordering matters. The name is checked against the live fleet before anything is
@@ -412,6 +468,12 @@ pub async fn create(
     // resolves to the toml to write, and refuses an unknown/pending/invalid
     // corridor before the directory is claimed.
     let corridor = body.resolve_corridor(&state.corridors).await?;
+
+    // The wizard's Spread and Sources steps, folded into that template here:
+    // before the signer moves out of `body`, and before anything touches the
+    // filesystem, so a bot is written fully configured in one step and a bad
+    // value fails with nothing on disk.
+    let toml = apply_wizard_overrides(&corridor.toml, &body)?;
 
     let fleet = state.fleet().await?;
     if fleet.contains(&name) {
@@ -458,7 +520,7 @@ pub async fn create(
     // The directory goes with it on failure. We created it, so nothing else can be in
     // there — and leaving an empty one behind would make the `create_dir` above refuse
     // every retry of the name the operator just got wrong.
-    if let Err(e) = setup::write_config_signer_from_toml(&dir, &corridor.toml, &signer) {
+    if let Err(e) = setup::write_config_signer_from_toml(&dir, &toml, &signer) {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(ApiError::bad_request(format!("{e:#}")));
     }
@@ -1615,6 +1677,55 @@ ttl_secs = 60
         assert_eq!(v["bookEnabled"], false);
         assert_eq!(v["rfqDefaultUnlocked"], true);
         assert_eq!(v["rfqPanelUnlocked"], true);
+    }
+
+    #[tokio::test]
+    async fn create_applies_wizard_overrides() {
+        let h = harness("create-wizard-overrides");
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({
+                    "name": "bot-a",
+                    "corridorId": "cngn-usdt-bsc",
+                    "signer": local(TEST_KEY),
+                    "buySpreadBps": "7",
+                    "sellSpreadBps": "9",
+                    "rpcUrl": "https://rpc.example.test/bsc",
+                    "feedUrl": "https://feed.example.test/price"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["buy"]["value"], "7");
+        assert_eq!(v["sell"]["value"], "9");
+        assert_eq!(v["rpcUrl"], "https://rpc.example.test/bsc");
+        assert_eq!(v["feedUrl"], "https://feed.example.test/price");
+        // The overrides don't disturb the RFQ-only stamp that runs after the write.
+        assert_eq!(v["bookEnabled"], false);
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_bad_wizard_override_before_writing() {
+        let h = harness("create-wizard-bad-override");
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({
+                    "name": "bot-a",
+                    "corridorId": "cngn-usdt-bsc",
+                    "signer": local(TEST_KEY),
+                    "rpcUrl": "not a url"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        // Refused before the directory was claimed, so a corrected retry can't
+        // hit AlreadyExists on a half-made bot.
+        assert!(!h.root.join("bot-a").exists());
     }
 
     #[tokio::test]

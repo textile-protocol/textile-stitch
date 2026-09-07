@@ -182,6 +182,12 @@ export interface RfqAccessResult {
   emailVerified?: boolean | null
   settings?: Settings
   enrollment?: RfqEnrollment
+  /**
+   * Present only on APPROVED, when the panel seated the bot and saved the
+   * config: whether a running bot was bounced onto it, and why not if it wasn't.
+   */
+  restarted?: boolean
+  restartError?: string | null
 }
 
 export type PanelRuntime = 'docker' | 'process'
@@ -334,4 +340,227 @@ export interface Allowances {
   chainId: number
   tokens: TokenAllowance[]
   readError: string | null
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/bots/{name}/funding — the wizard's Fund step reads this on a poll.
+//
+// One read answers both "is the wallet funded?" and "is Permit2 approved?", so
+// the two can never disagree. Chain, feed and price failures are fields, never
+// status codes: the step keeps rendering and keeps polling.
+
+/** `stable` is a pool's debt token (USDT, USDC…); `soft` is its collateral. */
+export type FundingRole = 'stable' | 'soft'
+
+export interface FundingToken {
+  role: FundingRole
+  symbol: string
+  /** Lowercase 0x hex, like `TokenAllowance.token`. */
+  token: string
+  decimals: number
+  /** Atomic-unit integer string. Null when the chain read failed. */
+  balance: string | null
+  /** The balance as a decimal string, trailing zeros trimmed. Null with `balance`. */
+  balanceText: string | null
+  /** USDT per 1 token. Stable tokens are pinned at 1. Null when nothing is known. */
+  price: number | null
+  /** `fixed` for the stable side, `feed` when the pool's feed answered. */
+  priceSource: 'fixed' | 'feed' | null
+  /** Why `price` is null, in the panel's words. */
+  priceError: string | null
+  /**
+   * This token's pool does not quote against a dollar stable, so no wallet
+   * balance and no feed can ever value it. The per-row twin of
+   * `FundingGate.unpriceable`, which only speaks for the whole bot: a bot with
+   * one dollar corridor and one without leaves that flag false while these rows
+   * stay unvalued forever.
+   */
+  unpriceable: boolean
+  /** balance × price. Null when either is null. */
+  usd: number | null
+  /** `usd >= gate.minTokenUsd`. Null when `usd` is null. */
+  funded: boolean | null
+  /** The bot's own `stitch approve` will approve this token. */
+  approvalNeeded: boolean
+  /** Atomic string. Null when the read failed. */
+  permit2Allowance: string | null
+  /** Null means unknown (read failed), never "no". */
+  approved: boolean | null
+}
+
+export interface FundingGas {
+  /** ETH, BNB, CELO, POL, or `gas` when the chain is not in the panel's table. */
+  symbol: string
+  balance: string | null
+  balanceText: string | null
+  price: number | null
+  /** `fallback` is the panel's built-in low figure: nothing answered. Show "(estimated)". */
+  priceSource: 'textile' | 'coingecko' | 'fallback' | null
+  usd: number | null
+  /**
+   * `usd >= gate.minGasUsd`. On a chain with no price, any non-zero balance
+   * counts. Null when the balance read failed.
+   */
+  ok: boolean | null
+}
+
+export interface FundingGate {
+  /** At least one token funded and gas ok. */
+  passes: boolean
+  minTokenUsd: number
+  minGasUsd: number
+  /** Symbols with `funded === true`. */
+  fundedTokens: string[]
+  /** Symbols with `approvalNeeded` and `approved !== true` (unknown counts as missing). */
+  approvalsMissing: string[]
+  /** No token side is funded. */
+  needsSide: boolean
+  /** `gas.ok === false`. */
+  needsGas: boolean
+  /**
+   * This gate can never pass, whatever arrives in the wallet.
+   *
+   * The panel values a pool's two sides off its debt token, and only when that
+   * token is a dollar stable it knows. On a corridor quoted against anything
+   * else (Textile lists `cNGN / GD` on Celo, quoted in GoodDollar) both rows
+   * come back unpriced and `needsSide` stays true forever. It is a property of
+   * the pair, not of the wallet or of a feed, so it never clears by waiting:
+   * the Fund step ends here and sends the operator back to pick another pair.
+   */
+  unpriceable: boolean
+}
+
+export interface Funding {
+  operatorAddress: string | null
+  chainId: number
+  /** `Celo`, `BSC`…; null for a custom chain. */
+  networkLabel: string | null
+  /** Address page on this chain's explorer, when the host is known. */
+  explorerUrl: string | null
+  permit2: string
+  tokens: FundingToken[]
+  gas: FundingGas
+  gate: FundingGate
+  /** First chain error, or why there is no operator address. Null when reads worked. */
+  readError: string | null
+  checkedAtUnix: number
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/bots/{name}/quote-proof — the panel asks Textile's public RFQ
+// preview (which the browser can't reach: no CORS) for a quote on this bot's
+// pair, restricted to this bot's wallet, and reports what came back.
+
+/**
+ * `usdtToSoft`: the taker pays USDT and receives the soft token, so it exercises
+ * the bot's sell side. `softToUsdt` exercises the bot's buy side.
+ */
+export type QuoteDirection = 'usdtToSoft' | 'softToUsdt'
+
+export interface QuoteProofRequest {
+  /** Default `usdtToSoft`. Wins over `side` when both are given. */
+  direction?: QuoteDirection
+  /** Alias in the bot's own terms: `sell` = usdtToSoft, `buy` = softToUsdt. */
+  side?: 'sell' | 'buy'
+  /** Default true: restrict the preview to this bot's wallet. */
+  onlyThisBot?: boolean
+  /** `[[pools]]` index, default 0. */
+  pool?: number
+  /** Venue override, like the access routes take. Tests only. */
+  venueUrl?: string
+}
+
+export interface QuoteProofPair {
+  softSymbol: string
+  softToken: string
+  softDecimals: number
+  stableSymbol: string
+  stableToken: string
+  stableDecimals: number
+  /** Corridor display name, e.g. `cNGN → USDT`. Null for a custom pool. */
+  label: string | null
+  networkLabel: string | null
+}
+
+export interface QuoteProofProbe {
+  sellSymbol: string
+  /** What the probe hands over (exact input), in whole tokens. Null on an exact-output probe. */
+  sellText: string | null
+  buySymbol: string
+  /** What the probe asks for (exact output), in whole tokens. Null on an exact-input probe. */
+  buyText: string | null
+  /** Wallets the preview was restricted to (the operator), or empty. */
+  restrictedTo: string[]
+}
+
+export interface QuoteProofQuote {
+  /** Decimal text in the sell token. */
+  sellText: string
+  /** Decimal text in the buy token, net of Textile's fee. */
+  buyText: string
+  /** Decimal text in `feeSymbol` (the sell token). */
+  feeText: string
+  feeSymbol: string
+  /** From the venue's rateRay: USDT per 1 soft token, before the fee. */
+  usdtPerSoft: string
+  /** 1 / usdtPerSoft, before the fee. */
+  softPerUsdt: string
+}
+
+export interface QuoteProofRate {
+  /** Soft per 1 USDT as actually delivered, fee included: the headline. */
+  allIn: string
+  /** Soft per 1 USDT from the venue's rateRay, before the fee. */
+  preFee: string
+  /** USDT per 1 soft token, before the fee. */
+  usdtPerSoft: string
+}
+
+export interface QuoteProof {
+  direction: QuoteDirection
+  chainId: number
+  pair: QuoteProofPair
+  probe: QuoteProofProbe
+  status: 'preview' | 'no_quote'
+  /** `status === 'preview'`. */
+  ok: boolean
+  /** On `no_quote`: `no_makers_online`, `no_valid_quote`, `no_restricted_liquidity`, or the venue's string. */
+  reason: string | null
+  /** Null on `no_quote`. */
+  quote: QuoteProofQuote | null
+  /** Null on `no_quote`. */
+  rate: QuoteProofRate | null
+  /** Flat copies of the quote, for callers that want one level. */
+  sellSymbol: string
+  sellAmount: string | null
+  buySymbol: string
+  buyAmount: string | null
+  /**
+   * Depth the venue could fill right now, in whole tokens. Null when not
+   * reported. The token it counts is NOT always the sell token: an
+   * exact-output probe reports what the venue could buy. Always render it with
+   * `availableSymbol`.
+   */
+  availableText: string | null
+  /** The ticker `availableText` is denominated in. Null with it. */
+  availableSymbol: string | null
+  /** Set when a firm quote is holding the book: wait this long before asking again. */
+  retryAfterMs: number | null
+  reservedUntil: string | null
+  /**
+   * The quote came from this bot: the venue named its wallet, or answered a
+   * preview it says it restricted to that wallet. `false` means the venue
+   * named a different maker. Null means it didn't say, which must not be
+   * rendered as "another maker quoted this".
+   */
+  fromThisBot: boolean | null
+  /** Previews don't expire; a firm quote would. Always null here. */
+  expiresAt: string | null
+  /** Public swap page for this pair. Null unless the venue is Textile's. */
+  swapUrl: string | null
+  /** Same page, restricted to this bot's wallet. Null with `swapUrl`. */
+  swapUrlMine: string | null
+  /** The venue's `data` object, verbatim. */
+  raw: unknown
+  checkedAtUnix: number
 }

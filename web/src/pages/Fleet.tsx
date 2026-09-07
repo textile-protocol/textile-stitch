@@ -101,7 +101,7 @@ export default function Fleet() {
           {data.bots.length} {data.bots.length === 1 ? 'bot' : 'bots'}
         </h1>
         <Link to="/add">
-          <Button variant="primary">Add a bot</Button>
+          <Button variant="primary">Add corridor</Button>
         </Link>
       </div>
 
@@ -114,11 +114,15 @@ export default function Fleet() {
         </Banner>
       )}
 
+      {/* The first-time screen. It sits under a button labelled Add corridor,
+          and the operator has never heard the word bot, so it leads with what
+          that button does rather than with what is missing. */}
       {data.bots.length === 0 ? (
-        <Empty title="No bots on this host yet">
+        <Empty title="Nothing running here yet">
           <p>
-            Add one, or point <code>STITCH_PANEL_BOTS_DIR</code> at the directory
-            holding your existing configs. The panel currently reads{' '}
+            Add a corridor to set up your first bot. Or point{' '}
+            <code>STITCH_PANEL_BOTS_DIR</code> at the directory holding your
+            existing configs. The panel currently reads{' '}
             <code>{data.botsDir}</code>.
           </p>
         </Empty>
@@ -163,6 +167,15 @@ function BotRow({
   const blocking = bot.warnings.filter((w) => w.blocksEditing)
   const advisory = bot.warnings.filter((w) => !w.blocksEditing)
 
+  // A bot the panel can't read a chain for, or can't write a config for, can't
+  // take another corridor. The wizard checks again on the way through; this
+  // just keeps a dead link off the row.
+  const canAddCorridor = bot.config != null && bot.editable
+  // How many controls this row actually renders, so two of them get two mobile
+  // columns and three wrap to 2 + 1 rather than overflowing.
+  const controlCount =
+    (canAddCorridor ? 1 : 0) + (bot.container ? 1 + (canUpdate ? 1 : 0) : 0)
+
   return (
     <Card className="!p-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
@@ -178,9 +191,21 @@ function BotRow({
         </div>
         <div
           className={`grid w-full gap-2 sm:ml-auto sm:flex sm:w-auto sm:flex-wrap sm:items-center [&_button]:w-full [&_button]:justify-center sm:[&_button]:w-auto ${
-            bot.container && canUpdate ? 'grid-cols-2' : 'grid-cols-1'
+            controlCount >= 2 ? 'grid-cols-2' : 'grid-cols-1'
           }`}
         >
+          {/* Outside the container branch on purpose: a bot with no container
+              can still take another corridor, and the panel picks the change up
+              when it is started. Default variant, so Update keeps the only
+              primary on the row. */}
+          {canAddCorridor && (
+            <Link
+              className="w-full sm:w-auto"
+              to={`/add?bot=${encodeURIComponent(bot.name)}&chain=${bot.config?.chainId}`}
+            >
+              <Button title="Add another corridor to this bot">Add corridor</Button>
+            </Link>
+          )}
           {bot.container ? (
             <>
               {bot.canStop ? (

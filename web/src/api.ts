@@ -13,7 +13,10 @@ import type {
   CorridorList,
   CreateBotResult,
   Fleet,
+  Funding,
   MigrationResult,
+  QuoteProof,
+  QuoteProofRequest,
   RfqAccessResult,
   SaveResult,
   SessionInfo,
@@ -138,7 +141,14 @@ export const api = {
   login: (password: string) => request<SessionInfo>('/api/login', json({ password })),
   logout: () => request<unknown>('/api/logout', { method: 'POST' }),
 
-  fleet: () => request<Fleet>('/api/bots'),
+  /**
+   * `signal` is for the callers an operator is waiting on: the wizard's Next
+   * asks this and one `settings` per same-chain bot before it can paint, and a
+   * wedged Docker daemon can hold `/api/bots` open with no server-side budget
+   * behind it. Nothing else passes one.
+   */
+  fleet: (signal?: AbortSignal) =>
+    request<Fleet>('/api/bots', signal ? { signal } : undefined),
   bot: (name: string) => request<Bot>(`/api/bots/${encodeURIComponent(name)}`),
   corridors: () => request<CorridorList>('/api/corridors'),
 
@@ -214,8 +224,11 @@ export const api = {
       { method: 'DELETE' },
     ),
 
-  settings: (name: string, pool: number) =>
-    request<Settings>(`/api/bots/${encodeURIComponent(name)}/settings?pool=${pool}`),
+  settings: (name: string, pool: number, signal?: AbortSignal) =>
+    request<Settings>(
+      `/api/bots/${encodeURIComponent(name)}/settings?pool=${pool}`,
+      signal ? { signal } : undefined,
+    ),
 
   saveSettings: (name: string, patch: unknown) =>
     request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/settings`, {
@@ -228,6 +241,31 @@ export const api = {
     request<Allowances>(
       `/api/bots/${encodeURIComponent(name)}/allowances`,
     ),
+
+  /**
+   * Wallet balances, dollar values, gas and Permit2 state in one read, plus the
+   * "may it start?" gate. Chain and price failures come back as fields, so a
+   * caller that polls keeps rendering.
+   */
+  funding: (name: string) =>
+    request<Funding>(`/api/bots/${encodeURIComponent(name)}/funding`),
+
+  /**
+   * Ask Textile's public RFQ preview for a quote on this bot's pair, through the
+   * panel (the browser can't call the venue directly). Always sends a JSON
+   * body, `{}` at minimum: the handler's Json extractor needs the content type.
+   */
+  quoteProof: (name: string, body: QuoteProofRequest = {}) =>
+    request<QuoteProof>(`/api/bots/${encodeURIComponent(name)}/quote-proof`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /**
+   * URL of the approve one-shot, for `streamSse(url, { method: 'POST' }, …)`.
+   * A URL rather than a request because the route streams output.
+   */
+  approveUrl: (name: string) => `/api/bots/${encodeURIComponent(name)}/approve`,
 
   enrollRfq: (name: string) =>
     request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/rfq/enroll`, {

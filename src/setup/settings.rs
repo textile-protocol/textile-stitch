@@ -504,8 +504,8 @@ pub fn add_pool_from_template(toml_str: &str, template: &str) -> Result<String> 
     );
     anyhow::ensure!(
         incoming.chain_id == current.chain_id,
-        "that corridor is on chain {}, this bot is on chain {}. One bot quotes one chain — add a \
-         second bot for the other network.",
+        "that corridor is on chain {}, this bot is on chain {}. One bot quotes one chain, so set \
+         up a second bot for the other network.",
         incoming.chain_id,
         current.chain_id
     );

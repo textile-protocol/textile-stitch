@@ -53,8 +53,8 @@ No Docker and no terminal. [Download the release for your OS](https://github.com
 - **Linux**: extract and run `stitch-desktop` (or the bundled `stitch.desktop`
   entry). For a headless server, prefer Option 2.
 
-In the browser: sign in with the password you created, **Add a bot**, pick a
-corridor, paste your operator wallet key, approve allowances, then **Connect**
+In the browser: sign in with the password you created, **Add corridor**, pick
+one from the list, paste your operator wallet key, approve allowances, then **Connect**
 the bot to Textile on Settings before Start. Use **Start at login** in Settings
 if you want the panel (and any bots left running) to come back after a reboot
 — login starts stay in the tray and skip the control window. Quit Stitch from
@@ -79,17 +79,17 @@ irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/insta
 
 It asks whether you're installing on a **local computer** (password login at
 `http://127.0.0.1:8420`) or a **server** (Tailscale on Linux, so you can open it
-from your other devices). Then it starts the web UI. Add a bot with a wizard,
-start and stop it, edit settings, approve allowances, tail logs — all in the
-browser.
+from your other devices). Then it starts the web UI. Add a corridor with a
+wizard, start and stop the bot, edit settings, approve allowances, tail logs —
+all in the browser.
 
 You need Docker with Compose v2. Server mode also needs a Tailscale account
 (the free tier is enough) and a Linux Docker host. Nothing is compiled: it runs
 the published image.
 
-Then open the URL it prints, click **Add a bot**, pick a corridor, paste your
-operator wallet key, and approve the router allowance from the bot's page before
-starting it.
+Then open the URL it prints, click **Add corridor**, pick one from the list,
+paste your operator wallet key, and approve the router allowance from the bot's
+page before starting it.
 
 Already running bots from your own `docker-compose.yml`? Point Stitch at that
 directory and it adopts them as they are — nothing is restarted or rewritten.
@@ -119,7 +119,7 @@ covers both the panel and the
 ### Install with an AI agent
 
 Your coding agent installs the Stitch panel and opens the web UI. You finish
-setup in the browser (add a bot, wallet, approvals, dry run, start). Later the
+setup in the browser (add a corridor, wallet, approvals, dry run, start). Later the
 agent can help operate an existing install on request.
 
 - **Claude Code** — paste:
@@ -184,7 +184,7 @@ Secrets always come from the environment, never the config file, and each has a
 `_FILE` variant (a path) that takes precedence over the raw value, the same as
 `STITCH_PRIVATE_KEY_FILE` vs `STITCH_PRIVATE_KEY`.
 
-The desktop / panel UI writes all of this for you: Add a bot and Settings have a
+The desktop / panel UI writes all of this for you: Add corridor and Settings have a
 **Signer** dropdown (hot wallet / Turnkey / MPCVault) that collects the fields
 below, drops the secret in an owner-only file, and points `stitch.env` at it. The
 manual `[signer]` fields below are for CLI and server operators editing

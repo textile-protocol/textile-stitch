@@ -441,7 +441,7 @@ try {
 Write-Step 'Done'
 Write-Say 'Open http://127.0.0.1:8420 and log in with the password you set.'
 Write-Say ''
-Write-Say 'In the web UI: Add a bot, pick a corridor, paste your operator wallet key,'
+Write-Say 'In the web UI: Add corridor, pick one, paste your operator wallet key,'
 Write-Say 'approve tokens, then start. The installer does not configure bots for you.'
 Write-Say ''
 Write-Say "Logs:    Set-Location '$PanelDir'; docker compose -f $ComposeFile logs -f panel"
