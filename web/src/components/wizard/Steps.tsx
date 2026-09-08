@@ -34,10 +34,10 @@ export const WHERE_LABELS = [
 
 /**
  * Adding to a bot that already exists. Name, Wallet and Connect are gone: it
- * has a name, a wallet and a maker identity, and Textile's approval covers
- * every corridor on that maker. Sources is Price feed alone, because the RPC
- * belongs to the bot and cannot differ per corridor. The writes run under the
- * Live pill rather than earning one of their own.
+ * has a name, a wallet and a maker identity, and its confirmed address already
+ * covers every corridor on that maker. Sources is Price feed alone, because the
+ * RPC belongs to the bot and cannot differ per corridor. The writes run under
+ * the Live pill rather than earning one of their own.
  */
 export const SHORT_LABELS = ['Corridor', 'Where', 'Price feed', 'Spread', 'Live']
 

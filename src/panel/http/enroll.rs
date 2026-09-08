@@ -138,12 +138,12 @@ pub async fn enroll(
 
     let message = match outcome {
         crate::enroll::EnrollOutcome::Flagged => format!(
-            "Registered as {} ({}). Textile has flagged this maker — you will not receive Swap quotes.",
+            "Registered as {} ({}). Textile has blocked this maker — you will not receive Swap quotes.",
             enrolled.maker_slug, enrolled.environment
         ),
         crate::enroll::EnrollOutcome::Waiting => format!(
-            "Registered as {} ({}). Request access so Textile can review this maker. You will \
-             not receive Swap quotes until they approve you.",
+            "Registered as {} ({}). Confirm your email address to go live — that is the only \
+             step left.",
             enrolled.maker_slug, enrolled.environment
         ),
         crate::enroll::EnrollOutcome::Live if rfq_default => format!(
@@ -449,7 +449,7 @@ mod tests {
             v["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("Request access so Textile can review"),
+                .contains("Confirm your email address to go live"),
             "waiting copy missing: {body}"
         );
 
@@ -561,8 +561,8 @@ mod tests {
             v["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("flagged this maker"),
-            "flagged copy missing: {body}"
+                .contains("blocked this maker"),
+            "blocked copy missing: {body}"
         );
     }
 }

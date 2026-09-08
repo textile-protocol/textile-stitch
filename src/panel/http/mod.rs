@@ -13,7 +13,6 @@
 //! never reach a response body: nothing here reads key material, and the wizard
 //! takes it write-only.
 
-pub mod access;
 pub mod allowances;
 pub mod assets;
 pub mod bots;
@@ -27,6 +26,7 @@ pub mod quote_proof;
 pub mod session;
 pub mod settings;
 pub mod updates;
+pub mod verify;
 pub mod wizard;
 
 use std::sync::Arc;
@@ -290,13 +290,10 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/settings", patch(settings::update))
         .route("/api/bots/{name}/rfq/enroll", post(enroll::enroll))
         .route(
-            "/api/bots/{name}/rfq/access-request",
-            post(access::request_access),
+            "/api/bots/{name}/rfq/verify-email",
+            post(verify::verify_email),
         )
-        .route(
-            "/api/bots/{name}/rfq/access-status",
-            post(access::access_status),
-        )
+        .route("/api/bots/{name}/rfq/status", post(verify::maker_status))
         .route("/api/bots/{name}/config", get(settings::raw))
         .route("/api/bots/{name}/config", put(settings::save_raw))
         .route("/api/bots/{name}/signer", put(bots::change_signer))

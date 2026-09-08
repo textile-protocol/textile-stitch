@@ -943,13 +943,10 @@ function RfqCard({
     flagged?: boolean
   } | null>(null)
   const [contactEmail, setContactEmail] = useState('')
-  const [contactWhatsapp, setContactWhatsapp] = useState('')
-  const [requesting, setRequesting] = useState(false)
+  const [sending, setSending] = useState(false)
   const [checking, setChecking] = useState(false)
-  const [accessStatus, setAccessStatus] = useState<
-    'NONE' | 'PENDING' | 'APPROVED' | 'REJECTED' | null
-  >(null)
-  const [accessMessage, setAccessMessage] = useState<string | null>(null)
+  const [emailVerified, setEmailVerified] = useState<boolean | null>(null)
+  const [venueMessage, setVenueMessage] = useState<string | null>(null)
 
   const ga = loaded.rfqDefaultUnlocked
   const connected = loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
@@ -989,35 +986,35 @@ function RfqCard({
   const live = connected && loaded.rfqEnabled
   const waiting = connected && !live
   const makerFlagged = enrollment?.flagged === true
-  const rejected = accessStatus === 'REJECTED'
 
-  async function requestAccess() {
-    setRequesting(true)
+  async function sendVerifyEmail() {
+    setSending(true)
     setConnectError(null)
-    setAccessMessage(null)
+    setVenueMessage(null)
     try {
-      const res = await api.requestRfqAccess(botName, {
-        contactEmail: contactEmail.trim() || undefined,
-        contactWhatsapp: contactWhatsapp.trim() || undefined,
+      const res = await api.verifyRfqEmail(botName, {
+        contactEmail: contactEmail.trim(),
       })
-      setAccessStatus(res.accessStatus)
-      setAccessMessage(res.message)
-      if (res.enrollment) setEnrollment(res.enrollment)
+      setEmailVerified(res.emailVerified)
+      setVenueMessage(res.message)
     } catch (e) {
       setConnectError(e instanceof ApiError ? e.message : String(e))
     } finally {
-      setRequesting(false)
+      setSending(false)
     }
   }
 
-  async function checkAccess() {
+  async function checkStatus() {
     setChecking(true)
     setConnectError(null)
-    setAccessMessage(null)
+    setVenueMessage(null)
     try {
-      const res = await api.checkRfqAccess(botName)
-      setAccessStatus(res.accessStatus)
-      setAccessMessage(res.message)
+      const res = await api.checkRfqStatus(botName)
+      setEmailVerified(res.emailVerified)
+      setVenueMessage(res.message)
+      if (res.contactEmail && !contactEmail.trim()) {
+        setContactEmail(res.contactEmail)
+      }
       if (res.enrollment) setEnrollment(res.enrollment)
       if (res.settings) onConnected(res.settings, res.message)
     } catch (e) {
@@ -1068,8 +1065,8 @@ function RfqCard({
               <span className="mt-2 block text-xs">
                 {waiting
                   ? makerFlagged
-                    ? 'This maker is flagged. You will not receive Swap quotes until Textile unflags you.'
-                    : 'Request access below so Textile can review this maker.'
+                    ? 'Textile has blocked this maker. You will not receive Swap quotes until they unblock you.'
+                    : 'Confirm your email address below to finish the switch.'
                   : 'Connect below to finish the switch.'}
               </span>
             )}
@@ -1084,11 +1081,11 @@ function RfqCard({
         />
         <p className="text-xs text-faint">
           Connect registers this bot&apos;s funding wallet and saves the
-          credential. Textile still has to approve you before you receive
-          Swap quotes — Request access below (once, for every pair), then
-          Check status after they do. You never paste an id or key. The venue
-          rejects requests under 1 whole token so the protocol fee cannot
-          round to zero.
+          credential. Then confirm your email address: click the link we send
+          and this bot is seated on every Swap pair, on every chain, including
+          ones listed later. You never paste an id or key. The venue rejects
+          requests under 1 whole token so the protocol fee cannot round to
+          zero.
         </p>
 
         {waiting ? (
@@ -1100,11 +1097,9 @@ function RfqCard({
             .{' '}
             {makerFlagged
               ? 'Textile has blocked this maker. You will not receive Swap quotes.'
-              : rejected
-                ? 'Textile turned this maker down. Request access again if you want another review.'
-                : accessStatus === 'PENDING'
-                  ? 'Access requested. Textile will review it. Check status after they approve you.'
-                  : 'Request access so Textile can review this maker. You will not receive Swap quotes until they approve you.'}
+              : emailVerified
+                ? 'Your address is confirmed. Press Check status to pick the seats up.'
+                : 'Confirm your email address below. That is the only step left — no Swap quotes until you do.'}
           </Banner>
         ) : live ? (
           <div className="rounded-lg border border-line-soft bg-hover/40 px-3 py-2 text-sm">
@@ -1133,55 +1128,44 @@ function RfqCard({
         )}
 
         {connectError && <Banner tone="danger">{connectError}</Banner>}
-        {accessMessage && !connectError && (
-          <Banner tone={accessStatus === 'REJECTED' ? 'danger' : 'success'}>
-            {accessMessage}
+        {venueMessage && !connectError && (
+          <Banner tone={emailVerified ? 'success' : 'info'}>
+            {venueMessage}
           </Banner>
         )}
 
         {waiting && !makerFlagged && (
           <div className="space-y-3 rounded-lg border border-line-soft p-3">
-            <p className="text-sm font-bold">Request access</p>
+            <p className="text-sm font-bold">Confirm your email</p>
             <p className="text-xs text-faint">
-              One request covers every Swap pair, on every chain, including
-              pairs Textile lists later. They reply by email, so use an
-              address you own — they send a link to confirm it. WhatsApp is
-              optional.
+              Use an address you own. Clicking the link we send seats this bot
+              on every Swap pair, on every chain, including pairs Textile lists
+              later. Sending again to the same address resends the link.
             </p>
             <Field label="Email">
               <Input
                 type="email"
                 value={contactEmail}
-                disabled={!editable || requesting}
+                disabled={!editable || sending}
                 placeholder="you@desk.com"
                 autoComplete="email"
                 onChange={(e) => setContactEmail(e.target.value)}
               />
             </Field>
-            <Field label="WhatsApp (optional)">
-              <Input
-                type="tel"
-                value={contactWhatsapp}
-                disabled={!editable || requesting}
-                placeholder="+15551234567"
-                autoComplete="tel"
-                onChange={(e) => setContactWhatsapp(e.target.value)}
-              />
-            </Field>
             <div className="flex flex-wrap gap-2">
               <Button
                 variant="primary"
-                busy={requesting}
+                busy={sending}
                 disabled={!editable || !contactEmail.trim()}
-                onClick={() => void requestAccess()}
+                onClick={() => void sendVerifyEmail()}
               >
-                Request access
+                Send the confirmation link
               </Button>
               <Button
                 variant="secondary"
                 busy={checking}
                 disabled={!editable}
-                onClick={() => void checkAccess()}
+                onClick={() => void checkStatus()}
               >
                 Check status
               </Button>

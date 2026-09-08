@@ -462,19 +462,19 @@ async fn run_connect(config_path: String, venue_url: Option<String>) -> anyhow::
         stitch_bot::enroll::EnrollOutcome::Waiting => {
             // A bot from `stitch init` has the ladder off, so telling that
             // operator "your ladder keeps running" would hide that the bot is
-            // deliberately dark until Textile approves it.
+            // deliberately dark until the operator confirms their address.
             let meanwhile = if cfg.book_enabled {
                 "RFQ stays off and your ladder keeps running."
             } else {
                 "RFQ stays off, and this bot has no public ladder — it will quote nothing \
-                 until the maker is approved."
+                 until the address is confirmed."
             };
             println!(
-                "\nRegistered, but no corridor is seated for this maker yet — Textile approves \
-                 makers before they quote. {meanwhile}\n\
-                 Ask Textile to approve this maker (the Stitch panel has a Request access form, \
-                 or mail contact@textilecredit.com with the maker id in [rfq].maker_id), then \
-                 re-run `stitch connect` to pick the seat up.\n\
+                "\nRegistered, but no corridor is seated for this maker yet — a maker is seated \
+                 once its operator confirms an email address. {meanwhile}\n\
+                 Give Textile an address (the Stitch panel asks for one on Connect, or mail \
+                 contact@textilecredit.com with the maker id in [rfq].maker_id), click the link \
+                 we send, then re-run `stitch connect` to pick the seat up.\n\
                  See docs/migrate-book-to-rfq.md#standalone-cli."
             );
         }

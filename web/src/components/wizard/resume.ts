@@ -3,13 +3,13 @@
 //
 // Two records, one per lane: the new-bot one here, and the add-lane one at the
 // foot of the file. Only the bot's name is stored for the new-bot lane. Nothing
-// about progress lives in either: on remount
-// the Fund step asks the server (bot state, balances, allowances, RFQ access)
-// and lands in the right phase from that. The record is cleared as soon as the
-// wizard reaches either of its endings (running, or waiting for Textile), and
-// a record nobody cleared expires on its own, so an abandoned run can never
-// hold /add hostage: a stale name would reopen the Fund step for the old bot
-// and there would be no way to set up a second one.
+// about progress lives in either: on remount the Fund step asks the server (bot
+// state, balances, allowances, RFQ seats) and lands in the right phase from
+// that. The record is cleared as soon as the wizard reaches either of its
+// endings (running, or waiting on a confirmed email), and a record nobody
+// cleared expires on its own, so an abandoned run can never hold /add hostage:
+// a stale name would reopen the Fund step for the old bot and there would be no
+// way to set up a second one.
 
 const KEY = 'stitch-wizard-resume'
 

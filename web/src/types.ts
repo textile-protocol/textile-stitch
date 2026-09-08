@@ -164,26 +164,31 @@ export interface RfqEnrollment {
   flagged?: boolean
 }
 
-export type RfqAccessStatus = 'NONE' | 'PENDING' | 'APPROVED' | 'REJECTED'
-
 export interface SaveResult {
   settings: Settings
   restarted: boolean
   restartError: string | null
   message: string
   enrollment?: RfqEnrollment
-  accessStatus?: RfqAccessStatus
 }
 
-export interface RfqAccessResult {
+/** What the panel says back about the operator's address. */
+export interface RfqEmailResult {
   message: string
-  accessStatus: RfqAccessStatus
-  /** False until the confirm link is clicked; absent from older venues. */
-  emailVerified?: boolean | null
+  contactEmail: string
+  /** True only when this address was already confirmed on an earlier link. */
+  emailVerified: boolean
+}
+
+export interface RfqStatusResult {
+  message: string
+  /** The whole gate: confirmed means seated, unless Textile blocked them. */
+  emailVerified: boolean
+  contactEmail?: string | null
   settings?: Settings
   enrollment?: RfqEnrollment
   /**
-   * Present only on APPROVED, when the panel seated the bot and saved the
+   * Present only once verified, when the panel seated the bot and saved the
    * config: whether a running bot was bounced onto it, and why not if it wasn't.
    */
   restarted?: boolean

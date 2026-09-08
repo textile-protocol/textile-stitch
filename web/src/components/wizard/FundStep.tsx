@@ -2,7 +2,7 @@
 //
 // The screen polls GET /funding until the server's gate passes (one token side
 // worth the floor, plus gas), then hands over to the shared start runner:
-// approve spending on chain, check Textile access, start, confirm it stays up.
+// approve spending on chain, check the Textile seats, start, confirm it stays up.
 // Nothing about progress is kept in the browser. On a reload the step asks the
 // server again and lands where it should: a running bot goes straight through,
 // an approved-but-stopped one starts, an unfunded one shows the checklist.
@@ -25,15 +25,16 @@ export interface FundStepProps {
   bot: string
   /**
    * Called exactly once when this step is finished. `live`: the bot is running.
-   * `waiting`: funded and approved on chain, Textile's access decision is
-   * outstanding (the panel refuses Start until then). `rejected`: Textile said
-   * no. A caller that only wants to move on can ignore the argument.
+   * `waiting`: funded and approved on chain, the operator's email is not
+   * confirmed yet (the panel refuses Start until then). `rejected`: Textile
+   * blocked the maker. A caller that only wants to move on can ignore the
+   * argument.
    */
   onStarted: (outcome: FundOutcome) => void
   /**
    * Rail Back. Disabled while approve or start is running. The only way out of
    * this step other than finishing it: the wizard ends at a live bot or at one
-   * waiting for Textile, never at "I'll do it later".
+   * waiting on a confirmation, never at "I'll do it later".
    */
   onBack?: () => void
   /**

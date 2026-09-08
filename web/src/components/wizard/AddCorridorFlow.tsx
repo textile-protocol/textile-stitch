@@ -10,12 +10,13 @@
 //     fewer. Never `rpcUrl`: that belongs to the bot, not to one corridor.
 //  3. enrollRfq. Not optional and not a nicety. `rfq_corridor` is per pool and a
 //     pool from addPool has none, while `[rfq].enabled` is bot-level and already
-//     true, so the start runner's access stage short-circuits and would happily
+//     true, so the start runner's seat stage short-circuits and would happily
 //     start a bot that answers nothing on the new corridor. Enrollment re-stamps
-//     every pool and is idempotent. No new access request is filed: Textile
-//     approves a maker, once, across every corridor and chain.
+//     every pool and is idempotent. Nothing is asked of Textile: a confirmed
+//     email seats a maker, once, across every corridor and chain.
 //  4. The funding check, on the new corridor's own two tokens. Then the shared
-//     start runner: approve spending, check access, start, confirm it stayed up.
+//     start runner: approve spending, check the seats, start, confirm it stayed
+//     up.
 //
 // It drives `useStartSequence` itself rather than mounting the Fund step. The
 // Fund step reports "live" the moment it sees a running bot, which is right for
@@ -27,7 +28,7 @@ import { api } from '../../api'
 import { formatAmount, formatClock, groupAddress } from '../../format'
 import { pairSymbols } from '../SpreadExample'
 import { Banner, Button, Card, Spinner } from '../ui'
-import ApprovalWait from './ApprovalWait'
+import EmailVerifyWait from './EmailVerifyWait'
 import LiveStep from './LiveStep'
 import ProgressList, { type ProgressRow } from './ProgressList'
 import { pairFunded, templatePair, templateSpreads } from './candidates'
@@ -427,11 +428,11 @@ export default function AddCorridorFlow({
             clearsResume={false}
           />
         ) : (
-          // No contact details and no Back: access is per maker, so this bot
-          // must never file a second request.
-          <ApprovalWait
+          // No Back: this bot already has a maker identity, and the address
+          // that seats it is confirmed once per maker, not per corridor.
+          <EmailVerifyWait
             bot={bot}
-            initial={outcome.access}
+            initial={outcome.status}
             initialError={outcome.kind === 'waiting' ? outcome.error : null}
             onApproved={() => setOutcome({ kind: 'live' })}
           />

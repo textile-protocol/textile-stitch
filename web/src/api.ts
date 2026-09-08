@@ -17,7 +17,8 @@ import type {
   MigrationResult,
   QuoteProof,
   QuoteProofRequest,
-  RfqAccessResult,
+  RfqEmailResult,
+  RfqStatusResult,
   SaveResult,
   SessionInfo,
   Settings,
@@ -273,18 +274,16 @@ export const api = {
       body: JSON.stringify({}),
     }),
 
-  requestRfqAccess: (
-    name: string,
-    body: { contactEmail?: string; contactWhatsapp?: string },
-  ) =>
-    request<RfqAccessResult>(
-      `/api/bots/${encodeURIComponent(name)}/rfq/access-request`,
+  /** Hand Textile the operator's address; they mail back a confirm link. */
+  verifyRfqEmail: (name: string, body: { contactEmail: string }) =>
+    request<RfqEmailResult>(
+      `/api/bots/${encodeURIComponent(name)}/rfq/verify-email`,
       { method: 'POST', body: JSON.stringify(body) },
     ),
 
-  checkRfqAccess: (name: string) =>
-    request<RfqAccessResult>(
-      `/api/bots/${encodeURIComponent(name)}/rfq/access-status`,
+  checkRfqStatus: (name: string) =>
+    request<RfqStatusResult>(
+      `/api/bots/${encodeURIComponent(name)}/rfq/status`,
       { method: 'POST', body: JSON.stringify({}) },
     ),
 

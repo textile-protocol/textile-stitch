@@ -76,8 +76,8 @@ pub fn maker_venue_origin(stream_or_origin: &str) -> String {
     for suffix in [
         "/v2/maker/stream",
         "/v2/maker/enroll",
-        "/v2/maker/access-request",
-        "/v2/maker/access-status",
+        "/v2/maker/verify-email",
+        "/v2/maker/status",
     ] {
         if let Some(base) = http.strip_suffix(suffix) {
             return base.to_string();
@@ -91,20 +91,17 @@ pub fn maker_enroll_url(stream_or_origin: &str) -> String {
     format!("{}/v2/maker/enroll", maker_venue_origin(stream_or_origin))
 }
 
-/// Where the panel asks Textile to seat this maker.
-pub fn maker_access_request_url(stream_or_origin: &str) -> String {
+/// Where the panel hands Textile the operator's address to confirm.
+pub fn maker_verify_email_url(stream_or_origin: &str) -> String {
     format!(
-        "{}/v2/maker/access-request",
+        "{}/v2/maker/verify-email",
         maker_venue_origin(stream_or_origin)
     )
 }
 
-/// Where a caller polls for the seating decision.
-pub fn maker_access_status_url(stream_or_origin: &str) -> String {
-    format!(
-        "{}/v2/maker/access-status",
-        maker_venue_origin(stream_or_origin)
-    )
+/// Where a caller polls for the seats a confirmed address earned.
+pub fn maker_status_url(stream_or_origin: &str) -> String {
+    format!("{}/v2/maker/status", maker_venue_origin(stream_or_origin))
 }
 
 /// The venue origin for a config: an explicit override, else the configured
@@ -206,7 +203,7 @@ pub async fn register_maker(
 pub enum EnrollOutcome {
     /// Live on a corridor: RFQ on, and the ladder off for an RFQ-default bot.
     Live,
-    /// Registered, but Textile flagged this maker. No quotes will arrive.
+    /// Registered, but Textile blocked this maker. No quotes will arrive.
     Flagged,
     /// Registered with no corridor seated on this chain yet. RFQ stays off.
     Waiting,

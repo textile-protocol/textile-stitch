@@ -4,7 +4,7 @@
 // poll) and offers "Start again" inline if it stops. Says the two things that
 // keep it live: the app stays open, the machine stays awake.
 //
-// Never calls access-status: on a seated bot that rewrites the config and
+// Never calls rfq/status: on a seated bot that rewrites the config and
 // restarts it.
 
 import { useCallback, useEffect, useRef, useState } from 'react'

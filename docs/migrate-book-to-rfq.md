@@ -9,7 +9,7 @@ This guide moves an existing bot from the ladder to RFQ. The mechanical part is
 a few minutes and one restart; the wait is Textile approving your maker, which
 happens in between. Your ladder keeps running until then.
 
-- [Getting access](#getting-access) — Connect registers you; Textile has to approve you before you quote
+- [Getting access](#getting-access) — Connect registers you; confirming your email is what puts you on the tape
 - [Panel and Desktop operators](#panel-and-desktop)
 - [Standalone CLI operators](#standalone-cli) — `stitch` from a terminal, systemd, or Docker without the panel
 - [What changes in your config](#what-changes)
@@ -21,26 +21,22 @@ happens in between. Your ladder keeps running until then.
 ## Getting access
 
 Connect registers your maker and issues a credential. It does **not** put you on
-the tape. Textile seats corridors only after a person approves the maker, so
-every new maker starts registered and dark:
+the tape. Confirming your email address is what does:
 
 1. **Connect.** The bot signs `MakerEnroll` with its funding wallet and gets a
    maker id and key back. No corridor is enabled yet.
-2. **Request access.** Tell Textile who you are. An email address you own is
-   required (placeholder and throwaway domains are refused); WhatsApp is
-   optional. That sends ops a dossier (wallet, chain, maker id, corridor,
-   contact) with Approve and Reject, and sends *you* a link to confirm the
-   address. Click it — the request is reviewed either way, but it shows up as
-   unverified until you do. You ask once: the same request covers every bot
-   you run on this wallet.
-3. **They approve**, which seats the maker on every RFQ corridor on every
-   chain — including pairs Textile lists later. You get an email saying so.
+2. **Give Textile an email address you own** (placeholder and throwaway domains
+   are refused). They send a link to it.
+3. **Click the link.** That seats the maker on every RFQ corridor on every
+   chain, including pairs Textile lists later. You get an email confirming it.
+   You do this once — the same confirmation covers every bot you run on this
+   wallet.
 4. **Check status.** Your bot picks the seat up and goes live. This does not
    rotate your key.
 
 Until step 3, `[rfq]` stays off and your ladder keeps running — so a leftover
 book bot is never dark in the gap. That is the whole reason to leave the ladder
-*after* you are approved, not before.
+*after* you are seated, not before.
 
 <a id="panel-and-desktop"></a>
 
@@ -50,15 +46,11 @@ book bot is never dark in the gap. That is the whole reason to leave the ladder
 2. In the **RFQ** card, press **Connect**. The bot signs a `MakerEnroll` message
    with its own funding wallet; Textile registers the maker and the panel writes
    `rfq-api.key` beside the config. You never paste an id or key.
-3. Ask Textile to seat the maker. Newer panels have a **Request access** form
-   in the RFQ card — an email address you own, WhatsApp optional — and the
-   card then reads "Access requested". Confirm the address from the link they
-   email you. If your panel has no such form, mail `contact@textilecredit.com`
-   with the maker id from `[rfq].maker_id`, the chain, and the pair.
-4. Wait for approval. When it lands, press **Check status** if your panel has
-   it — otherwise press **Reconnect**, which re-enrolls and picks the seat up
-   (it rotates the maker key; Check status does not). Either way the card goes
-   live and `[rfq]` is enabled.
+3. In the same card, give an email address you own and press **Send the
+   confirmation link**.
+4. Click the link in your inbox, then press **Check status**. The card goes live
+   and `[rfq]` is enabled. The bot also picks this up on its own within a
+   minute.
 5. If the bot was on the ladder, the card now offers **Switch to RFQ only**.
    Take it — Connect on a leftover book bot writes the credential and leaves the
    ladder alone, so this is the step that actually moves you.
@@ -86,24 +78,24 @@ stitch connect --config ./stitch.toml
 `rfq-api.key` next to the config (owner-only), and writes the `[rfq]` block into
 `stitch.toml`.
 
-On a maker Textile has not approved yet — which is every new maker — it prints
-that you are registered and waiting, leaves `[rfq]` off, and leaves your ladder
-running. That is the expected first result, not an error.
+On a maker whose address is not confirmed yet — which is every new maker — it
+prints that you are registered and waiting, leaves `[rfq]` off, and leaves your
+ladder running. That is the expected first result, not an error.
 
-### Requesting access without the panel
+### Confirming your email without the panel
 
-The Request access form lives in the Stitch panel; there is no `stitch` verb for
-it yet. Two ways through:
+The email form lives in the Stitch panel; there is no `stitch` verb for it yet.
+Two ways through:
 
 - **Run the panel once.** Point it at your existing bot directory, Connect (or
-  it picks up the credential you already have), ask for access, and pick the
-  seat up after approval. You can shut the panel down afterwards — the seat
+  it picks up the credential you already have), give it your address, click the
+  link, and pick the seat up. You can shut the panel down afterwards — the seat
   lives on the venue, not in the panel.
 - **Ask Textile directly.** Send `contact@textilecredit.com` your maker id (it
-  is in `[rfq].maker_id` after Connect), the chain, and the pair. Ops can seat
+  is in `[rfq].maker_id` after Connect), the chain, and the pair. They can seat
   you by hand.
 
-Once approved, re-run `stitch connect` to pick the seat up:
+Once confirmed, re-run `stitch connect` to pick the seat up:
 
 ```bash
 stitch connect --config ./stitch.toml
@@ -126,9 +118,8 @@ you do it. Don't run it on a live bot for no reason, and don't run it on two
 machines pointed at the same maker. The panel's Check status exists precisely
 because it applies the seat *without* rotating; the CLI has no equivalent yet.
 
-The other case `connect` reports is a **rejected or flagged maker**: the
-credential is saved but no quote requests will ever arrive. Talk to Textile
-before re-running.
+The other case `connect` reports is a **blocked maker**: the credential is saved
+but no quote requests will ever arrive. Talk to Textile before re-running.
 
 ### Pointing at a different venue
 
@@ -197,8 +188,8 @@ the bot cannot find `rfq-api.key` — check it sits next to `stitch.toml` and is
 readable by the user the bot runs as.
 
 If the responder starts but no requests arrive, you are registered without a
-seat — that is the approval step, not a bug. Check status in the panel (or ask
-Textile) rather than restarting the bot.
+seat — the email is still unconfirmed, not a bug. Click the link, then Check
+status in the panel (or ask Textile) rather than restarting the bot.
 
 A bot with the ladder off and no working credential quotes nothing at all. The
 panel refuses to Start or Restart one in that state; on the CLI, watch for that
@@ -219,8 +210,9 @@ defaults to true) and restart.
 
 Either way, leave `[rfq]` in place. `enabled = false` parks the responder
 without discarding your maker id, so switching back is one edit rather than
-another enrollment. Your approval is not lost either way: it is per maker, not
-per pair, so switching back never needs a second review.
+another enrollment. Your seats are not lost either way: they follow the
+confirmed address, which is per maker rather than per pair, so switching back
+never needs a second confirmation.
 
 Orders you already signed stay live on the book until they expire, whichever
 direction you move.

@@ -1,40 +1,41 @@
-// The Waiting screen: funded and approved on chain, Textile's access decision
-// outstanding. Polls the panel's access-status every 30 s (backing off to two
-// minutes on venue errors) and, the moment Textile says yes, runs the shared
-// start runner so the bot goes live without another click.
+// The Confirm-your-email screen: funded and approved on chain, the operator's
+// address still unconfirmed. Polls the panel's rfq/status every 30 s (backing
+// off to two minutes on venue errors) and, the moment Textile reports the
+// address confirmed, runs the shared start runner so the bot goes live without
+// another click.
 //
-// One rule above all: access-status is never called again once the bot is
-// seated. On an APPROVED bot that call rewrites the config and restarts a
-// running bot. So the screen asks the config first (`settings.rfqEnabled`) and
-// stops polling on the first APPROVED answer.
+// One rule above all: rfq/status is never called again once the bot is seated.
+// On a seated bot that call rewrites the config and restarts a running bot. So
+// the screen asks the config first (`settings.rfqEnabled`) and stops polling on
+// the first confirmed answer.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api } from '../../api'
 import { formatClock } from '../../format'
-import { Banner, Button, Card } from '../ui'
+import { Banner, Button, Card, Field, Input } from '../ui'
 import ProgressList, { type ProgressRow } from './ProgressList'
 import { errorText, useStartSequence } from './useStartSequence'
 import { CONTACT_EMAIL, progress as progressCopy, wait } from './wizardCopy'
-import type { RfqAccessResult } from '../../types'
+import type { RfqStatusResult } from '../../types'
 
-export interface ApprovalWaitProps {
+export interface EmailVerifyWaitProps {
   bot: string
-  /** Textile approved this maker and the bot is running. */
+  /** The address is confirmed and the bot is running. */
   onApproved: () => void
-  /** The last access result the wizard saw, when it has one. */
-  initial?: RfqAccessResult | null
+  /** The last status the wizard saw, when it has one. */
+  initial?: RfqStatusResult | null
   /**
-   * Why the wizard has no access result: the panel could not reach Textile on
-   * the way here. Shown at once, so the first thing an operator reads is that
-   * the venue was away, not the "we are reviewing your request" copy.
+   * Why the wizard has no status: the panel could not reach Textile on the way
+   * here. Shown at once, so the first thing an operator reads is that the venue
+   * was away, not the "check your inbox" copy.
    */
   initialError?: string | null
-  /** Contact details still in the wizard's memory, for "Request access again". */
-  contact?: { email: string; whatsapp: string }
+  /** The address still in the wizard's memory, for Resend. */
+  contactEmail?: string
   /**
    * Back to the Connect step (offered when the bot has no Textile credential).
-   * The only way off this screen other than Textile answering: waiting for
-   * approval is one of the wizard's two endings, so it offers no way out.
+   * The only way off this screen other than confirming: this is one of the
+   * wizard's two endings, so it offers no way out.
    */
   onBack?: () => void
 }
@@ -42,27 +43,28 @@ export interface ApprovalWaitProps {
 const CHECK_MS = 30_000
 const CHECK_MAX_MS = 120_000
 
+/** Same bar the venue applies, so a typo stops here rather than at the venue. */
+const isEmail = (s: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim())
+
 type View =
-  | 'pending'
-  | 'rejected'
+  | 'unconfirmed'
   | 'flagged'
-  | 'approved-not-quotable'
+  | 'confirmed-not-quotable'
   | 'restart-needed'
   | 'starting'
   | 'start-failed'
 
-export default function ApprovalWait({
+export default function EmailVerifyWait({
   bot,
   onApproved,
   initial = null,
   initialError = null,
-  contact,
+  contactEmail,
   onBack,
-}: ApprovalWaitProps) {
-  const seatedInitially =
-    initial?.accessStatus === 'APPROVED' && !!initial.settings?.rfqEnabled
-  const [access, setAccess] = useState<RfqAccessResult | null>(initial)
-  const [approved, setApproved] = useState(seatedInitially)
+}: EmailVerifyWaitProps) {
+  const seatedInitially = !!initial?.emailVerified && !!initial.settings?.rfqEnabled
+  const [status, setStatus] = useState<RfqStatusResult | null>(initial)
+  const [seatedNow, setSeatedNow] = useState(seatedInitially)
   const [restartError, setRestartError] = useState<string | null>(
     seatedInitially ? (initial?.restartError ?? null) : null,
   )
@@ -72,10 +74,11 @@ export default function ApprovalWait({
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null)
   const [nextCheckMs, setNextCheckMs] = useState(CHECK_MS)
   const [armed, setArmed] = useState(0)
-  const [requesting, setRequesting] = useState(false)
-  const [requestNote, setRequestNote] = useState<string | null>(null)
+  const [resending, setResending] = useState(false)
+  const [resendNote, setResendNote] = useState<string | null>(null)
+  const [typedEmail, setTypedEmail] = useState('')
   const [restarting, setRestarting] = useState(false)
-  const approvedRef = useRef(seatedInitially)
+  const seatedRef = useRef(seatedInitially)
   const mountedRef = useRef(true)
 
   const runner = useStartSequence(bot, {
@@ -94,9 +97,9 @@ export default function ApprovalWait({
 
   /** Textile seated the maker: stop polling and start the bot. */
   const seated = useCallback(
-    (result: RfqAccessResult | null) => {
-      approvedRef.current = true
-      setApproved(true)
+    (result: RfqStatusResult | null) => {
+      seatedRef.current = true
+      setSeatedNow(true)
       if (result?.restartError) setRestartError(result.restartError)
       else startRun()
     },
@@ -105,19 +108,17 @@ export default function ApprovalWait({
 
   const check = useCallback(
     async (manual: boolean) => {
-      if (approvedRef.current) return
+      if (seatedRef.current) return
       setChecking(true)
       try {
-        const result = await api.checkRfqAccess(bot)
-        if (!mountedRef.current || approvedRef.current) return
-        setAccess(result)
+        const result = await api.checkRfqStatus(bot)
+        if (!mountedRef.current || seatedRef.current) return
+        setStatus(result)
         setCheckError(null)
         setKeyMissing(false)
         setLastCheckedAt(Date.now())
         setNextCheckMs(CHECK_MS)
-        if (result.accessStatus === 'APPROVED' && result.settings?.rfqEnabled) {
-          seated(result)
-        }
+        if (result.emailVerified && result.settings?.rfqEnabled) seated(result)
       } catch (e) {
         if (!mountedRef.current) return
         const message = errorText(e)
@@ -146,7 +147,7 @@ export default function ApprovalWait({
   useEffect(() => {
     let cancelled = false
     void (async () => {
-      if (approvedRef.current) {
+      if (seatedRef.current) {
         if (!restartErrorRef.current) startRun()
         return
       }
@@ -168,29 +169,29 @@ export default function ApprovalWait({
     }
   }, [bot, check, seated, startRun])
 
-  // The timer. Re-armed after every completed check; stopped once approved,
-  // and while the start runner is working. That last guard is the module's
-  // rule, not tidiness: a run started from this screen seats the bot, and
-  // asking access-status again while it does rewrites the config and restarts
-  // the bot underneath it.
+  // The timer. Re-armed after every completed check; stopped once seated, and
+  // while the start runner is working. That last guard is the module's rule,
+  // not tidiness: a run started from this screen seats the bot, and asking
+  // rfq/status again while it does rewrites the config and restarts the bot
+  // underneath it.
   useEffect(() => {
-    if (approved || checking || runner.active) return
+    if (seatedNow || checking || runner.active) return
     const timer = window.setTimeout(() => void check(false), nextCheckMs)
     return () => clearTimeout(timer)
-  }, [approved, checking, runner.active, nextCheckMs, armed, check])
+  }, [seatedNow, checking, runner.active, nextCheckMs, armed, check])
 
   // A run that ended without the bot going live. It carries Textile's answer,
-  // so fold that back in and drop the "approved" latch: the bot is not seated
+  // so fold that back in and drop the "seated" latch: the bot is not seated
   // after all, the screen has to go back to showing what the venue said, and
   // Check again has to work again. Safe on the poll rule: a run that did not
-  // reach 'live' left the bot stopped, so a later access-status call has no
+  // reach 'live' left the bot stopped, so a later rfq/status call has no
   // running bot to restart.
   const outcome = runner.state.outcome
   useEffect(() => {
     if (!outcome || outcome.kind === 'live') return
-    approvedRef.current = false
-    setApproved(false)
-    if (outcome.access) setAccess(outcome.access)
+    seatedRef.current = false
+    setSeatedNow(false)
+    if (outcome.status) setStatus(outcome.status)
     setCheckError(outcome.kind === 'waiting' ? outcome.error : null)
   }, [outcome])
 
@@ -199,23 +200,30 @@ export default function ApprovalWait({
     void check(true)
   }
 
-  async function requestAgain() {
-    if (!contact?.email.trim()) return
-    setRequesting(true)
-    setRequestNote(null)
+  /**
+   * Send (or resend) the confirmation link. `address` is what the operator
+   * typed when the bot has none on file — an older bot that connected before
+   * this step existed, or a run whose first send was refused. Without it this
+   * screen is a dead end: nothing to resend, and AddCorridorFlow mounts it
+   * with no way back either.
+   */
+  async function sendLink(address: string) {
+    const email = address.trim()
+    if (!isEmail(email)) return
+    setResending(true)
+    setResendNote(null)
     try {
-      const result = await api.requestRfqAccess(bot, {
-        contactEmail: contact.email.trim(),
-        contactWhatsapp: contact.whatsapp.trim() || undefined,
-      })
+      const result = await api.verifyRfqEmail(bot, { contactEmail: email })
       if (!mountedRef.current) return
-      setAccess(result)
-      setRequestNote(result.message)
+      setResendNote(result.message)
+      setTypedEmail('')
+      // Pick the address up on the next poll rather than trusting local state.
+      void check(true)
     } catch (e) {
       if (!mountedRef.current) return
-      setRequestNote(errorText(e))
+      setResendNote(errorText(e))
     } finally {
-      if (mountedRef.current) setRequesting(false)
+      if (mountedRef.current) setResending(false)
     }
   }
 
@@ -235,37 +243,35 @@ export default function ApprovalWait({
   }
 
   const seq = runner.state
-  const slug = access?.enrollment?.makerSlug ?? null
+  const slug = status?.enrollment?.makerSlug ?? null
+  const email = contactEmail?.trim() || status?.contactEmail?.trim() || null
   // A finished run that did not go live counts as no run at all: the screen
   // goes back to Textile's answer with its real copy and its own buttons,
-  // instead of freezing on "Approved. Starting the bot" with no controls.
+  // instead of freezing on "Confirmed. Starting the bot" with no controls.
   const endedNotLive = seq.stage === 'done' && seq.outcome !== null && seq.outcome.kind !== 'live'
-  // Flagged is tested before APPROVED on purpose: the panel answers a flagged
-  // maker with APPROVED and flagged together, so an ordinary flagged maker
-  // used to land on 'approved-not-quotable' and never see the one screen that
+  // Flagged is tested before confirmed on purpose: the panel answers a blocked
+  // maker with emailVerified and flagged together, so an ordinary blocked maker
+  // used to land on 'confirmed-not-quotable' and never see the one screen that
   // helps them, the one with the maker id and the way to reach Textile.
   const view: View =
     seq.stage === 'failed'
       ? 'start-failed'
       : seq.stage !== 'idle' && !endedNotLive
         ? 'starting'
-        : approved && !endedNotLive
+        : seatedNow && !endedNotLive
           ? restartError
             ? 'restart-needed'
             : 'starting'
-          : access?.enrollment?.flagged
+          : status?.enrollment?.flagged
             ? 'flagged'
-            : access?.accessStatus === 'APPROVED'
-              ? 'approved-not-quotable'
-              : access?.accessStatus === 'REJECTED'
-                ? 'rejected'
-                : 'pending'
+            : status?.emailVerified
+              ? 'confirmed-not-quotable'
+              : 'unconfirmed'
 
   const title = {
-    pending: wait.title,
-    rejected: wait.rejectedTitle,
+    unconfirmed: wait.title,
     flagged: wait.flaggedTitle,
-    'approved-not-quotable': wait.notQuotableTitle,
+    'confirmed-not-quotable': wait.notQuotableTitle,
     'restart-needed': wait.restartTitle,
     starting: wait.approvedTitle,
     'start-failed': wait.startFailedTitle,
@@ -301,20 +307,46 @@ export default function ApprovalWait({
   return (
     <Card title={title}>
       <div className="space-y-4">
-        {view === 'pending' && (
+        {view === 'unconfirmed' && (
           <>
-            <p className="text-sm text-muted">{wait.body}</p>
-            {access?.message && <Banner tone="info">{access.message}</Banner>}
-            {access?.emailVerified === false && (
-              <Banner tone="warning">{wait.emailVerify}</Banner>
-            )}
+            <p className="text-sm text-muted">{email ? wait.body : wait.noAddressBody}</p>
+            {email && <Banner tone="info">{wait.sentTo(email)}</Banner>}
             {keyMissing && checkError && <Banner tone="danger">{checkError}</Banner>}
-            <p className="text-sm">{wait.keepOpen}</p>
+            {resendNote && <Banner tone="info">{resendNote}</Banner>}
+            {/* No address on file, so there is nothing to resend and nothing to
+                wait for. Ask for one here: this screen is one of the wizard's
+                two endings and AddCorridorFlow mounts it with no Back. */}
+            {!keyMissing && !email && (
+              <Field label={wait.addressLabel} hint={wait.addressHint}>
+                <Input
+                  value={typedEmail}
+                  inputMode="email"
+                  placeholder="you@desk.com"
+                  onChange={(e) => setTypedEmail(e.target.value)}
+                />
+              </Field>
+            )}
+            {email && <p className="text-sm">{wait.keepOpen}</p>}
             {statusLine && <p className="text-xs text-faint">{statusLine}</p>}
             <div className="flex flex-wrap items-center gap-3">
+              {!keyMissing && !email && (
+                <Button
+                  variant="primary"
+                  busy={resending}
+                  disabled={!isEmail(typedEmail)}
+                  onClick={() => void sendLink(typedEmail)}
+                >
+                  {wait.sendLink}
+                </Button>
+              )}
               {!keyMissing && (
                 <Button busy={checking} onClick={checkNow}>
                   {wait.checkNow}
+                </Button>
+              )}
+              {!keyMissing && email && (
+                <Button busy={resending} onClick={() => void sendLink(email)}>
+                  {wait.resend}
                 </Button>
               )}
               {keyMissing && onBack && (
@@ -326,14 +358,11 @@ export default function ApprovalWait({
           </>
         )}
 
-        {(view === 'rejected' || view === 'flagged') && (
+        {view === 'flagged' && (
           <>
-            <p className="text-sm">
-              {view === 'rejected' ? wait.rejectedBody(slug) : wait.flaggedBody(slug)}
-            </p>
-            {access?.message && <Banner tone="danger">{access.message}</Banner>}
+            <p className="text-sm">{wait.flaggedBody(slug)}</p>
+            {status?.message && <Banner tone="danger">{status.message}</Banner>}
             <p className="text-sm text-muted">{wait.contact(slug)}</p>
-            {requestNote && <Banner tone="info">{requestNote}</Banner>}
             {statusLine && <p className="text-xs text-faint">{statusLine}</p>}
             <div className="flex flex-wrap items-center gap-3">
               <a
@@ -342,11 +371,6 @@ export default function ApprovalWait({
               >
                 {wait.emailTextile}
               </a>
-              {view === 'rejected' && contact?.email.trim() && (
-                <Button busy={requesting} onClick={() => void requestAgain()}>
-                  {wait.requestAgain}
-                </Button>
-              )}
               <Button busy={checking} onClick={checkNow}>
                 {wait.checkAgain}
               </Button>
@@ -354,19 +378,19 @@ export default function ApprovalWait({
           </>
         )}
 
-        {/* Textile says approved, the bot's config doesn't say so yet: the
+        {/* Textile says confirmed, the bot's config doesn't say so yet: the
             venue answering and the panel writing that answer, out of step for a
             moment. The wizard can settle it itself, so the main button runs the
             start sequence (which re-reads the config, asks the venue again if
             it has to, and starts the bot). No link to Settings: leaving here
             strands a bot that is neither live nor waiting. */}
-        {view === 'approved-not-quotable' && (
+        {view === 'confirmed-not-quotable' && (
           <>
             <p className="text-sm text-muted">{wait.notQuotableBody}</p>
             {/* The operator pressed Finish setting up and it came back here.
                 Say so, rather than show the same screen as if nothing ran. */}
             {endedNotLive && <Banner tone="warning">{wait.notQuotableAgain}</Banner>}
-            {access?.message && <Banner tone="warning">{access.message}</Banner>}
+            {status?.message && <Banner tone="warning">{status.message}</Banner>}
             {statusLine && <p className="text-xs text-faint">{statusLine}</p>}
             <div className="flex flex-wrap items-center gap-3">
               <Button variant="primary" onClick={() => startRun()}>
@@ -394,8 +418,8 @@ export default function ApprovalWait({
         {(view === 'starting' || view === 'start-failed') && (
           <>
             <p className="text-sm text-muted">{wait.approvedBody}</p>
-            {access?.message && seq.stage === 'idle' && (
-              <Banner tone="success">{access.message}</Banner>
+            {status?.message && seq.stage === 'idle' && (
+              <Banner tone="success">{status.message}</Banner>
             )}
             <ProgressList rows={rows} />
             {failure && failure.stage === 'approve' && (

@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Request Textile to seat this maker, and poll until they do.
+//! Confirm the operator's email address, and pick up the seats it earns.
 //!
-//! Connect only registers a key. This is the last setup step: the panel
-//! posts contact details to the venue, which emails ops. Asked once per
-//! maker — approval covers every RFQ corridor on every chain, including
-//! pairs listed later. The email is required and the venue mails a confirm
-//! link beside the review; the request is reviewed either way. Check status
-//! applies corridors once approved, without rotating the key.
+//! Connect registers the bot and mints a key. The one thing left is proving
+//! the operator owns the address they gave: the panel posts it to the venue,
+//! the venue mails a confirm link, and clicking it seats this maker on every
+//! RFQ corridor on every chain — now and as more are listed. Nobody at Textile
+//! approves anything. Check status applies the seats without rotating the key.
 
 use axum::extract::{Path as UrlPath, State};
 use axum::response::{IntoResponse, Response};
@@ -19,28 +18,26 @@ use super::settings::{config_path, read_toml, save_and_restart};
 use super::{ApiError, AppState};
 use crate::config::{rfq_default_flag_in_dir, Config};
 use crate::enroll::{
-    apply_enrollment, maker_access_request_url, maker_access_status_url, venue_error_message,
+    apply_enrollment, maker_status_url, maker_verify_email_url, venue_error_message,
     venue_origin_from_config, EnrollCorridorPair, EnrollOutcome, EnrollResponse,
 };
 use crate::setup;
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct AccessBody {
+pub struct VerifyBody {
     #[serde(default)]
     pub venue_url: Option<String>,
     #[serde(default)]
     pub contact_email: Option<String>,
-    #[serde(default)]
-    pub contact_whatsapp: Option<String>,
-    #[serde(default)]
-    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AccessStatusResponse {
-    access_status: String,
+struct MakerStatusResponse {
+    /// The whole gate. False means the confirm link is still unclicked.
+    #[serde(default)]
+    email_verified: bool,
     #[serde(default)]
     flagged: bool,
     #[serde(default)]
@@ -56,67 +53,28 @@ struct AccessStatusResponse {
     corridor_pairs: Vec<EnrollCorridorPair>,
     #[serde(default)]
     contact_email: Option<String>,
-    /// False until the operator clicks the confirm link. Older venues omit
-    /// it, and "omitted" must not read as "not confirmed".
-    #[serde(default)]
-    email_verified: Option<bool>,
 }
 
-/// What the venue says back to a filed request.
+/// What the venue says back to a submitted address.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AccessRequestResponse {
+struct VerifyEmailResponse {
     #[serde(default)]
     contact_email: Option<String>,
     #[serde(default)]
-    email_verified: Option<bool>,
+    email_verified: bool,
 }
 
-/// The line under "Request sent" / "still pending": only nags about the
-/// confirm link while the venue actually says it is unconfirmed.
-fn verify_hint(contact_email: Option<&str>, email_verified: Option<bool>) -> String {
-    match (email_verified, contact_email) {
-        (Some(false), Some(email)) => format!(
-            " Confirm your email: we sent a link to {email}. Request access again to resend it."
-        ),
-        (Some(false), None) => {
-            " Confirm your email: we sent you a link. Request access again to resend it."
-                .to_string()
-        }
-        _ => String::new(),
-    }
-}
-
-/// Body for POST /v2/maker/access-request. The form leaves most of these
-/// blank, and blank has to mean absent: the venue validates them as optional
-/// strings, so a `null` reads as the wrong type and 400s the whole request.
+/// Body for POST /v2/maker/verify-email.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AccessRequestPayload<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    contact_email: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    contact_whatsapp: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    corridor: Option<&'a str>,
+struct VerifyEmailPayload<'a> {
+    contact_email: &'a str,
 }
 
 /// Trimmed value, or None when it is missing or blank.
 fn filled(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
-}
-
-/// Email is the channel Textile answers a review on, so it is the required
-/// one — and the one they ask you to confirm. WhatsApp is a bonus number.
-fn require_email(email: Option<&str>) -> Result<(), ApiError> {
-    if filled(email).is_some() {
-        return Ok(());
-    }
-    Err(ApiError::bad_request(
-        "add an email address you own so Textile can reply to your access request — WhatsApp is optional",
-    ))
 }
 
 fn venue_client() -> Result<reqwest::Client, ApiError> {
@@ -132,17 +90,22 @@ async fn read_bot_key(dir: &std::path::Path) -> Result<String, ApiError> {
     })
 }
 
-pub async fn request_access(
+/// Send (or resend) the confirmation link for this bot's operator address.
+pub async fn verify_email(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
-    Json(body): Json<AccessBody>,
+    Json(body): Json<VerifyBody>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
     let path = config_path(&bot)?;
     let current_toml = read_toml(&path)?;
     let cfg = Config::from_toml(&current_toml)
         .map_err(|e| ApiError::bad_request(format!("this config isn't valid: {e:#}")))?;
-    require_email(body.contact_email.as_deref())?;
+    let contact_email = filled(body.contact_email.as_deref()).ok_or_else(|| {
+        ApiError::bad_request(
+            "add an email address you own — confirming it is what puts this bot on the venue",
+        )
+    })?;
 
     let dir = path.parent().ok_or_else(|| {
         ApiError::internal(&anyhow::anyhow!(
@@ -152,66 +115,58 @@ pub async fn request_access(
     })?;
     let api_key = read_bot_key(dir).await?;
     let origin = venue_origin_from_config(&cfg, body.venue_url.as_deref());
-    let venue = maker_access_request_url(&origin);
-    // The identity the config carries, falling back to the catalog. Recomputing
-    // it from the catalog alone would name no corridor for a market listed after
-    // this Stitch release — leaving Textile to guess which one to seat.
-    let corridor = setup::config_identity(&current_toml).map(|c| c.id);
+    let venue = maker_verify_email_url(&origin);
 
     let response = venue_client()?
         .post(&venue)
         .bearer_auth(&api_key)
-        .json(&AccessRequestPayload {
-            contact_email: filled(body.contact_email.as_deref()),
-            contact_whatsapp: filled(body.contact_whatsapp.as_deref()),
-            note: filled(body.note.as_deref()),
-            corridor: filled(corridor.as_deref()),
-        })
+        .json(&VerifyEmailPayload { contact_email })
         .send()
         .await
-        .map_err(|e| {
-            ApiError::bad_request(format!(
-                "could not reach Textile access request at {venue}: {e}"
-            ))
-        })?;
+        .map_err(|e| ApiError::bad_request(format!("could not reach Textile at {venue}: {e}")))?;
     let status = response.status();
-    let text = response.text().await.map_err(|e| {
-        ApiError::bad_request(format!(
-            "Textile access request returned an unreadable body: {e}"
-        ))
-    })?;
+    let text = response
+        .text()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("Textile returned an unreadable body: {e}")))?;
     if !status.is_success() {
         let message = venue_error_message(&text)
-            .unwrap_or_else(|| format!("Textile access request failed ({status})"));
+            .unwrap_or_else(|| format!("Textile could not send the confirmation email ({status})"));
         return Err(ApiError::bad_request(message));
     }
-    let filed: AccessRequestResponse =
-        serde_json::from_str(&text).unwrap_or(AccessRequestResponse {
-            contact_email: None,
-            email_verified: None,
-        });
-    let hint = verify_hint(
-        filed
-            .contact_email
-            .as_deref()
-            .or(filled(body.contact_email.as_deref())),
-        filed.email_verified,
-    );
+    let sent: VerifyEmailResponse = serde_json::from_str(&text).unwrap_or(VerifyEmailResponse {
+        contact_email: None,
+        email_verified: false,
+    });
+    let address = sent
+        .contact_email
+        .as_deref()
+        .unwrap_or(contact_email)
+        .to_string();
 
+    let message = if sent.email_verified {
+        format!(
+            "{address} is already confirmed. This bot goes live as soon as it picks the seats up."
+        )
+    } else {
+        format!(
+            "Check {address} and click the link we sent. That is the only step left — the bot goes live the moment you do."
+        )
+    };
     Ok(Json(json!({
-        "message": format!(
-            "Request sent. Textile reviews it and approves you for every Swap pair at once.{hint}"
-        ),
-        "accessStatus": "PENDING",
-        "emailVerified": filed.email_verified,
+        "message": message,
+        "contactEmail": address,
+        "emailVerified": sent.email_verified,
     }))
     .into_response())
 }
 
-pub async fn access_status(
+/// Ask the venue where this maker stands, and go live if the address is
+/// confirmed and the seats cover a pool this bot can quote.
+pub async fn maker_status(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
-    Json(body): Json<AccessBody>,
+    Json(body): Json<VerifyBody>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
     let path = config_path(&bot)?;
@@ -228,7 +183,7 @@ pub async fn access_status(
     })?;
     let api_key = read_bot_key(dir).await?;
     let origin = venue_origin_from_config(&cfg, body.venue_url.as_deref());
-    let venue = maker_access_status_url(&origin);
+    let venue = maker_status_url(&origin);
 
     let response = venue_client()?
         .get(&venue)
@@ -236,50 +191,39 @@ pub async fn access_status(
         .send()
         .await
         .map_err(|e| {
-            ApiError::bad_request(format!(
-                "could not reach Textile access status at {venue}: {e}"
-            ))
+            ApiError::bad_request(format!("could not reach Textile status at {venue}: {e}"))
         })?;
     let status = response.status();
     let text = response.text().await.map_err(|e| {
-        ApiError::bad_request(format!(
-            "Textile access status returned an unreadable body: {e}"
-        ))
+        ApiError::bad_request(format!("Textile status returned an unreadable body: {e}"))
     })?;
     if !status.is_success() {
         let message = venue_error_message(&text)
-            .unwrap_or_else(|| format!("Textile access status failed ({status})"));
+            .unwrap_or_else(|| format!("Textile status failed ({status})"));
         return Err(ApiError::bad_request(message));
     }
-    let reported: AccessStatusResponse = serde_json::from_str(&text).map_err(|e| {
-        ApiError::bad_request(format!(
-            "Textile access status returned an unexpected body: {e}"
-        ))
+    let reported: MakerStatusResponse = serde_json::from_str(&text).map_err(|e| {
+        ApiError::bad_request(format!("Textile status returned an unexpected body: {e}"))
     })?;
 
-    if reported.access_status != "APPROVED" || reported.flagged {
+    if !reported.email_verified || reported.flagged {
         let message = if reported.flagged {
             format!(
                 "Textile blocked {}. You will not receive private quotes.",
                 reported.maker_slug
             )
-        } else if reported.access_status == "REJECTED" {
-            format!(
-                "Textile turned {} down. You can request access again.",
-                reported.maker_slug
-            )
-        } else if reported.access_status == "PENDING" {
-            format!(
-                "Textile still has your request. Nothing to do until they approve it.{}",
-                verify_hint(reported.contact_email.as_deref(), reported.email_verified)
-            )
         } else {
-            "No access request yet. Send one so Textile can review this maker.".to_string()
+            match reported.contact_email.as_deref() {
+                Some(email) => format!(
+                    "Confirm your email: we sent a link to {email}. The bot goes live the moment you click it."
+                ),
+                None => "Give Textile an email address and confirm it — that is what puts this bot on the venue.".to_string(),
+            }
         };
         return Ok(Json(json!({
             "message": message,
-            "accessStatus": reported.access_status,
             "emailVerified": reported.email_verified,
+            "contactEmail": reported.contact_email,
             "enrollment": {
                 "makerSlug": reported.maker_slug,
                 "environment": reported.environment,
@@ -297,9 +241,9 @@ pub async fn access_status(
     // the ladder down for a pool that can't quote, or sit at Waiting while a
     // later pool was the seated one.
     //
-    // Approval doesn't rotate the key, and the venue may omit fields it isn't
-    // changing, so blanks fall back to what's already in the config rather than
-    // erasing it.
+    // Confirming does not rotate the key, and the venue may omit fields it
+    // isn't changing, so blanks fall back to what's already in the config
+    // rather than erasing it.
     let current = setup::read_settings_at(&current_toml, 0).map_err(ApiError::bad_request)?;
     let enrolled = EnrollResponse {
         maker_id: if reported.maker_id.trim().is_empty() {
@@ -327,10 +271,11 @@ pub async fn access_status(
     if outcome != EnrollOutcome::Live {
         return Ok(Json(json!({
             "message": format!(
-                "Textile approved {} but this bot cannot quote on it yet: no pool is both seated on an RFQ corridor and able to build a book with funds behind it.",
+                "{} is confirmed on Textile but this bot cannot quote yet: no pool is both seated on an RFQ corridor and able to build a book with funds behind it.",
                 reported.maker_slug
             ),
-            "accessStatus": "APPROVED",
+            "emailVerified": true,
+            "contactEmail": reported.contact_email,
             "enrollment": {
                 "makerSlug": reported.maker_slug,
                 "environment": reported.environment,
@@ -349,10 +294,11 @@ pub async fn access_status(
         0,
         Some(json!({
             "message": format!(
-                "Textile approved {}. This bot is live on RFQ.",
+                "{} is confirmed on Textile. This bot is live on RFQ.",
                 reported.maker_slug
             ),
-            "accessStatus": "APPROVED",
+            "emailVerified": true,
+            "contactEmail": reported.contact_email,
             "enrollment": {
                 "makerSlug": reported.maker_slug,
                 "environment": reported.environment,
@@ -398,9 +344,9 @@ mod tests {
         .unwrap();
     }
 
-    async fn mock_access_venue(
+    async fn mock_venue(
         expect_key: &'static str,
-        status: &'static str,
+        email_verified: bool,
         flagged: bool,
         corridors: Vec<&'static str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
@@ -408,7 +354,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route(
-                "/v2/maker/access-request",
+                "/v2/maker/verify-email",
                 post(
                     move |headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
                         let auth = headers
@@ -416,28 +362,22 @@ mod tests {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("");
                         assert_eq!(auth, format!("Bearer {expect_key}"));
-                        assert!(body["contactEmail"].as_str().is_some());
-                        // The venue validates these as optional strings, so a
-                        // blank field must be absent rather than null.
+                        // The venue validates this as a required string, so a
+                        // blank field must never be sent as null.
                         assert!(
-                            !body
-                                .as_object()
-                                .expect("object body")
-                                .values()
-                                .any(Value::is_null),
-                            "sent a null field: {body}"
+                            body["contactEmail"].as_str().is_some(),
+                            "sent no address: {body}"
                         );
                         Json(json!({
-                            "accessStatus": "PENDING",
-                            "requestId": "clreq1",
                             "contactEmail": body["contactEmail"],
                             "emailVerified": false,
+                            "sent": true,
                         }))
                     },
                 ),
             )
             .route(
-                "/v2/maker/access-status",
+                "/v2/maker/status",
                 get(move |headers: axum::http::HeaderMap| {
                     let corridors = corridors.clone();
                     async move {
@@ -447,7 +387,8 @@ mod tests {
                             .unwrap_or("");
                         assert_eq!(auth, format!("Bearer {expect_key}"));
                         Json(json!({
-                            "accessStatus": status,
+                            "emailVerified": email_verified,
+                            "contactEmail": "desk@acme-fx.com",
                             "flagged": flagged,
                             "makerId": "clmakerenroll1",
                             "makerSlug": "stitch-56-f39fd6e5",
@@ -471,131 +412,31 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    /// A venue that records the corridor each access request named, so a test
-    /// can assert Textile is told which market to seat.
-    async fn recording_access_venue(
-        expect_key: &'static str,
-    ) -> (
-        String,
-        std::sync::Arc<std::sync::Mutex<Option<Value>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let recorder = seen.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let app = Router::new().route(
-            "/v2/maker/access-request",
-            post(
-                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
-                    let recorder = recorder.clone();
-                    async move {
-                        let auth = headers
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
-                        assert_eq!(auth, format!("Bearer {expect_key}"));
-                        *recorder.lock().unwrap() = Some(body["corridor"].clone());
-                        Json(json!({ "accessStatus": "PENDING", "requestId": "clreq1" }))
-                    }
-                },
-            ),
-        );
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        (format!("http://{addr}"), seen, handle)
-    }
-
-    /// The shipped cNGN/USDT BSC preset, restamped as a corridor Textile listed
-    /// after this release: same pair, but named by a registry row id the catalog
-    /// has never seen.
-    fn seed_registry_corridor(h: &Harness, name: &str) {
-        seed(h, name);
-        let path = h.root.join(name).join("stitch.toml");
-        let toml = std::fs::read_to_string(&path).unwrap();
-        let stamp = concat!(
-            "collateral_decimals = 6\n",
-            "corridor_id = \"cmregistryrow\"\n",
-            "corridor_name = \"cNGN / USDT\"\n",
-            "corridor_network = \"BNB Smart Chain\"",
-        );
-        std::fs::write(&path, toml.replace("collateral_decimals = 6", stamp)).unwrap();
-    }
-
-    #[tokio::test]
-    async fn an_access_request_names_the_corridor_the_config_carries() {
-        // Without the stamp the panel would have to recompute the corridor from
-        // the catalog compiled into it, which cannot name a market listed after
-        // this release — so Textile would get a request with no corridor on it
-        // and no way to know which market to seat.
-        let h = harness("rfq-access-corridor");
-        seed_registry_corridor(&h, "bot-a");
-        unlock_rfq_panel(&h, "bot-a");
-        setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
-        let (venue, seen, _server) = recording_access_venue("tx_live_enroll_secret").await;
-
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/rfq/access-request",
-                json!({ "venueUrl": venue, "contactEmail": "desk@example.com" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(
-            seen.lock().unwrap().clone(),
-            Some(json!("cmregistryrow")),
-            "the registry id, not the catalog slug it happens to share a pair with"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unstamped_bot_still_names_its_catalog_corridor() {
-        let h = harness("rfq-access-preset-corridor");
-        seed(&h, "bot-a");
-        unlock_rfq_panel(&h, "bot-a");
-        setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
-        let (venue, seen, _server) = recording_access_venue("tx_live_enroll_secret").await;
-
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/rfq/access-request",
-                json!({ "venueUrl": venue, "contactEmail": "desk@example.com" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(
-            seen.lock().unwrap().clone(),
-            Some(json!("cngn-usdt-bsc")),
-            "the catalog fallback still works for a shipped preset"
-        );
-    }
-
     #[test]
     fn venue_urls_share_an_origin() {
         assert_eq!(
-            maker_access_request_url("wss://api.textilecredit.com/v2/maker/stream"),
-            "https://api.textilecredit.com/v2/maker/access-request"
+            maker_verify_email_url("wss://api.textilecredit.com/v2/maker/stream"),
+            "https://api.textilecredit.com/v2/maker/verify-email"
         );
         assert_eq!(
-            maker_access_status_url("https://api.textilecredit.com/v2/maker/enroll"),
-            "https://api.textilecredit.com/v2/maker/access-status"
+            maker_status_url("https://api.textilecredit.com/v2/maker/enroll"),
+            "https://api.textilecredit.com/v2/maker/status"
         );
         assert_eq!(
-            maker_enroll_url("http://127.0.0.1:9/v2/maker/access-request"),
+            maker_enroll_url("http://127.0.0.1:9/v2/maker/verify-email"),
             "http://127.0.0.1:9/v2/maker/enroll"
         );
     }
 
     #[tokio::test]
-    async fn request_access_needs_an_email_and_whatsapp_stays_optional() {
-        let h = harness("rfq-access-contact");
+    async fn an_email_address_is_required() {
+        let h = harness("rfq-verify-contact");
         seed(&h, "bot-a");
         unlock_rfq_panel(&h, "bot-a");
         setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
-        for payload in [json!({}), json!({ "contactWhatsapp": "+15551234567" })] {
+        for payload in [json!({}), json!({ "contactEmail": "   " })] {
             let (status, body) = h
-                .post_json("/api/bots/bot-a/rfq/access-request", payload)
+                .post_json("/api/bots/bot-a/rfq/verify-email", payload)
                 .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert!(body.contains("email"), "{body}");
@@ -603,46 +444,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_access_posts_the_key_and_does_not_echo_it() {
-        let h = harness("rfq-access-request");
+    async fn submitting_an_address_posts_the_key_and_does_not_echo_it() {
+        let h = harness("rfq-verify-request");
         seed(&h, "bot-a");
         unlock_rfq_panel(&h, "bot-a");
         setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
-        let (venue, _server) =
-            mock_access_venue("tx_live_enroll_secret", "PENDING", false, vec![]).await;
+        let (venue, _server) = mock_venue("tx_live_enroll_secret", false, false, vec![]).await;
 
         let (status, body) = h
             .post_json(
-                "/api/bots/bot-a/rfq/access-request",
-                json!({
-                    "venueUrl": venue,
-                    "contactEmail": "desk@example.com",
-                }),
+                "/api/bots/bot-a/rfq/verify-email",
+                json!({ "venueUrl": venue, "contactEmail": " Desk@acme-fx.com " }),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(!body.contains("tx_live_enroll_secret"), "{body}");
         let v = Harness::parse(&body);
-        assert_eq!(v["accessStatus"], "PENDING");
         assert_eq!(v["emailVerified"], false);
         assert!(
-            v["message"].as_str().unwrap().contains("desk@example.com"),
-            "tells them where the confirm link went: {body}"
+            v["message"].as_str().unwrap().contains("Desk@acme-fx.com"),
+            "tells them where the link went: {body}"
         );
     }
 
-    #[test]
-    fn the_verify_hint_only_nags_while_unconfirmed() {
-        assert!(verify_hint(Some("a@b.c"), Some(false)).contains("a@b.c"));
-        assert_eq!(verify_hint(Some("a@b.c"), Some(true)), "");
-        // An older venue that does not report it must not read as unconfirmed.
-        assert_eq!(verify_hint(Some("a@b.c"), None), "");
-        assert!(verify_hint(None, Some(false)).contains("Confirm your email"));
+    #[tokio::test]
+    async fn status_waits_while_the_address_is_unconfirmed() {
+        let h = harness("rfq-verify-unconfirmed");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
+        let (venue, _server) =
+            mock_venue("tx_live_enroll_secret", false, false, vec!["cngn-usdt-bsc"]).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/status", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["emailVerified"], false);
+        assert!(v["settings"].is_null(), "nothing is written yet: {body}");
+        assert!(
+            v["message"].as_str().unwrap().contains("desk@acme-fx.com"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
-    async fn check_status_goes_live_when_approved() {
-        let h = harness("rfq-access-approved");
+    async fn status_goes_live_once_the_address_is_confirmed() {
+        let h = harness("rfq-verify-confirmed");
         seed(&h, "bot-a");
         unlock_rfq_panel(&h, "bot-a");
         setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
@@ -655,35 +504,27 @@ mod tests {
             ),
         )
         .unwrap();
-        let (venue, _server) = mock_access_venue(
-            "tx_live_enroll_secret",
-            "APPROVED",
-            false,
-            vec!["cngn-usdt-bsc"],
-        )
-        .await;
+        let (venue, _server) =
+            mock_venue("tx_live_enroll_secret", true, false, vec!["cngn-usdt-bsc"]).await;
 
         let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/rfq/access-status",
-                json!({ "venueUrl": venue }),
-            )
+            .post_json("/api/bots/bot-a/rfq/status", json!({ "venueUrl": venue }))
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
-        assert_eq!(v["accessStatus"], "APPROVED");
+        assert_eq!(v["emailVerified"], true);
         assert_eq!(v["settings"]["rfqEnabled"], true);
         assert_eq!(v["settings"]["rfqCorridor"], "cngn-usdt-bsc");
         assert!(!body.contains("tx_live_enroll_secret"));
     }
 
     #[tokio::test]
-    async fn check_status_does_not_go_live_on_a_pool_that_cannot_quote() {
+    async fn status_does_not_go_live_on_a_pool_that_cannot_quote() {
         // Check status is the second door onto the decision Connect makes, so
-        // it seats through `apply_enrollment` rather than its own copy. An
-        // approval on a pool with no capacity is not a reason to enable RFQ and
-        // take the ladder down: the bot would then quote on neither surface.
-        let h = harness("rfq-access-no-capacity");
+        // it seats through `apply_enrollment` rather than its own copy. A seat
+        // on a pool with no capacity is not a reason to enable RFQ and take the
+        // ladder down: the bot would then quote on neither surface.
+        let h = harness("rfq-verify-no-capacity");
         seed(&h, "bot-a");
         unlock_rfq_panel(&h, "bot-a");
         setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
@@ -708,23 +549,15 @@ mod tests {
             ),
         )
         .unwrap();
-        let (venue, _server) = mock_access_venue(
-            "tx_live_enroll_secret",
-            "APPROVED",
-            false,
-            vec!["cngn-usdt-bsc"],
-        )
-        .await;
+        let (venue, _server) =
+            mock_venue("tx_live_enroll_secret", true, false, vec!["cngn-usdt-bsc"]).await;
 
         let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/rfq/access-status",
-                json!({ "venueUrl": venue }),
-            )
+            .post_json("/api/bots/bot-a/rfq/status", json!({ "venueUrl": venue }))
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
-        assert_eq!(v["accessStatus"], "APPROVED");
+        assert_eq!(v["emailVerified"], true);
         assert!(
             v["settings"].is_null(),
             "nothing is written for a maker that cannot quote yet: {body}"
@@ -733,5 +566,23 @@ mod tests {
         let after = Config::from_toml(&std::fs::read_to_string(&toml_path).unwrap()).unwrap();
         assert!(!after.rfq_active(), "RFQ stays off");
         assert!(after.book_enabled, "and the ladder is left alone");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_maker_is_told_so_and_stays_off() {
+        let h = harness("rfq-verify-blocked");
+        seed(&h, "bot-a");
+        unlock_rfq_panel(&h, "bot-a");
+        setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_enroll_secret").unwrap();
+        let (venue, _server) = mock_venue("tx_live_enroll_secret", true, true, vec![]).await;
+
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/rfq/status", json!({ "venueUrl": venue }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["enrollment"]["flagged"], true);
+        assert!(v["message"].as_str().unwrap().contains("blocked"), "{body}");
+        assert!(v["settings"].is_null(), "{body}");
     }
 }

@@ -199,16 +199,16 @@ export const place = {
 
   separateTitle: 'Set up a separate bot',
   separateBody:
-    'Its own wallet and its own money. You fund it, and Textile approves it again. Takes longer.',
+    'Its own wallet and its own money. You fund it separately. Takes longer.',
 
   blockedAlready: (label: string) => `Already quoting ${label}.`,
   blockedNotEditable:
     "The panel can't edit this bot's config, so it can't take another corridor.",
   blockedNotConnected:
     'Not connected to Textile yet. Open it from the fleet and finish setting it up.',
-  /** Connected, credential on disk, access request still unanswered. */
+  /** Connected, credential on disk, email address still unconfirmed. */
   blockedWaitingTextile:
-    'Connected, waiting for Textile to approve this maker. It can take the corridor once they do.',
+    'Connected, but its email address is not confirmed yet. It can take the corridor once it is.',
   blockedUnreadable: "The panel can't read this bot's settings right now.",
   blockedUnchecked:
     'Not checked. The panel checks the first few bots on a network and stops there.',
@@ -222,8 +222,8 @@ export const place = {
    *
    * Never `allBlocked` here: the corridor does not need a bot of its own, it has
    * one. Told otherwise, an operator who came to add the pair they already quote
-   * was pointed at a second wallet, a second lot of money and a second wait on
-   * Textile, for a corridor that was live the whole time.
+   * was pointed at a second wallet and a second lot of money, for a corridor
+   * that was live the whole time.
    */
   allBlockedAlready: (bots: string[], label: string) =>
     bots.length === 1
@@ -344,7 +344,7 @@ export const progress = {
         : 'Spending already approved',
   approveSub:
     "Lets Textile's swap contract (Permit2) move the bot's tokens. The bot quotes both sides of the pair, so both tokens are approved, with one small gas fee each. Usually under a minute, up to two.",
-  accessTitle: 'Check your Textile access',
+  accessTitle: 'Check your Textile seats',
   startTitle: 'Start the bot',
   verifyTitle: 'Make sure it stays up',
   verifySub: 'About ten seconds.',
@@ -371,12 +371,16 @@ export const progress = {
 }
 
 export const wait = {
-  title: 'Waiting for Textile',
-  body: 'Money is in and spending is approved. Textile still has to approve this maker by hand. Nothing more to do on your side.',
+  title: 'Confirm your email',
+  body: 'Money is in and spending is approved. One step left: click the link Textile emailed you. The bot goes live the moment you do.',
+  sentTo: (email: string) => `We sent it to ${email}. Check spam if it is not there.`,
+  noAddressBody:
+    'Money is in and spending is approved. This bot has no email address on file, so there is no link to click yet. Give Textile one and it goes live as soon as you confirm it.',
+  addressLabel: 'Contact email',
+  addressHint: 'An inbox you own. Confirming it is what puts this bot on the venue.',
+  sendLink: 'Send the confirmation link',
   keepOpen:
-    'Keep this page open. It starts the bot the moment Textile says yes. If you close it, open the bot page after they approve you and press Start.',
-  emailVerify:
-    'Textile sent you a confirmation email. Click the link in it, or the request stays unverified.',
+    'Keep this page open. It starts the bot as soon as you confirm. If you close it, open the bot page after confirming and press Start.',
   status: (time: string, seconds: number) =>
     `Last checked ${time}. Checks again in ${seconds} seconds.`,
   statusFirst: 'Checking with Textile.',
@@ -385,12 +389,9 @@ export const wait = {
   checkNow: 'Check now',
   checkAgain: 'Check again',
   backToConnect: 'Back to Connect',
+  resend: 'Resend the email',
+  resendSent: (email: string) => `Sent again to ${email}.`,
 
-  rejectedTitle: 'Textile turned this request down',
-  rejectedBody: (slug: string | null) =>
-    slug
-      ? `Textile declined the access request for maker ${slug}.`
-      : 'Textile declined the access request for this maker.',
   flaggedTitle: 'Textile blocked this maker',
   flaggedBody: (slug: string | null) =>
     slug
@@ -401,18 +402,18 @@ export const wait = {
   emailTextile: 'Email Textile',
   emailSubject: (slug: string | null) =>
     `Maker access${slug ? ` for ${slug}` : ''}`,
-  requestAgain: 'Request access again',
 
-  approvedTitle: 'Approved. Starting the bot',
-  approvedBody: 'Textile approved you. Starting the bot.',
-  notQuotableTitle: 'Approved, with one thing left',
+  approvedTitle: 'Confirmed. Starting the bot',
+  approvedBody: 'Your address is confirmed. Starting the bot.',
+  notQuotableTitle: 'Confirmed, with one thing left',
   notQuotableBody:
-    'Textile approved you. The bot has not picked up the approval yet. This usually clears by itself in a few seconds.',
+    'Your address is confirmed. The bot has not picked the seats up yet. This usually clears by itself in a few seconds.',
   notQuotableAgain:
-    'The bot still has not picked up the approval. This page keeps checking and starts it as soon as it does.',
+    'The bot still has not picked the seats up. This page keeps checking and starts it as soon as it does.',
   finishSetup: 'Finish setting up',
-  restartTitle: 'Approved. The bot needs a restart',
-  restartBody: 'Textile approved you, but the running bot could not be restarted onto the new config.',
+  restartTitle: 'Confirmed. The bot needs a restart',
+  restartBody:
+    'Your address is confirmed, but the running bot could not be restarted onto the new config.',
   restartNow: 'Restart now',
   startFailedTitle: 'The bot did not start',
 }

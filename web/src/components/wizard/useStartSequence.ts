@@ -1,8 +1,8 @@
 // The one runner that takes a funded bot to "running": approve spending on
-// chain, check Textile access, start, and make sure it stays up.
+// chain, check the Textile seats, start, and make sure it stays up.
 //
-// Shared by the Fund step (first run), the Waiting screen (after Textile
-// approves) and the Live screen ("Start again"). Every stage re-derives its
+// Shared by the Fund step (first run), the Confirm-your-email screen (once the
+// address is confirmed) and the Live screen ("Start again"). Every stage re-derives its
 // facts from the server rather than from what an earlier screen remembered:
 // the chain says whether approvals are missing, the config says whether the
 // bot may start, the bot's own state says whether it stayed up. That is what
@@ -18,7 +18,7 @@ import { ApiError, api } from '../../api'
 import { appendLine } from '../../logBuffer'
 import { streamSse } from '../../sse'
 import { progress as copy } from './wizardCopy'
-import type { Bot, ExitEvent, Funding, LogLine, RfqAccessResult } from '../../types'
+import type { Bot, ExitEvent, Funding, LogLine, RfqStatusResult } from '../../types'
 
 export type ProgressState = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
 export type StartStage = 'approve' | 'access' | 'start' | 'verify'
@@ -50,13 +50,13 @@ export interface StartFailure {
  * How a run ended when it did not fail.
  *
  * `live`: the bot is running and stayed up. `waiting`: everything on our side
- * is done and Textile's access decision is what is missing (the panel refuses
- * Start until then). `rejected`: Textile said no, or flagged the maker.
+ * is done and the operator's unconfirmed email is what is missing (the panel
+ * refuses Start until then). `rejected`: Textile blocked the maker.
  */
 export type StartOutcome =
   | { kind: 'live' }
-  | { kind: 'waiting'; access: RfqAccessResult | null; error: string | null }
-  | { kind: 'rejected'; access: RfqAccessResult }
+  | { kind: 'waiting'; status: RfqStatusResult | null; error: string | null }
+  | { kind: 'rejected'; status: RfqStatusResult }
 
 export interface StartSequenceState {
   stage: SequenceStage
@@ -336,13 +336,13 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
         setProgress('approve', 'done')
       }
 
-      // 2. Textile access. The config is asked first: once a bot is seated,
+      // 2. The Textile seats. The config is asked first: once a bot is seated,
       // asking the venue again rewrites the config and restarts a running bot.
       setStage('access')
       setProgress('access', 'running')
       let ready = false
-      let access: RfqAccessResult | null = null
-      let accessError: string | null = null
+      let venueStatus: RfqStatusResult | null = null
+      let statusError: string | null = null
       try {
         ready = (await api.settings(bot, 0)).rfqEnabled
       } catch {
@@ -351,20 +351,20 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
       check()
       if (!ready) {
         try {
-          access = await api.checkRfqAccess(bot)
+          venueStatus = await api.checkRfqStatus(bot)
           check()
-          ready = access.accessStatus === 'APPROVED' && !!access.settings?.rfqEnabled
+          ready = venueStatus.emailVerified && !!venueStatus.settings?.rfqEnabled
         } catch (e) {
           check()
-          accessError = errorText(e)
+          statusError = errorText(e)
         }
       }
       setProgress('access', 'done')
       if (!ready) {
-        if (access && (access.accessStatus === 'REJECTED' || access.enrollment?.flagged)) {
-          return finish({ kind: 'rejected', access })
+        if (venueStatus?.enrollment?.flagged) {
+          return finish({ kind: 'rejected', status: venueStatus })
         }
-        return finish({ kind: 'waiting', access, error: accessError })
+        return finish({ kind: 'waiting', status: venueStatus, error: statusError })
       }
 
       // 3. Start. The panel refuses a bot whose wallet is held by another
@@ -383,7 +383,7 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
           const status = e instanceof ApiError ? e.status : 0
           if (status === 400 && isConnectFirst(message)) {
             setProgress('start', 'pending')
-            return finish({ kind: 'waiting', access, error: null })
+            return finish({ kind: 'waiting', status: venueStatus, error: null })
           }
           if (status === 409 && isWalletBusy(message)) {
             tries++
