@@ -1347,10 +1347,9 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
         <Card title="Connect to Textile">
           <div className="space-y-4">
             <p className="text-sm text-muted">
-              One click. Registers this bot&apos;s funding wallet with the venue
-              and saves the credential, then emails you a link to confirm your
-              address. You never paste an id or key. Clicking that link puts the
-              bot on every Swap corridor.
+              One click. Registers this bot with Textile and emails you a link
+              to confirm your address. Clicking it puts the bot on every Swap
+              corridor.
             </p>
             {createdBot && (
               <p className="text-xs text-faint">

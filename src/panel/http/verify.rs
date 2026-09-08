@@ -66,10 +66,15 @@ struct VerifyEmailResponse {
 }
 
 /// Body for POST /v2/maker/verify-email.
+///
+/// `bot_name` is the name the operator gave this bot. The venue's maker slug is
+/// generated and means nothing to them, so their own name is what Textile's
+/// emails are headed with.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VerifyEmailPayload<'a> {
     contact_email: &'a str,
+    bot_name: &'a str,
 }
 
 /// Trimmed value, or None when it is missing or blank.
@@ -120,7 +125,10 @@ pub async fn verify_email(
     let response = venue_client()?
         .post(&venue)
         .bearer_auth(&api_key)
-        .json(&VerifyEmailPayload { contact_email })
+        .json(&VerifyEmailPayload {
+            contact_email,
+            bot_name: &bot.name,
+        })
         .send()
         .await
         .map_err(|e| ApiError::bad_request(format!("could not reach Textile at {venue}: {e}")))?;
