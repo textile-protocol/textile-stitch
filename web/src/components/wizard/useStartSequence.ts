@@ -259,6 +259,77 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
       })
     }
 
+    interface Settled {
+      /** RFQ is on in the config, so the bot may be started. */
+      ready: boolean
+      status: RfqStatusResult | null
+      error: string | null
+    }
+
+    /**
+     * Ask where this bot stands with Textile, and let the panel enable RFQ if
+     * the answer is yes.
+     *
+     * The config is asked first on purpose: once a bot is seated, asking the
+     * venue again rewrites the config and restarts a running bot. Only an
+     * unseated bot gets the network call, and that call is also the thing that
+     * writes `[rfq].enabled` when the operator's address is confirmed — which
+     * is why it runs on the way out of a failed run too.
+     */
+    async function settleRfqStatus(): Promise<Settled> {
+      setStage('access')
+      setProgress('access', 'running')
+      let ready = false
+      try {
+        ready = (await api.settings(bot, 0)).rfqEnabled
+      } catch {
+        ready = false
+      }
+      check()
+      let status: RfqStatusResult | null = null
+      let error: string | null = null
+      if (!ready) {
+        try {
+          status = await api.checkRfqStatus(bot)
+          check()
+          ready = status.emailVerified && !!status.settings?.rfqEnabled
+        } catch (e) {
+          check()
+          error = errorText(e)
+        }
+      }
+      setProgress('access', 'done')
+      return { ready, status, error }
+    }
+
+    /**
+     * Fail, but settle the Textile side first.
+     *
+     * The chain half and the venue half are independent: a Permit2 approval
+     * that could not be paid for says nothing about whether the operator's
+     * address is confirmed. Halting on the approval without asking left a bot
+     * whose email was confirmed sitting with RFQ still off in its config — the
+     * one thing the onboarding is there to switch on. Skipping the wait for
+     * funds made that the common ending rather than a rare one, so the run
+     * asks on its way out and the config is right whenever the operator comes
+     * back to press Start.
+     *
+     * Best effort by design: this is already a failure, and a second one on
+     * the way out must not replace the message that explains it.
+     */
+    async function failSettling(
+      stage: StartStage,
+      message: string,
+      extra: Partial<StartFailure> = {},
+    ): Promise<never> {
+      try {
+        await settleRfqStatus()
+      } catch (e) {
+        if (e === CANCELLED) throw e
+      }
+      return fail(stage, message, extra)
+    }
+
     async function execute(): Promise<void> {
       // 1. Approve spending, only if the chain says something is missing.
       setStage('approving')
@@ -268,7 +339,7 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
         funding = await readFunding()
       } catch (e) {
         check()
-        return fail('approve', errorText(e))
+        return failSettling('approve', errorText(e))
       }
       check()
       handlersRef.current.onFunding?.(funding)
@@ -283,13 +354,15 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
           current = await api.bot(bot)
         } catch (e) {
           check()
-          return fail('approve', errorText(e))
+          return failSettling('approve', errorText(e))
         }
         check()
         if (!current.canApprove) {
-          return fail('approve', current.approveBlockedReason ?? copy.approveBlocked, {
-            blockedBy: current.approveBlockedBy,
-          })
+          return failSettling(
+            'approve',
+            current.approveBlockedReason ?? copy.approveBlocked,
+            { blockedBy: current.approveBlockedBy },
+          )
         }
 
         const result = await streamApprove()
@@ -310,7 +383,7 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
               check()
             }
           }
-          if (!cleared) return fail('approve', copy.approveStillBusy)
+          if (!cleared) return failSettling('approve', copy.approveStillBusy)
         } else {
           // Whatever the exit code, the chain is the truth: a transaction that
           // landed before the stream broke still counts.
@@ -320,13 +393,13 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
             after = await readFunding()
           } catch (e) {
             check()
-            return fail('approve', errorText(e))
+            return failSettling('approve', errorText(e))
           }
           check()
           handlersRef.current.onFunding?.(after)
           if (after.gate.approvalsMissing.length > 0) {
             const lastError = [...approveLines].reverse().find((l) => l.level === 'error')
-            return fail(
+            return failSettling(
               'approve',
               lastError?.text ??
                 (result.kind === 'error' ? result.message : copy.approvalDidNotLand),
@@ -336,35 +409,21 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
         setProgress('approve', 'done')
       }
 
-      // 2. The Textile seats. The config is asked first: once a bot is seated,
-      // asking the venue again rewrites the config and restarts a running bot.
-      setStage('access')
-      setProgress('access', 'running')
-      let ready = false
-      let venueStatus: RfqStatusResult | null = null
-      let statusError: string | null = null
-      try {
-        ready = (await api.settings(bot, 0)).rfqEnabled
-      } catch {
-        ready = false
-      }
+      // 2. The Textile seats. `settleRfqStatus` is what turns RFQ on in the
+      // config when the venue says the address is confirmed, so every ending
+      // of this run goes through it — the approve failures above reach it
+      // through `failSettling` rather than halting before this point.
+      const settled = await settleRfqStatus()
       check()
-      if (!ready) {
-        try {
-          venueStatus = await api.checkRfqStatus(bot)
-          check()
-          ready = venueStatus.emailVerified && !!venueStatus.settings?.rfqEnabled
-        } catch (e) {
-          check()
-          statusError = errorText(e)
+      if (!settled.ready) {
+        if (settled.status?.enrollment?.flagged) {
+          return finish({ kind: 'rejected', status: settled.status })
         }
-      }
-      setProgress('access', 'done')
-      if (!ready) {
-        if (venueStatus?.enrollment?.flagged) {
-          return finish({ kind: 'rejected', status: venueStatus })
-        }
-        return finish({ kind: 'waiting', status: venueStatus, error: statusError })
+        return finish({
+          kind: 'waiting',
+          status: settled.status,
+          error: settled.error,
+        })
       }
 
       // 3. Start. The panel refuses a bot whose wallet is held by another
@@ -383,7 +442,7 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
           const status = e instanceof ApiError ? e.status : 0
           if (status === 400 && isConnectFirst(message)) {
             setProgress('start', 'pending')
-            return finish({ kind: 'waiting', status: venueStatus, error: null })
+            return finish({ kind: 'waiting', status: settled.status, error: null })
           }
           if (status === 409 && isWalletBusy(message)) {
             tries++

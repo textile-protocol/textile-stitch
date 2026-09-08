@@ -67,6 +67,7 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
   const [state, dispatch] = useReducer(reduceFund, INITIAL_FUND)
   const startedRef = useRef(false)
   const autoRanRef = useRef(false)
+  const [skipped, setSkipped] = useState(false)
   const mountedRef = useRef(true)
   const [copied, setCopied] = useState(false)
   const [copyError, setCopyError] = useState<string | null>(null)
@@ -105,6 +106,21 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
     dispatch({ type: 'run' })
     startRun()
   }, [startRun])
+
+  /**
+   * Move on without waiting for money to land.
+   *
+   * Deliberately the same handover the gate uses rather than an exit from the
+   * wizard. Permit2 approval is the runner's first stage, and it does not need
+   * a funded book — only gas — so skipping the wait must not skip the approval
+   * too, or the operator returns later to a bot that still cannot trade and no
+   * longer has a screen telling them why. What is skipped is the waiting, not
+   * the setup.
+   */
+  function skipFunding() {
+    setSkipped(true)
+    triggerRun()
+  }
 
   // First read: the bot and its wallet together. A bot that is already running
   // goes straight through; one with a live process that is not quoting
@@ -420,10 +436,25 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
                 ? fund.status(Math.round(state.pollMs / 1000), formatClock(state.lastCheckedAt))
                 : fund.statusFirst}
             </p>
-            <Button variant="ghost" busy={checkingNow} onClick={() => void checkNow()}>
-              {fund.checkNow}
-            </Button>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button variant="ghost" busy={checkingNow} onClick={() => void checkNow()}>
+                {fund.checkNow}
+              </Button>
+              {/* Only while there is something to skip. Once the gate passes
+                  the runner has the wheel and there is no waiting left. */}
+              {address && (
+                <Button variant="ghost" onClick={skipFunding}>
+                  {fund.skip}
+                </Button>
+              )}
+            </div>
           </div>
+        )}
+
+        {/* Said once the operator has chosen to move on, so the progress list
+            below reads as expected rather than as something going wrong. */}
+        {skipped && (state.phase === 'running' || finished) && (
+          <Banner tone="info">{fund.skipped}</Banner>
         )}
 
         {(state.phase === 'running' || finished) && <ProgressList rows={rows} />}

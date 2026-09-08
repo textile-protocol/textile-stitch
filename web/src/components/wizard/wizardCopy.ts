@@ -108,6 +108,9 @@ export const fund = {
     `Checking every ${seconds} seconds. Last check ${time}.`,
   statusFirst: 'Checking the wallet.',
   checkNow: 'Check now',
+  skip: 'Skip for now',
+  skipped:
+    "Skipped the wait for funds. Spending approval and the Textile connection still run now, so the bot is ready the moment money lands — send it to the address above and press Start on the bot's page.",
   readError: (error: string) => `Can't read the wallet right now: ${error}. Still trying.`,
   /** The row's own note. `reason` is the server's, shown as it wrote it: it
       knows whether the feed is down or the pair simply cannot be valued, and
