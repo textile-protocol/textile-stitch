@@ -23,7 +23,7 @@ use tracing::info;
 
 use crate::closer::executor::{encode_allowance, encode_approve};
 use crate::config::{parse_liquidity_amount, Config, LiquidityAmount, PoolConfig};
-use crate::rpc::Wallet;
+use crate::rpc::{delegation_target, Wallet};
 
 /// How much of each token to approve to Permit2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,68 @@ pub enum ApprovalMode {
     /// radius, but the allowance is consumed as orders fill, so it must be
     /// re-approved to keep quoting.
     Exact,
+}
+
+/// What the maker wallet is on-chain. Only a code-less EOA can quote: Permit2
+/// recovers the order signature with `ecrecover`, and anything with code has to
+/// go through EIP-1271, which the book does not accept from makers yet. A
+/// delegated wallet is also capped at one in-flight transaction by the node, so
+/// it can't even reliably send its own approvals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletKind {
+    PlainEoa,
+    /// EIP-7702 delegated EOA ("smart account"), with its delegate.
+    Delegated(Address),
+    /// Deployed contract bytecode (Safe, AA account, …).
+    Contract,
+}
+
+/// Classify a wallet from its `eth_getCode` output.
+pub fn classify_code(code: &[u8]) -> WalletKind {
+    if code.is_empty() {
+        return WalletKind::PlainEoa;
+    }
+    match delegation_target(code) {
+        Some(delegate) => WalletKind::Delegated(delegate),
+        None => WalletKind::Contract,
+    }
+}
+
+/// The operator-facing reason a wallet can't be used, or `None` when it can.
+pub fn maker_eligibility_error(address: Address, kind: &WalletKind) -> Option<String> {
+    match kind {
+        WalletKind::PlainEoa => None,
+        WalletKind::Delegated(delegate) => Some(format!(
+            "maker wallet {address} is an EIP-7702 delegated smart account (delegated to \
+             {delegate}). Textile only accepts plain EOAs as makers — Permit2 verifies a \
+             delegated wallet through EIP-1271, which the order book does not support yet — and \
+             the node allows a delegated account only one transaction in flight, which is what \
+             makes approvals fail with \"in-flight transaction limit reached\".\n\
+             Fix: revoke the delegation (MetaMask: Settings -> switch the account back to a \
+             standard account), or run Stitch from a fresh EOA that was never upgraded. Then \
+             re-run `stitch approve`."
+        )),
+        WalletKind::Contract => Some(format!(
+            "maker wallet {address} has contract bytecode. Textile only accepts plain EOAs as \
+             makers (Permit2 would have to verify a contract via EIP-1271, which the order book \
+             does not support yet). Run Stitch from an EOA."
+        )),
+    }
+}
+
+/// Read the maker wallet's code and reject anything Permit2 can't `ecrecover`.
+/// Runs before `stitch approve` sends and before a live start posts, so an
+/// operator learns the wallet is unusable up front instead of after a rejected
+/// order — or a permanently wedged approval.
+pub async fn ensure_maker_is_plain_eoa(wallet: &Wallet) -> anyhow::Result<()> {
+    let code = wallet
+        .code()
+        .await
+        .context("reading the maker wallet's on-chain code")?;
+    match maker_eligibility_error(wallet.address(), &classify_code(&code)) {
+        Some(message) => bail!("{message}"),
+        None => Ok(()),
+    }
 }
 
 /// A token the operator must approve to Permit2, with the exact liquidity the
@@ -307,6 +369,38 @@ mod tests {
         "#
         );
         Config::from_toml(&toml).expect("config parses")
+    }
+
+    #[test]
+    fn classifies_wallets_from_their_code() {
+        let delegate: Address = "0x63c0c19a282a1b52B07dD5a65b58948A07DAE32B"
+            .parse()
+            .unwrap();
+        let mut delegated = vec![0xef, 0x01, 0x00];
+        delegated.extend_from_slice(delegate.as_slice());
+        assert_eq!(classify_code(&[]), WalletKind::PlainEoa);
+        assert_eq!(classify_code(&delegated), WalletKind::Delegated(delegate));
+        assert_eq!(
+            classify_code(&[0x60, 0x80, 0x60, 0x40]),
+            WalletKind::Contract
+        );
+    }
+
+    #[test]
+    fn only_a_plain_eoa_may_make() {
+        let maker: Address = "0x8136A5Af295ce8d1C3f4823b824520a0f22F1F09"
+            .parse()
+            .unwrap();
+        let delegate: Address = "0x63c0c19a282a1b52B07dD5a65b58948A07DAE32B"
+            .parse()
+            .unwrap();
+        assert!(maker_eligibility_error(maker, &WalletKind::PlainEoa).is_none());
+        let err = maker_eligibility_error(maker, &WalletKind::Delegated(delegate)).unwrap();
+        assert!(err.contains("EIP-7702"), "{err}");
+        assert!(err.contains("revoke the delegation"), "{err}");
+        assert!(maker_eligibility_error(maker, &WalletKind::Contract)
+            .unwrap()
+            .contains("contract bytecode"));
     }
 
     #[test]

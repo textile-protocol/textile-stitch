@@ -18,7 +18,9 @@ use alloy_primitives::{Address, Bytes, U256};
 use anyhow::{anyhow, Context};
 use tracing::{info, warn};
 
-use stitch_bot::approve::{run_approvals, unapproved_tokens, ApprovalMode};
+use stitch_bot::approve::{
+    ensure_maker_is_plain_eoa, run_approvals, unapproved_tokens, ApprovalMode,
+};
 use stitch_bot::banner::print_startup_banner;
 use stitch_bot::cli::{parse, Command};
 use stitch_bot::closer::discover::Discoverer;
@@ -273,6 +275,10 @@ async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow:
         maker = %wallet.address(), chain_id = cfg.chain_id, mode = ?mode, dry_run,
         "stitch approve: ensuring Permit2 approvals"
     );
+    // A wallet with code can't quote and — when it's 7702-delegated — can't even
+    // get its approvals through the node's one-in-flight limit. Say so before
+    // sending, not after a rejected transaction.
+    ensure_maker_is_plain_eoa(&wallet).await?;
     let sent = run_approvals(&wallet, permit2, &cfg, mode, dry_run).await?;
     if dry_run {
         info!("dry-run complete; no transactions sent");
@@ -535,6 +541,15 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
              the vault approved Permit2 in its constructor"
         );
     } else {
+        // Same reason the approve path checks: the book rejects orders from a
+        // wallet with code, so a delegated maker would quote into nothing.
+        match ensure_maker_is_plain_eoa(&wallet).await {
+            Ok(()) => {}
+            Err(e) if dry_run => {
+                warn!(error = %format!("{e:#}"), "maker wallet is not a plain EOA; continuing dry-run")
+            }
+            Err(e) => return Err(e),
+        }
         match unapproved_tokens(&wallet, permit2, &cfg).await {
             Ok(missing) if !missing.is_empty() => {
                 for m in &missing {

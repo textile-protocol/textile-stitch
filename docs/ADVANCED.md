@@ -478,6 +478,69 @@ journalctl -u stitch -f
 systemctl status stitch
 ```
 
+### Approve Times Out ("not mined within timeout")
+
+```
+Error: approving 0x55d3…7955 to Permit2
+Caused by:
+    tx 0x098f… (nonce 6) not mined within timeout
+```
+
+The transaction was accepted by the node — it is sitting in the mempool, not
+rejected. On BNB Chain the base fee is zero, so the tip is the entire bid, and
+the node's suggested tip is the chain floor (0.05 gwei) while the median
+transaction pays 0.1. A floor-priced transaction only lands when a validator
+that accepts the floor builds the block, which can take minutes.
+
+Stitch now re-sends the same nonce at a 25% higher fee every 12 seconds until
+the receipt arrives, so this should clear itself. If you still see it:
+
+- Re-run `stitch approve`. It reads the allowance first and skips tokens that
+  are already approved, so re-running is free and tells you whether the earlier
+  transaction landed after all.
+- Check the pending transaction on the explorer. If it is still there, replace
+  that nonce from your wallet with a higher gas price.
+- Point `rpc_url` at your own node or a paid provider. The free public endpoints
+  are fine for reads but give you no priority.
+
+### Approve Fails With "in-flight transaction limit reached"
+
+```
+Error: approving 0x55d3…7955 to Permit2
+Caused by:
+    rpc eth_sendRawTransaction error: {"code":-32000,"message":"in-flight transaction limit reached for delegated accounts"}
+```
+
+Your wallet has been upgraded to a smart account — MetaMask (and most wallets)
+now offer this, and it writes an EIP-7702 delegation onto the EOA. Two things
+break at once:
+
+- Nodes let a delegated account keep only **one** transaction in the pool. If an
+  earlier transaction is still pending, the next send is refused outright.
+- Textile does not accept delegated wallets as makers. Permit2 verifies their
+  signatures through EIP-1271, which the order book does not support yet, so
+  orders from that wallet get rejected at submit.
+
+Check it yourself:
+
+```bash
+cast code <your-address> --rpc-url <rpc>   # 0xef0100… means delegated
+```
+
+To fix it:
+
+1. Clear the pending transaction first. Look up your address on the explorer,
+   find the pending nonce, and re-send that **same nonce** from your wallet with
+   a higher gas price (MetaMask: "speed up", or a 0-value self-transfer with the
+   nonce set by hand under Advanced → custom nonce). A same-nonce replacement is
+   the one send a delegated account is always allowed.
+2. Revoke the delegation: MetaMask → Settings → switch the account back to a
+   standard account. Or move to a fresh EOA that was never upgraded, and fund it.
+3. Re-run `stitch approve`.
+
+`stitch approve` and a live start both check this up front now and refuse to run
+on a wallet with code.
+
 ### No Orders Are Posting
 
 Check these in order:
