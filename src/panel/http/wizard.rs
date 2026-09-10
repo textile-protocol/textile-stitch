@@ -825,9 +825,11 @@ refresh_threshold_bps = 0
             .as_str()
             .unwrap()
             .contains("[[pools]]"));
-        // Presets the API doesn't list stay reachable — otherwise the testnet
-        // corridor would disappear the moment the panel could reach Textile.
-        assert!(list.iter().any(|c| c["id"] == "cngn-usdt-bsc-testnet"));
+        // Nothing else. A preset the API doesn't list is not offered: the
+        // registry is the venue, and a corridor missing from it has no feed we
+        // serve, so a bot built on it would 404 every tick. This mock lists one
+        // corridor, so one corridor is what the operator can pick.
+        assert_eq!(list.len(), 1, "only what Textile listed: {body}");
     }
 
     #[tokio::test]

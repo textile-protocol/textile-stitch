@@ -17,8 +17,19 @@
 //!    would quietly widen a corridor we've already tuned and let it go dark
 //!    between samples. The API decides *which* corridors are offered; the preset
 //!    decides *how* one we know is quoted.
-//! 2. **Presets the API doesn't list stay on the end.** Testnet corridors aren't
-//!    in the production table and would otherwise vanish from the picker.
+//! 2. **A preset the API doesn't list is not offered.** The registry is the
+//!    venue: a corridor missing from it has no price feed we serve, so a bot
+//!    built on it would fetch its mid, get a 404, and never quote. This rule
+//!    used to run the other way, to keep the BSC testnet corridor visible —
+//!    but that corridor is in the production table now, and the only presets
+//!    the rule still added were XAUt/USDT and NVDA/USDG, whose feeds are both
+//!    switched off. It offered two corridors that could not price.
+//!
+//! Presets stay compiled in either way. They are still the tuning for rule 1,
+//! `find` still resolves one by id so an existing bot keeps working, and the
+//! offline fallback below still serves the whole catalog — without the API
+//! there is no listing to filter against, and a warned operator on a plane is
+//! better off with a picker than an empty screen.
 //!
 //! Everything is keyed on the market — chain plus the two token addresses — not
 //! on ids, because the two sources name corridors differently (`cngn-usdt-celo`
@@ -183,32 +194,23 @@ fn embedded() -> Vec<CorridorEntry> {
 }
 
 /// The API's list, with each entry swapped for the shipped preset that quotes
-/// the same market, then any presets the API didn't mention.
+/// the same market. Nothing is added: what the venue doesn't list, we don't
+/// offer.
 ///
-/// See the module docs for why the preset wins the overlap.
+/// See the module docs for why the preset wins the overlap, and why a preset
+/// the API left out is left out too.
 fn merge(remote: Vec<CorridorEntry>) -> Vec<CorridorEntry> {
-    let mut used: Vec<&'static str> = Vec::new();
-    let listed: Vec<CorridorEntry> = remote
+    remote
         .into_iter()
         .map(|entry| match preset_for(&entry) {
-            Some(preset) => {
-                used.push(preset.id);
-                // Keep the preset's config and its id — the id is what an
-                // already-created bot is labeled with, and what enrollment
-                // seats a corridor by, so a preset market must keep naming
-                // itself the same way whether or not the API answered.
-                CorridorEntry::from(preset)
-            }
+            // Keep the preset's config and its id — the id is what an
+            // already-created bot is labeled with, and what enrollment
+            // seats a corridor by, so a preset market must keep naming
+            // itself the same way whether or not the API answered.
+            Some(preset) => CorridorEntry::from(preset),
             None => entry,
         })
-        .collect();
-
-    let leftovers = setup::catalog()
-        .iter()
-        .filter(|c| !used.contains(&c.id))
-        .map(CorridorEntry::from);
-
-    listed.into_iter().chain(leftovers).collect()
+        .collect()
 }
 
 /// The shipped preset quoting the same market as this corridor, if we ship one.
@@ -330,15 +332,27 @@ refresh_threshold_bps = 0
     }
 
     #[test]
-    fn presets_the_api_does_not_list_are_still_offered() {
-        // The production table has no testnet corridor, and dropping it would
-        // take the only pair an operator can rehearse on off the picker.
+    fn presets_the_api_does_not_list_are_not_offered() {
+        // XAUt/USDT and NVDA/USDG are shipped but unlisted, and both feeds are
+        // switched off — offering them hands an operator a bot whose every
+        // tick 404s. The registry is the venue; it decides what exists.
         let merged = merge(vec![api_rendering_of_a_preset_market()]);
-        assert!(
-            merged.iter().any(|c| c.id == "cngn-usdt-bsc-testnet"),
-            "the testnet preset survives: {:?}",
-            merged.iter().map(|c| &c.id).collect::<Vec<_>>()
-        );
+        assert_eq!(merged.len(), 1, "only what the API listed");
+        for id in ["xaut-usdt-ethereum", "nvda-usdg-robinhood"] {
+            assert!(
+                !merged.iter().any(|c| c.id == id),
+                "{id} is not offered: {:?}",
+                merged.iter().map(|c| &c.id).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlisted_preset_still_resolves_for_a_bot_that_already_runs_it() {
+        // Not offering a corridor is not the same as forgetting it. Switch and
+        // add-pool send ids the panel handed out before, and an operator whose
+        // bot is already on one must not have it stop resolving.
+        assert!(setup::find_corridor("xaut-usdt-ethereum").is_some());
     }
 
     #[test]
