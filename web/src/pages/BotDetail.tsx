@@ -496,27 +496,104 @@ function Detail({ label, children }: { label: string; children: React.ReactNode 
 }
 
 /**
- * Short operator address. A hot wallet with a known explorer becomes a link
- * to that address page. MPC signers stay plain text.
+ * Short operator address, with a copy button for the full one. A hot wallet with
+ * a known explorer becomes a link to that address page. MPC signers stay plain text.
  */
 function OperatorAddress({ config }: { config: ConfigBody | null }) {
   if (!config?.operatorAddress) return '—'
-  const text = shortAddress(config.operatorAddress)
+  const address = config.operatorAddress
+  const text = shortAddress(address)
   const explorerUrl =
     config.signer === 'hot-wallet' ? config.explorerUrl : null
-  if (!explorerUrl) {
-    return <span title={config.operatorAddress}>{text}</span>
-  }
   return (
-    <a
-      href={explorerUrl}
-      target="_blank"
-      rel="noreferrer"
-      title={config.operatorAddress}
-      className="underline hover:text-ink"
+    <span className="inline-flex items-center gap-1.5">
+      {explorerUrl ? (
+        <a
+          href={explorerUrl}
+          target="_blank"
+          rel="noreferrer"
+          title={address}
+          className="underline hover:text-ink"
+        >
+          {text}
+        </a>
+      ) : (
+        <span title={address}>{text}</span>
+      )}
+      <CopyAddressButton address={address} />
+    </span>
+  )
+}
+
+/**
+ * The row shows a shortened address, so copying the real one otherwise means
+ * digging it out of the config. One click, then a checkmark for two seconds.
+ */
+function CopyAddressButton({ address }: { address: string }) {
+  const [copied, setCopied] = useState(false)
+
+  useEffect(() => {
+    if (!copied) return
+    const timer = window.setTimeout(() => setCopied(false), 2000)
+    return () => clearTimeout(timer)
+  }, [copied])
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(address)
+      setCopied(true)
+    } catch {
+      setCopied(false)
+    }
+  }
+
+  const label = copied ? 'Copied' : 'Copy address'
+  return (
+    <button
+      type="button"
+      onClick={() => void copy()}
+      title={label}
+      aria-label={label}
+      className="shrink-0 rounded p-0.5 text-faint transition hover:bg-hover hover:text-ink"
     >
-      {text}
-    </a>
+      {copied ? <CheckIcon /> : <CopyIcon />}
+    </button>
+  )
+}
+
+function CopyIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden className="block">
+      <rect
+        x="5"
+        y="5"
+        width="7.5"
+        height="7.5"
+        rx="1.5"
+        stroke="currentColor"
+        strokeWidth="1.3"
+      />
+      <path
+        d="M9 3.25V2.75A1.25 1.25 0 0 0 7.75 1.5h-5A1.25 1.25 0 0 0 1.5 2.75v5A1.25 1.25 0 0 0 2.75 9h.5"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
+function CheckIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden className="block">
+      <path
+        d="m2.75 7.5 3 3 5.5-6"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   )
 }
 
