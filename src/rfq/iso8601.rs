@@ -7,16 +7,6 @@
 //! hand-rolled converter (Howard Hinnant's civil-days algorithm) instead of a
 //! chrono dependency — the crate's date needs start and end here.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Current unix time in milliseconds; 0 if the clock is before the epoch.
-pub fn unix_ms_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Days since 1970-01-01 for a civil date (proleptic Gregorian).
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };

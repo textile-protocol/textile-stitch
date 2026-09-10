@@ -6,9 +6,9 @@
 use alloy_primitives::{hex, Address};
 use serde::Serialize;
 
-use crate::eip712::permit2_digest;
+use crate::protocol::eip712::permit2_digest;
+use crate::protocol::types::OrderParams;
 use crate::signer::Signer;
-use crate::types::OrderParams;
 
 /// Wire form of a signed operator order (addresses as `0x` strings, amounts as
 /// decimal strings to fit the GraphQL `BigInt` scalar).

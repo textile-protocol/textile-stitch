@@ -4,7 +4,7 @@
 //! the bot's tx submission. Hand-rolled to keep the dependency footprint tiny
 //! (just `alloy-rlp` + the `k256` signer we already use for EIP-712): the only
 //! crypto here is the same secp256k1 path, reused over the typed-tx signing
-//! hash. The submitter ([`crate::rpc`]) fills nonce/gas/fees and sends the
+//! hash. The submitter ([`crate::chain::rpc`]) fills nonce/gas/fees and sends the
 //! output of [`sign_tx`].
 
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};

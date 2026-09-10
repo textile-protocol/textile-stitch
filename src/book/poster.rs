@@ -9,11 +9,11 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::indexer::Indexer;
+use crate::protocol::types::OrderParams;
 use crate::signer::DynSigner;
-use crate::submit::{sign_submission, SubmitOrder};
-use crate::tick::unix_now;
-use crate::types::OrderParams;
+use crate::time::unix_now;
+use crate::venue::indexer::Indexer;
+use crate::venue::submit::{sign_submission, SubmitOrder};
 
 /// Signs and posts one operator order to the indexer. Holds the static context
 /// (signer, reactor, permit2…) so the per-tick call sites stay small. The signer

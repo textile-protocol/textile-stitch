@@ -18,10 +18,10 @@ use serde::Serialize;
 
 use super::settings::config_path;
 use super::{ApiError, AppState};
-use crate::approve::{approval_action, required_approvals, ApprovalAction, ApprovalMode};
+use crate::chain::approve::{approval_action, required_approvals, ApprovalAction, ApprovalMode};
+use crate::chain::rpc::Rpc;
 use crate::closer::executor::encode_allowance;
 use crate::config::Config;
-use crate::rpc::Rpc;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

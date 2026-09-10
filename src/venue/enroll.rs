@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::eip712::{maker_enroll_digest, maker_enroll_environment};
+use crate::protocol::eip712::{maker_enroll_digest, maker_enroll_environment};
 use crate::setup;
 use crate::signer::DynSigner;
 

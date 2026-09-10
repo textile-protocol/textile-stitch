@@ -14,7 +14,7 @@
 //! identical to a build without the module.
 //!
 //! Shared with the ladder: the same feed URLs, the same
-//! `quote::bid_price`/`ask_price` spreads, the same [`crate::eip712`] Permit2
+//! `quote::bid_price`/`ask_price` spreads, the same [`crate::protocol::eip712`] Permit2
 //! digest and the same order-bytes encoder — one pricing and signing story,
 //! two distribution channels. RFQ tightens staleness per feed (see
 //! [`crate::config::rfq_staleness_secs`]) so a 900s ladder template cannot
@@ -29,13 +29,13 @@
 //! shrink the next ladder. Two channels pledging one balance means a fill can
 //! revert when both land at once, which beats halving the depth of both.
 
+pub mod iso8601;
 pub mod math;
 pub mod nonce;
 pub mod order;
 pub mod reserve;
 pub mod responder;
 pub mod session;
-pub mod time;
 pub mod wire;
 
 use std::collections::{HashMap, HashSet};
@@ -49,22 +49,25 @@ use rand::RngCore;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
+use crate::book::taker::encode_order_bytes;
+use crate::chain::rpc::Wallet;
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
-use crate::eip712::permit2_digest;
-use crate::feed::{HttpFeed, PriceFeed, Quote};
-use crate::rpc::Wallet;
+use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
+use crate::pricing::tick::{is_price_usable, is_stale};
+use crate::protocol::eip712::permit2_digest;
 use crate::signer::DynSigner;
-use crate::taker::encode_order_bytes;
-use crate::tick::{is_price_usable, is_stale, unix_now};
+use crate::time::unix_now;
 
-use crate::vault::{
+use crate::protocol::vault::{
     address_from_word, apply_vault_order_policy, clamp_vault_deadline, encode_close_only,
     encode_corridor_asset, encode_liquid_settlement, encode_max_order_input_corridor,
     encode_max_order_input_settlement, encode_max_order_lifetime, encode_paused,
     encode_quotable_corridor, encode_quotable_settlement, encode_settlement_asset,
     encode_trading_epoch, trading_nonce, vault_nonce_low, VaultQuotePolicy,
 };
+use crate::time::unix_now_ms;
+use iso8601::{format_iso_ms, parse_iso_ms};
 use nonce::rfq_nonce;
 use order::{build_order, RfqOrderSpec};
 use reserve::{Reservations, RESERVATIONS_FILE};
@@ -72,7 +75,6 @@ use responder::{
     book_from_pool, decide_quote, levels_for, wallet_tokens, CorridorBook, InventoryView,
 };
 use session::AuthedSession;
-use time::{format_iso_ms, parse_iso_ms, unix_ms_now};
 use wire::{
     MakerFrame, QuoteRejectFrame, QuoteRequestFrame, QuoteResponseFrame, RejectReason, VenueFrame,
 };
@@ -809,7 +811,7 @@ fn ready_level_slugs(
     only: Option<&HashSet<String>>,
 ) -> Vec<String> {
     engine
-        .level_frames(prices, unix_ms_now())
+        .level_frames(prices, unix_now_ms())
         .into_iter()
         .filter_map(|frame| {
             let MakerFrame::Levels(lvl) = frame else {
@@ -833,7 +835,7 @@ async fn send_level_frames(
     only: Option<&HashSet<String>>,
     outbound: &mut RateWindow,
 ) -> anyhow::Result<Vec<String>> {
-    let frames = engine.level_frames(prices, unix_ms_now());
+    let frames = engine.level_frames(prices, unix_now_ms());
     let mut emitted = Vec::with_capacity(frames.len());
     for frame in frames {
         let MakerFrame::Levels(lvl) = &frame else {
@@ -1069,7 +1071,7 @@ async fn session_loop_inner(
                         last_rx.elapsed() < heartbeat_timeout,
                         "venue silent for {:?} (heartbeat timeout)", last_rx.elapsed()
                     );
-                    engine.reservations.prune(unix_ms_now() / 1_000);
+                    engine.reservations.prune(unix_now_ms() / 1_000);
                     // The first tick is immediate. After an expiry flush,
                     // emitting every book again in the same second is
                     // 2×books and trips the 40/s cap. Ordinary interval
@@ -1339,7 +1341,7 @@ impl Engine {
             return reject(RejectReason::Busy);
         }
 
-        let now_ms = unix_ms_now();
+        let now_ms = unix_now_ms();
         let now_secs = now_ms / 1_000;
         let Some(quote) = prices.get(&book.feed_url) else {
             return reject(RejectReason::StaleFeed);
@@ -1728,9 +1730,9 @@ mod tests {
     use super::wire::{QuoteExpiredFrame, QuoteResultFrame};
     use super::*;
     use crate::config::RfqCapacity;
-    use crate::quote::Spread;
+    use crate::pricing::quote::Spread;
     use crate::signer::{recover_address, LocalSigner};
-    use crate::tick::unix_now;
+    use crate::time::unix_now;
     use alloy_primitives::U256;
     use k256::ecdsa::SigningKey;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -2137,7 +2139,7 @@ mod tests {
     }
 
     fn exact_input_request(rfq_id: &str) -> QuoteRequestFrame {
-        let deadline = unix_ms_now() + 120_000;
+        let deadline = unix_now_ms() + 120_000;
         QuoteRequestFrame {
             rfq_id: rfq_id.into(),
             corridor_id: "cngn-usdc".into(),
@@ -2147,7 +2149,7 @@ mod tests {
             sell_amount: Some("1000000000".into()),
             buy_amount: None,
             taker: "0x0000000000000000000000000000000000000003".into(),
-            reply_by: format_iso_ms(unix_ms_now() + 750),
+            reply_by: format_iso_ms(unix_now_ms() + 750),
             quote_ttl_ms: 5_000,
             max_expires_at: format_iso_ms(deadline),
             fee_bps: 1,
@@ -2318,7 +2320,7 @@ mod tests {
             unix_now() + 60,
         );
         let prices = fresh_prices();
-        let MakerFrame::Levels(frame) = engine.level_frames(&prices, unix_ms_now())[0].clone()
+        let MakerFrame::Levels(frame) = engine.level_frames(&prices, unix_now_ms())[0].clone()
         else {
             panic!("expected levels");
         };
@@ -2357,7 +2359,7 @@ mod tests {
         engine.books.push(off_pair_book());
         let prices = fresh_prices();
         assert!(
-            engine.level_frames(&prices, unix_ms_now()).is_empty(),
+            engine.level_frames(&prices, unix_now_ms()).is_empty(),
             "no policy yet → publish nothing"
         );
         *engine.vault_policy.write().unwrap() = Some(VaultQuotePolicy {
@@ -2367,7 +2369,7 @@ mod tests {
             max_input_corridor: U256::MAX,
             max_lifetime_secs: 120,
         });
-        let frames = engine.level_frames(&prices, unix_ms_now());
+        let frames = engine.level_frames(&prices, unix_now_ms());
         assert_eq!(frames.len(), 1, "off-pair book must stay unpublished");
         let MakerFrame::Levels(frame) = &frames[0] else {
             panic!("expected levels, got {frames:?}");
@@ -2744,7 +2746,7 @@ mod tests {
     async fn quote_expired_restores_published_level_depth() {
         let mut engine = test_engine();
         let prices = fresh_prices();
-        let now_ms = unix_ms_now();
+        let now_ms = unix_now_ms();
 
         let MakerFrame::Levels(full) = engine.level_frames(&prices, now_ms)[0].clone() else {
             panic!("expected a levels frame before any quote");
@@ -2841,7 +2843,7 @@ mod tests {
             panic!("expected reject, got {reply:?}");
         };
         assert_eq!(rej.reason, RejectReason::StaleFeed);
-        assert!(engine.level_frames(&empty, unix_ms_now()).is_empty());
+        assert!(engine.level_frames(&empty, unix_now_ms()).is_empty());
 
         // A price far older than the staleness window.
         let stale = PriceCache::default();
@@ -2857,7 +2859,7 @@ mod tests {
             panic!("expected reject, got {reply:?}");
         };
         assert_eq!(rej.reason, RejectReason::StaleFeed);
-        assert!(engine.level_frames(&stale, unix_ms_now()).is_empty());
+        assert!(engine.level_frames(&stale, unix_now_ms()).is_empty());
         assert!(engine.reservations.is_empty(), "rejects reserve nothing");
     }
 
@@ -2899,7 +2901,7 @@ mod tests {
         // whole seconds, and the quote expiry must stay within *that*, not
         // the raw millisecond bound (quote_outlives_order otherwise).
         let mut req = exact_input_request("rfq_1");
-        req.max_expires_at = format_iso_ms(unix_ms_now() + 4_500);
+        req.max_expires_at = format_iso_ms(unix_now_ms() + 4_500);
         let max_expires_ms = parse_iso_ms(&req.max_expires_at).unwrap();
         let MakerFrame::QuoteResponse(resp) = engine.respond(req, &prices).await else {
             panic!("expected a firm quote");
@@ -2932,7 +2934,7 @@ mod tests {
         // classified late by the venue — never sign or reserve for it.
         let reservations_before = engine.reservations.len();
         let mut req = exact_input_request("rfq_3");
-        req.reply_by = format_iso_ms(unix_ms_now() - 1_000);
+        req.reply_by = format_iso_ms(unix_now_ms() - 1_000);
         let MakerFrame::QuoteReject(rej) = engine.respond(req, &prices).await else {
             panic!("expected reject");
         };
@@ -3002,7 +3004,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "stitch-instance-{}-{}-{tag}",
             std::process::id(),
-            unix_ms_now()
+            unix_now_ms()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -18,32 +18,33 @@ use alloy_primitives::{Address, Bytes, U256};
 use anyhow::{anyhow, Context};
 use tracing::{info, warn};
 
-use stitch_bot::approve::{
+use stitch_bot::app::banner::print_startup_banner;
+use stitch_bot::app::cli::{parse, Command};
+use stitch_bot::app::update::{run_update, warn_if_outdated};
+use stitch_bot::book::funding::{count_max_sides, u256_to_u128, TickBudgets};
+use stitch_bot::book::maker::{quote_side, QuoteState, Side, SideOutcome, TickCtx};
+use stitch_bot::book::poster::Poster;
+use stitch_bot::book::slots::{load_slot_nonce_state, slot_nonce_state_path};
+use stitch_bot::book::taker::{resolve_fee_bps, take_pool_once, TakeOutcome, TakerCtx};
+use stitch_bot::chain::approve::{
     ensure_maker_is_plain_eoa, run_approvals, unapproved_tokens, ApprovalMode,
 };
-use stitch_bot::banner::print_startup_banner;
-use stitch_bot::cli::{parse, Command};
+use stitch_bot::chain::rpc::Wallet;
 use stitch_bot::closer::discover::Discoverer;
 use stitch_bot::closer::executor::encode_balance_of;
 use stitch_bot::closer::runner::{close_pool_once, CloseOutcome, CloserPool};
 use stitch_bot::closer::strategy::{PoolParams, StrategyConfig};
 use stitch_bot::config::{Config, PoolConfig};
-use stitch_bot::feed::{HttpFeed, PriceFeed};
-use stitch_bot::funding::{count_max_sides, u256_to_u128, TickBudgets};
-use stitch_bot::indexer::Indexer;
-use stitch_bot::lean::{LeanDecision, LeanMode, LeanParams, LeanState};
-use stitch_bot::maker::{quote_side, QuoteState, Side, SideOutcome, TickCtx};
-use stitch_bot::poster::Poster;
-use stitch_bot::quote::oracle_rate_ray;
-use stitch_bot::quote::{ask_price, bid_price, SpotDeviationGuard};
-use stitch_bot::rpc::Wallet;
+use stitch_bot::pricing::feed::{HttpFeed, PriceFeed};
+use stitch_bot::pricing::lean::{LeanDecision, LeanMode, LeanParams, LeanState};
+use stitch_bot::pricing::quote::oracle_rate_ray;
+use stitch_bot::pricing::quote::{ask_price, bid_price, SpotDeviationGuard};
+use stitch_bot::pricing::tick::{is_price_usable, is_stale};
+use stitch_bot::pricing::twap::Twap;
 use stitch_bot::setup;
 use stitch_bot::signer::{address_from_signing_key, build_signer};
-use stitch_bot::slots::{load_slot_nonce_state, slot_nonce_state_path};
-use stitch_bot::taker::{resolve_fee_bps, take_pool_once, TakeOutcome, TakerCtx};
-use stitch_bot::tick::{is_price_usable, is_stale, unix_now};
-use stitch_bot::twap::Twap;
-use stitch_bot::update::{run_update, warn_if_outdated};
+use stitch_bot::time::unix_now;
+use stitch_bot::venue::indexer::Indexer;
 
 /// Build the blue-leg close target from a pool's config (assumes `closer_enabled`).
 fn build_closer_pool(pool: &PoolConfig) -> anyhow::Result<CloserPool> {
@@ -83,7 +84,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// balances, atomic. Signed orders don't move tokens until they fill (Permit2),
 /// so the wallet balance IS the inventory.
 async fn read_inventory(
-    wallet: &stitch_bot::rpc::Wallet,
+    wallet: &stitch_bot::chain::rpc::Wallet,
     maker: Address,
     collateral: Address,
     debt: Address,
@@ -429,14 +430,15 @@ async fn run_connect(config_path: String, venue_url: Option<String>) -> anyhow::
     let signer = build_signer(&cfg).await?;
     println!("Operator wallet: {:?}", signer.address());
 
-    let venue = stitch_bot::enroll::enroll_url_from_config(&cfg, venue_url.as_deref());
+    let venue = stitch_bot::venue::enroll::enroll_url_from_config(&cfg, venue_url.as_deref());
     println!("Registering with {venue} ...");
-    let enrolled = stitch_bot::enroll::register_maker(&cfg, &signer, &venue).await?;
+    let enrolled = stitch_bot::venue::enroll::register_maker(&cfg, &signer, &venue).await?;
 
     // Same rule the panel applies: a bot that can quote Swap leaves the public
     // ladder, because those resting orders are invisible to takers and still
     // hold inventory RFQ would otherwise quote.
-    let (edited, outcome) = stitch_bot::enroll::apply_enrollment(&current, &cfg, &enrolled, true)?;
+    let (edited, outcome) =
+        stitch_bot::venue::enroll::apply_enrollment(&current, &cfg, &enrolled, true)?;
 
     let dir = path
         .parent()
@@ -455,17 +457,17 @@ async fn run_connect(config_path: String, venue_url: Option<String>) -> anyhow::
         dir.join(setup::RFQ_API_KEY_FILE).display()
     );
     match outcome {
-        stitch_bot::enroll::EnrollOutcome::Live => {
+        stitch_bot::venue::enroll::EnrollOutcome::Live => {
             println!("\nThis bot now quotes Swap via RFQ. Restart it to pick the change up.");
         }
-        stitch_bot::enroll::EnrollOutcome::Flagged => {
+        stitch_bot::venue::enroll::EnrollOutcome::Flagged => {
             println!(
                 "\nTextile has flagged this maker, so no quote requests will arrive. The \
                  credential is saved; contact Textile before re-running `stitch connect` — \
                  re-running rotates the maker key."
             );
         }
-        stitch_bot::enroll::EnrollOutcome::Waiting => {
+        stitch_bot::venue::enroll::EnrollOutcome::Waiting => {
             // A bot from `stitch init` has the ladder off, so telling that
             // operator "your ladder keeps running" would hide that the bot is
             // deliberately dark until the operator confirms their address.

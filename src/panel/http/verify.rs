@@ -17,11 +17,11 @@ use serde_json::json;
 use super::settings::{config_path, read_toml, save_and_restart};
 use super::{ApiError, AppState};
 use crate::config::{rfq_default_flag_in_dir, Config};
-use crate::enroll::{
+use crate::setup;
+use crate::venue::enroll::{
     apply_enrollment, maker_status_url, maker_verify_email_url, venue_error_message,
     venue_origin_from_config, EnrollCorridorPair, EnrollOutcome, EnrollResponse,
 };
-use crate::setup;
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -323,11 +323,11 @@ mod tests {
     use super::super::testkit::{harness, Harness, TEST_KEY};
     use super::*;
     use crate::config::RFQ_PANEL_GATE;
-    use crate::enroll::maker_enroll_url;
     use crate::panel::docker::fake::{container, dir_layout_mounts};
     use crate::panel::docker::ContainerState;
     use crate::panel::naming::LABEL_BOT;
     use crate::setup;
+    use crate::venue::enroll::maker_enroll_url;
     use axum::http::StatusCode;
     use axum::routing::{get, post};
     use axum::Router;

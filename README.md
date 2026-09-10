@@ -24,6 +24,7 @@ Stitch quotes Swap by default, plus an optional second job:
 - [Quick Start](#quick-start)
 - [Other ways to install](#other-ways-to-install)
 - [How It Works](#how-it-works)
+- [Source Layout](#source-layout)
 - [Requirements](#requirements)
 - [Configuration](#configuration)
 - [Security Notes](#security-notes)
@@ -234,6 +235,26 @@ gas. See the
 
 Stitch reads the config at startup. After changing `stitch.toml`, restart the
 process.
+
+## Source Layout
+
+One crate, three binaries: `stitch` (the bot), `stitch-panel` (the local web
+UI, `--features panel`) and `stitch-desktop` (the tray app, `--features
+desktop`). Inside `src/`:
+
+`pricing/` decides what a quote should be — feed, TWAP, spread, inventory lean
+— as pure math with no I/O. `protocol/` holds the order types and the EIP-712 /
+OperatorVault encodings ported from the contracts, and `chain/` is the JSON-RPC
+client, transaction signing and Permit2 approvals. Those three feed the trading
+legs: `rfq/` (firm quotes over the venue's maker stream, the main path today),
+`book/` (the public ladder and the limit-order taker) and `closer/` (settlement
+auctions), each of them signing through `signer/` — the local hot wallet or an
+MPC backend. `venue/` is the Textile
+indexer client and maker enrollment, `config.rs` the operator's TOML, `app/`
+the CLI, banner and self-update, `setup/` the interactive installer, and
+`panel/` the panel's HTTP API. The panel's React frontend lives in
+[`web/`](web/README.md).
+
 
 ## Requirements
 

@@ -3,7 +3,7 @@
 //! Green-leg Permit2 approvals.
 //!
 //! The operator signs Permit2 `permitWitnessTransferFrom` orders whose spender
-//! is the reactor (see [`crate::eip712`]). For a filler to execute one, Permit2
+//! is the reactor (see [`crate::protocol::eip712`]). For a filler to execute one, Permit2
 //! must be allowed to pull the order's *input* token from the maker — debt on
 //! the buy side (we pay debt for collateral), collateral on the sell side. So
 //! the maker needs a one-time `ERC20.approve(Permit2, …)` per token it quotes.
@@ -21,9 +21,9 @@ use alloy_primitives::{Address, Bytes, U256};
 use anyhow::{bail, Context};
 use tracing::info;
 
+use crate::chain::rpc::{delegation_target, Wallet};
 use crate::closer::executor::{encode_allowance, encode_approve};
 use crate::config::{parse_liquidity_amount, Config, LiquidityAmount, PoolConfig};
-use crate::rpc::{delegation_target, Wallet};
 
 /// How much of each token to approve to Permit2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

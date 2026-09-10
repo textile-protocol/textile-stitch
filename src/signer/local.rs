@@ -80,7 +80,7 @@ fn read_private_key_file(path: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tick::unix_now;
+    use crate::time::unix_now;
 
     const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 

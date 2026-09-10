@@ -32,7 +32,7 @@ pub fn rfq_nonce(unix_ms: u64, counter: u64) -> U256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tick::unix_now;
+    use crate::time::unix_now;
 
     #[test]
     fn rfq_nonces_carry_the_namespace_bit() {

@@ -14,7 +14,7 @@ use alloy_primitives::{Address, U256};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::poster::OrderDraft;
+use crate::book::poster::OrderDraft;
 
 /// On-disk shape of the ledger. Serde field names are the file format — do not
 /// rename them.
@@ -229,7 +229,7 @@ pub fn save_slot_nonce_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tick::unix_now;
+    use crate::time::unix_now;
 
     fn temp_state_file(label: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();

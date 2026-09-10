@@ -13,22 +13,22 @@ use std::path::Path;
 use alloy_primitives::{Address, U256};
 use tracing::{info, warn};
 
-use crate::config::{parse_min_slice_debt, PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
-use crate::funding::{
+use crate::book::funding::{
     funded_input_cap, parse_input_liquidity, record_funded_input_replacement, u256_to_u128,
     InputLiquidity, TickBudgets,
 };
-use crate::ladder::balanced_ladder;
-use crate::poster::{drafted_input, OrderDraft, Poster};
-use crate::quote::{
-    ask_price, bid_price, buy_amounts_at, collateral_for_debt_ceil_at, sell_amounts_at,
-    SpotDeviationGuard, Spread,
-};
-use crate::slots::{
+use crate::book::ladder::balanced_ladder;
+use crate::book::poster::{drafted_input, OrderDraft, Poster};
+use crate::book::slots::{
     forget_spent_slot_nonces, remember_slot_inputs, reusable_slot_input, save_slot_nonce_state,
     slot_nonce,
 };
-use crate::tick::should_requote_now;
+use crate::config::{parse_min_slice_debt, PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
+use crate::pricing::quote::{
+    ask_price, bid_price, buy_amounts_at, collateral_for_debt_ceil_at, sell_amounts_at,
+    SpotDeviationGuard, Spread,
+};
+use crate::pricing::tick::should_requote_now;
 
 /// Which side of the book a quote is for. Bid buys collateral with debt below
 /// mid; ask sells collateral for debt above mid.
@@ -152,7 +152,7 @@ impl Side {
 /// source of truth here.
 pub struct TickCtx<'a> {
     pub poster: &'a Poster<'a>,
-    pub wallet: &'a crate::rpc::Wallet,
+    pub wallet: &'a crate::chain::rpc::Wallet,
     pub state_path: &'a Path,
 }
 

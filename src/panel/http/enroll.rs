@@ -110,12 +110,12 @@ pub async fn enroll(
     let rfq_default = cfg.rfq_default_unlocked() || rfq_default_flag_in_dir(&state.cfg.bots_dir);
 
     let signer = signer_for_bot(&cfg, &path).await?;
-    let venue = crate::enroll::enroll_url_from_config(&cfg, body.venue_url.as_deref());
-    let enrolled = crate::enroll::register_maker(&cfg, &signer, &venue)
+    let venue = crate::venue::enroll::enroll_url_from_config(&cfg, body.venue_url.as_deref());
+    let enrolled = crate::venue::enroll::register_maker(&cfg, &signer, &venue)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let (edited, outcome) =
-        crate::enroll::apply_enrollment(&current_toml, &cfg, &enrolled, rfq_default)
+        crate::venue::enroll::apply_enrollment(&current_toml, &cfg, &enrolled, rfq_default)
             .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
     let dir = path.parent().ok_or_else(|| {
@@ -137,20 +137,20 @@ pub async fn enroll(
     .map_err(|e| ApiError::internal(&e))?;
 
     let message = match outcome {
-        crate::enroll::EnrollOutcome::Flagged => format!(
+        crate::venue::enroll::EnrollOutcome::Flagged => format!(
             "Registered as {} ({}). Textile has blocked this maker — you will not receive Swap quotes.",
             enrolled.maker_slug, enrolled.environment
         ),
-        crate::enroll::EnrollOutcome::Waiting => format!(
+        crate::venue::enroll::EnrollOutcome::Waiting => format!(
             "Registered as {} ({}). Confirm your email address to go live — that is the only \
              step left.",
             enrolled.maker_slug, enrolled.environment
         ),
-        crate::enroll::EnrollOutcome::Live if rfq_default => format!(
+        crate::venue::enroll::EnrollOutcome::Live if rfq_default => format!(
             "Connected to Textile as {} ({}). This bot now quotes Swap only — it will not rest orders on the public book.",
             enrolled.maker_slug, enrolled.environment
         ),
-        crate::enroll::EnrollOutcome::Live => format!(
+        crate::venue::enroll::EnrollOutcome::Live => format!(
             "Connected to Textile as {} ({}).",
             enrolled.maker_slug, enrolled.environment
         ),

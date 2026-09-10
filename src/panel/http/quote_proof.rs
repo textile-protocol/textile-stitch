@@ -28,8 +28,8 @@ use super::funding::{format_units, units};
 use super::settings::config_path;
 use super::{ApiError, AppState};
 use crate::config::Config;
-use crate::enroll::{venue_error_message, venue_origin_from_config};
 use crate::setup;
+use crate::venue::enroll::{venue_error_message, venue_origin_from_config};
 
 /// The one venue whose quotes have a public swap page to link to.
 pub const PUBLIC_VENUE_ORIGIN: &str = "https://api.textilecredit.com";

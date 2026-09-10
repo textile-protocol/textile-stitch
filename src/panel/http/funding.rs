@@ -52,14 +52,14 @@ use serde::Serialize;
 use super::allowances::{read_allowance, short_token, token_symbols};
 use super::settings::config_path;
 use super::{ApiError, AppState};
-use crate::approve::{approval_action, required_approvals, ApprovalAction, ApprovalMode};
+use crate::chain::approve::{approval_action, required_approvals, ApprovalAction, ApprovalMode};
+use crate::chain::rpc::Rpc;
 use crate::closer::executor::encode_balance_of;
 use crate::config::Config;
-use crate::feed::{HttpFeed, PriceFeed};
 use crate::panel::native_price::{gas_symbol, gas_token, http_origin, GasToken, PriceSource};
-use crate::rpc::Rpc;
+use crate::pricing::feed::{HttpFeed, PriceFeed};
+use crate::pricing::tick::is_price_usable;
 use crate::setup;
-use crate::tick::is_price_usable;
 
 /// A side counts as funded when its balance is worth at least this many dollars.
 pub const FUND_MIN_TOKEN_USD: f64 = 20.0;

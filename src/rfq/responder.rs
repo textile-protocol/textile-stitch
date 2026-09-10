@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, U256};
 
 use crate::config::{PoolConfig, RfqCapacity};
-use crate::quote::{ask_price, bid_price, Spread};
-use crate::tick::is_price_usable;
+use crate::pricing::quote::{ask_price, bid_price, Spread};
+use crate::pricing::tick::is_price_usable;
 
 use super::math::{
     collateral_for_debt, debt_for_collateral, fee_on, max_fitting_output, min_feeable_output,

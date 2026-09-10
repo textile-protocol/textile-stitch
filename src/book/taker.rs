@@ -29,13 +29,13 @@ use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::chain::rpc::Wallet;
 use crate::closer::executor::{encode_approve, encode_balance_of};
-use crate::eip712::permit2_digest;
-use crate::indexer::Indexer;
-use crate::quote::sell_amounts_at;
-use crate::rpc::Wallet;
+use crate::pricing::quote::sell_amounts_at;
+use crate::protocol::eip712::permit2_digest;
+use crate::protocol::types::OrderParams;
 use crate::signer::address_from_verifying_key;
-use crate::types::OrderParams;
+use crate::venue::indexer::Indexer;
 
 /// Cooldown before an order we already submitted a fill for is eligible again
 /// — covers the pending-tx + indexer-reconcile window, mirroring the closer.

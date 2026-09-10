@@ -4,7 +4,7 @@
 //! clear the operator's margin, and close the front of the FIFO queue with one
 //! `pool.fill()` — approving the debt asset first if the allowance is short.
 //! The pure decisions live in [`super::strategy`]/[`super::feemath`]; this is
-//! the I/O glue over [`crate::rpc::Wallet`].
+//! the I/O glue over [`crate::chain::rpc::Wallet`].
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use tracing::info;
 
-use crate::rpc::Wallet;
+use crate::chain::rpc::Wallet;
 
 use super::discover::Discoverer;
 use super::executor::{encode_allowance, encode_approve, encode_fill};

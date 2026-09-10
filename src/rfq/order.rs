@@ -2,13 +2,13 @@
 // Copyright (c) 2026 Textile, Inc.
 //! RFQ order assembly: the taker-binding validation payload and the
 //! [`OrderParams`] a firm quote signs. The EIP-712/Permit2 digest and the
-//! `abi.encode(LimitOrder)` bytes come from the existing [`crate::eip712`] and
-//! [`crate::taker::encode_order_bytes`] paths — RFQ adds no second signing or
+//! `abi.encode(LimitOrder)` bytes come from the existing [`crate::protocol::eip712`] and
+//! [`crate::book::taker::encode_order_bytes`] paths — RFQ adds no second signing or
 //! encoding implementation to keep in sync.
 
 use alloy_primitives::{Address, Bytes, U256};
 
-use crate::types::OrderParams;
+use crate::protocol::types::OrderParams;
 
 /// `abi.encode(address[] preferredFillers, uint256 exclusiveUntil)` — the
 /// PreferredFillerValidation payload that binds the signed order to the
@@ -160,7 +160,7 @@ mod tests {
 
         // The encoded order is accepted by the shared encoder (smoke check
         // that RFQ orders flow through the same bytes path as taker fills).
-        let bytes = crate::taker::encode_order_bytes(&order);
+        let bytes = crate::book::taker::encode_order_bytes(&order);
         assert!(bytes.len() % 32 == 0 && !bytes.is_empty());
     }
 

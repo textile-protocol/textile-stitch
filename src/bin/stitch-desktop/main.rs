@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use stitch_bot::update::{ReleaseAsset, ReleaseCheck};
+use stitch_bot::app::update::{ReleaseAsset, ReleaseCheck};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
@@ -375,7 +375,7 @@ fn run() -> Result<()> {
         let mut fail_streak: usize = 0;
         let mut manual = false;
         loop {
-            let result = stitch_bot::update::check_latest_release_blocking();
+            let result = stitch_bot::app::update::check_latest_release_blocking();
             let sleep_secs = match &result {
                 ReleaseCheck::Failed { reason } => {
                     let idx = fail_streak.min(UPDATE_RETRY_SECS.len() - 1);
@@ -1265,7 +1265,7 @@ fn start_update_download(
     let asset = asset.clone();
     let proxy = proxy.clone();
     std::thread::spawn(move || {
-        let result = stitch_bot::update::download_desktop_update_blocking(&version, &asset)
+        let result = stitch_bot::app::update::download_desktop_update_blocking(&version, &asset)
             .map_err(|error| format!("{error:#}"));
         let _ = proxy.send_event(UserEvent::UpdateDownloadResult(result));
     });

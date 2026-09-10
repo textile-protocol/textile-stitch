@@ -4,7 +4,7 @@
 //!
 //! Mirrors `packages/constants/src/operatorVaultMath.ts` (`tradingNonce`) and
 //! the no-arg views on `IOperatorVault`. Encoding only — RPC lives with the
-//! caller so the RFQ inventory loop can share [`crate::rpc::Wallet`].
+//! caller so the RFQ inventory loop can share [`crate::chain::rpc::Wallet`].
 
 use alloy_primitives::{keccak256, Address, U256};
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
 //! RFQ amount math: fee fitting, atomic-unit conversions at a priced rate, and
-//! the RAY level rate. All `U256`, mirroring [`crate::quote`]'s fixed-point
+//! the RAY level rate. All `U256`, mirroring [`crate::pricing::quote`]'s fixed-point
 //! approach (price scaled to 1e9) so RFQ and ladder pricing can never drift on
 //! rounding conventions.
 

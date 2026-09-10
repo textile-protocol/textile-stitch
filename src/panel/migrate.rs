@@ -26,7 +26,7 @@ use crate::panel::inventory::{Bot, Layout, RUN_DIR};
 use crate::panel::provision::{self, bot_container_spec, find_beside, image_of, signer_runtime_at};
 use crate::setup;
 
-/// Suffix of the on-disk slot-nonce ledger, as written by [`crate::slots`]:
+/// Suffix of the on-disk slot-nonce ledger, as written by [`crate::book::slots`]:
 /// `stitch.<chain_id>.<maker_address>.slot-nonces.json`.
 const LEDGER_SUFFIX: &str = ".slot-nonces.json";
 

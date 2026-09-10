@@ -14,11 +14,11 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
-use crate::eip712::maker_session_digest;
+use crate::protocol::eip712::maker_session_digest;
 use crate::signer::DynSigner;
 
-use super::time::unix_ms_now;
 use super::wire::{MakerFrame, SessionAcceptedFrame, SessionFrame, VenueFrame};
+use crate::time::unix_now_ms;
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -165,7 +165,7 @@ async fn handshake(
         .challenge
         .parse()
         .context("venue challenge is not 32-byte hex")?;
-    let issued_at = unix_ms_now();
+    let issued_at = unix_now_ms();
     let digest = maker_session_digest(
         &challenge.domain.name,
         maker_id,

@@ -22,7 +22,7 @@
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 
-use crate::types::OrderParams;
+use crate::protocol::types::OrderParams;
 
 // --- type strings, verbatim from the vendored Solidity ---
 

@@ -19,11 +19,11 @@ use alloy_primitives::{Address, Bytes, U256};
 use anyhow::Context;
 use tracing::{info, warn};
 
-use crate::approve::{buy_input_amount, sell_input_amount};
+use crate::chain::approve::{buy_input_amount, sell_input_amount};
+use crate::chain::rpc::Wallet;
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{parse_liquidity_amount, Config, LiquidityAmount};
-use crate::indexer::Indexer;
-use crate::rpc::Wallet;
+use crate::venue::indexer::Indexer;
 
 /// A side's configured input size: an exact amount, or "max" (whatever the
 /// funded budget allows).

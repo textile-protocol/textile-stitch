@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 
 use crate::net::http_client;
-use crate::submit::SubmitOrder;
+use crate::venue::submit::SubmitOrder;
 
 const SUBMIT_MUTATION: &str = "mutation Submit($input: SubmitFillerOrderInput!) { \
 submitFillerOrder(input: $input) { id rateRay } }";
@@ -177,7 +177,7 @@ impl Indexer {
 
     /// Resting user limit orders (kind=LIMIT) for one corridor direction —
     /// the taker leg's discovery read. Returns the raw rows; parsing and the
-    /// signature re-verification live in [`crate::taker`].
+    /// signature re-verification live in [`crate::book::taker`].
     pub async fn resting_limit_orders(
         &self,
         chain_id: u64,

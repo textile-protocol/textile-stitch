@@ -20,9 +20,9 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::indexer::graphql_url_from_base;
 use crate::net::http_client;
 use crate::setup::CorridorEntry;
+use crate::venue::indexer::graphql_url_from_base;
 
 /// Textile's API origin — where the corridor list lives when nothing overrides it.
 pub const DEFAULT_CORRIDOR_API: &str = "https://api.textilecredit.com";

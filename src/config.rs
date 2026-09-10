@@ -7,8 +7,8 @@ use alloy_primitives::U256;
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::lean::{LeanMode, LeanParams, DEFAULT_BASE_BPS, DEFAULT_WIDE_BPS};
-use crate::quote::Spread;
+use crate::pricing::lean::{LeanMode, LeanParams, DEFAULT_BASE_BPS, DEFAULT_WIDE_BPS};
+use crate::pricing::quote::Spread;
 
 /// Default cap for generated ladder slices per side. Keep this low enough that
 /// one market-maker wallet does not dominate or churn the live order book.
@@ -550,7 +550,7 @@ pub struct PoolConfig {
     // average of the feed instead of the instantaneous value, so the book
     // stops chasing every tick: transient spikes get sold into above the
     // reverting mean instead of picking off a chased quote. See
-    // [`crate::twap`]. -----
+    // [`crate::pricing::twap`]. -----
     /// Rolling TWAP window in seconds (~60-300 is sensible). Omit to quote
     /// off the instantaneous feed (the historical behavior). Longer filters
     /// more noise but lags real moves more.
@@ -583,7 +583,7 @@ pub struct PoolConfig {
     // ----- Inventory-lean quoting. Leans both spreads against the wallet's
     // own inventory so the book self-rebalances and never freezes one-sided,
     // while no quote ever crosses fair (every offset is clamped to the
-    // measured feed-accuracy floor). See [`crate::lean`]. -----
+    // measured feed-accuracy floor). See [`crate::pricing::lean`]. -----
     /// Quote the live book off the lean prices. The pilot feature flag —
     /// revert instantly by setting it back to false and restarting.
     #[serde(default)]
@@ -877,7 +877,7 @@ enum LadderUnits {
 
 /// True when a side would actually draft at least one order.
 ///
-/// For a ladder this asks [`crate::ladder::balanced_ladder`] itself rather than
+/// For a ladder this asks [`crate::book::ladder::balanced_ladder`] itself rather than
 /// re-deriving its preconditions — it returns nothing when `total < min_slice`,
 /// when `min_slice` is 0, and when `max_orders` is 0, and re-implementing that
 /// here is exactly how a guard drifts from the builder.
@@ -906,8 +906,9 @@ fn side_drafts_orders(
         return match amount {
             LiquidityAmount::Max => min > 0 && orders > 0,
             LiquidityAmount::Exact(v) => match units {
-                LadderUnits::SameAsSlice => u128::try_from(v)
-                    .is_ok_and(|t| !crate::ladder::balanced_ladder(t, min, orders).is_empty()),
+                LadderUnits::SameAsSlice => u128::try_from(v).is_ok_and(|t| {
+                    !crate::book::ladder::balanced_ladder(t, min, orders).is_empty()
+                }),
                 // The conversion is `u128`-bounded too (`u256_to_u128` on the
                 // debt equivalent), but the collateral total itself is only
                 // read as `u128` after conversion, so bound the input the same

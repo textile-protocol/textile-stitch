@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Minimal Ethereum JSON-RPC client and a signing [`Wallet`] that lands
 //! transactions: fill nonce, gas, and EIP-1559 fees from the node, sign with
-//! [`crate::tx`], broadcast via `eth_sendRawTransaction`, and (optionally) wait
+//! [`crate::chain::tx`], broadcast via `eth_sendRawTransaction`, and (optionally) wait
 //! for the receipt. Reads go through `eth_call`. Just enough RPC for the
 //! blue-leg closer — no provider framework, same reqwest client the indexer and
 //! subgraph already use.
@@ -12,9 +12,9 @@ use std::time::Duration;
 use alloy_primitives::{hex, Address, Bytes, B256, U256};
 use serde_json::{json, Value};
 
+use crate::chain::tx::{sign_tx, Eip1559Tx};
 use crate::net::http_client;
 use crate::signer::DynSigner;
-use crate::tx::{sign_tx, Eip1559Tx};
 
 /// Default priority fee when the node has no `eth_maxPriorityFeePerGas`: 1 gwei.
 const DEFAULT_PRIORITY_WEI: u64 = 1_000_000_000;
