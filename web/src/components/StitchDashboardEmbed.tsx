@@ -7,9 +7,9 @@ const INITIAL_IFRAME_HEIGHT_PX = 480
 const EMBED_HEIGHT_SOURCE = 'textile-stitch-dashboard'
 const EMBED_HEIGHT_TYPE = 'embed-height'
 
-function dashboardUrl(operatorAddress: string, botName?: string): string {
+function dashboardUrl(wallet: string, botName?: string): string {
   const url = new URL(DATAROOM_STITCH_DASHBOARD)
-  url.searchParams.set('bot', operatorAddress)
+  url.searchParams.set('bot', wallet)
   url.searchParams.set('embed', '1')
   // Browsers often skip navigating an iframe when only the query changes.
   // The panel bot name makes the URL unique per switch so the frame reloads.
@@ -32,22 +32,26 @@ function isEmbedHeightMessage(
 }
 
 /**
- * Production stitch dashboard for one operator wallet, framed without dataroom
+ * Production stitch dashboard for one maker wallet, framed without dataroom
  * chrome (`?embed=1` strips nav + header + bot picker on the remote page).
  * Height follows postMessage from the embed so the panel scrolls, not the iframe.
+ *
+ * `wallet` is whatever the chain sees trading — the OperatorVault for a vault
+ * maker, the bot's own wallet otherwise. The dashboard's maker index is keyed by
+ * that address, so passing the signing key for a vault bot finds nothing.
  */
 export default function StitchDashboardEmbed({
-  operatorAddress,
+  wallet,
   botName,
 }: {
-  operatorAddress: string | null | undefined
+  wallet: string | null | undefined
   botName?: string
 }) {
   const [heightPx, setHeightPx] = useState(INITIAL_IFRAME_HEIGHT_PX)
-  const frameKey = `${botName ?? ''}:${operatorAddress ?? ''}`
+  const frameKey = `${botName ?? ''}:${wallet ?? ''}`
 
   useEffect(() => {
-    if (!operatorAddress) return
+    if (!wallet) return
     setHeightPx(INITIAL_IFRAME_HEIGHT_PX)
 
     function onMessage(event: MessageEvent) {
@@ -59,13 +63,13 @@ export default function StitchDashboardEmbed({
 
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [operatorAddress, botName])
+  }, [wallet, botName])
 
-  if (!operatorAddress) {
+  if (!wallet) {
     return (
       <p className="text-sm text-muted">
-        No operator wallet on this bot&apos;s config. Dashboard stats need the
-        operator address from settings.
+        No maker wallet on this bot&apos;s config. Dashboard stats need either a
+        vault address or the operator address from settings.
       </p>
     )
   }
@@ -75,7 +79,7 @@ export default function StitchDashboardEmbed({
       <iframe
         key={frameKey}
         title="Stitch dashboard"
-        src={dashboardUrl(operatorAddress, botName)}
+        src={dashboardUrl(wallet, botName)}
         className="block w-full border-0"
         style={{ height: heightPx, overflow: 'hidden' }}
       />

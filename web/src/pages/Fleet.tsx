@@ -252,6 +252,14 @@ function BotRow({
           </Tag>
         )}
         {bot.config && <Tag>{bot.config.signer}</Tag>}
+        {/* Capital sits in an OperatorVault, not this bot's own wallet. */}
+        {bot.config?.vaultAddress && (
+          <Tag>
+            <span title={bot.config.vaultAddress}>
+              vault {shortAddress(bot.config.vaultAddress)}
+            </span>
+          </Tag>
+        )}
         <span className="ml-auto font-mono" title={bot.image ?? undefined}>
           {imageLabel(bot.image, bot.version)}
         </span>

@@ -80,6 +80,12 @@ pub struct ConfigBody {
     /// Address page on this chain's explorer, when we know the host and have
     /// an operator address. The panel only surfaces it for a hot wallet.
     pub explorer_url: Option<String>,
+    /// The OperatorVault funding this bot's quotes, when `[vault]` is set. Null
+    /// means the capital sits in the operator wallet itself.
+    pub vault_address: Option<String>,
+    /// Explorer page for `vault_address`. Always safe to link: a vault is a
+    /// contract on the chain, never an offchain MPC identity.
+    pub vault_explorer_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +107,11 @@ impl From<&ConfigSummary> for ConfigBody {
             signer: c.signer.clone(),
             explorer_url: c
                 .operator_address
+                .as_deref()
+                .and_then(|address| crate::setup::address_explorer_url(c.chain_id, address)),
+            vault_address: c.vault_address.clone(),
+            vault_explorer_url: c
+                .vault_address
                 .as_deref()
                 .and_then(|address| crate::setup::address_explorer_url(c.chain_id, address)),
         }

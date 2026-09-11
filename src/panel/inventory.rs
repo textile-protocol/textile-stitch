@@ -224,6 +224,13 @@ pub struct ConfigSummary {
     pub operator_address: Option<String>,
     /// Which signer backend the config selects.
     pub signer: String,
+    /// The OperatorVault this bot makes for, when `[vault]` is set.
+    ///
+    /// Where the trading capital actually sits, which is not the same question as
+    /// which key signs. A vault maker's orders name the vault as swapper and
+    /// recipient, so the vault — not `operator_address` — is the wallet the chain
+    /// (and anything indexing it) attributes the bot's trades to.
+    pub vault_address: Option<String>,
     /// Whether a bot on this config broadcasts transactions from the operator
     /// wallet, rather than only signing orders offchain.
     ///
@@ -743,6 +750,14 @@ pub fn summarise(toml_str: &str, config_path: &Path) -> Result<ConfigSummary> {
         pools: parsed.pools.len(),
         operator_address: operator_address(&signer, config_path),
         signer: signer_label(&signer).to_string(),
+        // Already validated as an address by `from_toml`. Reparsed rather than
+        // copied so the panel reports one spelling whatever casing the operator
+        // typed — same normalisation `operator_address` gets.
+        vault_address: parsed
+            .vault
+            .as_ref()
+            .and_then(|v| v.address.parse::<alloy_primitives::Address>().ok())
+            .map(|a| format!("{a:?}")),
         sends_transactions: parsed
             .pools
             .iter()
@@ -1040,6 +1055,32 @@ mod tests {
             summary.operator_address.as_deref().map(str::to_lowercase),
             Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string())
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_vault_maker_reports_the_vault_as_its_capital() {
+        let (_cfg, root) = test_cfg("vault-summary");
+        let config_path = seed_bot_dir(&root, "bot-v").join("stitch.toml");
+        let toml = std::fs::read_to_string(&config_path).unwrap();
+
+        // No `[vault]`: the capital is the bot's own wallet, nothing to report.
+        let plain = summarise(&toml, &config_path).unwrap();
+        assert_eq!(plain.vault_address, None);
+
+        // `[vault]` is a top-level table header, so appending it can't land inside
+        // the last `[[pools]]` block.
+        let vaulted =
+            format!("{toml}\n[vault]\naddress = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"\n");
+        let summary = summarise(&vaulted, &config_path).unwrap();
+        assert_eq!(
+            summary.vault_address.as_deref(),
+            Some("0x70997970c51812dc3a010c7d01b50e0d17dc79c8"),
+            "the vault address is normalised, whatever casing the operator typed"
+        );
+        // A separate question from who signs: the bot key still signs the orders.
+        assert_eq!(summary.signer, "hot-wallet");
+
         std::fs::remove_dir_all(&root).ok();
     }
 

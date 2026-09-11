@@ -21,6 +21,7 @@ import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import VersionRollback from '../components/VersionRollback'
+import { capitalLocation, dashboardWallet } from '../capital'
 import { formatTimestamp, imageLabel, shortAddress, shortImage } from '../format'
 import { confirmRemovePlan } from '../removeBot'
 import type { Bot, ConfigBody, MigrationResult, UpdatesStatus } from '../types'
@@ -341,7 +342,9 @@ export default function BotDetail() {
 
         <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
           <Detail label="Origin">{bot.origin}</Detail>
-          <Detail label="Layout">{bot.layout}</Detail>
+          <Detail label="Capital">
+            <CapitalLocation config={bot.config} />
+          </Detail>
           <Detail label="Image">
             <span className="font-mono" title={bot.image ?? undefined}>
               {imageLabel(bot.image, bot.version)}
@@ -479,7 +482,7 @@ export default function BotDetail() {
         <StitchDashboardEmbed
           key={name}
           botName={name}
-          operatorAddress={bot.config?.operatorAddress}
+          wallet={dashboardWallet(bot.config)}
         />
       )}
     </div>
@@ -496,15 +499,46 @@ function Detail({ label, children }: { label: string; children: React.ReactNode 
 }
 
 /**
+ * Where this bot's capital sits: `vault` when it makes for an OperatorVault,
+ * else its own wallet. The address is the one the chain sees trading, so a
+ * vault bot shows the vault here and its signing key in the Operator row.
+ */
+function CapitalLocation({ config }: { config: ConfigBody | null }) {
+  const capital = capitalLocation(config)
+  if (!capital) return '—'
+  return (
+    <span className="inline-flex flex-wrap items-center gap-x-1.5">
+      <span>{capital.label}</span>
+      {capital.address && (
+        <AddressLink address={capital.address} explorerUrl={capital.explorerUrl} />
+      )}
+    </span>
+  )
+}
+
+/**
  * Short operator address, with a copy button for the full one. A hot wallet with
  * a known explorer becomes a link to that address page. MPC signers stay plain text.
  */
 function OperatorAddress({ config }: { config: ConfigBody | null }) {
   if (!config?.operatorAddress) return '—'
-  const address = config.operatorAddress
+  return (
+    <AddressLink
+      address={config.operatorAddress}
+      explorerUrl={config.signer === 'hot-wallet' ? config.explorerUrl : null}
+    />
+  )
+}
+
+/** Shortened address + copy button, linked to the explorer when there is one. */
+function AddressLink({
+  address,
+  explorerUrl,
+}: {
+  address: string
+  explorerUrl: string | null
+}) {
   const text = shortAddress(address)
-  const explorerUrl =
-    config.signer === 'hot-wallet' ? config.explorerUrl : null
   return (
     <span className="inline-flex items-center gap-1.5">
       {explorerUrl ? (

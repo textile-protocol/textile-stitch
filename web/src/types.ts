@@ -25,6 +25,13 @@ export interface ConfigBody {
   signer: string
   /** Address page on this chain's explorer, when the host is known. */
   explorerUrl: string | null
+  /**
+   * The OperatorVault funding this bot's quotes, when `[vault]` is set. Null
+   * means the capital sits in the operator wallet itself.
+   */
+  vaultAddress: string | null
+  /** Explorer page for `vaultAddress`. Null with it, or on an unknown chain. */
+  vaultExplorerUrl: string | null
 }
 
 export interface Bot {
