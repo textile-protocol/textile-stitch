@@ -20,10 +20,34 @@ fn price_scaled(price: f64) -> Option<U256> {
     (scaled.is_finite() && scaled > 0.0).then(|| U256::from(scaled as u128))
 }
 
+/// Whether an amount is small enough to quote. Nothing near `U256::MAX /
+/// 10_000` can settle — the reactor's fee controller multiplies amounts by
+/// bps — and the math below is total without this check, so it is policy:
+/// an oversized frame gets a `Size` reject instead of a wasted conversion.
+pub fn is_quotable(amount: U256) -> bool {
+    amount.checked_mul(U256::from(BPS_DENOMINATOR)).is_some()
+}
+
+/// `floor(x × n / d)` for `n <= d`, without ever needing `x × n` in 256 bits.
+/// `U256` operators wrap silently (ruint); the plain product is used while it
+/// fits, and past that the split `q·n + floor(r·n/d)` (with `x = q·d + r`)
+/// is exact because `q·n` is already an integer.
+fn mul_div_floor_nowrap(x: U256, n: U256, d: U256) -> U256 {
+    debug_assert!(n <= d, "split form only holds for n <= d");
+    x.checked_mul(n)
+        .map_or_else(|| (x / d) * n + (x % d) * n / d, |product| product / d)
+}
+
 /// The venue fee the controller injects on top of an output:
 /// `floor(output × fee_bps / 10000)`.
 pub fn fee_on(output: U256, fee_bps: u32) -> U256 {
-    output * U256::from(fee_bps) / U256::from(BPS_DENOMINATOR)
+    mul_div_floor_nowrap(output, U256::from(fee_bps), U256::from(BPS_DENOMINATOR))
+}
+
+/// `output` plus its injected fee, or `None` when the gross does not fit in
+/// 256 bits.
+pub fn gross_of(output: U256, fee_bps: u32) -> Option<U256> {
+    output.checked_add(fee_on(output, fee_bps))
 }
 
 /// Smallest output whose floored fee is at least 1 atomic unit.
@@ -48,9 +72,11 @@ pub struct FittedOutput {
 ///
 /// Exact-input requests cap the taker's gross spend at their sellAmount; the
 /// fee floors, so the naive `cap × 10000 / (10000 + fee_bps)` can undershoot
-/// by a unit or two. Start there and walk up — the floor bounds the walk to a
-/// couple of steps, and leaving even one atomic unit on the table loses
-/// price-priority ties.
+/// by exactly one unit, and leaving even one atomic unit on the table loses
+/// price-priority ties. So: seed there, then try one unit more. Total for
+/// every `cap` — the seed never forms `cap × 10000` (which wraps for caps at
+/// or above `U256::MAX / 10000` and used to leave a walk-up spinning for
+/// ~1e70 iterations on one core), and the fit check is overflow-checked.
 pub fn max_fitting_output(cap: U256, fee_bps: u32) -> FittedOutput {
     if fee_bps == 0 {
         return FittedOutput {
@@ -58,16 +84,19 @@ pub fn max_fitting_output(cap: U256, fee_bps: u32) -> FittedOutput {
             fee: U256::ZERO,
         };
     }
-    let denominator = U256::from(BPS_DENOMINATOR + u64::from(fee_bps));
-    let mut output = cap * U256::from(BPS_DENOMINATOR) / denominator;
-    let fits = |o: U256| o + fee_on(o, fee_bps) <= cap;
-    while fits(output + U256::from(1u8)) {
-        output += U256::from(1u8);
-    }
-    FittedOutput {
-        output,
-        fee: fee_on(output, fee_bps),
-    }
+    let bps = U256::from(BPS_DENOMINATOR);
+    let seed = mul_div_floor_nowrap(cap, bps, bps + U256::from(fee_bps));
+    let fitted = |output: U256| {
+        let fee = fee_on(output, fee_bps);
+        output
+            .checked_add(fee)
+            .is_some_and(|gross| gross <= cap)
+            .then_some(FittedOutput { output, fee })
+    };
+    seed.checked_add(U256::from(1u8))
+        .and_then(fitted)
+        .or_else(|| fitted(seed))
+        .expect("the seed always fits: seed × (10000 + fee_bps) <= cap × 10000")
 }
 
 /// Debt atomic for `collateral` atomic at `price` (debt per collateral,
@@ -81,8 +110,14 @@ pub fn debt_for_collateral(
     let Some(scaled) = price_scaled(price) else {
         return U256::ZERO;
     };
-    collateral * scaled * ten_pow(debt_decimals)
-        / (U256::from(PRICE_SCALE) * ten_pow(collateral_decimals))
+    // Zero on overflow: the responder reads a zero leg as unquotable (Size),
+    // which is the right answer for an amount the settlement cannot carry.
+    collateral
+        .checked_mul(scaled)
+        .and_then(|v| v.checked_mul(ten_pow(debt_decimals)))
+        .map_or(U256::ZERO, |v| {
+            v / (U256::from(PRICE_SCALE) * ten_pow(collateral_decimals))
+        })
 }
 
 /// Collateral atomic for `debt` atomic at `price` (debt per collateral,
@@ -96,8 +131,9 @@ pub fn collateral_for_debt(
     let Some(scaled) = price_scaled(price) else {
         return U256::ZERO;
     };
-    debt * ten_pow(collateral_decimals) * U256::from(PRICE_SCALE)
-        / (scaled * ten_pow(debt_decimals))
+    debt.checked_mul(ten_pow(collateral_decimals))
+        .and_then(|v| v.checked_mul(U256::from(PRICE_SCALE)))
+        .map_or(U256::ZERO, |v| v / (scaled * ten_pow(debt_decimals)))
 }
 
 /// The level rate the venue expects: human debt-per-collateral, RAY (1e27)
@@ -114,6 +150,8 @@ pub fn rate_ray(price: f64, _debt_decimals: u8, _collateral_decimals: u8) -> U25
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::U512;
+
     use super::*;
 
     #[test]
@@ -163,6 +201,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn max_quotable() -> U256 {
+        U256::MAX / U256::from(BPS_DENOMINATOR)
+    }
+
+    /// Widening reference: `floor(x × f / 10000)` in 512 bits.
+    fn wide_fee(x: U256, fee_bps: u32) -> U256 {
+        let wide = U512::from(x) * U512::from(fee_bps) / U512::from(BPS_DENOMINATOR);
+        U256::from(wide)
+    }
+
+    #[test]
+    fn fee_on_never_wraps() {
+        // Above U256::MAX / fee_bps the naive product wraps; the split form
+        // has to agree with the 512-bit reference all the way to the top.
+        for x in [
+            U256::MAX,
+            U256::MAX - U256::from(1u8),
+            U256::MAX / U256::from(3u8),
+            U256::from(1u8) << 255,
+            (U256::from(1u8) << 200) + U256::from(9_999u64),
+        ] {
+            for fee_bps in [1u32, 5, 30, 10_000] {
+                assert_eq!(
+                    fee_on(x, fee_bps),
+                    wide_fee(x, fee_bps),
+                    "x={x} fee={fee_bps}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fee_fit_terminates_and_is_maximal_at_the_top_of_u256() {
+        // Report S-01: `cap × 10000` wrapped for caps at or above
+        // U256::MAX / 10000, the seed came out ~10000× too small, and the
+        // walk-up never returned. These caps must answer immediately and
+        // correctly: the gross fits (checked, so no wrapped "fit"), and one
+        // more unit either overflows or breaks the cap.
+        for cap in [
+            U256::MAX,
+            U256::MAX - U256::from(1u8),
+            max_quotable(),
+            max_quotable() + U256::from(1u8),
+            U256::from(1u8) << 255,
+        ] {
+            for fee_bps in [1u32, 5, 30] {
+                let fit = max_fitting_output(cap, fee_bps);
+                let gross = fit.output.checked_add(fit.fee).expect("gross fits");
+                assert!(gross <= cap, "cap={cap} fee={fee_bps}");
+                assert_eq!(fit.fee, wide_fee(fit.output, fee_bps));
+                let next = fit.output + U256::from(1u8);
+                let next_gross = next.checked_add(wide_fee(next, fee_bps));
+                assert!(
+                    next_gross.map_or(true, |g| g > cap),
+                    "not maximal at cap={cap} fee={fee_bps}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conversions_return_zero_instead_of_wrapping() {
+        // A wrapped product would come out small and look like a fillable
+        // leg; zero is what the responder rejects as Size.
+        assert_eq!(debt_for_collateral(1.0, U256::MAX, 18, 6), U256::ZERO);
+        assert_eq!(collateral_for_debt(1.0, U256::MAX, 6, 18), U256::ZERO);
+        assert_eq!(
+            debt_for_collateral(1.0, max_quotable() + U256::from(1u8), 18, 18),
+            U256::ZERO
+        );
+        // Sane sizes are untouched by the checked path.
+        assert_eq!(
+            debt_for_collateral(1.0, U256::from(1_000_000u64), 6, 6),
+            U256::from(1_000_000u64)
+        );
+    }
+
+    #[test]
+    fn is_quotable_flips_exactly_where_the_bps_product_would_wrap() {
+        assert!(is_quotable(max_quotable()));
+        assert!(!is_quotable(max_quotable() + U256::from(1u8)));
+        assert!(!is_quotable(U256::MAX));
     }
 
     #[test]

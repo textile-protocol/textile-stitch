@@ -15,8 +15,8 @@ use crate::pricing::quote::{ask_price, bid_price, Spread};
 use crate::pricing::tick::is_price_usable;
 
 use super::math::{
-    collateral_for_debt, debt_for_collateral, fee_on, max_fitting_output, min_feeable_output,
-    rate_ray,
+    collateral_for_debt, debt_for_collateral, fee_on, gross_of, is_quotable, max_fitting_output,
+    min_feeable_output, rate_ray,
 };
 use super::wire::{Level, LevelsFrame, QuoteRequestFrame, RejectReason};
 
@@ -165,6 +165,16 @@ pub struct QuotePlan {
     pub buy_amount: U256,
 }
 
+/// A venue-supplied amount string as a quotable `U256`. Unparseable is a
+/// malformed frame (`Busy`); anything the settlement could never carry is
+/// `Size` before it reaches the fee or conversion math.
+fn parse_amount(raw: &str) -> Result<U256, RejectReason> {
+    let amount = raw.parse::<U256>().map_err(|_| RejectReason::Busy)?;
+    is_quotable(amount)
+        .then_some(amount)
+        .ok_or(RejectReason::Size)
+}
+
 /// Price one request against a corridor book at mid `mid` (debt per
 /// collateral, the same feed value the ladder quotes off), given what's
 /// already reserved on each side. Every failure is a wire-ready reject
@@ -234,9 +244,7 @@ pub fn decide_quote(
         // output plus the injected fee must fit under it, and the response
         // echoes the cap verbatim.
         (Some(raw), None) => {
-            let Ok(cap) = raw.parse::<U256>() else {
-                return Err(RejectReason::Busy);
-            };
+            let cap = parse_amount(raw)?;
             let fit = max_fitting_output(cap, req.fee_bps);
             let input = input_for_output(fit.output);
             (input, fit.output, fit.fee, cap)
@@ -244,12 +252,12 @@ pub fn decide_quote(
         // Exact-output: the maker pays exactly buyAmount; the taker's gross is
         // the priced output plus the fee on it.
         (None, Some(raw)) => {
-            let Ok(input) = raw.parse::<U256>() else {
-                return Err(RejectReason::Busy);
-            };
+            let input = parse_amount(raw)?;
             let output = output_for_input(input);
-            let fee = fee_on(output, req.fee_bps);
-            (input, output, fee, output + fee)
+            let Some(gross) = gross_of(output, req.fee_bps) else {
+                return Err(RejectReason::Size);
+            };
+            (input, output, fee_on(output, req.fee_bps), gross)
         }
         // Zero or two amounts — a malformed request.
         _ => return Err(RejectReason::Busy),
@@ -295,10 +303,12 @@ pub fn decide_quote(
         let input = available;
         let output = output_for_input(input);
         let fee = fee_on(output, req.fee_bps);
-        if input.is_zero() || output.is_zero() || fee.is_zero() {
+        let gross = gross_of(output, req.fee_bps);
+        let (Some(gross), false) = (gross, input.is_zero() || output.is_zero() || fee.is_zero())
+        else {
             return Err(RejectReason::Size);
-        }
-        (input, output, fee, output + fee)
+        };
+        (input, output, fee, gross)
     } else {
         (input, output, fee, sell_amount)
     };
@@ -580,6 +590,40 @@ mod tests {
         assert_eq!(plan.output, U256::from(1_000_000_000u64));
         assert_eq!(plan.fee, U256::from(500_000u64));
         assert_eq!(plan.sell_amount, U256::from(1_000_500_000u64));
+    }
+
+    #[test]
+    fn oversized_amounts_are_rejected_before_any_math_runs() {
+        // Report S-01: a sellAmount at or above U256::MAX / 10000 used to wedge
+        // the fee walk-up forever. Both legs bounce it at the parse site; the
+        // bound itself parses but its priced leg overflows the checked
+        // conversion and reads as zero — still Size, never a wrapped small
+        // input the maker would sign. Wider than U256 is a malformed frame.
+        let max_quotable = U256::MAX / U256::from(10_000u64);
+        let too_big = (max_quotable + U256::from(1u8)).to_string();
+        let cases = [
+            (Some(too_big.clone()), None, RejectReason::Size),
+            (Some(U256::MAX.to_string()), None, RejectReason::Size),
+            (None, Some(too_big), RejectReason::Size),
+            (Some(max_quotable.to_string()), None, RejectReason::Size),
+            (Some(format!("{}0", U256::MAX)), None, RejectReason::Busy),
+        ];
+        for (sell, buy, want) in cases {
+            let mut req = request(COLLATERAL, DEBT);
+            req.sell_amount = sell.clone();
+            req.buy_amount = buy.clone();
+            assert_eq!(
+                decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO),
+                Err(want),
+                "sell={sell:?} buy={buy:?}"
+            );
+        }
+        // Merely enormous (1e40, far past any supply) still clamps to capacity
+        // like any other oversized order.
+        let mut req = request(COLLATERAL, DEBT);
+        req.sell_amount = Some(format!("1{}", "0".repeat(40)));
+        let plan = decide(&book(), &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        assert_eq!(plan.input, U256::from(5_000_000_000u64));
     }
 
     #[test]
