@@ -21,7 +21,7 @@ import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import VersionRollback from '../components/VersionRollback'
-import { capitalLocation, dashboardWallet } from '../capital'
+import { capitalLocation, dashboardWallet, fundsFromVault } from '../capital'
 import { formatTimestamp, imageLabel, shortAddress, shortImage } from '../format'
 import { confirmRemovePlan } from '../removeBot'
 import type { Bot, ConfigBody, MigrationResult, UpdatesStatus } from '../types'
@@ -171,6 +171,13 @@ export default function BotDetail() {
   if (!bot && error) return <ErrorState error={error} onRetry={() => void load()} />
   if (!bot) return <Loading what={name} />
 
+  // A vault maker has nothing for this page to approve: Permit2 pulls from the
+  // OperatorVault, which approved both legs in its constructor, and the operator
+  // key only signs. Its wallet allowances would read "not approved" forever and
+  // Approve would grant permission on tokens it never spends — so the allowance
+  // card, the handoff banner and the Approve action all stay hidden.
+  const vaultFunded = fundsFromVault(bot.config)
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
@@ -227,7 +234,7 @@ export default function BotDetail() {
         </Banner>
       )}
 
-      {showPermit2Banner && (
+      {showPermit2Banner && !vaultFunded && (
         <Banner tone="warning" onDismiss={() => setShowPermit2Banner(false)}>
           <div className="space-y-2">
             <p>
@@ -442,18 +449,21 @@ export default function BotDetail() {
           {/*
             Above the runs: what needs approving is the thing an operator came
             here to find out, and it decides whether they press the button at
-            all.
+            all. A vault maker has no such question — see `vaultFunded`.
           */}
-          <Card title="Permit2 allowances">
-            <Permit2Allowances bot={bot.name} refreshKey={approvedAt} />
-          </Card>
+          {!vaultFunded && (
+            <Card title="Permit2 allowances">
+              <Permit2Allowances bot={bot.name} refreshKey={approvedAt} />
+            </Card>
+          )}
           <Card title="One-off runs">
             <OneShotRunner
               bot={bot.name}
               canApprove={bot.canApprove}
               approveBlockedReason={bot.approveBlockedReason}
               approveBlockedBy={bot.approveBlockedBy}
-              highlightPermit2={showPermit2Banner}
+              showApprove={!vaultFunded}
+              highlightPermit2={showPermit2Banner && !vaultFunded}
               onApproved={() => {
                 setShowPermit2Banner(false)
                 setApprovedAt((n) => n + 1)

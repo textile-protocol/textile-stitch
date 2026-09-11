@@ -13,6 +13,7 @@ import {
   Toggle,
 } from './ui'
 import ChangeSigner from './ChangeSigner'
+import { fundsFromVault } from '../capital'
 import { shortAddress } from '../format'
 import type { Bot, Corridor, Settings, Sizing, Spread } from '../types'
 
@@ -452,8 +453,12 @@ function CorridorsCard({
     if (
       !window.confirm(
         `Replace ${bot.name}'s whole config with a different corridor?\n\n` +
-          `Every pair currently configured is dropped and the corridor's preset is written in its place. Your signer is kept; spreads and sizing reset. A running bot is stopped.\n\n` +
-          `Before starting it again, approve the new corridor's tokens under Tools → Permit2 allowances.`,
+          `Every pair currently configured is dropped and the corridor's preset is written in its place. Your signer is kept; spreads and sizing reset. A running bot is stopped.` +
+          // A vault maker has no operator-wallet approvals to run, so pointing at
+          // a card it doesn't show would send someone hunting for nothing.
+          (fundsFromVault(bot.config)
+            ? ''
+            : `\n\nBefore starting it again, approve the new corridor's tokens under Tools → Permit2 allowances.`),
       )
     ) {
       return

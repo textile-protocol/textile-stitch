@@ -24,12 +24,17 @@ const LEVEL_CLASS: Record<LogLevel, string> = {
  * from the same wallet — two processes independently reading the pending nonce can
  * sign the same one, and one of the two transactions is then lost. The API enforces
  * that; `approveBlockedReason` is so the operator reads it instead of clicking.
+ *
+ * A vault maker drops the approval half entirely (`showApprove={false}`) and is
+ * dry run only: its Permit2 grants live on the OperatorVault, not on the wallet
+ * this would approve from.
  */
 export default function OneShotRunner({
   bot,
   canApprove,
   approveBlockedReason,
   approveBlockedBy,
+  showApprove = true,
   highlightPermit2 = false,
   onApproved,
   onStopForApproval,
@@ -39,6 +44,8 @@ export default function OneShotRunner({
   approveBlockedReason: string | null
   /** Live bot spending this wallet's nonce. Stop that one, not necessarily `bot`. */
   approveBlockedBy: string | null
+  /** False for a vault maker: there is nothing on its operator wallet to approve. */
+  showApprove?: boolean
   /** After create: surface the Permit2 + gas requirement up front. */
   highlightPermit2?: boolean
   /** Fired when `stitch approve` exits successfully. */
@@ -128,17 +135,19 @@ export default function OneShotRunner({
         >
           Dry run
         </Button>
-        <Button
-          busy={running === 'approve'}
-          disabled={running !== null || !canApprove}
-          onClick={() => run('approve')}
-          title={
-            approveBlockedReason ??
-            'Approve input tokens to Permit2. Sends transactions and costs gas.'
-          }
-        >
-          Approve allowances
-        </Button>
+        {showApprove && (
+          <Button
+            busy={running === 'approve'}
+            disabled={running !== null || !canApprove}
+            onClick={() => run('approve')}
+            title={
+              approveBlockedReason ??
+              'Approve input tokens to Permit2. Sends transactions and costs gas.'
+            }
+          >
+            Approve allowances
+          </Button>
+        )}
         {running && (
           <Button
             variant="ghost"
@@ -153,12 +162,21 @@ export default function OneShotRunner({
       </div>
 
       <p className="text-xs text-faint">
-        Both run in a throwaway container with this bot&apos;s own config and key. A
-        dry run posts nothing; Approve allowances sends Permit2 approval
-        transactions and costs a little gas.
+        {showApprove ? (
+          <>
+            Both run in a throwaway container with this bot&apos;s own config and
+            key. A dry run posts nothing; Approve allowances sends Permit2
+            approval transactions and costs a little gas.
+          </>
+        ) : (
+          <>
+            Runs in a throwaway container with this bot&apos;s own config and key,
+            and posts nothing.
+          </>
+        )}
       </p>
 
-      {!canApprove && approveBlockedReason && (
+      {showApprove && !canApprove && approveBlockedReason && (
         <Banner tone="warning">
           <div className="space-y-2">
             <p>{approveBlockedReason}</p>

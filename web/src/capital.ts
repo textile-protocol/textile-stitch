@@ -52,3 +52,16 @@ export function dashboardWallet(
 ): string | null {
   return capitalLocation(config)?.address ?? null
 }
+
+/**
+ * True when this bot's quotes fund from an OperatorVault.
+ *
+ * Permit2 then belongs to the vault, which approved both legs in its own
+ * constructor. The operator key only signs, so its allowances say nothing about
+ * whether the bot can fill — which is why the bot skips the strategy-wallet
+ * Permit2 preflight on a live start when `[vault]` is set, and why the panel
+ * has no approvals to show or send for one.
+ */
+export function fundsFromVault(config: ConfigBody | null | undefined): boolean {
+  return !!config?.vaultAddress
+}
