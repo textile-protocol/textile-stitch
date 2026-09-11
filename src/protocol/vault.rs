@@ -110,6 +110,31 @@ pub fn apply_vault_order_policy(
     (settlement, corridor_qty)
 }
 
+/// How much settlement the bot may publish and sign for, given how its
+/// orders will be filled.
+///
+/// `quotableSettlement()` prices the vault's whole economic inventory: what
+/// sits idle in the vault plus what `allocateIdle` has parked in the yield
+/// adapter (Aave). `liquidSettlement()` is only the idle part — the balance a
+/// plain Permit2 pull can reach, and what `VaultPolicy.validateEnvelope` caps
+/// a settlement-input order at when it runs.
+///
+/// Whether the adapter position counts depends on the route, not the vault.
+/// A fill through the chain's `VaultOrderExecutor` calls `prepareSettlement`
+/// before the reactor's Permit2 pull, so by the time the envelope is checked
+/// the adapter position is back in the vault and only the economic figure
+/// binds. A direct `reactor.execute` never recalls, so anything above liquid
+/// reverts on the pull. Publishing the liquid figure for an executor-routed
+/// vault pins a mostly-staked vault to its idle floor — a vault holding 2
+/// USDT with 1.99 in Aave would advertise 0.01 — and takes it off the market.
+pub fn quotable_settlement_for_route(quotable: U256, liquid: U256, executor_routed: bool) -> U256 {
+    if executor_routed {
+        quotable
+    } else {
+        quotable.min(liquid)
+    }
+}
+
 /// Clamp a requested deadline to `now + maxOrderLifetime`. None if that
 /// leaves no usable life.
 pub fn clamp_vault_deadline(
@@ -181,6 +206,39 @@ mod tests {
         assert_eq!(
             &encode_max_order_lifetime(),
             &hex::decode("9c454e9d").unwrap()
+        );
+    }
+
+    #[test]
+    fn executor_routed_vaults_quote_the_adapter_position_too() {
+        // 2 USDT of economic inventory, 0.01 idle, the rest in Aave.
+        let quotable = U256::from(2_000_000u64);
+        let liquid = U256::from(10_000u64);
+        assert_eq!(
+            quotable_settlement_for_route(quotable, liquid, true),
+            quotable,
+            "the executor unstakes before the Permit2 pull, so the whole position is fillable"
+        );
+        assert_eq!(
+            quotable_settlement_for_route(quotable, liquid, false),
+            liquid,
+            "a direct reactor fill can only pull what is idle"
+        );
+    }
+
+    #[test]
+    fn the_direct_route_never_publishes_more_than_quotable() {
+        // Liquid above quotable happens when minReserveSettlement bites:
+        // quotable nets the reserve out, liquid does not.
+        let quotable = U256::from(500u64);
+        let liquid = U256::from(900u64);
+        assert_eq!(
+            quotable_settlement_for_route(quotable, liquid, false),
+            quotable
+        );
+        assert_eq!(
+            quotable_settlement_for_route(quotable, liquid, true),
+            quotable
         );
     }
 

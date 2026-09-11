@@ -90,10 +90,13 @@ pub struct VaultConfig {
     pub address: String,
     /// The chain's VaultOrderExecutor. Listed beside the taker as a preferred
     /// filler, so the taker can fill through the executor, which unstakes
-    /// yield-deployed settlement before the Permit2 pull. The executor only
-    /// accepts the bound taker as caller, so listing it does not open the
-    /// order up. The venue rejects the two-entry binding on a chain where it
-    /// has no executor, so leave this unset until ops publishes the address.
+    /// yield-deployed settlement before the Permit2 pull. With it set the bot
+    /// quotes the vault's whole settlement position, staked part included;
+    /// without it only the idle balance is quotable, because a direct reactor
+    /// fill cannot recall from the adapter. The executor only accepts the
+    /// bound taker as caller, so listing it does not open the order up. The
+    /// venue rejects the two-entry binding on a chain where it has no
+    /// executor, so leave this unset until ops publishes the address.
     #[serde(default)]
     pub order_executor: Option<String>,
 }

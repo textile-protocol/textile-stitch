@@ -64,7 +64,8 @@ use crate::protocol::vault::{
     encode_corridor_asset, encode_liquid_settlement, encode_max_order_input_corridor,
     encode_max_order_input_settlement, encode_max_order_lifetime, encode_paused,
     encode_quotable_corridor, encode_quotable_settlement, encode_settlement_asset,
-    encode_trading_epoch, trading_nonce, vault_nonce_low, VaultQuotePolicy,
+    encode_trading_epoch, quotable_settlement_for_route, trading_nonce, vault_nonce_low,
+    VaultQuotePolicy,
 };
 use crate::time::unix_now_ms;
 use iso8601::{format_iso_ms, parse_iso_ms};
@@ -457,6 +458,7 @@ async fn run(rt: RfqRuntime) {
             tokens,
             inventory.clone(),
             rt.vault,
+            rt.vault_order_executor,
             rt.trading_epoch.clone(),
             rt.vault_policy.clone(),
         ));
@@ -1566,12 +1568,14 @@ async fn read_funded(wallet: &Wallet, permit2: Address, token: Address) -> anyho
 /// Refresh quotable amounts for every `max` token, once a second. A failed
 /// read leaves the previous value in place; the TTL then fails the side
 /// closed instead of quoting a stale high balance forever.
+#[allow(clippy::too_many_arguments)]
 async fn inventory_loop(
     wallet: Wallet,
     permit2: Address,
     tokens: Vec<Address>,
     cache: InventoryCache,
     vault: Option<Address>,
+    vault_order_executor: Option<Address>,
     trading_epoch: Arc<RwLock<u64>>,
     vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
 ) {
@@ -1589,7 +1593,16 @@ async fn inventory_loop(
             }
         }
         if let Some((address, settlement, corridor, max_lifetime)) = vault_pair {
-            match read_vault_inventory(&wallet, permit2, address, settlement, corridor).await {
+            match read_vault_inventory(
+                &wallet,
+                permit2,
+                address,
+                vault_order_executor,
+                settlement,
+                corridor,
+            )
+            .await
+            {
                 Ok((settlement_qty, corridor_qty, epoch, max_settlement, max_corridor)) => {
                     // Stamp after the RPC batch. A pre-read clock can already
                     // exceed INVENTORY_TTL_SECS on a slow endpoint, which would
@@ -1664,21 +1677,30 @@ async fn read_vault_inventory(
     wallet: &Wallet,
     permit2: Address,
     vault: Address,
+    order_executor: Option<Address>,
     settlement: Address,
     corridor: Address,
 ) -> anyhow::Result<(U256, U256, u64, U256, U256)> {
-    let settlement_qty = wallet
+    let quotable_settlement = wallet
         .read_uint(vault, &Bytes::from(encode_quotable_settlement()))
         .await
         .context("reading quotableSettlement")?;
-    // Quotable prices liquid + yield-adapter holdings, but validateEnvelope
-    // admits settlement input only up to min(quotable, liquid). Publishing the
+    // Quotable prices liquid + yield-adapter holdings. validateEnvelope admits
+    // settlement input only up to min(quotable, liquid) *at fill time*: with
+    // an executor listed on the order, `VaultOrderExecutor.fill` recalls from
+    // the adapter first, so the whole position is fillable and publishing
+    // only the liquid part would hide a staked vault's inventory. Without one
+    // the fill is a direct reactor call that cannot recall, so publishing the
     // larger number signs sizes the vault will reject.
     let liquid_settlement = wallet
         .read_uint(vault, &Bytes::from(encode_liquid_settlement()))
         .await
         .context("reading liquidSettlement")?;
-    let settlement_qty = settlement_qty.min(liquid_settlement);
+    let settlement_qty = quotable_settlement_for_route(
+        quotable_settlement,
+        liquid_settlement,
+        order_executor.is_some(),
+    );
     let corridor_qty = wallet
         .read_uint(vault, &Bytes::from(encode_quotable_corridor()))
         .await
