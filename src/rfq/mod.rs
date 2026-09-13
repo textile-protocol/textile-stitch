@@ -387,6 +387,80 @@ fn book_for_request<'a>(
         .or_else(|| books.iter().find(|b| b.slug == req.corridor_id))
 }
 
+/// The wallet *this* session's orders are attributed to, or `None` when the
+/// venue has not said unambiguously.
+///
+/// The venue only guarantees `(chainId, fundingWallet)` unique, so one maker
+/// can hold several slots on a chain and the list is not a lookup by chain
+/// alone. The authenticated signer is what picks the slot — it is the key that
+/// just proved itself in the handshake — so bind on it. Taking the first slot
+/// for the chain instead would refuse a perfectly valid second bot with a
+/// mismatch that is really the bot reading someone else's row.
+///
+/// Falling back to a lone slot keeps the check armed against a venue that
+/// predates `signingAddress`. Several slots and none naming this signer is the
+/// one case with no answer, and an unarmed check beats a wrong refusal: the
+/// venue already vouched for the session, so refusing here would take a
+/// working maker off the market over a list the bot cannot read.
+fn venue_funding_wallet(accepted: &wire::SessionAcceptedFrame, chain_id: u64) -> Option<Address> {
+    let on_chain: Vec<&wire::MakerWalletFrame> = accepted
+        .funding_wallets
+        .iter()
+        .filter(|w| w.chain_id == chain_id)
+        .collect();
+    if let Ok(signer) = accepted.signing_address.parse::<Address>() {
+        let bound = on_chain.iter().find(|w| {
+            w.signing_address
+                .as_deref()
+                .and_then(|s| s.parse::<Address>().ok())
+                == Some(signer)
+        });
+        if let Some(w) = bound {
+            return w.funding_wallet.parse().ok();
+        }
+    }
+    match on_chain.as_slice() {
+        [only] => only.funding_wallet.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Why this session must not quote, or `None` when it may.
+///
+/// The venue attributes every order to the funding wallet on the maker record
+/// the credential names — not to `[vault].address`. Those are set in different
+/// places: the wallet is fixed when the bot enrolls, the vault address is a
+/// line in stitch.toml. Point `[vault].address` at a newly deployed vault
+/// without re-enrolling and the bot keeps its old maker id, so it reads the
+/// new vault's inventory and publishes it as the old vault's — levels carry no
+/// vault, so nothing downstream can tell. A `restricted=<new vault>` swap then
+/// answers `no_restricted_liquidity` against a bot that looks perfectly
+/// healthy, while an unrestricted fill would be signed for a vault whose
+/// balance was never the one quoted.
+///
+/// A vault maker therefore refuses the session outright rather than quoting
+/// someone else's inventory. An EOA maker has nothing to compare — its funding
+/// wallet is the signing key — and a venue that does not send the field at all
+/// leaves the check unarmed rather than breaking the older pairing.
+fn vault_session_mismatch(
+    accepted: &wire::SessionAcceptedFrame,
+    chain_id: u64,
+    vault: Option<Address>,
+) -> Option<String> {
+    let vault = vault?;
+    let funding = venue_funding_wallet(accepted, chain_id)?;
+    if funding == vault {
+        return None;
+    }
+    Some(format!(
+        "maker {} funds from {funding} on chain {chain_id}, but [vault].address is {vault}. \
+         Quoting would publish this vault's inventory as {funding}'s. Re-enroll the bot \
+         against the vault (Connect in the Stitch panel) and put the maker id it issues in \
+         [rfq].maker_id.",
+        accepted.maker_id
+    ))
+}
+
 /// Map a configured pool onto a venue-assigned slug. Token match wins so a
 /// leftover `rfq_corridor` typo cannot hide a pair the venue already routed.
 fn bind_assigned_book(
@@ -929,6 +1003,11 @@ async fn session_loop_inner(
         mut stream,
         accepted,
     } = authed;
+
+    if let Some(issue) = vault_session_mismatch(&accepted, rt.chain_id, rt.vault) {
+        error!("{issue}");
+        return (Err(anyhow::anyhow!("{issue}")), reservations);
+    }
 
     // Bind each pool to a venue slug: tokens first, then a configured label.
     let books: Vec<CorridorBook> = rt
@@ -1755,7 +1834,7 @@ mod tests {
     use crate::pricing::quote::Spread;
     use crate::signer::{recover_address, LocalSigner};
     use crate::time::unix_now;
-    use alloy_primitives::U256;
+    use alloy_primitives::{address, U256};
     use k256::ecdsa::SigningKey;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
@@ -2492,7 +2571,124 @@ mod tests {
             heartbeat_timeout_ms: 5_000,
             corridors: corridors.iter().map(|s| (*s).to_string()).collect(),
             corridor_pairs: pairs,
+            funding_wallets: Vec::new(),
         }
+    }
+
+    const A_VAULT: Address = address!("f23712874ab6f973c2761cbfc608529da81d7ae2");
+    const ANOTHER_VAULT: Address = address!("4eae04aa25157d35684e958ed0fc22790729be60");
+
+    /// One slot on `chain_id`, naming no signer — the shape an older venue sends.
+    fn accepted_funding(chain_id: u64, wallet: &str) -> wire::SessionAcceptedFrame {
+        let mut a = accepted(&[], Vec::new());
+        a.funding_wallets = vec![wire::MakerWalletFrame {
+            chain_id,
+            funding_wallet: wallet.into(),
+            signing_address: None,
+        }];
+        a
+    }
+
+    /// Several slots on one chain, each naming the signer bound to it, and a
+    /// session authenticated as `signer`.
+    fn accepted_slots(signer: &str, slots: &[(u64, &str, &str)]) -> wire::SessionAcceptedFrame {
+        let mut a = accepted(&[], Vec::new());
+        a.signing_address = signer.into();
+        a.funding_wallets = slots
+            .iter()
+            .map(|(chain_id, funding, signing)| wire::MakerWalletFrame {
+                chain_id: *chain_id,
+                funding_wallet: (*funding).into(),
+                signing_address: Some((*signing).to_string()),
+            })
+            .collect();
+        a
+    }
+
+    #[test]
+    fn a_vault_session_on_the_matching_funding_wallet_quotes() {
+        let a = accepted_funding(56, "0xf23712874ab6f973C2761cbFc608529da81D7ae2");
+        assert!(vault_session_mismatch(&a, 56, Some(A_VAULT)).is_none());
+    }
+
+    #[test]
+    fn a_vault_repointed_without_re_enrolling_refuses_the_session() {
+        // stitch.toml moved to the new vault; the maker id still funds from
+        // the old one, so every level would be published as the old vault's.
+        let a = accepted_funding(56, "0x4Eae04Aa25157D35684e958Ed0fC22790729bE60");
+        let issue = vault_session_mismatch(&a, 56, Some(A_VAULT)).expect("mismatch");
+        assert!(issue.contains("Re-enroll"));
+        assert!(issue.to_lowercase().contains("4eae04aa"));
+    }
+
+    #[test]
+    fn an_eoa_maker_has_nothing_to_compare() {
+        let a = accepted_funding(56, "0x4Eae04Aa25157D35684e958Ed0fC22790729bE60");
+        assert!(vault_session_mismatch(&a, 56, None).is_none());
+    }
+
+    #[test]
+    fn a_venue_that_sends_no_binding_leaves_the_check_unarmed() {
+        // Older venue: absent is "cannot check", not "mismatch" — refusing
+        // would take every vault maker off the market on a rollback.
+        let a = accepted(&[], Vec::new());
+        assert!(vault_session_mismatch(&a, 56, Some(A_VAULT)).is_none());
+        // Same for a binding that covers other chains only.
+        let other = accepted_funding(8453, "0xf23712874ab6f973C2761cbFc608529da81D7ae2");
+        assert!(vault_session_mismatch(&other, 56, Some(ANOTHER_VAULT)).is_none());
+    }
+
+    const SIGNER_A: &str = "0x1b67b8a0fADdE796fFdA75c7932AcBd0a54ca0d3";
+    const SIGNER_B: &str = "0x000000000000000000000000000000000000BbBb";
+
+    #[test]
+    fn a_second_slot_on_the_chain_does_not_refuse_the_bot_bound_to_the_other() {
+        // The venue only holds (chainId, fundingWallet) unique, so one maker
+        // can carry both vaults on one chain. Taking the first slot for the
+        // chain refused whichever bot happened to sort second.
+        let a = accepted_slots(
+            SIGNER_A,
+            &[
+                (56, "0x4Eae04Aa25157D35684e958Ed0fC22790729bE60", SIGNER_B),
+                (56, "0xf23712874ab6f973C2761cbFc608529da81D7ae2", SIGNER_A),
+            ],
+        );
+        assert!(vault_session_mismatch(&a, 56, Some(A_VAULT)).is_none());
+    }
+
+    #[test]
+    fn the_mismatch_names_the_slot_this_signer_is_bound_to() {
+        // Signer B funds from the old vault, so pointing its stitch.toml at
+        // the new one is still a mismatch — and the message must name B's
+        // wallet, not whichever slot came first.
+        let a = accepted_slots(
+            SIGNER_B,
+            &[
+                (56, "0xf23712874ab6f973C2761cbFc608529da81D7ae2", SIGNER_A),
+                (56, "0x4Eae04Aa25157D35684e958Ed0fC22790729bE60", SIGNER_B),
+            ],
+        );
+        let issue = vault_session_mismatch(&a, 56, Some(A_VAULT)).expect("mismatch");
+        assert!(issue.to_lowercase().contains("4eae04aa"));
+    }
+
+    #[test]
+    fn several_slots_and_no_signer_match_leaves_the_check_unarmed() {
+        // Nothing says which slot is ours; refusing would take a maker the
+        // venue already authenticated off the market.
+        let mut a = accepted_slots(
+            SIGNER_A,
+            &[
+                (56, "0x4Eae04Aa25157D35684e958Ed0fC22790729bE60", SIGNER_B),
+                (56, "0x000000000000000000000000000000000000cCcC", SIGNER_B),
+            ],
+        );
+        assert!(vault_session_mismatch(&a, 56, Some(A_VAULT)).is_none());
+        // Same when the venue predates the per-slot signer entirely.
+        for w in &mut a.funding_wallets {
+            w.signing_address = None;
+        }
+        assert!(vault_session_mismatch(&a, 56, Some(A_VAULT)).is_none());
     }
 
     #[test]

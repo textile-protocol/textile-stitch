@@ -148,6 +148,14 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # The vault approves Permit2 for both legs in its constructor, so there is no
 # approval step here — `stitch approve` is for an EOA maker and is a no-op for
 # a vault. The public ladder must stay off.
+#
+# Changing `address` is not enough to move to a different vault. The venue
+# attributes orders to the funding wallet on the maker id in [rfq], which is
+# fixed at Connect — so a bot pointed at a new vault without re-enrolling
+# quotes the new vault's inventory as the old vault's, and a
+# `restricted=<new vault>` swap sees no liquidity. Connect again in the panel
+# and use the maker id it issues. The bot refuses the session rather than
+# quote through the mismatch.
 # [vault]
 # address = "0xYourOperatorVault"
 # order_executor = "0x0000000000000000000000000000000000000000"  # optional: the chain's VaultOrderExecutor, once the venue lists one.

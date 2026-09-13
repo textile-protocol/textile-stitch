@@ -58,6 +58,23 @@ pub struct CorridorPairFrame {
     pub debt_token: String,
 }
 
+/// A wallet slot the venue holds for this maker. For a vault maker
+/// `funding_wallet` is the OperatorVault and `signing_address` is its strategy
+/// signer; for an EOA maker the two are the same address.
+///
+/// A maker is not limited to one slot per chain — the only uniqueness the
+/// venue enforces is `(chainId, fundingWallet)` — so `signing_address` is what
+/// says which slot the session that just authenticated belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MakerWalletFrame {
+    pub chain_id: u64,
+    pub funding_wallet: String,
+    /// Absent from a venue that predates the field.
+    #[serde(default)]
+    pub signing_address: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAcceptedFrame {
@@ -70,6 +87,11 @@ pub struct SessionAcceptedFrame {
     /// Additive: tokens per slug so the bot can bind without `rfq_corridor`.
     #[serde(default)]
     pub corridor_pairs: Vec<CorridorPairFrame>,
+    /// Additive: the wallet every order this session signs is attributed to.
+    /// Empty from a venue that predates the field, which reads as "cannot
+    /// check" rather than "mismatch".
+    #[serde(default)]
+    pub funding_wallets: Vec<MakerWalletFrame>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
