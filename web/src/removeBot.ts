@@ -19,7 +19,7 @@ export function confirmRemovePlan(opts: {
   if (hasContainer) {
     if (
       !window.confirm(
-        `Remove ${name} from the fleet?\n\nThis deletes the container, config, and private key. Cannot be undone.\n\nOK removes it. Cancel aborts — nothing is removed.`,
+        `Remove ${name} from the fleet?\n\nThis deletes the container, config, and private key. Cannot be undone.\n\nThe panel has checked the tokens this bot trades and the gas coin. Anything else sent to this wallet is lost with the key.\n\nOK removes it. Cancel aborts — nothing is removed.`,
       )
     ) {
       return null
@@ -29,7 +29,7 @@ export function confirmRemovePlan(opts: {
 
   if (
     !window.confirm(
-      `Delete ${name}'s config and private key?\n\nThere is no container. This removes it from the fleet and cannot be undone.`,
+      `Delete ${name}'s config and private key?\n\nThere is no container. This removes it from the fleet and cannot be undone.\n\nThe panel has checked the tokens this bot trades and the gas coin. Anything else sent to this wallet is lost with the key.`,
     )
   ) {
     return null

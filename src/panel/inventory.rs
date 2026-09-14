@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
-use crate::panel::config::PanelConfig;
+use crate::panel::config::{PanelConfig, PanelRuntime};
 use crate::panel::docker::{ContainerInfo, ContainerState, MountInfo};
 use crate::panel::naming::{
     id_from_container_name, LABEL_BOT, LABEL_COMPOSE_PROJECT, LABEL_COMPOSE_SERVICE, LABEL_ONE_SHOT,
@@ -217,6 +217,12 @@ pub struct ConfigSummary {
     pub corridor_id: Option<String>,
     /// Human label, e.g. "cNGN / USDT on BNB Smart Chain".
     pub corridor_label: Option<String>,
+    /// Every pair this bot quotes, in pool order: "cNGN / USDT", "wBRL / USDT".
+    /// The fleet list shows these one by one, so a bot with three corridors
+    /// reads as three pairs rather than "3 corridors".
+    pub pairs: Vec<String>,
+    /// "Celo", "BNB Smart Chain"; None for a chain the catalog does not name.
+    pub network_label: Option<String>,
     pub chain_id: u64,
     pub pools: usize,
     /// The signing address. Derived from the key file for a hot wallet, read from
@@ -240,6 +246,25 @@ pub struct ConfigSummary {
     /// a second process holding the same key unsafe to run concurrently, so the
     /// panel needs to know before it offers one.
     pub sends_transactions: bool,
+    /// Where this bot stands with Textile's RFQ venue, from the config and the
+    /// files beside it alone. No venue call: asking the venue rewrites the
+    /// config on a seated bot, so this is what can be known without asking.
+    pub venue: VenueSeat,
+}
+
+/// A running process is not the same as a bot Textile sends quotes to. This
+/// is the second half, so the page can say "live" only when both are true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VenueSeat {
+    /// No maker credential on disk: Connect never ran (or was undone).
+    NotConnected,
+    /// Registered (credential + maker id), but `rfq_enabled` is off: the
+    /// email is unconfirmed, the maker is flagged, or no corridor is assigned.
+    /// The config cannot tell those apart; the venue can.
+    Waiting,
+    /// Registered and `rfq_enabled`: Textile routes quote requests here.
+    Seated,
 }
 
 /// One bot in the fleet.
@@ -549,7 +574,7 @@ fn bot_from_container(c: &ContainerInfo, cfg: &PanelConfig) -> Bot {
 
     let config = config_panel_path
         .as_ref()
-        .and_then(|p| read_summary(p, &mut warnings));
+        .and_then(|p| read_summary(p, cfg.runtime, &mut warnings));
 
     Bot {
         name,
@@ -590,7 +615,7 @@ fn panel_native_config(origin: &Origin, name: &str, cfg: &PanelConfig) -> Option
 fn bot_from_config_dir(name: &str, cfg: &PanelConfig) -> Bot {
     let panel_path = cfg.bot_dir(name).join("stitch.toml");
     let mut warnings = Vec::new();
-    let config = read_summary(&panel_path, &mut warnings);
+    let config = read_summary(&panel_path, cfg.runtime, &mut warnings);
     Bot {
         name: name.to_string(),
         origin: Origin::ConfigOnly,
@@ -666,7 +691,11 @@ pub fn config_host_path(mounts: &[MountInfo]) -> Option<PathBuf> {
 }
 
 /// Read and summarise a config, recording why it failed rather than dropping it.
-fn read_summary(path: &Path, warnings: &mut Vec<Warning>) -> Option<ConfigSummary> {
+fn read_summary(
+    path: &Path,
+    runtime: PanelRuntime,
+    warnings: &mut Vec<Warning>,
+) -> Option<ConfigSummary> {
     // Worth naming before the read fails with a bare "Is a directory (os error 21)",
     // because the cause is not obvious and the fix is a one-liner. Docker creates a
     // bind mount's source as a directory when it doesn't exist, so a config that has
@@ -693,7 +722,7 @@ fn read_summary(path: &Path, warnings: &mut Vec<Warning>) -> Option<ConfigSummar
             return None;
         }
     };
-    match summarise(&text, path) {
+    match summarise(&text, path, runtime) {
         Ok(s) => Some(s),
         Err(e) => {
             warnings.push(Warning::ConfigInvalid {
@@ -732,7 +761,11 @@ fn fleet_corridor_label(
 /// `config_path` is the toml itself, not its parent: a flat-layout bot's key is
 /// named after the config (`stitch.bot1.key`), and looking in the parent for a
 /// canonical `stitch.key` would either miss it or pick up an unrelated bot's.
-pub fn summarise(toml_str: &str, config_path: &Path) -> Result<ConfigSummary> {
+pub fn summarise(
+    toml_str: &str,
+    config_path: &Path,
+    runtime: PanelRuntime,
+) -> Result<ConfigSummary> {
     let parsed = crate::config::Config::from_toml(toml_str)?;
     // Stamped identity first, catalog second — a corridor listed after this
     // release is in no catalog this binary carries, and reporting it as null
@@ -748,6 +781,30 @@ pub fn summarise(toml_str: &str, config_path: &Path) -> Result<ConfigSummary> {
         ),
         chain_id: parsed.chain_id,
         pools: parsed.pools.len(),
+        pairs: parsed
+            .pools
+            .iter()
+            .map(|p| {
+                setup::catalog::pool_identity(parsed.chain_id, p)
+                    .map(|c| c.display_name)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{} / {}",
+                            setup::short_addr(&p.collateral),
+                            setup::short_addr(&p.debt)
+                        )
+                    })
+            })
+            .collect(),
+        network_label: corridor
+            .as_ref()
+            .map(|c| c.network_label.clone())
+            .or_else(|| {
+                setup::catalog()
+                    .iter()
+                    .find(|c| c.chain_id == parsed.chain_id)
+                    .map(|c| c.network_label.to_string())
+            }),
         operator_address: operator_address(&signer, config_path),
         signer: signer_label(&signer).to_string(),
         // Already validated as an address by `from_toml`. Reparsed rather than
@@ -762,7 +819,60 @@ pub fn summarise(toml_str: &str, config_path: &Path) -> Result<ConfigSummary> {
             .pools
             .iter()
             .any(|p| p.limit_taker_enabled() || p.closer_enabled()),
+        venue: venue_seat(&parsed, config_path, runtime),
     })
+}
+
+/// Whether an RFQ credential reaches this bot's process. Asks the same
+/// question the RFQ runtime will, not just "did Connect write `rfq-api.key`",
+/// but only counts sources that reach *this* bot's process: the env answer is
+/// runtime-specific. Shared by the Start guard and the state pill, so the two
+/// never disagree about whether a bot is connected.
+pub fn rfq_key_reaches_bot(
+    cfg: &crate::config::Config,
+    path: &Path,
+    runtime: PanelRuntime,
+) -> bool {
+    cfg.rfq.as_ref().is_some_and(|r| {
+        crate::rfq::api_key_configured(&r.api_key_env, path.parent(), |name| match runtime {
+            // `bot_container_spec` hands the container an explicitly built env
+            // list: it neither sources the bot's stitch.env nor inherits the
+            // panel's own environment. So for Docker the sibling rfq-api.key
+            // (mounted into the run dir, and what `with_rfq_key_env` keys off)
+            // is the only credential that reaches the child — counting env vars
+            // here would green-light a Start that then can't quote.
+            PanelRuntime::Docker => None,
+            // The process runtime applies the bot's stitch.env to the child and
+            // the child inherits the panel's environment. A key present in
+            // stitch.env wins even when blank: `apply_env_file` sets it either
+            // way, so an explicit blank *overrides* the inherited variable and
+            // the child sees nothing.
+            PanelRuntime::Process => crate::panel::provision::env_assignment(path, name)
+                .or_else(|| std::env::var(name).ok()),
+        })
+    })
+}
+
+/// See [`VenueSeat`]. The credential lives beside the config, in the same
+/// directory `read_rfq_api_key` reads from.
+fn venue_seat(
+    parsed: &crate::config::Config,
+    config_path: &Path,
+    runtime: PanelRuntime,
+) -> VenueSeat {
+    let registered = parsed
+        .rfq
+        .as_ref()
+        .is_some_and(|r| !r.maker_id.trim().is_empty())
+        && rfq_key_reaches_bot(parsed, config_path, runtime);
+    if !registered {
+        return VenueSeat::NotConnected;
+    }
+    if parsed.rfq.as_ref().is_some_and(|r| r.enabled) {
+        VenueSeat::Seated
+    } else {
+        VenueSeat::Waiting
+    }
 }
 
 /// The bot's signing address. MPC configs state it outright; a hot wallet's is
@@ -1059,20 +1169,84 @@ mod tests {
     }
 
     #[test]
+    fn the_venue_seat_comes_from_the_credential_and_the_flag() {
+        let (_cfg, root) = test_cfg("venue-seat");
+        let dir = seed_bot_dir(&root, "bot-r");
+        let config_path = dir.join("stitch.toml");
+        let toml = std::fs::read_to_string(&config_path).unwrap();
+
+        // Fresh out of the wizard: no [rfq], no credential.
+        assert_eq!(
+            summarise(&toml, &config_path, PanelRuntime::Docker)
+                .unwrap()
+                .venue,
+            VenueSeat::NotConnected
+        );
+
+        // Registered but not yet seated: maker id + credential, flag off.
+        let rfq = |enabled: bool| {
+            format!(
+                "{toml}\n[rfq]\nenabled = {enabled}\nurl = \"wss://x/v2/maker/stream\"\n\
+                 maker_id = \"cmu1\"\nvalidation_contract = \
+                 \"0x10B9EbA3a175Df418a35CB8329a527691EE258C5\"\n"
+            )
+        };
+        assert_eq!(
+            summarise(&rfq(false), &config_path, PanelRuntime::Docker)
+                .unwrap()
+                .venue,
+            VenueSeat::NotConnected,
+            "a maker id without the credential file is not a registration"
+        );
+        setup::write_rfq_api_key(&dir, "tx_live_test").unwrap();
+        assert_eq!(
+            summarise(&rfq(false), &config_path, PanelRuntime::Docker)
+                .unwrap()
+                .venue,
+            VenueSeat::Waiting
+        );
+        assert_eq!(
+            summarise(&rfq(true), &config_path, PanelRuntime::Docker)
+                .unwrap()
+                .venue,
+            VenueSeat::Seated
+        );
+
+        // The process runtime hands the child its stitch.env, so a key there
+        // is a registration too; under Docker only the sibling file reaches it.
+        std::fs::remove_file(dir.join(setup::RFQ_API_KEY_FILE)).unwrap();
+        std::fs::write(dir.join("stitch.env"), "STITCH_RFQ_API_KEY=tx_live_env\n").unwrap();
+        assert_eq!(
+            summarise(&rfq(true), &config_path, PanelRuntime::Docker)
+                .unwrap()
+                .venue,
+            VenueSeat::NotConnected
+        );
+        assert_eq!(
+            summarise(&rfq(true), &config_path, PanelRuntime::Process)
+                .unwrap()
+                .venue,
+            VenueSeat::Seated
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_vault_maker_reports_the_vault_as_its_capital() {
         let (_cfg, root) = test_cfg("vault-summary");
         let config_path = seed_bot_dir(&root, "bot-v").join("stitch.toml");
         let toml = std::fs::read_to_string(&config_path).unwrap();
 
         // No `[vault]`: the capital is the bot's own wallet, nothing to report.
-        let plain = summarise(&toml, &config_path).unwrap();
+        let plain = summarise(&toml, &config_path, PanelRuntime::Docker).unwrap();
         assert_eq!(plain.vault_address, None);
 
         // `[vault]` is a top-level table header, so appending it can't land inside
         // the last `[[pools]]` block.
         let vaulted =
             format!("{toml}\n[vault]\naddress = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"\n");
-        let summary = summarise(&vaulted, &config_path).unwrap();
+        let summary = summarise(&vaulted, &config_path, PanelRuntime::Docker).unwrap();
         assert_eq!(
             summary.vault_address.as_deref(),
             Some("0x70997970c51812dc3a010c7d01b50e0d17dc79c8"),

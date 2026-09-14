@@ -96,40 +96,24 @@ export function reduceFund(state: FundState, action: FundAction): FundState {
   }
 }
 
-/** The sentences under the gate line, from the server's booleans. */
+/**
+ * The sentences under the gate line, from the server's booleans. Gas only:
+ * the token sides are not this screen's business (the bot page waits for
+ * them), so an empty wallet with gas in it is simply ready.
+ */
 export function gateReasons(
   f: Funding,
   words: {
     cantRead: string
-    unpriceablePair: (symbols: string[]) => string
-    needsSide: (min: number, symbols: string[]) => string
-    cantPrice: (symbol: string) => string
     needsGas: (minGas: number, gas: string) => string
     gasUnpriced: string
   },
 ): string[] {
-  const out: string[] = []
-  if (f.readError) {
-    out.push(words.cantRead)
-    return out
-  }
-  if (f.gate.unpriceable) {
-    // The pair itself can't be valued, so "add $20 of X" would be an
-    // instruction nobody can follow: needsSide is true here and stays true.
-    out.push(words.unpriceablePair(f.tokens.map((t) => t.symbol)))
-  } else if (f.gate.needsSide) {
-    out.push(words.needsSide(f.gate.minTokenUsd, f.tokens.map((t) => t.symbol)))
-    // Any row holding money the panel can't value, whichever side it is. This
-    // used to be filtered to the soft side, which left an operator who funded
-    // the stable side first with no explanation at all: they saw "add $20 of
-    // X or Y" while holding $50 of one of them.
-    for (const t of f.tokens) {
-      if (t.balance && t.balance !== '0' && t.price === null) {
-        out.push(words.cantPrice(t.symbol))
-      }
-    }
-  }
-  if (f.gate.needsGas) out.push(words.needsGas(f.gate.minGasUsd, f.gas.symbol))
-  if (f.gas.price === null && f.gas.balance !== null) out.push(words.gasUnpriced)
-  return out
+  if (f.readError) return [words.cantRead]
+  if (!f.gate.needsGas) return []
+  // On a chain whose gas the panel can't price, "$1 of gas" is not an
+  // instruction anyone can follow; the one that is says any balance counts.
+  return f.gas.price === null && f.gas.balance !== null
+    ? [words.gasUnpriced]
+    : [words.needsGas(f.gate.minGasUsd, f.gas.symbol)]
 }

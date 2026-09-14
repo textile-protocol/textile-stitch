@@ -60,6 +60,10 @@ const BUMP_AFTER: Duration = Duration::from_secs(12);
 const BUMP_NUMERATOR: u64 = 125;
 const BUMP_DENOMINATOR: u64 = 100;
 
+/// Gas an empty value transfer takes on every EVM chain: the floor for a
+/// reserve, so a lying estimate can't strand dust.
+const NATIVE_TRANSFER_GAS: u64 = 21_000;
+
 /// EIP-7702 delegation designator: an EOA that has been "upgraded" carries
 /// exactly `0xef0100 || delegate` as its code.
 const EIP7702_DESIGNATOR: [u8; 3] = [0xef, 0x01, 0x00];
@@ -299,6 +303,17 @@ impl Wallet {
     /// designator for a wallet that has been upgraded to a smart account.
     pub async fn code(&self) -> anyhow::Result<Bytes> {
         self.rpc.get_code(self.address).await
+    }
+
+    /// What a plain value transfer to `to` bids in gas, with one fee bump of
+    /// headroom: `gas_limit * max_fee` off the same plan [`Self::send_and_wait`]
+    /// would build, so "all but the fee" leaves enough for the send that
+    /// follows. Sized against the bid, not the price paid: the node refuses
+    /// a transaction whose `value + gas_limit * max_fee` exceeds the balance.
+    pub async fn native_transfer_reserve(&self, to: Address) -> anyhow::Result<U256> {
+        let plan = self.plan_tx(to, &Bytes::new(), U256::ZERO).await?;
+        let gas = plan.gas_limit.max(U256::from(NATIVE_TRANSFER_GAS));
+        Ok(plan.bumped().max_fee.saturating_mul(gas))
     }
 
     /// Nonce + fees + gas for one send, read from the node.
@@ -669,6 +684,24 @@ mod tests {
             w.address(),
             address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
         );
+    }
+
+    #[tokio::test]
+    async fn the_native_reserve_covers_what_a_send_would_bid() {
+        // Every quantity the node is asked for answers 0x5208 (21000): nonce,
+        // fees and the gas estimate alike. `baseFeePerGas` is missing from the
+        // block answer, so the base fee reads as zero and the bid is the tip.
+        let url = fixed_node(r#"{"jsonrpc":"2.0","id":1,"result":"0x5208"}"#).await;
+        let wallet = Wallet::new(url, local_signer(), 1);
+        let to = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
+        let plan = wallet.plan_tx(to, &Bytes::new(), U256::ZERO).await.unwrap();
+        let reserve = wallet.native_transfer_reserve(to).await.unwrap();
+        let first_bid = plan.gas_limit * plan.max_fee;
+        assert!(
+            reserve > first_bid,
+            "one fee bump of headroom: {reserve} vs {first_bid}"
+        );
+        assert_eq!(reserve, plan.gas_limit * plan.bumped().max_fee);
     }
 
     /// End-to-end proof the EIP-1559 encode → sign → broadcast → receipt path is

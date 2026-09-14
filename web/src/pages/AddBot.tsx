@@ -24,7 +24,6 @@ import AddCorridorFlow from '../components/wizard/AddCorridorFlow'
 import EmailVerifyWait from '../components/wizard/EmailVerifyWait'
 import CorridorPicker from '../components/wizard/CorridorPicker'
 import FundStep, { type FundOutcome } from '../components/wizard/FundStep'
-import LiveStep from '../components/wizard/LiveStep'
 import SourcePicker, {
   isHttpUrl,
   sourceOk,
@@ -52,9 +51,9 @@ import {
   saveResume,
 } from '../components/wizard/resume'
 import { pairSymbols } from '../components/SpreadExample'
+import { isAddress } from '../format'
 import type {
   Corridor,
-  RfqEnrollment,
   RfqStatusResult,
   Spread,
 } from '../types'
@@ -105,22 +104,6 @@ const emptySources: SourcesState = {
   rpcUrl: '',
 }
 
-const isAddress =(s: string) => /^0x[0-9a-fA-F]{40}$/.test(s.trim())
-/** Same bar the venue applies, so a bad address stops at the Name step. */
-const isEmail = (s: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim())
-/** Mirrors the panel's validate_bot_id, so a bad name stops at the Name step, not at Create. */
-const MAX_BOT_NAME = 40
-function botNameProblem(s: string): string | null {
-  if (s === '') return null
-  if (s.length > MAX_BOT_NAME)
-    return `Bot name can't be longer than ${MAX_BOT_NAME} characters.`
-  if (!/^[a-z0-9-]+$/.test(s))
-    return 'Only lowercase letters, digits and hyphens. No spaces or capitals.'
-  if (s.startsWith('-') || s.endsWith('-'))
-    return 'Must start and end with a letter or digit.'
-  if (s.includes('--')) return 'Two hyphens in a row are not allowed.'
-  return null
-}
 const decimalsOk = (s: string) => {
   const n = Number(s)
   return Number.isInteger(n) && n >= 0 && n <= 36
@@ -186,8 +169,8 @@ async function openingCorridor(
 }
 
 /**
- * The add-bot wizard: corridor, spreads, sources, name, wallet, connect, fund,
- * live.
+ * The add-bot wizard: corridor, sources, spread, wallet, approve, then connect
+ * to Textile. It ends on the bot's own page.
  *
  * Deliberately many short steps rather than one long form, matching the desktop
  * app. Nothing is sent until the wallet step, and the secret fields are never
@@ -226,7 +209,6 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   const [customMode, setCustomMode] = useState<'fields' | 'toml'>('fields')
   const [importedToml, setImportedToml] = useState('')
   const [importError, setImportError] = useState<string | null>(null)
-  const [name, setName] = useState('')
   const [signer, setSigner] = useState<SignerState>(emptySigner)
   const [start, setStart] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -242,26 +224,14 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   // An explicit choice on purpose — independent price sources make the venue
   // more robust, so the default is offered, not assumed.
   const [sources, setSources] = useState<SourcesState>(emptySources)
-  // Name step: the address Textile confirms. Held here for the one-click
-  // Connect that follows the wallet step.
-  const [contactEmail, setContactEmail] = useState('')
   // After create the wizard keeps going instead of leaving for the bot page.
   const [createdBot, setCreatedBot] = useState<string | null>(null)
   // The wizard opened straight on the Fund step for a bot from an earlier run.
   // Everything the earlier steps collected (corridor, contact, venue answer)
   // is gone, so anything derived from them has to stay out of the way.
   const [resumed, setResumed] = useState(false)
-  // The one-click Connect: registers the wallet with the venue, then hands it
-  // the address from the Name step so the confirm link goes out.
-  const [connecting, setConnecting] = useState(false)
-  const [connectError, setConnectError] = useState<string | null>(null)
-  const [enrollment, setEnrollment] = useState<RfqEnrollment | null>(null)
-  const [connected, setConnected] = useState(false)
-  const [connectNote, setConnectNote] = useState<string | null>(null)
-  // How the Fund step ended, and therefore what the last step shows: the Live
-  // screen once the bot is running, the Waiting screen until then. Null until
-  // the Fund step reports. The waiting screen flips this to `live` itself when
-  // the address is confirmed, so the last step changes without a step change.
+  // How the Approve step ended. Null until it reports; `live` takes the
+  // operator straight to the bot page, anything else opens the last step.
   const [fundOutcome, setFundOutcome] = useState<FundOutcome | null>(null)
 
   // Which road this run is on.
@@ -272,8 +242,8 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   // runs one on that chain. `add` puts the corridor on a bot that exists.
   //
   // `step` deliberately stays at 0 on both new lanes, and `createdBot` stays
-  // null. Three effects key off `step` (the `?resume=` stamp at 6, the record
-  // clear at 7, the mount jump to 6), so leaving it alone is what stops the add
+  // null. Three effects key off `step` (the `?resume=` stamp at 4, the record
+  // clear at 5, the mount jump to 4), so leaving it alone is what stops the add
   // lane from ever stamping a live production bot into the resume machinery.
   // That is the worst thing this feature could do, and it is closed by the
   // shape of the state rather than by remembering not to.
@@ -356,7 +326,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   // spreads the operator had already typed. The custom form's URLs are
   // deliberately NOT part of that key: the effect below mirrors them, and
   // keying on them here meant changing one character of an RPC URL threw away
-  // a spread the operator had typed two steps earlier.
+  // a spread the operator had typed a step earlier.
   const seededRef = useRef<string | null>(null)
   useEffect(() => {
     if (corridorId === '') return
@@ -433,7 +403,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
     if (!resumeBot) return
     setCreatedBot(resumeBot)
     setResumed(true)
-    setStep(6)
+    setStep(4)
   }, [createdBot, searchParams])
 
   // A reload while the add lane was open. `?bot=` plus `?corridor=` is enough
@@ -518,12 +488,12 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   // to /add, which is to say no second bot could ever be created. The `?resume=`
   // in the URL still brings a reload of THIS tab back to where it was.
   useEffect(() => {
-    if (step === 7 && fundOutcome) clearResume()
-  }, [step, fundOutcome])
+    if (step === 5) clearResume()
+  }, [step])
 
   // Put the bot in the URL once funding starts, so a refresh keeps its place.
   useEffect(() => {
-    if (step < 6 || !createdBot) return
+    if (step < 4 || !createdBot) return
     if (searchParams.get('resume') === createdBot) return
     const next = new URLSearchParams(searchParams)
     next.set('resume', createdBot)
@@ -538,6 +508,8 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   // The pair's symbols for the Spread step's copy and worked example. Null for
   // a custom or imported corridor, where the step reads without them.
   const symbols = isCustom ? null : pairSymbols(corridor?.displayName)
+  // The feed the Sources step settled on, for the Spread step's live example.
+  const feedUrl = sources.feedMode === 'own' ? sources.feedUrl : sources.feedDefault
   // The chain the new bot will trade on, for the shared-wallet check. Comes from
   // the preset, or from the custom form once a chain id is typed.
   const importedChainId = chainIdFromToml(importedToml)
@@ -548,25 +520,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
         ? Number(custom.chainId)
         : undefined
     : corridor?.chainId
-  // The pair for the Live screen's public swap link, from the taker's side:
-  // they sell the stable and buy the local token. Null for a custom corridor,
-  // and null after a resume: the corridor step still preselects the first
-  // corridor in the catalog on every load, so on a resumed run these symbols
-  // belong to an unrelated pair and would send the operator to the wrong swap
-  // page. The Live screen then uses the link the quote itself carries.
-  const liveCorridor =
-    !resumed && symbols && chainId
-      ? { sellSymbol: symbols.quote, buySymbol: symbols.base, chainId }
-      : null
 
-  // Whether the Connect step may be left forwards. After an attempt, whatever
-  // it answered: unconfirmed, blocked and unreachable all still need a funded
-  // wallet. And on a resumed run, where an earlier run may already have
-  // connected this bot and only the wizard has forgotten — the Fund step's
-  // Back must not lead somewhere with no way out. Before the first attempt of
-  // a fresh run it stays closed, so Continue can't be used to slip past
-  // connecting.
-  const canLeaveConnect = connected || connectError !== null || resumed
 
   /**
    * Drop the add lane's own parameters. `?resume=` is left alone: it belongs to
@@ -678,10 +632,10 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
     setSearchParams(next, { replace: true })
   }
 
-  // The rail. Nine pills against five is the only thing on screen telling the
+  // The rail. Seven pills against five is the only thing on screen telling the
   // operator that adding to a bot they already run is the short road, so the
   // sets are deliberately different lengths. A resumed new-bot run always gets
-  // the eight-pill rail: that operator never saw a Where screen.
+  // the six-pill rail: that operator never saw a Where screen.
   const rail =
     sawWhere && !resumed
       ? { labels: WHERE_LABELS, current: step === 0 ? 0 : step + 1 }
@@ -778,6 +732,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
             <SpreadFields
               spreads={spreads}
               symbols={symbols}
+              feedUrl={feedUrl}
               onChange={setSpreads}
             />
             <p className="mt-4 text-sm text-muted">
@@ -814,8 +769,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
             }}
             onBack={() => setShortStep(1)}
             onStartOver={startOver}
-            botPath={botPath(targetBot)}
-            onOpenBot={() => navigate(botPath(targetBot))}
+            onOpenBot={() => navigate(botPath(targetBot, 'funds'))}
           />
         )}
       </div>
@@ -848,8 +802,8 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
     setBusy(true)
     setError(null)
     try {
+      // No name: the panel names the bot after its wallet.
       const res = await api.createBot({
-        name: name.trim(),
         ...(isCustom
           ? customMode === 'toml'
             ? { toml: importedToml }
@@ -875,9 +829,9 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
       saveResume(res.bot.name)
       // The create note and needsPermit2Approval are deliberately dropped. Both
       // describe a bot that is created and not yet set up, which is only true
-      // between here and the Fund step; the wizard now carries on through
+      // between here and the Approve step; the wizard now carries on through
       // approval and start, so nothing downstream may quote them.
-      setStep(5)
+      setStep(4)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -885,54 +839,10 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
     }
   }
 
-  /**
-   * One click: register the wallet with the venue (Connect), then hand it the
-   * operator's address so the confirm link goes out. Two existing panel routes
-   * behind one button. If the second fails after a successful enroll, the
-   * enrollment is kept and Retry runs both again — enroll is a reconnect, so
-   * it's safe.
-   */
-  async function connect() {
-    if (!createdBot) return
-    setConnecting(true)
-    setConnectError(null)
-    try {
-      const enrolled = await api.enrollRfq(createdBot)
-      setEnrollment(enrolled.enrollment ?? null)
-      const sent = await api.verifyRfqEmail(createdBot, {
-        contactEmail: contactEmail.trim(),
-      })
-      setConnected(true)
-      setConnectNote(sent.message)
-    } catch (e) {
-      setConnectError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setConnecting(false)
-    }
-  }
-
-  /**
-   * Leave the wizard for the bot's page. Only the Live screen offers this, so
-   * by the time it runs the wizard has approved Permit2, started the bot and
-   * seen it quote.
-   *
-   * It carries no create-time state on purpose. `needsPermit2` is hardcoded
-   * true by the create endpoint and the create note says the bot is
-   * unconnected and not started; both were written for the old flow, which
-   * left from Connect. Passing them on now would greet an operator who just
-   * watched their own stitch quote with "Permit2 approval required" on the
-   * Tools tab.
-   */
-  function finish() {
-    if (!createdBot) return
-    navigate(botPath(createdBot), { state: { note: null, needsPermit2: false } })
-  }
-
-  /** On from Connect to funding, remembering the bot in case the tab closes. */
-  function toFunding() {
-    if (!createdBot) return
-    saveResume(createdBot)
-    setStep(6)
+  /** The wizard's one ending: the bot is live, so its page takes over. */
+  function land(name: string) {
+    clearResume()
+    navigate(botPath(name, 'funds'))
   }
 
   /**
@@ -970,18 +880,14 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
     setCreatedBot(null)
     setResumed(false)
     setFundOutcome(null)
-    setEnrollment(null)
-    setConnected(false)
-    setConnectNote(null)
-    setConnectError(null)
     setStep(0)
   }
 
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-bold">Add corridor</h1>
-      {/* Live is the last label even while the Waiting screen is up: waiting is
-          a state on the way there, not a destination of its own. */}
+      {/* Live is the last label even while the Connect screen is up: waiting
+          for Textile is a state on the way there, not a destination of its own. */}
       <Steps current={rail.current} labels={rail.labels} />
 
       {/* Why a bot named in a Fleet row's link isn't being added to. The Where
@@ -1195,22 +1101,6 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
       )}
 
       {step === 1 && (
-        <Card title="Spreads">
-          <SpreadFields spreads={spreads} symbols={symbols} onChange={setSpreads} />
-          <div className="mt-4 flex justify-between">
-            <Button onClick={() => setStep(0)}>Back</Button>
-            <Button
-              variant="primary"
-              onClick={() => setStep(2)}
-              disabled={!spreadsOk(spreads)}
-            >
-              Next
-            </Button>
-          </div>
-        </Card>
-      )}
-
-      {step === 2 && (
         <Card title="Price feed and RPC">
           <div className="mt-4 space-y-5">
             <SourcePicker
@@ -1233,10 +1123,10 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
             />
           </div>
           <div className="mt-4 flex justify-between">
-            <Button onClick={() => setStep(1)}>Back</Button>
+            <Button onClick={() => setStep(0)}>Back</Button>
             <Button
               variant="primary"
-              onClick={() => setStep(3)}
+              onClick={() => setStep(2)}
               disabled={!sourcesOk(sources)}
             >
               Next
@@ -1245,57 +1135,28 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
         </Card>
       )}
 
-      {step === 3 && (
-        <Card title="Name it">
-          <div className="space-y-4">
-            <Field
-              label="Bot name"
-              hint={
-                botNameProblem(name.trim()) ??
-                "Lowercase letters, digits and single hyphens. This becomes the config directory and part of the container name, so it can't be changed later without recreating the bot."
-              }
+      {step === 2 && (
+        <Card title="Spreads">
+          <SpreadFields
+            spreads={spreads}
+            symbols={symbols}
+            feedUrl={feedUrl}
+            onChange={setSpreads}
+          />
+          <div className="mt-4 flex justify-between">
+            <Button onClick={() => setStep(1)}>Back</Button>
+            <Button
+              variant="primary"
+              onClick={() => setStep(3)}
+              disabled={!spreadsOk(spreads)}
             >
-              <Input
-                value={name}
-                autoFocus
-                placeholder="bot-a"
-                onChange={(e) => setName(e.target.value)}
-              />
-            </Field>
-            <Field
-              label="Contact email"
-              hint={
-                contactEmail.trim() !== '' && !isEmail(contactEmail)
-                  ? 'That does not look like an email address.'
-                  : 'Required. Confirming this address is what puts the bot on the venue, so use an inbox you can open now.'
-              }
-            >
-              <Input
-                value={contactEmail}
-                inputMode="email"
-                placeholder="you@example.com"
-                onChange={(e) => setContactEmail(e.target.value)}
-              />
-            </Field>
-            <div className="flex justify-between">
-              <Button onClick={() => setStep(2)}>Back</Button>
-              <Button
-                variant="primary"
-                onClick={() => setStep(4)}
-                disabled={
-                  name.trim().length === 0 ||
-                  botNameProblem(name.trim()) !== null ||
-                  !isEmail(contactEmail)
-                }
-              >
-                Next
-              </Button>
-            </div>
+              Next
+            </Button>
           </div>
         </Card>
       )}
 
-      {step === 4 && (
+      {step === 3 && (
         <Card title="Set up the operator wallet">
           <div className="space-y-4">
             <SignerFields value={signer} onChange={setSigner} />
@@ -1304,9 +1165,9 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
 
             {rfqDefault ? (
               <p className="text-xs text-faint">
-                Created stopped. Next, the wizard connects it to Textile. It
-                starts quoting once Textile approves the request and the
-                wallet is funded.
+                Created stopped. Next, a little gas for the approvals, then
+                Textile. It starts quoting once Textile confirms your email and
+                the wallet is funded.
               </p>
             ) : (
               <>
@@ -1329,7 +1190,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
             {error && <Banner tone="danger">{error}</Banner>}
 
             <div className="flex justify-between">
-              <Button onClick={() => setStep(3)}>Back</Button>
+              <Button onClick={() => setStep(2)}>Back</Button>
               <Button
                 variant="primary"
                 busy={busy}
@@ -1343,124 +1204,37 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
         </Card>
       )}
 
-      {step === 5 && (
-        <Card title="Connect to Textile">
-          <div className="space-y-4">
-            <p className="text-sm text-muted">
-              One click. Registers this bot with Textile and emails you a link
-              to confirm your address. Clicking it puts the bot on every Swap
-              corridor.
-            </p>
-            {createdBot && (
-              <p className="text-xs text-faint">
-                Bot <span className="font-mono">{createdBot}</span> is created.
-                It quotes nothing until it is connected and your email is
-                confirmed.
-              </p>
-            )}
-            {enrollment && (
-              <Banner tone={enrollment.flagged ? 'warning' : 'success'}>
-                Connected as{' '}
-                <span className="font-mono">{enrollment.makerSlug}</span>
-                {enrollment.corridors.length > 0
-                  ? `. Seated on: ${enrollment.corridors.join(', ')}.`
-                  : '. The corridors arrive the moment you confirm your email.'}
-                {enrollment.flagged
-                  ? '. Textile has blocked this maker: no Swap quotes until they unblock you.'
-                  : ''}
-              </Banner>
-            )}
-            {connectNote && <Banner tone="info">{connectNote}</Banner>}
-            {connectError && <Banner tone="danger">{connectError}</Banner>}
-            {/* The venue needs an address to confirm. Normally the Name step
-                has it; on a run resumed straight into funding it is asked for
-                here, so this step still works instead of being refused every
-                time. */}
-            {!isEmail(contactEmail) && (
-              <Field
-                label="Contact email"
-                hint={
-                  contactEmail.trim() !== ''
-                    ? 'That does not look like an email address.'
-                    : 'Required. Textile sends the confirm link here.'
-                }
-              >
-                <Input
-                  value={contactEmail}
-                  inputMode="email"
-                  placeholder="you@example.com"
-                  onChange={(e) => setContactEmail(e.target.value)}
-                />
-              </Field>
-            )}
-            {/* Forward only. Once Connect has been tried, Continue goes to
-                funding whatever came back: link sent, blocked, or the venue
-                unreachable, the wallet still has to be funded and the confirm
-                screen deals with the rest. Continue is not offered before the
-                first attempt, so it can't be used to slip past Connect. There
-                is no "connect later": the wizard ends at a running bot or at
-                one waiting on a confirmation. */}
-            <div className="flex items-center justify-end gap-3">
-              {(!connected || connectError) && (
-                <Button
-                  variant="primary"
-                  busy={connecting}
-                  disabled={!isEmail(contactEmail)}
-                  onClick={() => void connect()}
-                >
-                  {connectError ? 'Retry' : 'Connect to Textile'}
-                </Button>
-              )}
-              {createdBot && canLeaveConnect && (
-                <Button
-                  variant={connectError ? 'secondary' : 'primary'}
-                  onClick={toFunding}
-                >
-                  Continue
-                </Button>
-              )}
-            </div>
-          </div>
-        </Card>
-      )}
-
       {/* Fund. Watches the wallet, then approves spending and starts the bot
           on its own. It reports how that ended and the wizard moves on. */}
-      {step === 6 && createdBot && (
+      {step === 4 && createdBot && (
         <FundStep
           bot={createdBot}
           onStarted={(outcome) => {
+            // Live already (a resumed run whose email was confirmed earlier):
+            // nothing left to ask, the bot page is the destination.
+            if (outcome.kind === 'live') {
+              land(createdBot)
+              return
+            }
             setFundOutcome(outcome)
-            setStep(7)
+            setStep(5)
           }}
-          onBack={() => setStep(5)}
           onStartOver={startOver}
         />
       )}
 
-      {/* The last step, in one of two states. Running: the Live screen, which
-          proves it with a real quote and is the only screen with a way out.
-          Not running yet: the Confirm-your-email screen, which polls Textile
-          and starts the bot itself the moment the address is confirmed. */}
-      {step === 7 &&
-        createdBot &&
-        (fundOutcome?.kind === 'live' ? (
-          <LiveStep
-            bot={createdBot}
-            corridor={liveCorridor}
-            botPath={botPath(createdBot)}
-            onOpenBot={finish}
-          />
-        ) : (
-          <EmailVerifyWait
-            bot={createdBot}
-            initial={outcomeStatus(fundOutcome)}
-            initialError={outcomeError(fundOutcome)}
-            contactEmail={contactEmail}
-            onApproved={() => setFundOutcome({ kind: 'live' })}
-            onBack={() => setStep(5)}
-          />
-        ))}
+      {/* The last step: Connect to Textile, then wait for the confirmation.
+          The moment the bot is live the wizard is over and the operator lands
+          on the bot's Funds tab, which is where the money goes in. There is no
+          Live screen: a page that only says "it's live" is a page in the way. */}
+      {step === 5 && createdBot && (
+        <EmailVerifyWait
+          bot={createdBot}
+          initial={outcomeStatus(fundOutcome)}
+          initialError={outcomeError(fundOutcome)}
+          onApproved={() => land(createdBot)}
+        />
+      )}
     </div>
   )
 }

@@ -98,6 +98,36 @@ pub fn validate_bot_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// How many hex characters of the wallet a bot id carries. Eight matches the
+/// venue's own maker ids (`stitch-42220-5cffb39d`) and how operators talk about
+/// their wallets, and stays readable in the fleet list where the full address
+/// would not.
+const WALLET_ID_HEX: usize = 8;
+
+/// The id for a new bot, from the wallet it will transact with: `0x` plus the
+/// first [`WALLET_ID_HEX`] hex characters, lowercase. The same wallet on a
+/// second chain (the common setup: one key, several networks) would collide,
+/// so a taken id gets `-2`, `-3`, … rather than a refusal; the fleet list shows
+/// the chain next to each bot, which is all that tells them apart anyway.
+///
+/// A bot is one wallet on one chain and may quote several corridors, which is
+/// why it is not named after a corridor: that name would go stale the day a
+/// second corridor is added. The address never does.
+pub fn bot_id_for_wallet(
+    address: &alloy_primitives::Address,
+    taken: impl Fn(&str) -> bool,
+) -> String {
+    let hex = format!("{address:x}");
+    let base = format!("0x{}", &hex[..WALLET_ID_HEX.min(hex.len())]);
+    if !taken(&base) {
+        return base;
+    }
+    (2u32..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken(candidate))
+        .expect("an unbounded suffix search terminates")
+}
+
 /// The container name for a bot id. Matches the `stitch-bot-a` convention the
 /// hand-written compose files already use, so an operator's muscle memory for
 /// `docker logs stitch-<id>` keeps working.
@@ -118,6 +148,27 @@ pub fn id_from_container_name(name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bot_is_named_after_its_wallet() {
+        let addr: alloy_primitives::Address = "0x5CFfB39D2e641a0e461E8956b383fC60dB457bD5"
+            .parse()
+            .unwrap();
+        let id = bot_id_for_wallet(&addr, |_| false);
+        assert_eq!(id, "0x5cffb39d");
+        validate_bot_id(&id).unwrap();
+    }
+
+    #[test]
+    fn the_same_wallet_on_another_chain_gets_a_suffix_not_a_refusal() {
+        let addr: alloy_primitives::Address = "0x5CFfB39D2e641a0e461E8956b383fC60dB457bD5"
+            .parse()
+            .unwrap();
+        let existing = ["0x5cffb39d", "0x5cffb39d-2"];
+        let id = bot_id_for_wallet(&addr, |c| existing.contains(&c));
+        assert_eq!(id, "0x5cffb39d-3");
+        validate_bot_id(&id).unwrap();
+    }
 
     #[test]
     fn accepts_the_names_operators_actually_use() {

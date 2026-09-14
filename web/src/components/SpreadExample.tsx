@@ -1,10 +1,14 @@
-// The Spread step's worked example: what two bps inputs mean on a swap worth
-// 1,000 of the quote token. Pure props and no fetch on purpose — a spread in
-// bps is a share of the notional whatever the mid is, so the numbers are right
-// with the feed up, degraded or unreachable, and for a custom corridor.
+// The Spread step's worked example: what two bps inputs do to the price the
+// bot will quote around. With the feed's mid in hand (see useFeedMid) it
+// shows the real bid and ask; without one it falls back to a swap worth 1,000
+// of the quote token, which is right whatever the mid is. Pure props, no
+// fetch: the caller decides whether a mid exists.
 
 import type { ReactNode } from 'react'
+import { formatClock } from '../format'
+import type { FeedMid } from '../api'
 import type { Spread } from '../types'
+import type { FeedMidState } from './wizard/useFeedMid'
 
 /**
  * The example swap is worth this much of the quote token at the mid. Price-free
@@ -73,6 +77,27 @@ const money = new Intl.NumberFormat(undefined, {
   maximumFractionDigits: 2,
 })
 const whole = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 })
+
+/**
+ * How a live mid is shown. The feed publishes quote per base (USDT per cNGN,
+ * 0.00073), which is the bot's fair price but not how anyone says it: the
+ * market, and the Textile app, say 1,368 cNGN per USDT. So a pair whose base
+ * is worth less than one unit of quote is turned round for display, and the
+ * bid and ask are turned round with it. Nothing about the bot changes; the
+ * bps are applied to the feed's number and only the last step inverts.
+ */
+export function displayRate(mid: number): { inverted: boolean; rate: number } {
+  return mid < 1 ? { inverted: true, rate: 1 / mid } : { inverted: false, rate: mid }
+}
+
+/** Enough decimals to see one bps move, without a wall of digits. */
+function rateFormatter(rate: number): Intl.NumberFormat {
+  const digits = rate >= 1000 ? 2 : rate >= 10 ? 3 : rate >= 1 ? 4 : 6
+  return new Intl.NumberFormat(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })
+}
 
 /**
  * A side's bps for display: a whole number the backend would accept. The buy
@@ -156,12 +181,15 @@ export function SpreadExample({
   sell,
   base,
   quote,
+  feed = { status: 'idle' },
 }: {
   buy: Spread
   sell: Spread
   /** Symbols from the corridor name; null for a custom or imported corridor. */
   base: string | null
   quote: string | null
+  /** The feed's live mid, when the caller fetched one. Idle means "don't". */
+  feed?: FeedMidState
 }) {
   if (buy.kind !== 'bps' || sell.kind !== 'bps') return null
 
@@ -172,6 +200,8 @@ export function SpreadExample({
 
   const buyEdge = b === null ? null : (EXAMPLE_NOTIONAL * b) / 10000
   const sellEdge = s === null ? null : (EXAMPLE_NOTIONAL * s) / 10000
+
+  const live = feed.status === 'ok' ? liveExample(feed.mid, b, s, base, quote) : null
 
   // One fixed scale for both sides, stepped up to hold the wider one, so the
   // dots show each spread's size and not just their ratio.
@@ -193,7 +223,7 @@ export function SpreadExample({
             : 'hidden text-xs sm:block'
         }
       >
-        {sub || ' '}
+        {sub || ' '}
       </span>
     </div>
   )
@@ -203,29 +233,67 @@ export function SpreadExample({
     </span>
   )
 
+  // The two outer cells, each still driven by its own spread input.
+  const buyCell = cell(
+    live ? live.buyLabel : base ? `You buy ${base} for` : 'You buy for',
+    b === null || buyEdge === null
+      ? missing(buy.value, 'buy')
+      : live
+        ? live.buy
+        : amount(EXAMPLE_NOTIONAL - buyEdge),
+    buyEdge === null ? '' : live ? live.buySub : `${amount(buyEdge)} less than the mid`,
+  )
+  const midCell = cell('Mid', live ? live.mid : amount(EXAMPLE_NOTIONAL), live ? live.midSub : '')
+  const sellCell = cell(
+    live ? live.sellLabel : base ? `You sell ${base} for` : 'You sell for',
+    s === null || sellEdge === null
+      ? missing(sell.value, 'sell')
+      : live
+        ? live.sell
+        : amount(EXAMPLE_NOTIONAL + sellEdge),
+    sellEdge === null ? '' : live ? live.sellSub : `${amount(sellEdge)} more than the mid`,
+  )
+
+  // Low number on the left, high on the right, like any quote. On a pair the
+  // example shows the other way round (cNGN per USDT) the buy-spread side is
+  // the HIGHER number, so the whole picture mirrors: the sell-spread cell and
+  // its dot take the left, the buy-spread cell and dot take the right. Each
+  // dot still tracks its own input; only where it is drawn changes.
+  const mirror = live?.inverted ?? false
+  const [leftCell, rightCell] = mirror ? [sellCell, buyCell] : [buyCell, sellCell]
+  const leftBps = mirror ? s : b
+  const rightBps = mirror ? b : s
+  const leftPct = mirror ? sellPct : buyPct
+  const rightPct = mirror ? buyPct : sellPct
+  const leftCaption = mirror ? `buys ${live?.quoteName} lower` : 'pays less'
+  const rightCaption = mirror ? `sells ${live?.quoteName} higher` : 'charges more'
+  // A caption needs room between its dot and the mid ring, or the three words
+  // print on top of each other at a tight spread. Under this it stays quiet;
+  // the numbers above already say what the dot means.
+  const captionRoom = 9
+
   return (
     <div className="mt-4 rounded-lg border border-line-soft bg-canvas p-4">
-      <p className="text-xs font-bold text-muted">
-        Example: a swap worth {whole.format(EXAMPLE_NOTIONAL)}
-        {unit} at the mid, so 1 bps = 0.01%, or {amount(EXAMPLE_NOTIONAL / 10000)}
-      </p>
+      {live ? (
+        <p className="text-xs font-bold text-muted">
+          Your price feed's mid as of {formatClock(live.readAt * 1000)}. 1 bps = 0.01% of it.
+        </p>
+      ) : (
+        <p className="text-xs font-bold text-muted">
+          {feed.status === 'loading'
+            ? 'Reading your price feed…'
+            : feed.status === 'down'
+              ? 'Your price feed did not answer, so an example instead:'
+              : 'Example:'}{' '}
+          a swap worth {whole.format(EXAMPLE_NOTIONAL)}
+          {unit} at the mid, so 1 bps = 0.01%, or {amount(EXAMPLE_NOTIONAL / 10000)}
+        </p>
+      )}
 
       <div className="mt-3 grid grid-cols-1 gap-x-2 gap-y-2 sm:grid-cols-3">
-        {cell(
-          base ? `You buy ${base} for` : 'You buy for',
-          b === null || buyEdge === null
-            ? missing(buy.value, 'buy')
-            : amount(EXAMPLE_NOTIONAL - buyEdge),
-          buyEdge === null ? '' : `${amount(buyEdge)} less than the mid`,
-        )}
-        {cell('Mid', amount(EXAMPLE_NOTIONAL), '')}
-        {cell(
-          base ? `You sell ${base} for` : 'You sell for',
-          s === null || sellEdge === null
-            ? missing(sell.value, 'sell')
-            : amount(EXAMPLE_NOTIONAL + sellEdge),
-          sellEdge === null ? '' : `${amount(sellEdge)} more than the mid`,
-        )}
+        {leftCell}
+        {midCell}
+        {rightCell}
       </div>
 
       {/* Dot positions are inline styles on purpose: Tailwind v4 can't see a
@@ -242,25 +310,25 @@ export function SpreadExample({
         <div className="min-w-0 flex-1">
       <div aria-hidden className="relative h-4">
         <div className="absolute inset-x-0 top-1/2 h-px bg-line" />
-        {b !== null && s !== null && (
+        {leftBps !== null && rightBps !== null && (
           <div
             className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-accent/25 transition-[left,width] duration-200"
             style={{
-              left: `${50 - buyPct}%`,
-              width: `${buyPct + sellPct}%`,
+              left: `${50 - leftPct}%`,
+              width: `${leftPct + rightPct}%`,
             }}
           />
         )}
-        {b !== null && (
+        {leftBps !== null && (
           <span
             className="absolute top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent transition-[left] duration-200"
-            style={{ left: `${50 - buyPct}%` }}
+            style={{ left: `${50 - leftPct}%` }}
           />
         )}
-        {s !== null && (
+        {rightBps !== null && (
           <span
             className="absolute top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent transition-[left] duration-200"
-            style={{ left: `${50 + sellPct}%` }}
+            style={{ left: `${50 + rightPct}%` }}
           />
         )}
         <span className="absolute left-1/2 top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-ink bg-canvas" />
@@ -269,21 +337,21 @@ export function SpreadExample({
           which way the feed quotes. A side at 0 bps sits inside the ring, so
           its caption gives way to "mid" rather than overprinting it. */}
       <div aria-hidden className="relative h-4 text-[10px] text-faint">
-        {b !== null && b > 0 && (
+        {leftBps !== null && leftPct >= captionRoom && (
           <span
             className="absolute -translate-x-1/2 whitespace-nowrap transition-[left] duration-200"
-            style={{ left: `${captionPct(50 - buyPct)}%` }}
+            style={{ left: `${captionPct(50 - leftPct)}%` }}
           >
-            pays less
+            {leftCaption}
           </span>
         )}
         <span className="absolute left-1/2 -translate-x-1/2">mid</span>
-        {s !== null && s > 0 && (
+        {rightBps !== null && rightPct >= captionRoom && (
           <span
             className="absolute -translate-x-1/2 whitespace-nowrap transition-[left] duration-200"
-            style={{ left: `${captionPct(50 + sellPct)}%` }}
+            style={{ left: `${captionPct(50 + rightPct)}%` }}
           >
-            charges more
+            {rightCaption}
           </span>
         )}
       </div>
@@ -294,4 +362,69 @@ export function SpreadExample({
       </div>
     </div>
   )
+}
+
+/**
+ * The three cells on a live mid. Bid and ask come off the feed's own number
+ * (quote per base): the bot pays mid × (1 − buy) and charges mid × (1 + sell).
+ *
+ * Everything is said in the hard currency. For a pair that reads as soft per
+ * hard (cNGN per USDT), the bot buying cNGN IS the bot selling USDT, so the
+ * buy-spread cell becomes "You sell USDT for 1,368.77 cNGN" and the
+ * sell-spread cell "You buy USDT for 1,368.49 cNGN": more cNGN when it sells a
+ * dollar, fewer when it buys one, which is how the operator already thinks
+ * about it. A pair that reads as hard per unit (3,400 USDT per XAUt) is
+ * already in the hard currency and keeps "You buy XAUt for 3,399.66 USDT".
+ */
+function liveExample(
+  feedMid: FeedMid,
+  b: number | null,
+  s: number | null,
+  base: string | null,
+  quote: string | null,
+): {
+  inverted: boolean
+  quoteName: string
+  mid: string
+  midSub: string
+  buyLabel: string
+  buy: string
+  buySub: string
+  sellLabel: string
+  sell: string
+  sellSub: string
+  /** When the feed published this mid, unix seconds. */
+  readAt: number
+} {
+  const { inverted, rate } = displayRate(feedMid.price)
+  const fmt = rateFormatter(rate)
+  const baseName = base ?? 'base'
+  const quoteName = quote ?? 'quote'
+  // The unit the numbers are in: cNGN when inverted, USDT when not.
+  const unit = inverted ? baseName : quoteName
+  const show = (n: number) => `${fmt.format(n)} ${unit}`
+
+  const bidQpb = b === null ? null : feedMid.price * (1 - b / 10000)
+  const askQpb = s === null ? null : feedMid.price * (1 + s / 10000)
+  const toShown = (qpb: number) => (inverted ? 1 / qpb : qpb)
+
+  const bid = bidQpb === null ? null : toShown(bidQpb)
+  const ask = askQpb === null ? null : toShown(askQpb)
+  const delta = (x: number) => `${fmt.format(Math.abs(x - rate))} ${unit}`
+
+  return {
+    inverted,
+    quoteName,
+    readAt: feedMid.timestamp,
+    mid: show(rate),
+    midSub: inverted
+      ? `per ${quoteName}. 1 ${baseName} = ${feedMid.price.toPrecision(4)} ${quoteName}`
+      : `per ${baseName}`,
+    buyLabel: inverted ? `You sell ${quoteName} for` : `You buy ${baseName} for`,
+    buy: bid === null ? '' : show(bid),
+    buySub: bid === null ? '' : `${delta(bid)} ${inverted ? 'more' : 'less'} than the mid`,
+    sellLabel: inverted ? `You buy ${quoteName} for` : `You sell ${baseName} for`,
+    sell: ask === null ? '' : show(ask),
+    sellSub: ask === null ? '' : `${delta(ask)} ${inverted ? 'fewer' : 'more'} than the mid`,
+  }
 }

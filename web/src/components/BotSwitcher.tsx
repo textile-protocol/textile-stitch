@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { api } from '../api'
-import { botPath, parseBotTab, type BotTab } from '../botRoutes'
+import { botPath, parseBotTab, type BotTab, botLabel } from '../botRoutes'
 import type { Bot } from '../types'
 import { StatePill } from './ui'
 
@@ -10,7 +10,7 @@ import { StatePill } from './ui'
  * dropdown so you can jump there without going back to Fleet. The current
  * `?tab=` is kept so Logs stays Logs.
  */
-export default function BotSwitcher({ name }: { name: string }) {
+export default function BotSwitcher({ name, label }: { name: string; label: string }) {
   const { search } = useLocation()
   const tab: BotTab = parseBotTab(new URLSearchParams(search).get('tab'))
   const [bots, setBots] = useState<Bot[] | null>(null)
@@ -66,7 +66,7 @@ export default function BotSwitcher({ name }: { name: string }) {
   if (!bots || others.length === 0) {
     return (
       <h1 className={TITLE} title={name}>
-        {name}
+        {label}
       </h1>
     )
   }
@@ -81,12 +81,12 @@ export default function BotSwitcher({ name }: { name: string }) {
           className={`inline-flex items-center gap-1.5 rounded-lg px-2 py-0.5 -mx-2 transition hover:bg-hover ${
             open ? 'bg-hover' : ''
           }`}
-          aria-label={`Switch bot, current: ${name}`}
+          aria-label={`Switch bot, current: ${label}`}
           aria-expanded={open}
           aria-controls={panelId}
           title={name}
         >
-          <span className={TITLE_TEXT}>{name}</span>
+          <span className={TITLE_TEXT}>{label}</span>
           <Chevron open={open} />
         </button>
       </h1>
@@ -107,13 +107,18 @@ export default function BotSwitcher({ name }: { name: string }) {
                 }`}
                 aria-current={active ? 'page' : undefined}
               >
-                <span className="min-w-0 flex-1 truncate">{bot.name}</span>
+                <span className="min-w-0 flex-1 truncate">
+                  {botLabel(bot)}
+                  {bot.displayName && (
+                    <span className="ml-1.5 font-mono text-xs font-normal text-faint">{bot.name}</span>
+                  )}
+                </span>
                 {bot.config?.corridorLabel && (
                   <span className="max-w-24 truncate text-xs font-normal text-muted">
                     {bot.config.corridorLabel}
                   </span>
                 )}
-                <StatePill state={bot.state} status={bot.status} />
+                <StatePill state={bot.state} status={bot.status} venue={bot.config?.venue} />
               </Link>
             )
           })}

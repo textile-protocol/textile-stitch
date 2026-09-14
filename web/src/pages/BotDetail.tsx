@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { BOT_TABS, TAB_LABEL, botPath, parseBotTab, type BotTab } from '../botRoutes'
+import { BOT_TABS, TAB_LABEL, botLabel, botPath, parseBotTab, type BotTab } from '../botRoutes'
 import { ApiError, api } from '../api'
 import {
   Banner,
@@ -20,17 +20,27 @@ import Permit2Allowances from '../components/Permit2Allowances'
 import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
+import FundsTab from '../components/FundsTab'
+import DesktopSwitches from '../components/DesktopSwitches'
+import ReconnectTextile from '../components/ReconnectTextile'
+import RfqOverrides from '../components/RfqOverrides'
+import RenameBot from '../components/RenameBot'
 import VersionRollback from '../components/VersionRollback'
-import { capitalLocation, dashboardWallet, fundsFromVault } from '../capital'
-import { formatTimestamp, imageLabel, shortAddress, shortImage } from '../format'
+import { dashboardWallet, fundsFromVault } from '../capital'
+import { imageLabel, shortAddress, shortImage, formatUsd, hostOf } from '../format'
+import { totalUsd, unpricedSymbols, useFunding } from '../funding'
 import { confirmRemovePlan } from '../removeBot'
-import type { Bot, ConfigBody, MigrationResult, UpdatesStatus } from '../types'
+import type { Bot, ConfigBody, Funding, MigrationResult, UpdatesStatus } from '../types'
 
 export default function BotDetail() {
   const { name = '' } = useParams()
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const [bot, setBot] = useState<Bot | null>(null)
+  // The wallet's balances, priced. Owned here rather than by the Funds tab
+  // because the header shows the total on every tab, and one poll is enough
+  // for both.
+  const { funding, refresh: refreshFunding } = useFunding(name)
   const [error, setError] = useState<string | null>(null)
   // The wizard redirects here with what it just did, so its confirmation survives
   // the navigation.
@@ -48,7 +58,7 @@ export default function BotDetail() {
   const [busy, setBusy] = useState<string | null>(null)
   // After create, land on Tools so Approve allowances is the next obvious step.
   // Tab lives in `?tab=` so switching bots from the title keeps the same section.
-  const fallbackTab: BotTab = handoff?.needsPermit2 ? 'tools' : 'settings'
+  const fallbackTab: BotTab = handoff?.needsPermit2 ? 'tools' : 'funds'
   const tab = parseBotTab(searchParams.get('tab'), fallbackTab)
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
 
@@ -184,11 +194,9 @@ export default function BotDetail() {
         <Link to="/" className="text-sm text-muted hover:text-ink">
           ← Fleet
         </Link>
-        <BotSwitcher name={bot.name} />
-        <StatePill state={bot.state} status={bot.status} />
-        {bot.config?.corridorLabel && (
-          <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
-        )}
+        <BotSwitcher name={bot.name} label={botLabel(bot)} />
+        <RenameBot bot={bot} onRenamed={setBot} />
+        <StatePill state={bot.state} status={bot.status} venue={bot.config?.venue} />
         {updateAvailable && <Tag>update available</Tag>}
       </div>
 
@@ -259,12 +267,33 @@ export default function BotDetail() {
       )}
 
       <Card>
+        {/* The number an operator opens this page for. Everything in the
+            wallet, in dollars, large, before any button. */}
+        <div className="mb-4">
+          <p className="text-xs uppercase tracking-wide text-faint">Total value</p>
+          <TotalValue funding={funding} />
+          {/* The wallet that holds it, right under the number: the address an
+              operator copies most, so it does not live in a grid cell. */}
+          <div className="mt-1 flex flex-wrap items-center gap-3 text-sm">
+            <OperatorAddress config={bot.config} />
+            {bot.config?.explorerUrl && (
+              <a
+                className="text-xs text-accent underline"
+                href={bot.config.explorerUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                View on {hostOf(bot.config.explorerUrl) ?? 'explorer'}
+              </a>
+            )}
+          </div>
+        </div>
+
         {/*
-          On narrow screens a single flex+ml-auto row wraps badly: Update stays
-          left and Remove jumps to the far right of the next line. Lifecycle
-          actions share a 2-col grid on mobile; Remove sits full-width under
-          them. From sm up, everything is one wrapping row with Remove pushed
-          to the end.
+          The everyday buttons only: Stop/Start, Restart, and Update when there
+          is one. Recreate and Remove live under Tools, where a wrong click
+          costs a second look rather than a bot. A 2-col grid on mobile, one
+          wrapping row from sm up.
         */}
         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center [&_button]:w-full sm:[&_button]:w-auto">
@@ -300,9 +329,6 @@ export default function BotDetail() {
                 >
                   Restart
                 </Button>
-                <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
-                  Recreate
-                </Button>
                 {canUpdate && !bot.canMigrate && bot.layout !== 'flat-files' && (
                   <Button
                     variant="primary"
@@ -318,9 +344,10 @@ export default function BotDetail() {
               <>
                 <Tag>no container</Tag>
                 {/*
-                  Config is on disk but no container: the wizard failed mid-create, or
-                  someone removed the container and kept the files. Recreate is the
-                  only recovery — Add Bot conflicts with the existing directory.
+                  Config is on disk but no container: the wizard failed mid-create,
+                  or someone removed the container and kept the files. Recreate is
+                  the only recovery, so it stays up here for that case alone; the
+                  everyday copy of it lives under Tools.
                 */}
                 <Button
                   busy={busy === 'recreate'}
@@ -332,39 +359,14 @@ export default function BotDetail() {
               </>
             )}
           </div>
-          <Button
-            variant="danger"
-            busy={busy === 'remove'}
-            className="w-full sm:ml-auto sm:w-auto"
-            onClick={() => void remove()}
-            title={
-              bot.container
-                ? 'Delete the container, config, and private key — gone from the fleet'
-                : 'Delete config and private key — gone from the fleet'
-            }
-          >
-            {bot.container ? 'Remove' : 'Delete'}
-          </Button>
         </div>
 
-        <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
-          <Detail label="Origin">{bot.origin}</Detail>
-          <Detail label="Capital">
-            <CapitalLocation config={bot.config} />
-          </Detail>
-          <Detail label="Image">
-            <span className="font-mono" title={bot.image ?? undefined}>
-              {imageLabel(bot.image, bot.version)}
-            </span>
-          </Detail>
-          <Detail label="Created">{formatTimestamp(bot.createdUnix)}</Detail>
-          <Detail label="Chain">{bot.config ? bot.config.chainId : '—'}</Detail>
-          <Detail label="Pools">{bot.config ? bot.config.pools : '—'}</Detail>
-          <Detail label="Signer">{bot.config?.signer ?? '—'}</Detail>
-          <Detail label="Operator">
-            <OperatorAddress config={bot.config} />
-          </Detail>
-        </dl>
+        {/* The desktop app's own switches, when there is one. The two things
+            that keep a laptop-hosted bot alive, next to the buttons that run
+            it, rather than in a menu the operator has to know exists. */}
+        <div className="mt-3">
+          <DesktopSwitches />
+        </div>
       </Card>
 
       {bot.warnings.length > 0 && (
@@ -472,8 +474,8 @@ export default function BotDetail() {
             />
           </Card>
           {/*
-            Last, and after the one-off runs: it's the recovery tool for a bad
-            release, not something to reach for on the way past.
+            After the one-off runs: it's the recovery tool for a bad release,
+            not something to reach for on the way past.
           */}
           <Card title="Roll back to an earlier version">
             <VersionRollback
@@ -485,8 +487,58 @@ export default function BotDetail() {
               }}
             />
           </Card>
+          <Card title="Textile connection">
+            <div className="space-y-4">
+              <ReconnectTextile bot={bot.name} onDone={() => void load()} />
+              <RfqOverrides bot={bot.name} onSaved={() => void load()} />
+            </div>
+          </Card>
+          {bot.container && (
+            <Card title="Recreate the container">
+              <p className="text-sm text-muted">
+                Throws the container away and builds a new one from the config and key on
+                disk, on the current bot image. Config, key and money stay. Use it when
+                the container is wedged or to pick up a new image; brief gap in quoting.
+              </p>
+              <div className="mt-3">
+                <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
+                  Recreate
+                </Button>
+              </div>
+            </Card>
+          )}
+          {/*
+            Last, and gated: Remove deletes the private key, and the key is the
+            only way to reach whatever the wallet holds. Below the floor it is a
+            cleanup; above it, it is losing money with a confirm dialog in front.
+          */}
+          <Card title={bot.container ? 'Remove this bot' : 'Delete this bot'}>
+            <RemoveBot
+              funding={funding}
+              hasContainer={!!bot.container}
+              busy={busy === 'remove'}
+              onRemove={() => void remove()}
+            />
+          </Card>
         </>
       )}
+
+      {/* Mounted on every tab, shown on one: a withdraw streams from a
+          one-shot that keeps running if the browser lets go, so the stream
+          (and its result) has to survive a look at Logs. */}
+      <div className={tab === 'funds' ? '' : 'hidden'}>
+        <FundsTab
+          bot={bot}
+          funding={funding}
+          busy={busy}
+          onStop={(target) => void act('stop', target)}
+          onStart={() => void act('start')}
+          onWithdrew={() => {
+            void load()
+            refreshFunding()
+          }}
+        />
+      </div>
 
       {tab === 'dashboard' && (
         <StitchDashboardEmbed
@@ -499,28 +551,53 @@ export default function BotDetail() {
   )
 }
 
-function Detail({ label, children }: { label: string; children: React.ReactNode }) {
+/**
+ * The Remove button and the reason it may be disabled. The server decides
+ * (`removeBlockedBy` comes with every wallet read, and the remove route
+ * applies the same rule again before it deletes the key); this only shows the
+ * answer before the click. While the wallet has not been read yet the button
+ * stays live: a bot whose config the panel cannot read is one the route
+ * deletes nothing for, and an unreadable wallet is refused by the route.
+ */
+function RemoveBot({
+  funding,
+  hasContainer,
+  busy,
+  onRemove,
+}: {
+  funding: Funding | null
+  hasContainer: boolean
+  busy: boolean
+  onRemove: () => void
+}) {
+  const blocked = funding?.removeBlockedBy ?? null
   return (
-    <div>
-      <dt className="text-xs uppercase tracking-wide text-faint">{label}</dt>
-      <dd className="mt-0.5">{children}</dd>
+    <div className="space-y-3">
+      <p className="text-sm text-muted">
+        {hasContainer
+          ? 'Deletes the container, the config and the private key. Gone from the fleet, and cannot be undone.'
+          : 'Deletes the config and the private key. Gone from the fleet, and cannot be undone.'}
+      </p>
+      {blocked && <Banner tone="warning">{blocked}</Banner>}
+      <Button variant="danger" busy={busy} disabled={blocked !== null} onClick={onRemove}>
+        {hasContainer ? 'Remove' : 'Delete'}
+      </Button>
     </div>
   )
 }
 
-/**
- * Where this bot's capital sits: `vault` when it makes for an OperatorVault,
- * else its own wallet. The address is the one the chain sees trading, so a
- * vault bot shows the vault here and its signing key in the Operator row.
- */
-function CapitalLocation({ config }: { config: ConfigBody | null }) {
-  const capital = capitalLocation(config)
-  if (!capital) return '—'
+function TotalValue({ funding }: { funding: Funding | null }) {
+  const size = 'text-3xl font-bold tracking-tight sm:text-4xl'
+  const total = totalUsd(funding)
+  if (total === null) return <span className={`text-faint ${size}`}>—</span>
+  const unpriced = unpricedSymbols(funding)
   return (
-    <span className="inline-flex flex-wrap items-center gap-x-1.5">
-      <span>{capital.label}</span>
-      {capital.address && (
-        <AddressLink address={capital.address} explorerUrl={capital.explorerUrl} />
+    <span className="block">
+      <span className={`tabular-nums ${size}`}>{formatUsd(total)}</span>
+      {unpriced.length > 0 && (
+        <span className="ml-2 text-xs text-warning" title={`Not priced: ${unpriced.join(', ')}`}>
+          + unpriced {unpriced.join(', ')}
+        </span>
       )}
     </span>
   )

@@ -3,7 +3,8 @@
 // panel needs.
 
 import type { ReactNode } from 'react'
-import type { BotState, WarningBody } from '../types'
+import { botStatus, waitingReason } from '../botStatus'
+import type { BotState, VenueSeat, WarningBody } from '../types'
 
 export function Card({
   title,
@@ -75,22 +76,33 @@ export function Spinner() {
   )
 }
 
-/** Container state as a pill. Only `running` is green: see docker::ContainerState. */
-export function StatePill({ state, status }: { state: BotState; status: string }) {
-  const tone =
-    state === 'running'
-      ? 'bg-success-bg text-success'
-      : state === 'dead' || state === 'exited'
-        ? 'bg-danger-bg text-danger'
-        : state === 'restarting' || state === 'created'
-          ? 'bg-warning-bg text-warning'
-          : 'bg-hover text-muted'
+/** live / waiting / stopped / crashed, with the raw state (and, for waiting,
+ * the reason) on hover. `venue` comes from the bot's config; without it the
+ * pill can only speak for the process. */
+export function StatePill({
+  state,
+  status,
+  venue,
+}: {
+  state: BotState
+  status: string
+  venue?: VenueSeat
+}) {
+  const shown = botStatus(state, status, venue)
+  const tone = {
+    live: 'bg-success-bg text-success',
+    waiting: 'bg-warning-bg text-warning',
+    stopped: 'bg-hover text-muted',
+    crashed: 'bg-danger-bg text-danger',
+  }[shown]
+  const title =
+    shown === 'waiting' && venue ? waitingReason(venue) : `${state}: ${status}`
   return (
     <span
-      title={status}
+      title={title}
       className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-bold ${tone}`}
     >
-      {state}
+      {shown === 'waiting' ? 'waiting on Textile' : shown}
     </span>
   )
 }

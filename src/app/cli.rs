@@ -32,6 +32,15 @@ pub enum Command {
         config: String,
         venue_url: Option<String>,
     },
+    /// Move tokens out of the bot's wallet: `token` is an ERC-20 address or
+    /// `native` for the gas coin, `amount` a human decimal or `all`, `to` the
+    /// destination. Signs with the bot's own signer and exits.
+    Withdraw {
+        config: String,
+        token: String,
+        amount: String,
+        to: String,
+    },
 }
 
 /// Parse a command from an argument iterator (already skipping argv[0]).
@@ -47,6 +56,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
     let mut connect = false;
     let mut venue_url: Option<String> = None;
     let mut dir: Option<String> = None;
+    let mut withdraw = false;
+    let mut token: Option<String> = None;
+    let mut amount: Option<String> = None;
+    let mut to: Option<String> = None;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -63,6 +76,21 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
             "connect" => connect = true,
             "--venue" => venue_url = Some(it.next().ok_or_else(|| anyhow!("--venue needs a URL"))?),
             "--dir" => dir = Some(it.next().ok_or_else(|| anyhow!("--dir needs a path"))?),
+            // Verb: `stitch withdraw --config <path> --token <addr|native> --amount <n|all> --to <addr>`.
+            "withdraw" => withdraw = true,
+            "--token" => {
+                token = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--token needs an address or `native`"))?,
+                )
+            }
+            "--amount" => {
+                amount = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--amount needs a number or `all`"))?,
+                )
+            }
+            "--to" => to = Some(it.next().ok_or_else(|| anyhow!("--to needs an address"))?),
             other => return Err(anyhow!("unknown argument: {other}")),
         }
     }
@@ -74,10 +102,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
     // and a flag documented as approve-only. Validate the whole invocation
     // before dispatching, so a wrong command line is an error rather than the
     // wrong live operation.
-    let verbs: Vec<&str> = [(init, "init"), (connect, "connect"), (approve, "approve")]
-        .into_iter()
-        .filter_map(|(on, name)| on.then_some(name))
-        .collect();
+    let verbs: Vec<&str> = [
+        (init, "init"),
+        (connect, "connect"),
+        (approve, "approve"),
+        (withdraw, "withdraw"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
     if verbs.len() > 1 {
         return Err(anyhow!("pick one verb, got `{}`", verbs.join("` and `")));
     }
@@ -89,6 +122,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
     }
     if exact && !approve {
         return Err(anyhow!("--exact only applies to `approve`"));
+    }
+    if (token.is_some() || amount.is_some() || to.is_some()) && !withdraw {
+        return Err(anyhow!(
+            "--token, --amount and --to only apply to `withdraw`"
+        ));
+    }
+    if dry_run && withdraw {
+        return Err(anyhow!("--dry-run does not apply to `withdraw`"));
     }
     if dry_run && connect {
         // `--dry-run` means "read, don't write", and enrollment has no such
@@ -114,6 +155,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
             config,
             dry_run,
             exact,
+        });
+    }
+    if withdraw {
+        return Ok(Command::Withdraw {
+            config,
+            token: token.ok_or_else(|| anyhow!("withdraw needs --token <address|native>"))?,
+            amount: amount.ok_or_else(|| anyhow!("withdraw needs --amount <number|all>"))?,
+            to: to.ok_or_else(|| anyhow!("withdraw needs --to <address>"))?,
         });
     }
     Ok(Command::Run { config, dry_run })
@@ -167,6 +216,72 @@ mod tests {
                 dir: Some("d".into())
             }
         );
+    }
+
+    #[test]
+    fn withdraw_needs_all_three_and_nothing_else_takes_them() {
+        assert_eq!(
+            parse_vec(&[
+                "withdraw",
+                "--config",
+                "s.toml",
+                "--token",
+                "native",
+                "--amount",
+                "all",
+                "--to",
+                "0x000000000000000000000000000000000000dEaD"
+            ])
+            .unwrap(),
+            Command::Withdraw {
+                config: "s.toml".into(),
+                token: "native".into(),
+                amount: "all".into(),
+                to: "0x000000000000000000000000000000000000dEaD".into(),
+            }
+        );
+        for (args, want) in [
+            (
+                vec![
+                    "withdraw", "--config", "s.toml", "--token", "native", "--to", "0x1",
+                ],
+                "--amount",
+            ),
+            (
+                vec![
+                    "withdraw", "--config", "s.toml", "--amount", "1", "--to", "0x1",
+                ],
+                "--token",
+            ),
+            (
+                vec![
+                    "withdraw", "--config", "s.toml", "--token", "native", "--amount", "1",
+                ],
+                "--to",
+            ),
+            (
+                vec!["approve", "--config", "s.toml", "--to", "0x1"],
+                "only apply to `withdraw`",
+            ),
+            (
+                vec![
+                    "withdraw",
+                    "--config",
+                    "s.toml",
+                    "--token",
+                    "native",
+                    "--amount",
+                    "1",
+                    "--to",
+                    "0x1",
+                    "--dry-run",
+                ],
+                "does not apply",
+            ),
+        ] {
+            let err = parse_vec(&args).expect_err(&format!("{args:?} must be rejected"));
+            assert!(err.to_string().contains(want), "{args:?}: {err}");
+        }
     }
 
     #[test]

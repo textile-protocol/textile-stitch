@@ -9,21 +9,16 @@ import {
   Field,
   Input,
   Loading,
-  Select,
   Toggle,
 } from './ui'
-import ChangeSigner from './ChangeSigner'
-import { fundsFromVault } from '../capital'
 import { shortAddress } from '../format'
-import type { Bot, Corridor, Settings, Sizing, Spread } from '../types'
+import type { Bot, Corridor, Settings, Spread } from '../types'
 
 /**
- * Structured settings matching the desktop Stitch app: corridor, signer, spreads,
- * taker leg, endpoints, plus a collapsed Experimental card for opt-in knobs
- * (TWAP / inventory-lean). The RFQ card is always on — new bots quote Swap
- * via RFQ. Only the genuinely book-only fields (order lifetime, refresh
- * threshold) hide when the ladder is off, and the collapsed Legacy card is
- * where the ladder itself can be put back. Sizing / tick stay on the Raw
+ * The Corridors tab: every pool on this bot, its spreads and price feed, plus
+ * a collapsed Experimental card for opt-in knobs (taker leg, TWAP,
+ * inventory-lean). Quoting is always on; the venue flow owns the RFQ switch,
+ * and the Textile overrides live under Tools. Sizing / tick stay on the Raw
  * config tab.
  *
  * Sends only the fields the operator touched — a partial patch means a concurrent
@@ -38,7 +33,6 @@ export default function SettingsForm({
 }) {
   const [loaded, setLoaded] = useState<Settings | null>(null)
   const [draft, setDraft] = useState<Settings | null>(null)
-  const [rfqApiKey, setRfqApiKey] = useState('')
   const [loadError, setLoadError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -74,19 +68,8 @@ export default function SettingsForm({
       .settings(bot.name, activePool)
       .then((s) => {
         if (cancelled) return
-        // New RFQ-only bots default to answering Swap quotes, so the operator
-        // can skip ticking the box and go straight to Connect. Display-only:
-        // nothing persists until Connect writes the [rfq] block with the venue
-        // credential (a fresh bot has no maker id to enable against). Seeding
-        // both loaded and draft keeps the form clean rather than dirty. Only on
-        // this initial load — later refreshes reflect what the operator chose.
-        const connected = s.rfqApiKeySet && s.rfqMakerId.trim() !== ''
-        const seeded =
-          s.rfqDefaultUnlocked && !connected && !s.rfqEnabled
-            ? { ...s, rfqEnabled: true }
-            : s
-        setLoaded(seeded)
-        setDraft(seeded)
+        setLoaded(s)
+        setDraft(s)
       })
       .catch((e) => {
         if (!cancelled) setLoadError(e instanceof ApiError ? e.message : String(e))
@@ -99,8 +82,7 @@ export default function SettingsForm({
   if (loadError) return <ErrorState error={loadError} />
   if (!loaded || !draft) return <Loading what="the settings" />
 
-  const dirty =
-    JSON.stringify(loaded) !== JSON.stringify(draft) || rfqApiKey.trim() !== ''
+  const dirty = JSON.stringify(loaded) !== JSON.stringify(draft)
   // Functional update so two sets in one handler (e.g. clearing TWAP window +
   // deviation together) both land — a spread from a stale `draft` would drop the first.
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
@@ -113,7 +95,7 @@ export default function SettingsForm({
     try {
       const res = await api.saveSettings(
         bot.name,
-        changedFields(loaded!, draft!, rfqApiKey),
+        changedFields(loaded!, draft!),
       )
       // A save carries a restart, so the pool picker can move before it
       // answers. Writing this response then would put another corridor's
@@ -125,7 +107,6 @@ export default function SettingsForm({
       }
       setLoaded(res.settings)
       setDraft(res.settings)
-      setRfqApiKey('')
       onSaved(res.message)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -138,7 +119,6 @@ export default function SettingsForm({
     setPool(res.settings.poolIndex)
     setLoaded(res.settings)
     setDraft(res.settings)
-    setRfqApiKey('')
     onSaved(res.message)
   }
 
@@ -162,42 +142,32 @@ export default function SettingsForm({
           setPool(index)
         }}
         onPoolsChanged={applyPoolResult}
-        onSwitched={(message) => {
-          setPool(0)
-          onSaved(message)
-        }}
       />
 
-      <ChangeSigner
-        bot={bot.name}
-        chainId={bot.config?.chainId}
-        wantsToBeUp={bot.state === 'running' || bot.state === 'restarting'}
-        onChanged={onSaved}
-      />
-
-      {loaded.rfqPanelUnlocked && (
+      {/* No wallet change here: a bot is named after its wallet, and the
+          wizard makes a new bot for a new wallet. Moving a bot between keys
+          would leave the name, the venue registration and the approvals
+          pointing at the old one. */}
+      {/* Only while there is something to do here: not connected, waiting on
+          Textile, or the old public-ladder mode to switch off. A seated bot
+          says so in the state pill; Reconnect lives under Tools. */}
+      {loaded.rfqPanelUnlocked &&
+        !(loaded.rfqEnabled && loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== '' && !loaded.bookEnabled) && (
         <RfqCard
           botName={bot.name}
-          draft={draft}
           loaded={loaded}
-          rfqApiKey={rfqApiKey}
-          pendingPatch={changedFields(loaded, draft, rfqApiKey)}
-          corridorId={
-            loaded.pools.find((p) => p.index === loaded.poolIndex)
-              ?.corridorId ?? ''
-          }
+          pendingPatch={changedFields(loaded, draft)}
           editable={loaded.editable}
-          onChange={set}
-          onApiKey={setRfqApiKey}
           onConnected={(next, message) => {
             setPool(next.poolIndex)
             setLoaded(next)
             setDraft(next)
-            setRfqApiKey('')
             onSaved(message)
           }}
         />
       )}
+
+      <VaultCard bot={bot} address={loaded.vaultAddress} />
 
       <Card
         title="Spreads"
@@ -266,20 +236,6 @@ export default function SettingsForm({
         </div>
       </Card>
 
-      <Card title="Taker leg">
-        <Toggle
-          checked={draft.takerEnabled}
-          disabled={!loaded.editable}
-          onChange={(v) => set('takerEnabled', v)}
-          label="Take resting orders that cross this bot's quote"
-        />
-        <p className="mt-2 text-xs text-faint">
-          Fill users' resting limit orders when their price crosses your quote.
-          Fills are priced off the buy/sell spreads above, so a side with no
-          spread is never taken.
-        </p>
-      </Card>
-
       <Card title="Endpoints">
         <div className="space-y-4">
           <Field label="RPC URL" hint="Where the bot reads chain state and sends transactions.">
@@ -308,14 +264,6 @@ export default function SettingsForm({
         onChange={set}
       />
 
-      {loaded.rfqDefaultUnlocked && (
-        <LegacyCard
-          loaded={loaded}
-          draft={draft}
-          editable={loaded.editable}
-          onChange={set}
-        />
-      )}
 
       {error && <Banner tone="danger">{error}</Banner>}
 
@@ -330,10 +278,7 @@ export default function SettingsForm({
         </Button>
         <Button
           disabled={!dirty}
-          onClick={() => {
-            setDraft(loaded)
-            setRfqApiKey('')
-          }}
+          onClick={() => setDraft(loaded)}
         >
           Discard
         </Button>
@@ -352,10 +297,9 @@ export default function SettingsForm({
 }
 
 /**
- * Every [[pools]] entry on this bot, plus add / remove / replace.
+ * Every [[pools]] entry on this bot, plus add and remove.
  *
  * Add appends a same-chain catalog corridor so one process quotes two pairs.
- * Switch still replaces the whole file — keep it as the escape hatch.
  */
 function CorridorsCard({
   bot,
@@ -365,7 +309,6 @@ function CorridorsCard({
   onBusyChange,
   onSelectPool,
   onPoolsChanged,
-  onSwitched,
 }: {
   bot: Bot
   settings: Settings
@@ -377,12 +320,9 @@ function CorridorsCard({
   onBusyChange: (busy: boolean) => void
   onSelectPool: (index: number) => void
   onPoolsChanged: (res: { settings: Settings; message: string }) => void
-  onSwitched: (message: string) => void
 }) {
   const [corridors, setCorridors] = useState<Corridor[] | null>(null)
-  const [switching, setSwitching] = useState(false)
-  const [switchChoice, setSwitchChoice] = useState('')
-  const [busy, setBusy] = useState<'remove' | 'switch' | null>(null)
+  const [busy, setBusy] = useState<'remove' | null>(null)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => {
     onBusyChange(busy !== null)
@@ -411,7 +351,6 @@ function CorridorsCard({
   const addable = live.filter(
     (c) => chainId != null && c.chainId === chainId && !already.has(c.id),
   )
-  const switchable = live
 
   const selected =
     settings.pools.find((p) => p.index === settings.poolIndex) ?? settings.pools[0]
@@ -449,38 +388,11 @@ function CorridorsCard({
     }
   }
 
-  async function applySwitch() {
-    if (
-      !window.confirm(
-        `Replace ${bot.name}'s whole config with a different corridor?\n\n` +
-          `Every pair currently configured is dropped and the corridor's preset is written in its place. Your signer is kept; spreads and sizing reset. A running bot is stopped.` +
-          // A vault maker has no operator-wallet approvals to run, so pointing at
-          // a card it doesn't show would send someone hunting for nothing.
-          (fundsFromVault(bot.config)
-            ? ''
-            : `\n\nBefore starting it again, approve the new corridor's tokens under Tools → Permit2 allowances.`),
-      )
-    ) {
-      return
-    }
-    setBusy('switch')
-    setError(null)
-    try {
-      const res = await api.switchCorridor(bot.name, switchChoice)
-      setSwitching(false)
-      onSwitched(res.message)
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setBusy(null)
-    }
-  }
-
   return (
     <Card title="Corridors">
       <p className="text-sm text-ink">
         {settings.poolCount === 1
-          ? 'This bot quotes one pair. Add a second corridor on the same chain and one process quotes both, from one wallet and one nonce.'
+          ? 'Corridors in a single bot share the same capital.'
           : `This bot quotes ${settings.poolCount} pairs from one wallet. Pick one to edit its spreads, sizing and feed.`}
       </p>
       <ul className="mt-3 space-y-2">
@@ -522,11 +434,6 @@ function CorridorsCard({
           >
             <Button disabled={saving}>Add another corridor…</Button>
           </Link>
-          <p className="mt-2 text-sm text-muted">
-            Only pairs Textile lists on this bot&apos;s network. The new corridor
-            gets its own price feed and spreads; the wallet and signer stay
-            shared.
-          </p>
         </div>
       )}
 
@@ -543,58 +450,6 @@ function CorridorsCard({
         </div>
       )}
 
-      {corridors && switchable.length >= 2 && !switching && (
-        <div className="mt-4 border-t border-line-soft pt-3">
-          <Button
-            variant="ghost"
-            disabled={saving}
-            onClick={() => {
-              setSwitchChoice(bot.config?.corridorId ?? switchable[0]!.id)
-              setSwitching(true)
-              setError(null)
-            }}
-          >
-            Replace entire config…
-          </Button>
-        </div>
-      )}
-      {switching && corridors && (
-        <div className="mt-3 space-y-3">
-          <Field
-            label="Replace with"
-            hint="Drops every pool and writes the corridor preset. Spreads reset; the signer stays."
-          >
-            <Select
-              value={switchChoice}
-              onChange={(e) => setSwitchChoice(e.target.value)}
-            >
-              {switchable.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.displayName} — {c.networkLabel}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <div className="flex gap-2">
-            <Button
-              variant="primary"
-              busy={busy === 'switch'}
-              disabled={!switchChoice || saving}
-              onClick={() => void applySwitch()}
-            >
-              Replace config
-            </Button>
-            <Button
-              onClick={() => {
-                setSwitching(false)
-                setError(null)
-              }}
-            >
-              Cancel
-            </Button>
-          </div>
-        </div>
-      )}
       {error && <Banner tone="danger">{error}</Banner>}
     </Card>
   )
@@ -634,6 +489,44 @@ export function SpreadField({
  * default so the main form stays short; each feature group is its own
  * subsection so later experiments can drop in beside TWAP / lean.
  */
+/**
+ * Where the bot's capital sits: its own wallet, or an OperatorVault Benoit
+ * attaches to the bot's config. Read-only here on purpose: the vault is set
+ * up outside the panel for now, and a switch that only half of the setup
+ * honours would be a lie. Bot-wide, like the wallet it stands in for.
+ */
+function VaultCard({ bot, address }: { bot: Bot; address: string }) {
+  const active = address.trim() !== ''
+  const explorer = bot.config?.vaultExplorerUrl ?? null
+  return (
+    <Card title="Vault">
+      <div className="flex flex-wrap items-center gap-3 text-sm">
+        <span
+          className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-bold ${
+            active ? 'bg-success-bg text-success' : 'bg-hover text-muted'
+          }`}
+        >
+          {active ? 'Active' : 'Not active'}
+        </span>
+        {active ? (
+          <>
+            <span className="font-mono" title={address}>
+              {shortAddress(address)}
+            </span>
+            {explorer && (
+              <a className="text-xs text-accent underline" href={explorer} target="_blank" rel="noreferrer">
+                View on explorer
+              </a>
+            )}
+          </>
+        ) : (
+          <span className="text-muted">This bot trades from its own wallet.</span>
+        )}
+      </div>
+    </Card>
+  )
+}
+
 function ExperimentalCard({
   draft,
   editable,
@@ -670,6 +563,18 @@ function ExperimentalCard({
             Features here are opt-in and may change. Leave them alone unless you
             know you want them.
           </p>
+
+          <ExperimentalSubsection
+            title="Taker leg"
+            description="On for every bot the panel creates. The bot fills users' resting limit orders when their price crosses your quote; fills are priced off the buy/sell spreads above, so a side with no spread is never taken. Each fill is an on-chain transaction from the wallet, which is why Approve and Withdraw need the bot stopped."
+          >
+            <Toggle
+              checked={draft.takerEnabled}
+              disabled={!editable}
+              onChange={(v) => onChange('takerEnabled', v)}
+              label="Take resting orders that cross this bot's quote"
+            />
+          </ExperimentalSubsection>
 
           <ExperimentalSubsection
             title="TWAP / lean"
@@ -800,147 +705,22 @@ function ExperimentalSubsection({
   )
 }
 
-/**
- * Can this side actually post? Mirrors `PoolConfig::buy_enabled` / `sell_enabled`
- * on the bot: a spread *and* a size — either a flat order size or a
- * total-liquidity + min-slice ladder. Without one the ladder rests nothing, so
- * the card says so instead of offering a switch that does nothing.
- */
-function sideCanPost(spread: Spread, sizing: Sizing): boolean {
-  const has = (v: string) => v.trim() !== ''
-  return (
-    has(spread.value) &&
-    (has(sizing.orderSize) ||
-      (has(sizing.totalLiquidity) && has(sizing.minSliceDebt)))
-  )
-}
-
-/**
- * Legacy: the public ladder.
- *
- * Collapsed by default and last on the page — Swap is RFQ now, and a bot that
- * rests orders on the book is quoting into a venue no taker sees. It stays
- * reachable because leftover book bots exist and an operator may need to put
- * one back while debugging.
- *
- * The toggle reflects the config, so a migrated or new (RFQ-only) bot opens
- * with it off. Turning it on writes `book_enabled = true` through the normal
- * Save, which restarts the bot; the API refuses the flip when no side has a
- * spread and a size, since that would restart into quoting nothing.
- */
-function LegacyCard({
-  loaded,
-  draft,
-  editable,
-  onChange,
-}: {
-  loaded: Settings
-  draft: Settings
-  editable: boolean
-  onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const canPost =
-    sideCanPost(draft.buy, draft.buySizing) ||
-    sideCanPost(draft.sell, draft.sellSizing)
-  const turningOn = draft.bookEnabled && !loaded.bookEnabled
-  return (
-    <Card>
-      <button
-        type="button"
-        className={`-m-1 flex w-full items-center gap-2 rounded-lg p-1 text-left hover:bg-hover ${open ? 'mb-4' : ''}`}
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span
-          aria-hidden
-          className={`inline-block text-xs text-muted transition-transform ${open ? 'rotate-90' : ''}`}
-        >
-          ▸
-        </span>
-        <h2 className="text-base font-bold">Legacy</h2>
-        <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-muted">
-          {loaded.bookEnabled ? 'ladder on' : 'off'}
-        </span>
-      </button>
-      {open && (
-        <div className="space-y-4">
-          <p className="text-xs text-faint">
-            Before RFQ, Stitch quoted by resting a ladder of signed orders on
-            the public book. Swap no longer reads that book — it asks makers for
-            a firm quote — so a ladder posted today is invisible to takers while
-            still holding your inventory behind live orders. Leave this off
-            unless you know why you want it.
-          </p>
-
-          <Toggle
-            checked={draft.bookEnabled}
-            disabled={!editable}
-            onChange={(v) => onChange('bookEnabled', v)}
-            label="Post a public ladder (book_enabled)"
-          />
-
-          <p className="text-xs text-faint">
-            Sizing lives on the Raw config tab. The ladder also uses the order
-            lifetime and refresh threshold under Spreads, which appear once it
-            is on.
-          </p>
-
-          {turningOn && !canPost && (
-            <Banner tone="danger">
-              No side can post: a ladder needs a spread and a size. Set the
-              sizing on the Raw config tab first — saving this now will be
-              refused.
-            </Banner>
-          )}
-
-          {turningOn && canPost && (
-            <Banner tone="warning">
-              Saving restarts the bot with the ladder on. It will sign and rest
-              orders against your funded balance, and those orders stay live
-              until they expire even if you turn this back off.
-            </Banner>
-          )}
-        </div>
-      )}
-    </Card>
-  )
-}
-
-const DEFAULT_RFQ_URL = 'wss://api.textilecredit.com/v2/maker/stream'
-
-/**
- * RFQ. Happy path is Connect: the bot signs MakerEnroll and the panel writes
- * the credential. Paste fields stay under Advanced for manual overrides.
- * The key is write-only.
- */
 function RfqCard({
   botName,
-  draft,
   loaded,
-  rfqApiKey,
   pendingPatch,
-  corridorId,
   editable,
-  onChange,
-  onApiKey,
   onConnected,
 }: {
   botName: string
-  draft: Settings
   loaded: Settings
-  rfqApiKey: string
   pendingPatch: Record<string, unknown>
-  corridorId: string
   editable: boolean
-  onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void
-  onApiKey: (value: string) => void
   onConnected: (settings: Settings, message: string) => void
 }) {
   const [connecting, setConnecting] = useState(false)
   const [migrating, setMigrating] = useState(false)
   const [connectError, setConnectError] = useState<string | null>(null)
-  const [advanced, setAdvanced] = useState(false)
   const [enrollment, setEnrollment] = useState<{
     makerSlug: string
     environment: string
@@ -956,21 +736,6 @@ function RfqCard({
   const ga = loaded.rfqDefaultUnlocked
   const connected = loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
   const onBook = loaded.bookEnabled
-
-  function enable(next: boolean) {
-    onChange('rfqEnabled', next)
-    if (!next) return
-    if (!draft.rfqUrl.trim()) onChange('rfqUrl', DEFAULT_RFQ_URL)
-    const registered =
-      loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
-    const waiting = registered && !draft.rfqCorridor.trim()
-    // A registered bot with no venue corridor is flagged or has no RFQ pair.
-    // Do not invent a slug from the book corridor — that is not an assignment.
-    if (waiting) return
-    if (!draft.rfqCorridor.trim() && corridorId) {
-      onChange('rfqCorridor', corridorId)
-    }
-  }
 
   async function connect() {
     setConnecting(true)
@@ -1048,7 +813,7 @@ function RfqCard({
   }
 
   return (
-    <Card title="RFQ">
+    <Card title="Textile connection">
       <div className="space-y-4">
         {ga && onBook && (
           <Banner tone="warning">
@@ -1078,21 +843,10 @@ function RfqCard({
           </Banner>
         )}
 
-        <Toggle
-          checked={draft.rfqEnabled}
-          disabled={!editable}
-          onChange={enable}
-          label="Answer Swap quote requests"
-        />
-        <p className="text-xs text-faint">
-          Connect registers this bot&apos;s funding wallet and saves the
-          credential. Then confirm your email address: click the link we send
-          and this bot is seated on every Swap pair, on every chain, including
-          ones listed later. You never paste an id or key. The venue rejects
-          requests under 1 whole token so the protocol fee cannot round to
-          zero.
-        </p>
-
+        {/* No on/off switch: answering quote requests is what a bot is for.
+            `rfq_enabled` still exists in the config, but the venue flow owns
+            it (Connect and the email confirmation turn it on; a flagged maker
+            turns it off), never a click here. Stop the bot to stop quoting. */}
         {waiting ? (
           <Banner tone="warning">
             Registered
@@ -1106,25 +860,7 @@ function RfqCard({
                 ? 'Your address is confirmed. Press Check status to pick the seats up.'
                 : 'Confirm your email address below. That is the only step left — no Swap quotes until you do.'}
           </Banner>
-        ) : live ? (
-          <div className="rounded-lg border border-line-soft bg-hover/40 px-3 py-2 text-sm">
-            <p className="font-medium">
-              Connected
-              {enrollment
-                ? ` as ${enrollment.makerSlug} (${enrollment.environment})`
-                : ''}
-              {ga && !onBook ? ' · Swap only' : ''}
-            </p>
-            <p className="mt-1 text-xs text-faint">
-              {enrollment?.corridors.length
-                ? `Corridors: ${enrollment.corridors.join(', ')}`
-                : loaded.rfqCorridor
-                  ? `Corridor: ${loaded.rfqCorridor}`
-                  : 'No corridor assigned yet.'}
-              {loaded.rfqApiKeySet ? ' · API key saved' : ''}
-            </p>
-          </div>
-        ) : (
+        ) : live ? null : (
           <Banner tone="warning">
             {ga
               ? 'Not connected. This bot will not quote until you connect to Textile.'
@@ -1178,118 +914,30 @@ function RfqCard({
           </div>
         )}
 
-        <div className="space-y-1">
+        {!connected && (
           <Button
-            variant={connected ? 'ghost' : 'primary'}
+            variant="primary"
             busy={connecting}
             disabled={!editable}
             onClick={() => void connect()}
           >
-            {connected
-              ? 'Reconnect to Textile'
-              : ga && onBook
-                ? 'Connect and switch to RFQ'
-                : 'Connect to Textile'}
+            {ga && onBook ? 'Connect and switch to RFQ' : 'Connect to Textile'}
           </Button>
-          {connected && (
-            <p className="text-xs text-faint">
-              Optional. Only if the session is stuck — not part of switching
-              to RFQ.
-            </p>
-          )}
-        </div>
-
-        <div>
-          <button
-            type="button"
-            className="text-xs text-muted underline hover:text-ink"
-            onClick={() => setAdvanced((v) => !v)}
-          >
-            {advanced ? 'Hide advanced' : 'Advanced'}
-          </button>
-        </div>
-
-        {advanced && (
-          <div className="space-y-4 border-t border-line-soft pt-4">
-            <p className="text-xs text-faint">
-              Manual overrides. Use Connect above unless you were given these
-              values to paste.
-            </p>
-            <Field
-              label="Quote stream URL"
-              hint="Where the bot listens for private quote requests. Production is wss://. ws:// is allowed only on localhost."
-            >
-              <Input
-                value={draft.rfqUrl}
-                disabled={!editable}
-                placeholder={DEFAULT_RFQ_URL}
-                onChange={(e) => onChange('rfqUrl', e.target.value)}
-              />
-            </Field>
-            <Field
-              label="Maker ID"
-              hint="Textile's maker record ID (starts with cl or cm). Not the short display name."
-            >
-              <Input
-                value={draft.rfqMakerId}
-                disabled={!editable}
-                placeholder="cl…"
-                autoComplete="off"
-                onChange={(e) => onChange('rfqMakerId', e.target.value)}
-              />
-            </Field>
-            <Field
-              label="Fill validation contract"
-              hint="On-chain address that authorizes this maker to fill preferred quotes on this chain."
-            >
-              <Input
-                value={draft.rfqValidationContract}
-                disabled={!editable}
-                placeholder="0x…"
-                autoComplete="off"
-                onChange={(e) => onChange('rfqValidationContract', e.target.value)}
-              />
-            </Field>
-            <Field
-              label="Corridor"
-              hint="Trading corridor this bot quotes on (for example cngn-usdt-celo). Usually matches the bot's corridor."
-            >
-              <Input
-                value={draft.rfqCorridor}
-                disabled={!editable}
-                placeholder={corridorId || 'cngn-usdt-bsc'}
-                onChange={(e) => onChange('rfqCorridor', e.target.value)}
-              />
-            </Field>
-            <Field
-              label="API key"
-              hint={
-                loaded.rfqApiKeySet
-                  ? 'A key is already saved. Paste a new one only to rotate it. The current value is never shown.'
-                  : 'Starts with tx_live_…. Saved on disk for the panel owner only — never written to stitch.toml.'
-              }
-            >
-              <Input
-                type="password"
-                value={rfqApiKey}
-                disabled={!editable}
-                placeholder={loaded.rfqApiKeySet ? '••••••••' : 'tx_live_…'}
-                autoComplete="off"
-                onChange={(e) => onApiKey(e.target.value)}
-              />
-            </Field>
-          </div>
         )}
+
       </div>
     </Card>
   )
 }
 
-/** Only the fields this form edits, plus the pool index the API needs. */
-function changedFields(
+/**
+ * Only the fields that changed, plus the pool index the API needs. Shared with
+ * the Textile overrides under Tools, which edit the `rfq*` keys the same way.
+ */
+export function changedFields(
   loaded: Settings,
   draft: Settings,
-  rfqApiKey: string,
+  rfqApiKey = '',
 ): Record<string, unknown> {
   // The pair goes with the index: the panel refuses a multi-corridor write
   // whose index has been renumbered by someone else's add or remove.
@@ -1320,6 +968,7 @@ function changedFields(
     'rfqValidationContract',
     'rfqCorridor',
     'bookEnabled',
+    'vaultAddress',
   ]
   for (const key of keys) {
     if (JSON.stringify(loaded[key]) !== JSON.stringify(draft[key])) {

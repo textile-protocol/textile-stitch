@@ -241,7 +241,7 @@ function Row({
       <span className="min-w-0 flex-1">
         <span className="flex flex-wrap items-center gap-2">
           <span className="font-bold">{place.addTo(bot.name)}</span>
-          <StatePill state={bot.state} status={bot.status} />
+          <StatePill state={bot.state} status={bot.status} venue={bot.config?.venue} />
           {bot.config && <Tag>chain {bot.config.chainId}</Tag>}
         </span>
         {candidate.blocked ? (

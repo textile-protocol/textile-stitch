@@ -22,7 +22,6 @@ pub mod logs;
 #[cfg(test)]
 pub(crate) mod mock_chain;
 pub mod origin;
-pub mod quote_proof;
 pub mod session;
 pub mod settings;
 pub mod updates;
@@ -274,10 +273,12 @@ fn public_routes() -> Router<AppState> {
 fn protected_routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/api/corridors", get(wizard::corridors))
+        .route("/api/feed/mid", get(wizard::feed_mid))
         .route("/api/wallets/generate", post(wizard::generate_wallet))
         .route("/api/signer/check", post(wizard::check_signer))
         .route("/api/bots", get(bots::list).post(wizard::create))
         .route("/api/bots/{name}", get(bots::show).delete(bots::remove))
+        .route("/api/bots/{name}/name", patch(bots::rename))
         .route("/api/bots/{name}/start", post(bots::start))
         .route("/api/bots/{name}/stop", post(bots::stop))
         .route("/api/bots/{name}/restart", post(bots::restart))
@@ -296,8 +297,6 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/rfq/status", post(verify::maker_status))
         .route("/api/bots/{name}/config", get(settings::raw))
         .route("/api/bots/{name}/config", put(settings::save_raw))
-        .route("/api/bots/{name}/signer", put(bots::change_signer))
-        .route("/api/bots/{name}/corridor", post(bots::switch_corridor))
         .route("/api/bots/{name}/pools", post(settings::add_pool))
         .route(
             "/api/bots/{name}/pools/{index}",
@@ -306,11 +305,12 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/logs", get(logs::tail))
         .route("/api/bots/{name}/allowances", get(allowances::allowances))
         .route("/api/bots/{name}/funding", get(funding::funding))
-        .route(
-            "/api/bots/{name}/quote-proof",
-            post(quote_proof::quote_proof),
-        )
         .route("/api/bots/{name}/approve", post(logs::approve))
+        .route("/api/bots/{name}/withdraw", post(logs::withdraw))
+        .route(
+            "/api/desktop",
+            get(crate::panel::desktop::get).patch(crate::panel::desktop::patch),
+        )
         .route("/api/bots/{name}/dry-run", post(logs::dry_run))
         .route("/api/compose-export", get(bots::compose_export))
         .route("/api/updates", get(updates::status))

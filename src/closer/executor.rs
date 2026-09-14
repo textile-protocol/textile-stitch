@@ -30,6 +30,15 @@ pub fn encode_approve(spender: Address, amount: U256) -> Vec<u8> {
     data
 }
 
+/// Calldata for ERC20 `transfer(address to, uint256 amount)`.
+pub fn encode_transfer(to: Address, amount: U256) -> Vec<u8> {
+    let mut data = Vec::with_capacity(68);
+    data.extend_from_slice(&selector("transfer(address,uint256)"));
+    data.extend_from_slice(&to.into_word().0);
+    data.extend_from_slice(&amount.to_be_bytes::<32>());
+    data
+}
+
 /// Calldata for ERC20 `allowance(address owner, address spender)` (a read).
 pub fn encode_allowance(owner: Address, spender: Address) -> Vec<u8> {
     let mut data = Vec::with_capacity(68);

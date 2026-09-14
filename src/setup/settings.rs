@@ -17,7 +17,7 @@
 //! inventories; the view carries the token decimals instead and lets the caller
 //! format.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::config::{
@@ -149,6 +149,10 @@ pub struct SettingsView {
     pub book_enabled: bool,
     /// `[experimental] rfq_default` matches the GA token on this file.
     pub rfq_default_unlocked: bool,
+    /// The OperatorVault this bot trades from (`[vault].address`), empty when
+    /// it trades from its own wallet. Bot-wide: every corridor on the bot
+    /// shares the capital, so they share the vault.
+    pub vault_address: String,
 }
 
 impl SettingsView {
@@ -182,6 +186,7 @@ impl SettingsView {
             rfq_validation_contract: None,
             rfq_corridor: None,
             book_enabled: None,
+            vault_address: None,
         }
     }
 }
@@ -221,6 +226,9 @@ pub struct SettingsPatch {
     pub rfq_corridor: Option<String>,
     /// `None` leaves the public ladder alone. `Some(false)` is RFQ-only.
     pub book_enabled: Option<bool>,
+    /// `None` leaves `[vault]` alone; `Some("")` removes it (trade from the
+    /// bot's own wallet); an address sets it.
+    pub vault_address: Option<String>,
 }
 
 /// Read the first pool's editable values from a `stitch.toml` body.
@@ -299,6 +307,11 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
         rfq_corridor: pool.rfq_corridor.clone().unwrap_or_default(),
         book_enabled: cfg.book_enabled,
         rfq_default_unlocked: cfg.rfq_default_unlocked(),
+        vault_address: cfg
+            .vault
+            .as_ref()
+            .map(|v| v.address.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -476,6 +489,7 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
     }
     apply_rfq(&mut doc, patch)?;
     apply_book_enabled(doc.as_table_mut(), patch.book_enabled);
+    apply_vault(&mut doc, patch.vault_address.as_deref())?;
 
     let edited = doc.to_string();
     // Guard: never hand back something the bot can't load. This is also what
@@ -558,6 +572,12 @@ pub fn add_pool_from_template(toml_str: &str, template: &str) -> Result<String> 
             );
         }
     }
+
+    // The taker leg is a per-pool flag the panel stamps on at create (see
+    // `apply_rfq_default_preset`). A corridor added later follows the bot's
+    // existing pools, so one bot does not end up half on and half off.
+    let taker_on = current.pools.iter().all(|p| p.limit_taker_enabled());
+    apply_taker(&mut new_table, taker_on);
 
     let mut doc = toml_str
         .parse::<DocumentMut>()
@@ -654,7 +674,8 @@ fn summarize_pools(cfg: &Config) -> Vec<PoolSummary> {
         .collect()
 }
 
-fn short_addr(addr: &str) -> String {
+/// `0x1234…abcd`, for a token the catalog does not know.
+pub fn short_addr(addr: &str) -> String {
     // Character indices, not bytes: `Config::from_toml` accepts a custom
     // token string that is not an ASCII address, and Settings still has to
     // render a label instead of panicking mid-codepoint.
@@ -901,6 +922,39 @@ fn apply_book_enabled(table: &mut Table, enabled: Option<bool>) {
     }
 }
 
+/// Set or clear `[vault]`. An address makes the bot trade from that
+/// OperatorVault (its orders name the vault as swapper and recipient); empty
+/// removes the table so the bot trades from its own wallet again. Only the
+/// address is managed here: `order_executor`, when ops publish one, is kept
+/// as written.
+fn apply_vault(doc: &mut DocumentMut, address: Option<&str>) -> Result<()> {
+    let Some(raw) = address else {
+        return Ok(());
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        doc.as_table_mut().remove("vault");
+        return Ok(());
+    }
+    let parsed: alloy_primitives::Address = raw
+        .parse()
+        .with_context(|| format!("vault address {raw:?} is not an address"))?;
+    if parsed.is_zero() {
+        bail!("vault address can't be the zero address");
+    }
+    if doc.get("vault").and_then(Item::as_table).is_none() {
+        let mut table = Table::new();
+        table.set_implicit(false);
+        doc.insert("vault", Item::Table(table));
+    }
+    let table = doc
+        .get_mut("vault")
+        .and_then(Item::as_table_mut)
+        .expect("just inserted [vault]");
+    set_value(table, "address", Value::from(format!("{parsed:?}")));
+    Ok(())
+}
+
 /// The patch Connect/Reconnect should apply: RFQ fields only. Never rewriting
 /// ladder sizing — that is what produced "buy max orders must be at least 1"
 /// on a reconnect that had no business touching the book.
@@ -932,13 +986,25 @@ pub fn rfq_connect_patch(
     }
 }
 
-/// Stamp a freshly written corridor template as RFQ-only: public ladder off.
-/// Spreads and liquidity stay — RFQ uses them.
+/// Stamp a freshly written corridor template with the panel's defaults:
+/// public ladder off (RFQ-only), taker leg on for every pool. Spreads and
+/// liquidity stay — RFQ uses them. The taker leg is on because a resting
+/// order priced better than our own quote is free money, and a bot that
+/// ignores it leaves it to whoever doesn't; the binary's own default stays
+/// off for hand-written configs, so this is a panel decision, written down
+/// in the file where the operator can see and undo it.
 pub fn apply_rfq_default_preset(toml_str: &str) -> Result<String> {
     let mut doc = toml_str
         .parse::<DocumentMut>()
         .context("parsing stitch.toml")?;
     apply_book_enabled(doc.as_table_mut(), Some(false));
+    let pools = doc
+        .get("pools")
+        .and_then(Item::as_array_of_tables)
+        .map_or(0, |a| a.len());
+    for index in 0..pools {
+        apply_taker(pool_mut(&mut doc, index)?, true);
+    }
     let edited = doc.to_string();
     Config::from_toml(&edited).context("the RFQ-default preset is not a valid config")?;
     Ok(edited)
@@ -1443,6 +1509,39 @@ mod tests {
     }
 
     #[test]
+    fn the_vault_address_is_set_normalised_and_cleared() {
+        let view = read_settings(TEMPLATE).unwrap();
+        assert_eq!(view.vault_address, "");
+
+        let mut patch = view.to_patch();
+        patch.vault_address = Some("0x70997970C51812dc3A010C7d01b50e0d17dc79C8".into());
+        let on = apply_settings(TEMPLATE, &patch).unwrap();
+        assert!(on.contains("[vault]"), "{on}");
+        assert_eq!(
+            read_settings(&on).unwrap().vault_address,
+            "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            "one spelling whatever casing was typed"
+        );
+
+        // Empty removes the table; the file is back to the template.
+        let mut clear = read_settings(&on).unwrap().to_patch();
+        clear.vault_address = Some("".into());
+        let off = apply_settings(&on, &clear).unwrap();
+        assert!(!off.contains("[vault]"), "{off}");
+        assert_eq!(read_settings(&off).unwrap().vault_address, "");
+
+        // Garbage and the zero address are refused before anything is written.
+        let mut bad = view.to_patch();
+        bad.vault_address = Some("not-an-address".into());
+        assert!(apply_settings(TEMPLATE, &bad).is_err());
+        bad.vault_address = Some("0x0000000000000000000000000000000000000000".into());
+        assert!(apply_settings(TEMPLATE, &bad)
+            .unwrap_err()
+            .to_string()
+            .contains("zero address"));
+    }
+
+    #[test]
     fn taker_defaults_off_and_toggling_it_round_trips() {
         let mut view = read_settings(TEMPLATE).unwrap();
         // The shipped template doesn't opt into the taker leg.
@@ -1925,6 +2024,21 @@ mod tests {
         assert_eq!(view.pool_count, 2);
         assert_eq!(view.pools[1].corridor_id.as_deref(), Some("wbrl-usdt-celo"));
         assert_eq!(view.pools[0].corridor_id.as_deref(), Some("cngn-usdt-celo"));
+    }
+
+    #[test]
+    fn an_added_corridor_follows_the_bots_taker_flag() {
+        // Panel bots have the taker leg on from create; a corridor added later
+        // gets the same, so one bot is not half on and half off. A bot that
+        // runs without it stays that way.
+        let stamped = apply_rfq_default_preset(CELO).unwrap();
+        let out = add_pool_from_template(&stamped, WBRL).unwrap();
+        let cfg = Config::from_toml(&out).unwrap();
+        assert!(cfg.pools.iter().all(|p| p.limit_taker_enabled()), "{out}");
+
+        let out = add_pool_from_template(CELO, WBRL).unwrap();
+        let cfg = Config::from_toml(&out).unwrap();
+        assert!(cfg.pools.iter().all(|p| !p.limit_taker_enabled()), "{out}");
     }
 
     #[test]

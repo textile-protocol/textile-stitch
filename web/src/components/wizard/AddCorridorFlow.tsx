@@ -25,17 +25,17 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../../api'
-import { formatAmount, formatClock, groupAddress } from '../../format'
+import { formatClock } from '../../format'
 import { pairSymbols } from '../SpreadExample'
 import { Banner, Button, Card, Spinner } from '../ui'
 import EmailVerifyWait from './EmailVerifyWait'
-import LiveStep from './LiveStep'
+import { AddressBlock, GasRow, TokenRow } from './FundingRows'
 import ProgressList, { type ProgressRow } from './ProgressList'
 import { pairFunded, templatePair, templateSpreads } from './candidates'
 import { type FundOutcome } from './FundStep'
 import { clearAddResume, saveAddResume } from './resume'
 import { errorText, useStartSequence } from './useStartSequence'
-import { add, botRunState, fund, live, progress as progressCopy } from './wizardCopy'
+import { add, botRunState, fund, progress as progressCopy } from './wizardCopy'
 import type { Corridor, Funding, FundingToken, SaveResult, Spread } from '../../types'
 
 export interface AddCorridorFlowProps {
@@ -75,7 +75,6 @@ export interface AddCorridorFlowProps {
    * corridor button leads nowhere else for a day.
    */
   onStartOver: () => void
-  botPath: string
   onOpenBot: () => void
 }
 
@@ -96,7 +95,6 @@ export default function AddCorridorFlow({
   onAdded,
   onBack,
   onStartOver,
-  botPath,
   onOpenBot,
 }: AddCorridorFlowProps) {
   const [writes, setWrites] = useState<Record<WriteKey, WriteState>>({
@@ -119,7 +117,6 @@ export default function AddCorridorFlow({
   const [fundingError, setFundingError] = useState<string | null>(null)
   const [checkedAt, setCheckedAt] = useState<number | null>(null)
   const [outcome, setOutcome] = useState<FundOutcome | null>(null)
-  const [copied, setCopied] = useState(false)
   const [checking, setChecking] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [stopError, setStopError] = useState<string | null>(null)
@@ -374,24 +371,13 @@ export default function AddCorridorFlow({
     }
   }
 
-  async function copyAddress(address: string) {
-    try {
-      await navigator.clipboard.writeText(address)
-      setCopied(true)
-      window.setTimeout(() => mountedRef.current && setCopied(false), 2000)
-    } catch {
-      // The address is on screen and selectable either way.
-    }
-  }
-
   const symbols = pairSymbols(corridor.displayName)
   const waitingForMoney = phase === 'funding' && !pairUnpriceable
   // Live on the buy side only: the wallet has the stable but not the soft
   // token, so the bot can buy and has nothing to sell. Worth one sentence.
   const oneSided = softRow?.funded !== true && stableRow?.funded === true
 
-  // The ending. LiveStep gets the corridor the operator just picked, so its
-  // public swap link is the right one.
+  // The ending: the bot's own page, or the confirm-your-email screen.
   if (phase === 'done' && outcome) {
     return (
       <div className="space-y-4">
@@ -400,9 +386,9 @@ export default function AddCorridorFlow({
             {add.oneSided(bot, symbols.base, symbols.quote)}
           </Banner>
         )}
-        {/* Not once the bot is up: the runner started it, LiveStep below says
-            so, and a banner telling the operator to go and start it by hand
-            would contradict the screen it is sitting on. */}
+        {/* Not once the bot is up: the runner started it, and a banner telling
+            the operator to go and start it by hand would contradict the screen
+            it is sitting on. */}
         {notBounced && outcome.kind !== 'live' && (
           <Banner tone="warning">
             {restartError && <p>{restartError}</p>}
@@ -412,21 +398,13 @@ export default function AddCorridorFlow({
           </Banner>
         )}
         {outcome.kind === 'live' ? (
-          <LiveStep
-            bot={bot}
-            corridor={
-              symbols
-                ? {
-                    sellSymbol: symbols.quote,
-                    buySymbol: symbols.base,
-                    chainId: corridor.chainId,
-                  }
-                : null
-            }
-            botPath={botPath}
-            onOpenBot={onOpenBot}
-            clearsResume={false}
-          />
+          // Live: the bot page is the destination, same as the new-bot lane.
+          // The banners above are the only thing worth a click first.
+          <div>
+            <Button variant="primary" onClick={onOpenBot}>
+              {add.openBot}
+            </Button>
+          </div>
         ) : (
           // No Back: this bot already has a maker identity, and the address
           // that seats it is confirmed once per maker, not per corridor.
@@ -434,7 +412,7 @@ export default function AddCorridorFlow({
             bot={bot}
             initial={outcome.status}
             initialError={outcome.kind === 'waiting' ? outcome.error : null}
-            onApproved={() => setOutcome({ kind: 'live' })}
+            onApproved={onOpenBot}
           />
         )}
       </div>
@@ -444,7 +422,6 @@ export default function AddCorridorFlow({
   const seq = runner.state
   const failure = seq.failure
   const gasSymbol = funding?.gas.symbol ?? 'gas'
-  const network = corridor.networkLabel
   const address = funding?.operatorAddress ?? null
 
   const rows: ProgressRow[] = [
@@ -557,7 +534,7 @@ export default function AddCorridorFlow({
                 </Button>
                 {failedStep === 'enroll' && (
                   <>
-                    <Button onClick={onOpenBot}>{live.openBot}</Button>
+                    <Button onClick={onOpenBot}>{add.openBot}</Button>
                     <Button onClick={onStartOver}>{add.enrollStartOver}</Button>
                   </>
                 )}
@@ -586,7 +563,7 @@ export default function AddCorridorFlow({
               <p>{add.unpriceableNext(bot)}</p>
               <div>
                 <Button variant="primary" onClick={onOpenBot}>
-                  {live.openBot}
+                  {add.openBot}
                 </Button>
               </div>
             </div>
@@ -597,24 +574,7 @@ export default function AddCorridorFlow({
             warning to click past: the flow ends at a live corridor, so it waits
             here and starts on its own the moment money lands. */}
         {waitingForMoney && funding && address && (
-          <div className="rounded-lg border border-line-soft bg-canvas p-4">
-            <p className="text-sm font-bold">{fund.addressLabel(network)}</p>
-            <p className="mt-2 break-all font-mono text-base tabular-nums">
-              {groupAddress(address).map((group, i) => (
-                <span key={i} className={i > 0 ? 'ml-1.5' : ''}>
-                  {group}
-                </span>
-              ))}
-            </p>
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <Button variant="primary" onClick={() => void copyAddress(address)}>
-                {copied ? fund.copied : fund.copyAddress}
-              </Button>
-            </div>
-            <p className="mt-3 text-sm font-bold text-warning">
-              {fund.chainWarning(network)}
-            </p>
-          </div>
+          <AddressBlock funding={funding} address={address} />
         )}
 
         {waitingForMoney && funding && (
@@ -622,26 +582,9 @@ export default function AddCorridorFlow({
             {[softRow, stableRow]
               .filter((t): t is FundingToken => t !== null)
               .map((t) => (
-                <li
-                  key={t.token}
-                  className="flex items-center justify-between gap-3 px-3 py-2 text-sm"
-                >
-                  <span className="font-bold">{t.symbol}</span>
-                  <span className="text-muted">
-                    {t.balanceText === null
-                      ? fund.pill.unknown
-                      : `${formatAmount(t.balanceText)} ${t.symbol}`}
-                  </span>
-                </li>
+                <TokenRow key={t.token} token={t} />
               ))}
-            <li className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
-              <span className="font-bold">{funding.gas.symbol}</span>
-              <span className="text-muted">
-                {funding.gas.balanceText === null
-                  ? fund.pill.unknown
-                  : `${formatAmount(funding.gas.balanceText)} ${funding.gas.symbol}`}
-              </span>
-            </li>
+            <GasRow funding={funding} pill={false} />
           </ul>
         )}
 

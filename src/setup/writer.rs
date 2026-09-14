@@ -135,6 +135,21 @@ impl SignerSetup {
             SignerSetup::Mpcvault { .. } => SignerKind::Mpcvault,
         }
     }
+
+    /// The wallet this signer transacts from: derived from the key material for
+    /// a hot wallet, declared by the operator for an MPC one. The panel names a
+    /// new bot after it.
+    pub fn operator_address(&self) -> Result<Address> {
+        match self {
+            SignerSetup::Local { material } => material.operator_address(),
+            SignerSetup::Turnkey {
+                operator_address, ..
+            }
+            | SignerSetup::Mpcvault {
+                operator_address, ..
+            } => parse_address(operator_address),
+        }
+    }
 }
 
 /// Owner-only file holding the venue maker API key. Never written into TOML.
@@ -459,52 +474,6 @@ fn prepared_signer_toml(paths: &ConfigPaths, signer: &SignerSetup) -> Result<Str
     Ok(updated)
 }
 
-/// Write a new corridor template into `dir/stitch.toml` while preserving the
-/// existing `[signer]` section, so switching corridor on an MPC config doesn't
-/// silently drop the signer — which would leave stitch.env pointing at MPC
-/// credentials while the config falls back to the hot wallet. The secret file
-/// and stitch.env are unchanged and stay correct. A hot-wallet config (no
-/// `[signer]`) gets the template byte-for-byte, exactly as before.
-///
-/// Refuses when the current file is missing, unreadable, or not valid TOML —
-/// swallowing those failures would look like "no `[signer]`" and overwrite an
-/// MPC/Turnkey config with the bare hot-wallet template.
-///
-/// The desktop setup GUI always uses the standard filename. The panel also has
-/// flat-layout bots whose mounted file is `stitch.<bot>.toml` — those must call
-/// [`switch_corridor_file`] with the actual path.
-pub fn switch_corridor_preserving_signer(dir: impl AsRef<Path>, template: &str) -> Result<()> {
-    switch_corridor_file(&config_paths(dir.as_ref()).toml, template)
-}
-
-/// Write a corridor template into an existing config file, keeping `[signer]`.
-///
-/// Same rules as [`switch_corridor_preserving_signer`], but the caller names the
-/// file — required for flat-layout panel bots that mount `stitch.<bot>.toml`
-/// rather than `stitch.toml`.
-pub fn switch_corridor_file(toml_path: &Path, template: &str) -> Result<()> {
-    let current = std::fs::read_to_string(toml_path)
-        .with_context(|| format!("reading {}", toml_path.display()))?;
-    let existing: toml_edit::DocumentMut = current.parse().with_context(|| {
-        format!(
-            "{} is not valid TOML; fix or replace the config before switching corridor",
-            toml_path.display()
-        )
-    })?;
-    match existing.get("signer").cloned() {
-        None => write_toml_atomic(toml_path, template),
-        Some(signer) => {
-            let mut doc: toml_edit::DocumentMut = template
-                .parse()
-                .context("corridor template is not valid TOML")?;
-            doc["signer"] = signer;
-            let updated = doc.to_string();
-            Config::from_toml(&updated).context("the switched config is not valid")?;
-            write_toml_atomic(toml_path, &updated)
-        }
-    }
-}
-
 /// Apply [`crate::setup::apply_rfq_default_preset`] to a file just written
 /// from a corridor template (create or switch).
 pub fn stamp_rfq_default_preset(toml_path: &Path) -> Result<()> {
@@ -760,14 +729,16 @@ fn key_tmp_path(path: &Path) -> PathBuf {
     dir.join(format!(".{name}.tmp"))
 }
 
-/// Replace a text file atomically: write a sibling temp file, then rename it over
-/// the target so a crash mid-write can't leave a half-written config behind.
+/// Replace a config file atomically. See [`write_file_atomic`].
 pub fn write_toml_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_file_atomic(path, contents)
+}
+
+/// Replace a file atomically: write a sibling temp file, then rename it over
+/// the target so a crash mid-write can't leave a half-written file behind.
+pub fn write_file_atomic(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("stitch.toml");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{name}.tmp"));
     std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
     replace_file(&tmp, path).with_context(|| {
@@ -1330,87 +1301,6 @@ mod tests {
         assert!(
             !dir.join("mpcvault-api.token").exists(),
             "stale MPC token removed after switching back"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn switch_corridor_keeps_the_mpc_signer() {
-        let dir = unique_dir("switch-sig");
-        let bsc = find_corridor("cngn-usdt-bsc").unwrap();
-        write_config_signer(
-            &dir,
-            bsc,
-            &SignerSetup::Mpcvault {
-                vault_uuid: "v".into(),
-                client_signer_pubkey: "k".into(),
-                operator_address: OPERATOR.into(),
-                api_base_url: None,
-                callback_listen_addr: None,
-                api_token: "tok".into(),
-            },
-        )
-        .unwrap();
-        let celo = find_corridor("wbrl-usdt-celo").unwrap();
-        switch_corridor_preserving_signer(&dir, celo.toml_template).unwrap();
-        let toml = std::fs::read_to_string(config_paths(&dir).toml).unwrap();
-        // New corridor took effect (Celo chain id)...
-        assert!(toml.contains("42220"), "switched to the Celo corridor");
-        // ...and the MPC signer survived the switch.
-        assert!(toml.contains("provider = \"mpcvault\""));
-        assert!(toml.contains("vault_uuid = \"v\""));
-        Config::from_toml(&toml).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn switch_corridor_writes_template_verbatim_for_hot_wallet() {
-        let dir = unique_dir("switch-hot");
-        let bsc = find_corridor("cngn-usdt-bsc").unwrap();
-        write_config(&dir, bsc, KEY).unwrap();
-        let celo = find_corridor("wbrl-usdt-celo").unwrap();
-        switch_corridor_preserving_signer(&dir, celo.toml_template).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(config_paths(&dir).toml).unwrap(),
-            celo.toml_template
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn switch_corridor_refuses_invalid_toml() {
-        let dir = unique_dir("switch-bad");
-        std::fs::create_dir_all(&dir).unwrap();
-        let toml = config_paths(&dir).toml;
-        std::fs::write(&toml, "this is not [[[ valid toml").unwrap();
-        let before = std::fs::read_to_string(&toml).unwrap();
-        let celo = find_corridor("wbrl-usdt-celo").unwrap();
-        let err = switch_corridor_preserving_signer(&dir, celo.toml_template).unwrap_err();
-        assert!(
-            err.to_string().contains("not valid TOML"),
-            "expected parse refusal, got: {err:#}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&toml).unwrap(),
-            before,
-            "invalid config must not be overwritten"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn switch_corridor_refuses_missing_file() {
-        let dir = unique_dir("switch-missing");
-        std::fs::create_dir_all(&dir).unwrap();
-        let celo = find_corridor("wbrl-usdt-celo").unwrap();
-        let err = switch_corridor_preserving_signer(&dir, celo.toml_template).unwrap_err();
-        assert!(
-            err.to_string().contains("reading"),
-            "expected read refusal, got: {err:#}"
-        );
-        assert!(
-            !config_paths(&dir).toml.exists(),
-            "must not create a config when the prior file was missing"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -8,7 +8,7 @@
 
 import type { ConfigBody } from './types'
 
-export interface CapitalLocation {
+interface CapitalLocation {
   /** What holds the capital, in operator words: `vault`, `hot wallet`, `MPC wallet`. */
   label: string
   /** The wallet the chain sees trading. Null when the config has no address yet. */
@@ -21,7 +21,7 @@ export interface CapitalLocation {
  * Read the capital location off a bot's config. Null when there's no readable
  * config — nothing is known, so the caller shows a dash rather than a guess.
  */
-export function capitalLocation(
+function capitalLocation(
   config: ConfigBody | null | undefined,
 ): CapitalLocation | null {
   if (!config) return null

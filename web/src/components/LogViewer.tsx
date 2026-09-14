@@ -1,21 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
-import { appendLine, MAX_LINES } from '../logBuffer'
+import { appendLine, LEVEL_CLASS, MAX_LINES } from '../logBuffer'
 import { streamSse } from '../sse'
 import { Button, Banner } from './ui'
-import type { LogLine, LogLevel } from '../types'
+import type { LogLine } from '../types'
 
 /** How many historical lines to replay when the tail opens. */
 const REPLAY = 500
-
-const LEVEL_CLASS: Record<LogLevel, string> = {
-  error: 'text-danger',
-  warn: 'text-warning',
-  info: 'text-ink',
-  debug: 'text-muted',
-  trace: 'text-faint',
-  plain: 'text-muted',
-}
 
 export default function LogViewer({ bot }: { bot: string }) {
   const [lines, setLines] = useState<LogLine[]>([])

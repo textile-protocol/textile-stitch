@@ -1,40 +1,33 @@
 // The wizard's step rail, and the three label sets it can show.
 //
+// Sources sits before Spread in every set: the feed is where the price comes
+// from, the spread is what the bot does with it, and an operator reasons in
+// that order. (The short set already did; the long sets now match.)
+//
 // The rail is the only thing on screen that tells an operator how much road is
 // left, so the three sets are deliberately different lengths: five pills for
-// adding a corridor to a bot that already exists, nine for setting up a
+// adding a corridor to a bot that already exists, seven for setting up a
 // separate bot from the same start. Live is the last label in every set, even
-// while the Waiting screen is up: waiting is a state on the way there, not a
-// destination of its own.
+// while the Connect screen is up: the email, the confirmation and the wait are
+// states on the way there, not destinations of their own.
 
 /** No bot on the picked chain, so the Where step never happens. Today's flow. */
-export const LABELS = [
-  'Corridor',
-  'Spread',
-  'Sources',
-  'Name',
-  'Wallet',
-  'Connect',
-  'Fund',
-  'Live',
-]
+export const LABELS = ['Corridor', 'Sources', 'Spread', 'Wallet', 'Approve', 'Live']
 
 /** The operator saw the Where step and chose a separate bot. */
 export const WHERE_LABELS = [
   'Corridor',
   'Where',
-  'Spread',
   'Sources',
-  'Name',
+  'Spread',
   'Wallet',
-  'Connect',
-  'Fund',
+  'Approve',
   'Live',
 ]
 
 /**
- * Adding to a bot that already exists. Name, Wallet and Connect are gone: it
- * has a name, a wallet and a maker identity, and its confirmed address already
+ * Adding to a bot that already exists. Wallet and the Connect ending are gone:
+ * it has a wallet and a maker identity, and its confirmed address already
  * covers every corridor on that maker. Sources is Price feed alone, because the
  * RPC belongs to the bot and cannot differ per corridor. The writes run under
  * the Live pill rather than earning one of their own.

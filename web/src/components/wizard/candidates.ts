@@ -296,7 +296,9 @@ function compare(a: Candidate, b: Candidate): number {
  */
 export function pairFunded(funding: Funding, pair: TokenPair | null): boolean {
   if (funding.gas.ok === false) return false
-  if (!pair) return funding.gate.passes
+  // `gate.passes` is gas-only now (Approve asks for gas, Live waits for
+  // money), so it no longer says anything about tokens. Ask the rows.
+  if (!pair) return funding.gate.fundedTokens.length > 0
   const row = (address: string) =>
     funding.tokens.find((t) => t.token.toLowerCase() === address)
   return row(pair.collateral)?.funded === true || row(pair.debt)?.funded === true

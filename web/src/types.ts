@@ -19,6 +19,9 @@ export interface WarningBody {
 export interface ConfigBody {
   corridorId: string | null
   corridorLabel: string | null
+  /** Every pair the bot quotes, in pool order: "cNGN / USDT", "wBRL / USDT". */
+  pairs: string[]
+  networkLabel: string | null
   chainId: number
   pools: number
   operatorAddress: string | null
@@ -32,10 +35,22 @@ export interface ConfigBody {
   vaultAddress: string | null
   /** Explorer page for `vaultAddress`. Null with it, or on an unknown chain. */
   vaultExplorerUrl: string | null
+  /**
+   * Whether Textile sends this bot quotes, from the config alone. `waiting`
+   * covers an unconfirmed email, a flagged maker and no corridor: the config
+   * can't tell those apart, and asking the venue rewrites a seated bot's
+   * config, so the page doesn't.
+   */
+  venue: VenueSeat
 }
 
+export type VenueSeat = 'not-connected' | 'waiting' | 'seated'
+
 export interface Bot {
+  /** The id: config directory and container name. Never changes. */
   name: string
+  /** The operator's own name for it, when set. Show this, fall back to `name`. */
+  displayName: string | null
   origin: 'panel' | 'compose' | 'adopted' | 'config-only' | string
   layout: string
   container: string | null
@@ -55,7 +70,6 @@ export interface Bot {
   image: string | null
   /** GitHub release for the running image, e.g. `v0.1.226`. */
   version: string | null
-  createdUnix: number | null
   editable: boolean
   canMigrate: boolean
   migrateBlockedReason: string | null
@@ -63,6 +77,15 @@ export interface Bot {
   approveBlockedReason: string | null
   /** Bot that must be stopped to unblock approval — this one, or a sibling. */
   approveBlockedBy: string | null
+  /**
+   * Whether a withdraw can run right now. Stricter than approval: every live
+   * process on the wallet has to be down, since even a maker-only bot quotes
+   * against the balance a withdraw would drain.
+   */
+  canWithdraw: boolean
+  withdrawBlockedReason: string | null
+  /** The bot to stop first: this one, or a sibling quoting from the wallet. */
+  withdrawBlockedBy: string | null
   config: ConfigBody | null
   warnings: WarningBody[]
 }
@@ -160,6 +183,8 @@ export interface Settings {
   rfqMakerId: string
   rfqValidationContract: string
   rfqCorridor: string
+  /** The OperatorVault the bot trades from; '' when it trades from its own wallet. */
+  vaultAddress: string
   /** A maker API key is stored on disk. The secret itself is never returned. */
   rfqApiKeySet: boolean
 }
@@ -417,7 +442,11 @@ export interface FundingGas {
 }
 
 export interface FundingGate {
-  /** At least one token funded and gas ok. */
+  /**
+   * Gas covers the approvals still outstanding. That is all the wizard needs
+   * to approve and start; the trading money arrives on the bot page, and
+   * `fundedTokens` says which sides hold it.
+   */
   passes: boolean
   minTokenUsd: number
   minGasUsd: number
@@ -455,124 +484,11 @@ export interface Funding {
   gate: FundingGate
   /** First chain error, or why there is no operator address. Null when reads worked. */
   readError: string | null
-  checkedAtUnix: number
-}
-
-// ---------------------------------------------------------------------------
-// POST /api/bots/{name}/quote-proof — the panel asks Textile's public RFQ
-// preview (which the browser can't reach: no CORS) for a quote on this bot's
-// pair, restricted to this bot's wallet, and reports what came back.
-
-/**
- * `usdtToSoft`: the taker pays USDT and receives the soft token, so it exercises
- * the bot's sell side. `softToUsdt` exercises the bot's buy side.
- */
-export type QuoteDirection = 'usdtToSoft' | 'softToUsdt'
-
-export interface QuoteProofRequest {
-  /** Default `usdtToSoft`. Wins over `side` when both are given. */
-  direction?: QuoteDirection
-  /** Alias in the bot's own terms: `sell` = usdtToSoft, `buy` = softToUsdt. */
-  side?: 'sell' | 'buy'
-  /** Default true: restrict the preview to this bot's wallet. */
-  onlyThisBot?: boolean
-  /** `[[pools]]` index, default 0. */
-  pool?: number
-  /** Venue override, like the access routes take. Tests only. */
-  venueUrl?: string
-}
-
-export interface QuoteProofPair {
-  softSymbol: string
-  softToken: string
-  softDecimals: number
-  stableSymbol: string
-  stableToken: string
-  stableDecimals: number
-  /** Corridor display name, e.g. `cNGN → USDT`. Null for a custom pool. */
-  label: string | null
-  networkLabel: string | null
-}
-
-export interface QuoteProofProbe {
-  sellSymbol: string
-  /** What the probe hands over (exact input), in whole tokens. Null on an exact-output probe. */
-  sellText: string | null
-  buySymbol: string
-  /** What the probe asks for (exact output), in whole tokens. Null on an exact-input probe. */
-  buyText: string | null
-  /** Wallets the preview was restricted to (the operator), or empty. */
-  restrictedTo: string[]
-}
-
-export interface QuoteProofQuote {
-  /** Decimal text in the sell token. */
-  sellText: string
-  /** Decimal text in the buy token, net of Textile's fee. */
-  buyText: string
-  /** Decimal text in `feeSymbol` (the sell token). */
-  feeText: string
-  feeSymbol: string
-  /** From the venue's rateRay: USDT per 1 soft token, before the fee. */
-  usdtPerSoft: string
-  /** 1 / usdtPerSoft, before the fee. */
-  softPerUsdt: string
-}
-
-export interface QuoteProofRate {
-  /** Soft per 1 USDT as actually delivered, fee included: the headline. */
-  allIn: string
-  /** Soft per 1 USDT from the venue's rateRay, before the fee. */
-  preFee: string
-  /** USDT per 1 soft token, before the fee. */
-  usdtPerSoft: string
-}
-
-export interface QuoteProof {
-  direction: QuoteDirection
-  chainId: number
-  pair: QuoteProofPair
-  probe: QuoteProofProbe
-  status: 'preview' | 'no_quote'
-  /** `status === 'preview'`. */
-  ok: boolean
-  /** On `no_quote`: `no_makers_online`, `no_valid_quote`, `no_restricted_liquidity`, or the venue's string. */
-  reason: string | null
-  /** Null on `no_quote`. */
-  quote: QuoteProofQuote | null
-  /** Null on `no_quote`. */
-  rate: QuoteProofRate | null
-  /** Flat copies of the quote, for callers that want one level. */
-  sellSymbol: string
-  sellAmount: string | null
-  buySymbol: string
-  buyAmount: string | null
   /**
-   * Depth the venue could fill right now, in whole tokens. Null when not
-   * reported. The token it counts is NOT always the sell token: an
-   * exact-output probe reports what the venue could buy. Always render it with
-   * `availableSymbol`.
+   * Why deleting this bot's key would lose money, or null when the wallet is
+   * empty enough that removal is only cleanup. The remove route applies the
+   * same rule again before it deletes anything.
    */
-  availableText: string | null
-  /** The ticker `availableText` is denominated in. Null with it. */
-  availableSymbol: string | null
-  /** Set when a firm quote is holding the book: wait this long before asking again. */
-  retryAfterMs: number | null
-  reservedUntil: string | null
-  /**
-   * The quote came from this bot: the venue named its wallet, or answered a
-   * preview it says it restricted to that wallet. `false` means the venue
-   * named a different maker. Null means it didn't say, which must not be
-   * rendered as "another maker quoted this".
-   */
-  fromThisBot: boolean | null
-  /** Previews don't expire; a firm quote would. Always null here. */
-  expiresAt: string | null
-  /** Public swap page for this pair. Null unless the venue is Textile's. */
-  swapUrl: string | null
-  /** Same page, restricted to this bot's wallet. Null with `swapUrl`. */
-  swapUrlMine: string | null
-  /** The venue's `data` object, verbatim. */
-  raw: unknown
+  removeBlockedBy: string | null
   checkedAtUnix: number
 }

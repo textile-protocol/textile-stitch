@@ -15,8 +15,6 @@ import type {
   Fleet,
   Funding,
   MigrationResult,
-  QuoteProof,
-  QuoteProofRequest,
   RfqEmailResult,
   RfqStatusResult,
   SaveResult,
@@ -137,7 +135,33 @@ const json = (body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 })
 
+export interface FeedMid {
+  /** Quote per base as the feed publishes it (USDT per cNGN). */
+  price: number
+  /** Unix seconds the feed observed it. */
+  timestamp: number
+}
+
+export interface DesktopSwitches {
+  /** False outside the desktop app: nothing to show. */
+  available: boolean
+  autostart: boolean
+  keepAwake: boolean
+  /** "Keep Mac awake" / "Keep PC awake", from the app. */
+  keepAwakeLabel: string
+  /** A change the app has not applied yet; the values above already reflect it. */
+  pending: { autostart?: boolean | null; keepAwake?: boolean | null } | null
+}
+
 export const api = {
+  /** The desktop app's own switches, relayed through the panel. */
+  desktop: () => request<DesktopSwitches>('/api/desktop'),
+  setDesktop: (body: { autostart?: boolean; keepAwake?: boolean }) =>
+    request<DesktopSwitches>('/api/desktop', {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
   session: () => request<SessionInfo>('/api/session'),
   login: (password: string) => request<SessionInfo>('/api/login', json({ password })),
   logout: () => request<unknown>('/api/logout', { method: 'POST' }),
@@ -151,7 +175,24 @@ export const api = {
   fleet: (signal?: AbortSignal) =>
     request<Fleet>('/api/bots', signal ? { signal } : undefined),
   bot: (name: string) => request<Bot>(`/api/bots/${encodeURIComponent(name)}`),
+  /** Set (or, with '', clear) the display name. The id never changes. */
+  rename: (name: string, displayName: string) =>
+    request<Bot>(`/api/bots/${encodeURIComponent(name)}/name`, {
+      method: 'PATCH',
+      body: JSON.stringify({ displayName }),
+    }),
   corridors: () => request<CorridorList>('/api/corridors'),
+
+  /**
+   * The mid a price feed is publishing now, fetched by the panel with the
+   * bot's own feed adapter (the browser can't: Textile's /price only answers
+   * cross-origin for the app). The Spread step's worked example runs on it.
+   */
+  feedMid: (url: string, signal?: AbortSignal) =>
+    request<FeedMid>(
+      `/api/feed/mid?url=${encodeURIComponent(url)}`,
+      signal ? { signal } : undefined,
+    ),
 
   createBot: (body: unknown) =>
     request<CreateBotResult>('/api/bots', json(body)),
@@ -159,7 +200,7 @@ export const api = {
   /**
    * Mint a fresh hot wallet for the Create wallet step. Returns address + seed
    * phrase once — nothing is stored until the client posts the phrase back on
-   * create / change-signer.
+   * create.
    */
   generateWallet: () =>
     request<{ address: string; seedPhrase: string }>(
@@ -169,7 +210,7 @@ export const api = {
 
   /**
    * Dry-run: which other bots already use this signer on this chain. Used to warn
-   * before create / change-signer — sharing a wallet races nonces.
+   * before create — sharing a wallet races nonces.
    */
   checkSigner: (body: {
     chainId: number
@@ -183,7 +224,7 @@ export const api = {
         name: string
         chainId: number | null
         operatorAddress: string | null
-        /** Live with taker/closer on — Start / change-signer-while-up will refuse. */
+        /** Live with taker/closer on — Start will refuse. */
         blocksLiveSwitch: boolean
       }[]
     }>('/api/signer/check', json(body)),
@@ -252,21 +293,12 @@ export const api = {
     request<Funding>(`/api/bots/${encodeURIComponent(name)}/funding`),
 
   /**
-   * Ask Textile's public RFQ preview for a quote on this bot's pair, through the
-   * panel (the browser can't call the venue directly). Always sends a JSON
-   * body, `{}` at minimum: the handler's Json extractor needs the content type.
-   */
-  quoteProof: (name: string, body: QuoteProofRequest = {}) =>
-    request<QuoteProof>(`/api/bots/${encodeURIComponent(name)}/quote-proof`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
-
-  /**
    * URL of the approve one-shot, for `streamSse(url, { method: 'POST' }, …)`.
    * A URL rather than a request because the route streams output.
    */
   approveUrl: (name: string) => `/api/bots/${encodeURIComponent(name)}/approve`,
+  /** URL of the withdraw one-shot; same streaming shape as approve. */
+  withdrawUrl: (name: string) => `/api/bots/${encodeURIComponent(name)}/withdraw`,
 
   enrollRfq: (name: string) =>
     request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/rfq/enroll`, {
@@ -298,20 +330,7 @@ export const api = {
       body: JSON.stringify({ toml }),
     }),
 
-  // Switch the signer backend: writes the new config + secret and recreates the
-  // container. The raw editor can't do this — the secret lives outside the TOML.
-  changeSigner: (name: string, signer: unknown) =>
-    request<{ bot: Bot; message: string }>(
-      `/api/bots/${encodeURIComponent(name)}/signer`,
-      { method: 'PUT', body: JSON.stringify(signer) },
-    ),
 
-  /** Replace stitch.toml with a corridor preset; keeps the signer; stops if running. */
-  switchCorridor: (name: string, corridorId: string) =>
-    request<{ bot: Bot; message: string }>(
-      `/api/bots/${encodeURIComponent(name)}/corridor`,
-      { method: 'POST', body: JSON.stringify({ corridorId }) },
-    ),
 
   /** Append a same-chain catalog corridor as another [[pools]] entry. */
   addPool: (name: string, corridorId: string) =>

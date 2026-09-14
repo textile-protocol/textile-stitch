@@ -1,21 +1,31 @@
-// Wizard step 6: fund the bot's wallet, then start it without another click.
+// The wizard's Approve step: gas in, approvals out, then start without
+// another click.
 //
-// The screen polls GET /funding until the server's gate passes (one token side
-// worth the floor, plus gas), then hands over to the shared start runner:
-// approve spending on chain, check the Textile seats, start, confirm it stays up.
+// Approval is permission, not money: one `approve(Permit2)` per token the bot
+// quotes, paid from gas, so Textile can settle a trade from this wallet
+// against an order the bot signed. It needs no token balance, only gas, so
+// this screen asks for gas alone. The screen polls GET /funding until the
+// server's gate passes (gas covers the approvals still outstanding), then
+// hands over to the shared start runner: approve on chain, check the Textile
+// seats, start, confirm it stays up. The trading money is the bot page's
+// business: the bot runs empty until it lands, and quotes the moment one side
+// does.
+//
 // Nothing about progress is kept in the browser. On a reload the step asks the
 // server again and lands where it should: a running bot goes straight through,
-// an approved-but-stopped one starts, an unfunded one shows the checklist.
+// an approved-but-stopped one starts, a gasless one shows the checklist.
 
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { ApiError, api } from '../../api'
-import { formatAmount, formatClock, formatUsd, groupAddress, shortAddress } from '../../format'
+import { formatAmount, formatClock } from '../../format'
+import { LEVEL_CLASS } from '../../logBuffer'
 import { Banner, Button, Card, Spinner } from '../ui'
 import ProgressList, { type ProgressRow } from './ProgressList'
+import { AddressBlock, ApprovalRow, GasRow, orderedTokens } from './FundingRows'
 import { INITIAL_FUND, gateReasons, reduceFund } from './fundMachine'
 import { errorText, useStartSequence, type StartOutcome } from './useStartSequence'
 import { fund, progress as progressCopy } from './wizardCopy'
-import type { Funding, FundingToken, LogLevel } from '../../types'
+import type { LogLevel } from '../../types'
 
 /** What the step reports when it is finished. Re-exported for the wizard. */
 export type FundOutcome = StartOutcome
@@ -32,45 +42,24 @@ export interface FundStepProps {
    */
   onStarted: (outcome: FundOutcome) => void
   /**
-   * Rail Back. Disabled while approve or start is running. The only way out of
-   * this step other than finishing it: the wizard ends at a live bot or at one
-   * waiting on a confirmation, never at "I'll do it later".
+   * Forget this bot and take the wizard back to its first step. The only
+   * control that can break a step the operator is stuck on: there is no Back
+   * from here, because the wizard ends at a live bot or at one waiting on a
+   * confirmation, never at "I'll do it later". Not a way out of the wizard:
+   * it starts the wizard again, and the bot it forgets keeps its wallet, its
+   * money and its Textile request.
    */
-  onBack?: () => void
-  /**
-   * Forget this bot and take the wizard back to its first step. Offered
-   * throughout, not only in the states this bot cannot be finished from (it is
-   * gone, its config can't be read, it has no wallet address, its pair can't
-   * be valued): Back from here goes to Connect, whose Continue returns here,
-   * so this is the only control that can break a step the operator is stuck
-   * on. Not a way out of the wizard: it starts the wizard again, and the bot
-   * it forgets keeps its wallet, its money and its Textile request. Falls back
-   * to `onBack`.
-   */
-  onStartOver?: () => void
-}
-
-const LEVEL_CLASS: Record<LogLevel, string> = {
-  error: 'text-danger',
-  warn: 'text-warning',
-  info: 'text-ink',
-  debug: 'text-muted',
-  trace: 'text-faint',
-  plain: 'text-muted',
+  onStartOver: () => void
 }
 
 /** Default floors for the intro before the first read arrives. */
-const DEFAULT_MIN_TOKEN_USD = 20
 const DEFAULT_MIN_GAS_USD = 1
 
-export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundStepProps) {
+export default function FundStep({ bot, onStarted, onStartOver }: FundStepProps) {
   const [state, dispatch] = useReducer(reduceFund, INITIAL_FUND)
   const startedRef = useRef(false)
   const autoRanRef = useRef(false)
-  const [skipped, setSkipped] = useState(false)
   const mountedRef = useRef(true)
-  const [copied, setCopied] = useState(false)
-  const [copyError, setCopyError] = useState<string | null>(null)
   const [showOutput, setShowOutput] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [stopError, setStopError] = useState<string | null>(null)
@@ -106,21 +95,6 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
     dispatch({ type: 'run' })
     startRun()
   }, [startRun])
-
-  /**
-   * Move on without waiting for money to land.
-   *
-   * Deliberately the same handover the gate uses rather than an exit from the
-   * wizard. Permit2 approval is the runner's first stage, and it does not need
-   * a funded book — only gas — so skipping the wait must not skip the approval
-   * too, or the operator returns later to a bot that still cannot trade and no
-   * longer has a screen telling them why. What is skipped is the waiting, not
-   * the setup.
-   */
-  function skipFunding() {
-    setSkipped(true)
-    triggerRun()
-  }
 
   // First read: the bot and its wallet together. A bot that is already running
   // goes straight through; one with a live process that is not quoting
@@ -166,31 +140,13 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
     }
   }, [bot, triggerRun])
 
-  // This corridor quotes against something the panel has no dollar price for,
-  // so both rows come back unvalued and the gate refuses whatever the wallet
-  // holds. Nothing about that changes with time: it is the pair, not a feed.
-  const unpriceable = state.funding?.gate.unpriceable === true
-
   // The poll. Stops the moment the runner takes over (it reads funding itself)
-  // and while a load is in flight. Also stops on an unvaluable pair: the answer
-  // is the same every time, and the step ends on it below rather than polling
-  // a wallet that can never clear the gate.
+  // and while a load is in flight.
   useEffect(() => {
-    if (state.phase !== 'checking' || unpriceable) return
+    if (state.phase !== 'checking') return
     const timer = window.setInterval(() => void refresh(), state.pollMs)
     return () => clearInterval(timer)
-  }, [state.phase, state.pollMs, unpriceable, refresh])
-
-  async function copyAddress(address: string) {
-    try {
-      await navigator.clipboard.writeText(address)
-      setCopyError(null)
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 2000)
-    } catch {
-      setCopyError(fund.copyFailed)
-    }
-  }
+  }, [state.phase, state.pollMs, refresh])
 
   async function checkNow() {
     setCheckingNow(true)
@@ -222,10 +178,13 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
   }
 
   const funding = state.funding
-  const minToken = funding?.gate.minTokenUsd ?? DEFAULT_MIN_TOKEN_USD
   const minGas = funding?.gate.minGasUsd ?? DEFAULT_MIN_GAS_USD
-  const network = funding?.networkLabel ?? (funding ? `chain ${funding.chainId}` : 'this network')
   const gasSymbol = funding?.gas.symbol ?? 'gas'
+  // The same figure the gas row shows, so the title and the row never differ.
+  const gasPrice = funding?.gas.price ?? null
+  const gasAmount =
+    gasPrice !== null && gasPrice > 0 ? formatAmount(String(minGas / gasPrice), 3) : null
+  const title = fund.title(gasAmount, gasSymbol)
   const seq = runner.state
   const failure = seq.failure
   const busy = runner.active
@@ -233,11 +192,11 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
 
   if (state.phase === 'gone') {
     return (
-      <Card title={fund.title}>
+      <Card title={title}>
         <div className="space-y-4">
           <Banner tone="danger">{fund.gone}</Banner>
           <div className="flex justify-between">
-            <Button onClick={onStartOver ?? onBack}>{fund.startOver}</Button>
+            <Button onClick={onStartOver}>{fund.startOver}</Button>
           </div>
         </div>
       </Card>
@@ -251,41 +210,11 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
   // every later visit to /add, and the only way out was to leave the wizard.
   if (state.phase === 'unreadable') {
     return (
-      <Card title={fund.title}>
+      <Card title={title}>
         <div className="space-y-4">
           <Banner tone="danger">{fund.unreadable(state.loadError ?? '')}</Banner>
           <div className="flex flex-wrap items-center gap-3">
-            {onBack && <Button onClick={onBack}>{fund.back}</Button>}
-            <Button variant="primary" onClick={onStartOver ?? onBack}>
-              {fund.startOver}
-            </Button>
-          </div>
-        </div>
-      </Card>
-    )
-  }
-
-  // A pair the panel can't value in dollars: the gate refuses forever, so this
-  // ends the step instead of polling. Without it the screen asked for money
-  // that would not help, on a five-second loop, and the only control was Back
-  // to Connect, whose Continue came straight back here. Terminal, like `gone`
-  // and `unreadable`, and for the same reason: nothing here can be finished.
-  // Only while the step is still watching: once the runner has the wheel the
-  // bot is being approved and started, and that progress is what to show.
-  if (state.phase === 'checking' && unpriceable && funding) {
-    const symbols = funding.tokens.map((t) => t.symbol)
-    return (
-      <Card title={fund.title}>
-        <div className="space-y-4">
-          <Banner tone="warning">
-            <div className="space-y-2">
-              <p className="font-bold">{fund.unpriceableTitle}</p>
-              <p>{fund.unpriceable(symbols)}</p>
-              <p>{fund.unpriceableNext}</p>
-            </div>
-          </Banner>
-          <div className="flex flex-wrap items-center gap-3">
-            <Button variant="primary" onClick={onStartOver ?? onBack}>
+            <Button variant="primary" onClick={onStartOver}>
               {fund.startOver}
             </Button>
           </div>
@@ -296,7 +225,6 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
 
   const reasons = funding ? gateReasons(funding, fund) : []
   const address = funding?.operatorAddress ?? null
-  const explorerHost = hostOf(funding?.explorerUrl ?? null)
 
   const rows: ProgressRow[] = [
     {
@@ -334,47 +262,15 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
   ]
 
   return (
-    <Card title={fund.title}>
+    <Card title={title}>
       <div className="space-y-4">
-        <p className="text-sm text-muted">{fund.intro(minToken, minGas)}</p>
-
         {!funding && !state.loadError && (
           <div className="flex items-center gap-2 py-4 text-sm text-muted">
             <Spinner /> {fund.statusFirst}
           </div>
         )}
 
-        {funding && address && (
-          <div className="rounded-lg border border-line-soft bg-canvas p-4">
-            <p className="text-sm font-bold">{fund.addressLabel(network)}</p>
-            {/* Groups are separate spans with a margin, not spaces in the text:
-                a select-and-copy of the line yields the exact address. */}
-            <p className="mt-2 break-all font-mono text-base tabular-nums">
-              {groupAddress(address).map((group, i) => (
-                <span key={i} className={i > 0 ? 'ml-1.5' : ''}>
-                  {group}
-                </span>
-              ))}
-            </p>
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <Button variant="primary" onClick={() => void copyAddress(address)}>
-                {copied ? fund.copied : fund.copyAddress}
-              </Button>
-              {funding.explorerUrl && explorerHost && (
-                <a
-                  className="text-sm text-accent underline"
-                  href={funding.explorerUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  {fund.viewOn(explorerHost)}
-                </a>
-              )}
-            </div>
-            {copyError && <p className="mt-2 text-xs text-danger">{copyError}</p>}
-            <p className="mt-3 text-sm font-bold text-warning">{fund.chainWarning(network)}</p>
-          </div>
-        )}
+        {funding && address && <AddressBlock funding={funding} address={address} />}
 
         {/* No wallet address to show, so nothing can arrive and the gate can
             never pass for this bot. Same ending as the 409 above: start the
@@ -383,7 +279,7 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
           <Banner tone="warning">
             <div className="space-y-2">
               <p>{fund.noOperator}</p>
-              <Button variant="secondary" onClick={onStartOver ?? onBack}>
+              <Button variant="secondary" onClick={onStartOver}>
                 {fund.startOver}
               </Button>
             </div>
@@ -392,23 +288,18 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
 
         {funding && (
           <ul className="divide-y divide-line-soft rounded-lg border border-line-soft">
-            {orderedTokens(funding).map((t) => (
-              <TokenRow key={t.token} token={t} funding={funding} />
-            ))}
             <GasRow funding={funding} />
+            {orderedTokens(funding)
+              .filter((t) => t.approvalNeeded)
+              .map((t) => (
+                <ApprovalRow key={t.token} token={t} />
+              ))}
           </ul>
         )}
 
         {funding && (
           <div className="space-y-1">
-            <p className="text-sm">
-              {fund.gate(
-                funding.gate.minTokenUsd,
-                funding.tokens.map((t) => t.symbol),
-                funding.gate.minGasUsd,
-                funding.gas.symbol,
-              )}
-            </p>
+            <p className="text-sm">{fund.gate(funding.gate.minGasUsd, funding.gas.symbol)}</p>
             {state.phase === 'checking' && reasons.length > 0 && (
               <ul className="list-disc space-y-0.5 pl-5 text-sm text-muted">
                 {reasons.map((r) => (
@@ -436,25 +327,10 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
                 ? fund.status(Math.round(state.pollMs / 1000), formatClock(state.lastCheckedAt))
                 : fund.statusFirst}
             </p>
-            <div className="flex flex-wrap items-center gap-3">
-              <Button variant="ghost" busy={checkingNow} onClick={() => void checkNow()}>
-                {fund.checkNow}
-              </Button>
-              {/* Only while there is something to skip. Once the gate passes
-                  the runner has the wheel and there is no waiting left. */}
-              {address && (
-                <Button variant="ghost" onClick={skipFunding}>
-                  {fund.skip}
-                </Button>
-              )}
-            </div>
+            <Button variant="ghost" busy={checkingNow} onClick={() => void checkNow()}>
+              {fund.checkNow}
+            </Button>
           </div>
-        )}
-
-        {/* Said once the operator has chosen to move on, so the progress list
-            below reads as expected rather than as something going wrong. */}
-        {skipped && (state.phase === 'running' || finished) && (
-          <Banner tone="info">{fund.skipped}</Banner>
         )}
 
         {(state.phase === 'running' || finished) && <ProgressList rows={rows} />}
@@ -523,12 +399,7 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
             start-over button above. */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-3">
-            {onBack && (
-              <Button onClick={onBack} disabled={busy}>
-                {fund.back}
-              </Button>
-            )}
-            {onStartOver && !busy && failure && (
+            {!busy && failure && (
               <button
                 type="button"
                 className="text-xs text-muted underline"
@@ -546,130 +417,6 @@ export default function FundStep({ bot, onStarted, onBack, onStartOver }: FundSt
         </div>
       </div>
     </Card>
-  )
-}
-
-/** Stable side first, then soft tokens, so the rows read "dollars, local, gas". */
-function orderedTokens(f: Funding): FundingToken[] {
-  return [...f.tokens].sort((a, b) =>
-    a.role === b.role ? 0 : a.role === 'stable' ? -1 : 1,
-  )
-}
-
-function hostOf(url: string | null): string | null {
-  if (!url) return null
-  try {
-    return new URL(url).host
-  } catch {
-    return null
-  }
-}
-
-function TokenRow({ token: t, funding }: { token: FundingToken; funding: Funding }) {
-  const soft = funding.tokens.find((x) => x.role === 'soft')?.symbol ?? t.symbol
-  const min = funding.gate.minTokenUsd
-  const hint =
-    t.funded === true
-      ? fund.fundedHint
-      : t.role === 'stable'
-        ? fund.stableHint(min, t.symbol, soft)
-        : fund.softHint(min, t.symbol)
-  const pill: Pill =
-    t.balance === null
-      ? { tone: 'warning', label: fund.pill.unknown }
-      : t.funded === true
-        ? { tone: 'success', label: fund.pill.funded, done: true }
-        : t.funded === null
-          ? { tone: 'warning', label: fund.pill.unknown }
-          : t.balance === '0'
-            ? { tone: 'muted', label: fund.pill.empty }
-            : { tone: 'muted', label: fund.pill.low }
-  return (
-    <li className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-3 py-2.5">
-      <StatusPill pill={pill} />
-      <div className="min-w-0">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-bold text-ink">{t.symbol}</span>
-          <span className="font-mono text-xs text-faint" title={t.token}>
-            {shortAddress(t.token)}
-          </span>
-        </div>
-        <p className="text-xs text-faint">{hint}</p>
-        {/* The server's own reason, verbatim: it knows whether a feed is down
-            or the pair simply has no dollar price, and the note used to invent
-            "Trying again" for both. */}
-        {t.price === null && t.balance !== null && t.balance !== '0' && (
-          <p className="text-xs text-warning">{fund.priceError(t.symbol, t.priceError)}</p>
-        )}
-      </div>
-      <div className="text-right tabular-nums">
-        <p className="text-sm">
-          {t.balanceText !== null ? `${formatAmount(t.balanceText)} ${t.symbol}` : '—'}
-        </p>
-        <p className="text-xs text-muted">{formatUsd(t.usd)}</p>
-      </div>
-    </li>
-  )
-}
-
-function GasRow({ funding }: { funding: Funding }) {
-  const g = funding.gas
-  const min = funding.gate.minGasUsd
-  const approxAmount =
-    g.price !== null && g.price > 0 ? formatAmount(String(min / g.price), 3) : null
-  const hint =
-    g.ok === true
-      ? fund.gasOkHint
-      : g.price === null && g.balance !== null
-        ? fund.gasHintUnpriced(g.symbol)
-        : fund.gasHint(min, approxAmount, g.symbol)
-  const pill: Pill =
-    g.balance === null || g.ok === null
-      ? { tone: 'warning', label: fund.pill.unknown }
-      : g.ok
-        ? { tone: 'success', label: fund.pill.ok, done: true }
-        : { tone: 'muted', label: fund.pill.addGas }
-  return (
-    <li className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-3 py-2.5">
-      <StatusPill pill={pill} />
-      <div className="min-w-0">
-        <p className="text-sm font-bold text-ink">
-          {g.symbol} <span className="font-normal text-faint">for gas</span>
-        </p>
-        <p className="text-xs text-faint">{hint}</p>
-      </div>
-      <div className="text-right tabular-nums">
-        <p className="text-sm">
-          {g.balanceText !== null ? `${formatAmount(g.balanceText)} ${g.symbol}` : '—'}
-        </p>
-        <p className="text-xs text-muted">
-          {formatUsd(g.usd)}
-          {g.priceSource === 'fallback' && g.usd !== null ? ` ${fund.estimated}` : ''}
-        </p>
-      </div>
-    </li>
-  )
-}
-
-interface Pill {
-  tone: 'success' | 'warning' | 'muted'
-  label: string
-  done?: boolean
-}
-
-function StatusPill({ pill }: { pill: Pill }) {
-  const tone = {
-    success: 'bg-success-bg text-success',
-    warning: 'bg-warning-bg text-warning',
-    muted: 'bg-hover text-muted',
-  }[pill.tone]
-  return (
-    <span
-      className={`inline-flex w-24 shrink-0 items-center justify-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-bold ${tone}`}
-    >
-      {pill.done && <span aria-hidden>✓</span>}
-      {pill.label}
-    </span>
   )
 }
 

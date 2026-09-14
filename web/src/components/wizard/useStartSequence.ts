@@ -1,8 +1,8 @@
 // The one runner that takes a funded bot to "running": approve spending on
 // chain, check the Textile seats, start, and make sure it stays up.
 //
-// Shared by the Fund step (first run), the Confirm-your-email screen (once the
-// address is confirmed) and the Live screen ("Start again"). Every stage re-derives its
+// Shared by the Approve step (first run), the Confirm-your-email screen (once
+// the address is confirmed) and the add-corridor lane. Every stage re-derives its
 // facts from the server rather than from what an earlier screen remembered:
 // the chain says whether approvals are missing, the config says whether the
 // bot may start, the bot's own state says whether it stayed up. That is what

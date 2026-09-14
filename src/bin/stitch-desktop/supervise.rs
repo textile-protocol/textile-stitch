@@ -58,6 +58,9 @@ impl PanelSupervisor {
         load_env_file(&mut cmd, &self.paths.env_file)?;
         cmd.env("STITCH_PANEL_STITCH_BIN", &self.stitch_bin);
         cmd.env("STITCH_PANEL_RUNTIME", "process");
+        // Where this app publishes its own switches (keep awake, start at
+        // login) and picks up the panel's requests to flip them.
+        cmd.env(stitch_bot::panel::desktop::DIR_ENV, &self.paths.root);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

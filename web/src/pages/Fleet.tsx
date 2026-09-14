@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { botLabel, botPath } from '../botRoutes'
 import { Link, useLocation } from 'react-router-dom'
 import { ApiError, api } from '../api'
 import {
@@ -11,7 +12,8 @@ import {
   StatePill,
   Tag,
 } from '../components/ui'
-import { imageLabel, shortAddress } from '../format'
+import { formatUsd } from '../format'
+import { totalUsd, unpricedSymbols } from '../funding'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
@@ -21,11 +23,14 @@ export default function Fleet() {
   const [data, setData] = useState<FleetData | null>(null)
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState<string | null>(null)
   // A bot that was just removed or created redirects here with what happened, so
   // the confirmation isn't lost with the page it was shown on.
   const handoff = (useLocation().state as { note?: string } | null)?.note ?? null
   const [note, setNote] = useState<string | null>(handoff)
+  // Dollar value per bot, read here rather than per row because the order
+  // of the list depends on it. Each bot is its own request, so one slow
+  // chain leaves that bot's value unknown rather than stalling the rest.
+  const [values, setValues] = useState<Record<string, RowTotal>>({})
 
   const load = useCallback(async () => {
     try {
@@ -51,47 +56,44 @@ export default function Fleet() {
     return () => clearInterval(timer)
   }, [load, loadUpdates])
 
-  async function act(name: string, what: 'start' | 'stop' | 'update') {
-    if (what === 'update') {
-      const bot = data?.bots.find((b) => b.name === name)
-      // Recreate drops an in-container nonce ledger. Flat-layout bots must migrate
-      // first — the detail page already says so; don't offer a quieter path here.
-      if (bot && (bot.canMigrate || bot.layout === 'flat-files')) {
-        setError(
-          `${name} still uses the flat layout. Open it and migrate before updating, or recreating loses the slot-nonce ledger and live orders can collide.`,
-        )
-        return
-      }
-      if (
-        !window.confirm(
-          `Update ${name} to ${updates?.bot.targetImage ?? 'the panel bot image'}?\n\nThe container is recreated (brief gap in quoting). Config and key stay.`,
-        )
-      ) {
-        return
+  const botNames = (data?.bots ?? [])
+    .filter((b) => b.config)
+    .map((b) => b.name)
+    .join('\n')
+  useEffect(() => {
+    const names = botNames ? botNames.split('\n') : []
+    if (names.length === 0) return
+    let cancelled = false
+    const read = () => {
+      for (const name of names) {
+        void api
+          .funding(name)
+          .then((funding) => {
+            if (cancelled) return
+            setValues((v) => ({
+              ...v,
+              [name]: {
+                usd: totalUsd(funding),
+                unpriced: unpricedSymbols(funding),
+              },
+            }))
+          })
+          .catch(() => {})
       }
     }
-    setBusy(`${name}:${what}`)
-    setNote(null)
-    try {
-      const res = what === 'update' ? await api.updateBot(name) : await api[what](name)
-      if (res.message) setNote(res.message)
-      await load()
-      await loadUpdates()
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setBusy(null)
+    read()
+    const timer = window.setInterval(read, VALUE_POLL_MS)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
     }
-  }
+  }, [botNames])
 
   if (!data && error) return <ErrorState error={error} onRetry={() => void load()} />
   if (!data) return <Loading what="the fleet" />
 
   const behind = new Set(
     (updates?.bots ?? []).filter((b) => b.updateAvailable).map((b) => b.name),
-  )
-  const canUpdate = new Set(
-    (updates?.bots ?? []).filter((b) => b.canUpdate).map((b) => b.name),
   )
 
   return (
@@ -110,7 +112,7 @@ export default function Fleet() {
       {behind.size > 0 && (
         <Banner tone="info">
           {behind.size} {behind.size === 1 ? 'bot has' : 'bots have'} a stitch image update
-          available. Open a bot and click Update, or use Update on the row.
+          available. Open a bot and click Update.
         </Banner>
       )}
 
@@ -129,19 +131,15 @@ export default function Fleet() {
       ) : (
         <ul className="space-y-3">
           {[...data.bots]
-            .sort((a, b) => a.name.localeCompare(b.name))
+            .sort((a, b) => fleetOrder(a, b, values))
             .map((bot) => (
             <li key={bot.name}>
               <BotRow
                 bot={bot}
-                busy={busy}
+                value={values[bot.name]}
                 updateAvailable={
                   behind.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
                 }
-                canUpdate={
-                  canUpdate.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
-                }
-                onAct={act}
               />
             </li>
           ))}
@@ -153,120 +151,58 @@ export default function Fleet() {
 
 function BotRow({
   bot,
-  busy,
+  value,
   updateAvailable,
-  canUpdate,
-  onAct,
 }: {
   bot: Bot
-  busy: string | null
+  /** The wallet's worth, undefined while unread. */
+  value: RowTotal | undefined
   updateAvailable: boolean
-  canUpdate: boolean
-  onAct: (name: string, what: 'start' | 'stop' | 'update') => void
 }) {
   const blocking = bot.warnings.filter((w) => w.blocksEditing)
   const advisory = bot.warnings.filter((w) => !w.blocksEditing)
+  const pairs = bot.config?.pairs ?? []
+  const network = bot.config?.networkLabel ?? (bot.config ? `chain ${bot.config.chainId}` : null)
 
-  // A bot the panel can't read a chain for, or can't write a config for, can't
-  // take another corridor. The wizard checks again on the way through; this
-  // just keeps a dead link off the row.
-  const canAddCorridor = bot.config != null && bot.editable
-  // How many controls this row actually renders, so two of them get two mobile
-  // columns and three wrap to 2 + 1 rather than overflowing.
-  const controlCount =
-    (canAddCorridor ? 1 : 0) + (bot.container ? 1 + (canUpdate ? 1 : 0) : 0)
-
+  // The whole row is the link: a fleet is for picking a bot, and every
+  // action lives on the bot's page. No buttons here to compete with it.
   return (
-    <Card className="!p-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
-        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-          <Link to={`/bots/${encodeURIComponent(bot.name)}`} className="font-bold">
-            {bot.name}
-          </Link>
-          <StatePill state={bot.state} status={bot.status} />
-          {bot.config?.corridorLabel && (
-            <span className="text-sm text-muted">{bot.config.corridorLabel}</span>
-          )}
-          {updateAvailable && <Tag>update available</Tag>}
-        </div>
-        <div
-          className={`grid w-full gap-2 sm:ml-auto sm:flex sm:w-auto sm:flex-wrap sm:items-center [&_button]:w-full [&_button]:justify-center sm:[&_button]:w-auto ${
-            controlCount >= 2 ? 'grid-cols-2' : 'grid-cols-1'
-          }`}
-        >
-          {/* Outside the container branch on purpose: a bot with no container
-              can still take another corridor, and the panel picks the change up
-              when it is started. Default variant, so Update keeps the only
-              primary on the row. */}
-          {canAddCorridor && (
-            <Link
-              className="w-full sm:w-auto"
-              to={`/add?bot=${encodeURIComponent(bot.name)}&chain=${bot.config?.chainId}`}
-            >
-              <Button title="Add another corridor to this bot">Add corridor</Button>
-            </Link>
-          )}
-          {bot.container ? (
-            <>
-              {bot.canStop ? (
-                <Button
-                  busy={busy === `${bot.name}:stop`}
-                  onClick={() => onAct(bot.name, 'stop')}
-                  title="Graceful stop: the bot finishes its tick, then exits"
+    <Card className="!p-0">
+      <Link
+        to={botPath(bot.name)}
+        className="flex flex-col gap-3 p-4 no-underline hover:bg-hover sm:flex-row sm:items-center"
+      >
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+            <span className="font-bold text-ink">{botLabel(bot)}</span>
+            {bot.displayName && (
+              <span className="font-mono text-xs text-faint">{bot.name}</span>
+            )}
+            <StatePill state={bot.state} status={bot.status} venue={bot.config?.venue} />
+            {updateAvailable && <Tag>update available</Tag>}
+            {!bot.container && <Tag>no container</Tag>}
+          </div>
+          {/* One chip per corridor, so three corridors read as three pairs and
+              wrap to a second line rather than being counted. */}
+          {(pairs.length > 0 || network) && (
+            <div className="flex flex-wrap items-center gap-1.5 text-sm text-muted">
+              {pairs.map((pair, i) => (
+                <span
+                  key={`${pair}-${i}`}
+                  className="rounded-md border border-line-soft px-1.5 py-0.5 text-xs"
                 >
-                  Stop
-                </Button>
-              ) : (
-                <Button
-                  busy={busy === `${bot.name}:start`}
-                  onClick={() => onAct(bot.name, 'start')}
-                >
-                  Start
-                </Button>
-              )}
-              {canUpdate && (
-                <Button
-                  variant="primary"
-                  busy={busy === `${bot.name}:update`}
-                  onClick={() => onAct(bot.name, 'update')}
-                >
-                  Update
-                </Button>
-              )}
-            </>
-          ) : (
-            <Tag>no container</Tag>
+                  {pair}
+                </span>
+              ))}
+              {network && <span className="text-xs text-faint">on {network}</span>}
+            </div>
           )}
         </div>
-      </div>
-
-      <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-faint">
-        <Tag>{bot.origin}</Tag>
-        <Tag>{bot.layout}</Tag>
-        {bot.config && <Tag>chain {bot.config.chainId}</Tag>}
-        {bot.config?.operatorAddress && (
-          <Tag>
-            <span title={bot.config.operatorAddress}>
-              {shortAddress(bot.config.operatorAddress)}
-            </span>
-          </Tag>
-        )}
-        {bot.config && <Tag>{bot.config.signer}</Tag>}
-        {/* Capital sits in an OperatorVault, not this bot's own wallet. */}
-        {bot.config?.vaultAddress && (
-          <Tag>
-            <span title={bot.config.vaultAddress}>
-              vault {shortAddress(bot.config.vaultAddress)}
-            </span>
-          </Tag>
-        )}
-        <span className="ml-auto font-mono" title={bot.image ?? undefined}>
-          {imageLabel(bot.image, bot.version)}
-        </span>
-      </div>
+        {bot.config && <RowValue value={value} />}
+      </Link>
 
       {(blocking.length > 0 || advisory.length > 0) && (
-        <div className="mt-3 space-y-2">
+        <div className="space-y-2 px-4 pb-4">
           {blocking.map((w) => (
             <Banner key={w.kind} tone="danger">
               {w.message}
@@ -279,7 +215,7 @@ function BotRow({
                 <>
                   {' '}
                   <Link
-                    to={`/bots/${encodeURIComponent(bot.name)}`}
+                    to={botPath(bot.name)}
                     className="font-bold underline"
                   >
                     Fix it
@@ -292,4 +228,56 @@ function BotRow({
       )}
     </Card>
   )
+}
+
+const VALUE_POLL_MS = 5000
+
+/** What one wallet is worth: the priced sides summed, the unpriced ones named. */
+interface RowTotal {
+  usd: number | null
+  unpriced: string[]
+}
+
+/** The same figure and the same "+ unpriced" caveat as the bot page's header,
+ * so a wallet holding an unpriceable balance never reads as a few dollars. */
+function RowValue({ value }: { value: RowTotal | undefined }) {
+  const usd = value?.usd ?? null
+  const unpriced = value?.unpriced ?? []
+  return (
+    <span className="shrink-0 text-right sm:ml-auto">
+      <span
+        className="text-base font-bold tabular-nums text-ink"
+        title={value === undefined ? 'Reading the wallet' : 'Everything in the wallet, in dollars'}
+      >
+        {usd === null ? <span className="text-faint">—</span> : formatUsd(usd)}
+      </span>
+      {unpriced.length > 0 && (
+        <span className="ml-2 text-xs text-warning" title={`Not priced: ${unpriced.join(', ')}`}>
+          + unpriced {unpriced.join(', ')}
+        </span>
+      )}
+    </span>
+  )
+}
+
+/**
+ * Three bands, then value within each:
+ *   1. running (live, or waiting on Textile), richest first
+ *   2. not running with money in the wallet, richest first
+ *   3. not running with nothing in it
+ * A value not read yet sorts as unknown at the bottom of its band, then by
+ * name, so the list is stable while the first reads land.
+ */
+function fleetOrder(a: Bot, b: Bot, values: Record<string, RowTotal>): number {
+  // An unpriced holding counts as money: it could be worth anything.
+  const holdsMoney = (v: RowTotal | undefined) =>
+    v !== undefined && ((v.usd !== null && v.usd > 0) || v.unpriced.length > 0)
+  const band = (bot: Bot) => (bot.running ? 0 : holdsMoney(values[bot.name]) ? 1 : 2)
+  const ba = band(a)
+  const bb = band(b)
+  if (ba !== bb) return ba - bb
+  const va = values[a.name]?.usd ?? -1
+  const vb = values[b.name]?.usd ?? -1
+  if (va !== vb) return vb - va
+  return botLabel(a).localeCompare(botLabel(b))
 }

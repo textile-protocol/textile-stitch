@@ -1,6 +1,6 @@
 // The "what happens now" list shown once the wallet is funded: the whole path
 // is visible at once, with each row pending, running, done, failed or skipped.
-// Shared by the Fund step, the Waiting screen and the Live screen's recovery.
+// Shared by the Approve step and the Confirm-your-email screen.
 
 import type { ReactNode } from 'react'
 import { Spinner } from '../ui'

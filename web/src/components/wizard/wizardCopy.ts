@@ -1,4 +1,4 @@
-// Every operator-facing sentence on the wizard's Fund, Waiting and Live
+// Every operator-facing sentence on the wizard's Fund and Confirm-your-email
 // screens, in one file so the words can be reviewed without reading the
 // components.
 //
@@ -8,7 +8,6 @@
 
 export const CONTACT_EMAIL = 'contact@textilecredit.com'
 export const TELEGRAM = 't.me/TextileNigeria'
-export const PUBLIC_SWAP_BASE = 'https://app.textilecredit.com/s/swap'
 
 /** `USDT or cNGN`, `USDT, cNGN or wBRL`. */
 export function joinOr(items: string[]): string {
@@ -53,9 +52,14 @@ export function botRunState(running: boolean, canStop: boolean): BotRunState {
 }
 
 export const fund = {
-  title: 'Fund the bot',
-  intro: (minToken: number, minGas: number) =>
-    `Send money to the bot's wallet from any wallet or exchange. It starts by itself once one token reaches ${dollars(minToken)} and there is ${dollars(minGas)} of gas. Nothing to press.`,
+  /**
+   * In the gas token, with the amount once the price is known: "Deposit 12.1
+   * CELO and approve spending". The operator sends a coin, not a dollar
+   * figure, so the title names the coin. Before the read lands, or on a chain
+   * the panel can't price, it names the token alone.
+   */
+  title: (amount: string | null, gas: string) =>
+    amount ? `Deposit ${amount} ${gas} and approve spending` : `Deposit ${gas} and approve spending`,
   addressLabel: (network: string) => `Bot wallet on ${network}`,
   copyAddress: 'Copy address',
   copied: 'Copied',
@@ -66,71 +70,44 @@ export const fund = {
   noOperator:
     'This bot has no wallet address the panel can read, so there is nothing to fund here.',
 
-  stableHint: (min: number, stable: string, soft: string) =>
-    `${dollars(min)} of ${stable} lets the bot buy ${soft}.`,
-  softHint: (min: number, soft: string) =>
-    `${dollars(min)} of ${soft} lets the bot sell ${soft}.`,
-  gasHint: (min: number, amount: string | null, gas: string) =>
-    amount
-      ? `Needs ${dollars(min)}, about ${amount} ${gas}. Pays for the approvals.`
-      : `Needs ${dollars(min)} of ${gas}. Pays for the approvals.`,
-  gasHintUnpriced: (gas: string) =>
-    `Any ${gas} balance counts on this chain. Pays for the approvals.`,
-  fundedHint: 'Enough to start.',
-  gasOkHint: 'Enough.',
+  approvedHint: 'Textile can settle this token from the wallet.',
+  approvalHint: (symbol: string) =>
+    `One transaction, paid from gas, that lets Textile settle ${symbol} trades from this wallet. Never spends on its own.`,
   estimated: '(estimated)',
 
   pill: {
-    funded: 'Funded',
-    empty: 'Empty',
-    low: 'Not enough',
     addGas: 'Add gas',
+    approved: 'Approved',
+    needsApproval: 'Needs approval',
     ok: 'OK',
-    reading: 'Reading',
     unknown: 'Unknown',
   },
 
-  gate: (min: number, symbols: string[], minGas: number, gas: string) =>
-    `Ready when the wallet holds ${dollars(min)} of ${joinOr(symbols)}, plus ${dollars(minGas)} of ${gas} for gas.`,
+  gate: (minGas: number, gas: string) =>
+    `Ready when the wallet holds ${dollars(minGas)} of ${gas} for gas.`,
   needsSide: (min: number, symbols: string[]) =>
     `Add at least ${dollars(min)} of ${joinOr(symbols)} to the bot wallet.`,
   needsGas: (minGas: number, gas: string) => `Add at least ${dollars(minGas)} of ${gas} for gas.`,
-  cantPrice: (symbol: string) =>
-    `Can't price ${symbol} right now, so its balance doesn't count yet.`,
   cantRead: "Can't read the bot wallet on chain right now.",
-  /** The permanent case, in the gate's own bullet list. Not "add money": no
-      amount of either token changes this answer. */
-  unpriceablePair: (symbols: string[]) =>
-    `The panel can't say what ${joinAnd(symbols)} are worth in dollars, so it can't check this wallet. Sending money here does not change that.`,
   gasUnpriced: "Can't price gas on this chain, so any non-zero balance counts.",
 
   status: (seconds: number, time: string) =>
     `Checking every ${seconds} seconds. Last check ${time}.`,
   statusFirst: 'Checking the wallet.',
   checkNow: 'Check now',
-  skip: 'Skip for now',
-  skipped:
-    "Skipped the wait for funds. Spending approval and the Textile connection still run now, so the bot is ready the moment money lands — send it to the address above and press Start on the bot's page.",
   readError: (error: string) => `Can't read the wallet right now: ${error}. Still trying.`,
   /** The row's own note. `reason` is the server's, shown as it wrote it: it
       knows whether the feed is down or the pair simply cannot be valued, and
       an invented "trying again" once promised a retry that could not work. */
   priceError: (symbol: string, reason: string | null) =>
     reason ? `Can't price ${symbol}: ${reason}.` : `Can't price ${symbol} right now.`,
-  fundsFound: 'Funds found. Setting up the bot.',
+  fundsFound: 'Gas found. Approving and starting.',
   unreadable: (error: string) => `The panel can't read this bot's config: ${error}`,
-
-  unpriceableTitle: "This pair can't be set up here",
-  unpriceable: (symbols: string[]) =>
-    `The panel prices a pair against dollars, and it has no dollar price for ${joinAnd(symbols)}. It can't tell whether the wallet holds enough to trade, so it can't start the bot on this pair.`,
-  unpriceableNext:
-    'Set up a bot on a pair with USDT or USDC in it. This bot keeps its wallet and anything already sent to it.',
 
   gone: 'This bot no longer exists. Go back and create it again.',
   startOver: 'Start over',
   differentBot: 'Set up a different bot',
   retry: 'Retry',
-  back: 'Back',
 }
 
 /**
@@ -145,15 +122,6 @@ export const fund = {
 export const place = {
   title: (label: string) => `Where should ${label} run?`,
 
-  /**
-   * The recommendation, as a label that does not move.
-   *
-   * It sits above the rows rather than on the selected one. Tied to the radio,
-   * the only screen that recommended the long road was the one where the short
-   * one had just been ruled out for the bot the operator named, which is the
-   * screen that needs the recommendation most.
-   */
-  recommendedHeading: 'Recommended',
   recommendedWhy:
     'Adding it to an existing bot means both corridors will share the liquidity in the pool (same USDT can be traded against 2 different assets)',
 
@@ -168,37 +136,6 @@ export const place = {
   wallet: (short: string) => `Wallet ${short}.`,
   /** Filled in when the background balance read lands. Absent if it doesn't. */
   holds: (amounts: string[]) => `Holds ${joinAnd(amounts)}.`,
-
-  /** The two things that are actually true of sharing a bot. Both real. */
-  sharedWallet:
-    'The corridors on one bot share its wallet. The same money backs all of them, so a trade on one leaves less for the others.',
-  /**
-   * A stopped bot is an eligible target, and on that one the restart sentence
-   * is false twice over: nothing restarts, and nothing was quoting. What
-   * happens instead is bigger, so it gets said: the flow starts that bot, and
-   * every corridor already on it goes back on the book.
-   *
-   * A paused or restarting bot is the third case. It is bounced like a running
-   * one, so it must not be promised the stopped bot's sentence.
-   */
-  restarts: (bot: string | null, state: BotRunState) => {
-    const name = bot ?? 'the bot'
-    if (state === 'quoting')
-      return `Adding a corridor restarts ${name}. Its other corridors stop quoting for a few seconds.`
-    if (state === 'live-but-not-quoting')
-      return `${name} is not quoting right now. Adding a corridor restarts it, and its corridors go back on the book when it comes up.`
-    return `Adding a corridor starts ${name}. Its other corridors start quoting again too.`
-  },
-  /**
-   * The same consequence with no row selected yet.
-   *
-   * `restarts` needs a bot and the state that bot is in, and this screen can
-   * open with nothing selected: a prefilled bot that turned out to be blocked
-   * leaves the radio on the separate-bot row. The consequence still belongs on
-   * the screen, so it is said about whichever bot they end up picking.
-   */
-  restartsAny:
-    'Adding a corridor restarts the bot you put it on, so its other corridors stop quoting for a few seconds. A bot that is stopped is started instead.',
 
   separateTitle: 'Set up a separate bot',
   separateBody:
@@ -253,6 +190,7 @@ export const place = {
 
 /** Adding the picked corridor to a bot that already exists. */
 export const add = {
+  openBot: 'Open the bot page',
   feedTitle: 'Price feed',
   feedLead: (bot: string) =>
     `This corridor gets its own feed. The other corridors on ${bot} keep theirs.`,
@@ -367,18 +305,21 @@ export const progress = {
   startStayedBusy: 'The bot wallet stayed busy for a minute.',
   verifyFailed: 'The bot stopped right after starting.',
   verifyUnconfirmed: (message: string) => `Couldn't confirm the bot is running: ${message}.`,
-  seeLogs: 'See logs',
   recreate:
     "The bot's container is gone. Press Retry. If it keeps failing, delete this bot from the fleet and set it up again.",
   retry: 'Retry',
 }
 
 export const wait = {
+  connectTitle: 'Connect to Textile',
+  connectBody:
+    'Spending is approved. Last thing: Textile needs to know this bot and an email it can confirm. One click registers the bot and sends you a link; the bot goes live the moment you click it.',
+  connectButton: 'Connect to Textile',
+  connectRetry: 'Retry',
   title: 'Confirm your email',
-  body: 'Money is in and spending is approved. One step left: click the link Textile emailed you. The bot goes live the moment you do.',
   sentTo: (email: string) => `We sent it to ${email}. Check spam if it is not there.`,
   noAddressBody:
-    'Money is in and spending is approved. This bot has no email address on file, so there is no link to click yet. Give Textile one and it goes live as soon as you confirm it.',
+    'Spending is approved and the bot is registered, but it has no email address on file, so there is no link to click yet. Give Textile one and it goes live as soon as you confirm it.',
   addressLabel: 'Contact email',
   addressHint: 'An inbox you own. Confirming it is what puts this bot on the venue.',
   sendLink: 'Send the confirmation link',
@@ -391,9 +332,15 @@ export const wait = {
     `Couldn't reach Textile: ${message}. Trying again in ${seconds} seconds.`,
   checkNow: 'Check now',
   checkAgain: 'Check again',
-  backToConnect: 'Back to Connect',
   resend: 'Resend the email',
-  resendSent: (email: string) => `Sent again to ${email}.`,
+  changeEmail: 'Wrong address? Change it',
+  newAddressLabel: 'New contact email',
+  newAddressHint: (old: string) =>
+    old
+      ? `Textile sends a fresh link here and forgets ${old}. The old link stops working.`
+      : 'Textile sends a fresh link here.',
+  sendToNew: 'Send the link there instead',
+  keepAddress: 'Keep the current one',
 
   flaggedTitle: 'Textile blocked this maker',
   flaggedBody: (slug: string | null) =>
@@ -421,52 +368,3 @@ export const wait = {
   startFailedTitle: 'The bot did not start',
 }
 
-export const live = {
-  title: 'Your stitch is live',
-  headline: (label: string | null, network: string | null) =>
-    label && network
-      ? `Your stitch is live on ${label} on ${network}.`
-      : label
-        ? `Your stitch is live on ${label}.`
-        : 'Your stitch is live.',
-  fetchedAgo: (seconds: number) => `Live quote from Textile, fetched ${seconds} s ago`,
-  rateSell: (buy: string, soft: string, stable: string) => `1 ${stable} gets ${buy} ${soft}`,
-  rateBuy: (sell: string, soft: string, stable: string) => `${sell} ${soft} gets 1 ${stable}`,
-  probeNote: (sell: string, symbol: string) =>
-    `For a ${sell} ${symbol} trade. Textile's fee is included in the number.`,
-  quotedByYou: 'Quoted by your stitch.',
-  quotedByOther: "Quoted by another maker. Yours isn't in the book yet.",
-  quotedByUnknown: 'Textile did not say which maker priced this.',
-  swapLink: 'See it on the public swap page',
-  mineLink: "Only your bot's price",
-  refresh: 'Refresh quote',
-
-  asking: 'Asking Textile for a live quote…',
-  firstPrices: 'The bot publishes its first prices a few seconds after it starts.',
-  retryingIn: (seconds: number) => `Trying again in ${seconds} s.`,
-  noQuoteYet: 'No quote from your stitch yet.',
-  stillNone: 'Still no quote from your stitch. Check the logs, then try again.',
-  tryAgain: 'Try again',
-  /** The probe size and the depth are in different tokens on a buy probe. */
-  depth: (probe: string, probeSymbol: string, available: string, availableSymbol: string) =>
-    `Textile is quoting, but not yet for a full ${probe} ${probeSymbol}. It can fill ${available} ${availableSymbol} right now.`,
-  venueDown: "Textile's quote service didn't answer.",
-  openMarket: (buy: string, soft: string, stable: string) =>
-    `Textile's book quotes 1 ${stable} = ${buy} ${soft} right now.`,
-  unfundedTitle: 'Nothing to quote yet',
-  unfundedBody:
-    'The bot wallet holds nothing it can quote with. Send money to it and the prices follow.',
-  noCorridorTitle: 'No swap corridor for this pair',
-  seeLogs: 'See logs',
-
-  keepHeader: 'Two things to keep it live',
-  keepProcess: 'Keep this app open. The bot runs inside it and stops when the app closes.',
-  keepDocker: 'Keep this machine on and Docker running. The bot stops with them.',
-  keepAwake:
-    'Keep the machine awake. Turn off sleep while the bot runs. A sleeping laptop quotes nothing.',
-
-  stopped: (status: string) => `Your stitch stopped. ${status}`,
-  startAgain: 'Start again',
-  panelUnreachable: (message: string) => `Can't reach the panel: ${message}`,
-  openBot: 'Open the bot page',
-}

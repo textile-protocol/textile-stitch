@@ -188,6 +188,8 @@ pub struct SettingsBody {
     pub rfq_corridor: String,
     /// A maker API key is stored in `rfq-api.key`. Never the secret itself.
     pub rfq_api_key_set: bool,
+    /// The OperatorVault the bot trades from, or empty for its own wallet.
+    pub vault_address: String,
 }
 
 impl SettingsBody {
@@ -230,6 +232,7 @@ impl SettingsBody {
             rfq_validation_contract: v.rfq_validation_contract.clone(),
             rfq_corridor: v.rfq_corridor.clone(),
             rfq_api_key_set,
+            vault_address: v.vault_address.clone(),
         }
     }
 }
@@ -396,6 +399,10 @@ pub struct SettingsUpdate {
     pub rfq_api_key: Option<String>,
     #[serde(default)]
     pub book_enabled: Option<bool>,
+    /// An address to trade from that OperatorVault; empty to trade from the
+    /// bot's own wallet; omitted to leave it alone.
+    #[serde(default)]
+    pub vault_address: Option<String>,
 }
 
 impl SettingsUpdate {
@@ -484,6 +491,9 @@ impl SettingsUpdate {
         }
         if let Some(v) = self.book_enabled {
             patch.book_enabled = Some(v);
+        }
+        if let Some(v) = &self.vault_address {
+            patch.vault_address = Some(v.trim().to_string());
         }
         Ok(patch)
     }
@@ -1296,7 +1306,8 @@ pub(super) async fn save_and_restart(
     // `summarise` derives the would-be identity from the incoming TOML plus the key
     // beside the config on disk — which a settings save never touches — so a local bot's
     // operator address is correct without reconstructing it.
-    let would_be = crate::panel::inventory::summarise(toml, path).map_err(ApiError::bad_request)?;
+    let would_be = crate::panel::inventory::summarise(toml, path, state.cfg.runtime)
+        .map_err(ApiError::bad_request)?;
     let would_be_wallet = would_be.operator_address.as_ref().map(|address| WalletId {
         chain_id: would_be.chain_id,
         address: address.to_lowercase(),

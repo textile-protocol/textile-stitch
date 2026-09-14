@@ -8,11 +8,14 @@
 //! whether there is gas, and whether Permit2 is approved — so the screen can
 //! never show two snapshots that disagree with each other.
 //!
-//! The rule it applies, agreed with the product owner: the bot may start when
-//! at least ONE side holds [`FUND_MIN_TOKEN_USD`] and the wallet holds enough
-//! of the chain's gas token to pay for the transactions the wizard is about to
-//! send. Either side arriving first is fine. Gas is priced by
-//! [`crate::panel::native_price`].
+//! The rule it applies, agreed with the product owner (2026-09-14): the bot
+//! may be approved and started as soon as the wallet holds enough of the
+//! chain's gas token to pay for the approvals still outstanding. Nothing else.
+//! Approval is permission, not money, and needs no token balance; the trading
+//! money arrives afterwards, on the Live screen, and the bot quotes the moment
+//! one side holds [`FUND_MIN_TOKEN_USD`]. The token rows and `fundedTokens`
+//! are still reported for that screen; they just no longer hold the gate. Gas
+//! is priced by [`crate::panel::native_price`].
 //!
 //! Being a dollar is checked, not assumed. The pool's DEBT side is whatever
 //! the corridor quotes against, and Textile lists corridors whose debt token
@@ -56,6 +59,7 @@ use crate::chain::approve::{approval_action, required_approvals, ApprovalAction,
 use crate::chain::rpc::Rpc;
 use crate::closer::executor::encode_balance_of;
 use crate::config::Config;
+use crate::panel::inventory::Bot;
 use crate::panel::native_price::{gas_symbol, gas_token, http_origin, GasToken, PriceSource};
 use crate::pricing::feed::{HttpFeed, PriceFeed};
 use crate::pricing::tick::is_price_usable;
@@ -186,7 +190,8 @@ pub struct FundingGasBody {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FundingGateBody {
-    /// The bot may be approved and started.
+    /// The bot may be approved and started: gas covers the approvals still
+    /// outstanding. Says nothing about the token sides (see `needs_side`).
     pub passes: bool,
     pub min_token_usd: f64,
     pub min_gas_usd: f64,
@@ -231,7 +236,75 @@ pub struct FundingBody {
     /// The first chain error, if any. Set once for the whole request: every
     /// read hits the same node, so per-row copies would just repeat it.
     pub read_error: Option<String>,
+    /// Why deleting this bot's key would lose money, in operator words, or
+    /// `null` when the wallet is empty enough that removal is only cleanup.
+    /// The page shows it next to Remove; the remove route enforces it.
+    pub remove_blocked_by: Option<String>,
     pub checked_at_unix: u64,
+}
+
+/// Removing a bot below this much is cleanup; above it is losing money. Ten
+/// dollars covers dust and leftover gas without covering anything an operator
+/// would miss.
+pub const REMOVE_MAX_USD: f64 = 10.0;
+
+/// Dollars in the wallet, or `None` when nothing could be priced.
+fn total_usd(tokens: &[FundingTokenBody], gas: &FundingGasBody) -> Option<f64> {
+    let priced: Vec<f64> = tokens
+        .iter()
+        .map(|t| t.usd)
+        .chain(std::iter::once(gas.usd))
+        .flatten()
+        .collect();
+    (!priced.is_empty()).then(|| priced.iter().sum())
+}
+
+/// Why deleting the key behind this wallet would lose money, or `None` when it
+/// would not. Refuses while the wallet holds more than [`REMOVE_MAX_USD`],
+/// while any side with a balance is unpriced (it could be worth anything), and
+/// while the wallet cannot be read at all (it could hold anything). Withdraw
+/// first is the way through in every case. A bot with no readable address has
+/// no key to lose.
+///
+/// The rows are the tokens the bot's corridors trade plus the gas coin: an RPC
+/// cannot list every ERC-20 an address holds, so a token sent here by mistake
+/// is outside the gate. The confirm dialog says so.
+fn remove_refusal(
+    operator_address: Option<&str>,
+    tokens: &[FundingTokenBody],
+    gas: &FundingGasBody,
+    read_error: Option<&str>,
+) -> Option<String> {
+    operator_address?;
+    if let Some(why) = read_error {
+        return Some(format!(
+            "The panel cannot read this wallet right now, so it cannot tell whether it is \
+             empty: {why} Try again when it can."
+        ));
+    }
+    let held_unpriced = |usd: Option<f64>, balance: Option<&str>| {
+        usd.is_none() && balance.is_some_and(|b| b != "0")
+    };
+    let unpriced: Vec<&str> = tokens
+        .iter()
+        .filter(|t| held_unpriced(t.usd, t.balance.as_deref()))
+        .map(|t| t.symbol.as_str())
+        .chain(held_unpriced(gas.usd, gas.balance.as_deref()).then_some(&*gas.symbol))
+        .collect();
+    if !unpriced.is_empty() {
+        return Some(format!(
+            "The wallet holds {} the panel cannot price. Withdraw it first (Funds tab).",
+            unpriced.join(" and ")
+        ));
+    }
+    let total = total_usd(tokens, gas)?;
+    (total > REMOVE_MAX_USD).then(|| {
+        format!(
+            "The wallet holds ${total:.2}. Removing the bot deletes its key, and the key is the \
+             only way to that money. Withdraw first (Funds tab); removal unlocks under \
+             ${REMOVE_MAX_USD:.0}."
+        )
+    })
 }
 
 /// One corridor token the wallet may hold.
@@ -266,7 +339,13 @@ pub async fn funding(
     UrlPath(name): UrlPath<String>,
 ) -> Result<Response, ApiError> {
     let bot = state.bot(&name).await?;
-    let path = config_path(&bot)?;
+    Ok(Json(read_funding(&state, &bot).await?).into_response())
+}
+
+/// One read of everything the wallet holds. Shared with the remove route,
+/// which asks the same question before it deletes the key.
+pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, ApiError> {
+    let path = config_path(bot)?;
     let toml = std::fs::read_to_string(&path).map_err(|e| {
         ApiError::internal(&anyhow::anyhow!(e).context(format!("reading {}", path.display())))
     })?;
@@ -426,7 +505,13 @@ pub async fn funding(
         .as_deref()
         .and_then(|a| setup::address_explorer_url(cfg.chain_id, a));
 
-    Ok(Json(FundingBody {
+    let remove_blocked_by = remove_refusal(
+        operator_address.as_deref(),
+        &tokens,
+        &gas,
+        read_error.as_deref(),
+    );
+    Ok(FundingBody {
         operator_address,
         chain_id: cfg.chain_id,
         network_label,
@@ -436,9 +521,9 @@ pub async fn funding(
         gas,
         gate,
         read_error,
+        remove_blocked_by,
         checked_at_unix: now_unix(),
     })
-    .into_response())
 }
 
 /// Every distinct token across the pools, stable side first per pool, with
@@ -694,7 +779,9 @@ fn gate_of(
     let needs_side = funded_tokens.is_empty();
     let needs_gas = gas.ok != Some(true);
     FundingGateBody {
-        passes: !needs_side && !needs_gas,
+        // Gas alone. `needs_side` is reported for Live, which waits for the
+        // money, but an empty wallet with gas in it is ready to be approved.
+        passes: !needs_gas,
         min_token_usd: FUND_MIN_TOKEN_USD,
         min_gas_usd,
         funded_tokens,
@@ -846,6 +933,113 @@ mod tests {
             .unwrap_or_else(|| panic!("no {symbol} row: {v}"))
     }
 
+    fn row(symbol: &str, balance: Option<&str>, usd: Option<f64>) -> FundingTokenBody {
+        FundingTokenBody {
+            role: "stable",
+            symbol: symbol.into(),
+            token: "0x00".into(),
+            decimals: 6,
+            balance: balance.map(str::to_string),
+            balance_text: None,
+            price: None,
+            price_source: None,
+            price_error: None,
+            unpriceable: false,
+            usd,
+            funded: None,
+            approval_needed: false,
+            permit2_allowance: None,
+            approved: None,
+        }
+    }
+
+    fn gas(usd: Option<f64>) -> FundingGasBody {
+        FundingGasBody {
+            symbol: "BNB".into(),
+            balance: Some("1".into()),
+            balance_text: None,
+            price: None,
+            price_source: None,
+            usd,
+            ok: None,
+        }
+    }
+
+    #[test]
+    fn remove_is_refused_for_money_unpriced_holdings_and_unreadable_wallets() {
+        let owner = Some("0xabc");
+        // Dust and leftover gas are cleanup.
+        assert_eq!(
+            remove_refusal(
+                owner,
+                &[row("USDT", Some("1"), Some(0.5))],
+                &gas(Some(2.0)),
+                None
+            ),
+            None
+        );
+        // Over the floor is losing money.
+        let why = remove_refusal(
+            owner,
+            &[row("USDT", Some("1"), Some(9.0))],
+            &gas(Some(2.0)),
+            None,
+        )
+        .unwrap();
+        assert!(
+            why.contains("$11.00") && why.contains("Withdraw first"),
+            "{why}"
+        );
+        // A balance nobody could price could be worth anything.
+        let why = remove_refusal(
+            owner,
+            &[row("cNGN", Some("5"), None)],
+            &gas(Some(0.0)),
+            None,
+        )
+        .unwrap();
+        assert!(
+            why.contains("cNGN") && why.contains("cannot price"),
+            "{why}"
+        );
+        // A balance that could not be read is the read error's business, not
+        // an unpriced holding.
+        let why = remove_refusal(
+            owner,
+            &[row("cNGN", None, None)],
+            &gas(None),
+            Some("node down."),
+        )
+        .unwrap();
+        assert!(
+            why.contains("cannot read this wallet") && why.contains("node down."),
+            "{why}"
+        );
+        // Gas the panel can't price is a holding too: a custom chain's coin
+        // with no dollar price could be worth anything.
+        let why = remove_refusal(owner, &[row("cNGN", Some("0"), None)], &gas(None), None).unwrap();
+        assert!(why.contains("BNB") && why.contains("cannot price"), "{why}");
+        // Nothing held, nothing priced, no read error: nothing to weigh.
+        let empty = FundingGasBody {
+            balance: Some("0".into()),
+            ..gas(None)
+        };
+        assert_eq!(
+            remove_refusal(owner, &[row("cNGN", Some("0"), None)], &empty, None),
+            None
+        );
+        // No key, nothing to lose, whatever else is true.
+        assert_eq!(
+            remove_refusal(
+                None,
+                &[row("USDT", Some("1"), Some(900.0))],
+                &gas(None),
+                Some("x")
+            ),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn funding_reports_balances_gate_and_approvals() {
         let h = harness("funding-ok");
@@ -991,7 +1185,9 @@ mod tests {
         assert!(cngn["funded"].is_null(), "unknown, not false: {body}");
         // The balance itself still reads fine.
         assert_eq!(cngn["balanceText"], "30000");
-        assert_eq!(v["gate"]["passes"], false);
+        // A dead feed cannot value the side, but the gate is gas-only now, so
+        // the bot can still be approved and started; Live waits for the value.
+        assert_eq!(v["gate"]["passes"], true, "{body}");
         assert_eq!(v["gate"]["needsSide"], true);
         assert!(v["readError"].is_null(), "a dead feed is not a chain error");
     }
@@ -1257,9 +1453,10 @@ mod tests {
         // The balances themselves still read fine; only the dollar value is
         // missing, so the screen can still show what arrived.
         assert!(v["tokens"][0]["balance"].as_str().is_some(), "{body}");
-        assert_eq!(v["gate"]["passes"], false, "{body}");
+        // Gas-only gate: an unvaluable pair can still be approved and started.
+        assert_eq!(v["gate"]["passes"], true, "{body}");
         assert_eq!(v["gate"]["needsSide"], true);
-        // And the gate says WHY it will never pass, so the Fund step can end
+        // And the gate says WHY the sides will never value, so Live can say so
         // with an explanation instead of polling a wallet that cannot clear it
         // and asking for money that would not help.
         assert_eq!(v["gate"]["unpriceable"], true, "{body}");
@@ -1332,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_needs_one_side_and_gas() {
+    fn the_gate_needs_gas_and_reports_the_sides() {
         fn row(symbol: &str, funded: Option<bool>, approved: Option<bool>) -> FundingTokenBody {
             FundingTokenBody {
                 role: "stable",
@@ -1382,17 +1579,20 @@ mod tests {
         assert_eq!(g.min_gas_usd, 0.5, "the figure the caller sized");
         assert!(!g.unpriceable);
 
+        // No side funded, gas fine: passes. Approval needs no money, and Live
+        // is the screen that waits for it. `needs_side` still says so.
         let g = gate_of(&[row("USDT", None, None)], &gas(Some(true)), 1.0, false);
-        assert!(!g.passes && g.needs_side && !g.needs_gas);
+        assert!(g.passes && g.needs_side && !g.needs_gas);
 
+        // A funded side without gas: refused. Nothing can be sent.
         let g = gate_of(&[row("USDT", Some(true), None)], &gas(None), 1.0, false);
         assert!(!g.passes && !g.needs_side && g.needs_gas);
 
-        // Unpriceable is carried through untouched: it explains the refusal,
-        // it does not cause one. Every row is unknown here, so the gate would
-        // have refused anyway.
+        // Unpriceable is carried through untouched and no longer holds the
+        // gate: the bot can be approved and started, and Live says why the
+        // sides will never show a dollar value.
         let g = gate_of(&[row("GD", None, None)], &gas(Some(true)), 1.0, true);
-        assert!(!g.passes && g.needs_side && g.unpriceable);
+        assert!(g.passes && g.needs_side && g.unpriceable);
     }
 
     /// The wizard sends one approve per unapproved side and then a start, so

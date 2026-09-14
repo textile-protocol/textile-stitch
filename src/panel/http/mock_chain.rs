@@ -38,11 +38,6 @@ impl MockChain {
         self
     }
 
-    pub fn allowance(mut self, token: &str, atomic: U256) -> Self {
-        self.allowances.insert(token.to_lowercase(), atomic);
-        self
-    }
-
     pub fn symbol(mut self, token: &str, symbol: &str) -> Self {
         self.symbols
             .insert(token.to_lowercase(), symbol.to_string());

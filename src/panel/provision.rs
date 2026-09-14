@@ -521,19 +521,27 @@ pub fn bot_container_spec(
     }
 }
 
-/// What a one-shot run does. Both are read-mostly operations an operator wants to
-/// run before putting orders on the book.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a one-shot run does: an operation against the bot's own config and
+/// key, in a throwaway process, so the panel itself never holds the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OneShot {
     /// Grant the Permit2 allowances the bot needs to trade. Sends transactions.
     Approve,
     /// Load the config, price a tick and print what it would post, without
     /// signing or submitting anything.
     DryRun,
+    /// Move tokens out of the bot's wallet. Sends one transaction. The
+    /// arguments are passed to `stitch withdraw` verbatim; the binary is what
+    /// validates them against the config and the chain.
+    Withdraw {
+        token: String,
+        amount: String,
+        to: String,
+    },
 }
 
 impl OneShot {
-    fn command(self) -> Vec<String> {
+    fn command(&self) -> Vec<String> {
         let config = format!("{RUN_DIR}/stitch.toml");
         match self {
             OneShot::Approve => vec!["stitch".into(), "approve".into(), "--config".into(), config],
@@ -543,23 +551,43 @@ impl OneShot {
                 config,
                 "--dry-run".into(),
             ],
+            OneShot::Withdraw { token, amount, to } => vec![
+                "stitch".into(),
+                "withdraw".into(),
+                "--config".into(),
+                config,
+                "--token".into(),
+                token.clone(),
+                "--amount".into(),
+                amount.clone(),
+                "--to".into(),
+                to.clone(),
+            ],
         }
     }
 
     /// Container name prefix, so a leftover one-shot is obvious in `docker ps -a`
     /// and can't collide with the bot itself.
-    fn name_prefix(self) -> &'static str {
+    fn name_prefix(&self) -> &'static str {
         match self {
             OneShot::Approve => "stitch-approve",
             OneShot::DryRun => "stitch-dryrun",
+            OneShot::Withdraw { .. } => "stitch-withdraw",
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             OneShot::Approve => "approve",
             OneShot::DryRun => "dry-run",
+            OneShot::Withdraw { .. } => "withdraw",
         }
+    }
+
+    /// Whether the run signs and broadcasts from the operator wallet, and so
+    /// has to hold that wallet to itself for its duration.
+    pub fn broadcasts(&self) -> bool {
+        !matches!(self, OneShot::DryRun)
     }
 }
 
@@ -578,7 +606,7 @@ pub fn one_shot_spec(
     binds: Vec<BindSpec>,
     name: &str,
     signer: &SignerRuntime,
-    what: OneShot,
+    what: &OneShot,
 ) -> CreateSpec {
     let mut env = vec!["RUST_LOG=info".to_string()];
     env.extend(signer.env.iter().cloned());
@@ -954,7 +982,7 @@ mod tests {
             bot.binds.clone(),
             "bot-a",
             &local(),
-            OneShot::Approve,
+            &OneShot::Approve,
         );
 
         // Same mounts: approve has to sign with the same key.
@@ -975,14 +1003,14 @@ mod tests {
     fn the_one_shot_commands_point_at_the_mounted_config() {
         let cfg = cfg();
         let binds = bot_mounts(&cfg.host_bot_dir("bot-a"), "stitch.key");
-        let approve = one_shot_spec(IMAGE, binds.clone(), "bot-a", &local(), OneShot::Approve)
+        let approve = one_shot_spec(IMAGE, binds.clone(), "bot-a", &local(), &OneShot::Approve)
             .cmd
             .unwrap();
         assert_eq!(approve[0], "stitch");
         assert!(approve.contains(&"approve".to_string()));
         assert!(approve.contains(&format!("{RUN_DIR}/stitch.toml")));
 
-        let dry = one_shot_spec(IMAGE, binds, "bot-a", &local(), OneShot::DryRun)
+        let dry = one_shot_spec(IMAGE, binds, "bot-a", &local(), &OneShot::DryRun)
             .cmd
             .unwrap();
         assert!(dry.contains(&"--dry-run".to_string()));

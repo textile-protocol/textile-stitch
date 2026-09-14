@@ -15,16 +15,17 @@ use serde::{Deserialize, Serialize};
 use super::logs;
 use super::{ApiError, AppState};
 use crate::panel::docker::{ContainerState, STOP_GRACE_SECS};
-use crate::panel::inventory::{Bot, ConfigSummary, Fleet, Layout, WalletId, Warning};
+use crate::panel::inventory::{Bot, ConfigSummary, Fleet, Layout, Warning};
 use crate::panel::versions::{PublishedVersion, ROLLBACK_CHOICES};
 use crate::panel::{compose, migrate, provision, PanelRuntime};
-use crate::setup::{self, SignerSetup};
 
 /// One bot, as the UI sees it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BotBody {
     pub name: String,
+    /// The operator's own name for the bot, when set. `name` stays the id.
+    pub display_name: Option<String>,
     pub origin: String,
     pub layout: String,
     pub container: Option<String>,
@@ -63,6 +64,11 @@ pub struct BotBody {
     /// The bot that must be stopped to unblock approval. Often this bot, but a
     /// sibling on the same wallet when that sibling is the one that can broadcast.
     pub approve_blocked_by: Option<String>,
+    /// Whether a withdraw can run right now. Stricter than approval: every
+    /// live process on the wallet has to be down, quoting or not.
+    pub can_withdraw: bool,
+    pub withdraw_blocked_reason: Option<String>,
+    pub withdraw_blocked_by: Option<String>,
     pub config: Option<ConfigBody>,
     pub warnings: Vec<WarningBody>,
 }
@@ -72,6 +78,9 @@ pub struct BotBody {
 pub struct ConfigBody {
     pub corridor_id: Option<String>,
     pub corridor_label: Option<String>,
+    /// Every pair the bot quotes, in pool order.
+    pub pairs: Vec<String>,
+    pub network_label: Option<String>,
     pub chain_id: u64,
     pub pools: usize,
     /// The signing address. Never the key.
@@ -86,6 +95,9 @@ pub struct ConfigBody {
     /// Explorer page for `vault_address`. Always safe to link: a vault is a
     /// contract on the chain, never an offchain MPC identity.
     pub vault_explorer_url: Option<String>,
+    /// `not-connected` / `waiting` / `seated`: whether Textile sends this bot
+    /// quotes. The page folds it into the state pill.
+    pub venue: crate::panel::inventory::VenueSeat,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +112,8 @@ impl From<&ConfigSummary> for ConfigBody {
     fn from(c: &ConfigSummary) -> Self {
         Self {
             corridor_id: c.corridor_id.clone(),
+            pairs: c.pairs.clone(),
+            network_label: c.network_label.clone(),
             corridor_label: c.corridor_label.clone(),
             chain_id: c.chain_id,
             pools: c.pools,
@@ -110,6 +124,7 @@ impl From<&ConfigSummary> for ConfigBody {
                 .as_deref()
                 .and_then(|address| crate::setup::address_explorer_url(c.chain_id, address)),
             vault_address: c.vault_address.clone(),
+            venue: c.venue,
             vault_explorer_url: c
                 .vault_address
                 .as_deref()
@@ -128,14 +143,25 @@ impl From<&Warning> for WarningBody {
     }
 }
 
+/// Where this bot's `panel.json` lives: its own directory. A flat-layout bot
+/// shares the bots root with every other flat bot, so a label there would name
+/// all of them at once; it gets none.
+fn label_dir(bot: &Bot) -> Option<std::path::PathBuf> {
+    (bot.layout != Layout::FlatFiles)
+        .then(|| bot.config_dir())
+        .flatten()
+}
+
 /// Project a discovered bot into its JSON shape.
 pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
     let migrate_check = migrate::check(bot, &state.cfg);
     // Needs the fleet, not just this bot: another bot sharing the operator wallet
     // blocks an approval just as much as this one being live does.
     let approve_check = super::logs::approve_check(bot, fleet);
+    let withdraw_check = super::logs::withdraw_check(bot, fleet);
     BotBody {
         name: bot.name.clone(),
+        display_name: label_dir(bot).and_then(|dir| crate::panel::label::read_display_name(&dir)),
         origin: bot.origin.as_str().to_string(),
         layout: bot.layout.as_str().to_string(),
         container: bot.container_name.clone(),
@@ -152,6 +178,9 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
         can_approve: approve_check.is_ok(),
         approve_blocked_reason: approve_check.err().map(|e| format!("{e:#}")),
         approve_blocked_by: super::logs::approve_blocked_by(bot, fleet),
+        can_withdraw: withdraw_check.is_ok(),
+        withdraw_blocked_reason: withdraw_check.err().map(|e| format!("{e:#}")),
+        withdraw_blocked_by: super::logs::withdraw_blocked_by(bot, fleet),
         config: bot.config.as_ref().map(ConfigBody::from),
         warnings: bot.warnings.iter().map(WarningBody::from).collect(),
     }
@@ -238,6 +267,37 @@ pub async fn show(
 ) -> Result<Response, ApiError> {
     let (bot, fleet) = state.bot_and_fleet(&name).await?;
     Ok(Json(with_version(to_body(&bot, &state, &fleet), &bot, &state, true).await).into_response())
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameBody {
+    /// The new name, or null / empty to go back to showing the wallet id.
+    pub display_name: Option<String>,
+}
+
+/// `PATCH /api/bots/{name}/name`: set the display name. Nothing else moves:
+/// the id, the container, the venue registration and the files all stay.
+pub async fn rename(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> Result<Response, ApiError> {
+    let (bot, fleet) = state.bot_and_fleet(&name).await?;
+    let dir = label_dir(&bot).ok_or_else(|| {
+        ApiError::conflict(format!(
+            "{name} has no config directory of its own to remember a name in"
+        ))
+    })?;
+    let wanted = body
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    crate::panel::label::write_display_name(&dir, wanted).map_err(ApiError::bad_request)?;
+    // `to_body` reads the label file itself, so the fleet from before the
+    // write already answers with the new name.
+    Ok(Json(to_body(&bot, &state, &fleet)).into_response())
 }
 
 /// A lifecycle action's result. Carries the bot's new state so the UI doesn't
@@ -529,30 +589,7 @@ pub(super) fn config_has_a_live_leg_with(
     if ladder_posts || cfg.has_independent_leg() {
         return true;
     }
-    // Ask the same question the RFQ runtime will, not just "did Connect write
-    // rfq-api.key" — but only count sources that actually reach *this* bot's
-    // process. The env answer is runtime-specific, so it's decided here rather
-    // than inside `api_key_configured`.
-    let has_key = cfg.rfq.as_ref().is_some_and(|r| {
-        crate::rfq::api_key_configured(&r.api_key_env, path.parent(), |name| match runtime {
-            // `bot_container_spec` hands the container an explicitly built env
-            // list: it neither sources the bot's stitch.env nor inherits the
-            // panel's own environment. So for Docker the sibling rfq-api.key
-            // (mounted into the run dir, and what `with_rfq_key_env` keys off)
-            // is the only credential that reaches the child — counting env vars
-            // here would green-light a Start that then can't quote.
-            crate::panel::PanelRuntime::Docker => None,
-            // The process runtime applies the bot's stitch.env to the child and
-            // the child inherits the panel's environment. A key present in
-            // stitch.env wins even when blank: `apply_env_file` sets it either
-            // way, so an explicit blank *overrides* the inherited variable and
-            // the child sees nothing.
-            crate::panel::PanelRuntime::Process => {
-                crate::panel::provision::env_assignment(path, name)
-                    .or_else(|| std::env::var(name).ok())
-            }
-        })
-    });
+    let has_key = crate::panel::inventory::rfq_key_reaches_bot(cfg, path, runtime);
     cfg.rfq_quotable() && (has_key || credential_present)
 }
 
@@ -697,11 +734,18 @@ pub async fn remove(
 
     if query.delete_config {
         refuse_shared_config_delete(&bot, &fleet, &state.cfg)?;
+        refuse_funded_key_delete(&state, &bot).await?;
     }
 
     let had_container = bot.container_name.is_some();
     if let Some(container) = &bot.container_name {
         stop_before_destroying(&state, &bot, container).await?;
+        // The stop can take a tick's grace (up to 30 s), and a deposit can land
+        // in that window. Ask again now that nothing is quoting and the
+        // container is still there to restart, rather than after it is gone.
+        if query.delete_config {
+            refuse_funded_key_delete(&state, &bot).await?;
+        }
         state.docker.remove(container, true).await?;
     }
 
@@ -746,38 +790,69 @@ enum ConfigDelete {
     NotOwned,
 }
 
-/// Delete the config the panel can see for this bot — the mounted path, not
-/// `bots/<name>/` assumed from the routing name.
-///
-/// Compose services are often named differently from the directory they mount
-/// (`foo` → `bots/custom-dir`), and flat-layout bots store `stitch.<name>.toml`
-/// loose in the bots root. Both used to be left behind by Remove.
-fn delete_bot_config(bot: &Bot, cfg: &crate::panel::PanelConfig) -> Result<ConfigDelete, ApiError> {
-    let Some(config_path) = bot.config_panel_path.as_ref() else {
-        return Ok(ConfigDelete::NotOwned);
-    };
-    if !config_path.starts_with(&cfg.bots_dir) {
-        return Ok(ConfigDelete::NotOwned);
-    }
+/// What deleting this bot's config would remove from disk.
+enum DeleteTarget<'a> {
+    /// Just the bot's own files: a flat-layout bot, or a config sitting
+    /// directly in the bots root (never `rm -rf` that whole tree).
+    Files(&'a std::path::Path),
+    /// The bot's own directory.
+    Dir(&'a std::path::Path),
+}
 
+/// The files the panel owns for this bot — the mounted path, not `bots/<name>/`
+/// assumed from the routing name. Compose services are often named differently
+/// from the directory they mount (`foo` → `bots/custom-dir`), and flat-layout
+/// bots store `stitch.<name>.toml` loose in the bots root. `None` for a config
+/// outside the bots root, which the panel never deletes.
+fn owned_config_target<'a>(
+    bot: &'a Bot,
+    cfg: &crate::panel::PanelConfig,
+) -> Option<DeleteTarget<'a>> {
+    let config_path = bot.config_panel_path.as_deref()?;
+    if !config_path.starts_with(&cfg.bots_dir) {
+        return None;
+    }
     match bot.layout {
-        Layout::FlatFiles => {
+        Layout::FlatFiles => Some(DeleteTarget::Files(config_path)),
+        Layout::Directory | Layout::Unknown => {
+            let dir = config_path.parent()?;
+            if dir == cfg.bots_dir.as_path() {
+                Some(DeleteTarget::Files(config_path))
+            } else if dir.starts_with(&cfg.bots_dir) {
+                Some(DeleteTarget::Dir(dir))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Refuse to delete a key that still guards money. The page shows the same
+/// reason next to Remove, but the page's read can be seconds old and a deposit
+/// can land in between, so the route reads the wallet again itself: once
+/// before stopping anything (a funded bot is not stopped for nothing) and once
+/// more after the stop, right before the only irreversible thing the panel
+/// does. Only when the delete would actually remove files: a config the panel
+/// doesn't own keeps its key either way.
+async fn refuse_funded_key_delete(state: &AppState, bot: &Bot) -> Result<(), ApiError> {
+    if owned_config_target(bot, &state.cfg).is_none() {
+        return Ok(());
+    }
+    let funding = super::funding::read_funding(state, bot).await?;
+    match funding.remove_blocked_by {
+        Some(why) => Err(ApiError::conflict(why)),
+        None => Ok(()),
+    }
+}
+
+fn delete_bot_config(bot: &Bot, cfg: &crate::panel::PanelConfig) -> Result<ConfigDelete, ApiError> {
+    match owned_config_target(bot, cfg) {
+        None => Ok(ConfigDelete::NotOwned),
+        Some(DeleteTarget::Files(config_path)) => {
             delete_flat_config_files(config_path)?;
             Ok(ConfigDelete::Removed)
         }
-        Layout::Directory | Layout::Unknown => {
-            let Some(dir) = config_path.parent() else {
-                return Ok(ConfigDelete::NotOwned);
-            };
-            // Flat files and a mis-resolved path can put stitch.toml directly in
-            // the bots root — never `rm -rf` that whole tree.
-            if dir == cfg.bots_dir.as_path() {
-                delete_flat_config_files(config_path)?;
-                return Ok(ConfigDelete::Removed);
-            }
-            if !dir.starts_with(&cfg.bots_dir) {
-                return Ok(ConfigDelete::NotOwned);
-            }
+        Some(DeleteTarget::Dir(dir)) => {
             std::fs::remove_dir_all(dir).map_err(|e| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1124,106 +1199,6 @@ async fn rollback_check(state: &AppState, bot: &Bot) -> Result<(), String> {
     Ok(())
 }
 
-/// Replace stitch.toml with a corridor preset, keeping the signer. Stops a
-/// running bot (same as the desktop settings screen) so the operator approves
-/// tokens for the new corridor before starting again.
-pub async fn switch_corridor(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(body): Json<CorridorBody>,
-) -> Result<Response, ApiError> {
-    let (_config, bot) = lock_config(&name, &state).await?;
-    super::require_editable(&bot)?;
-    // The mounted file, not `dir/stitch.toml`. Flat-layout bots use
-    // `stitch.<bot>.toml`; writing the standard name would leave the container
-    // still mounting the old corridor.
-    let toml_path = bot
-        .config_panel_path
-        .as_ref()
-        .ok_or_else(|| ApiError::conflict(format!("{name} has no editable config path")))?;
-
-    let corridor = state
-        .corridors
-        .find(&body.corridor_id)
-        .await
-        .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "there is no corridor called \"{}\". Ask /api/corridors for the list.",
-                body.corridor_id
-            ))
-        })?;
-
-    // Same refusal as create: a pending corridor's preset still carries a zero
-    // reactor, so switching onto it would turn a working bot into one that
-    // quotes into nothing.
-    if corridor.pending_deploy {
-        return Err(ApiError::bad_request(format!(
-            "the {} corridor on {} isn't deployed yet, so a bot can't quote it.",
-            corridor.display_name, corridor.network_label
-        )));
-    }
-
-    if bot.config.as_ref().and_then(|c| c.corridor_id.as_deref()) == Some(corridor.id.as_str()) {
-        return Err(ApiError::bad_request(format!(
-            "{name} is already on the {} corridor",
-            corridor.display_name
-        )));
-    }
-
-    // Stop *before* rewriting the config. Writing first and then failing the
-    // stop leaves disk on the new corridor while the live process still quotes
-    // the old one — and a retry then hits "already on" without another stop.
-    //
-    // Key off "has a non-terminal container", not `wants_to_be_up`. A paused
-    // bot isn't "up" for Start/Stop labeling, but it still holds the old
-    // corridor in memory — rewriting disk then `docker unpause` resumes the
-    // stale process. Same stop path recreate uses for any non-terminal state.
-    let was_live = bot.container_name.is_some() && !bot.state.is_terminal();
-    if was_live {
-        if let Some(container) = &bot.container_name {
-            // Graceful stop only — the container stays so Start brings it back.
-            stop_before_destroying(&state, &bot, container).await?;
-        }
-    }
-
-    let outgoing = std::fs::read_to_string(toml_path).ok();
-    let outgoing_cfg = outgoing
-        .as_deref()
-        .and_then(|toml| crate::config::Config::from_toml(toml).ok());
-    let stamp_rfq =
-        crate::config::rfq_default_preset_applies(outgoing_cfg.as_ref(), &state.cfg.bots_dir);
-
-    setup::switch_corridor_file(toml_path, &corridor.toml_template)
-        .map_err(|e| ApiError::bad_request(format!("couldn't switch corridor: {e:#}")))?;
-    if stamp_rfq {
-        setup::stamp_rfq_default_preset(toml_path).map_err(|e| {
-            ApiError::bad_request(format!("couldn't keep RFQ-only after switch: {e:#}"))
-        })?;
-    }
-
-    crate::panel::updates::clear_cache();
-
-    let where_to = format!("{} on {}", corridor.display_name, corridor.network_label);
-    let mut message = if was_live {
-        format!(
-            "Switched to {where_to}. The bot was stopped — approve tokens for the new corridor, then Start."
-        )
-    } else {
-        format!("Switched to {where_to}. Approve tokens for the new corridor before starting.")
-    };
-    if stamp_rfq {
-        message
-            .push_str(" This bot stays RFQ-only — connect it to Textile on Settings before Start.");
-    }
-    action_response(&state, &name, Some(message)).await
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CorridorBody {
-    pub corridor_id: String,
-}
-
 /// Recreate a bot's container from its config on disk, in the panel's layout.
 ///
 /// This is how a bot whose container was removed comes back, and how an operator
@@ -1247,8 +1222,8 @@ pub async fn recreate(
 /// one thing the rollback promised wouldn't happen. So a bot sitting on an
 /// immutable pin of the configured repository keeps it.
 ///
-/// Same rule [`change_signer`] already follows, for the same reason: a rebuild
-/// that isn't about the image must not swap the trading binary underneath.
+/// A rebuild that isn't about the image must not swap the trading binary
+/// underneath.
 ///
 /// Everything else falls back to the configured image — a mutable channel (which
 /// is what "recreate on the current release" means anyway), a bare `sha256:…`
@@ -1498,206 +1473,6 @@ async fn recreate_container(
     Ok(())
 }
 
-/// The operator wallet a signer selects. The corridor and chain don't change on a
-/// signer swap — only the operator address does — so the new wallet is that address on
-/// the bot's current chain. Formatted the way discovery formats it (lowercased 0x-hex),
-/// so a claim on it matches what the fleet reports for the same account.
-fn new_signer_wallet(bot: &Bot, setup: &SignerSetup) -> Result<Option<WalletId>, ApiError> {
-    let Some(chain_id) = bot.config.as_ref().map(|c| c.chain_id) else {
-        return Ok(None);
-    };
-    let address = match setup {
-        SignerSetup::Local { material } => {
-            let addr = material.operator_address().map_err(ApiError::bad_request)?;
-            format!("{addr:?}").to_lowercase()
-        }
-        SignerSetup::Turnkey {
-            operator_address, ..
-        }
-        | SignerSetup::Mpcvault {
-            operator_address, ..
-        } => operator_address.trim().to_lowercase(),
-    };
-    Ok(Some(WalletId { chain_id, address }))
-}
-
-/// Switch a bot's signer backend, then rebuild its container with the new runtime.
-///
-/// The raw config editor can't do this: the backend's secret (`turnkey-api.key`,
-/// `mpcvault-api.token`) and the Turnkey public key live outside the TOML, and swapping
-/// the backend needs a container rebuilt with different mounts and env. So this takes the
-/// credentials, writes config + secret + env atomically (`apply_signer`), and recreates
-/// the container.
-///
-/// Wallet-safe and all-or-nothing: the new signer selects a new operator wallet, so the
-/// old (still-running) wallet and the new one are both claimed and the fleet checked
-/// *before* anything is written. A change that would collide refuses without touching
-/// disk — no window where discovery reports the new wallet while the old process still
-/// signs the old one.
-pub async fn change_signer(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(body): Json<super::wizard::SignerRequest>,
-) -> Result<Response, ApiError> {
-    let signer = body.into_setup()?;
-
-    // Config lock across the whole change (write + recreate), held to the end.
-    let (_config, bot) = lock_config(&name, &state).await?;
-    super::require_editable(&bot)?;
-    let dir = bot
-        .config_dir()
-        .ok_or_else(|| ApiError::conflict(format!("{name} has no config directory")))?;
-    if dir != state.cfg.bot_dir(&name) {
-        return Err(ApiError::conflict(format!(
-            "{name}'s config is at {}, not under {}. Migrate it to the per-bot directory layout \
-             first, then change its signer.",
-            dir.display(),
-            state.cfg.bots_dir.display()
-        )));
-    }
-
-    // The recreate starts a signer only if the bot was up; a stopped bot's recreate
-    // leaves it stopped, and nothing signs until a later Start (which guards itself). So
-    // the wallets are guarded only when a signer will actually come up.
-    let restart_after = bot.state.wants_to_be_up();
-    let new_wallet = new_signer_wallet(&bot, &signer)?;
-    let _guards = if restart_after {
-        // Old wallet (the running process) held until the old container is gone; the new
-        // wallet claimed for the process the recreate brings up. One claim when they match.
-        let old = state.wallet_locks.try_claim_for(&bot).ok_or_else(|| {
-            ApiError::conflict(format!(
-                "{name}'s current operator wallet is busy — an approval or launch is running \
-                 against it. Nothing was changed; wait and try again."
-            ))
-        })?;
-        let new = match &new_wallet {
-            None => None,
-            Some(w) if old.as_ref().map(logs::WalletClaim::wallet) == Some(w) => None,
-            Some(w) => Some(state.wallet_locks.try_claim(w.clone()).ok_or_else(|| {
-                ApiError::conflict(
-                    "the operator wallet the new signer selects is busy — an approval or launch \
-                     is running against it. Nothing was changed; wait and try again."
-                        .to_string(),
-                )
-            })?),
-        };
-        // A live sibling on the new wallet means the recreate would start a second signer
-        // on it. Skip only when this bot is itself already transacting on that same wallet.
-        let overlap_exists = logs::already_transacting(&bot) && bot.wallet() == new_wallet;
-        if !overlap_exists {
-            if let Some(w) = &new_wallet {
-                let fleet = state.fleet().await?;
-                logs::no_live_sibling_on_wallet_id(&name, w, &fleet).map_err(ApiError::conflict)?;
-            }
-        }
-        (Some(old), new)
-    } else {
-        (None, None)
-    };
-
-    // Ordering is the whole safety argument. Discovery reads the config file, so the
-    // instant `apply_signer` commits, the fleet reports the *new* wallet — while the old
-    // container is still signing from the *old* one. So don't commit the new identity
-    // until the old process is gone: preflight the image, remove the old container, and
-    // only then write the new config and build the replacement. A failure before the
-    // remove leaves the old config selecting the old, still-guarded wallet; a failure
-    // after it leaves no process signing at all. Either way the old wallet is never left
-    // live-but-unreported once this handler drops its claims.
-    //
-    // Validate the change first, while the bot is still up: `apply_signer` parses and
-    // validates the config on disk, and a bad key — or a config that's invalid on disk,
-    // which inventory still marks editable — would otherwise fail only *after* the live
-    // container was destroyed, leaving the operator with no bot.
-    setup::validate_signer_change(&dir, &signer).map_err(ApiError::bad_request)?;
-    // The bot's *own* image, not the panel-wide default. A migrated or pinned bot can run
-    // a custom image, and a signer change only asks to swap the signer — recreating it on
-    // `cfg.bot_image` would silently switch the trading binary too. `image_of` keeps the
-    // running image when the bot has one and falls back to the default otherwise.
-    //
-    // `refresh: false`: don't pull. A mutable tag like `:latest` would pull a newer digest
-    // behind the same reference, so refreshing here would deploy a new trading binary off
-    // the back of a signer change. Refreshing the image is Recreate's job; this reuses the
-    // copy already on the host, only pulling if it's missing entirely.
-    let image = provision::image_of(&bot, &state.cfg);
-    state.docker.ensure_image(&image, false).await?;
-    if let Some(container) = &bot.container_name {
-        stop_before_destroying(&state, &bot, container).await?;
-        state.docker.remove(container, true).await?;
-    }
-
-    // The old process is gone. Write the new config + secret + env atomically, then hand
-    // the new files to the bot's UID — `apply_signer` writes them root-owned `0600`, and
-    // a bot running as another UID can't read its own key, so without this the
-    // replacement exits on startup (the wizard does the same after writing a signer).
-    setup::apply_signer(&dir, &signer).map_err(|e| {
-        ApiError::internal(&e.context(format!(
-            "applying {name}'s new signer. The config was rolled back to the previous signer, but \
-             its container was already removed — use Recreate to bring it back up."
-        )))
-    })?;
-    // Hand over only the files this change wrote — stitch.toml, stitch.env, and the new
-    // signer secret — not the whole directory. A migrated bot's directory can hold an
-    // operator-owned backup or other retained file (migration deliberately preserves
-    // them); sweeping every entry to the bot's uid would give the bot access to data it
-    // has no business with, permanently. This mirrors migration's selective handoff.
-    provision::hand_over_paths_to_bot(&dir, &setup::signer_files(&dir, &signer), state.cfg.bot_uid)
-        .map_err(|e| {
-            ApiError::new(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{e:#}"),
-            )
-        })?;
-
-    let runtime = provision::signer_runtime(&dir)?;
-    let spec = provision::bot_container_spec(
-        &state.cfg,
-        &name,
-        &image,
-        &runtime,
-        bot.config
-            .as_ref()
-            .and_then(|c| c.corridor_id.clone())
-            .as_deref(),
-    );
-    provision::check_file_mounts(&spec.binds, &state.cfg).map_err(ApiError::conflict)?;
-    state.docker.create(&spec).await.map_err(|e| {
-        ApiError::internal(&e.context(format!(
-            "creating {name}'s replacement container after switching its signer. Its config is on \
-             disk with the new backend, so Recreate brings it up once the cause is fixed."
-        )))
-    })?;
-    if restart_after {
-        if let Err(e) = state.docker.start(&spec.name).await {
-            // The start can report failure after the daemon already brought the new
-            // container up on the new wallet; releasing the claims now would let a sibling
-            // launch on that wallet. Settle it — stop the container, then let the guards go
-            // (or hold them until the stop lands). Hand over the whole guard tuple: the new
-            // wallet is the one that's live, and whichever guard covers it must be held.
-            let err = ApiError::internal(&e.context(format!(
-                "starting {name} after switching its signer. The new container exists with the new \
-                 backend, so Start brings it up once the cause is fixed."
-            )));
-            let held = (_guards.0.is_some() || _guards.1.is_some()).then_some(_guards);
-            return Err(settle_ambiguous_launch(&state, &spec.name, held, err).await);
-        }
-    }
-
-    tracing::info!(bot = %name, "signer changed and container recreated");
-    action_response(
-        &state,
-        &name,
-        Some(format!(
-            "{name}'s signer backend was switched and its container recreated{}.",
-            if restart_after {
-                " and started"
-            } else {
-                " (left stopped, because it wasn't up before)"
-            }
-        )),
-    )
-    .await
-}
-
 /// Move a bot off the flat-file layout so its nonce ledger survives recreation.
 pub async fn migrate_layout(
     State(state): State<AppState>,
@@ -1778,6 +1553,7 @@ pub async fn compose_export(State(state): State<AppState>) -> Result<Response, A
 
 #[cfg(test)]
 mod tests {
+    use super::super::mock_chain::{mock_rpc, MockChain};
     use super::super::testkit::{harness, Harness};
     use crate::panel::docker::fake::{container, dir_layout_mounts, flat_layout_mounts, Call};
     use crate::panel::docker::ContainerState;
@@ -1792,6 +1568,44 @@ mod tests {
         setup::write_config(root.join(name), corridor, super::super::testkit::TEST_KEY)
             .expect("writing the test bot config");
         super::super::testkit::keep_book_on(&root.join(name).join("stitch.toml"));
+    }
+
+    /// Point a seeded bot's config at a mock node, and its feed and API at
+    /// a closed port, so a wallet read never leaves the machine. Deleting a
+    /// config reads the wallet first (the funded-key gate), so every test
+    /// that deletes one goes through here.
+    fn point_at_chain(h: &Harness, name: &str, rpc_url: &str) {
+        let path = h.root.join(name).join("stitch.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("https://bsc-dataseed.binance.org", rpc_url)
+            .replace("https://api.textilecredit.com", "http://127.0.0.1:1");
+        std::fs::write(&path, toml).unwrap();
+    }
+
+    /// A seeded bot whose wallet reads as empty.
+    async fn seed_with_empty_wallet(
+        h: &Harness,
+        name: &str,
+    ) -> crate::panel::http::mock_chain::MockNode {
+        let node = mock_rpc(MockChain::default()).await;
+        seed_panel_bot(h, name);
+        point_at_chain(h, name, &node.url);
+        node
+    }
+
+    /// USDT on BSC, as the corridor template spells it.
+    const BSC_USDT: &str = "0x55d398326f99059fF775485246999027B3197955";
+
+    async fn delete_config(h: &Harness, name: &str) -> (StatusCode, String) {
+        h.send(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/bots/{name}?deleteConfig=true"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
     }
 
     /// A running, panel-native bot with the good layout.
@@ -1815,6 +1629,83 @@ mod tests {
         c.labels.insert(LABEL_BOT.to_string(), name.to_string());
         c.mounts = dir_layout_mounts(&h.root.join(name).display().to_string());
         h.docker.add_container(c);
+    }
+
+    #[tokio::test]
+    async fn a_display_name_is_set_cleared_and_never_touches_the_id() {
+        let h = harness("rename");
+        seed_panel_bot(&h, "bot-a");
+
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/name",
+                serde_json::json!({ "displayName": " Lagos desk " }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["name"], "bot-a", "the id is untouched");
+        assert_eq!(v["displayName"], "Lagos desk");
+        assert!(h.root.join("bot-a/panel.json").exists());
+        assert!(
+            !std::fs::read_to_string(h.root.join("bot-a/stitch.toml"))
+                .unwrap()
+                .contains("Lagos"),
+            "the bot's own config is not where the panel keeps its label"
+        );
+
+        // It comes back on a plain read too.
+        let (_, body) = h.get("/api/bots/bot-a").await;
+        assert_eq!(Harness::parse(&body)["displayName"], "Lagos desk");
+
+        // Too long is refused with the limit in the message.
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/name",
+                serde_json::json!({ "displayName": "x".repeat(41) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("40"), "{body}");
+
+        // Empty clears it and removes the file.
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/name",
+                serde_json::json!({ "displayName": "" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(Harness::parse(&body)["displayName"].is_null());
+        assert!(!h.root.join("bot-a/panel.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_flat_layout_bot_cannot_be_named() {
+        // Its only directory is the bots root, shared with every other flat
+        // bot: a panel.json there would rename all of them at once.
+        let h = harness("rename-flat");
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        std::fs::write(h.root.join("stitch.bot1.toml"), corridor.toml_template).unwrap();
+        std::fs::write(
+            h.root.join("stitch.bot1.key"),
+            super::super::testkit::TEST_KEY,
+        )
+        .unwrap();
+        let mut c = container("stitch-bot1", ContainerState::Running);
+        c.labels
+            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
+        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
+        h.docker.add_container(c);
+
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot1/name",
+                serde_json::json!({ "displayName": "Lagos desk" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(!h.root.join("panel.json").exists());
     }
 
     #[tokio::test]
@@ -2531,18 +2422,52 @@ mod tests {
     #[tokio::test]
     async fn delete_with_the_flag_also_removes_the_config_directory() {
         let h = harness("delete-config");
-        seed_panel_bot(&h, "bot-a");
-        let (status, body) = h
-            .send(
-                axum::http::Request::builder()
-                    .method("DELETE")
-                    .uri("/api/bots/bot-a?deleteConfig=true")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await;
+        let _node = seed_with_empty_wallet(&h, "bot-a").await;
+        let (status, body) = delete_config(&h, "bot-a").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(!h.root.join("bot-a").exists());
+    }
+
+    #[tokio::test]
+    async fn deleting_the_config_is_refused_while_the_wallet_holds_money() {
+        // The key is the only way to that money. The page disables Remove on
+        // the same rule, but its read can be seconds old, so the route reads
+        // the wallet again itself.
+        let h = harness("delete-config-funded");
+        let node =
+            mock_rpc(MockChain::default().balance(BSC_USDT, 25_000_000_000_000_000_000)).await;
+        seed_panel_bot(&h, "bot-a");
+        point_at_chain(&h, "bot-a", &node.url);
+        let (status, body) = delete_config(&h, "bot-a").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("$25.00"), "{body}");
+        assert!(body.contains("Withdraw first"), "{body}");
+        assert!(h.root.join("bot-a/stitch.key").exists(), "nothing deleted");
+        assert!(h.docker.exists("stitch-bot-a"), "nothing destroyed");
+    }
+
+    #[tokio::test]
+    async fn deleting_the_config_is_refused_while_the_wallet_cannot_be_read() {
+        // A wallet that can't be read could hold anything.
+        let h = harness("delete-config-unreadable");
+        seed_panel_bot(&h, "bot-a");
+        point_at_chain(&h, "bot-a", "http://127.0.0.1:1");
+        let (status, body) = delete_config(&h, "bot-a").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("cannot read this wallet"), "{body}");
+        assert!(h.root.join("bot-a/stitch.key").exists(), "nothing deleted");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_config_with_no_key_needs_no_wallet_read() {
+        // No key, nothing to lose: the gate does not even ask the chain.
+        let h = harness("delete-config-no-key");
+        let node = seed_with_empty_wallet(&h, "bot-a").await;
+        std::fs::remove_file(h.root.join("bot-a/stitch.key")).unwrap();
+        let (status, body) = delete_config(&h, "bot-a").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!h.root.join("bot-a").exists());
+        assert_eq!(node.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2573,7 +2498,9 @@ mod tests {
         // Compose service `foo` mounting `bots/custom-dir` — the old path used
         // bots/foo and left the real config behind.
         let h = harness("delete-compose-path");
+        let node = mock_rpc(MockChain::default()).await;
         write_bot(&h.root, "custom-dir");
+        point_at_chain(&h, "custom-dir", &node.url);
         let mut c = container("stitch-foo", ContainerState::Running);
         c.labels
             .insert(LABEL_COMPOSE_SERVICE.to_string(), "foo".to_string());
@@ -2605,10 +2532,18 @@ mod tests {
     #[tokio::test]
     async fn delete_config_removes_flat_layout_files() {
         let h = harness("delete-flat");
+        let node = mock_rpc(MockChain::default()).await;
         let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
         let toml = h.root.join("stitch.bot1.toml");
         let key = h.root.join("stitch.bot1.key");
-        std::fs::write(&toml, corridor.toml_template).unwrap();
+        std::fs::write(
+            &toml,
+            corridor
+                .toml_template
+                .replace("https://bsc-dataseed.binance.org", &node.url)
+                .replace("https://api.textilecredit.com", "http://127.0.0.1:1"),
+        )
+        .unwrap();
         std::fs::write(&key, super::super::testkit::TEST_KEY).unwrap();
         let mut c = container("stitch-bot1", ContainerState::Running);
         c.labels
@@ -2636,16 +2571,10 @@ mod tests {
     #[tokio::test]
     async fn delete_config_removes_a_config_only_bot() {
         let h = harness("delete-config-only");
+        let node = mock_rpc(MockChain::default()).await;
         write_bot(&h.root, "bot-a");
-        let (status, body) = h
-            .send(
-                axum::http::Request::builder()
-                    .method("DELETE")
-                    .uri("/api/bots/bot-a?deleteConfig=true")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await;
+        point_at_chain(&h, "bot-a", &node.url);
+        let (status, body) = delete_config(&h, "bot-a").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(!h.root.join("bot-a").exists());
         assert!(body.contains("config is gone"), "{body}");
@@ -2822,158 +2751,6 @@ mod tests {
             kinds.contains(&"ledgerNotPersisted".to_string()),
             "{kinds:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn changing_the_signer_backend_writes_the_secret_and_recreates() {
-        let h = harness("change-signer");
-        seed_panel_bot(&h, "bot-a"); // local hot wallet, running
-        let (status, body) = h
-            .put_json(
-                "/api/bots/bot-a/signer",
-                serde_json::json!({
-                    "kind": "turnkey",
-                    "organizationId": "org-1",
-                    "signWith": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-                    "operatorAddress": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-                    "apiPublicKey": "PUBKEY",
-                    "apiPrivateKey": "PRIVKEY",
-                }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        // The config now selects Turnkey and the backend's secret was written to disk —
-        // the thing a raw TOML edit could never do.
-        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert!(toml.contains("provider = \"turnkey\""), "{toml}");
-        assert!(h.root.join("bot-a/turnkey-api.key").exists());
-        // And the container was rebuilt with the new runtime: old removed, new created
-        // and (since it was up) started.
-        let calls = h.docker.calls();
-        assert!(
-            calls.iter().any(|c| matches!(c, Call::Remove { .. })),
-            "{calls:?}"
-        );
-        assert!(
-            calls.iter().any(|c| matches!(c, Call::Create(_))),
-            "{calls:?}"
-        );
-        assert!(
-            calls.iter().any(|c| matches!(c, Call::Start(_))),
-            "{calls:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn changing_the_signer_is_refused_when_a_live_sibling_shares_the_new_wallet() {
-        // The new signer's operator address is the wallet the rebuilt bot will sign from.
-        // A live sibling already transacting on it means the recreate would start a second
-        // signer there — refused, and nothing written or rebuilt.
-        let h = harness("change-signer-sibling");
-        seed_panel_bot(&h, "bot-a"); // local, running, maker-only
-        let addr = h
-            .state
-            .bot("bot-a")
-            .await
-            .unwrap()
-            .wallet()
-            .unwrap()
-            .address;
-        // A live taker sibling on the wallet the new signer will select (same address).
-        seed_transacting(&h, "bot-b", ContainerState::Running);
-        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-
-        let (status, body) = h
-            .put_json(
-                "/api/bots/bot-a/signer",
-                serde_json::json!({
-                    "kind": "turnkey",
-                    "organizationId": "org-1",
-                    "signWith": addr,
-                    "operatorAddress": addr,
-                    "apiPublicKey": "PUBKEY",
-                    "apiPrivateKey": "PRIVKEY",
-                }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(body.contains("shares its operator wallet"), "{body}");
-        // Nothing written, nothing rebuilt.
-        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert_eq!(before, after, "the switch must not be persisted");
-        assert!(
-            !h.docker
-                .calls()
-                .iter()
-                .any(|c| matches!(c, Call::Create(_))),
-            "{:?}",
-            h.docker.calls()
-        );
-    }
-
-    #[tokio::test]
-    async fn an_invalid_config_does_not_destroy_the_bot_on_a_signer_change() {
-        // `apply_signer` validates the config on disk, so a bot whose TOML is invalid (but
-        // still exposed as editable) must be caught *before* its live container is removed
-        // — otherwise the operator is left with no bot and a validation error.
-        let h = harness("change-signer-badconfig");
-        seed_panel_bot(&h, "bot-a"); // running, valid config
-        std::fs::write(h.root.join("bot-a/stitch.toml"), "not valid = = toml").unwrap();
-
-        let (status, body) = h
-            .put_json(
-                "/api/bots/bot-a/signer",
-                serde_json::json!({
-                    "kind": "turnkey",
-                    "organizationId": "org-1",
-                    "signWith": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-                    "operatorAddress": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-                    "apiPublicKey": "PUBKEY",
-                    "apiPrivateKey": "PRIVKEY",
-                }),
-            )
-            .await;
-        assert_ne!(status, StatusCode::OK, "{body}");
-        // The live container must not have been removed.
-        assert!(
-            !h.docker
-                .calls()
-                .iter()
-                .any(|c| matches!(c, Call::Remove { .. })),
-            "{:?}",
-            h.docker.calls()
-        );
-    }
-
-    #[tokio::test]
-    async fn changing_the_signer_is_refused_for_a_flat_layout_bot() {
-        // Recreate — and so a signer change — needs the panel's per-bot layout to rebuild
-        // with the right mounts. A flat-layout bot is pointed at Migrate first.
-        let h = harness("change-signer-flat");
-        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
-        std::fs::write(h.root.join("stitch.bot1.toml"), corridor.toml_template).unwrap();
-        std::fs::write(
-            h.root.join("stitch.bot1.key"),
-            super::super::testkit::TEST_KEY,
-        )
-        .unwrap();
-        let mut c = container("stitch-bot1", ContainerState::Running);
-        c.labels
-            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
-        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
-        h.docker.add_container(c);
-
-        let (status, body) = h
-            .put_json(
-                "/api/bots/bot1/signer",
-                serde_json::json!({
-                    "kind": "local",
-                    "privateKey": super::super::testkit::TEST_KEY,
-                }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(body.contains("per-bot directory layout"), "{body}");
     }
 
     #[tokio::test]
@@ -3389,54 +3166,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changing_the_signer_preserves_the_bots_own_image() {
-        // A migrated or pinned bot runs its own image, not the panel-wide default. A
-        // signer change only asks to swap the signer, so it must recreate on the same
-        // image — otherwise it silently switches the trading binary. The seeded container
-        // runs `:latest` while the harness default is `:test`, so a recreate on the
-        // default would show up here.
-        let h = harness("change-signer-image");
-        seed_panel_bot(&h, "bot-a"); // container image ...:latest
-        let seeded_image = "ghcr.io/textile-protocol/textile-stitch:latest";
-        assert_ne!(
-            h.state.cfg.bot_image, seeded_image,
-            "the test only proves preservation if the default differs from the bot's image"
-        );
-
-        let (status, body) = h
-            .put_json(
-                "/api/bots/bot-a/signer",
-                serde_json::json!({
-                    "kind": "turnkey",
-                    "organizationId": "org-1",
-                    "signWith": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-                    "operatorAddress": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-                    "apiPublicKey": "PUBKEY",
-                    "apiPrivateKey": "PRIVKEY",
-                }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-
-        let created = h.docker.create_specs();
-        let spec = created.last().expect("a replacement container was created");
-        assert_eq!(
-            spec.image, seeded_image,
-            "the recreate must keep the bot's own image, not the panel default"
-        );
-        // And it didn't refresh: pulling a mutable tag like `:latest` off a signer change
-        // would deploy a newer trading binary. Refreshing the image is Recreate's job.
-        assert!(
-            !h.docker
-                .calls()
-                .iter()
-                .any(|c| matches!(c, Call::EnsureImage { refresh: true, .. })),
-            "a signer change must not refresh the image: {:?}",
-            h.docker.calls()
-        );
-    }
-
-    #[tokio::test]
     async fn starting_an_already_running_bot_is_a_no_op_not_a_shutdown() {
         // The overlapping-Start race: the config lock serializes two Starts, so the
         // second re-reads the bot as already running. `docker start` on a live container
@@ -3517,211 +3246,6 @@ mod tests {
         assert!(
             h.root.join("bot1/stitch.toml").exists(),
             "the config must have moved into the per-bot layout"
-        );
-    }
-
-    #[tokio::test]
-    async fn switching_corridor_rewrites_toml_and_stops_a_running_bot() {
-        let h = harness("switch-corridor");
-        seed_panel_bot(&h, "bot-a");
-
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/corridor",
-                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains("Switched to"), "{body}");
-        assert!(body.contains("stopped"), "{body}");
-
-        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert!(
-            setup::identify_corridor(&toml).is_some_and(|c| c.id == "wbrl-usdt-celo"),
-            "config should now be the wBRL corridor"
-        );
-        assert!(
-            toml.contains("book_enabled = false"),
-            "switch_corridor stamps RFQ-only for every bot: {toml}"
-        );
-        assert_eq!(
-            h.docker.state_of("stitch-bot-a"),
-            Some(ContainerState::Exited),
-            "a running bot must be stopped after a corridor switch"
-        );
-        // Stop must precede the write: if Docker refuses the stop, stitch.toml
-        // stays on the old corridor so a retry can try again.
-        let calls = h.docker.calls();
-        let stop_at = calls
-            .iter()
-            .position(|c| matches!(c, Call::Stop { name, .. } if name == "stitch-bot-a"));
-        assert!(stop_at.is_some(), "expected a stop call, got {calls:?}");
-    }
-
-    #[tokio::test]
-    async fn a_failed_stop_leaves_the_corridor_unchanged() {
-        let h = harness("switch-corridor-stopfail");
-        seed_panel_bot(&h, "bot-a");
-        h.docker.fail_stop("daemon refused the stop");
-
-        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/corridor",
-                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert_eq!(
-            before, after,
-            "a refused stop must not leave disk on the new corridor"
-        );
-        assert!(
-            setup::identify_corridor(&after).is_some_and(|c| c.id == "cngn-usdt-bsc"),
-            "still on the original corridor"
-        );
-    }
-
-    #[tokio::test]
-    async fn switching_to_the_same_corridor_is_refused() {
-        let h = harness("switch-same-corridor");
-        seed_panel_bot(&h, "bot-a");
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/corridor",
-                serde_json::json!({ "corridorId": "cngn-usdt-bsc" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("already on"), "{body}");
-    }
-
-    #[tokio::test]
-    async fn switching_corridor_with_the_fleet_flag_stays_rfq_only() {
-        let h = harness("switch-corridor-rfq-default");
-        seed_panel_bot(&h, "bot-a");
-        std::fs::write(
-            h.root.join(crate::config::PANEL_FLAGS_FILE),
-            format!(
-                "[experimental]\nrfq_default = \"{}\"\n",
-                crate::config::RFQ_DEFAULT_GATE
-            ),
-        )
-        .unwrap();
-
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/corridor",
-                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains("RFQ-only"), "{body}");
-        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert!(
-            setup::identify_corridor(&toml).is_some_and(|c| c.id == "wbrl-usdt-celo"),
-            "config should now be the wBRL corridor"
-        );
-        assert!(toml.contains("book_enabled = false"), "{toml}");
-    }
-
-    #[tokio::test]
-    async fn switching_an_rfq_only_bot_does_not_turn_the_book_back_on() {
-        let h = harness("switch-corridor-keep-rfq");
-        seed_panel_bot(&h, "bot-a");
-        let path = h.root.join("bot-a/stitch.toml");
-        let stamped =
-            setup::apply_rfq_default_preset(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        std::fs::write(&path, stamped).unwrap();
-
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/corridor",
-                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains("RFQ-only"), "{body}");
-        let toml = std::fs::read_to_string(&path).unwrap();
-        assert!(toml.contains("book_enabled = false"), "{toml}");
-        assert!(
-            setup::identify_corridor(&toml).is_some_and(|c| c.id == "wbrl-usdt-celo"),
-            "{toml}"
-        );
-    }
-
-    #[tokio::test]
-    async fn switching_corridor_rewrites_the_flat_layout_filename() {
-        // Flat-layout bots mount `stitch.<bot>.toml`, not `stitch.toml`. Writing
-        // the standard name would report success while Start still loads the old
-        // corridor from the mounted file.
-        let h = harness("switch-flat-corridor");
-        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
-        let toml = h.root.join("stitch.bot1.toml");
-        std::fs::write(&toml, corridor.toml_template).unwrap();
-        std::fs::write(
-            h.root.join("stitch.bot1.key"),
-            super::super::testkit::TEST_KEY,
-        )
-        .unwrap();
-        let mut c = container("stitch-bot1", ContainerState::Exited);
-        c.labels
-            .insert(LABEL_COMPOSE_SERVICE.to_string(), "bot1".to_string());
-        c.mounts = flat_layout_mounts(&h.root.display().to_string(), "bot1");
-        h.docker.add_container(c);
-
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot1/corridor",
-                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let after = std::fs::read_to_string(&toml).unwrap();
-        assert!(
-            setup::identify_corridor(&after).is_some_and(|c| c.id == "wbrl-usdt-celo"),
-            "mounted flat-layout file must be the one rewritten: {after}"
-        );
-        assert!(
-            !h.root.join("stitch.toml").exists(),
-            "must not invent a sibling stitch.toml the container never mounts"
-        );
-    }
-
-    #[tokio::test]
-    async fn switching_corridor_stops_a_paused_bot_before_rewriting() {
-        // Paused isn't "up" for Start/Stop labeling, but the frozen process still
-        // has the old corridor. Skipping the stop would rewrite disk while an
-        // unpause later resumes the stale process.
-        let h = harness("switch-paused-corridor");
-        seed_panel_bot_in_state(&h, "bot-a", ContainerState::Paused);
-        let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-
-        let (status, body) = h
-            .post_json(
-                "/api/bots/bot-a/corridor",
-                serde_json::json!({ "corridorId": "wbrl-usdt-celo" }),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(
-            body.contains("was stopped"),
-            "operator must hear the pause was cleared: {body}"
-        );
-        assert!(
-            h.docker
-                .calls()
-                .iter()
-                .any(|c| matches!(c, Call::Stop { name, .. } if name == "stitch-bot-a")),
-            "paused bot must be stopped before the TOML rewrite: {:?}",
-            h.docker.calls()
-        );
-        let after = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
-        assert_ne!(before, after, "corridor rewrite should have landed");
-        assert!(
-            setup::identify_corridor(&after).is_some_and(|c| c.id == "wbrl-usdt-celo"),
-            "disk should be on the new corridor"
         );
     }
 

@@ -43,21 +43,11 @@ function decimalSeparator(): string {
   )
 }
 
-/** A unix timestamp as a locale date-time, or a dash when there isn't one. */
-export function formatTimestamp(unix: number | null | undefined): string {
-  if (!unix) return '—'
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  }).format(new Date(unix * 1000))
-}
-
 /**
  * An RFC 3339 timestamp as a locale date, or a dash.
  *
- * Separate from [`formatTimestamp`] because the source is different: this one
- * comes from a registry / commit record as a string, and an unparseable value
- * has to read as "unknown" rather than as `Invalid Date`.
+ * The source is a registry / commit record as a string, and an unparseable
+ * value has to read as "unknown" rather than as `Invalid Date`.
  */
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return '—'
@@ -176,4 +166,20 @@ function shortenSha256(value: string): string {
   const hex = value.startsWith('sha256:') ? value.slice('sha256:'.length) : null
   if (hex === null || hex.length <= 12) return value
   return `sha256:${hex.slice(0, 6)}…${hex.slice(-6)}`
+}
+
+/** A full `0x…` address, the only shape the panel sends to the chain. */
+export function isAddress(s: string): boolean {
+  return /^0x[0-9a-fA-F]{40}$/.test(s.trim())
+}
+
+/** `celoscan.io` out of an explorer URL, for a link's own label. Null when
+ * there is no URL or it does not parse. */
+export function hostOf(url: string | null | undefined): string | null {
+  if (!url) return null
+  try {
+    return new URL(url).host.replace(/^www\./, '')
+  } catch {
+    return null
+  }
 }

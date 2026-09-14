@@ -12,13 +12,15 @@
 //! Secrets are write-only. They arrive in the request body, go through the writer
 //! into an owner-only file, and are never read back by any route.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use super::{bots, ApiError, AppState};
 use crate::panel::{naming, provision};
+use crate::pricing::feed::{HttpFeed, PriceFeed};
+use crate::pricing::tick::is_price_usable;
 use crate::setup::{self, CorridorEntry, CustomCorridor, LocalKeyMaterial, SignerSetup};
 
 #[derive(Serialize)]
@@ -69,6 +71,57 @@ pub async fn corridors(State(state): State<AppState>) -> Response {
         "warning": listing.warning,
     }))
     .into_response()
+}
+
+/// How long one feed read may take before the Spread step gives up on the
+/// example and shows the notional one. A screen is waiting on this.
+const FEED_MID_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+
+#[derive(Deserialize)]
+pub struct FeedMidQuery {
+    pub url: String,
+}
+
+/// The mid a price feed is publishing right now, read the way the bot reads it.
+///
+/// The Spread step's worked example wants real numbers rather than a made-up
+/// notional, and the browser can't fetch the feed itself: Textile's `/price`
+/// only answers cross-origin for the app. So the panel fetches on its behalf,
+/// through [`HttpFeed`], the adapter the running bot uses, so what the example
+/// shows is exactly what the bot would quote around and not a second parser's
+/// opinion of the same JSON.
+///
+/// Any http(s) URL the operator can type into the Sources step is allowed
+/// here, because the bot they are about to create will fetch that same URL on
+/// its own. The panel adds no reach the bot doesn't already have.
+pub async fn feed_mid(Query(q): Query<FeedMidQuery>) -> Result<Response, ApiError> {
+    let url = q.url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(ApiError::bad_request(
+            "feed URL must start with http:// or https://",
+        ));
+    }
+    let quote = tokio::time::timeout(FEED_MID_BUDGET, HttpFeed::new(url).fetch())
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {}s", FEED_MID_BUDGET.as_secs()))
+        .and_then(|r| r)
+        .map_err(|e| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("price feed did not answer with a price: {e:#}"),
+            )
+        })?;
+    if !is_price_usable(quote.price) {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("price feed published {}, not a usable price", quote.price),
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "price": quote.price,
+        "timestamp": quote.timestamp,
+    }))
+    .into_response())
 }
 
 /// Generate a fresh hot wallet for the "Create wallet" step.
@@ -274,7 +327,11 @@ pub async fn check_signer(
 #[serde(rename_all = "camelCase")]
 pub struct CreateRequest {
     /// Bot name. Becomes the config directory and part of the container name.
-    pub name: String,
+    /// Optional: the wizard leaves it out and the bot is named after its wallet
+    /// (see [`naming::bot_id_for_wallet`]); an explicit name is still honoured
+    /// for the API and for tests.
+    #[serde(default)]
+    pub name: Option<String>,
     /// A catalog corridor's id. Required unless `custom` is given.
     #[serde(default)]
     pub corridor_id: Option<String>,
@@ -461,8 +518,15 @@ pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<CreateRequest>,
 ) -> Result<Response, ApiError> {
-    let name = body.name.trim().to_string();
-    naming::validate_bot_id(&name).map_err(ApiError::bad_request)?;
+    let explicit_name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    if let Some(name) = &explicit_name {
+        naming::validate_bot_id(name).map_err(ApiError::bad_request)?;
+    }
 
     // A listed corridor, a shipped preset, or the custom form — either way this
     // resolves to the toml to write, and refuses an unknown/pending/invalid
@@ -476,6 +540,23 @@ pub async fn create(
     let toml = apply_wizard_overrides(&corridor.toml, &body)?;
 
     let fleet = state.fleet().await?;
+    // Validated before the directory is claimed, not after. This is pure request-body
+    // checking with no filesystem in it, and every early return between the claim and
+    // the writer's cleanup would leave an empty directory behind that makes the
+    // corrected retry fail with `AlreadyExists` until someone rmdir's it by hand.
+    let signer = body.signer.into_setup()?;
+
+    // No name given: the bot is its wallet. The fleet snapshot decides what is
+    // taken; the directory claim below is still the arbiter of a race.
+    let name = match explicit_name {
+        Some(name) => name,
+        None => {
+            let address = signer.operator_address().map_err(ApiError::bad_request)?;
+            naming::bot_id_for_wallet(&address, |candidate| {
+                fleet.contains(candidate) || state.cfg.bot_dir(candidate).exists()
+            })
+        }
+    };
     if fleet.contains(&name) {
         return Err(ApiError::conflict(format!(
             "there is already a bot called \"{name}\". Pick another name, or remove that one \
@@ -492,12 +573,6 @@ pub async fn create(
     // It also means the panel only ever hands the bot a directory it created, so the
     // handover below can't reach an operator's README, backup or recovered ledger —
     // there is nothing else in there.
-    // Validated before the directory is claimed, not after. This is pure request-body
-    // checking with no filesystem in it, and every early return between the claim and
-    // the writer's cleanup would leave an empty directory behind that makes the
-    // corrected retry fail with `AlreadyExists` until someone rmdir's it by hand.
-    let signer = body.signer.into_setup()?;
-
     let dir = state.cfg.bot_dir(&name);
     if let Err(e) = std::fs::create_dir(&dir) {
         return Err(match e.kind() {
@@ -737,6 +812,74 @@ refresh_threshold_bps = 0
             axum::serve(listener, app).await.ok();
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// A price feed shaped like Textile's `/price`, or one that is down.
+    async fn mock_feed(
+        body: serde_json::Value,
+        status: u16,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::routing::get;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/price",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        Json(body),
+                    )
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}/price"), handle)
+    }
+
+    #[tokio::test]
+    async fn the_feed_mid_is_what_the_bot_would_read() {
+        let (url, server) = mock_feed(
+            json!({ "pair": "cngn-usdt", "price": 0.00073, "timestamp": 1789377908, "degraded": false }),
+            200,
+        )
+        .await;
+        let h = harness("feed-mid");
+        let (status, body) = h.get(&format!("/api/feed/mid?url={}", url)).await;
+        server.abort();
+        assert_eq!(status, 200, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["price"], 0.00073);
+        assert_eq!(body["timestamp"], 1789377908);
+    }
+
+    #[tokio::test]
+    async fn a_feed_that_is_down_is_reported_not_invented() {
+        let (url, server) = mock_feed(json!({ "error": "nope" }), 503).await;
+        let h = harness("feed-mid-down");
+        let (status, body) = h.get(&format!("/api/feed/mid?url={}", url)).await;
+        server.abort();
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("did not answer with a price"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_feed_publishing_a_zero_price_is_refused() {
+        let (url, server) = mock_feed(json!({ "price": 0.0, "timestamp": 1 }), 200).await;
+        let h = harness("feed-mid-zero");
+        let (status, body) = h.get(&format!("/api/feed/mid?url={}", url)).await;
+        server.abort();
+        assert_eq!(status, 502, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_feed_url_that_is_not_http_is_refused_before_any_fetch() {
+        let h = harness("feed-mid-scheme");
+        let (status, _) = h.get("/api/feed/mid?url=file:///etc/passwd").await;
+        assert_eq!(status, 400);
     }
 
     #[tokio::test]
@@ -1047,11 +1190,10 @@ refresh_threshold_bps = 0
         )
         .await;
         // Leftover book + taker, then Start — that's what can_transact keys on.
-        // New bots are RFQ-only and refuse Start without Connect.
+        // New bots are RFQ-only and refuse Start without Connect. The taker
+        // leg is already on: create stamps it.
         let path = h.root.join("bot-a/stitch.toml");
         keep_book_on(&path);
-        let toml = std::fs::read_to_string(&path).unwrap() + "\nlimit_taker_enabled = true\n";
-        std::fs::write(&path, toml).unwrap();
         let (status, body) = h.post_json("/api/bots/bot-a/start", json!({})).await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
@@ -1068,6 +1210,36 @@ refresh_threshold_bps = 0
         let v = Harness::parse(&body);
         assert_eq!(v["conflicts"].as_array().unwrap().len(), 1);
         assert_eq!(v["conflicts"][0]["blocksLiveSwitch"], true, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_bot_created_without_a_name_is_named_after_its_wallet() {
+        // TEST_KEY is Hardhat account #0: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266.
+        let h = harness("create-unnamed");
+        let body = json!({ "corridorId": "cngn-usdt-bsc", "signer": local(TEST_KEY) });
+        let (status, first) = h.post_json("/api/bots", body.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        assert_eq!(Harness::parse(&first)["bot"]["name"], "0xf39fd6e5");
+        assert!(h.root.join("0xf39fd6e5/stitch.toml").exists());
+        assert!(h.docker.exists("stitch-0xf39fd6e5"));
+
+        // The same wallet again (a second chain, in real life) is not a refusal.
+        let (status, second) = h.post_json("/api/bots", body).await;
+        assert_eq!(status, StatusCode::CREATED, "{second}");
+        assert_eq!(Harness::parse(&second)["bot"]["name"], "0xf39fd6e5-2");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_name_still_wins_over_the_wallet() {
+        let h = harness("create-named");
+        let (status, body) = h
+            .post_json(
+                "/api/bots",
+                json!({ "name": "desk-one", "corridorId": "cngn-usdt-bsc", "signer": local(TEST_KEY) }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(Harness::parse(&body)["bot"]["name"], "desk-one");
     }
 
     #[tokio::test]
@@ -1673,10 +1845,15 @@ ttl_secs = 60
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
         assert!(toml.contains("book_enabled = false"), "{toml}");
+        assert!(
+            toml.contains("limit_taker_enabled = true"),
+            "create must switch the taker leg on: {toml}"
+        );
         let (status, body) = h.get("/api/bots/bot-a/settings").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v = Harness::parse(&body);
         assert_eq!(v["bookEnabled"], false);
+        assert_eq!(v["takerEnabled"], true);
         assert_eq!(v["rfqDefaultUnlocked"], true);
         assert_eq!(v["rfqPanelUnlocked"], true);
     }

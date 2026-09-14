@@ -48,6 +48,7 @@ use wry::WebViewBuilder;
 
 use crate::prefs::DesktopPrefs;
 use crate::supervise::PanelSupervisor;
+use stitch_bot::panel::desktop::{DesktopRequest, DesktopState, REQUEST_FILE, STATE_FILE};
 
 const PANEL_URL: &str = "http://127.0.0.1:8420";
 
@@ -496,6 +497,11 @@ fn run() -> Result<()> {
 
     // Cache OS login-item state (toggle updates this; avoid re-querying every poll).
     let mut autostart_enabled = autostart::is_enabled();
+    // Say where the switches stand before the panel can ask, and clear any
+    // request a previous run left behind: it described a wish for a process
+    // that is gone.
+    let _ = std::fs::remove_file(paths.root.join(REQUEST_FILE));
+    publish_desktop_state(&paths, autostart_enabled, prefs.keep_awake);
 
     let html = if awaiting_signup {
         control_ui::signup_html(legacy_password_reset)
@@ -615,6 +621,7 @@ fn run() -> Result<()> {
                         &menu_icons,
                         tray.as_ref(),
                     );
+                    publish_desktop_state(&paths, autostart_enabled, prefs.keep_awake);
                     if !awaiting_signup {
                         sync_control_ui(
                             webview.as_ref(),
@@ -812,6 +819,30 @@ fn run() -> Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::RefreshStatus) => {
+                // The panel's page may have asked for a switch to flip. Same
+                // code paths as the menu and the control window, then the
+                // state file says what happened.
+                if let Some((req, raw)) = read_desktop_request(&paths) {
+                    if let Some(enabled) = req.autostart {
+                        match autostart::set_enabled(enabled) {
+                            Ok(()) => autostart_enabled = enabled,
+                            Err(e) => eprintln!("start at login failed: {e}"),
+                        }
+                    }
+                    if let Some(enabled) = req.keep_awake {
+                        apply_keep_awake(
+                            enabled,
+                            &mut keep_awake,
+                            &mut prefs,
+                            &paths,
+                            &keep_awake_item,
+                            &menu_icons,
+                            tray.as_ref(),
+                        );
+                    }
+                    publish_desktop_state(&paths, autostart_enabled, prefs.keep_awake);
+                    finish_desktop_request(&paths, &raw);
+                }
                 // Custom menu icons bake OS ink into RGBA. muda can't mark them
                 // as AppKit templates, so rebuild when light/dark flips.
                 if menu_icons.refresh_for_appearance() {
@@ -1205,6 +1236,7 @@ fn handle_ipc(
                 Ok(()) => *autostart_enabled = enabled,
                 Err(e) => eprintln!("start at login failed: {e}"),
             }
+            publish_desktop_state(paths, *autostart_enabled, prefs.keep_awake);
         }
         other if other.starts_with("toggle_keep_awake:") => {
             let enabled = other.ends_with(":1");
@@ -1217,6 +1249,7 @@ fn handle_ipc(
                 menu_icons,
                 tray,
             );
+            publish_desktop_state(paths, *autostart_enabled, prefs.keep_awake);
         }
         #[cfg(target_os = "macos")]
         other if other.starts_with("toggle_hide_dock:") => {
@@ -1269,6 +1302,52 @@ fn start_update_download(
             .map_err(|error| format!("{error:#}"));
         let _ = proxy.send_event(UserEvent::UpdateDownloadResult(result));
     });
+}
+
+/// Tell the panel where the switches stand. Best effort: a failed write means
+/// the panel's page shows nothing, and the menu still works.
+fn publish_desktop_state(paths: &paths::DesktopPaths, autostart: bool, keep_awake: bool) {
+    let state = DesktopState {
+        autostart,
+        keep_awake,
+        keep_awake_label: keep_awake::label().to_string(),
+    };
+    // The shared writer, not a bare rename: on Windows `rename` refuses to
+    // overwrite the state file every publish after the first.
+    let write = serde_json::to_vec_pretty(&state)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| {
+            stitch_bot::setup::write_file_atomic(&paths.root.join(STATE_FILE), bytes)
+        });
+    if let Err(e) = write {
+        eprintln!("publishing desktop state failed: {e:#}");
+    }
+}
+
+/// A request the panel's page left for us, with the bytes it came in. The
+/// file stays until [`finish_desktop_request`]: the panel reads it to say
+/// "pending", and removing it before the new state is published would show
+/// the old value for a tick. Malformed or empty requests are dropped here,
+/// so a bad file can't wedge the tick.
+fn read_desktop_request(paths: &paths::DesktopPaths) -> Option<(DesktopRequest, String)> {
+    let path = paths.root.join(REQUEST_FILE);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let req: Option<DesktopRequest> = serde_json::from_str(&raw)
+        .ok()
+        .filter(|r: &DesktopRequest| r.autostart.is_some() || r.keep_awake.is_some());
+    if req.is_none() {
+        let _ = std::fs::remove_file(&path);
+    }
+    req.map(|r| (r, raw))
+}
+
+/// Remove the request just applied, unless the panel has already replaced it
+/// with a new one: that one is for the next tick.
+fn finish_desktop_request(paths: &paths::DesktopPaths, applied: &str) {
+    let path = paths.root.join(REQUEST_FILE);
+    if std::fs::read_to_string(&path).is_ok_and(|now| now == applied) {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 fn apply_keep_awake(
@@ -1486,6 +1565,87 @@ fn paint_awake_dot(rgba: &mut [u8], size: u32) {
 
 fn fallback_icon() -> Icon {
     tray_icon_from_embedded().expect("grandma tray icon")
+}
+
+#[cfg(test)]
+mod desktop_bridge_tests {
+    use super::*;
+
+    fn paths(tag: &str) -> paths::DesktopPaths {
+        let root = std::env::temp_dir().join(format!(
+            "stitch-desktop-bridge-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        paths::DesktopPaths {
+            bots_dir: root.join("bots"),
+            env_file: root.join("panel.env"),
+            password_file: root.join("panel.password"),
+            panel_log: root.join("panel.log"),
+            root,
+        }
+    }
+
+    #[test]
+    fn the_state_file_says_what_the_switches_are() {
+        let p = paths("state");
+        publish_desktop_state(&p, true, false);
+        let s = stitch_bot::panel::desktop::read_state(&p.root).unwrap();
+        assert!(s.autostart && !s.keep_awake);
+        assert_eq!(s.keep_awake_label, keep_awake::label());
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
+
+    #[test]
+    fn a_request_stays_until_finished_and_an_empty_one_is_dropped() {
+        let p = paths("request");
+        stitch_bot::panel::desktop::write_request(
+            &p.root,
+            &DesktopRequest {
+                keep_awake: Some(true),
+                autostart: None,
+            },
+        )
+        .unwrap();
+        let (taken, raw) = read_desktop_request(&p).expect("the request is there");
+        assert_eq!(taken.keep_awake, Some(true));
+        assert!(
+            p.root.join(REQUEST_FILE).exists(),
+            "still pending until the new state is out"
+        );
+        finish_desktop_request(&p, &raw);
+        assert!(read_desktop_request(&p).is_none(), "consumed");
+
+        std::fs::write(p.root.join(REQUEST_FILE), "{}").unwrap();
+        assert!(
+            read_desktop_request(&p).is_none(),
+            "nothing asked, nothing taken"
+        );
+        assert!(!p.root.join(REQUEST_FILE).exists(), "and the file is gone");
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
+
+    #[test]
+    fn a_request_written_while_one_is_applied_is_kept_for_the_next_tick() {
+        let p = paths("request-race");
+        let write =
+            |req: DesktopRequest| stitch_bot::panel::desktop::write_request(&p.root, &req).unwrap();
+        write(DesktopRequest {
+            keep_awake: Some(true),
+            autostart: None,
+        });
+        let (_, raw) = read_desktop_request(&p).unwrap();
+        // The page asks for the other switch before this tick finishes.
+        write(DesktopRequest {
+            keep_awake: None,
+            autostart: Some(true),
+        });
+        finish_desktop_request(&p, &raw);
+        let (next, _) = read_desktop_request(&p).expect("the newer request survives");
+        assert_eq!(next.autostart, Some(true));
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
 }
 
 #[cfg(test)]

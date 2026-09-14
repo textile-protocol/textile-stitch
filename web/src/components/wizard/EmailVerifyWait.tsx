@@ -1,8 +1,11 @@
-// The Confirm-your-email screen: funded and approved on chain, the operator's
-// address still unconfirmed. Polls the panel's rfq/status every 30 s (backing
-// off to two minutes on venue errors) and, the moment Textile reports the
-// address confirmed, runs the shared start runner so the bot goes live without
-// another click.
+// The wizard's last screen: approved on chain, not yet on the venue. It does
+// the whole Textile side in one place. A bot with no maker
+// credential gets the Connect form (an email, one button: register the bot
+// and send the confirmation link); a bot that is registered waits for the
+// link to be clicked. Either way it polls the panel's rfq/status every 30 s
+// (backing off to two minutes on venue errors) and, the moment Textile
+// reports the address confirmed, runs the shared start runner so the bot goes
+// live without another click.
 //
 // One rule above all: rfq/status is never called again once the bot is seated.
 // On a seated bot that call rewrites the config and restarts a running bot. So
@@ -12,7 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api } from '../../api'
 import { formatClock } from '../../format'
-import { Banner, Button, Card, Field, Input } from '../ui'
+import { Banner, Button, Card, Field, Input, Spinner } from '../ui'
 import ProgressList, { type ProgressRow } from './ProgressList'
 import { errorText, useStartSequence } from './useStartSequence'
 import { CONTACT_EMAIL, progress as progressCopy, wait } from './wizardCopy'
@@ -30,14 +33,6 @@ export interface EmailVerifyWaitProps {
    * was away, not the "check your inbox" copy.
    */
   initialError?: string | null
-  /** The address still in the wizard's memory, for Resend. */
-  contactEmail?: string
-  /**
-   * Back to the Connect step (offered when the bot has no Textile credential).
-   * The only way off this screen other than confirming: this is one of the
-   * wizard's two endings, so it offers no way out.
-   */
-  onBack?: () => void
 }
 
 const CHECK_MS = 30_000
@@ -59,8 +54,6 @@ export default function EmailVerifyWait({
   onApproved,
   initial = null,
   initialError = null,
-  contactEmail,
-  onBack,
 }: EmailVerifyWaitProps) {
   const seatedInitially = !!initial?.emailVerified && !!initial.settings?.rfqEnabled
   const [status, setStatus] = useState<RfqStatusResult | null>(initial)
@@ -77,6 +70,18 @@ export default function EmailVerifyWait({
   const [resending, setResending] = useState(false)
   const [resendNote, setResendNote] = useState<string | null>(null)
   const [typedEmail, setTypedEmail] = useState('')
+  // The address this screen sent a link to, until Textile reports one: the
+  // venue's answer can lag the send by a poll, and the screen must not say
+  // "no address on file" in between.
+  const [sentEmail, setSentEmail] = useState<string | null>(null)
+  const [connecting, setConnecting] = useState(false)
+  // "Change email" opens the address field on a bot that already has one.
+  const [changingEmail, setChangingEmail] = useState(false)
+  // Until the first rfq/status answer the screen does not know whether the
+  // bot is registered, and the two copies say opposite things, so it says
+  // neither: a spinner, then the right one.
+  const [probed, setProbed] = useState(seatedInitially)
+  const [connectError, setConnectError] = useState<string | null>(null)
   const [restarting, setRestarting] = useState(false)
   const seatedRef = useRef(seatedInitially)
   const mountedRef = useRef(true)
@@ -132,6 +137,7 @@ export default function EmailVerifyWait({
       } finally {
         if (mountedRef.current) {
           setChecking(false)
+          setProbed(true)
           setArmed((n) => n + 1)
         }
       }
@@ -174,11 +180,14 @@ export default function EmailVerifyWait({
   // not tidiness: a run started from this screen seats the bot, and asking
   // rfq/status again while it does rewrites the config and restarts the bot
   // underneath it.
+  // `connecting` holds it too: Connect writes the credential and then sends
+  // the link, and a check landing between the two would flip the screen to
+  // the registered form under the operator's click.
   useEffect(() => {
-    if (seatedNow || checking || runner.active) return
+    if (seatedNow || checking || connecting || runner.active) return
     const timer = window.setTimeout(() => void check(false), nextCheckMs)
     return () => clearTimeout(timer)
-  }, [seatedNow, checking, runner.active, nextCheckMs, armed, check])
+  }, [seatedNow, checking, connecting, runner.active, nextCheckMs, armed, check])
 
   // A run that ended without the bot going live. It carries Textile's answer,
   // so fold that back in and drop the "seated" latch: the bot is not seated
@@ -200,6 +209,9 @@ export default function EmailVerifyWait({
     void check(true)
   }
 
+  /** The address Textile has on file, or the one this screen just sent to. */
+  const email = status?.contactEmail?.trim() || sentEmail
+
   /**
    * Send (or resend) the confirmation link. `address` is what the operator
    * typed when the bot has none on file — an older bot that connected before
@@ -208,15 +220,19 @@ export default function EmailVerifyWait({
    * with no way back either.
    */
   async function sendLink(address: string) {
-    const email = address.trim()
-    if (!isEmail(email)) return
+    const target = address.trim()
+    if (!isEmail(target)) return
     setResending(true)
     setResendNote(null)
     try {
-      const result = await api.verifyRfqEmail(bot, { contactEmail: email })
+      const result = await api.verifyRfqEmail(bot, { contactEmail: target })
       if (!mountedRef.current) return
-      setResendNote(result.message)
+      // A resend to the same address gets the venue's note; a new address is
+      // said by the "We sent it to …" line, so no second banner.
+      setResendNote(target === email ? result.message : null)
+      setSentEmail(target)
       setTypedEmail('')
+      setChangingEmail(false)
       // Pick the address up on the next poll rather than trusting local state.
       void check(true)
     } catch (e) {
@@ -224,6 +240,35 @@ export default function EmailVerifyWait({
       setResendNote(errorText(e))
     } finally {
       if (mountedRef.current) setResending(false)
+    }
+  }
+
+  /**
+   * Register the bot with Textile and send the confirmation link, in one go.
+   * This is the old Connect step, folded in here: the email is only ever
+   * needed for this, so it is asked for here and nowhere earlier. Enroll is a
+   * reconnect on a bot that already has a credential, so Retry is safe.
+   */
+  async function connect(address: string) {
+    const email = address.trim()
+    if (!isEmail(email)) return
+    setConnecting(true)
+    setConnectError(null)
+    try {
+      await api.enrollRfq(bot)
+      if (!mountedRef.current) return
+      await api.verifyRfqEmail(bot, { contactEmail: email })
+      if (!mountedRef.current) return
+      setKeyMissing(false)
+      setCheckError(null)
+      setSentEmail(email)
+      setTypedEmail('')
+      void check(true)
+    } catch (e) {
+      if (!mountedRef.current) return
+      setConnectError(errorText(e))
+    } finally {
+      if (mountedRef.current) setConnecting(false)
     }
   }
 
@@ -244,7 +289,6 @@ export default function EmailVerifyWait({
 
   const seq = runner.state
   const slug = status?.enrollment?.makerSlug ?? null
-  const email = contactEmail?.trim() || status?.contactEmail?.trim() || null
   // A finished run that did not go live counts as no run at all: the screen
   // goes back to Textile's answer with its real copy and its own buttons,
   // instead of freezing on "Confirmed. Starting the bot" with no controls.
@@ -269,7 +313,7 @@ export default function EmailVerifyWait({
               : 'unconfirmed'
 
   const title = {
-    unconfirmed: wait.title,
+    unconfirmed: keyMissing ? wait.connectTitle : wait.title,
     flagged: wait.flaggedTitle,
     'confirmed-not-quotable': wait.notQuotableTitle,
     'restart-needed': wait.restartTitle,
@@ -307,51 +351,105 @@ export default function EmailVerifyWait({
   return (
     <Card title={title}>
       <div className="space-y-4">
-        {view === 'unconfirmed' && (
+        {view === 'unconfirmed' && !probed && (
+          <p className="flex items-center gap-2 text-sm text-muted">
+            <Spinner /> {wait.statusFirst}
+          </p>
+        )}
+        {view === 'unconfirmed' && probed && keyMissing && (
           <>
-            <p className="text-sm text-muted">{email ? wait.body : wait.noAddressBody}</p>
-            {email && <Banner tone="info">{wait.sentTo(email)}</Banner>}
-            {keyMissing && checkError && <Banner tone="danger">{checkError}</Banner>}
-            {resendNote && <Banner tone="info">{resendNote}</Banner>}
-            {/* No address on file, so there is nothing to resend and nothing to
-                wait for. Ask for one here: this screen is one of the wizard's
-                two endings and AddCorridorFlow mounts it with no Back. */}
-            {!keyMissing && !email && (
-              <Field label={wait.addressLabel} hint={wait.addressHint}>
+            {/* Not registered with Textile yet. The old Connect step, here:
+                the email is only needed for this, so this is where it is
+                asked. One button registers the bot and sends the link; the
+                polling below takes over from there. */}
+            <p className="text-sm text-muted">{wait.connectBody}</p>
+            {connectError && <Banner tone="danger">{connectError}</Banner>}
+            <Field label={wait.addressLabel} hint={wait.addressHint}>
+              <Input
+                value={typedEmail}
+                autoFocus
+                inputMode="email"
+                placeholder="you@desk.com"
+                onChange={(e) => setTypedEmail(e.target.value)}
+              />
+            </Field>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                variant="primary"
+                busy={connecting}
+                disabled={!isEmail(typedEmail)}
+                onClick={() => void connect(typedEmail)}
+              >
+                {connectError ? wait.connectRetry : wait.connectButton}
+              </Button>
+            </div>
+          </>
+        )}
+        {view === 'unconfirmed' && probed && !keyMissing && (
+          <>
+            {/* With an address on file the banner below says it all; the
+                intro only repeated it. Without one the lead is still needed:
+                it explains why the field is there. */}
+            {!email && <p className="text-sm text-muted">{wait.noAddressBody}</p>}
+            {email && !changingEmail && <Banner tone="info">{wait.sentTo(email)}</Banner>}
+            {resendNote && !changingEmail && <Banner tone="info">{resendNote}</Banner>}
+            {/* The address field, in two cases: no address on file (an older
+                bot, or a first send that was refused), or the operator wants
+                a different one (a typo, the wrong inbox). Textile takes the
+                new address and sends a fresh link; the old one stops working.
+                This screen is one of the wizard's two endings and
+                AddCorridorFlow mounts it with no Back, so it has to be
+                fixable here. */}
+            {(!email || changingEmail) && (
+              <Field
+                label={changingEmail ? wait.newAddressLabel : wait.addressLabel}
+                hint={changingEmail ? wait.newAddressHint(email ?? '') : wait.addressHint}
+              >
                 <Input
                   value={typedEmail}
+                  autoFocus={changingEmail}
                   inputMode="email"
                   placeholder="you@desk.com"
                   onChange={(e) => setTypedEmail(e.target.value)}
                 />
               </Field>
             )}
-            {email && <p className="text-sm">{wait.keepOpen}</p>}
-            {statusLine && <p className="text-xs text-faint">{statusLine}</p>}
+            {email && !changingEmail && <p className="text-sm">{wait.keepOpen}</p>}
+            {statusLine && !changingEmail && <p className="text-xs text-faint">{statusLine}</p>}
             <div className="flex flex-wrap items-center gap-3">
-              {!keyMissing && !email && (
+              {(!email || changingEmail) && (
                 <Button
                   variant="primary"
                   busy={resending}
-                  disabled={!isEmail(typedEmail)}
+                  disabled={!isEmail(typedEmail) || typedEmail.trim() === email}
                   onClick={() => void sendLink(typedEmail)}
                 >
-                  {wait.sendLink}
+                  {changingEmail ? wait.sendToNew : wait.sendLink}
                 </Button>
               )}
-              {!keyMissing && (
+              {changingEmail && (
+                <Button
+                  onClick={() => {
+                    setChangingEmail(false)
+                    setTypedEmail('')
+                  }}
+                >
+                  {wait.keepAddress}
+                </Button>
+              )}
+              {!changingEmail && (
                 <Button busy={checking} onClick={checkNow}>
                   {wait.checkNow}
                 </Button>
               )}
-              {!keyMissing && email && (
+              {email && !changingEmail && (
                 <Button busy={resending} onClick={() => void sendLink(email)}>
                   {wait.resend}
                 </Button>
               )}
-              {keyMissing && onBack && (
-                <Button variant="primary" onClick={onBack}>
-                  {wait.backToConnect}
+              {email && !changingEmail && (
+                <Button variant="ghost" onClick={() => setChangingEmail(true)}>
+                  {wait.changeEmail}
                 </Button>
               )}
             </div>

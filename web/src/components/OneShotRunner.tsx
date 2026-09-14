@@ -1,17 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { appendLine } from '../logBuffer'
+import { appendLine, LEVEL_CLASS } from '../logBuffer'
 import { streamSse } from '../sse'
 import { Banner, Button } from './ui'
-import type { ExitEvent, LogLine, LogLevel } from '../types'
-
-const LEVEL_CLASS: Record<LogLevel, string> = {
-  error: 'text-danger',
-  warn: 'text-warning',
-  info: 'text-ink',
-  debug: 'text-muted',
-  trace: 'text-faint',
-  plain: 'text-muted',
-}
+import type { ExitEvent, LogLine } from '../types'
 
 /**
  * Runs `stitch approve` or a dry run in a throwaway container and streams the

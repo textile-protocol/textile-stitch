@@ -163,6 +163,8 @@ fn print_help() {
          COMMANDS:\n    \
          approve           Approve the config's input tokens to Permit2, then exit.\n                      \
          Required before going live; uses a max allowance unless --exact.\n    \
+         withdraw          Move tokens out of the bot's wallet, then exit. Takes\n                      \
+         --token <address|native> --amount <number|all> --to <address>.\n    \
          connect           Register this wallet with Textile and write the maker\n                      \
          credential, then exit. Required before an RFQ bot can quote.\n    \
          init              Interactively create stitch.toml/.env/.key, then exit.\n\n\
@@ -241,6 +243,12 @@ async fn main() -> anyhow::Result<()> {
             exact,
         } => run_approve(config, dry_run, exact).await,
         Command::Run { config, dry_run } => run(config, dry_run).await,
+        Command::Withdraw {
+            config,
+            token,
+            amount,
+            to,
+        } => run_withdraw(config, token, amount, to).await,
     }
 }
 
@@ -286,6 +294,33 @@ async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow:
     } else {
         info!(approvals_sent = sent, "approvals complete");
     }
+    Ok(())
+}
+
+/// `stitch withdraw`: move tokens out of the bot's wallet and exit. Signs with
+/// the config's signer, same as quoting does. The panel's Funds tab runs this
+/// as a one-shot; it also works from a shell. A vault bot's signer wallet is
+/// still a wallet (gas, dust, a mistaken transfer): this moves what *it*
+/// holds, never the vault's capital, which leaves by the vault's own redeem.
+async fn run_withdraw(
+    config_path: String,
+    token: String,
+    amount: String,
+    to: String,
+) -> anyhow::Result<()> {
+    let cfg = Config::from_toml(
+        &std::fs::read_to_string(&config_path)
+            .with_context(|| format!("reading config {config_path}"))?,
+    )?;
+    let signer = build_signer(&cfg).await?;
+    let wallet = Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id);
+    let plan =
+        stitch_bot::chain::withdraw::plan_withdraw(&cfg, &wallet, &token, &amount, &to).await?;
+    let hash = stitch_bot::chain::withdraw::send_withdraw(&wallet, &plan).await?;
+    println!(
+        "withdrew {} of {} to {} in tx {hash}",
+        plan.amount, plan.symbol, plan.to
+    );
     Ok(())
 }
 

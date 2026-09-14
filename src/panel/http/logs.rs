@@ -256,6 +256,58 @@ pub fn approve_blocked_by(bot: &Bot, fleet: &Fleet) -> Option<String> {
     )?)
 }
 
+/// Whether a withdraw would pull inventory from under a live quote.
+///
+/// Stricter than [`approve_check`]: an approval only needs the nonce to
+/// itself, but a withdraw changes what the wallet holds, and a maker-only bot
+/// (no taker, no closer, so it never broadcasts) is still issuing firm quotes
+/// against that balance. Draining it makes quotes already out there fail at
+/// fill time. So every live process on the wallet has to be down, whatever
+/// legs it runs: this bot, and any sibling quoting from the same key.
+pub fn withdraw_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
+    if is_live(bot) {
+        anyhow::bail!(
+            "{} is {} and quoting against this wallet; a withdraw under its quotes fails the \
+             fills it already committed to. Stop {} first.",
+            bot.name,
+            bot.state.as_str(),
+            bot.name
+        );
+    }
+    if let Some(other) = live_wallet_sibling(bot, fleet) {
+        anyhow::bail!(
+            "{} shares its operator wallet with {}, which is {} and quoting against it. Stop {} \
+             first.",
+            bot.name,
+            other.name,
+            other.state.as_str(),
+            other.name
+        );
+    }
+    Ok(())
+}
+
+/// The bot to stop before a withdraw can run, when there is one.
+pub fn withdraw_blocked_by(bot: &Bot, fleet: &Fleet) -> Option<String> {
+    if is_live(bot) {
+        return stoppable_name(bot);
+    }
+    stoppable_name(live_wallet_sibling(bot, fleet)?)
+}
+
+/// Any live process at all, whichever legs it runs.
+fn is_live(bot: &Bot) -> bool {
+    bot.container_name.is_some() && !bot.state.is_terminal()
+}
+
+/// Another live bot on this bot's wallet, transacting or not.
+fn live_wallet_sibling<'a>(bot: &Bot, fleet: &'a Fleet) -> Option<&'a Bot> {
+    let wallet = bot.wallet()?;
+    fleet.bots().iter().find(|other| {
+        other.name != bot.name && other.wallet().as_ref() == Some(&wallet) && is_live(other)
+    })
+}
+
 /// A Stop target the panel can actually aim at.
 ///
 /// Duplicate names collapse into one fleet row, and [`super::require_actionable`]
@@ -436,6 +488,60 @@ pub async fn approve(
     one_shot(state, &name, OneShot::Approve).await
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawBody {
+    /// An ERC-20 address the bot's corridors trade, or `native` for the gas coin.
+    pub token: String,
+    /// A plain decimal in the token's own units, or `all`.
+    pub amount: String,
+    /// Destination address.
+    pub to: String,
+}
+
+/// `stitch withdraw`: move tokens out of the bot's wallet, signed by the bot's
+/// own binary in a one-shot. Same wallet rules as an approval: the bot (and
+/// any sibling on the wallet) must be stopped, because a fill and a withdraw
+/// signing the same nonce loses one of them.
+///
+/// The shape checks here are the cheap ones that save a container launch on
+/// a typo; the binary re-validates everything against the config and chain.
+pub async fn withdraw(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    axum::Json(body): axum::Json<WithdrawBody>,
+) -> Result<Response, ApiError> {
+    let to = body.to.trim();
+    if to.parse::<alloy_primitives::Address>().is_err() {
+        return Err(ApiError::bad_request(format!(
+            "{to:?} is not an address. Paste the full 0x… address of the wallet to send to."
+        )));
+    }
+    let token = body.token.trim();
+    if !token.eq_ignore_ascii_case("native") && token.parse::<alloy_primitives::Address>().is_err()
+    {
+        return Err(ApiError::bad_request(
+            "token must be a token address the bot trades, or `native` for gas",
+        ));
+    }
+    let amount = body.amount.trim();
+    if amount.is_empty() {
+        return Err(ApiError::bad_request(
+            "amount is required: a number, or `all`",
+        ));
+    }
+    one_shot(
+        state,
+        &name,
+        OneShot::Withdraw {
+            token: token.to_string(),
+            amount: amount.to_string(),
+            to: to.to_string(),
+        },
+    )
+    .await
+}
+
 /// A dry run: validate the config and the corridor without posting orders.
 pub async fn dry_run(
     State(state): State<AppState>,
@@ -466,6 +572,7 @@ async fn reserve_approval(
     state: &AppState,
     name: &str,
     mut bot: Bot,
+    check: fn(&Bot, &Fleet) -> anyhow::Result<()>,
 ) -> Result<(Bot, Option<WalletClaim>), ApiError> {
     for _ in 0..2 {
         let Some(wallet) = bot.wallet() else {
@@ -476,9 +583,9 @@ async fn reserve_approval(
             .try_claim(wallet.clone())
             .ok_or_else(|| {
                 ApiError::conflict(format!(
-                "{}'s operator wallet is busy — an approval is running against it, or a bot on it \
-                 is being started. Wait for that to finish: two processes would read the same \
-                 pending nonce and one transaction would be dropped.",
+                "{}'s operator wallet is busy — an approval or a withdraw is running against it, \
+                 or a bot on it is being started. Wait for that to finish: two processes would \
+                 read the same pending nonce and one transaction would be dropped.",
                 bot.name
             ))
             })?;
@@ -491,7 +598,7 @@ async fn reserve_approval(
             bot = fresh;
             continue;
         }
-        approve_check(&fresh, &fleet).map_err(ApiError::conflict)?;
+        check(&fresh, &fleet).map_err(ApiError::conflict)?;
         return Ok((fresh, Some(claim)));
     }
     Err(ApiError::conflict(format!(
@@ -513,14 +620,17 @@ async fn one_shot(state: AppState, name: &str, which: OneShot) -> Result<Respons
     // the config lock from the claim until the container has started — `start_hold`
     // carries it to the Docker layer, which drops it the instant the container is up.
     // `bot` is rebound to the read the claim was taken against.
-    let (bot, claim, start_hold) = match which {
-        OneShot::DryRun => (bot, None, None),
-        OneShot::Approve => {
-            let (config_guard, bot) = super::bots::lock_config(name, &state).await?;
-            let (bot, claim) = reserve_approval(&state, name, bot).await?;
-            let start_hold = config_guard.map(|g| Arc::new(g) as crate::panel::docker::Keepalive);
-            (bot, claim, start_hold)
-        }
+    let (bot, claim, start_hold) = if which.broadcasts() {
+        let (config_guard, bot) = super::bots::lock_config(name, &state).await?;
+        let check = match which {
+            OneShot::Withdraw { .. } => withdraw_check,
+            OneShot::Approve | OneShot::DryRun => approve_check,
+        };
+        let (bot, claim) = reserve_approval(&state, name, bot, check).await?;
+        let start_hold = config_guard.map(|g| Arc::new(g) as crate::panel::docker::Keepalive);
+        (bot, claim, start_hold)
+    } else {
+        (bot, None, None)
     };
     let config = bot
         .config_panel_path
@@ -549,9 +659,10 @@ async fn one_shot(state: AppState, name: &str, which: OneShot) -> Result<Respons
         binds,
         name,
         &signer,
-        which,
+        &which,
     );
     tracing::info!(bot = %name, action = which.as_str(), "running one-shot");
+    let action = which.as_str();
 
     // The claim goes to the Docker layer as a keepalive, not into this closure. The
     // stream ends when the browser stops listening; the container keeps signing until
@@ -570,7 +681,7 @@ async fn one_shot(state: AppState, name: &str, which: OneShot) -> Result<Respons
                     &serde_json::json!({
                         "code": code,
                         "ok": code == 0,
-                        "action": which.as_str(),
+                        "action": action,
                     }),
                 ),
                 Err(e) => json_event("error", &serde_json::json!({ "message": format!("{e:#}") })),
@@ -783,6 +894,107 @@ mod tests {
         assert!(body.contains("event: exit"), "{body}");
         assert!(body.contains(r#""ok":true"#), "{body}");
         assert!(body.contains(r#""action":"approve""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn withdraw_runs_the_binary_with_the_operators_arguments() {
+        let h = harness("withdraw");
+        seed_in_state(&h, "bot-a", ContainerState::Exited);
+        h.docker
+            .set_log_lines(vec![out("withdrew 1000000 to 0xdead… in tx 0xabc")]);
+        h.docker.set_one_shot_exit(0);
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/withdraw",
+                serde_json::json!({
+                    "token": "native",
+                    "amount": "all",
+                    "to": "0x000000000000000000000000000000000000dEaD",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""action":"withdraw""#), "{body}");
+        assert!(body.contains(r#""ok":true"#), "{body}");
+        let shots = h.docker.one_shot_specs();
+        let spec = shots.last().expect("a one-shot ran");
+        assert!(
+            spec.name.starts_with("stitch-withdraw-bot-a-"),
+            "{}",
+            spec.name
+        );
+        let cmd = spec.cmd.clone().unwrap_or_default();
+        assert_eq!(&cmd[..2], &["stitch", "withdraw"]);
+        assert!(
+            cmd.windows(2).any(|w| w == ["--token", "native"]),
+            "{cmd:?}"
+        );
+        assert!(cmd.windows(2).any(|w| w == ["--amount", "all"]), "{cmd:?}");
+        assert!(
+            cmd.windows(2)
+                .any(|w| w == ["--to", "0x000000000000000000000000000000000000dEaD"]),
+            "{cmd:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_refuses_a_bad_address_before_launching_anything() {
+        let h = harness("withdraw-bad-to");
+        seed(&h, "bot-a");
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/withdraw",
+                serde_json::json!({ "token": "native", "amount": "1", "to": "not-an-address" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(h.docker.one_shot_specs().is_empty(), "nothing must run");
+    }
+
+    #[tokio::test]
+    async fn withdraw_is_refused_while_the_bot_is_live() {
+        // Same rule as approve: two signers on one wallet race the nonce, and
+        // the loser is either the withdraw or a fill the bot committed to.
+        let h = harness("withdraw-live");
+        seed_transacting(&h, "bot-a", ContainerState::Running);
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/withdraw",
+                serde_json::json!({
+                    "token": "native",
+                    "amount": "1",
+                    "to": "0x000000000000000000000000000000000000dEaD",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Stop bot-a first"), "{body}");
+        assert!(body.contains("quoting"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn withdraw_is_refused_while_a_maker_only_bot_or_sibling_quotes_the_wallet() {
+        // A maker-only bot never broadcasts, so an approval may run beside it,
+        // but its quotes are firm against the balance a withdraw would drain.
+        let h = harness("withdraw-maker");
+        seed(&h, "bot-a");
+        let body = serde_json::json!({
+            "token": "native",
+            "amount": "1",
+            "to": "0x000000000000000000000000000000000000dEaD",
+        });
+        let (status, text) = h.post_json("/api/bots/bot-a/withdraw", body.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        assert!(text.contains("Stop bot-a first"), "{text}");
+
+        // Same wallet, other bot: the stopped one may not drain what the
+        // running one quotes.
+        seed_in_state(&h, "bot-b", ContainerState::Exited);
+        let (status, text) = h.post_json("/api/bots/bot-b/withdraw", body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        assert!(text.contains("Stop bot-a first"), "{text}");
+        assert!(h.docker.one_shot_specs().is_empty(), "nothing must run");
     }
 
     #[tokio::test]

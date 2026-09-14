@@ -8,6 +8,7 @@
 import { SpreadField } from '../SettingsForm'
 import { BPS_LIMIT, SPREAD_BANDS, SpreadExample, parseBps } from '../SpreadExample'
 import type { Spread } from '../../types'
+import { useFeedMid } from './useFeedMid'
 
 export interface Spreads {
   buy: Spread
@@ -25,13 +26,20 @@ export function spreadsOk(s: Spreads): boolean {
 export default function SpreadFields({
   spreads,
   symbols,
+  feedUrl,
   onChange,
 }: {
   spreads: Spreads
   /** The pair's symbols, when they are known. Null for a custom corridor. */
   symbols: { base: string; quote: string } | null
+  /**
+   * The price feed the Sources step settled on, so the example can show the
+   * real mid. Null keeps the example on its round notional.
+   */
+  feedUrl: string | null
   onChange: (next: Spreads) => void
 }) {
+  const feed = useFeedMid(feedUrl)
   return (
     <>
       <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -91,6 +99,7 @@ export default function SpreadFields({
         sell={spreads.sell}
         base={symbols?.base ?? null}
         quote={symbols?.quote ?? null}
+        feed={feed}
       />
     </>
   )
