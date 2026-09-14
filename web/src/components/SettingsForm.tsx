@@ -167,8 +167,6 @@ export default function SettingsForm({
         />
       )}
 
-      <VaultCard bot={bot} address={loaded.vaultAddress} />
-
       <Card
         title="Spreads"
         action={
@@ -489,44 +487,6 @@ export function SpreadField({
  * default so the main form stays short; each feature group is its own
  * subsection so later experiments can drop in beside TWAP / lean.
  */
-/**
- * Where the bot's capital sits: its own wallet, or an OperatorVault Benoit
- * attaches to the bot's config. Read-only here on purpose: the vault is set
- * up outside the panel for now, and a switch that only half of the setup
- * honours would be a lie. Bot-wide, like the wallet it stands in for.
- */
-function VaultCard({ bot, address }: { bot: Bot; address: string }) {
-  const active = address.trim() !== ''
-  const explorer = bot.config?.vaultExplorerUrl ?? null
-  return (
-    <Card title="Vault">
-      <div className="flex flex-wrap items-center gap-3 text-sm">
-        <span
-          className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-bold ${
-            active ? 'bg-success-bg text-success' : 'bg-hover text-muted'
-          }`}
-        >
-          {active ? 'Active' : 'Not active'}
-        </span>
-        {active ? (
-          <>
-            <span className="font-mono" title={address}>
-              {shortAddress(address)}
-            </span>
-            {explorer && (
-              <a className="text-xs text-accent underline" href={explorer} target="_blank" rel="noreferrer">
-                View on explorer
-              </a>
-            )}
-          </>
-        ) : (
-          <span className="text-muted">This bot trades from its own wallet.</span>
-        )}
-      </div>
-    </Card>
-  )
-}
-
 function ExperimentalCard({
   draft,
   editable,
