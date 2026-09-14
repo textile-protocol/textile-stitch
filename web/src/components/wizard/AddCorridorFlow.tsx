@@ -29,7 +29,7 @@ import { formatClock } from '../../format'
 import { pairSymbols } from '../SpreadExample'
 import { Banner, Button, Card, Spinner } from '../ui'
 import EmailVerifyWait from './EmailVerifyWait'
-import { AddressBlock, GasRow, TokenRow } from './FundingRows'
+import { AddressBlock, GasRow, TokenRow, VaultAddress } from './FundingRows'
 import ProgressList, { type ProgressRow } from './ProgressList'
 import { pairFunded, templatePair, templateSpreads } from './candidates'
 import { type FundOutcome } from './FundStep'
@@ -423,6 +423,11 @@ export default function AddCorridorFlow({
   const failure = seq.failure
   const gasSymbol = funding?.gas.symbol ?? 'gas'
   const address = funding?.operatorAddress ?? null
+  // The token rows and the gate below are the vault's balance on a vault
+  // maker. The address block stays the signing key, because that is what pays
+  // for transactions and the only address here anyone should send to — but
+  // then it can no longer be introduced as where the corridor's money goes.
+  const vaulted = funding?.capitalSource === 'vault'
 
   const rows: ProgressRow[] = [
     {
@@ -483,7 +488,11 @@ export default function AddCorridorFlow({
       (s): s is string => !!s,
     )
     if (softRow?.funded !== true && stableRow?.funded !== true && symbolsHere.length > 0) {
-      needs.push(fund.needsSide(funding.gate.minTokenUsd, symbolsHere))
+      needs.push(
+        vaulted
+          ? fund.needsSideVault(funding.gate.minTokenUsd, symbolsHere)
+          : fund.needsSide(funding.gate.minTokenUsd, symbolsHere),
+      )
     }
     if (funding.gas.ok === false) {
       needs.push(fund.needsGas(funding.gate.minGasUsd, funding.gas.symbol))
@@ -575,6 +584,12 @@ export default function AddCorridorFlow({
             here and starts on its own the moment money lands. */}
         {waitingForMoney && funding && address && (
           <AddressBlock funding={funding} address={address} />
+        )}
+
+        {waitingForMoney && funding && vaulted && (
+          <p className="text-sm text-muted">
+            {fund.vaultCapital(funding.gas.symbol)} <VaultAddress funding={funding} />
+          </p>
         )}
 
         {waitingForMoney && funding && (

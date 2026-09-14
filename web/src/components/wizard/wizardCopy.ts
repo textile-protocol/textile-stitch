@@ -87,6 +87,16 @@ export const fund = {
     `Ready when the wallet holds ${dollars(minGas)} of ${gas} for gas.`,
   needsSide: (min: number, symbols: string[]) =>
     `Add at least ${dollars(min)} of ${joinOr(symbols)} to the bot wallet.`,
+  /**
+   * The same gate for a vault maker, as a condition rather than an errand: its
+   * corridor tokens arrive through the vault's own deposits, and a transfer to
+   * the vault address buys no shares, so nobody is told to send anything.
+   */
+  needsSideVault: (min: number, symbols: string[]) =>
+    `The vault needs at least ${dollars(min)} of ${joinOr(symbols)} before this corridor can quote.`,
+  /** Why the address above is only half the story on a vault maker. */
+  vaultCapital: (gas: string) =>
+    `This bot quotes from an OperatorVault, so its corridor tokens come from the vault, not from the address above. Send that address ${gas} for gas only.`,
   needsGas: (minGas: number, gas: string) => `Add at least ${dollars(minGas)} of ${gas} for gas.`,
   cantRead: "Can't read the bot wallet on chain right now.",
   gasUnpriced: "Can't price gas on this chain, so any non-zero balance counts.",

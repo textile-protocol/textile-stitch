@@ -63,6 +63,10 @@ use crate::panel::inventory::Bot;
 use crate::panel::native_price::{gas_symbol, gas_token, http_origin, GasToken, PriceSource};
 use crate::pricing::feed::{HttpFeed, PriceFeed};
 use crate::pricing::tick::is_price_usable;
+use crate::protocol::vault::{
+    address_from_word, encode_corridor_asset, encode_liquid_settlement, encode_quotable_corridor,
+    encode_quotable_settlement, encode_settlement_asset, quotable_settlement_for_route,
+};
 use crate::setup;
 
 /// A side counts as funded when its balance is worth at least this many dollars.
@@ -137,7 +141,9 @@ pub struct FundingTokenBody {
     /// Lowercase `0x…` address.
     pub token: String,
     pub decimals: u8,
-    /// Wallet balance in atomic units, decimal. `null` when the read failed.
+    /// Balance in atomic units, decimal. `null` when the read failed. On a
+    /// vault maker this is what the vault can quote, not what its address
+    /// holds — see [`read_inventory`].
     pub balance: Option<String>,
     /// The same balance in whole tokens, e.g. `"25"` or `"0.5"`.
     pub balance_text: Option<String>,
@@ -223,6 +229,14 @@ pub struct FundingBody {
     /// The wallet to fund. `null` when the panel has no key or `[signer]`
     /// address to derive it from; `readError` then says so.
     pub operator_address: Option<String>,
+    /// The address the token rows were read at: the OperatorVault when
+    /// `[vault]` is set, else the operator wallet.
+    pub capital_address: Option<String>,
+    /// Which of the two `capital_address` is: `"vault"` or `"wallet"`.
+    pub capital_source: &'static str,
+    /// Explorer page for `capital_address`, when the chain has one. Always
+    /// real for a vault: it is a contract on this chain.
+    pub capital_explorer_url: Option<String>,
     pub chain_id: u64,
     /// `Celo`, `BNB Smart Chain`… from the pool's corridor identity. `null`
     /// for a custom pool.
@@ -230,7 +244,16 @@ pub struct FundingBody {
     /// The wallet on the chain's explorer, when the chain has one.
     pub explorer_url: Option<String>,
     pub permit2: String,
+    /// What the bot quotes against — the vault's balances when there is one.
     pub tokens: Vec<FundingTokenBody>,
+    /// What the signer wallet itself holds, when the capital is somewhere
+    /// else. `null` without a vault, where `tokens` is already the wallet.
+    ///
+    /// Gas, dust, a mistaken transfer: the balances that die with the key, so
+    /// this is what the remove gate weighs and what a withdraw can move.
+    /// Never priced differently from `tokens` — same plans, same feeds, other
+    /// address — and never carries approvals: a vault maker has none.
+    pub wallet_tokens: Option<Vec<FundingTokenBody>>,
     pub gas: FundingGasBody,
     pub gate: FundingGateBody,
     /// The first chain error, if any. Set once for the whole request: every
@@ -342,134 +365,137 @@ pub async fn funding(
     Ok(Json(read_funding(&state, &bot).await?).into_response())
 }
 
-/// One read of everything the wallet holds. Shared with the remove route,
-/// which asks the same question before it deletes the key.
+/// One read of everything the bot's money sits in. Shared with the remove
+/// route, which asks the same question before it deletes the key.
+///
+/// Two addresses when `[vault]` is set, not one. The token rows report the
+/// OperatorVault — through its own inventory views, not `balanceOf`, see
+/// [`read_inventory`] — because that is the balance the bot's quotes draw on;
+/// the operator key only signs for it. Gas stays on the signer wallet, which
+/// is what pays for the transactions. And the signer wallet's own token
+/// balances are read as well, into `walletTokens`: removing a bot deletes that
+/// key, and what the key can reach is what the remove gate has to weigh.
+///
+/// Which is why the read failures are kept apart by the address they came
+/// from. A vault view that timed out must not refuse a delete: the vault
+/// outlives the key, so the gate only cares whether the wallet's own balances
+/// were read.
 pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, ApiError> {
     let path = config_path(bot)?;
     let toml = std::fs::read_to_string(&path).map_err(|e| {
         ApiError::internal(&anyhow::anyhow!(e).context(format!("reading {}", path.display())))
     })?;
     let cfg = Config::from_toml(&toml).map_err(ApiError::bad_request)?;
-    let plans = plan_tokens(&cfg)?;
 
     let operator_address = bot.config.as_ref().and_then(|c| c.operator_address.clone());
-    let owner = operator_address
-        .as_deref()
-        .and_then(|a| a.parse::<Address>().ok());
+    let vault_address = bot.config.as_ref().and_then(|c| c.vault_address.clone());
+    let plans = plan_tokens(&cfg, vault_address.is_some())?;
+
+    let parse = |a: &Option<String>| a.as_deref().and_then(|a| a.parse::<Address>().ok());
+    let wallet = parse(&operator_address);
+    let vault = parse(&vault_address);
+    // Where the money the bot quotes against sits.
+    let capital = vault.or(wallet);
+    // The second read, and only when there is a second address to read.
+    let dust_owner = vault.and(wallet);
     let permit2 = cfg.permit2.parse::<Address>();
 
-    let mut read_error: Option<String> = None;
-    if owner.is_none() {
-        read_error = Some(
+    // Kept apart by address: `capital_errors` are the vault's (or, with no
+    // vault, the wallet's own, which is the same address), `wallet_errors` are
+    // the signing key's. Only the second kind can block a removal.
+    let mut capital_errors: Vec<String> = Vec::new();
+    let mut wallet_errors: Vec<String> = Vec::new();
+    if capital.is_none() {
+        capital_errors.push(
             "this bot has no operator address the panel can read, so balances can't be checked."
                 .to_string(),
         );
-    } else if let Err(e) = &permit2 {
-        read_error = Some(format!("the config's permit2 address is not valid: {e}"));
+    } else if vault.is_none() {
+        // Only where an allowance is actually read: a vault maker asks the
+        // chain for none, so a bad permit2 address costs it nothing.
+        if let Err(e) = &permit2 {
+            capital_errors.push(format!("the config's permit2 address is not valid: {e}"));
+        }
     }
+    // A vault holds its own Permit2 approvals — granted in its constructor —
+    // and the operator key only signs, so there is no allowance to read.
+    let permit2_owner = match vault {
+        Some(_) => None,
+        None => permit2.as_ref().ok().copied(),
+    };
 
     // Chain reads and price lookups side by side: neither waits for the other,
     // and each is bounded on its own, so a dead node and a dead feed together
     // still cost about six seconds, not their sum.
     let api_origin = http_origin(&cfg.indexer_url);
-    let (chain, feed_prices, native) = tokio::join!(
-        read_chain(&cfg.rpc_url, owner, permit2.as_ref().ok().copied(), &plans),
+    let executor_routed = cfg
+        .vault
+        .as_ref()
+        .and_then(|v| v.order_executor.as_deref())
+        .is_some();
+    let (reads, inventory, dust, native_balance, feed_prices, native) = tokio::join!(
+        read_tokens(&cfg.rpc_url, capital, permit2_owner, &plans),
+        read_inventory(&cfg.rpc_url, vault, executor_routed),
+        read_balances(&cfg.rpc_url, dust_owner, &plans),
+        read_native(&cfg.rpc_url, wallet),
         fetch_feed_prices(&plans),
         tokio::time::timeout(
             PRICE_BUDGET,
             state.native_prices.get(cfg.chain_id, api_origin.as_deref()),
         ),
     );
-    let (reads, native_balance) = chain.unwrap_or((Vec::new(), None));
     let native = native.ok().flatten();
+    if let Some(Err(e)) = &inventory {
+        capital_errors.push(format!("{e:#}"));
+    }
+    let quotable = inventory.as_ref().and_then(|r| r.as_ref().ok());
+
+    // One price per plan, shared by both sets of rows: the same token at two
+    // addresses is worth the same, and a screen showing both must not imply
+    // otherwise.
+    let prices: Vec<PlanPrice> = plans.iter().map(|p| price_of(p, &feed_prices)).collect();
 
     let tokens: Vec<FundingTokenBody> = plans
         .iter()
         .enumerate()
         .map(|(i, plan)| {
             let read = reads.get(i);
-            let balance = match read.map(|r| &r.balance) {
-                Some(Ok(v)) => Some(*v),
-                Some(Err(e)) => {
-                    read_error.get_or_insert(format!("{e:#}"));
-                    None
-                }
-                None => None,
+            // The vault's own figure when it named this token. A token the
+            // vault does not name is not one it can quote at all, so its raw
+            // balance there is all there is to say about it; and when the
+            // views themselves failed, nothing is.
+            let balance = match (quotable.and_then(|q| q.get(&plan.key).copied()), &inventory) {
+                (Some(q), _) => Some(q),
+                (None, Some(Err(_))) => None,
+                (None, _) => value_of(read.map(|r| &r.balance), &mut capital_errors),
             };
-            let allowance = match read.and_then(|r| r.allowance.as_ref()) {
-                Some(Ok(v)) => Some(*v),
-                Some(Err(e)) => {
-                    read_error.get_or_insert(format!("{e:#}"));
-                    None
-                }
-                None => None,
-            };
-            // A pool that doesn't quote against a dollar can't be valued in
-            // dollars on either side: the feed reads debt per collateral, so
-            // it is only a dollar price when the debt token is a dollar.
-            let (price, price_source, price_error) = if !plan.priced_in_usd {
-                (None, None, Some(NOT_A_DOLLAR_PAIR.to_string()))
-            } else {
-                match plan.role {
-                    "stable" => (Some(1.0), Some("fixed"), None),
-                    _ => match plan
-                        .feed_url
-                        .as_deref()
-                        .and_then(|url| feed_prices.get(url))
-                    {
-                        Some(Ok(p)) => (Some(*p), Some("feed"), None),
-                        Some(Err(e)) => (None, None, Some(e.clone())),
-                        None => (None, None, Some("this pool has no price feed".to_string())),
-                    },
-                }
-            };
-            let usd = match (balance, price) {
-                (Some(b), Some(p)) => Some(units(b, plan.decimals) * p),
-                _ => None,
-            };
-            FundingTokenBody {
-                role: plan.role,
-                symbol: plan
-                    .ticker
-                    .clone()
-                    .or_else(|| read.and_then(|r| r.symbol.clone()))
-                    .unwrap_or_else(|| short_token(&plan.key)),
-                token: plan.key.clone(),
-                decimals: plan.decimals,
-                balance: balance.map(|b| b.to_string()),
-                balance_text: balance.map(|b| format_units(b, plan.decimals)),
-                price,
-                price_source,
-                price_error,
-                unpriceable: !plan.priced_in_usd,
-                usd,
-                funded: usd.map(|u| u >= FUND_MIN_TOKEN_USD),
-                approval_needed: plan.approval_needed,
-                permit2_allowance: allowance.map(|a| a.to_string()),
-                approved: if plan.approval_needed {
-                    allowance.map(|a| {
-                        approval_action(
-                            a,
-                            plan.required,
-                            plan.uses_max_liquidity,
-                            ApprovalMode::Max,
-                        ) == ApprovalAction::AlreadyApproved
-                    })
-                } else {
-                    None
-                },
-            }
+            row_of(
+                plan,
+                read.and_then(|r| r.symbol.clone()),
+                balance,
+                value_of(read.and_then(|r| r.allowance.as_ref()), &mut capital_errors),
+                &prices[i],
+            )
         })
         .collect();
 
-    let gas_balance = match native_balance {
-        Some(Ok(v)) => Some(v),
-        Some(Err(e)) => {
-            read_error.get_or_insert(format!("{e:#}"));
-            None
-        }
-        None => None,
-    };
+    let wallet_tokens = vault.map(|_| {
+        plans
+            .iter()
+            .enumerate()
+            .map(|(i, plan)| {
+                row_of(
+                    plan,
+                    tokens.get(i).map(|t| t.symbol.clone()),
+                    value_of(dust.get(i), &mut wallet_errors),
+                    None,
+                    &prices[i],
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let gas_balance = value_of(native_balance.as_ref(), &mut wallet_errors);
     let gas_usd = match (gas_balance, native) {
         (Some(b), Some(p)) => Some(units(b, 18) * p.usd),
         _ => None,
@@ -501,23 +527,45 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
         .iter()
         .find_map(|pool| setup::pool_identity(cfg.chain_id, pool))
         .map(|c| c.network_label);
-    let explorer_url = operator_address
-        .as_deref()
-        .and_then(|a| setup::address_explorer_url(cfg.chain_id, a));
+    let explorer = |address: &Option<String>| {
+        address
+            .as_deref()
+            .and_then(|a| setup::address_explorer_url(cfg.chain_id, a))
+    };
+    let capital_address = vault_address.clone().or_else(|| operator_address.clone());
 
+    // Every read is in; the first failure speaks for the request.
+    let read_error = capital_errors
+        .iter()
+        .chain(wallet_errors.iter())
+        .next()
+        .cloned();
+    // What the key can reach. The vault outlives the key — its money is not
+    // lost with the bot — so with a vault only the signer wallet's own
+    // balances, and only the failures reading them, stand in the way of
+    // removing it. With no vault the capital is that wallet, so both count.
+    let own_tokens = wallet_tokens.as_deref().unwrap_or(&tokens);
+    let key_error = match vault {
+        Some(_) => wallet_errors.first(),
+        None => capital_errors.first().or_else(|| wallet_errors.first()),
+    };
     let remove_blocked_by = remove_refusal(
         operator_address.as_deref(),
-        &tokens,
+        own_tokens,
         &gas,
-        read_error.as_deref(),
+        key_error.map(String::as_str),
     );
     Ok(FundingBody {
+        capital_explorer_url: explorer(&capital_address),
+        capital_source: if vault.is_some() { "vault" } else { "wallet" },
+        capital_address,
+        explorer_url: explorer(&operator_address),
         operator_address,
         chain_id: cfg.chain_id,
         network_label,
-        explorer_url,
         permit2: cfg.permit2.clone(),
         tokens,
+        wallet_tokens,
         gas,
         gate,
         read_error,
@@ -526,10 +574,114 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
     })
 }
 
+/// A read's value, keeping its failure for `readError` instead of dropping it.
+fn value_of<T: Copy>(read: Option<&anyhow::Result<T>>, errors: &mut Vec<String>) -> Option<T> {
+    match read {
+        Some(Ok(v)) => Some(*v),
+        Some(Err(e)) => {
+            errors.push(format!("{e:#}"));
+            None
+        }
+        None => None,
+    }
+}
+
+/// What a token is worth in dollars, and why it isn't when it isn't.
+struct PlanPrice {
+    price: Option<f64>,
+    source: Option<&'static str>,
+    error: Option<String>,
+}
+
+/// Price one plan off the feeds already fetched.
+///
+/// A pool that doesn't quote against a dollar can't be valued in dollars on
+/// either side: the feed reads debt per collateral, so it is only a dollar
+/// price when the debt token is a dollar.
+fn price_of(plan: &TokenPlan, feed_prices: &HashMap<String, Result<f64, String>>) -> PlanPrice {
+    let unpriced = |why: String| PlanPrice {
+        price: None,
+        source: None,
+        error: Some(why),
+    };
+    if !plan.priced_in_usd {
+        return unpriced(NOT_A_DOLLAR_PAIR.to_string());
+    }
+    if plan.role == "stable" {
+        return PlanPrice {
+            price: Some(1.0),
+            source: Some("fixed"),
+            error: None,
+        };
+    }
+    match plan
+        .feed_url
+        .as_deref()
+        .and_then(|url| feed_prices.get(url))
+    {
+        Some(Ok(p)) => PlanPrice {
+            price: Some(*p),
+            source: Some("feed"),
+            error: None,
+        },
+        Some(Err(e)) => unpriced(e.clone()),
+        None => unpriced("this pool has no price feed".to_string()),
+    }
+}
+
+/// One token row: what this address holds of it, and what that is worth.
+fn row_of(
+    plan: &TokenPlan,
+    symbol: Option<String>,
+    balance: Option<U256>,
+    allowance: Option<U256>,
+    price: &PlanPrice,
+) -> FundingTokenBody {
+    let usd = match (balance, price.price) {
+        (Some(b), Some(p)) => Some(units(b, plan.decimals) * p),
+        _ => None,
+    };
+    FundingTokenBody {
+        role: plan.role,
+        symbol: plan
+            .ticker
+            .clone()
+            .or(symbol)
+            .unwrap_or_else(|| short_token(&plan.key)),
+        token: plan.key.clone(),
+        decimals: plan.decimals,
+        balance: balance.map(|b| b.to_string()),
+        balance_text: balance.map(|b| format_units(b, plan.decimals)),
+        price: price.price,
+        price_source: price.source,
+        price_error: price.error.clone(),
+        unpriceable: !plan.priced_in_usd,
+        usd,
+        funded: usd.map(|u| u >= FUND_MIN_TOKEN_USD),
+        approval_needed: plan.approval_needed,
+        permit2_allowance: allowance.map(|a| a.to_string()),
+        approved: if plan.approval_needed {
+            allowance.map(|a| {
+                approval_action(a, plan.required, plan.uses_max_liquidity, ApprovalMode::Max)
+                    == ApprovalAction::AlreadyApproved
+            })
+        } else {
+            None
+        },
+    }
+}
+
 /// Every distinct token across the pools, stable side first per pool, with
 /// what the approval preflight commits to it.
-fn plan_tokens(cfg: &Config) -> Result<Vec<TokenPlan>, ApiError> {
-    let required = required_approvals(cfg).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+///
+/// A vault maker commits nothing: the vault granted Permit2 on both legs in
+/// its constructor and the operator key only signs, so every row comes back
+/// with `approvalNeeded` false and the panel asks the chain for no allowances.
+fn plan_tokens(cfg: &Config, vaulted: bool) -> Result<Vec<TokenPlan>, ApiError> {
+    let required = match vaulted {
+        true => Vec::new(),
+        false => required_approvals(cfg).map_err(|e| ApiError::bad_request(format!("{e:#}")))?,
+    };
     let tickers = token_symbols(cfg);
     let mut plans: Vec<TokenPlan> = Vec::new();
     for pool in &cfg.pools {
@@ -582,22 +734,24 @@ fn parse_token(raw: &str, role: &str) -> Result<Address, ApiError> {
     })
 }
 
-/// Every chain read at once, each under its own budget.
+/// Every token read at once, each under its own budget.
 ///
-/// `None` when there is no owner to read for. Every failure, the budget
+/// An empty vec when there is no owner to read for. Every failure, the budget
 /// included, stays inside its own read: one slow `eth_call` degrades that row
 /// to "unknown" and the rows that answered still show their balances. The
 /// public nodes these configs point at rate-limit one call at a time, so a
 /// batch-wide timeout used to blank a fully funded wallet.
-async fn read_chain(
+async fn read_tokens(
     rpc_url: &str,
     owner: Option<Address>,
     permit2: Option<Address>,
     plans: &[TokenPlan],
-) -> Option<(Vec<TokenRead>, Option<anyhow::Result<U256>>)> {
-    let owner = owner?;
+) -> Vec<TokenRead> {
+    let Some(owner) = owner else {
+        return Vec::new();
+    };
     let rpc = Rpc::new(rpc_url.to_string());
-    let token_reads = futures_util::future::join_all(plans.iter().map(|plan| {
+    futures_util::future::join_all(plans.iter().map(|plan| {
         let rpc = rpc.clone();
         async move {
             let balance = budgeted(rpc_url, read_balance(&rpc, plan.address, owner));
@@ -624,10 +778,114 @@ async fn read_chain(
                 symbol,
             }
         }
-    }));
-    let native = budgeted(rpc_url, rpc.get_balance(owner));
-    let (reads, native) = tokio::join!(token_reads, native);
-    Some((reads, Some(native)))
+    }))
+    .await
+}
+
+/// The same tokens at a second address: balances only. What the signer wallet
+/// still holds of its own when the trading capital sits in a vault — there are
+/// no allowances to ask about there, and the symbols are already known.
+async fn read_balances(
+    rpc_url: &str,
+    owner: Option<Address>,
+    plans: &[TokenPlan],
+) -> Vec<anyhow::Result<U256>> {
+    let Some(owner) = owner else {
+        return Vec::new();
+    };
+    let rpc = Rpc::new(rpc_url.to_string());
+    futures_util::future::join_all(
+        plans
+            .iter()
+            .map(|plan| budgeted(rpc_url, read_balance(&rpc, plan.address, owner))),
+    )
+    .await
+}
+
+/// What the vault will actually quote, by lowercase token address.
+///
+/// Not `balanceOf`. `allocateIdle` parks settlement above the liquid floor in
+/// the yield adapter, so a working vault's raw balance reads low — one holding
+/// 2 USDT with 1.99 in Aave shows 0.01 — and it reads high the other way,
+/// counting deposits queued for the next epoch and redemptions already
+/// reserved, neither of which the vault may trade. These are the same views
+/// the bot sizes its quotes from (`read_vault_inventory` in `src/rfq`), so the
+/// panel's answer to "what does this corridor have to work with" is the bot's.
+///
+/// Whether the yield position counts depends on the route: with a
+/// `[vault].order_executor` listed, a fill recalls from the adapter before the
+/// Permit2 pull, so the whole position is quotable; without one only the idle
+/// part is. Same rule as the bot's, from the same function.
+///
+/// `None` when there is no vault. An error when the views don't answer — a
+/// quiet fall back to `balanceOf` would be the wrong number with nothing
+/// saying so.
+async fn read_inventory(
+    rpc_url: &str,
+    vault: Option<Address>,
+    executor_routed: bool,
+) -> Option<anyhow::Result<HashMap<String, U256>>> {
+    let vault = vault?;
+    let rpc = Rpc::new(rpc_url.to_string());
+    let word = |data: Vec<u8>, what: &'static str| {
+        let rpc = rpc.clone();
+        async move { budgeted(rpc_url, read_word(&rpc, vault, data, what)).await }
+    };
+    let (settlement, corridor, quotable, liquid, corridor_qty) = tokio::join!(
+        word(encode_settlement_asset(), "settlementAsset()"),
+        word(encode_corridor_asset(), "corridorAsset()"),
+        word(encode_quotable_settlement(), "quotableSettlement()"),
+        word(encode_liquid_settlement(), "liquidSettlement()"),
+        word(encode_quotable_corridor(), "quotableCorridor()"),
+    );
+    Some(vault_inventory(
+        vault,
+        [settlement, corridor, quotable, liquid, corridor_qty],
+        executor_routed,
+    ))
+}
+
+/// The map from the five reads, or the first of them that failed.
+fn vault_inventory(
+    vault: Address,
+    reads: [anyhow::Result<U256>; 5],
+    executor_routed: bool,
+) -> anyhow::Result<HashMap<String, U256>> {
+    let [settlement, corridor, quotable, liquid, corridor_qty] = reads;
+    let settlement = address_from_word(settlement?);
+    let corridor = address_from_word(corridor?);
+    anyhow::ensure!(
+        !settlement.is_zero() && !corridor.is_zero(),
+        "the vault at {vault} names no settlement or corridor asset — is that address an \
+         OperatorVault on this chain?"
+    );
+    Ok(HashMap::from([
+        (
+            format!("{settlement:#x}"),
+            quotable_settlement_for_route(quotable?, liquid?, executor_routed),
+        ),
+        (format!("{corridor:#x}"), corridor_qty?),
+    ]))
+}
+
+/// One no-argument view returning a single word. `what` names the call, so a
+/// failure says which view rather than just which address.
+async fn read_word(rpc: &Rpc, to: Address, data: Vec<u8>, what: &str) -> anyhow::Result<U256> {
+    let out = rpc.eth_call(to, &Bytes::from(data)).await?;
+    anyhow::ensure!(
+        out.len() >= 32,
+        "{what} on {to} returned {} bytes, not a word",
+        out.len()
+    );
+    Ok(U256::from_be_slice(&out[out.len() - 32..]))
+}
+
+/// The gas coin, on the wallet that pays for the transactions. `None` when
+/// there is no signer address to read.
+async fn read_native(rpc_url: &str, owner: Option<Address>) -> Option<anyhow::Result<U256>> {
+    let owner = owner?;
+    let rpc = Rpc::new(rpc_url.to_string());
+    Some(budgeted(rpc_url, rpc.get_balance(owner)).await)
 }
 
 /// One chain read under the screen's budget. A read that runs out of time
@@ -905,6 +1163,43 @@ mod tests {
         add_container(h, name);
     }
 
+    /// A vault address the seeded bot's key is not: the OperatorVault holds
+    /// the trading capital, the key only signs for it.
+    const VAULT: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    const WALLET: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    /// The chain's VaultOrderExecutor. Listed on a bot's `[vault]`, it is what
+    /// makes the yield-adapter position quotable.
+    const EXECUTOR: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+
+    /// The same bot, with `[vault]` set. A top-level table header appended to
+    /// the config can't land inside another table, so this is a safe suffix.
+    fn attach_vault(h: &Harness, name: &str, vault: &str, executor: Option<&str>) {
+        let path = h.root.join(name).join("stitch.toml");
+        let toml = std::fs::read_to_string(&path).unwrap();
+        let executor = match executor {
+            Some(e) => format!("order_executor = \"{e}\"\n"),
+            None => String::new(),
+        };
+        std::fs::write(
+            &path,
+            format!("{toml}\n[vault]\naddress = \"{vault}\"\n{executor}"),
+        )
+        .unwrap();
+    }
+
+    /// A vault that names this corridor's pair and answers its inventory
+    /// views. `quotable` is the whole settlement position, `liquid` only the
+    /// idle part; the gap is what `allocateIdle` put in the yield adapter.
+    fn vault_views(chain: MockChain, quotable: u128, liquid: u128, corridor: u128) -> MockChain {
+        chain
+            .view_address(VAULT, "settlementAsset()", USDT)
+            .view_address(VAULT, "corridorAsset()", CNGN)
+            .view(VAULT, "quotableSettlement()", U256::from(quotable))
+            .view(VAULT, "liquidSettlement()", U256::from(liquid))
+            .view(VAULT, "quotableCorridor()", U256::from(corridor))
+    }
+
     fn add_container(h: &Harness, name: &str) {
         let mut c = crate::panel::docker::fake::container(
             &format!("stitch-{name}"),
@@ -1106,6 +1401,149 @@ mod tests {
         assert_eq!(v["gate"]["needsSide"], false);
         assert_eq!(v["gate"]["needsGas"], false);
         assert!(v["checkedAtUnix"].as_u64().unwrap() > 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_vault_maker_reports_the_vault_as_its_assets() {
+        // The money the bot quotes against is the vault's; the signer wallet
+        // holds a dollar of dust and the gas.
+        let h = harness("funding-vault");
+        let node = mock_rpc(vault_views(
+            MockChain::default()
+                .balance_of(USDT, VAULT, 25_000_000)
+                .balance_of(USDT, WALLET, 1_000_000)
+                .balance(CNGN, 0)
+                .native(20_000_000_000_000_000_000),
+            25_000_000,
+            25_000_000,
+            0,
+        ))
+        .await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        attach_vault(&h, "bot-a", VAULT, None);
+
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert!(v["readError"].is_null(), "{body}");
+
+        // The rows are the vault's, and they say so.
+        assert_eq!(v["capitalSource"], "vault");
+        // Normalised by the inventory, whatever casing the operator typed.
+        let vault = v["capitalAddress"].as_str().unwrap().to_string();
+        assert_eq!(vault, VAULT.to_lowercase());
+        assert_eq!(
+            v["capitalExplorerUrl"],
+            format!("https://celoscan.io/address/{vault}")
+        );
+        assert_eq!(token(&v, "USDT")["balanceText"], "25", "{body}");
+        assert_eq!(token(&v, "USDT")["usd"], 25.0);
+        assert_eq!(v["gate"]["fundedTokens"], json!(["USDT"]));
+
+        // The signer wallet's own money is reported apart from it, priced the
+        // same way, with no approvals attached.
+        let wallet = v["walletTokens"].as_array().unwrap();
+        let dust = wallet.iter().find(|t| t["symbol"] == "USDT").unwrap();
+        assert_eq!(dust["balanceText"], "1", "{body}");
+        assert_eq!(dust["usd"], 1.0);
+        assert!(dust["permit2Allowance"].is_null(), "{body}");
+
+        // A vault approved Permit2 in its constructor and the key signs only:
+        // nothing here is waiting on an approval.
+        assert_eq!(token(&v, "USDT")["approvalNeeded"], false);
+        assert_eq!(v["gate"]["approvalsMissing"], json!([]));
+        assert_eq!(v["gate"]["passes"], true, "{body}");
+
+        // Gas is still the signer wallet's — it pays for the transactions.
+        assert_eq!(v["gas"]["balanceText"], "20");
+        assert_eq!(v["gas"]["ok"], true);
+
+        // And the vault's $25 is not the key's to lose: the vault outlives it.
+        assert!(v["removeBlockedBy"].is_null(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_vault_makers_own_dust_still_blocks_removal() {
+        let h = harness("funding-vault-dust");
+        let node = mock_rpc(vault_views(
+            MockChain::default()
+                .balance_of(USDT, VAULT, 25_000_000)
+                .balance_of(USDT, WALLET, 40_000_000)
+                .balance(CNGN, 0)
+                .native(20_000_000_000_000_000_000),
+            25_000_000,
+            25_000_000,
+            0,
+        ))
+        .await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        attach_vault(&h, "bot-a", VAULT, None);
+
+        let (_, body) = h.get("/api/bots/bot-a/funding").await;
+        let v = Harness::parse(&body);
+        // $40 of USDT sat down on the signing key by mistake. Deleting the key
+        // loses it, vault or no vault.
+        let why = v["removeBlockedBy"].as_str().unwrap_or_default();
+        assert!(why.contains("$41.60"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_vault_maker_reports_what_it_can_quote_not_what_it_holds() {
+        // A working vault has most of its settlement in the yield adapter, so
+        // `balanceOf` reads almost empty. With an executor listed the whole
+        // position is fillable, and that is the number the bot quotes.
+        let h = harness("funding-vault-quotable");
+        let node = mock_rpc(vault_views(
+            MockChain::default()
+                .balance_of(USDT, VAULT, 1_000_000)
+                .balance(CNGN, 0)
+                .native(20_000_000_000_000_000_000),
+            30_000_000,
+            1_000_000,
+            0,
+        ))
+        .await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        attach_vault(&h, "bot-a", VAULT, Some(EXECUTOR));
+
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert!(v["readError"].is_null(), "{body}");
+        assert_eq!(token(&v, "USDT")["balanceText"], "30", "{body}");
+        assert_eq!(token(&v, "USDT")["usd"], 30.0);
+        assert_eq!(v["gate"]["fundedTokens"], json!(["USDT"]));
+    }
+
+    #[tokio::test]
+    async fn a_vault_read_that_fails_does_not_block_removing_the_key() {
+        // No views on this address, so the inventory read fails. The signer
+        // wallet answered, and it is the only thing removal can lose.
+        let h = harness("funding-vault-unreadable");
+        let node = mock_rpc(
+            MockChain::default()
+                .balance_of(USDT, WALLET, 1_000_000)
+                .balance(CNGN, 0)
+                .native(20_000_000_000_000_000_000),
+        )
+        .await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        attach_vault(&h, "bot-a", VAULT, None);
+
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        // The vault's rows are unknown, and the page says why.
+        assert!(token(&v, "USDT")["balance"].is_null(), "{body}");
+        let why = v["readError"].as_str().unwrap_or_default();
+        assert!(why.contains("settlementAsset()"), "{body}");
+        // But the key's own balances were read, so Remove is not held up by a
+        // vault nobody could reach.
+        assert!(v["removeBlockedBy"].is_null(), "{body}");
     }
 
     #[tokio::test]

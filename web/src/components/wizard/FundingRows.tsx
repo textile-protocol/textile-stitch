@@ -13,9 +13,45 @@ import type { Funding, FundingToken } from '../../types'
 
 /** Stable side first, so the order matches the pair's name (`cNGN / USDT`
  * reads soft-first, but the money an operator sends first is the dollar). */
-export function orderedTokens(f: Funding): FundingToken[] {
-  return [...f.tokens].sort((a, b) =>
+export function orderTokens(tokens: FundingToken[]): FundingToken[] {
+  return [...tokens].sort((a, b) =>
     a.role === b.role ? 0 : a.role === 'stable' ? -1 : 1,
+  )
+}
+
+/** The same order, for the rows the bot quotes against. */
+export function orderedTokens(f: Funding): FundingToken[] {
+  return orderTokens(f.tokens)
+}
+
+/**
+ * Where the vault is, in one line, linked when the chain has an explorer.
+ *
+ * Deliberately not an [`AddressBlock`]: nobody should be told to send tokens
+ * to a vault. It issues shares for deposits through its own epochs, and a
+ * plain transfer to it mints none — the money would be a donation to the LPs.
+ * So the vault is shown to be read, not to be pasted into a wallet.
+ */
+export function VaultAddress({ funding }: { funding: Funding }) {
+  const address = funding.capitalAddress
+  if (!address) return null
+  const host = hostOf(funding.capitalExplorerUrl)
+  return (
+    <span className="whitespace-nowrap">
+      <span className="font-mono text-xs text-ink" title={address}>
+        {shortAddress(address)}
+      </span>
+      {funding.capitalExplorerUrl && host && (
+        <a
+          className="ml-2 text-xs text-accent underline"
+          href={funding.capitalExplorerUrl}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {fund.viewOn(host)}
+        </a>
+      )}
+    </span>
   )
 }
 

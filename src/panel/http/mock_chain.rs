@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::U256;
+use alloy_primitives::{keccak256, Address, U256};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -23,10 +23,18 @@ pub struct MockChain {
     /// Native balance of every address (the mock doesn't look at the owner).
     pub native_wei: U256,
     pub balances: HashMap<String, U256>,
+    /// Balances for one holder, keyed by `(token, owner)`, both lowercase.
+    /// Falls back to `balances` for an owner with no row of its own, so a test
+    /// that doesn't care who holds what doesn't have to say.
+    pub owner_balances: HashMap<(String, String), U256>,
     pub allowances: HashMap<String, U256>,
     /// ERC-20 `symbol()` per token. A token not listed answers `0x` (no
     /// return data), which is what a non-contract address does.
     pub symbols: HashMap<String, String>,
+    /// One word per no-argument view, keyed by `(address, 4-byte selector)`.
+    /// The vault's inventory views live here; a view with no row answers `0x`,
+    /// which is what a contract that doesn't have it does.
+    pub views: HashMap<(String, String), U256>,
     /// Sleep this long before every answer — a hung node.
     pub delay: Option<Duration>,
 }
@@ -38,10 +46,33 @@ impl MockChain {
         self
     }
 
+    /// What one holder has of a token — for a bot whose capital is in a vault
+    /// and whose signer wallet holds something else entirely.
+    pub fn balance_of(mut self, token: &str, owner: &str, atomic: u128) -> Self {
+        self.owner_balances.insert(
+            (token.to_lowercase(), owner.to_lowercase()),
+            U256::from(atomic),
+        );
+        self
+    }
+
     pub fn symbol(mut self, token: &str, symbol: &str) -> Self {
         self.symbols
             .insert(token.to_lowercase(), symbol.to_string());
         self
+    }
+
+    /// A no-argument view answering one word: `view(vault, "quotableSettlement()", …)`.
+    pub fn view(mut self, to: &str, signature: &str, value: U256) -> Self {
+        let selector = alloy_primitives::hex::encode(&keccak256(signature.as_bytes())[..4]);
+        self.views.insert((to.to_lowercase(), selector), value);
+        self
+    }
+
+    /// The same, for a view that answers an address.
+    pub fn view_address(self, to: &str, signature: &str, address: &str) -> Self {
+        let address: Address = address.parse().expect("not an address");
+        self.view(to, signature, U256::from_be_slice(address.as_slice()))
     }
 
     pub fn native(mut self, wei: u128) -> Self {
@@ -104,9 +135,19 @@ fn answer(chain: &MockChain, req: &Value) -> Value {
             let to = tx["to"].as_str().unwrap_or("").to_lowercase();
             let data = tx["data"].as_str().unwrap_or("0x");
             let selector = data.get(2..10).unwrap_or("");
+            if let Some(word) = chain.views.get(&(to.clone(), selector.to_string())) {
+                return json!({ "jsonrpc": "2.0", "id": id, "result": uint_word(*word) });
+            }
             match selector {
                 // balanceOf(address)
-                "70a08231" => uint_word(chain.balances.get(&to).copied().unwrap_or(U256::ZERO)),
+                "70a08231" => {
+                    let owner = address_arg(data, 0);
+                    let held = owner
+                        .and_then(|o| chain.owner_balances.get(&(to.clone(), o)).copied())
+                        .or_else(|| chain.balances.get(&to).copied())
+                        .unwrap_or(U256::ZERO);
+                    uint_word(held)
+                }
                 // allowance(address,address)
                 "dd62ed3e" => uint_word(chain.allowances.get(&to).copied().unwrap_or(U256::ZERO)),
                 // symbol()
@@ -126,6 +167,13 @@ fn answer(chain: &MockChain, req: &Value) -> Value {
         }
     };
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+/// The `n`th argument of a call, read as an address: the low 20 bytes of the
+/// word, lowercase and `0x`-prefixed.
+fn address_arg(data: &str, n: usize) -> Option<String> {
+    let word = data.get(10 + n * 64..10 + (n + 1) * 64)?;
+    Some(format!("0x{}", word.get(24..)?.to_lowercase()))
 }
 
 fn uint_word(v: U256) -> Value {

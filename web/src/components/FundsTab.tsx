@@ -11,10 +11,15 @@
 // same rule (`canWithdraw` is its answer), so the form only shows it before
 // the click.
 //
-// A vault maker's trading capital sits in the OperatorVault and leaves by the
-// vault's own redeem flow; the form here moves only what the signer wallet
-// itself holds (gas, dust, a mistaken transfer), which is what the remove gate
-// asks to be cleared before the key goes.
+// A vault maker's assets are the vault's: the rows above are read there, which
+// is where the balance its quotes draw on actually is. Gas stays the signer
+// wallet's, because that is what pays for the transactions.
+//
+// The Withdraw form stays on a vault maker, titled and framed as the signing
+// key's: the vault's money is not reachable from here (it leaves by the vault's
+// own redeem flow), but the key's own gas and anything sent to it by mistake
+// are, and a withdraw is the only way to either. Hiding the card would make
+// them unreachable and Remove would delete the key with them.
 //
 // This is also where the wizard lands a freshly live bot.
 
@@ -23,11 +28,18 @@ import { api } from '../api'
 import { botLabel } from '../botRoutes'
 import { fundsFromVault } from '../capital'
 import { formatAmount, isAddress, shortAddress } from '../format'
+import { walletDust } from '../funding'
 import { LEVEL_CLASS, appendLine } from '../logBuffer'
 import { streamSse } from '../sse'
 import { Banner, Button, Card, Field, Input, Select } from './ui'
-import { GasRow, TokenRow, orderedTokens } from './wizard/FundingRows'
-import type { Bot, ExitEvent, Funding, LogLine } from '../types'
+import {
+  GasRow,
+  TokenRow,
+  VaultAddress,
+  orderTokens,
+  orderedTokens,
+} from './wizard/FundingRows'
+import type { Bot, ExitEvent, Funding, FundingToken, LogLine } from '../types'
 
 const NATIVE = 'native'
 
@@ -54,6 +66,10 @@ export default function FundsTab({
   onWithdrew: () => void
 }) {
   const address = funding?.operatorAddress ?? null
+  const vaulted = fundsFromVault(bot.config)
+  // What the signing key itself still holds. Empty on a clean vault maker,
+  // and the whole balance sheet on every other bot.
+  const dust = walletDust(funding)
 
   return (
     <div className="space-y-4">
@@ -68,29 +84,41 @@ export default function FundsTab({
               fund here.
             </Banner>
           )}
+          {funding && vaulted && (
+            <p className="text-sm text-muted">
+              This bot quotes from an OperatorVault, so these are the vault&rsquo;s
+              quotable balances, not the signing key&rsquo;s.{' '}
+              <VaultAddress funding={funding} />
+            </p>
+          )}
           {funding && (
             <ul className="divide-y divide-line-soft rounded-lg border border-line-soft">
               {orderedTokens(funding).map((t) => (
                 <TokenRow key={t.token} token={t} />
               ))}
-              <GasRow funding={funding} pill={false} />
+              {/* Without a vault this is the same wallet as the rows above, so
+                  the gas sits with them. With one it belongs to the signer
+                  wallet's own list, below. */}
+              {!vaulted && <GasRow funding={funding} pill={false} />}
             </ul>
           )}
+          {funding && vaulted && <SignerWallet funding={funding} dust={dust} />}
         </div>
       </Card>
 
-      <Card title="Withdraw">
-        {fundsFromVault(bot.config) && (
+      <Card title={vaulted ? 'Withdraw from the signer wallet' : 'Withdraw'}>
+        {vaulted && (
           <p className="mb-4 text-sm text-muted">
-            This bot trades from an OperatorVault. The balances above, and anything sent
-            from here, are the signer wallet's own gas and dust, not the trading capital.
-            The vault's money leaves by its redeem flow.
+            Only what the signing key holds: its gas, and anything sent to it by
+            mistake. The vault&rsquo;s money is not reachable from here — it leaves by
+            the vault&rsquo;s own redeem flow.
           </p>
         )}
         {funding ? (
           <WithdrawForm
             bot={bot}
             funding={funding}
+            tokens={vaulted ? (funding.walletTokens ?? []) : funding.tokens}
             busy={busy}
             onStop={onStop}
             onStart={onStart}
@@ -104,12 +132,40 @@ export default function FundsTab({
   )
 }
 
+/**
+ * The signing key's own balance sheet, under the vault's: the gas it pays
+ * transactions with, and anything that landed on it that shouldn't have. Kept
+ * separate because these are the balances that die with the key — the vault's
+ * do not.
+ */
+function SignerWallet({ funding, dust }: { funding: Funding; dust: FundingToken[] }) {
+  return (
+    <div>
+      <p className="mb-2 text-xs font-bold uppercase tracking-wide text-faint">
+        Signer wallet
+      </p>
+      <ul className="divide-y divide-line-soft rounded-lg border border-line-soft">
+        {orderTokens(dust).map((t) => (
+          <TokenRow key={t.token} token={t} />
+        ))}
+        <GasRow funding={funding} pill={false} />
+      </ul>
+      {dust.length > 0 && (
+        <p className="mt-2 text-xs text-warning">
+          Corridor tokens on the signing key are not traded — the bot quotes against
+          the vault. Withdraw them below.
+        </p>
+      )}
+    </div>
+  )
+}
+
 type Choice = { key: string; label: string; balanceText: string | null; decimals: number }
 
 /** The tokens the wallet can send: each corridor token, then the gas coin. */
-function choicesOf(funding: Funding): { tokens: Choice[]; native: Choice } {
+function choicesOf(rows: FundingToken[], funding: Funding): { tokens: Choice[]; native: Choice } {
   return {
-    tokens: orderedTokens(funding).map((t) => ({
+    tokens: orderTokens(rows).map((t) => ({
       key: t.token,
       label: t.symbol,
       balanceText: t.balanceText,
@@ -138,6 +194,7 @@ type Phase = 'form' | 'confirm' | 'running' | 'done' | 'failed'
 function WithdrawForm({
   bot,
   funding,
+  tokens: rows,
   busy,
   onStop,
   onStart,
@@ -145,12 +202,15 @@ function WithdrawForm({
 }: {
   bot: Bot
   funding: Funding
+  /** The balances this key can actually send: the signer wallet's own, which
+   * on a vault maker is not what the Assets rows above show. */
+  tokens: FundingToken[]
   busy: string | null
   onStop: (target: string) => void
   onStart: () => void
   onWithdrew: () => void
 }) {
-  const { tokens, native } = choicesOf(funding)
+  const { tokens, native } = choicesOf(rows, funding)
   const choices = [...tokens, native]
   const [tokenKey, setTokenKey] = useState(tokens[0]?.key ?? NATIVE)
   const [amount, setAmount] = useState('')

@@ -473,13 +473,36 @@ export interface FundingGate {
 
 export interface Funding {
   operatorAddress: string | null
+  /**
+   * The address the token rows were read at: the OperatorVault when one is
+   * connected, else the operator wallet.
+   */
+  capitalAddress: string | null
+  /** Which of the two `capitalAddress` is. */
+  capitalSource: 'vault' | 'wallet'
+  /** Address page for `capitalAddress`, when the chain has one. */
+  capitalExplorerUrl: string | null
   chainId: number
   /** `Celo`, `BSC`…; null for a custom chain. */
   networkLabel: string | null
   /** Address page on this chain's explorer, when the host is known. */
   explorerUrl: string | null
   permit2: string
+  /**
+   * What the bot quotes against. With a vault that is the vault's quotable
+   * inventory, which is not its token balance: money in the yield adapter
+   * counts, money queued for a deposit epoch or reserved for a redemption
+   * does not.
+   */
   tokens: FundingToken[]
+  /**
+   * What the signer wallet itself holds, when the capital is in a vault. Null
+   * without one, where `tokens` is already the wallet.
+   *
+   * Gas, dust, a mistaken transfer: the balances that die with the key. Priced
+   * like `tokens` (same feeds, other address) and never approved for anything.
+   */
+  walletTokens: FundingToken[] | null
   gas: FundingGas
   gate: FundingGate
   /** First chain error, or why there is no operator address. Null when reads worked. */

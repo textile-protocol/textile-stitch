@@ -7,15 +7,36 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { api } from './api'
-import type { Funding } from './types'
+import type { Funding, FundingToken } from './types'
 
 /** Five seconds, like the wizard: money arrives while you watch. */
 export const FUNDING_POLL_MS = 5000
 
-/** Dollars in the wallet, or null when nothing could be priced. */
+/**
+ * Every corridor token row the read produced: the capital's, plus what the
+ * signer wallet itself holds when that is somewhere else. Two addresses, never
+ * the same money twice.
+ */
+function allTokens(funding: Funding): FundingToken[] {
+  return [...funding.tokens, ...(funding.walletTokens ?? [])]
+}
+
+/**
+ * What the signer wallet still holds of the corridor tokens, when the capital
+ * sits in a vault. Empty without one, and empty when the wallet is clean —
+ * which is the normal state: a vault maker's money is the vault's, and only a
+ * mistaken transfer puts a corridor token on the signing key.
+ */
+export function walletDust(funding: Funding | null): FundingToken[] {
+  return (funding?.walletTokens ?? []).filter(
+    (t) => t.balance !== null && t.balance !== '0',
+  )
+}
+
+/** Dollars the bot has, or null when nothing could be priced. */
 export function totalUsd(funding: Funding | null): number | null {
   if (!funding) return null
-  const priced = [...funding.tokens.map((t) => t.usd), funding.gas.usd].filter(
+  const priced = [...allTokens(funding).map((t) => t.usd), funding.gas.usd].filter(
     (u): u is number => u !== null,
   )
   if (priced.length === 0) return null
@@ -28,9 +49,15 @@ export function unpricedSymbols(funding: Funding | null): string[] {
   if (!funding) return []
   const held = (usd: number | null, balance: string | null) =>
     usd === null && balance !== null && balance !== '0'
+  // The same token can come back unpriced at both addresses; it is one
+  // missing price to report, not two.
   return [
-    ...funding.tokens.filter((t) => held(t.usd, t.balance)).map((t) => t.symbol),
-    ...(held(funding.gas.usd, funding.gas.balance) ? [funding.gas.symbol] : []),
+    ...new Set([
+      ...allTokens(funding)
+        .filter((t) => held(t.usd, t.balance))
+        .map((t) => t.symbol),
+      ...(held(funding.gas.usd, funding.gas.balance) ? [funding.gas.symbol] : []),
+    ]),
   ]
 }
 

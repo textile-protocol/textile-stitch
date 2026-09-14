@@ -272,21 +272,42 @@ export default function BotDetail() {
         <div className="mb-4">
           <p className="text-xs uppercase tracking-wide text-faint">Total value</p>
           <TotalValue funding={funding} />
-          {/* The wallet that holds it, right under the number: the address an
-              operator copies most, so it does not live in a grid cell. */}
+          {/* What holds it, right under the number: the address an operator
+              copies most, so it does not live in a grid cell. For a vault
+              maker that is the vault — the money is there, not on the key
+              that signs for it, and saying otherwise sends people to an
+              explorer page showing nothing. */}
           <div className="mt-1 flex flex-wrap items-center gap-3 text-sm">
-            <OperatorAddress config={bot.config} />
-            {bot.config?.explorerUrl && (
-              <a
-                className="text-xs text-accent underline"
-                href={bot.config.explorerUrl}
-                target="_blank"
-                rel="noreferrer"
-              >
-                View on {hostOf(bot.config.explorerUrl) ?? 'explorer'}
-              </a>
+            {vaultFunded ? (
+              <>
+                <Tag>vault</Tag>
+                <AddressLink
+                  address={bot.config?.vaultAddress ?? ''}
+                  explorerUrl={bot.config?.vaultExplorerUrl ?? null}
+                />
+              </>
+            ) : (
+              <>
+                <OperatorAddress config={bot.config} />
+                {bot.config?.explorerUrl && (
+                  <a
+                    className="text-xs text-accent underline"
+                    href={bot.config.explorerUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    View on {hostOf(bot.config.explorerUrl) ?? 'explorer'}
+                  </a>
+                )}
+              </>
             )}
           </div>
+          {vaultFunded && (
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted">
+              <span>signed by</span>
+              <OperatorAddress config={bot.config} />
+            </div>
+          )}
         </div>
 
         {/*
