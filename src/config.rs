@@ -252,17 +252,19 @@ pub struct FeedConfig {
     pub rfq_staleness_secs: Option<u64>,
 }
 
-/// How often Textile's `/price` restamps the cNGN mark: the `sample-cngn-pricing`
-/// cron, once a minute. The cap below is expressed in terms of it, because the
-/// only thing that number has to be right about is how many published marks it
-/// can afford to miss.
+/// How often Textile's `/price` restamps a cron-sampled mark: once a minute,
+/// whether that is the `sample-cngn-pricing` cron or the one-fetch-a-minute
+/// coalescing the handler applies to a custom HTTPS feed. The cap below is
+/// expressed in terms of it, because the only thing that number has to be
+/// right about is how many published marks it can afford to miss.
 pub const PRICE_FEED_CADENCE_SECS: u64 = 60;
 
-/// What a feed gets if it does not ask: RFQ firm quotes go dark after a minute.
+/// The tight window: RFQ firm quotes go dark on a mark older than a minute.
 ///
-/// Deliberately the tight value, so a corridor nobody has reasoned about is
-/// never quietly granted a wide window. A feed that genuinely needs more says
-/// so in its own `[feed].rfq_staleness_secs`.
+/// What a live-fetched feed gets, and what any feed we cannot place gets — see
+/// [`default_rfq_staleness_secs`] for which is which. A feed that needs
+/// something else says so in its own `[feed].rfq_staleness_secs`, which always
+/// wins over the inference.
 pub const RFQ_DEFAULT_STALENESS_SECS: u64 = 60;
 
 /// Ceiling on what any feed may request, however wide `[feed].staleness_secs`
@@ -334,30 +336,67 @@ pub fn requested_rfq_staleness_secs(feed: &FeedConfig, pool: &PoolConfig) -> u64
     }
 }
 
+/// Pairs Textile's `/price` fetches from the upstream on the request, so their
+/// marks are seconds old and the tight window is the right one.
+///
+/// Mirrors `LIVE_SOURCES` in `api/src/services/fillerPrice/liveQuotes.ts`,
+/// which the bot cannot read at runtime. `liveQuotes.test.ts` fails if the two
+/// drift apart.
+///
+/// This is the inverse of the list it replaced. The old rule named the one
+/// cron-sampled pair (`cngn`) and gave everything else the tight window, which
+/// reads as the careful choice and is not: the corridors that need the wide
+/// window are the ones nobody has tuned, because a corridor listed from the
+/// admin has no shipped preset to carry the tuning and takes whatever this
+/// function says. ZARU/USDC on Base went out that way — a custom HTTPS feed
+/// restamped once a minute, gated at 60s, dark for the tail of every cycle
+/// while the maker sat connected and funded.
+///
+/// So the polarity is: name what is provably fast, and let everything else
+/// have the margin. Getting an entry wrong here costs a maker resting on a
+/// mark up to [`RFQ_MAX_STALENESS_SECS`] old on a pair that is actually fresh;
+/// omitting one costs a dark corridor. Only the first is recoverable by the
+/// operator noticing, so the list errs toward being short.
+const LIVE_FETCHED_PAIRS: &[&str] = &[
+    "brla-usdt",
+    "copm-usdt",
+    "gd-cngn",
+    "gd-usdt",
+    "idr-usdt",
+    "nvda-usdg",
+    "usdc-usdt",
+    "wars-usdt",
+    "wbrl-usdt",
+    "weth-usdt",
+    "xaut-usdt",
+];
+
 /// What a feed gets when its config says nothing, inferred from the feed URL.
 ///
 /// Config always wins; this only decides the unset case. It exists because the
 /// tight default is right for a live-fetched feed and wrong for a cron-sampled
-/// one, and the bots already deployed against Textile's cNGN sampler have
-/// configs written before the setting existed. Upgrading Stitch does not
-/// rewrite a mounted `stitch.toml`, so without this those makers would silently
-/// take the 60s default and go dark between samples — the bug this all started
-/// with, reintroduced by an upgrade.
+/// one, and bots already deployed carry configs written before the setting
+/// existed. Upgrading Stitch does not rewrite a mounted `stitch.toml`, so
+/// without this those makers would silently take the 60s default and go dark
+/// between samples — the bug this all started with, reintroduced by an upgrade.
+///
+/// Scoped to Textile `/price` feeds, because that is the only publisher whose
+/// cadence we know. A third-party feed URL keeps the tight default: we have no
+/// basis to widen it, and an operator who needs more says so in their config.
 ///
 /// Keyed on the `pair` the feed selects rather than the host, because the pair
 /// is what decides which publisher is behind the endpoint: every corridor uses
 /// the same `/price` shape and differs only there. A self-hosted mirror of the
-/// same endpoint therefore behaves identically, and a non-cNGN pair on the same
-/// host still gets the tight window.
+/// same endpoint therefore behaves identically.
 fn default_rfq_staleness_secs(feed_url: &str) -> u64 {
-    if feed_pair(feed_url).is_some_and(|p| p.starts_with("cngn")) {
-        RFQ_MAX_STALENESS_SECS
-    } else {
-        RFQ_DEFAULT_STALENESS_SECS
+    match feed_pair(feed_url) {
+        Some(pair) if !LIVE_FETCHED_PAIRS.contains(&pair.as_str()) => RFQ_MAX_STALENESS_SECS,
+        _ => RFQ_DEFAULT_STALENESS_SECS,
     }
 }
 
-/// The `pair` query parameter of a feed URL, lowercased.
+/// The `pair` query parameter of a feed URL, lowercased. `None` when the URL
+/// names no pair, which is every feed that is not Textile's `/price`.
 fn feed_pair(feed_url: &str) -> Option<String> {
     let query = feed_url.split_once('?')?.1;
     query.split('&').find_map(|kv| {
@@ -2553,7 +2592,7 @@ mod tests {
     /// The inference keys on the pair, not the host, because the pair is what
     /// selects the publisher — every corridor shares the same `/price` shape.
     #[test]
-    fn only_cngn_pairs_infer_the_wide_window() {
+    fn only_live_fetched_pairs_infer_the_tight_window() {
         let with = |url: &str| {
             rfq_staleness_secs(&FeedConfig {
                 url: url.into(),
@@ -2562,26 +2601,28 @@ mod tests {
             })
         };
         let host = "https://api.textilecredit.com/price?chainId=1";
-        assert_eq!(
-            with(&format!("{host}&pair=cngn-usdt")),
-            RFQ_MAX_STALENESS_SECS
-        );
-        assert_eq!(
-            with(&format!("{host}&pair=CNGN-USDC")),
-            RFQ_MAX_STALENESS_SECS
-        );
-        // Same host, live-fetched pairs: tight.
-        for pair in ["weth-usdt", "xaut-usdt", "nvda-usdg", "usdc-usdt"] {
+        // Live-fetched: the mark is seconds old, so the tight window holds.
+        for pair in LIVE_FETCHED_PAIRS {
             assert_eq!(
                 with(&format!("{host}&pair={pair}")),
                 RFQ_DEFAULT_STALENESS_SECS,
-                "{pair} is live-fetched and must not inherit the sampler window"
+                "{pair} is live-fetched and must not take the sampler window"
             );
         }
-        // No pair at all, and a pair that merely contains "cngn" later on.
+        // Cron-sampled: the minute sampler, and a custom HTTPS feed the
+        // handler coalesces to one upstream fetch a minute.
+        for pair in ["cngn-usdt", "CNGN-USDC", "usdc-zaru", "wcngn-usdt"] {
+            assert_eq!(
+                with(&format!("{host}&pair={pair}")),
+                RFQ_MAX_STALENESS_SECS,
+                "{pair} is restamped on a cron and needs the margin"
+            );
+        }
+        // A feed that names no pair is not Textile's `/price`, so we have no
+        // cadence to reason from and must not widen it.
         assert_eq!(with(host), RFQ_DEFAULT_STALENESS_SECS);
         assert_eq!(
-            with(&format!("{host}&pair=wcngn-usdt")),
+            with("https://rates.example.com/v1/zar"),
             RFQ_DEFAULT_STALENESS_SECS
         );
         // Explicit config still beats the inference, in both directions.
