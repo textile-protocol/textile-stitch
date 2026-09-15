@@ -242,6 +242,12 @@ approve`, the taker and the closer.
   all, so there is no address to read. Add one in the console (Ethereum, or a
   testnet asset such as ETH_TEST5 on a Sandbox). Step 2. The panel accepts any
   EVM asset, so you do not have to match whatever `asset_id` is set to.
+- **`FAILED (ENV_UNSUPPORTED_ASSET)` when Verify signs** — the signing request
+  was filed under an asset this workspace doesn't have. A Sandbox is
+  testnet-only and has no mainnet `ETH`. Verify resolves the address from
+  whichever EVM wallet the vault does hold and signs under that same asset, so
+  this should not happen on a current build; if it does, check `asset_id` in
+  `stitch.toml` isn't pinned to something the workspace can't use.
 - **`Signer` isn't in the role dropdown when adding the API user** — the
   workspace has no API Co-Signer, so there is no key share for a Signer to hold.
   Sort the co-signer first; the role appears once one is paired. Don't reach for

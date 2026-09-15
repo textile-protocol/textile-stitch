@@ -685,7 +685,7 @@ function FireblocksFields({
     setBusy(null)
     if (credentialsChanged) setVaults(null)
     // An address proven for one vault says nothing about another.
-    set({ ...patch, operatorAddress: '' })
+    set({ ...patch, operatorAddress: '', assetId: '' })
   }
 
   /**
@@ -746,11 +746,14 @@ function FireblocksFields({
         }),
       (res) => {
         setLatencyMs(res.latencyMs)
-        set({ operatorAddress: res.address })
+        // Keep the asset the signature was actually produced under. Writing the
+        // default instead would hand the bot a config that fails at runtime the
+        // same way Verify would have, on a workspace that doesn't hold it.
+        set({ operatorAddress: res.address, assetId: res.assetId })
       },
       () => {
         setLatencyMs(null)
-        set({ operatorAddress: '' })
+        set({ operatorAddress: '', assetId: '' })
       },
     )
 

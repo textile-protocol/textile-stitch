@@ -228,8 +228,12 @@ export const api = {
 
   /**
    * Sign one throwaway message for real. Returns the address that signature
-   * recovered to — which is what fills in the operator address — and how long
-   * the round trip took.
+   * recovered to — which is what fills in the operator address — the asset
+   * wallet that produced it, and how long the round trip took.
+   *
+   * The asset matters: a workspace that doesn't hold the asset we asked for
+   * (a Sandbox has no mainnet `ETH`) resolves the address from whatever EVM
+   * wallet it does have, and the bot has to keep signing under that one.
    */
   fireblocksVerify: (body: {
     apiKey: string
@@ -238,7 +242,7 @@ export const api = {
     vaultAccountId: string
     assetId?: string
   }) =>
-    request<{ address: string; latencyMs: number }>(
+    request<{ address: string; assetId: string; latencyMs: number }>(
       '/api/signer/fireblocks/verify',
       json(body),
     ),

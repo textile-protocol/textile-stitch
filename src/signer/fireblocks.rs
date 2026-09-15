@@ -420,6 +420,18 @@ pub struct Discovery {
     signer: FireblocksSigner,
 }
 
+/// A vault's EVM address, and the asset wallet that produced it.
+///
+/// The asset matters as much as the address: Fireblocks files a signing request
+/// under an `assetId`, and one that doesn't exist in this environment is
+/// refused with `ENV_UNSUPPORTED_ASSET` — which is what a Sandbox does with
+/// mainnet `ETH`. So whatever asset answered the address lookup is the asset
+/// the signer has to keep using, and the one written into the config.
+pub(crate) struct ResolvedVaultAddress {
+    pub(crate) address: Address,
+    pub(crate) asset_id: String,
+}
+
 /// One vault account the operator can pick from.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -435,6 +447,10 @@ pub struct VerifiedSigner {
     /// The address the vault resolves to, confirmed by recovering a real
     /// signature rather than merely read back from the API.
     pub address: String,
+    /// The asset wallet that produced it — and therefore the one the bot has to
+    /// keep signing under. Returned so the panel can write it into the config
+    /// instead of leaving the default to fail at runtime the way Verify would.
+    pub asset_id: String,
     /// Round trip for one typed-message signature. The number that decides
     /// whether this signer can quote — see the RFQ reply budget.
     pub latency_ms: u64,
@@ -530,10 +546,19 @@ impl Discovery {
     /// On EVM chains one vault account has a single address across every
     /// network, so this is the operator address for every corridor, not just
     /// the one `asset_id` names.
-    pub async fn address(&self, vault_account_id: &str, asset_id: &str) -> anyhow::Result<Address> {
+    pub async fn address(
+        &self,
+        vault_account_id: &str,
+        asset_id: &str,
+    ) -> anyhow::Result<ResolvedVaultAddress> {
         // Fast path: the asset we were told to use.
         let asked = match self.evm_address_for(vault_account_id, asset_id).await {
-            Ok(Some(address)) => return Ok(address),
+            Ok(Some(address)) => {
+                return Ok(ResolvedVaultAddress {
+                    address,
+                    asset_id: asset_id.trim().to_string(),
+                })
+            }
             Ok(None) => None,
             // A vault with no wallet for this asset may 404 rather than answer
             // with an empty list. Hold the error rather than raise it — the
@@ -550,8 +575,8 @@ impl Discovery {
         // one asset id it guessed: a Sandbox workspace is testnet-only, cannot
         // hold mainnet `ETH` at all, and had no way to say so, because the form
         // never offered an asset field.
-        if let Some(address) = self.any_evm_address(vault_account_id).await? {
-            return Ok(address);
+        if let Some(resolved) = self.any_evm_address(vault_account_id).await? {
+            return Ok(resolved);
         }
 
         Err(match asked {
@@ -609,7 +634,10 @@ impl Discovery {
     ///
     /// Bounded: a vault can hold a lot of assets and we only need one, so stop
     /// at the first hit and cap the probes rather than walking everything.
-    async fn any_evm_address(&self, vault_account_id: &str) -> anyhow::Result<Option<Address>> {
+    async fn any_evm_address(
+        &self,
+        vault_account_id: &str,
+    ) -> anyhow::Result<Option<ResolvedVaultAddress>> {
         let account = self
             .signer
             .send(
@@ -629,7 +657,10 @@ impl Discovery {
             };
             if let Ok(Some(address)) = self.evm_address_for(vault_account_id, id).await {
                 tracing::debug!(asset = id, "resolved the vault address from its EVM wallet");
-                return Ok(Some(address));
+                return Ok(Some(ResolvedVaultAddress {
+                    address,
+                    asset_id: id.to_string(),
+                }));
             }
         }
         Ok(None)
@@ -654,14 +685,19 @@ impl Discovery {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(DEFAULT_ASSET_ID);
-        let address = self.address(vault_account_id, asset_id).await?;
+        let resolved = self.address(vault_account_id, asset_id).await?;
+        // Sign under the asset that actually answered, not the one we asked
+        // for. They differ whenever the fallback ran — a Sandbox holding
+        // ETH_TEST5 rather than ETH — and filing the request under an asset the
+        // environment doesn't have is refused outright.
+        //
         // Struct update rather than a hand-copied field list: a probe that
         // silently drifts from the signer it stands in for would report a
         // latency (or a success) that the real thing won't reproduce.
         let probe = FireblocksSigner {
             vault_account_id: vault_account_id.trim().to_string(),
-            asset_id: asset_id.to_string(),
-            operator_address: address,
+            asset_id: resolved.asset_id.clone(),
+            operator_address: resolved.address,
             ..self.signer.clone()
         };
         let payload = crate::protocol::typed_data::signer_check_payload(B256::from(
@@ -675,7 +711,8 @@ impl Discovery {
             .await
             .context("Fireblocks could not sign a test message for this vault account")?;
         Ok(VerifiedSigner {
-            address: format!("{address:?}"),
+            address: format!("{:?}", resolved.address),
+            asset_id: resolved.asset_id,
             latency_ms: started.elapsed().as_millis() as u64,
         })
     }
@@ -855,6 +892,22 @@ mod tests {
     /// A vault's asset wallets are mixed; only the EVM ones can be the operator
     /// address. `parse_address` rejecting a BTC or SOL address is the test, so
     /// those have to read as absent rather than as an error.
+    /// The panel reads `assetId` off this and writes it into the config, so the
+    /// wire name is a contract with `web/src/api.ts`, not an implementation
+    /// detail.
+    #[test]
+    fn verify_reports_the_asset_it_signed_under() {
+        let body = serde_json::to_value(VerifiedSigner {
+            address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".into(),
+            asset_id: "ETH_TEST5".into(),
+            latency_ms: 312,
+        })
+        .unwrap();
+        assert_eq!(body["assetId"], "ETH_TEST5");
+        assert_eq!(body["latencyMs"], 312);
+        assert!(body["address"].is_string());
+    }
+
     #[test]
     fn only_an_evm_address_counts_as_a_hit() {
         let evm = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
