@@ -43,6 +43,24 @@ fn plan_fees(base_fee: U256, suggested_gas_price: U256, node_tip: U256) -> (U256
     (priority, max_fee)
 }
 
+/// The pair [`plan_fees`] works from — `(suggested_gas_price, node_tip)` —
+/// given what the node actually answered.
+///
+/// A price the node *did* answer always wins. Substituting
+/// [`DEFAULT_PRIORITY_WEI`] for a missing `eth_maxPriorityFeePerGas` outbids a
+/// live `eth_gasPrice`, because `plan_fees` takes the higher of the two and
+/// cannot tell a made-up number from a real one: on BNB Chain that turns a
+/// 0.1 gwei chain into a 1 gwei bid, ten times the reserve an approval needs
+/// up front. Only when neither call answers is there nothing to derive a bid
+/// from, and the flat default stands in.
+fn node_prices(node_tip: Option<U256>, gas_price: Option<U256>) -> (U256, U256) {
+    let fallback = match (node_tip, gas_price) {
+        (None, None) => U256::from(DEFAULT_PRIORITY_WEI),
+        _ => U256::ZERO,
+    };
+    (gas_price.unwrap_or(fallback), node_tip.unwrap_or(fallback))
+}
+
 /// How long to wait for a receipt before re-sending the same nonce at a higher
 /// fee. We bid what the node suggests, and on a zero-base-fee chain that is the
 /// floor and nothing more: BNB Chain answers `eth_maxPriorityFeePerGas` with
@@ -319,17 +337,19 @@ impl Wallet {
     /// Nonce + fees + gas for one send, read from the node.
     async fn plan_tx(&self, to: Address, data: &Bytes, value: U256) -> anyhow::Result<TxPlan> {
         let nonce = self.rpc.transaction_count(self.address).await?;
-        let node_tip = self
-            .rpc
-            .max_priority_fee()
-            .await
-            .unwrap_or_else(|_| U256::from(DEFAULT_PRIORITY_WEI));
-        let suggested = self.rpc.gas_price().await.unwrap_or(node_tip);
+        let node_tip = self.rpc.max_priority_fee().await.ok();
+        let node_price = self.rpc.gas_price().await.ok();
         let base_fee = self.rpc.base_fee().await.unwrap_or(U256::ZERO);
-        let (priority, max_fee) = plan_fees(base_fee, suggested, node_tip);
-        if priority > node_tip.max(suggested) {
+        let (suggested, tip) = node_prices(node_tip, node_price);
+        let (priority, max_fee) = plan_fees(base_fee, suggested, tip);
+        if node_tip
+            .into_iter()
+            .chain(node_price)
+            .max()
+            .is_some_and(|answered| priority > answered)
+        {
             tracing::warn!(
-                node_tip = %node_tip, node_gas_price = %suggested, bidding = %priority,
+                node_tip = ?node_tip, node_gas_price = ?node_price, bidding = %priority,
                 "the RPC suggested a fee below the floor; bidding the floor instead"
             );
         }
@@ -648,6 +668,41 @@ mod tests {
             U256::from(300_000_000u64),
         );
         assert_eq!(tip, U256::from(300_000_000u64));
+    }
+
+    #[test]
+    fn a_missing_tip_leaves_a_live_gas_price_to_set_the_bid() {
+        // BNB Chain prices gas at 0.1 gwei and the node refuses
+        // `eth_maxPriorityFeePerGas`. The old default stood in at 1 gwei and
+        // won the `max`, so an approval reserved ten times what it costs.
+        let price = U256::from(100_000_000u64);
+        let (suggested, tip) = node_prices(None, Some(price));
+        assert_eq!((suggested, tip), (price, U256::ZERO));
+        let (priority, max_fee) = plan_fees(U256::ZERO, suggested, tip);
+        assert_eq!(priority, price);
+        assert_eq!(max_fee, price);
+    }
+
+    #[test]
+    fn a_missing_gas_price_leaves_the_node_tip_to_set_the_bid() {
+        let node_tip = U256::from(300_000_000u64);
+        let (suggested, tip) = node_prices(Some(node_tip), None);
+        assert_eq!((suggested, tip), (U256::ZERO, node_tip));
+        assert_eq!(plan_fees(U256::ZERO, suggested, tip).0, node_tip);
+    }
+
+    #[test]
+    fn neither_price_answering_falls_back_to_the_flat_default() {
+        let default = U256::from(DEFAULT_PRIORITY_WEI);
+        assert_eq!(node_prices(None, None), (default, default));
+        assert_eq!(plan_fees(U256::ZERO, default, default).0, default);
+    }
+
+    #[test]
+    fn both_prices_answering_are_passed_through_untouched() {
+        let tip = U256::from(50_000_000u64);
+        let price = U256::from(120_000_000u64);
+        assert_eq!(node_prices(Some(tip), Some(price)), (price, tip));
     }
 
     #[test]

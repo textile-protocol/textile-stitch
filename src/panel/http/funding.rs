@@ -1102,6 +1102,8 @@ mod tests {
 
     const USDT: &str = "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e";
     const CNGN: &str = "0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f";
+    const USDT_BSC: &str = "0x55d398326f99059fF775485246999027B3197955";
+    const CNGN_BSC: &str = "0xa8AEA66B361a8d53e8865c62D142167Af28Af058";
 
     /// Textile's API as the funding check sees it: `/native-price` (counted)
     /// and the `/price` feed, each with a fixed status.
@@ -1112,6 +1114,17 @@ mod tests {
     }
 
     async fn mock_api(native_status: u16, feed_status: u16, feed_price: f64) -> MockApi {
+        mock_api_native(native_status, feed_status, feed_price, 0.08).await
+    }
+
+    /// As [`mock_api`], with the gas token's dollar price chosen by the caller.
+    /// A BSC test needs a BNB-shaped number, not Celo's eight cents.
+    async fn mock_api_native(
+        native_status: u16,
+        feed_status: u16,
+        feed_price: f64,
+        native_usd: f64,
+    ) -> MockApi {
         let native_hits = Arc::new(AtomicUsize::new(0));
         let counter = native_hits.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1125,7 +1138,7 @@ mod tests {
                         counter.fetch_add(1, Ordering::SeqCst);
                         (
                             StatusCode::from_u16(native_status).unwrap(),
-                            Json(json!({ "chainId": 42220, "symbol": "CELOUSDT", "priceUsd": 0.08, "timestamp": 1 })),
+                            Json(json!({ "symbol": "NATIVEUSDT", "priceUsd": native_usd, "timestamp": 1 })),
                         )
                     }
                 }),
@@ -1159,6 +1172,23 @@ mod tests {
             .replace("https://forno.celo.org", rpc_url)
             .replace(
                 "https://api.textilecredit.com/price?chainId=42220&pair=cngn-usdt",
+                feed_url,
+            )
+            .replace("https://api.textilecredit.com", api_base);
+        std::fs::write(&path, toml).unwrap();
+        add_container(h, name);
+    }
+
+    /// The same shape on BNB Smart Chain, where the gas figures are cents.
+    fn seed_bsc(h: &Harness, name: &str, rpc_url: &str, api_base: &str, feed_url: &str) {
+        let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
+        setup::write_config(h.root.join(name), corridor, TEST_KEY).unwrap();
+        let path = h.root.join(name).join("stitch.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("https://bsc-dataseed.binance.org", rpc_url)
+            .replace(
+                "https://api.textilecredit.com/price?chainId=56&pair=cngn-usdt",
                 feed_url,
             )
             .replace("https://api.textilecredit.com", api_base);
@@ -1404,6 +1434,47 @@ mod tests {
         assert_eq!(v["gate"]["needsSide"], false);
         assert_eq!(v["gate"]["needsGas"], false);
         assert!(v["checkedAtUnix"].as_u64().unwrap() > 1_700_000_000);
+    }
+
+    /// The screenshot this was reported from: a BSC wallet holding $0.07 of
+    /// BNB, two approvals outstanding, and a wizard that would not move on.
+    ///
+    /// Sized off the chain, two approves on BSC are fractions of a cent, so the
+    /// gate clears here. The end-to-end check exists because the unit test on
+    /// [`min_gas_usd`] alone would not have caught a handler that passed the
+    /// wrong chain id in: the copy on screen is this number and nothing else.
+    #[tokio::test]
+    async fn funding_on_bsc_asks_cents_of_gas_not_dollars() {
+        let h = harness("funding-bsc");
+        let node = mock_rpc(
+            MockChain::default()
+                .balance(USDT_BSC, 25_000_000_000_000_000_000)
+                .balance(CNGN_BSC, 0)
+                // 0.0001 BNB, the wallet from the report.
+                .native(100_000_000_000_000),
+        )
+        .await;
+        let api = mock_api_native(200, 200, 0.00073, 700.0).await;
+        let feed = format!("{}/price?chainId=56&pair=cngn-usdt", api.base);
+        seed_bsc(&h, "bot-a", &node.url, &api.base, &feed);
+
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["chainId"], 56);
+        assert_eq!(v["gas"]["symbol"], "BNB");
+        let gas_usd = v["gas"]["usd"].as_f64().unwrap();
+        assert!((gas_usd - 0.07).abs() < 1e-9, "{body}");
+
+        assert_eq!(
+            v["gate"]["approvalsMissing"],
+            json!(["USDT", "cNGN"]),
+            "both sides are approved, so the gate is sized for two: {body}"
+        );
+        assert_eq!(v["gate"]["minGasUsd"], 0.05, "{body}");
+        assert_eq!(v["gas"]["ok"], true, "{body}");
+        assert_eq!(v["gate"]["needsGas"], false, "{body}");
+        assert_eq!(v["gate"]["passes"], true, "{body}");
     }
 
     #[tokio::test]
@@ -2049,6 +2120,10 @@ mod tests {
         assert!(min_gas_usd(1, 1) > 1.0);
         // Base pays in ETH too, but at L2 prices.
         assert_eq!(min_gas_usd(8453, 2), 1.0);
+        // BNB Smart Chain: two approves are fractions of a cent, so the gate
+        // clears on a few cents of BNB rather than two dollars of it.
+        assert_eq!(min_gas_usd(56, 2), 0.05);
+        assert_eq!(min_gas_usd(56, 0), 0.025, "the start still needs gas");
         // A chain the panel can't name falls back to the flat figure.
         assert_eq!(min_gas_usd(999, 2), 2.0);
     }

@@ -93,11 +93,15 @@ pub fn gas_token(chain_id: u64) -> Option<GasToken> {
             fallback_usd: 1000.0,
             tx_gas_usd: 0.50,
         },
+        // BNB Smart Chain is the cheap one: gas sits at 0.05-0.1 gwei and an
+        // approve is ~46k gas, so one costs well under a cent. A dollar here
+        // asked an operator for a couple hundred times what they need, and the
+        // wizard sat on "add $2 of BNB" with a funded wallet in front of it.
         56 | 97 => GasToken {
             symbol: "BNB",
             coingecko_id: "binancecoin",
             fallback_usd: 200.0,
-            tx_gas_usd: 1.0,
+            tx_gas_usd: 0.025,
         },
         42220 => GasToken {
             symbol: "CELO",
