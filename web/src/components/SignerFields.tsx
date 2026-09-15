@@ -427,6 +427,24 @@ function ImportWalletPanel({
  */
 const SLOW_SIGN_MS = 400
 
+/** A 4096-bit PEM is ~3.2 KB; this is slack, not a limit anyone should hit. */
+const MAX_PEM_BYTES = 64 * 1024
+
+/**
+ * Whether the field holds a whole private key rather than something half-typed.
+ *
+ * Both markers, deliberately: this gates whether the raw key stays on screen,
+ * and a half-pasted key still needs the editor open so the operator can finish
+ * or fix it. Requiring only BEGIN would collapse the box mid-paste on a slow
+ * clipboard and hide the thing they were still working on.
+ */
+function isCompletePem(value: string): boolean {
+  return (
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(value) &&
+    /-----END [A-Z ]*PRIVATE KEY-----/.test(value)
+  )
+}
+
 /**
  * Where the operator's workspace answers.
  *
@@ -448,6 +466,154 @@ const FIREBLOCKS_REGIONS: [label: string, url: string][] = [
   ['US East', 'https://us-east-1-api.fireblocks.io'],
   ['Sandbox', 'https://sandbox-api.fireblocks.io'],
 ]
+
+/**
+ * A PEM is the one credential nobody types: it is a file already sitting on
+ * disk from `openssl req`, and it is ~50 lines long. So accept it as a file —
+ * dropped or picked — as well as pasted.
+ *
+ * Read in the browser and dropped into the same form value the paste path
+ * fills, so nothing new reaches the server and the file is never uploaded
+ * anywhere; it travels in the create/verify request body exactly as a pasted
+ * key would.
+ *
+ * Once a whole key is in, the editor collapses to a confirmation. A private key
+ * left rendered across four rows is one screen-share or support screenshot away
+ * from being disclosed, and after it is loaded there is nothing to read it for —
+ * what the operator wants to know is *that* it took, which the summary says. The
+ * editor comes back on Replace, and dropping a new file over the summary works
+ * without going through it.
+ */
+function PemField({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (pem: string) => void
+}) {
+  const [dragging, setDragging] = useState(false)
+  const [loaded, setLoaded] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+  const held = isCompletePem(value)
+
+  async function accept(file: File | undefined) {
+    if (!file) return
+    setError(null)
+    // A private key is a few KB; anything far bigger is the wrong file and
+    // shouldn't be read into memory to find that out.
+    if (file.size > MAX_PEM_BYTES) {
+      setLoaded(null)
+      setError(`${file.name} is ${Math.round(file.size / 1024)} KB — too big to be a private key.`)
+      return
+    }
+    let text: string
+    try {
+      text = await file.text()
+    } catch (e) {
+      setLoaded(null)
+      setError(`Couldn't read ${file.name}: ${(e as Error).message}`)
+      return
+    }
+    // Catch the wrong file here rather than letting it fail server-side after
+    // the operator has moved on — the public key and the CSR sit in the same
+    // directory and are easy to grab by mistake.
+    if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(text)) {
+      setLoaded(null)
+      setError(
+        `${file.name} doesn't look like a private key. You want fireblocks_secret.key — the ` +
+          `file openssl wrote next to the CSR, not the CSR itself.`,
+      )
+      return
+    }
+    setLoaded(file.name)
+    onChange(text)
+  }
+
+  return (
+    <div className="space-y-2">
+      <Field
+        label="API private key (fireblocks_secret.key)"
+        hint={
+          held
+            ? 'Hidden once loaded. Drop another file to swap it.'
+            : 'Paste it, or drop the file here.'
+        }
+      >
+        <div
+          onDragOver={(e) => {
+            // Without preventDefault the browser navigates to the file instead
+            // of handing it to us.
+            e.preventDefault()
+            setDragging(true)
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault()
+            setDragging(false)
+            void accept(e.dataTransfer.files[0])
+          }}
+          className={`rounded-lg transition ${dragging ? 'ring-2 ring-accent' : ''}`}
+        >
+          {held ? (
+            <div className="flex items-center justify-between gap-3 rounded-lg border border-line bg-canvas px-3 py-2">
+              <span className="text-sm text-ink">
+                {loaded ? `Loaded ${loaded}` : 'Private key set'}
+              </span>
+              <button
+                type="button"
+                className="rounded px-2 py-0.5 text-xs font-bold text-muted hover:bg-hover hover:text-ink"
+                onClick={() => {
+                  setLoaded(null)
+                  setError(null)
+                  onChange('')
+                }}
+              >
+                Replace
+              </button>
+            </div>
+          ) : (
+            <TextArea
+              rows={4}
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="-----BEGIN PRIVATE KEY-----"
+              value={value}
+              onChange={(e) => {
+                // Typed or pasted over: whatever file this came from no longer
+                // describes what is in the box.
+                setLoaded(null)
+                setError(null)
+                onChange(e.target.value)
+              }}
+            />
+          )}
+        </div>
+      </Field>
+
+      {/* Outside the Field: its <label> would forward clicks to whichever
+          control it wraps, so a hidden file input in there turns every click on
+          the textarea into a file dialog. */}
+      <input
+        ref={fileRef}
+        type="file"
+        className="hidden"
+        onChange={(e) => {
+          void accept(e.target.files?.[0])
+          // Reset so picking the same file twice still fires a change.
+          e.target.value = ''
+        }}
+      />
+      {!held && (
+        <Button type="button" onClick={() => fileRef.current?.click()}>
+          Choose file…
+        </Button>
+      )}
+
+      {error && <Banner tone="danger">{error}</Banner>}
+    </div>
+  )
+}
 
 /**
  * Fireblocks needs two credentials and nothing else typed.
@@ -618,18 +784,10 @@ function FireblocksFields({
         />
       </Field>
 
-      <Field label="API private key (fireblocks_secret.key)">
-        <TextArea
-          rows={4}
-          autoComplete="off"
-          spellCheck={false}
-          placeholder="-----BEGIN PRIVATE KEY-----"
-          value={apiPrivateKey}
-          onChange={(e) =>
-            invalidate({ apiPrivateKey: e.target.value }, { credentialsChanged: true })
-          }
-        />
-      </Field>
+      <PemField
+        value={apiPrivateKey}
+        onChange={(pem) => invalidate({ apiPrivateKey: pem }, { credentialsChanged: true })}
+      />
 
       <Button
         type="button"

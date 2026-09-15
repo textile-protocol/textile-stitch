@@ -41,10 +41,30 @@ That's what makes the discovery possible.
 
 ## 1. Create the API user
 
-In the Fireblocks console, go to **Settings → Users → Add user** and create an
-**API user** with the **Signer** role. Signer is the role that can actually
-produce signatures; an Editor or Viewer key will read your vaults fine and then
-fail on the first sign.
+**Sort the Co-Signer out before you touch the user.** This is the order you hit
+it in, not an afterthought: the **Signer** role is the one that holds an MPC key
+share, and Fireblocks only offers it once the workspace has an API Co-Signer to
+hold that share. Create the user first and `Signer` simply will not be in the
+role dropdown, with nothing on screen explaining why.
+
+If your workspace already signs programmatically it already has a co-signer. If
+it doesn't, that is the piece to sort out first — without one nothing signs
+automatically and every request waits for a human in the mobile app, which will
+not work for a quoting bot.
+
+On the **Developer Sandbox** you can skip this entirely: sandboxes ship with an
+API user already created and wired to Fireblocks' Communal Test Co-signer. Look
+under **Settings → Users** for the existing one rather than adding another. See
+[Testing against the Fireblocks sandbox](#testing-against-the-fireblocks-sandbox).
+
+With a co-signer in place, go to **Settings → Users → Add user** and create an
+**API user** with the **Signer** role. Two roles that look plausible and are not:
+
+- **Editor** / **Viewer** — these read your vaults fine and then fail on the
+  first sign. Signing is exactly what they can't do.
+- **Embedded Wallet Signer** — a different product. Embedded Wallets (NCW) are
+  end-user wallets; this role signs for those, not for the vault account Stitch
+  trades from. The console's own description says "for embedded wallets".
 
 Fireblocks asks for a CSR. Generate the key pair locally:
 
@@ -53,14 +73,15 @@ openssl req -new -newkey rsa:4096 -nodes \
   -keyout fireblocks_secret.key -out fireblocks.csr
 ```
 
-Upload `fireblocks.csr`. Keep `fireblocks_secret.key` — that's the secret, and
-Fireblocks never sees it. When the user is approved you get the **API key**
-(a UUID). That plus the key file is everything.
+`openssl req` will prompt for country, organisation and so on; Fireblocks does
+not care what you put, so press enter through them — or skip the prompts with
+`-subj "/CN=stitch"`. `-nodes` means "don't encrypt the private key", which is
+required: the bot reads it unattended and there is nobody to type a passphrase.
 
-The API user has to be attached to a **Co-Signer**. If your workspace already
-signs programmatically, it already has one. If not, this is the piece to sort
-out first — without a co-signer nothing signs automatically and every request
-waits for a human in the mobile app, which will not work for a quoting bot.
+That one command writes **both** files. Upload `fireblocks.csr` — it is the
+public half and not sensitive. Keep `fireblocks_secret.key`; that's the secret,
+Fireblocks never sees it, and it is the file you give the panel. When the user is
+approved you get the **API key** (a UUID). That plus the key file is everything.
 
 ## 2. Pick (or create) the vault account
 
@@ -96,7 +117,10 @@ about 750 ms after it asks.
 ## 4. Configure the bot
 
 **Desktop / panel.** Open the bot's Settings, pick **Signer → Fireblocks**, and
-paste the API key and the contents of `fireblocks_secret.key`. Then:
+enter the API key. For the private key, drop `fireblocks_secret.key` onto the
+field (or **Choose file…**) — pasting the contents still works if you'd rather.
+Once a whole key is in, the panel hides it and shows a confirmation; **Replace**
+puts the editor back. Then:
 
 1. Pick your **workspace region** if it isn't the global one — an EU or US-East
    workspace answers only on its own host, and the same host is written into
@@ -218,8 +242,16 @@ approve`, the taker and the closer.
   all, so there is no address to read. Add one in the console (Ethereum, or a
   testnet asset such as ETH_TEST5 on a Sandbox). Step 2. The panel accepts any
   EVM asset, so you do not have to match whatever `asset_id` is set to.
+- **`Signer` isn't in the role dropdown when adding the API user** — the
+  workspace has no API Co-Signer, so there is no key share for a Signer to hold.
+  Sort the co-signer first; the role appears once one is paired. Don't reach for
+  **Embedded Wallet Signer** instead — it signs for Embedded Wallets, not vault
+  accounts. If you have a co-signer and the role still isn't offered, Fireblocks
+  support can enable it.
 - **`the Fireblocks API private key is not a usable RSA PEM`** — paste the whole
-  `fireblocks_secret.key`, including the `BEGIN`/`END` lines.
+  `fireblocks_secret.key`, including the `BEGIN`/`END` lines. If you dropped a
+  file and it was rejected, check you grabbed the key and not `fireblocks.csr` —
+  they land in the same directory from the same command.
 - **`api_base_url host ... is not an official fireblocks API host`** — if your
   workspace is in a region, point `api_base_url` at its endpoint
   (`https://eu-api.fireblocks.io` and friends are accepted).
