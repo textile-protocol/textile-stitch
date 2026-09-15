@@ -68,9 +68,13 @@ Any vault account works. Note that on EVM chains a Fireblocks vault account has
 **one address across every EVM network** — Celo, Base, Arbitrum, Ethereum, BSC
 all share it — so one vault account covers every corridor you run.
 
-The vault needs an **ETH asset wallet** for the panel to read its address. If
-the vault is new, add the ETH asset to it. (You don't need ETH the token, or an
-Ethereum corridor; this is how Fireblocks exposes the EVM address.)
+The vault needs at least one **EVM asset wallet** for the panel to read its
+address. If the vault is new, add one — **Ethereum** on a mainnet or testnet
+workspace, or a testnet asset such as **ETH_TEST5** on a Sandbox, which is
+testnet-only and cannot hold mainnet ETH. Any EVM asset does: they all share the
+same address, so the panel takes whichever one your vault has. You don't need to
+hold the token, or trade that chain — adding the asset is just how Fireblocks
+mints the wallet and its address.
 
 Fund it with a little native gas on each chain you trade — Permit2 approvals
 need it.
@@ -210,8 +214,10 @@ approve`, the taker and the closer.
   policy rule, or one that doesn't cover this vault account and API user. Step 3.
 - **Signing works but takes seconds** — the policy rule is routing to a human
   approver instead of the co-signer. Make it auto-approve.
-- **`vault account N has no ETH wallet yet`** — add the ETH asset to the vault
-  in the console. Step 2.
+- **`vault account N has no EVM wallet`** — the vault has no EVM asset wallet at
+  all, so there is no address to read. Add one in the console (Ethereum, or a
+  testnet asset such as ETH_TEST5 on a Sandbox). Step 2. The panel accepts any
+  EVM asset, so you do not have to match whatever `asset_id` is set to.
 - **`the Fireblocks API private key is not a usable RSA PEM`** — paste the whole
   `fireblocks_secret.key`, including the `BEGIN`/`END` lines.
 - **`api_base_url host ... is not an official fireblocks API host`** — if your

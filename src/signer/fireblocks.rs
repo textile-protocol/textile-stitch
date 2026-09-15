@@ -531,6 +531,55 @@ impl Discovery {
     /// network, so this is the operator address for every corridor, not just
     /// the one `asset_id` names.
     pub async fn address(&self, vault_account_id: &str, asset_id: &str) -> anyhow::Result<Address> {
+        // Fast path: the asset we were told to use.
+        let asked = match self.evm_address_for(vault_account_id, asset_id).await {
+            Ok(Some(address)) => return Ok(address),
+            Ok(None) => None,
+            // A vault with no wallet for this asset may 404 rather than answer
+            // with an empty list. Hold the error rather than raise it — the
+            // fallback below usually turns it into a success, and if it doesn't
+            // this is the more informative thing to report.
+            Err(e) => Some(e),
+        };
+
+        // Fall back to whatever EVM wallet the vault *does* have.
+        //
+        // Every EVM asset in a vault account shares one address, so any of them
+        // answers the question correctly — `ETH`, `ETH_TEST5`, `CELO`, whatever
+        // the operator happened to add. Without this the panel insists on the
+        // one asset id it guessed: a Sandbox workspace is testnet-only, cannot
+        // hold mainnet `ETH` at all, and had no way to say so, because the form
+        // never offered an asset field.
+        if let Some(address) = self.any_evm_address(vault_account_id).await? {
+            return Ok(address);
+        }
+
+        Err(match asked {
+            Some(e) => e.context(format!(
+                "Fireblocks vault account {vault_account_id} has no EVM wallet. Add an EVM asset \
+                 to it in the Fireblocks console — Ethereum on a mainnet or testnet workspace, \
+                 or a testnet asset such as ETH_TEST5 on a Sandbox — then try again."
+            )),
+            None => anyhow!(
+                "Fireblocks vault account {vault_account_id} has no EVM wallet. Add an EVM asset \
+                 to it in the Fireblocks console — Ethereum on a mainnet or testnet workspace, \
+                 or a testnet asset such as ETH_TEST5 on a Sandbox — then try again."
+            ),
+        })
+    }
+
+    /// The EVM address of one asset wallet, or `None` if this vault has no
+    /// wallet for that asset — or has one that isn't an EVM address at all.
+    ///
+    /// Non-EVM reads as absent on purpose: a BTC or SOL wallet cannot be the
+    /// operator address, and `parse_address` rejecting it is exactly the test
+    /// the caller wants when it is sweeping a vault's assets looking for one it
+    /// can use.
+    async fn evm_address_for(
+        &self,
+        vault_account_id: &str,
+        asset_id: &str,
+    ) -> anyhow::Result<Option<Address>> {
         let path = addresses_path(vault_account_id, asset_id);
         let page = self
             .signer
@@ -542,23 +591,48 @@ impl Discovery {
                      {vault_account_id}"
                 )
             })?;
-        // `addresses_paged` wraps the list; the older endpoint returned a bare
-        // array. Accept either so this does not break on an API version bump.
-        let first = page["addresses"]
+        // `addresses_paginated` wraps the list; the older endpoint returned a
+        // bare array. Accept either so this does not break on a version bump.
+        let Some(first) = page["addresses"]
             .as_array()
             .or_else(|| page.as_array())
             .and_then(|a| a.first())
-            .ok_or_else(|| {
-                anyhow!(
-                    "Fireblocks vault account {vault_account_id} has no {asset_id} wallet yet. \
-                     Add the {asset_id} asset to that vault in the Fireblocks console, then \
-                     try again."
-                )
-            })?;
-        let raw = first["address"].as_str().ok_or_else(|| {
-            anyhow!("Fireblocks returned no address for vault {vault_account_id}")
-        })?;
-        parse_address(raw)
+        else {
+            return Ok(None);
+        };
+        Ok(first["address"]
+            .as_str()
+            .and_then(|raw| parse_address(raw).ok()))
+    }
+
+    /// Sweep the vault's own asset list for something with an EVM address.
+    ///
+    /// Bounded: a vault can hold a lot of assets and we only need one, so stop
+    /// at the first hit and cap the probes rather than walking everything.
+    async fn any_evm_address(&self, vault_account_id: &str) -> anyhow::Result<Option<Address>> {
+        let account = self
+            .signer
+            .send(
+                reqwest::Method::GET,
+                &format!("/v1/vault/accounts/{}", vault_account_id.trim()),
+                None,
+            )
+            .await
+            .with_context(|| format!("reading Fireblocks vault account {vault_account_id}"))?;
+        let assets = account["assets"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for asset in assets.iter().take(MAX_ASSET_PROBES) {
+            let Some(id) = asset["id"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if let Ok(Some(address)) = self.evm_address_for(vault_account_id, id).await {
+                tracing::debug!(asset = id, "resolved the vault address from its EVM wallet");
+                return Ok(Some(address));
+            }
+        }
+        Ok(None)
     }
 
     /// Prove the whole path works, end to end, and time it.
@@ -615,6 +689,11 @@ const DISCOVERY_TIMEOUT_SECS: u64 = 30;
 /// asking for more than the documented value risks a 400 that would break vault
 /// listing outright — worse than one extra round trip on a large workspace.
 const VAULT_PAGE_LIMIT: usize = 200;
+/// How many of a vault's assets to probe when hunting for an EVM wallet. One
+/// hit is all we need, and a vault holding more EVM-less assets than this is
+/// not the operator wallet anyone meant to point at.
+const MAX_ASSET_PROBES: usize = 20;
+
 /// Enough for 250k vault accounts. The bound exists so a cursor bug cannot spin
 /// the panel, not because a real workspace would approach it.
 const MAX_VAULT_PAGES: usize = 500;
@@ -771,6 +850,25 @@ mod tests {
             normalize_base_url("https://eu-api.fireblocks.io/v1/"),
             "https://eu-api.fireblocks.io"
         );
+    }
+
+    /// A vault's asset wallets are mixed; only the EVM ones can be the operator
+    /// address. `parse_address` rejecting a BTC or SOL address is the test, so
+    /// those have to read as absent rather than as an error.
+    #[test]
+    fn only_an_evm_address_counts_as_a_hit() {
+        let evm = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        assert!(parse_address(evm).is_ok());
+        for other in [
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+            "DdzFFzCqrht5W8DHMAHqfp2yUMiRDLhvJHhPQRLDTrvY",
+            "",
+        ] {
+            assert!(
+                parse_address(other).is_err(),
+                "{other:?} is not an EVM address and must not be accepted"
+            );
+        }
     }
 
     #[test]
