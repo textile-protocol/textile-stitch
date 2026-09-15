@@ -364,6 +364,7 @@ const LIVE_FETCHED_PAIRS: &[&str] = &[
     "gd-usdt",
     "idr-usdt",
     "nvda-usdg",
+    "tesouro-usdc",
     "usdc-usdt",
     "wars-usdt",
     "wbrl-usdt",
