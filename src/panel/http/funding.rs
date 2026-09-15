@@ -211,15 +211,18 @@ pub struct FundingGateBody {
     pub needs_side: bool,
     /// Gas is short (or unknown).
     pub needs_gas: bool,
-    /// Nothing this bot holds can ever be valued, so this gate can never pass.
+    /// Nothing this bot holds can ever be valued in dollars.
     ///
     /// True when no pool quotes against a token on [`DOLLAR_TOKENS`]: both rows
-    /// of every pool come back unpriced, `funded` stays unknown and `needsSide`
+    /// of every pool come back unpriced, `funded` stays unknown and `needs_side`
     /// stays true whatever arrives in the wallet. It is a property of the
     /// corridor and of this build's allowlist, not of the wallet or of a feed,
-    /// so it never clears by waiting. The wizard reads this to end the Fund
-    /// step with an explanation and a way back to the corridor step, instead of
-    /// polling a wallet that cannot pass and telling the operator to add money.
+    /// so it never clears by waiting.
+    ///
+    /// It has no say in `passes`, which is gas alone. Both wizard lanes wait on
+    /// gas and leave the trading money to the bot page, so a pair nobody can
+    /// value no longer stops a setup; the flag is reported for callers that
+    /// want to explain a blank dollar figure.
     pub unpriceable: bool,
 }
 

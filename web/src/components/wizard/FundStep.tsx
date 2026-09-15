@@ -395,8 +395,8 @@ export default function FundStep({ bot, onStarted, onStartOver }: FundStepProps)
             ordinary waiting-for-money screen nothing is stuck, and a fresh
             start there would leave a created, funded, enrolled bot at neither
             ending, one orphan per press. The states that genuinely dead-end
-            (gone, unreadable, unpriceable, no address) each carry their own
-            start-over button above. */}
+            (gone, unreadable, no address) each carry their own start-over
+            button above. */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-3">
             {!busy && failure && (

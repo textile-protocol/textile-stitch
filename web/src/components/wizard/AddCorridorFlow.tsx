@@ -14,9 +14,17 @@
 //     start a bot that answers nothing on the new corridor. Enrollment re-stamps
 //     every pool and is idempotent. Nothing is asked of Textile: a confirmed
 //     email seats a maker, once, across every corridor and chain.
-//  4. The funding check, on the new corridor's own two tokens. Then the shared
-//     start runner: approve spending, check the seats, start, confirm it stayed
-//     up.
+//  4. The gas check, then the shared start runner: approve spending, check the
+//     seats, start, confirm it stayed up.
+//
+//     Gas, and nothing else. Approval is permission, not money: the new
+//     corridor's token needs a Permit2 approval before anything can settle
+//     against it, and that costs one transaction's worth of gas and no balance
+//     at all. This step used to wait for one of the corridor's two tokens to
+//     arrive first, which put the approval behind the money and left an
+//     operator adding a token they had not funded yet — the ordinary case —
+//     parked on a checklist that never moved. The trading money is the bot
+//     page's business, same as in the new-bot lane.
 //
 // It drives `useStartSequence` itself rather than mounting the Fund step. The
 // Fund step reports "live" the moment it sees a running bot, which is right for
@@ -29,14 +37,15 @@ import { formatClock } from '../../format'
 import { pairSymbols } from '../SpreadExample'
 import { Banner, Button, Card, Spinner } from '../ui'
 import EmailVerifyWait from './EmailVerifyWait'
-import { AddressBlock, GasRow, TokenRow, VaultAddress } from './FundingRows'
+import { AddressBlock, ApprovalRow, GasRow, VaultAddress, orderedTokens } from './FundingRows'
 import ProgressList, { type ProgressRow } from './ProgressList'
-import { pairFunded, templatePair, templateSpreads } from './candidates'
+import { templatePair, templateSpreads } from './candidates'
 import { type FundOutcome } from './FundStep'
+import { gateReasons } from './fundMachine'
 import { clearAddResume, saveAddResume } from './resume'
 import { errorText, useStartSequence } from './useStartSequence'
 import { add, botRunState, fund, progress as progressCopy } from './wizardCopy'
-import type { Corridor, Funding, FundingToken, SaveResult, Spread } from '../../types'
+import type { Corridor, Funding, SaveResult, Spread } from '../../types'
 
 export interface AddCorridorFlowProps {
   bot: string
@@ -160,22 +169,15 @@ export default function AddCorridorFlow({
   // that was read, and on a retry the add result that carried them is gone.
   const patchPairRef = useRef<{ collateral: string; debt: string } | null>(null)
 
+  // The new corridor's own two rows. Nothing gates on them — they are what the
+  // ending says about the money behind the corridor, which is the bot page's
+  // business from there on.
   const softRow = pair
     ? (funding?.tokens.find((t) => t.token.toLowerCase() === pair.collateral) ?? null)
     : null
   const stableRow = pair
     ? (funding?.tokens.find((t) => t.token.toLowerCase() === pair.debt) ?? null)
     : null
-  // This corridor is quoted against something the panel has no dollar price
-  // for, so neither of its rows can ever be valued and the funding check
-  // refuses whatever arrives. Read off the side the pool is quoted in, which is
-  // the one that decides: `gate.unpriceable` only speaks for the whole bot, and
-  // a sibling corridor holding USDT keeps it false. Not "add money": no amount
-  // of either token changes this answer, so the lane says so and stops polling
-  // instead of asking for some every five seconds forever.
-  const pairUnpriceable =
-    funding !== null &&
-    (stableRow?.unpriceable === true || (pair === null && funding.gate.unpriceable))
 
   const runner = useStartSequence(bot, {
     onFunding: (next) => {
@@ -206,7 +208,9 @@ export default function AddCorridorFlow({
       setFunding(next)
       setFundingError(null)
       setCheckedAt(Date.now())
-      if (pairFunded(next, pair)) {
+      // The server's gate, which is gas covering the approvals still
+      // outstanding and nothing else. The token sides are not asked about here.
+      if (next.gate.passes) {
         setPhase('running')
         startRun()
       } else {
@@ -217,8 +221,6 @@ export default function AddCorridorFlow({
       setFundingError(errorText(e))
       setPhase('funding')
     }
-    // `pair` is derived from the corridor prop, which does not change here.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bot, startRun])
 
   // The writes, once per attempt. Retry bumps `attempt`; a step already done
@@ -339,13 +341,12 @@ export default function AddCorridorFlow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attempt])
 
-  // Watch the wallet until the new corridor has a side it can quote. Stops on a
-  // corridor the panel can't value: that answer is the same every time.
+  // Watch the wallet until it holds the gas the approvals need.
   useEffect(() => {
-    if (phase !== 'funding' || pairUnpriceable) return
+    if (phase !== 'funding') return
     const id = window.setInterval(() => void readFunding(), POLL_MS)
     return () => window.clearInterval(id)
-  }, [phase, pairUnpriceable, readFunding])
+  }, [phase, readFunding])
 
   function retry() {
     setFailedStep(null)
@@ -372,10 +373,20 @@ export default function AddCorridorFlow({
   }
 
   const symbols = pairSymbols(corridor.displayName)
-  const waitingForMoney = phase === 'funding' && !pairUnpriceable
+  const waitingForGas = phase === 'funding'
+  // The token rows and the money sentences are the vault's balance on a vault
+  // maker. The address block stays the signing key, because that is what pays
+  // for transactions and the only address here anyone should send to — but
+  // then it can no longer be introduced as where the corridor's money goes.
+  const vaulted = funding?.capitalSource === 'vault'
   // Live on the buy side only: the wallet has the stable but not the soft
   // token, so the bot can buy and has nothing to sell. Worth one sentence.
   const oneSided = softRow?.funded !== true && stableRow?.funded === true
+  // Both sides read, both short. The corridor is set up and the bot quotes it
+  // the moment money lands, so this is the one thing left to say, and it is
+  // said here at the ending rather than waited on before the approval. Only on
+  // a `false`: a row the panel could not value says nothing about the wallet.
+  const unfunded = softRow?.funded === false && stableRow?.funded === false
 
   // The ending: the bot's own page, or the confirm-your-email screen.
   if (phase === 'done' && outcome) {
@@ -383,7 +394,16 @@ export default function AddCorridorFlow({
       <div className="space-y-4">
         {oneSided && symbols && (
           <Banner tone="info">
-            {add.oneSided(bot, symbols.base, symbols.quote)}
+            {vaulted
+              ? add.oneSidedVault(bot, symbols.base, symbols.quote)
+              : add.oneSided(bot, symbols.base, symbols.quote)}
+          </Banner>
+        )}
+        {unfunded && symbols && (
+          <Banner tone="info">
+            {vaulted
+              ? add.unfundedVault(bot, symbols.base, symbols.quote)
+              : add.unfunded(bot, symbols.base, symbols.quote)}
           </Banner>
         )}
         {/* Not once the bot is up: the runner started it, and a banner telling
@@ -423,11 +443,6 @@ export default function AddCorridorFlow({
   const failure = seq.failure
   const gasSymbol = funding?.gas.symbol ?? 'gas'
   const address = funding?.operatorAddress ?? null
-  // The token rows and the gate below are the vault's balance on a vault
-  // maker. The address block stays the signing key, because that is what pays
-  // for transactions and the only address here anyone should send to — but
-  // then it can no longer be introduced as where the corridor's money goes.
-  const vaulted = funding?.capitalSource === 'vault'
 
   const rows: ProgressRow[] = [
     {
@@ -482,22 +497,9 @@ export default function AddCorridorFlow({
     )
   }
 
-  const needs: string[] = []
-  if (funding && waitingForMoney) {
-    const symbolsHere = [softRow?.symbol, stableRow?.symbol].filter(
-      (s): s is string => !!s,
-    )
-    if (softRow?.funded !== true && stableRow?.funded !== true && symbolsHere.length > 0) {
-      needs.push(
-        vaulted
-          ? fund.needsSideVault(funding.gate.minTokenUsd, symbolsHere)
-          : fund.needsSide(funding.gate.minTokenUsd, symbolsHere),
-      )
-    }
-    if (funding.gas.ok === false) {
-      needs.push(fund.needsGas(funding.gate.minGasUsd, funding.gas.symbol))
-    }
-  }
+  // The same sentences the Fund step prints under the same gate, so the two
+  // lanes never word the gas ask differently.
+  const needs = funding && waitingForGas ? gateReasons(funding, fund) : []
 
   return (
     <Card title={add.workTitle(corridor.displayName, bot)}>
@@ -552,55 +554,38 @@ export default function AddCorridorFlow({
           </Banner>
         )}
 
-        {/* The corridor is written and Textile has it, and the panel cannot
-            price either of its sides, so the check it would wait on can never
-            pass. Terminal, like the Fund step's own version of this screen: an
-            address to send to would be asking for money that cannot help. */}
-        {phase === 'funding' && pairUnpriceable && funding && (
-          <Banner tone="warning">
-            <div className="space-y-2">
-              <p className="font-bold">{add.unpriceableTitle}</p>
-              <p>
-                {add.unpriceable(
-                  corridor.displayName,
-                  bot,
-                  [softRow?.symbol, stableRow?.symbol].filter(
-                    (s): s is string => !!s,
-                  ),
-                )}
-              </p>
-              <p>{add.unpriceableNext(bot)}</p>
-              <div>
-                <Button variant="primary" onClick={onOpenBot}>
-                  {add.openBot}
-                </Button>
-              </div>
-            </div>
-          </Banner>
-        )}
-
-        {/* The new corridor has no side it can quote yet. Not a skip and not a
-            warning to click past: the flow ends at a live corridor, so it waits
-            here and starts on its own the moment money lands. */}
-        {waitingForMoney && funding && address && (
+        {/* Not enough gas to pay for the approvals the new corridor needs.
+            The only thing this screen ever waits on: the corridor is already
+            on disk and Textile already has it, and the trading money behind it
+            belongs to the bot page. It starts on its own the moment the gas
+            lands. */}
+        {waitingForGas && funding && address && (
           <AddressBlock funding={funding} address={address} />
         )}
 
-        {waitingForMoney && funding && vaulted && (
+        {/* On a vault maker the address above is the signing key and nothing
+            else: gas is exactly what it is being asked for here, and the
+            corridor's own money is the vault's, which is shown to be read
+            rather than sent to. */}
+        {waitingForGas && funding && vaulted && (
           <p className="text-sm text-muted">
             {fund.vaultCapital(funding.gas.symbol)} <VaultAddress funding={funding} />
           </p>
         )}
 
-        {waitingForMoney && funding && (
+        {waitingForGas && funding && (
           <ul className="divide-y divide-line-soft rounded-lg border border-line-soft">
-            {[softRow, stableRow]
-              .filter((t): t is FundingToken => t !== null)
+            <GasRow funding={funding} />
+            {orderedTokens(funding)
+              .filter((t) => t.approvalNeeded)
               .map((t) => (
-                <TokenRow key={t.token} token={t} />
+                <ApprovalRow key={t.token} token={t} />
               ))}
-            <GasRow funding={funding} pill={false} />
           </ul>
+        )}
+
+        {waitingForGas && funding && (
+          <p className="text-sm">{fund.gate(funding.gate.minGasUsd, funding.gas.symbol)}</p>
         )}
 
         {needs.length > 0 && (
@@ -611,15 +596,9 @@ export default function AddCorridorFlow({
           </ul>
         )}
 
-        {waitingForMoney && oneSided && symbols && (
-          <p className="text-sm text-muted">
-            {add.oneSided(bot, symbols.base, symbols.quote)}
-          </p>
-        )}
-
         {fundingError && <Banner tone="warning">{add.fundingUnreadable(fundingError)}</Banner>}
 
-        {waitingForMoney && (
+        {waitingForGas && (
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="flex items-center gap-2 text-xs text-faint">
               {!funding && <Spinner />}

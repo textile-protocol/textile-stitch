@@ -9,11 +9,6 @@
 export const CONTACT_EMAIL = 'contact@textilecredit.com'
 export const TELEGRAM = 't.me/TextileNigeria'
 
-/** `USDT or cNGN`, `USDT, cNGN or wBRL`. */
-export function joinOr(items: string[]): string {
-  return joinWith(items, 'or')
-}
-
 /** `USDT and cNGN`. */
 export function joinAnd(items: string[]): string {
   return joinWith(items, 'and')
@@ -85,15 +80,6 @@ export const fund = {
 
   gate: (minGas: number, gas: string) =>
     `Ready when the wallet holds ${dollars(minGas)} of ${gas} for gas.`,
-  needsSide: (min: number, symbols: string[]) =>
-    `Add at least ${dollars(min)} of ${joinOr(symbols)} to the bot wallet.`,
-  /**
-   * The same gate for a vault maker, as a condition rather than an errand: its
-   * corridor tokens arrive through the vault's own deposits, and a transfer to
-   * the vault address buys no shares, so nobody is told to send anything.
-   */
-  needsSideVault: (min: number, symbols: string[]) =>
-    `The vault needs at least ${dollars(min)} of ${joinOr(symbols)} before this corridor can quote.`,
   /** Why the address above is only half the story on a vault maker. */
   vaultCapital: (gas: string) =>
     `This bot quotes from an OperatorVault, so its corridor tokens come from the vault, not from the address above. Send that address ${gas} for gas only.`,
@@ -268,31 +254,51 @@ export const add = {
    */
   oneSided: (bot: string, soft: string, stable: string) =>
     `${bot} can buy ${soft} with the ${stable} already there. Send ${soft} to the same wallet if you also want it to sell.`,
+  /**
+   * The same fact on a vault maker, as a condition rather than an errand. Its
+   * corridor tokens arrive as deposits through the vault's own epochs, and a
+   * plain transfer to the vault mints no shares, so nobody is told to send
+   * anything anywhere.
+   */
+  oneSidedVault: (bot: string, soft: string, stable: string) =>
+    `${bot} can buy ${soft} with the ${stable} the vault holds. It sells ${soft} once the vault holds some of that too.`,
 
   /**
-   * The corridor is written and enrolled, and the panel has no dollar price for
-   * either of its sides, so the funding check can never pass. A property of the
-   * corridor, not of the wallet: asking for money here would ask for money that
-   * cannot help. The Fund step ends the same way for a new bot.
+   * Set up, approved, and nothing behind either side yet. Said at the ending
+   * rather than waited on before the approval: the approval costs gas and no
+   * balance, and money that has not arrived is the bot page's business.
    */
-  unpriceableTitle: "This corridor can't be checked here",
-  unpriceable: (label: string, bot: string, symbols: string[]) =>
-    `${label} is on ${bot} and Textile has it. The panel checks a wallet by pricing it in dollars, and it has no dollar price for ${joinAnd(symbols)}, so it can't tell whether there is enough behind this corridor to quote it. Sending money does not change that.`,
-  unpriceableNext: (bot: string) =>
-    `Open ${bot} from the fleet to start it and watch its logs. Its other corridors are not affected. To take this one off again, use Corridors on the bot page.`,
+  unfunded: (bot: string, soft: string, stable: string) =>
+    `Nothing is behind this corridor yet. Send ${soft} or ${stable} to ${bot}'s wallet and it starts quoting. The Funds tab on the bot page is where that happens.`,
+  /** The same ending on a vault maker. Same rule as `oneSidedVault`: a
+      condition the vault meets, never an address to send to. */
+  unfundedVault: (bot: string, soft: string, stable: string) =>
+    `Nothing is behind this corridor yet. ${bot} quotes from an OperatorVault, so it starts quoting once the vault holds ${soft} or ${stable}.`,
 
   retry: 'Retry',
   back: 'Back',
 }
 
 export const progress = {
-  /** `state` is the row's progress state; the chain is still being read while `running` with no symbols. */
+  /**
+   * `state` is the row's progress state; the chain is still being read while
+   * `running` with no symbols.
+   *
+   * "Spending already approved" belongs to `skipped` alone, which is the chain
+   * saying there was nothing to approve. On a `pending` row it is a claim about
+   * a read nobody has made yet, and it reads as "nothing to do here" on a
+   * screen that has not moved — which is how an operator adding a corridor
+   * whose token had never been approved came to sit on this step waiting for
+   * something the row told them was already done.
+   */
   approveTitle: (symbols: string[], state: string) =>
     symbols.length > 0
       ? `Approve spending for ${joinAnd(symbols)}`
       : state === 'running'
         ? 'Check spending approval'
-        : 'Spending already approved',
+        : state === 'skipped'
+          ? 'Spending already approved'
+          : 'Approve spending',
   approveSub:
     "Lets Textile's swap contract (Permit2) move the bot's tokens. The bot quotes both sides of the pair, so both tokens are approved, with one small gas fee each. Usually under a minute, up to two.",
   accessTitle: 'Check your Textile seats',

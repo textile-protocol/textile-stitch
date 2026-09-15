@@ -459,14 +459,17 @@ export interface FundingGate {
   /** `gas.ok === false`. */
   needsGas: boolean
   /**
-   * This gate can never pass, whatever arrives in the wallet.
+   * Nothing this bot holds can ever be valued in dollars.
    *
    * The panel values a pool's two sides off its debt token, and only when that
    * token is a dollar stable it knows. On a corridor quoted against anything
    * else (Textile lists `cNGN / GD` on Celo, quoted in GoodDollar) both rows
    * come back unpriced and `needsSide` stays true forever. It is a property of
-   * the pair, not of the wallet or of a feed, so it never clears by waiting:
-   * the Fund step ends here and sends the operator back to pick another pair.
+   * the pair, not of the wallet or of a feed, so it never clears by waiting.
+   *
+   * It says nothing about `passes`, which is gas alone: both wizard lanes wait
+   * on gas and hand the trading money to the bot page, so an unvaluable pair no
+   * longer stops anyone. Nothing in the UI reads this today.
    */
   unpriceable: boolean
 }

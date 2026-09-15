@@ -284,22 +284,3 @@ function compare(a: Candidate, b: Candidate): number {
   if (a.bot.running !== b.bot.running) return a.bot.running ? -1 : 1
   return a.bot.name.localeCompare(b.bot.name)
 }
-
-/**
- * Can this bot quote the new corridor at all?
- *
- * Deliberately not `funding.gate.passes`: that is already true on any bot whose
- * sibling corridor holds USDT, which is nearly all of them, so it would wave
- * through a corridor with nothing behind either side. This asks the narrower
- * question the new corridor actually turns on: one of ITS two tokens funded,
- * plus gas. `funded === null` is a failed price read, not a yes.
- */
-export function pairFunded(funding: Funding, pair: TokenPair | null): boolean {
-  if (funding.gas.ok === false) return false
-  // `gate.passes` is gas-only now (Approve asks for gas, Live waits for
-  // money), so it no longer says anything about tokens. Ask the rows.
-  if (!pair) return funding.gate.fundedTokens.length > 0
-  const row = (address: string) =>
-    funding.tokens.find((t) => t.token.toLowerCase() === address)
-  return row(pair.collateral)?.funded === true || row(pair.debt)?.funded === true
-}
