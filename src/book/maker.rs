@@ -153,6 +153,9 @@ impl Side {
 pub struct TickCtx<'a> {
     pub poster: &'a Poster<'a>,
     pub wallet: &'a crate::chain::rpc::Wallet,
+    /// How the tick's chain reads go out — resolved once at startup so a
+    /// per-tick probe isn't itself a request. See [`crate::chain::multicall`].
+    pub reader: crate::chain::multicall::Batcher,
     pub state_path: &'a Path,
 }
 
@@ -417,6 +420,7 @@ async fn capped_input(
     funded_input_cap(
         poster.indexer,
         ctx.wallet,
+        ctx.reader,
         poster.chain_id,
         poster.maker,
         input_token,

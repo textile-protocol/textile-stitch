@@ -29,6 +29,7 @@ use stitch_bot::book::taker::{resolve_fee_bps, take_pool_once, TakeOutcome, Take
 use stitch_bot::chain::approve::{
     ensure_maker_is_plain_eoa, run_approvals, unapproved_tokens, ApprovalMode,
 };
+use stitch_bot::chain::multicall::Batcher;
 use stitch_bot::chain::rpc::Wallet;
 use stitch_bot::closer::discover::Discoverer;
 use stitch_bot::closer::executor::encode_balance_of;
@@ -715,9 +716,24 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         slot_inputs,
         slot_deadlines,
     };
+    // Probed once: the ladder's per-token balance and allowance ride in one
+    // request where Multicall3 exists, and fall back to one call each where it
+    // does not. A node that is down at startup just gets the slow path.
+    let reader = match Batcher::detect(wallet.rpc()).await {
+        Ok(reader) => reader,
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                "could not probe for Multicall3; ladder reads go out one call at a time"
+            );
+            Batcher::sequential()
+        }
+    };
+    info!(batched = reader.is_batched(), "ladder chain reads resolved");
     let ctx = TickCtx {
         poster: &poster,
         wallet: &wallet,
+        reader,
         state_path: &slot_nonce_state_path,
     };
     // Sides quoting "max" liquidity target an even share of each token's funded

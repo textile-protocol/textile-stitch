@@ -15,11 +15,12 @@
 
 use std::collections::HashMap;
 
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, U256};
 use anyhow::Context;
 use tracing::{info, warn};
 
 use crate::chain::approve::{buy_input_amount, sell_input_amount};
+use crate::chain::multicall::{decode_uint, Batcher, Call};
 use crate::chain::rpc::Wallet;
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{parse_liquidity_amount, Config, LiquidityAmount};
@@ -133,25 +134,38 @@ pub fn take_max_share(
 
 /// `min(balance, Permit2 allowance)` on-chain minus nothing yet — the fresh
 /// budget for a token, with the indexer's live commitments attached.
+///
+/// The balance and the allowance go out together: they are read once per
+/// token per tick and there is no reason to pay two round trips for a pair
+/// that has to agree on a block anyway. `reader` is resolved once by the
+/// caller (see [`crate::chain::multicall`]).
 async fn read_funded_budget(
     indexer: &Indexer,
     wallet: &Wallet,
+    reader: Batcher,
     chain_id: u64,
     maker: Address,
     token: Address,
     permit2: Address,
 ) -> anyhow::Result<FundedInputBudget> {
-    let balance = wallet
-        .read_uint(token, &Bytes::from(encode_balance_of(wallet.address())))
-        .await
-        .context("could not read funded input")?;
-    let allowance = wallet
-        .read_uint(
-            token,
-            &Bytes::from(encode_allowance(wallet.address(), permit2)),
+    let results = reader
+        .read(
+            wallet.rpc(),
+            &[
+                Call::new(token, encode_balance_of(wallet.address())),
+                Call::new(token, encode_allowance(wallet.address(), permit2)),
+            ],
         )
         .await
         .context("could not read funded input")?;
+    let word = |i: usize| -> anyhow::Result<U256> {
+        results
+            .get(i)
+            .and_then(|r| r.as_ref())
+            .map(decode_uint)
+            .context("could not read funded input")
+    };
+    let (balance, allowance) = (word(0)?, word(1)?);
     let committed = indexer
         .committed_input(chain_id, &maker.to_string(), &token.to_string())
         .await
@@ -204,6 +218,7 @@ pub fn cap_input_liquidity(configured: InputLiquidity, available: U256) -> anyho
 pub async fn funded_input_cap(
     indexer: &Indexer,
     wallet: &Wallet,
+    reader: Batcher,
     chain_id: u64,
     maker: Address,
     token: Address,
@@ -216,7 +231,7 @@ pub async fn funded_input_cap(
     label: &str,
 ) -> Option<u128> {
     if let std::collections::hash_map::Entry::Vacant(e) = budgets.funded_inputs.entry(token) {
-        match read_funded_budget(indexer, wallet, chain_id, maker, token, permit2).await {
+        match read_funded_budget(indexer, wallet, reader, chain_id, maker, token, permit2).await {
             Ok(budget) => {
                 e.insert(budget);
             }

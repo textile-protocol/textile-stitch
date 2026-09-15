@@ -50,7 +50,8 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::book::taker::encode_order_bytes;
-use crate::chain::rpc::Wallet;
+use crate::chain::multicall::{decode_uint, Batcher, Call};
+use crate::chain::rpc::{Rpc, Wallet};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
@@ -110,9 +111,22 @@ pub struct RfqRuntime {
 }
 
 /// How old a wallet reading may be before a `max` side goes dark.
-/// The refresh loop runs every second; 3s covers one missed tick plus RPC
-/// slop. Fail closed: a stale or missing reading is no inventory.
+/// Fail closed: a stale or missing reading is no inventory.
 const INVENTORY_TTL_SECS: u64 = 3;
+
+/// How often the refresh loop re-reads the wallet.
+///
+/// Every tick is RPC we pay for and nothing here moves between blocks except
+/// when we trade, so the cadence is set by the TTL above rather than by how
+/// fresh we could be: one full cycle plus a round trip has to land inside
+/// [`INVENTORY_TTL_SECS`] or a side goes dark between refreshes. 2s leaves a
+/// second of slack and halves what the loop cost at 1s.
+const INVENTORY_REFRESH_SECS: u64 = 2;
+
+// A refresh slower than the TTL takes every `max` side dark between cycles.
+// Checked here rather than in a test: the two numbers are only ever changed
+// together, and this refuses to build instead of failing later.
+const _: () = assert!(INVENTORY_REFRESH_SECS < INVENTORY_TTL_SECS);
 
 /// Latest `min(balance, Permit2 allowance)` per token, shared between the
 /// refresh loop and the session task. Quote path only reads — never waits
@@ -1664,22 +1678,51 @@ async fn price_loop(url: String, cache: PriceCache) {
 /// corridor both channels quote the whole wallet, and the venue's
 /// `reserveReply` counts firm quotes against firm quotes only. In-flight RFQ
 /// quotes are still netted off, in [`reserve`].
-async fn read_funded(wallet: &Wallet, permit2: Address, token: Address) -> anyhow::Result<U256> {
-    let owner = wallet.address();
-    let balance = wallet
-        .read_uint(token, &Bytes::from(encode_balance_of(owner)))
-        .await
-        .context("reading RFQ token balance")?;
-    let allowance = wallet
-        .read_uint(token, &Bytes::from(encode_allowance(owner, permit2)))
-        .await
-        .context("reading RFQ Permit2 allowance")?;
-    Ok(balance.min(allowance))
+///
+/// Two reads per token, every token in one batch. A bot seated on five
+/// corridors holds six tokens, which was twelve round trips a second before
+/// this was a batch.
+fn funded_calls(owner: Address, permit2: Address, tokens: &[Address]) -> Vec<Call> {
+    tokens
+        .iter()
+        .flat_map(|token| {
+            [
+                Call::new(*token, encode_balance_of(owner)),
+                Call::new(*token, encode_allowance(owner, permit2)),
+            ]
+        })
+        .collect()
 }
 
-/// Refresh quotable amounts for every `max` token, once a second. A failed
-/// read leaves the previous value in place; the TTL then fails the side
-/// closed instead of quoting a stale high balance forever.
+/// `min(balance, allowance)` per token, in `tokens` order. A token whose pair
+/// of reads did not both come back is `None`: it keeps its last reading until
+/// the TTL drops it, rather than reading as zero and taking the side dark on
+/// one reverting token.
+fn decode_funded(tokens: &[Address], results: &[Option<Bytes>]) -> Vec<(Address, Option<U256>)> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, token)| {
+            let funded = match (results.get(i * 2), results.get(i * 2 + 1)) {
+                (Some(Some(balance)), Some(Some(allowance))) => {
+                    Some(decode_uint(balance).min(decode_uint(allowance)))
+                }
+                _ => None,
+            };
+            (*token, funded)
+        })
+        .collect()
+}
+
+/// Refresh quotable amounts for every `max` token on a timer. A failed read
+/// leaves the previous value in place; the TTL then fails the side closed
+/// instead of quoting a stale high balance forever.
+///
+/// Every cycle is one batched request where it used to be one per view (see
+/// [`crate::chain::multicall`]). The batcher is probed once and then reused;
+/// a probe that cannot reach the node reads one call at a time for that cycle
+/// and tries again on the next, rather than pinning the process to the
+/// expensive path because the node blipped at startup.
 #[allow(clippy::too_many_arguments)]
 async fn inventory_loop(
     wallet: Wallet,
@@ -1692,10 +1735,28 @@ async fn inventory_loop(
     vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
 ) {
     let mut vault_pair: Option<(Address, Address, Address, u64)> = None;
+    let mut batcher: Option<Batcher> = None;
     loop {
+        if batcher.is_none() {
+            match Batcher::detect(wallet.rpc()).await {
+                Ok(resolved) => {
+                    info!(
+                        batched = resolved.is_batched(),
+                        "rfq inventory reads resolved"
+                    );
+                    batcher = Some(resolved);
+                }
+                Err(e) => debug!(
+                    error = %format!("{e:#}"),
+                    "could not probe for Multicall3; reading one call at a time this cycle"
+                ),
+            }
+        }
+        let reader = batcher.unwrap_or_else(Batcher::sequential);
+
         if vault_pair.is_none() {
             if let Some(address) = vault {
-                match read_vault_assets(&wallet, address).await {
+                match read_vault_assets(wallet.rpc(), reader, address).await {
                     Ok(pair) => vault_pair = Some((address, pair.0, pair.1, pair.2)),
                     Err(e) => warn!(
                         error = %format!("{e:#}"),
@@ -1706,7 +1767,8 @@ async fn inventory_loop(
         }
         if let Some((address, settlement, corridor, max_lifetime)) = vault_pair {
             match read_vault_inventory(
-                &wallet,
+                wallet.rpc(),
+                reader,
                 permit2,
                 address,
                 vault_order_executor,
@@ -1741,113 +1803,141 @@ async fn inventory_loop(
                 ),
             }
         } else if vault.is_none() {
-            for token in &tokens {
-                match read_funded(&wallet, permit2, *token).await {
-                    Ok(funded) => cache.set(*token, funded, unix_now()),
-                    Err(e) => warn!(
-                        token = %token,
-                        error = %format!("{e:#}"),
-                        "rfq inventory refresh failed; last reading kept until TTL"
-                    ),
+            let calls = funded_calls(wallet.address(), permit2, &tokens);
+            match reader.read(wallet.rpc(), &calls).await {
+                Ok(results) => {
+                    let now = unix_now();
+                    for (token, funded) in decode_funded(&tokens, &results) {
+                        match funded {
+                            Some(funded) => cache.set(token, funded, now),
+                            // One token reverting must not cost the others
+                            // their refresh, which is why the batch allows
+                            // failures instead of failing whole.
+                            None => warn!(
+                                token = %token,
+                                "rfq inventory read failed for this token; last reading kept until TTL"
+                            ),
+                        }
+                    }
                 }
+                Err(e) => warn!(
+                    error = %format!("{e:#}"),
+                    "rfq inventory refresh failed; last reading kept until TTL"
+                ),
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(INVENTORY_REFRESH_SECS)).await;
     }
 }
 
-async fn read_vault_assets(
-    wallet: &Wallet,
-    vault: Address,
-) -> anyhow::Result<(Address, Address, u64)> {
-    let settlement = address_from_word(
-        wallet
-            .read_uint(vault, &Bytes::from(encode_settlement_asset()))
-            .await
-            .context("reading vault settlementAsset")?,
-    );
-    let corridor = address_from_word(
-        wallet
-            .read_uint(vault, &Bytes::from(encode_corridor_asset()))
-            .await
-            .context("reading vault corridorAsset")?,
-    );
+/// The vault's two assets and its order-lifetime cap — fixed at deploy, so
+/// this is read once and kept.
+fn vault_asset_calls(vault: Address) -> Vec<Call> {
+    vec![
+        Call::new(vault, encode_settlement_asset()),
+        Call::new(vault, encode_corridor_asset()),
+        Call::new(vault, encode_max_order_lifetime()),
+    ]
+}
+
+/// Every answer is required: without all three there is no pair to quote, so
+/// a missing one is an error rather than a zero.
+fn decode_vault_assets(results: &[Option<Bytes>]) -> anyhow::Result<(Address, Address, u64)> {
+    let word = |i: usize, what: &str| -> anyhow::Result<U256> {
+        results
+            .get(i)
+            .and_then(|r| r.as_ref())
+            .map(decode_uint)
+            .ok_or_else(|| anyhow::anyhow!("reading vault {what}"))
+    };
+    let settlement = address_from_word(word(0, "settlementAsset")?);
+    let corridor = address_from_word(word(1, "corridorAsset")?);
     anyhow::ensure!(
         !settlement.is_zero() && !corridor.is_zero(),
         "vault assets unset"
     );
-    let max_lifetime = wallet
-        .read_uint(vault, &Bytes::from(encode_max_order_lifetime()))
-        .await
-        .context("reading maxOrderLifetime")?
-        .to::<u64>();
+    let max_lifetime = word(2, "maxOrderLifetime")?.to::<u64>();
     anyhow::ensure!(max_lifetime > 0, "vault maxOrderLifetime is zero");
     Ok((settlement, corridor, max_lifetime))
 }
 
-async fn read_vault_inventory(
-    wallet: &Wallet,
+async fn read_vault_assets(
+    rpc: &Rpc,
+    reader: Batcher,
+    vault: Address,
+) -> anyhow::Result<(Address, Address, u64)> {
+    let results = reader.read(rpc, &vault_asset_calls(vault)).await?;
+    decode_vault_assets(&results)
+}
+
+/// The ten views a vault maker quotes off, in one batch. `settlement` and
+/// `corridor` are the vault's own assets, already resolved — the two
+/// allowances are the vault's Permit2 approvals on them.
+fn vault_inventory_calls(
     permit2: Address,
     vault: Address,
-    order_executor: Option<Address>,
     settlement: Address,
     corridor: Address,
+) -> Vec<Call> {
+    vec![
+        Call::new(vault, encode_quotable_settlement()),
+        Call::new(vault, encode_liquid_settlement()),
+        Call::new(vault, encode_quotable_corridor()),
+        Call::new(vault, encode_max_order_input_settlement()),
+        Call::new(vault, encode_max_order_input_corridor()),
+        Call::new(vault, encode_close_only()),
+        Call::new(vault, encode_paused()),
+        Call::new(vault, encode_trading_epoch()),
+        Call::new(settlement, encode_allowance(vault, permit2)),
+        Call::new(corridor, encode_allowance(vault, permit2)),
+    ]
+}
+
+/// `(quotable settlement, quotable corridor, epoch, per-order caps)`.
+///
+/// Quotable prices liquid + yield-adapter holdings. validateEnvelope admits
+/// settlement input only up to min(quotable, liquid) *at fill time*: with an
+/// executor listed on the order, `VaultOrderExecutor.fill` recalls from the
+/// adapter first, so the whole position is fillable and publishing only the
+/// liquid part would hide a staked vault's inventory. Without one the fill is
+/// a direct reactor call that cannot recall, so publishing the larger number
+/// signs sizes the vault will reject.
+///
+/// Every view is required. A partial answer cannot be applied — quoting
+/// without `paused` or `closeOnly` is quoting through a stop — so a missing
+/// one fails the refresh and the TTL takes the vault dark.
+fn decode_vault_inventory(
+    results: &[Option<Bytes>],
+    executor_routed: bool,
 ) -> anyhow::Result<(U256, U256, u64, U256, U256)> {
-    let quotable_settlement = wallet
-        .read_uint(vault, &Bytes::from(encode_quotable_settlement()))
-        .await
-        .context("reading quotableSettlement")?;
-    // Quotable prices liquid + yield-adapter holdings. validateEnvelope admits
-    // settlement input only up to min(quotable, liquid) *at fill time*: with
-    // an executor listed on the order, `VaultOrderExecutor.fill` recalls from
-    // the adapter first, so the whole position is fillable and publishing
-    // only the liquid part would hide a staked vault's inventory. Without one
-    // the fill is a direct reactor call that cannot recall, so publishing the
-    // larger number signs sizes the vault will reject.
-    let liquid_settlement = wallet
-        .read_uint(vault, &Bytes::from(encode_liquid_settlement()))
-        .await
-        .context("reading liquidSettlement")?;
-    let settlement_qty = quotable_settlement_for_route(
-        quotable_settlement,
-        liquid_settlement,
-        order_executor.is_some(),
-    );
-    let corridor_qty = wallet
-        .read_uint(vault, &Bytes::from(encode_quotable_corridor()))
-        .await
-        .context("reading quotableCorridor")?;
-    let max_settlement = wallet
-        .read_uint(vault, &Bytes::from(encode_max_order_input_settlement()))
-        .await
-        .context("reading maxOrderInputSettlement")?;
-    let max_corridor = wallet
-        .read_uint(vault, &Bytes::from(encode_max_order_input_corridor()))
-        .await
-        .context("reading maxOrderInputCorridor")?;
-    let close_only = !wallet
-        .read_uint(vault, &Bytes::from(encode_close_only()))
-        .await
-        .context("reading closeOnly")?
-        .is_zero();
-    let paused = !wallet
-        .read_uint(vault, &Bytes::from(encode_paused()))
-        .await
-        .context("reading paused")?
-        .is_zero();
-    let epoch = wallet
-        .read_uint(vault, &Bytes::from(encode_trading_epoch()))
-        .await
-        .context("reading tradingEpoch")?
-        .to::<u64>();
-    let settlement_allowance = wallet
-        .read_uint(settlement, &Bytes::from(encode_allowance(vault, permit2)))
-        .await
-        .context("reading vault settlement Permit2 allowance")?;
-    let corridor_allowance = wallet
-        .read_uint(corridor, &Bytes::from(encode_allowance(vault, permit2)))
-        .await
-        .context("reading vault corridor Permit2 allowance")?;
+    const VIEWS: [&str; 10] = [
+        "quotableSettlement",
+        "liquidSettlement",
+        "quotableCorridor",
+        "maxOrderInputSettlement",
+        "maxOrderInputCorridor",
+        "closeOnly",
+        "paused",
+        "tradingEpoch",
+        "settlement Permit2 allowance",
+        "corridor Permit2 allowance",
+    ];
+    let word = |i: usize| -> anyhow::Result<U256> {
+        results
+            .get(i)
+            .and_then(|r| r.as_ref())
+            .map(decode_uint)
+            .ok_or_else(|| anyhow::anyhow!("reading vault {}", VIEWS[i]))
+    };
+    let settlement_qty = quotable_settlement_for_route(word(0)?, word(1)?, executor_routed);
+    let corridor_qty = word(2)?;
+    let max_settlement = word(3)?;
+    let max_corridor = word(4)?;
+    let close_only = !word(5)?.is_zero();
+    let paused = !word(6)?.is_zero();
+    let epoch = word(7)?.to::<u64>();
+    let settlement_allowance = word(8)?;
+    let corridor_allowance = word(9)?;
     let (settlement_qty, corridor_qty) =
         apply_vault_order_policy(settlement_qty, corridor_qty, close_only, paused);
     Ok((
@@ -1857,6 +1947,20 @@ async fn read_vault_inventory(
         max_settlement,
         max_corridor,
     ))
+}
+
+async fn read_vault_inventory(
+    rpc: &Rpc,
+    reader: Batcher,
+    permit2: Address,
+    vault: Address,
+    order_executor: Option<Address>,
+    settlement: Address,
+    corridor: Address,
+) -> anyhow::Result<(U256, U256, u64, U256, U256)> {
+    let calls = vault_inventory_calls(permit2, vault, settlement, corridor);
+    let results = reader.read(rpc, &calls).await?;
+    decode_vault_inventory(&results, order_executor.is_some())
 }
 
 #[cfg(test)]
@@ -1873,6 +1977,158 @@ mod tests {
 
     const COLLATERAL: &str = "0x0000000000000000000000000000000000000001";
     const DEBT: &str = "0x0000000000000000000000000000000000000002";
+
+    // --- inventory reads -------------------------------------------------
+    //
+    // These used to be one `eth_call` per view on a one-second loop. They are
+    // one batch now, so what is worth pinning is that the batch is decoded
+    // into the same numbers, in the right order, and that a hole in it is
+    // never read as a zero — a zero here is "quote nothing", and a wrong zero
+    // would take a funded maker off the market.
+
+    fn word(v: u64) -> Option<Bytes> {
+        Some(Bytes::from(U256::from(v).to_be_bytes::<32>().to_vec()))
+    }
+
+    #[test]
+    fn funded_calls_are_a_balance_and_an_allowance_per_token_in_order() {
+        let owner = address!("0000000000000000000000000000000000000009");
+        let permit2 = address!("000000000000000000000000000000000000000a");
+        let tokens = [COLLATERAL.parse().unwrap(), DEBT.parse().unwrap()];
+        let calls = funded_calls(owner, permit2, &tokens);
+        assert_eq!(calls.len(), 4, "two reads per token, batched");
+        assert_eq!(calls[0].target, tokens[0]);
+        assert_eq!(calls[1].target, tokens[0]);
+        assert_eq!(calls[2].target, tokens[1]);
+        assert_eq!(calls[0].data, encode_balance_of(owner));
+        assert_eq!(calls[1].data, encode_allowance(owner, permit2));
+    }
+
+    #[test]
+    fn funded_is_the_lesser_of_balance_and_allowance() {
+        let tokens: Vec<Address> = vec![COLLATERAL.parse().unwrap(), DEBT.parse().unwrap()];
+        // Token 0: approved for less than it holds. Token 1: the other way.
+        let results = vec![word(100), word(40), word(7), word(900)];
+        assert_eq!(
+            decode_funded(&tokens, &results),
+            vec![
+                (tokens[0], Some(U256::from(40u64))),
+                (tokens[1], Some(U256::from(7u64))),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_reverting_token_does_not_cost_the_others_their_reading() {
+        let tokens: Vec<Address> = vec![COLLATERAL.parse().unwrap(), DEBT.parse().unwrap()];
+        // Token 0's allowance call reverted; token 1 answered in full.
+        let results = vec![word(100), None, word(7), word(900)];
+        let decoded = decode_funded(&tokens, &results);
+        assert_eq!(decoded[0], (tokens[0], None), "keeps its last reading");
+        assert_eq!(decoded[1], (tokens[1], Some(U256::from(7u64))));
+    }
+
+    #[test]
+    fn a_truncated_batch_reads_as_missing_rather_than_zero() {
+        let tokens: Vec<Address> = vec![COLLATERAL.parse().unwrap(), DEBT.parse().unwrap()];
+        let decoded = decode_funded(&tokens, &[word(100), word(40)]);
+        assert_eq!(decoded[1], (tokens[1], None));
+    }
+
+    fn vault_inventory_results() -> Vec<Option<Bytes>> {
+        vec![
+            word(1_000),    // quotableSettlement
+            word(10),       // liquidSettlement — most of it is staked
+            word(2_000),    // quotableCorridor
+            word(500),      // maxOrderInputSettlement
+            word(600),      // maxOrderInputCorridor
+            word(0),        // closeOnly
+            word(0),        // paused
+            word(4),        // tradingEpoch
+            word(u64::MAX), // settlement Permit2 allowance
+            word(u64::MAX), // corridor Permit2 allowance
+        ]
+    }
+
+    #[test]
+    fn the_vault_batch_decodes_in_view_order() {
+        let (settlement, corridor, epoch, max_s, max_c) =
+            decode_vault_inventory(&vault_inventory_results(), true).unwrap();
+        assert_eq!(
+            settlement,
+            U256::from(1_000u64),
+            "executor-routed quotes the staked position"
+        );
+        assert_eq!(corridor, U256::from(2_000u64));
+        assert_eq!(epoch, 4);
+        assert_eq!(max_s, U256::from(500u64));
+        assert_eq!(max_c, U256::from(600u64));
+
+        // Without an executor the fill cannot recall from the adapter, so only
+        // the idle balance is quotable.
+        let (settlement, _, _, _, _) =
+            decode_vault_inventory(&vault_inventory_results(), false).unwrap();
+        assert_eq!(settlement, U256::from(10u64));
+    }
+
+    #[test]
+    fn a_paused_vault_quotes_nothing_and_close_only_quotes_one_side() {
+        let mut paused = vault_inventory_results();
+        paused[6] = word(1);
+        let (settlement, corridor, ..) = decode_vault_inventory(&paused, true).unwrap();
+        assert_eq!((settlement, corridor), (U256::ZERO, U256::ZERO));
+
+        let mut close_only = vault_inventory_results();
+        close_only[5] = word(1);
+        let (settlement, corridor, ..) = decode_vault_inventory(&close_only, true).unwrap();
+        assert_eq!(settlement, U256::ZERO);
+        assert_eq!(corridor, U256::from(2_000u64));
+    }
+
+    #[test]
+    fn a_vault_publishes_no_more_than_it_has_approved_to_permit2() {
+        let mut results = vault_inventory_results();
+        results[8] = word(25); // settlement approved for 25 of its 1000
+        let (settlement, corridor, ..) = decode_vault_inventory(&results, true).unwrap();
+        assert_eq!(settlement, U256::from(25u64));
+        assert_eq!(corridor, U256::from(2_000u64));
+    }
+
+    /// Quoting without `paused` is quoting through a stop, so a partial batch
+    /// fails the whole refresh and the TTL takes the vault dark.
+    #[test]
+    fn a_missing_vault_view_fails_the_refresh() {
+        for i in 0..10 {
+            let mut results = vault_inventory_results();
+            results[i] = None;
+            assert!(
+                decode_vault_inventory(&results, true).is_err(),
+                "view #{i} missing must not decode"
+            );
+        }
+        assert!(decode_vault_inventory(&[], true).is_err());
+    }
+
+    #[test]
+    fn vault_assets_refuse_an_unset_pair_or_a_zero_lifetime() {
+        let settlement = address!("0000000000000000000000000000000000000011");
+        let corridor = address!("0000000000000000000000000000000000000012");
+        let as_word = |a: Address| Some(Bytes::from(a.into_word().0.to_vec()));
+
+        let ok = vec![as_word(settlement), as_word(corridor), word(300)];
+        assert_eq!(
+            decode_vault_assets(&ok).unwrap(),
+            (settlement, corridor, 300)
+        );
+
+        let unset = vec![as_word(Address::ZERO), as_word(corridor), word(300)];
+        assert!(decode_vault_assets(&unset).is_err());
+
+        let no_lifetime = vec![as_word(settlement), as_word(corridor), word(0)];
+        assert!(decode_vault_assets(&no_lifetime).is_err());
+
+        assert!(decode_vault_assets(&[as_word(settlement)]).is_err());
+    }
 
     fn handover(code: u16) -> anyhow::Error {
         anyhow::Error::new(session::VenueHandover {

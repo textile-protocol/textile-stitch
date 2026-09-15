@@ -115,8 +115,8 @@ moves — a deadband on top of it holds the book stale between threshold
 crossings, which is the exact failure TWAP is meant to fix. Set it to 0 (or
 remove it; 0 is the default) so the book re-posts every `tick_interval_secs`,
 pinned to the current center. Posting is off-chain and free. The costs of
-every-tick reposting are local: one balance/allowance read per side per tick
-against your RPC, and one signature per live order per tick — a full 40-slice
+every-tick reposting are local: one batched balance/allowance read per input
+token per tick against your RPC, and one signature per live order per tick — a full 40-slice
 ladder on both sides is 80 signatures per tick, instant for the local
 hotwallet but a round trip each for an MPC signer (raise
 `max_concurrent_signs`, or lengthen `tick_interval_secs`, if your signing
@@ -128,6 +128,30 @@ the configured spreads. The auction closer deliberately keeps pricing off the
 instantaneous feed — it values a one-shot on-chain fill at execution time,
 where the current price is the right mark; the TWAP smooths standing quotes
 that rest in the book waiting to be picked off.
+
+### What Stitch Costs Your RPC
+
+Two loops read the chain on a timer, and both batch through
+[Multicall3](https://www.multicall3.com) when the chain has it — which every
+chain Stitch quotes on does, at the same address.
+
+The RFQ responder re-reads what it may pledge every 2 seconds: a balance and a
+Permit2 allowance for each quotable token, or ten vault views for a vault
+maker. That is one request per cycle — roughly 43k a day — however many
+corridors the venue has seated you on. The ladder (`book_enabled = true`) adds
+one request per input token per `tick_interval_secs`.
+
+Stitch probes for Multicall3 at startup and logs which way reads go
+(`rfq inventory reads resolved batched=true`). On a chain without it, every
+view is its own `eth_call` and the same work costs one request per view — a
+bot on five corridors holds six tokens, so that is twelve requests a cycle and
+about half a million a day on inventory alone. If you pay per request and that
+line looks wrong, check the probe: a node that was down at startup is retried,
+but a chain genuinely missing Multicall3 stays on the slow path.
+
+Nothing above is tunable from `stitch.toml` on purpose. The 2-second cadence
+is set by how long a reading may be trusted before a side goes dark, not by
+how fresh it could be.
 
 ### Liquidity And Order Sizing
 

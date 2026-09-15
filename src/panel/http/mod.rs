@@ -19,8 +19,10 @@ pub mod bots;
 pub mod enroll;
 pub mod funding;
 pub mod logs;
+// The test node moved to `chain::mock_node` so the default build's tests can
+// use it too; panel tests keep their old path through this re-export.
 #[cfg(test)]
-pub(crate) mod mock_chain;
+pub(crate) use crate::chain::mock_node as mock_chain;
 pub mod origin;
 pub mod session;
 pub mod settings;

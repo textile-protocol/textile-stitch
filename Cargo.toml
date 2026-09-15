@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.261"
+version = "0.1.262"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; quotes Swap via RFQ firm quotes and optionally fills resting limit orders."
 license = "AGPL-3.0-or-later"
@@ -53,6 +53,10 @@ wry = { version = "0.48", optional = true }
 keepawake = { version = "0.6", optional = true, default-features = false }
 alloy-primitives = { version = "1", features = ["rlp"] }
 alloy-rlp = "0.3"
+# ABI codec for the Multicall3 `aggregate3` batch (chain::multicall). Same
+# major as alloy-primitives, and the same crate Warp uses for the identical
+# job — a hand-rolled codec here would mis-read balances silently.
+alloy-sol-types = "1"
 async-trait = "0.1"
 # BIP-39/BIP-32 seed-phrase derivation for the hot wallet (same crate ethers/alloy
 # use, so account 0 at m/44'/60'/0'/0/0 matches MetaMask/Rabby/etc.).
