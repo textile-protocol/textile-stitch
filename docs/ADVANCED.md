@@ -306,7 +306,7 @@ By default Stitch signs with the local private key (the hotwallet). An optional
 handles every signature the bot makes: the EIP-712 limit orders and the on-chain
 fill/approve transactions. You pick one backend for the whole bot.
 
-Three options:
+Four options:
 
 - **Local hotwallet** (default): the bot signs with `STITCH_PRIVATE_KEY` /
   `STITCH_PRIVATE_KEY_FILE`. Omit `[signer]` entirely, or set
@@ -320,6 +320,13 @@ Three options:
   one shared service for many operators: MPCVault binds one client-signer per
   vault and each operator needs their own vault and funds, so it's one sidecar
   per operator.
+- **Fireblocks**: MPC custody with no sidecar — the API Co-Signer is part of the
+  operator's own Fireblocks workspace. Signs EIP-712 **typed messages**, which
+  needs only a Typed Message policy rule the operator writes themselves, not the
+  Raw Signing entitlement Fireblocks has to enable for you. That covers RFQ
+  quoting; the on-chain legs need `raw_signing = true` and the entitlement to go
+  with it. Signing is create-then-poll rather than one call, so measure the
+  latency before relying on it to quote.
 
 Secrets always come from the environment, never the config file (same rule as the
 existing key). Each secret has a `_FILE` variant (a path) that takes precedence
@@ -331,7 +338,7 @@ approvals (`stitch approve`) regardless of the signer.
 
 **Desktop / panel.** If you use `stitch-desktop` or the server panel, you don't
 need to edit any of this by hand. Add corridor and Settings both have a **Signer**
-dropdown (hot wallet / Turnkey / MPCVault) that collects the fields below, writes
+dropdown (hot wallet / Turnkey / MPCVault / Fireblocks) that collects the fields below, writes
 the `[signer]` section, stores each secret in an owner-only file, and points
 `stitch.env` at it. Changing the signer in Settings rewrites all three and
 restarts a running bot. The rest of this section is the reference for CLI and
@@ -383,6 +390,39 @@ Env var: `MPCVAULT_API_TOKEN` / `MPCVAULT_API_TOKEN_FILE` (secret).
 
 For the full walkthrough (MPCVault vault, API token, Client Signer, the sidecar,
 and validation), see [MPCVault signer setup](signer-mpcvault.md).
+
+Fireblocks:
+
+```toml
+[signer]
+provider         = "fireblocks"
+vault_account_id = "0"                          # the vault account holding the operator wallet
+operator_address = "0x<the EVM address that vault account resolves to>"
+asset_id         = "ETH"                        # optional, default; picks the key format, not a network
+api_base_url     = "https://api.fireblocks.io"  # optional, default
+raw_signing      = false                        # optional, default
+poll_interval_ms = 50                           # optional; signing is create-then-poll, so this is latency
+poll_timeout_secs    = 30                       # optional
+max_concurrent_signs = 4                        # optional
+```
+
+Env vars: `FIREBLOCKS_API_KEY` (an identifier, plain env), and
+`FIREBLOCKS_API_PRIVATE_KEY` / `FIREBLOCKS_API_PRIVATE_KEY_FILE` (the RSA PEM,
+secret).
+
+On EVM chains one Fireblocks vault account has the same address on every
+network, so one vault account covers every corridor.
+
+With `raw_signing = false` (the default) the bot signs typed messages only. That
+covers RFQ quoting *and* the ladder — both only sign Permit2 orders — but not the
+EIP-1559 transaction hash, so `limit_taker` and closer pools are rejected at
+config time with a message saying so. The one on-chain need left is the Permit2
+approval, which can be sent from the Fireblocks console instead of by `stitch
+approve`.
+
+For the full walkthrough (API user and co-signer, the vault account, the Typed
+Message policy rule, and the panel's Verify step), see [Fireblocks signer
+setup](signer-fireblocks.md).
 
 MPCVault is a two-process setup: the bot plus the sidecar on the same host. The
 bot runs an HTTP "callback approval" server at `callback_listen_addr`; the

@@ -203,3 +203,22 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # callback_listen_addr = "0.0.0.0:8088"   # optional, default; where the bot serves the approval callback
 # poll_timeout_secs    = 30                # optional
 # max_concurrent_signs = 4                 # optional
+#
+# Fireblocks (MPC custody, no sidecar — the API Co-Signer is part of your own
+# Fireblocks workspace). Signs EIP-712 typed messages, which needs only a Typed
+# Message policy rule you write yourself, not the Raw Signing entitlement
+# Fireblocks has to enable for you. That covers RFQ quoting and the ladder; the
+# on-chain legs (limit_taker, closer) need raw signing and are refused without
+# it. Secrets in the env: FIREBLOCKS_API_KEY (an identifier, plain),
+# FIREBLOCKS_API_PRIVATE_KEY / FIREBLOCKS_API_PRIVATE_KEY_FILE (the RSA PEM).
+# The panel discovers vault_account_id and operator_address for you.
+# [signer]
+# provider         = "fireblocks"
+# vault_account_id = "0"                   # the vault account holding the operator wallet
+# operator_address = "0x<the EVM address that vault account resolves to>"
+# asset_id         = "ETH"                 # optional, default; picks the key format, not a network
+# api_base_url     = "https://api.fireblocks.io"  # optional, default (only official hosts allowed unless STITCH_ALLOW_CUSTOM_SIGNER_API=1)
+# raw_signing      = false                 # optional, default; true only if Fireblocks enabled Raw Signing
+# poll_interval_ms = 50                    # optional; signing is create-then-poll, so this is latency
+# poll_timeout_secs    = 30                # optional
+# max_concurrent_signs = 4                 # optional

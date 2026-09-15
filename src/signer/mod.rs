@@ -6,8 +6,14 @@
 //! through a [`Signer`]: a 32-byte digest in, a 65-byte `r ++ s ++ v` (v in
 //! {27,28}) signature out. The default backend is a raw local key
 //! ([`local::LocalSigner`], the "hotwallet"); MPC backends ([`turnkey`],
-//! [`mpcvault`]) implement the same trait so the rest of the bot never knows
-//! which one is signing. The provider is chosen by the optional `[signer]`
+//! [`mpcvault`], [`fireblocks`]) implement the same trait so the rest of the bot
+//! never knows which one is signing.
+//!
+//! One backend needs more than a digest. Fireblocks will not sign opaque bytes
+//! without a raw-signing entitlement its customers have to negotiate, so it
+//! signs the EIP-712 *structure* instead — hence [`Signer::sign_typed`], which
+//! every other backend satisfies by hashing locally and falling through to
+//! [`Signer::sign_digest`]. The provider is chosen by the optional `[signer]`
 //! config section; absent, it is the local key from the environment (unchanged
 //! behaviour).
 //!
@@ -29,6 +35,7 @@ use zeroize::Zeroize;
 
 use crate::config::Config;
 
+pub mod fireblocks;
 pub mod local;
 pub mod mpcvault;
 pub mod turnkey;
@@ -44,6 +51,20 @@ pub use local::LocalSigner;
 pub trait Signer: Send + Sync {
     /// Sign `digest`, returning `r(32) ++ s(32) ++ v(1)` with `v` in {27, 28}.
     async fn sign_digest(&self, digest: B256) -> anyhow::Result<[u8; 65]>;
+
+    /// Sign an EIP-712 payload.
+    ///
+    /// The default hashes locally and signs the digest, which is exactly what
+    /// every backend that accepts raw bytes should do — the structure carries no
+    /// extra information once you have the digest. Backends that cannot sign a
+    /// bare digest, or that want the provider to enforce policy on what is
+    /// being signed, override this and send the structure instead.
+    async fn sign_typed(
+        &self,
+        payload: &crate::protocol::typed_data::Eip712Payload,
+    ) -> anyhow::Result<[u8; 65]> {
+        self.sign_digest(payload.digest()).await
+    }
 
     /// The Ethereum address this signer controls.
     fn address(&self) -> Address;
@@ -83,6 +104,13 @@ pub async fn build_signer(cfg: &Config) -> anyhow::Result<DynSigner> {
 pub struct SignerSecrets {
     pub turnkey_api_private_key_file: Option<PathBuf>,
     pub mpcvault_api_token_file: Option<PathBuf>,
+    pub fireblocks_api_private_key_file: Option<PathBuf>,
+    /// Fireblocks' API key is an identifier rather than a secret, so the writer
+    /// parks it in the bot's `stitch.env` instead of a key file. The panel never
+    /// sources that file, so — exactly like the secret paths above — it has to
+    /// be handed in per call rather than read from the process environment,
+    /// which on a multi-bot panel holds either nothing or another bot's key.
+    pub fireblocks_api_key: Option<String>,
 }
 
 /// [`build_signer`] with explicit secret paths. See [`SignerSecrets`].
@@ -94,6 +122,9 @@ pub async fn build_signer_with(cfg: &Config, secrets: &SignerSecrets) -> anyhow:
         )?)),
         SignerConfig::Mpcvault(c) => Ok(Arc::new(
             mpcvault::MpcVaultSigner::from_config_with(&c, secrets).await?,
+        )),
+        SignerConfig::Fireblocks(c) => Ok(Arc::new(
+            fireblocks::FireblocksSigner::from_config_with(&c, secrets)?,
         )),
     }
 }
@@ -108,6 +139,7 @@ pub enum SignerConfig {
     Local,
     Turnkey(TurnkeyConfig),
     Mpcvault(MpcVaultConfig),
+    Fireblocks(FireblocksConfig),
 }
 
 impl SignerConfig {
@@ -117,6 +149,37 @@ impl SignerConfig {
             SignerConfig::Local => 8,
             SignerConfig::Turnkey(c) => c.max_concurrent_signs,
             SignerConfig::Mpcvault(c) => c.max_concurrent_signs,
+            SignerConfig::Fireblocks(c) => c.max_concurrent_signs,
+        }
+    }
+
+    /// Whether this backend can sign an opaque 32-byte digest.
+    ///
+    /// Only the EIP-1559 transaction hash needs that — every other signature the
+    /// bot makes is EIP-712 and goes through [`Signer::sign_typed`]. Fireblocks
+    /// without a raw-signing entitlement cannot, so config validation uses this
+    /// to reject the on-chain legs up front instead of failing at the first fill.
+    pub fn can_sign_raw_digests(&self) -> bool {
+        self.raw_signing_unavailable().is_none()
+    }
+
+    /// Why this backend can't sign transactions, in the backend's own words.
+    ///
+    /// The capability is generic but the remedy never is — "ask Fireblocks to
+    /// enable Raw Signing" means nothing for a future backend with the same
+    /// limitation. So the explanation lives with the backend that knows it, and
+    /// the two enforcement sites (config validation and the panel's approve /
+    /// withdraw gate) quote it rather than each hardcoding one vendor's name.
+    pub fn raw_signing_unavailable(&self) -> Option<&'static str> {
+        match self {
+            SignerConfig::Local | SignerConfig::Turnkey(_) | SignerConfig::Mpcvault(_) => None,
+            SignerConfig::Fireblocks(c) if c.raw_signing => None,
+            SignerConfig::Fireblocks(_) => Some(
+                "signs Fireblocks typed messages, which cannot sign an on-chain transaction. \
+                 Send it from the Fireblocks console instead — a Permit2 approval is a one-time \
+                 ERC-20 approve per token. To do it from here, have Fireblocks enable Raw \
+                 Signing on the workspace and set [signer].raw_signing = true",
+            ),
         }
     }
 }
@@ -156,6 +219,55 @@ pub struct MpcVaultConfig {
     pub max_concurrent_signs: usize,
 }
 
+/// Fireblocks config. Only two of these are ever typed by hand — the panel
+/// resolves the vault account and the address it controls from the credentials.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FireblocksConfig {
+    /// The vault account holding the operator wallet, as its numeric id.
+    pub vault_account_id: String,
+    /// The operator/maker EVM address that vault account resolves to.
+    pub operator_address: String,
+    /// Which asset the signing request is filed under. For typed messages this
+    /// selects the key format, not a network: one EVM vault account has the same
+    /// address on every EVM chain, so the default covers every corridor and
+    /// there is no chain-to-asset table to keep current.
+    #[serde(default = "default_fireblocks_asset_id")]
+    pub asset_id: String,
+    #[serde(default = "default_fireblocks_base_url")]
+    pub api_base_url: String,
+    /// Allow signing opaque digests via the `RAW` operation. Off by default:
+    /// raw signing is the entitlement this backend exists to avoid needing, and
+    /// turning it on without Fireblocks having enabled it on the workspace just
+    /// moves the failure later. Required for the on-chain legs (fills, closer,
+    /// withdraw, and an automated `stitch approve`).
+    #[serde(default)]
+    pub raw_signing: bool,
+    #[serde(default = "default_fireblocks_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_fireblocks_poll_timeout_secs")]
+    pub poll_timeout_secs: u64,
+    #[serde(default = "default_fireblocks_max_concurrent_signs")]
+    pub max_concurrent_signs: usize,
+}
+
+fn default_fireblocks_asset_id() -> String {
+    fireblocks::DEFAULT_ASSET_ID.to_string()
+}
+fn default_fireblocks_base_url() -> String {
+    fireblocks::DEFAULT_API_BASE_URL.to_string()
+}
+fn default_fireblocks_poll_interval_ms() -> u64 {
+    fireblocks::DEFAULT_POLL_INTERVAL_MS
+}
+fn default_fireblocks_poll_timeout_secs() -> u64 {
+    30
+}
+/// Fireblocks rate-limits per workspace per minute, and each signature is a
+/// create plus several polls, so this stays below Turnkey's.
+fn default_fireblocks_max_concurrent_signs() -> usize {
+    4
+}
+
 fn default_turnkey_base_url() -> String {
     "https://api.turnkey.com".to_string()
 }
@@ -168,6 +280,20 @@ fn default_mpcvault_base_url() -> String {
 /// attacker. Override only with `STITCH_ALLOW_CUSTOM_SIGNER_API=1`.
 const TURNKEY_API_HOSTS: &[&str] = &["api.turnkey.com"];
 const MPCVAULT_API_HOSTS: &[&str] = &["api.mpcvault.com"];
+/// Fireblocks' production host, the sandbox (where an operator validates the
+/// setup before policy rules exist in production), and the regional endpoints.
+///
+/// The regions are not optional extras: a workspace provisioned in the EU
+/// answers on `eu-api` and nothing else, so omitting them would lock those
+/// operators out entirely rather than merely inconveniencing them. Fireblocks
+/// names regions in its own SDK; keep this list in step with theirs.
+const FIREBLOCKS_API_HOSTS: &[&str] = &[
+    "api.fireblocks.io",
+    "sandbox-api.fireblocks.io",
+    "eu-api.fireblocks.io",
+    "eu2-api.fireblocks.io",
+    "us-east-1-api.fireblocks.io",
+];
 
 /// Refuse a signer `api_base_url` that isn't on the provider allowlist.
 ///
@@ -177,6 +303,7 @@ pub fn validate_signer_api_base_url(provider: &str, raw: &str) -> anyhow::Result
     let allowed = match provider {
         "turnkey" => TURNKEY_API_HOSTS,
         "mpcvault" => MPCVAULT_API_HOSTS,
+        "fireblocks" => FIREBLOCKS_API_HOSTS,
         _ => return Ok(()),
     };
     let parsed = url::Url::parse(raw.trim())
@@ -491,6 +618,38 @@ mod tests {
             address_from_signing_key(&key()),
             address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
         );
+    }
+
+    #[test]
+    fn fireblocks_regional_hosts_are_accepted_but_lookalikes_are_not() {
+        // An EU-provisioned workspace answers on eu-api and nowhere else, so
+        // refusing the regions would lock those operators out, not inconvenience
+        // them.
+        for host in [
+            "https://api.fireblocks.io",
+            "https://eu-api.fireblocks.io",
+            "https://eu2-api.fireblocks.io",
+            "https://us-east-1-api.fireblocks.io",
+            "https://sandbox-api.fireblocks.io",
+        ] {
+            validate_signer_api_base_url("fireblocks", host).unwrap_or_else(|e| {
+                panic!("{host} is a real Fireblocks endpoint and must be allowed: {e:#}")
+            });
+        }
+        // Suffix matching would accept these; exact matching must not. The JWT
+        // binds the path and body but not the host, so a lookalike that relays
+        // to the real API replays every stamped request inside its validity
+        // window.
+        for hostile in [
+            "https://api.fireblocks.io.evil.example",
+            "https://evil-api.fireblocks.io.attacker.test",
+            "https://notfireblocks.io",
+        ] {
+            assert!(
+                validate_signer_api_base_url("fireblocks", hostile).is_err(),
+                "{hostile} must be refused"
+            );
+        }
     }
 
     #[test]

@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { ApiError, api } from '../api'
-import { Banner, Button, Field, Input, Select } from './ui'
+import { Banner, Button, Field, Input, Select, TextArea } from './ui'
 
-export type SignerKind = 'local' | 'turnkey' | 'mpcvault'
+export type SignerKind = 'local' | 'turnkey' | 'mpcvault' | 'fireblocks'
 /** How the local hot wallet is provided. Create is the default. */
 export type LocalMode = 'create' | 'import'
 export type KeyForm = 'privateKey' | 'seedPhrase'
@@ -68,6 +68,7 @@ export function SignerFields({
           <option value="local">Hot wallet (local)</option>
           <option value="turnkey">MPC — Turnkey</option>
           <option value="mpcvault">MPC — MPCVault · Experimental</option>
+          <option value="fireblocks">MPC — Fireblocks · Experimental</option>
         </Select>
       </Field>
 
@@ -87,6 +88,13 @@ export function SignerFields({
             ['apiPublicKey', 'API public key', false],
             ['apiPrivateKey', 'API private key', true],
           ]}
+        />
+      )}
+
+      {value.kind === 'fireblocks' && (
+        <FireblocksFields
+          values={value.mpc}
+          onChange={(mpc) => set({ mpc })}
         />
       )}
 
@@ -412,6 +420,275 @@ function ImportWalletPanel({
   )
 }
 
+/**
+ * Above this, one signature eats so much of the venue's ~750ms reply budget
+ * that quoting stops being reliable. Not a hard limit — the bot still runs — but
+ * the operator should see it at setup rather than infer it from missed quotes.
+ */
+const SLOW_SIGN_MS = 400
+
+/**
+ * Where the operator's workspace answers.
+ *
+ * A Fireblocks workspace is provisioned into one region and answers on that host
+ * alone, so this is not a preference — an EU workspace simply is not reachable at
+ * `api.fireblocks.io`. A picker rather than a text field because the value has to
+ * match the backend's allowlist exactly, and there is nothing to gain from
+ * letting it be mistyped.
+ *
+ * The chosen URL is used for discovery *and* written into `stitch.toml`, so the
+ * bot signs against the same host the panel verified against.
+ */
+const FIREBLOCKS_DEFAULT_API = 'https://api.fireblocks.io'
+
+const FIREBLOCKS_REGIONS: [label: string, url: string][] = [
+  ['Global (default)', FIREBLOCKS_DEFAULT_API],
+  ['EU', 'https://eu-api.fireblocks.io'],
+  ['EU2', 'https://eu2-api.fireblocks.io'],
+  ['US East', 'https://us-east-1-api.fireblocks.io'],
+  ['Sandbox', 'https://sandbox-api.fireblocks.io'],
+]
+
+/**
+ * Fireblocks needs two credentials and nothing else typed.
+ *
+ * The vault account comes from a dropdown the panel populates, and the operator
+ * address is *never* entered: Verify signs a throwaway message and fills in the
+ * address that signature recovered to. That ordering is deliberate — a
+ * hand-copied address that doesn't match the vault produces signed orders that
+ * fail to settle, and the operator finds out days later.
+ *
+ * Verify also reports the round-trip latency, which for this backend is the
+ * thing most likely to make it unsuitable: signing is a create-then-poll cycle
+ * and the venue stops listening for a quote after ~750ms.
+ */
+function FireblocksFields({
+  values,
+  onChange,
+}: {
+  values: Record<string, string>
+  onChange: (v: Record<string, string>) => void
+}) {
+  const [vaults, setVaults] = useState<{ id: string; name: string }[] | null>(null)
+  const [busy, setBusy] = useState<'vaults' | 'verify' | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [latencyMs, setLatencyMs] = useState<number | null>(null)
+  const alive = useRef(true)
+  /**
+   * Which set of inputs the in-flight request belongs to.
+   *
+   * Verify is a real signing round trip and can take seconds. If the operator
+   * edits the key, the PEM or the vault while it is out, `invalidate` clears the
+   * proof — but the old request is still coming, and writing its address back
+   * would leave `isSignerComplete` satisfied by an address proven for inputs
+   * that are no longer in the form. That bot would quote orders signed by a
+   * wallet it doesn't control. Same guard the Create wallet panel above uses.
+   */
+  const genRef = useRef(0)
+
+  useEffect(() => {
+    alive.current = true
+    return () => {
+      alive.current = false
+    }
+  }, [])
+
+  const apiKey = (values.apiKey ?? '').trim()
+  const apiPrivateKey = values.apiPrivateKey ?? ''
+  const haveCredentials = apiKey.length > 0 && apiPrivateKey.trim().length > 0
+  const apiBaseUrl = (values.apiBaseUrl ?? '').trim() || FIREBLOCKS_DEFAULT_API
+
+  /** Patch the form, dropping any proof that belonged to the old values. */
+  const set = (patch: Record<string, string>) => {
+    onChange({ ...values, ...patch })
+  }
+  /**
+   * Retire everything the old inputs proved.
+   *
+   * Bumping the generation makes any in-flight response stale, so it will skip
+   * its own `finally` — which is why `busy` is cleared here rather than there.
+   * `credentialsChanged` also drops the vault list, since a different key or
+   * region is a different workspace.
+   */
+  const invalidate = (
+    patch: Record<string, string>,
+    { credentialsChanged = false } = {},
+  ) => {
+    genRef.current += 1
+    setLatencyMs(null)
+    setBusy(null)
+    if (credentialsChanged) setVaults(null)
+    // An address proven for one vault says nothing about another.
+    set({ ...patch, operatorAddress: '' })
+  }
+
+  /**
+   * Run one request, applying its result only if the inputs it belongs to are
+   * still the ones in the form.
+   *
+   * A response that arrives after the operator edited the key, PEM or vault
+   * describes inputs that no longer exist. Writing it back would leave
+   * `isSignerComplete` satisfied by an address proven for the wrong
+   * credentials, and that bot would quote orders signed by a wallet it doesn't
+   * control — so a stale result is dropped silently rather than applied.
+   */
+  async function guarded<T>(
+    kind: 'vaults' | 'verify',
+    call: () => Promise<T>,
+    ok: (result: T) => void,
+    fail: () => void,
+  ) {
+    const gen = ++genRef.current
+    const stale = () => !alive.current || genRef.current !== gen
+    setBusy(kind)
+    setError(null)
+    try {
+      const result = await call()
+      if (stale()) return
+      ok(result)
+    } catch (e) {
+      if (stale()) return
+      fail()
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      if (!stale()) setBusy(null)
+    }
+  }
+
+  const loadVaults = () =>
+    guarded(
+      'vaults',
+      () => api.fireblocksVaults({ apiKey, apiPrivateKey, apiBaseUrl }),
+      (res) => {
+        setVaults(res.vaults)
+        if (res.vaults.length === 0) {
+          setError('That workspace has no vault accounts. Create one in the Fireblocks console.')
+        }
+      },
+      () => setVaults(null),
+    )
+
+  const verify = () =>
+    guarded(
+      'verify',
+      () =>
+        api.fireblocksVerify({
+          apiKey,
+          apiPrivateKey,
+          apiBaseUrl,
+          vaultAccountId: (values.vaultAccountId ?? '').trim(),
+        }),
+      (res) => {
+        setLatencyMs(res.latencyMs)
+        set({ operatorAddress: res.address })
+      },
+      () => {
+        setLatencyMs(null)
+        set({ operatorAddress: '' })
+      },
+    )
+
+  return (
+    <div className="space-y-3">
+      <Field label="Workspace region">
+        <Select
+          value={apiBaseUrl}
+          onChange={(e) =>
+            invalidate({ apiBaseUrl: e.target.value }, { credentialsChanged: true })
+          }
+        >
+          {FIREBLOCKS_REGIONS.map(([label, url]) => (
+            <option key={url} value={url}>
+              {label}
+            </option>
+          ))}
+        </Select>
+      </Field>
+
+      <Field label="API key">
+        <Input
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          placeholder="00000000-0000-0000-0000-000000000000"
+          value={values.apiKey ?? ''}
+          onChange={(e) =>
+            invalidate({ apiKey: e.target.value }, { credentialsChanged: true })
+          }
+        />
+      </Field>
+
+      <Field label="API private key (fireblocks_secret.key)">
+        <TextArea
+          rows={4}
+          autoComplete="off"
+          spellCheck={false}
+          placeholder="-----BEGIN PRIVATE KEY-----"
+          value={apiPrivateKey}
+          onChange={(e) =>
+            invalidate({ apiPrivateKey: e.target.value }, { credentialsChanged: true })
+          }
+        />
+      </Field>
+
+      <Button
+        type="button"
+        onClick={loadVaults}
+        disabled={!haveCredentials || busy !== null}
+      >
+        {busy === 'vaults' ? 'Loading vaults…' : 'Load vault accounts'}
+      </Button>
+
+      {vaults && vaults.length > 0 && (
+        <Field label="Vault account">
+          <Select
+            value={values.vaultAccountId ?? ''}
+            onChange={(e) => invalidate({ vaultAccountId: e.target.value })}
+          >
+            <option value="">Pick a vault account…</option>
+            {vaults.map((v) => (
+              <option key={v.id} value={v.id}>
+                {v.name ? `${v.name} (${v.id})` : v.id}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      )}
+
+      {(values.vaultAccountId ?? '').trim().length > 0 && (
+        <Button
+          type="button"
+          onClick={verify}
+          disabled={busy !== null}
+        >
+          {busy === 'verify' ? 'Signing a test message…' : 'Verify'}
+        </Button>
+      )}
+
+      {values.operatorAddress && (
+        <Banner tone={latencyMs !== null && latencyMs > SLOW_SIGN_MS ? 'warning' : 'success'}>
+          <div>
+            Signed as <code>{values.operatorAddress}</code>.
+          </div>
+          {latencyMs !== null && (
+            <div>
+              One signature took {latencyMs} ms.{' '}
+              {latencyMs > SLOW_SIGN_MS
+                ? 'That is too slow to quote reliably — the venue stops listening about 750 ms ' +
+                  'after it asks, and this bot still has to price and respond inside that. ' +
+                  'Check whether your Transaction Authorization Policy auto-approves signing ' +
+                  'rather than waiting on a human.'
+                : 'That fits inside the venue reply budget.'}
+            </div>
+          )}
+        </Banner>
+      )}
+
+      {error && <Banner tone="danger">{error}</Banner>}
+    </div>
+  )
+}
+
 function MpcFields({
   values,
   onChange,
@@ -452,6 +729,12 @@ export function isSignerComplete(s: SignerState): boolean {
       )
     case 'mpcvault':
       return ['vaultUuid', 'clientSignerPubkey', 'operatorAddress', 'apiToken'].every(filled)
+    case 'fireblocks':
+      // `operatorAddress` is never typed — it only gets set by a successful
+      // Verify, so requiring it here is what makes Verify mandatory rather than
+      // advisory. A bot whose address was guessed wrong quotes orders no one
+      // can fill.
+      return ['apiKey', 'apiPrivateKey', 'vaultAccountId', 'operatorAddress'].every(filled)
   }
 }
 

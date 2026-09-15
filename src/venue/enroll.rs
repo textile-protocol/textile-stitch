@@ -21,7 +21,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::protocol::eip712::{maker_enroll_digest, maker_enroll_environment};
+use crate::protocol::eip712::maker_enroll_environment;
+use crate::protocol::typed_data::maker_enroll_payload;
 use crate::setup;
 use crate::signer::DynSigner;
 
@@ -146,7 +147,7 @@ pub async fn register_maker(
         Some(vault) => vault.address.parse().context("invalid [vault].address")?,
         None => address,
     };
-    let digest = maker_enroll_digest(
+    let payload = maker_enroll_payload(
         environment,
         address,
         funding_wallet,
@@ -154,7 +155,7 @@ pub async fn register_maker(
         issued_at,
     );
     let signature = signer
-        .sign_digest(digest)
+        .sign_typed(&payload)
         .await
         .context("signing the enroll digest")?;
 

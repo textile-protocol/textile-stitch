@@ -6,7 +6,7 @@
 use alloy_primitives::{hex, Address};
 use serde::Serialize;
 
-use crate::protocol::eip712::permit2_digest;
+use crate::protocol::typed_data::permit2_payload;
 use crate::protocol::types::OrderParams;
 use crate::signer::Signer;
 
@@ -35,8 +35,12 @@ pub async fn sign_submission(
     chain_id: u64,
     signer: &dyn Signer,
 ) -> anyhow::Result<SubmitOrder> {
-    let digest = permit2_digest(order, permit2, chain_id);
-    let sig = signer.sign_digest(digest).await?;
+    // Typed rather than raw: a backend that only signs EIP-712 structures
+    // (Fireblocks) can post orders, and every other backend hashes this locally
+    // and signs the identical digest.
+    let sig = signer
+        .sign_typed(&permit2_payload(order, permit2, chain_id))
+        .await?;
     Ok(SubmitOrder {
         chain_id,
         client_order_id: None,
@@ -56,6 +60,7 @@ pub async fn sign_submission(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::eip712::permit2_digest;
     use crate::signer::{
         address_from_signing_key, parse_private_key, recover_address, LocalSigner,
     };

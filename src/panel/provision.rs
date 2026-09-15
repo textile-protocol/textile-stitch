@@ -26,6 +26,7 @@ use crate::panel::inventory::{Bot, Layout, RUN_DIR};
 use crate::panel::naming::{
     container_name, LABEL_BOT, LABEL_CORRIDOR, LABEL_LAYOUT, LABEL_ONE_SHOT,
 };
+use crate::setup::writer::SignerKind;
 use crate::setup::{self, SignerView, RFQ_API_KEY_FILE, RFQ_API_KEY_FILE_ENV};
 
 /// Value of the layout label on containers the panel creates.
@@ -33,9 +34,12 @@ pub const LAYOUT_DIRECTORY: &str = "directory";
 
 /// The secret file each signer backend reads, as named by
 /// [`crate::setup::write_config_signer`].
-const LOCAL_SECRET: &str = "stitch.key";
-const TURNKEY_SECRET: &str = "turnkey-api.key";
-const MPCVAULT_SECRET: &str = "mpcvault-api.token";
+// Names come from the one table on `SignerKind`, so the file the writer creates
+// and the file a container gets mounted cannot drift apart.
+const LOCAL_SECRET: &str = SignerKind::Local.secret_file();
+const TURNKEY_SECRET: &str = SignerKind::Turnkey.secret_file();
+const MPCVAULT_SECRET: &str = SignerKind::Mpcvault.secret_file();
+const FIREBLOCKS_SECRET: &str = SignerKind::Fireblocks.secret_file();
 
 /// What the panel knows about a bot's on-disk config, as far as provisioning
 /// cares: which signer it selects and therefore which secret file to mount and
@@ -126,6 +130,23 @@ pub fn signer_runtime_for(signer: &SignerView, config: &Path) -> SignerRuntime {
                 in_container(MPCVAULT_SECRET)
             )],
         },
+        SignerView::Fireblocks { .. } => {
+            let mut env = vec![format!(
+                "FIREBLOCKS_API_PRIVATE_KEY_FILE={}",
+                in_container(FIREBLOCKS_SECRET)
+            )];
+            // The API key is an identifier, not a secret, and the TOML has no
+            // home for it — same situation as Turnkey's public key, so the same
+            // treatment: the writer parked it in stitch.env, lift it from there
+            // rather than guessing.
+            if let Some(key) = env_value(config, "FIREBLOCKS_API_KEY") {
+                env.push(format!("FIREBLOCKS_API_KEY={key}"));
+            }
+            SignerRuntime {
+                secret_file: FIREBLOCKS_SECRET.to_string(),
+                env,
+            }
+        }
     }
 }
 
@@ -943,6 +964,48 @@ mod tests {
             &"TURNKEY_API_PRIVATE_KEY_FILE=/home/stitch/run/turnkey-api.key".to_string()
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn fireblocks_view() -> SignerView {
+        SignerView::Fireblocks {
+            vault_account_id: "3".into(),
+            operator_address: "0x0".into(),
+            asset_id: "ETH".into(),
+            api_base_url: String::new(),
+            raw_signing: false,
+        }
+    }
+
+    #[test]
+    fn fireblocks_api_key_is_lifted_out_of_stitch_env() {
+        let dir = std::env::temp_dir().join(format!("stitch-prov-fb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stitch.env"),
+            "FIREBLOCKS_API_KEY='11111111-2222-3333-4444-555555555555'\nRUST_LOG=info\n",
+        )
+        .unwrap();
+
+        let rt = signer_runtime_from(&fireblocks_view(), &dir);
+        assert_eq!(rt.secret_file, "fireblocks-api.key");
+        assert!(rt
+            .env
+            .contains(&"FIREBLOCKS_API_KEY=11111111-2222-3333-4444-555555555555".to_string()));
+        assert!(rt.env.contains(
+            &"FIREBLOCKS_API_PRIVATE_KEY_FILE=/home/stitch/run/fireblocks-api.key".to_string()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same rule as Turnkey's public key: a value the panel can't read is
+    /// omitted, so the bot fails with its own clear error instead of starting
+    /// against an invented credential.
+    #[test]
+    fn a_missing_fireblocks_api_key_is_omitted_rather_than_guessed() {
+        let rt = signer_runtime_from(&fireblocks_view(), Path::new("/definitely/not/here"));
+        assert!(!rt.env.iter().any(|e| e.starts_with("FIREBLOCKS_API_KEY=")));
+        // The secret mount is still right — only the identifier is missing.
+        assert_eq!(rt.secret_file, "fireblocks-api.key");
     }
 
     #[test]

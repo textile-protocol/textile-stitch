@@ -226,6 +226,7 @@ fn can_transact(bot: &Bot) -> bool {
 /// This covers bots. It cannot cover a second *approval*, which isn't in the fleet
 /// yet when the check runs — [`WalletLocks`] does that.
 pub fn approve_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
+    signer_can_broadcast(bot, "approve")?;
     if can_transact(bot) {
         anyhow::bail!(
             "{} is {} with its taker or closer leg on, so it can broadcast from the same wallet \
@@ -238,6 +239,22 @@ pub fn approve_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
         );
     }
     no_live_sibling_on_the_wallet(bot, fleet)
+}
+
+/// Refuse an on-chain action a bot's signer physically cannot perform.
+///
+/// A signer that only signs EIP-712 structures has everything it needs to quote
+/// but cannot produce a transaction hash. Both `approve` and `withdraw`
+/// broadcast, so both would run, spend the wallet lock, and fail inside the
+/// container with an error the operator sees only in the log tail. Answering
+/// here instead means the panel greys the button, the add-bot wizard's existing
+/// `canApprove` gate stops before it starts the run, and the reason — which the
+/// backend supplies, so it stays right for the next one — names what to do.
+fn signer_can_broadcast(bot: &Bot, action: &str) -> anyhow::Result<()> {
+    match bot.config.as_ref().and_then(|c| c.cannot_sign_transactions) {
+        None => Ok(()),
+        Some(why) => anyhow::bail!("{} {why}, so the panel can't {action} for it.", bot.name),
+    }
 }
 
 /// The live bot that must be stopped before an approval can run, if any.
@@ -265,6 +282,7 @@ pub fn approve_blocked_by(bot: &Bot, fleet: &Fleet) -> Option<String> {
 /// fill time. So every live process on the wallet has to be down, whatever
 /// legs it runs: this bot, and any sibling quoting from the same key.
 pub fn withdraw_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
+    signer_can_broadcast(bot, "withdraw")?;
     if is_live(bot) {
         anyhow::bail!(
             "{} is {} and quoting against this wallet; a withdraw under its quotes fails the \
@@ -733,6 +751,87 @@ mod tests {
 
     fn seed(h: &Harness, name: &str) {
         seed_in_state(h, name, ContainerState::Running);
+    }
+
+    /// A Fireblocks bot with no `raw_signing`: signs typed messages only, so it
+    /// physically cannot broadcast a transaction.
+    fn seed_typed_only(h: &Harness, name: &str) {
+        seed(h, name);
+        let toml = h.root.join(name).join("stitch.toml");
+        let current = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(
+            &toml,
+            format!(
+                "{current}\n[signer]\nprovider = \"fireblocks\"\n\
+                 vault_account_id = \"0\"\n\
+                 operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n"
+            ),
+        )
+        .unwrap();
+        // The signer swap means stitch.key is no longer this bot's secret.
+        std::fs::write(h.root.join(name).join("fireblocks-api.key"), "PEM\n").unwrap();
+    }
+
+    /// `stitch approve` signs an EIP-1559 transaction, which a typed-message
+    /// signer cannot produce. Refusing here is what stops the add-bot wizard
+    /// from starting a run that can only fail inside the container.
+    #[tokio::test]
+    async fn a_typed_message_only_bot_cannot_approve() {
+        let h = harness("approve-typed-only");
+        seed_typed_only(&h, "bot-a");
+        h.docker.set_one_shot_exit(0);
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/approve", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            h.docker.one_shot_specs().is_empty(),
+            "nothing may be started"
+        );
+
+        // And the wizard is told before it tries: its start sequence reads
+        // canApprove and stops on the reason rather than streaming a failure.
+        let (_, body) = h.get("/api/bots/bot-a").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canApprove"], false);
+        let reason = v["approveBlockedReason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("Fireblocks console"),
+            "the reason must say what to do instead: {reason}"
+        );
+        assert!(reason.contains("raw_signing"), "{reason}");
+        // No bot to stop — this is not a nonce conflict, so the UI must not
+        // offer a Stop button that would do nothing.
+        assert!(v["approveBlockedBy"].is_null(), "{body}");
+    }
+
+    /// Same signer, same reason, for the other on-chain action.
+    #[tokio::test]
+    async fn a_typed_message_only_bot_cannot_withdraw() {
+        let h = harness("withdraw-typed-only");
+        seed_typed_only(&h, "bot-a");
+        let (_, body) = h.get("/api/bots/bot-a").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canWithdraw"], false);
+        assert!(v["withdrawBlockedReason"]
+            .as_str()
+            .is_some_and(|r| r.contains("Fireblocks console")));
+    }
+
+    /// With raw signing on, the same backend is allowed to broadcast — the gate
+    /// is about the signer's capability, not about Fireblocks as a brand.
+    #[tokio::test]
+    async fn raw_signing_lets_a_fireblocks_bot_approve() {
+        let h = harness("approve-fb-raw");
+        seed_typed_only(&h, "bot-a");
+        let toml = h.root.join("bot-a").join("stitch.toml");
+        let current = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, format!("{current}raw_signing = true\n")).unwrap();
+
+        let (_, body) = h.get("/api/bots/bot-a").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canApprove"], true, "{body}");
+        assert!(v["approveBlockedReason"].is_null(), "{body}");
     }
 
     fn seed_in_state(h: &Harness, name: &str, state: ContainerState) {

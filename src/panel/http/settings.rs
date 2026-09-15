@@ -1187,6 +1187,7 @@ fn signer_provider(signer: &setup::SignerView) -> &'static str {
         setup::SignerView::Local => "local (hot wallet)",
         setup::SignerView::Turnkey { .. } => "Turnkey",
         setup::SignerView::Mpcvault { .. } => "MPCVault",
+        setup::SignerView::Fireblocks { .. } => "Fireblocks",
     }
 }
 

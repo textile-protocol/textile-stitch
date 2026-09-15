@@ -350,6 +350,13 @@ pub enum SignerView {
         api_base_url: String,
         callback_listen_addr: String,
     },
+    Fireblocks {
+        vault_account_id: String,
+        operator_address: String,
+        asset_id: String,
+        api_base_url: String,
+        raw_signing: bool,
+    },
 }
 
 /// Read the current signer from a `stitch.toml` body.
@@ -389,6 +396,13 @@ pub fn try_read_signer(toml_str: &str) -> Result<SignerView> {
             operator_address: c.operator_address,
             api_base_url: c.api_base_url,
             callback_listen_addr: c.callback_listen_addr,
+        },
+        SignerConfig::Fireblocks(c) => SignerView::Fireblocks {
+            vault_account_id: c.vault_account_id,
+            operator_address: c.operator_address,
+            asset_id: c.asset_id,
+            api_base_url: c.api_base_url,
+            raw_signing: c.raw_signing,
         },
         SignerConfig::Local => SignerView::Local,
     })
@@ -998,16 +1012,44 @@ pub fn apply_rfq_default_preset(toml_str: &str) -> Result<String> {
         .parse::<DocumentMut>()
         .context("parsing stitch.toml")?;
     apply_book_enabled(doc.as_table_mut(), Some(false));
+    // The taker settles on chain, so it is only a sensible default for a signer
+    // that can sign a transaction. Turning it on regardless would make the
+    // preset emit a config its own validation rejects — which is not a
+    // theoretical shape: it is every bot the wizard creates on a Fireblocks
+    // signer without raw signing, failing with a 400 immediately after a
+    // successful Verify. The preset picks what is *available* to this bot.
+    let taker = taker_is_available(toml_str);
     let pools = doc
         .get("pools")
         .and_then(Item::as_array_of_tables)
         .map_or(0, |a| a.len());
     for index in 0..pools {
-        apply_taker(pool_mut(&mut doc, index)?, true);
+        apply_taker(pool_mut(&mut doc, index)?, taker);
     }
     let edited = doc.to_string();
     Config::from_toml(&edited).context("the RFQ-default preset is not a valid config")?;
     Ok(edited)
+}
+
+/// Whether this config's signer could run the taker leg at all.
+///
+/// Reads the `[signer]` table the writer has already put in the document. A
+/// missing or unreadable section means the hot wallet, which signs everything —
+/// the same default `try_read_signer` takes, and the safe one here: the preset
+/// validates its own output, so a wrong `true` fails loudly rather than
+/// producing a bot that can't sign its fills.
+fn taker_is_available(toml_str: &str) -> bool {
+    use crate::signer::SignerConfig;
+    let Ok(doc) = toml::from_str::<toml::Value>(toml_str) else {
+        return true;
+    };
+    let Some(table) = doc.get("signer") else {
+        return true;
+    };
+    table
+        .clone()
+        .try_into::<SignerConfig>()
+        .map_or(true, |signer| signer.can_sign_raw_digests())
 }
 
 fn rfq_table_mut(doc: &mut DocumentMut) -> &mut Table {
@@ -1206,6 +1248,58 @@ mod tests {
         view.to_patch()
     }
 
+    const FIREBLOCKS_SIGNER: &str = "\n[signer]\nprovider = \"fireblocks\"\n\
+         vault_account_id = \"7\"\n\
+         operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n";
+
+    /// A Fireblocks bot must never read back as a hot wallet: downstream that
+    /// mounts `stitch.key` for a bot whose secret is `fireblocks-api.key`.
+    /// The wizard writes the signer, then stamps the RFQ default. A preset that
+    /// turned the taker on regardless would emit a config its own validation
+    /// rejects, and `create` deletes the bot directory and 400s — so every
+    /// Fireblocks bot would die immediately after a successful Verify.
+    #[test]
+    fn the_rfq_default_preset_leaves_the_taker_off_for_a_typed_only_signer() {
+        let src = format!("{CELO}{FIREBLOCKS_SIGNER}");
+        let stamped = apply_rfq_default_preset(&src).expect("the preset must stay valid");
+        assert!(
+            !stamped.contains("limit_taker_enabled"),
+            "a signer that can't sign transactions must not be given the taker:\n{stamped}"
+        );
+        // And the config it produced actually parses, which is the failure the
+        // wizard hit.
+        crate::config::Config::from_toml(&stamped).expect("preset output must be a valid config");
+    }
+
+    /// The same preset on a signer that *can* broadcast still turns the taker
+    /// on — this is a capability gate, not a blanket retreat.
+    #[test]
+    fn the_rfq_default_preset_still_enables_the_taker_for_a_hot_wallet() {
+        let stamped = apply_rfq_default_preset(CELO).unwrap();
+        assert!(stamped.contains("limit_taker_enabled"), "{stamped}");
+    }
+
+    #[test]
+    fn a_fireblocks_config_reads_back_as_fireblocks_with_its_defaults() {
+        let view = try_read_signer(FIREBLOCKS_SIGNER).expect("fireblocks config parses");
+        match view {
+            SignerView::Fireblocks {
+                vault_account_id,
+                asset_id,
+                api_base_url,
+                raw_signing,
+                ..
+            } => {
+                assert_eq!(vault_account_id, "7");
+                // Defaults come from the config layer, not the file.
+                assert_eq!(asset_id, "ETH");
+                assert_eq!(api_base_url, "https://api.fireblocks.io");
+                assert!(!raw_signing, "raw signing is off unless asked for");
+            }
+            other => panic!("expected Fireblocks, got {other:?}"),
+        }
+    }
+
     const TURNKEY_SIGNER: &str = "\n[signer]\nprovider = \"turnkey\"\n\
          organization_id = \"org-1\"\n\
          sign_with = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n\
@@ -1252,6 +1346,8 @@ mod tests {
         // env into a file has to be told rather than handed the hot wallet.
         assert!(try_read_signer("this is not [ toml").is_err());
         assert!(try_read_signer("[signer]\nprovider = \"turnkey\"\n").is_err());
+        // Fireblocks needs both required fields too.
+        assert!(try_read_signer("[signer]\nprovider = \"fireblocks\"\n").is_err());
         // The lenient wrapper is still lenient, for the desktop form.
         assert!(matches!(
             read_signer("this is not [ toml"),

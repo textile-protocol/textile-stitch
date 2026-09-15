@@ -23,6 +23,7 @@ pub enum SignerKind {
     Local,
     Turnkey,
     Mpcvault,
+    Fireblocks,
 }
 
 impl SignerKind {
@@ -32,14 +33,18 @@ impl SignerKind {
             SignerKind::Local => "Hot wallet (local key)",
             SignerKind::Turnkey => "MPC — Turnkey",
             SignerKind::Mpcvault => "MPC — MPCVault",
+            SignerKind::Fireblocks => "MPC — Fireblocks",
         }
     }
 
     /// MPCVault is still experimental (its live client-signer callback flow has
     /// not been validated against a paid vault), so the UI keeps warning on it.
-    /// Turnkey is production-ready. The local hotwallet was never experimental.
+    /// Fireblocks is too, for a different reason: signing is a create-then-poll
+    /// round trip rather than one call, and whether that fits inside the venue's
+    /// reply budget has not been measured against a real workspace. Turnkey is
+    /// production-ready. The local hotwallet was never experimental.
     pub fn experimental(self) -> bool {
-        matches!(self, SignerKind::Mpcvault)
+        matches!(self, SignerKind::Mpcvault | SignerKind::Fireblocks)
     }
 
     /// Label with an `· Experimental` marker appended for experimental backends,
@@ -52,7 +57,27 @@ impl SignerKind {
         }
     }
 
-    pub const ALL: [SignerKind; 3] = [SignerKind::Local, SignerKind::Turnkey, SignerKind::Mpcvault];
+    /// The owner-only file this backend's secret lives in, beside `stitch.toml`.
+    ///
+    /// One table, because three separate places need to agree on these names:
+    /// the writer that creates them, the panel provisioning that mounts them
+    /// into a container, and the check that decides whether a folder is set up.
+    /// They used to be literals repeated at each site.
+    pub const fn secret_file(self) -> &'static str {
+        match self {
+            SignerKind::Local => "stitch.key",
+            SignerKind::Turnkey => "turnkey-api.key",
+            SignerKind::Mpcvault => "mpcvault-api.token",
+            SignerKind::Fireblocks => "fireblocks-api.key",
+        }
+    }
+
+    pub const ALL: [SignerKind; 4] = [
+        SignerKind::Local,
+        SignerKind::Turnkey,
+        SignerKind::Mpcvault,
+        SignerKind::Fireblocks,
+    ];
 }
 
 /// How the operator supplied their hot-wallet key. Either a raw private key or a
@@ -125,6 +150,19 @@ pub enum SignerSetup {
         callback_listen_addr: Option<String>,
         api_token: String,
     },
+    /// Fireblocks MPC. The API key is an identifier (→ env inline); the RSA
+    /// private key is the secret (→ fireblocks-api.key). `vault_account_id` and
+    /// `operator_address` are discovered from the credentials by the panel
+    /// rather than typed.
+    Fireblocks {
+        vault_account_id: String,
+        operator_address: String,
+        asset_id: Option<String>,
+        api_base_url: Option<String>,
+        raw_signing: bool,
+        api_key: String,
+        api_private_key: String,
+    },
 }
 
 impl SignerSetup {
@@ -133,6 +171,7 @@ impl SignerSetup {
             SignerSetup::Local { .. } => SignerKind::Local,
             SignerSetup::Turnkey { .. } => SignerKind::Turnkey,
             SignerSetup::Mpcvault { .. } => SignerKind::Mpcvault,
+            SignerSetup::Fireblocks { .. } => SignerKind::Fireblocks,
         }
     }
 
@@ -146,6 +185,9 @@ impl SignerSetup {
                 operator_address, ..
             }
             | SignerSetup::Mpcvault {
+                operator_address, ..
+            }
+            | SignerSetup::Fireblocks {
                 operator_address, ..
             } => parse_address(operator_address),
         }
@@ -485,11 +527,17 @@ pub fn stamp_rfq_default_preset(toml_path: &Path) -> Result<()> {
 
 /// Path of the owner-only secret file for a signer, next to stitch.toml.
 fn secret_path(paths: &ConfigPaths, signer: &SignerSetup) -> PathBuf {
-    match signer {
-        SignerSetup::Local { .. } => paths.key.clone(),
-        SignerSetup::Turnkey { .. } => paths.dir.join("turnkey-api.key"),
-        SignerSetup::Mpcvault { .. } => paths.dir.join("mpcvault-api.token"),
-    }
+    paths.dir.join(signer.kind().secret_file())
+}
+
+/// Every backend's secret file, in the shared bots directory.
+///
+/// Derived from [`SignerKind::ALL`] rather than hand-listed: the writer, the
+/// "is this folder configured" check, and the sweep that removes a previous
+/// backend's secret all need the same set, and three hand-maintained copies is
+/// how one of them ends up missing the next backend.
+pub fn all_secret_files(dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    SignerKind::ALL.iter().map(|k| dir.join(k.secret_file()))
 }
 
 /// The files [`apply_signer`] writes, as names relative to `dir`: `stitch.toml`,
@@ -515,11 +563,7 @@ pub fn signer_files(dir: impl AsRef<Path>, signer: &SignerSetup) -> Vec<String> 
 /// Best-effort: a missing file is fine.
 fn remove_other_secrets(paths: &ConfigPaths, keep: &SignerSetup) {
     let kept = secret_path(paths, keep);
-    for candidate in [
-        paths.key.clone(),
-        paths.dir.join("turnkey-api.key"),
-        paths.dir.join("mpcvault-api.token"),
-    ] {
+    for candidate in all_secret_files(&paths.dir) {
         if candidate != kept {
             let _ = std::fs::remove_file(&candidate);
         }
@@ -538,6 +582,10 @@ fn render_env_for(paths: &ConfigPaths, signer: &SignerSetup) -> String {
             q(api_public_key.trim())
         ),
         SignerSetup::Mpcvault { .. } => format!("MPCVAULT_API_TOKEN_FILE={secret}\n"),
+        SignerSetup::Fireblocks { api_key, .. } => format!(
+            "FIREBLOCKS_API_KEY={}\nFIREBLOCKS_API_PRIVATE_KEY_FILE={secret}\n",
+            q(api_key.trim())
+        ),
     };
     format!("{head}RUST_LOG=info\n")
 }
@@ -555,6 +603,11 @@ fn write_signer_secrets(paths: &ConfigPaths, signer: &SignerSetup) -> Result<()>
             api_private_key, ..
         } => format!("{}\n", api_private_key.trim()),
         SignerSetup::Mpcvault { api_token, .. } => format!("{}\n", api_token.trim()),
+        // The RSA PEM is multi-line and its trailing newline matters to some
+        // parsers, so normalise to exactly one rather than trimming it away.
+        SignerSetup::Fireblocks {
+            api_private_key, ..
+        } => format!("{}\n", api_private_key.trim_end()),
     };
     let path = secret_path(paths, signer);
     let res = write_key_file_atomic(&path, line.as_bytes())
@@ -615,6 +668,25 @@ fn signer_table(signer: &SignerSetup) -> toml_edit::Table {
             t["operator_address"] = value(operator_address.trim());
             set_opt(&mut t, "api_base_url", api_base_url);
             set_opt(&mut t, "callback_listen_addr", callback_listen_addr);
+        }
+        SignerSetup::Fireblocks {
+            vault_account_id,
+            operator_address,
+            asset_id,
+            api_base_url,
+            raw_signing,
+            ..
+        } => {
+            t["provider"] = value("fireblocks");
+            t["vault_account_id"] = value(vault_account_id.trim());
+            t["operator_address"] = value(operator_address.trim());
+            set_opt(&mut t, "asset_id", asset_id);
+            set_opt(&mut t, "api_base_url", api_base_url);
+            // Only written when on: the default is off, and an explicit `false`
+            // in the file reads like the operator considered and chose it.
+            if *raw_signing {
+                t["raw_signing"] = value(true);
+            }
         }
         SignerSetup::Local { .. } => {}
     }
@@ -679,6 +751,25 @@ fn validate_signer(signer: &SignerSetup) -> Result<()> {
                 !api_token.trim().is_empty(),
                 "MPCVault API token is required",
             )?;
+        }
+        SignerSetup::Fireblocks {
+            vault_account_id,
+            operator_address,
+            api_key,
+            api_private_key,
+            ..
+        } => {
+            need(
+                !vault_account_id.trim().is_empty(),
+                "Fireblocks vault account is required",
+            )?;
+            parse_address(operator_address)
+                .context("operator address is not a valid EVM address")?;
+            need(!api_key.trim().is_empty(), "Fireblocks API key is required")?;
+            // Catch a pasted-wrong key here rather than at the first sign: the
+            // PEM is the one field an operator supplies by file, and a partial
+            // copy is easy to make and invisible afterwards.
+            crate::signer::fireblocks::parse_rsa_pem(api_private_key)?;
         }
     }
     Ok(())
@@ -1111,6 +1202,131 @@ mod tests {
         assert!(env.contains("MPCVAULT_API_TOKEN_FILE="));
         assert!(!env.contains("STITCH_PRIVATE_KEY_FILE"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A throwaway 2048-bit RSA key, generated for these tests and never used
+    /// anywhere else. Fireblocks credentials are validated as real PEMs at write
+    /// time, so the tests need a real one.
+    const TEST_RSA_PEM: &str = include_str!("testdata/fireblocks-test-rsa.pem");
+
+    fn fireblocks(vault: &str, api_key: &str) -> SignerSetup {
+        fireblocks_with_raw_signing(vault, api_key, false)
+    }
+
+    fn fireblocks_with_raw_signing(vault: &str, api_key: &str, raw_signing: bool) -> SignerSetup {
+        SignerSetup::Fireblocks {
+            vault_account_id: vault.to_string(),
+            operator_address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string(),
+            asset_id: None,
+            api_base_url: None,
+            raw_signing,
+            api_key: api_key.to_string(),
+            api_private_key: TEST_RSA_PEM.to_string(),
+        }
+    }
+
+    #[test]
+    fn fireblocks_config_puts_the_api_key_in_env_and_the_rsa_key_in_a_file() {
+        let dir = unique_dir("fireblocks-write");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        write_config_signer(&dir, corridor, &fireblocks("3", "API-KEY-UUID")).unwrap();
+
+        let toml = std::fs::read_to_string(dir.join("stitch.toml")).unwrap();
+        assert!(toml.contains("provider = \"fireblocks\""));
+        assert!(toml.contains("vault_account_id = \"3\""));
+        // Off by default, and deliberately not written as `false` — the file
+        // should not imply the operator made a choice they never made.
+        assert!(
+            !toml.contains("raw_signing"),
+            "raw_signing must be omitted when off, got:\n{toml}"
+        );
+        // The RSA key is secret and never belongs in the config.
+        assert!(
+            !toml.contains("BEGIN PRIVATE KEY"),
+            "the RSA key must not reach stitch.toml"
+        );
+
+        let env = std::fs::read_to_string(dir.join("stitch.env")).unwrap();
+        assert!(env.contains("FIREBLOCKS_API_KEY='API-KEY-UUID'"));
+        assert!(env.contains("FIREBLOCKS_API_PRIVATE_KEY_FILE="));
+        assert!(
+            !env.contains("BEGIN PRIVATE KEY"),
+            "the RSA key must not be inlined into stitch.env"
+        );
+
+        let secret = std::fs::read_to_string(dir.join("fireblocks-api.key")).unwrap();
+        assert!(secret.starts_with("-----BEGIN PRIVATE KEY-----"));
+        assert!(
+            secret.ends_with("-----END PRIVATE KEY-----\n"),
+            "the PEM keeps exactly one trailing newline"
+        );
+    }
+
+    #[test]
+    fn fireblocks_writes_raw_signing_only_when_the_operator_turned_it_on() {
+        let dir = unique_dir("fireblocks-raw");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let signer = fireblocks_with_raw_signing("0", "K", true);
+        write_config_signer(&dir, corridor, &signer).unwrap();
+        let toml = std::fs::read_to_string(dir.join("stitch.toml")).unwrap();
+        assert!(toml.contains("raw_signing = true"), "{toml}");
+    }
+
+    /// A mistyped or half-pasted PEM must fail before anything is written, not
+    /// at the bot's first quote.
+    #[test]
+    fn fireblocks_rejects_a_key_that_is_not_a_real_pem() {
+        let dir = unique_dir("fireblocks-bad-pem");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let signer = SignerSetup::Fireblocks {
+            vault_account_id: "0".into(),
+            operator_address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            asset_id: None,
+            api_base_url: None,
+            raw_signing: false,
+            api_key: "K".into(),
+            api_private_key: "-----BEGIN PRIVATE KEY-----\nnot really a key\n".into(),
+        };
+        let err = write_config_signer(&dir, corridor, &signer).unwrap_err();
+        assert!(format!("{err:#}").contains("RSA PEM"), "{err:#}");
+        assert!(
+            !dir.join("fireblocks-api.key").exists(),
+            "nothing may be written when validation fails"
+        );
+    }
+
+    /// Switching to Fireblocks must sweep the previous backend's secret, or a
+    /// stale hot-wallet key stays readable on disk.
+    #[test]
+    fn switching_to_fireblocks_removes_the_other_backends_secrets() {
+        let dir = unique_dir("fireblocks-sweep");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        write_config_signer(
+            &dir,
+            corridor,
+            &SignerSetup::Local {
+                material: LocalKeyMaterial::PrivateKey(
+                    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".into(),
+                ),
+            },
+        )
+        .unwrap();
+        assert!(dir.join("stitch.key").exists());
+
+        apply_signer(&dir, &fireblocks("1", "K")).unwrap();
+        assert!(
+            !dir.join("stitch.key").exists(),
+            "the hot-wallet key must not survive the switch"
+        );
+        assert!(dir.join("fireblocks-api.key").exists());
+    }
+
+    #[test]
+    fn signer_files_names_the_fireblocks_secret() {
+        assert_eq!(
+            signer_files(std::path::Path::new("/tmp/x"), &fireblocks("0", "K")),
+            vec!["stitch.toml", "stitch.env", "fireblocks-api.key"]
+        );
     }
 
     #[test]

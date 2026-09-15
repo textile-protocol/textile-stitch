@@ -246,6 +246,16 @@ pub struct ConfigSummary {
     /// a second process holding the same key unsafe to run concurrently, so the
     /// panel needs to know before it offers one.
     pub sends_transactions: bool,
+    /// Why this bot's signer cannot sign a transaction, if it cannot.
+    ///
+    /// `Some` only for a backend that signs EIP-712 structures but not an
+    /// EIP-1559 transaction hash (Fireblocks without `raw_signing`). The panel
+    /// needs to know before it offers an approval or a withdrawal, both of which
+    /// are transactions — otherwise the wizard runs `stitch approve` and the
+    /// operator watches it fail with nothing to do about it. Carrying the reason
+    /// rather than a bool keeps the remedy with the backend that knows it; see
+    /// [`crate::signer::SignerConfig::raw_signing_unavailable`].
+    pub cannot_sign_transactions: Option<&'static str>,
     /// Where this bot stands with Textile's RFQ venue, from the config and the
     /// files beside it alone. No venue call: asking the venue rewrites the
     /// config on a seated bot, so this is what can be known without asking.
@@ -819,6 +829,10 @@ pub fn summarise(
             .pools
             .iter()
             .any(|p| p.limit_taker_enabled() || p.closer_enabled()),
+        cannot_sign_transactions: parsed
+            .signer
+            .as_ref()
+            .and_then(|s| s.raw_signing_unavailable()),
         venue: venue_seat(&parsed, config_path, runtime),
     })
 }
@@ -892,6 +906,9 @@ fn operator_address(signer: &setup::SignerView, config_path: &Path) -> Option<St
         }
         | setup::SignerView::Mpcvault {
             operator_address, ..
+        }
+        | setup::SignerView::Fireblocks {
+            operator_address, ..
         } => Some(operator_address.clone()),
     }
 }
@@ -901,6 +918,7 @@ fn signer_label(signer: &setup::SignerView) -> &'static str {
         setup::SignerView::Local => "hot-wallet",
         setup::SignerView::Turnkey { .. } => "turnkey",
         setup::SignerView::Mpcvault { .. } => "mpcvault",
+        setup::SignerView::Fireblocks { .. } => "fireblocks",
     }
 }
 

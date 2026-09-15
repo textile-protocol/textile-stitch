@@ -55,7 +55,7 @@ use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
 use crate::pricing::tick::{is_price_usable, is_stale};
-use crate::protocol::eip712::permit2_digest;
+use crate::protocol::typed_data::permit2_payload;
 use crate::signer::DynSigner;
 use crate::time::unix_now;
 
@@ -573,7 +573,7 @@ async fn run(rt: RfqRuntime) {
         .await
         {
             Ok(authed) => {
-                let started = tokio::time::Instant::now();
+                let started = std::time::Instant::now();
                 let (err, ledger) = session_loop(
                     &rt,
                     &prices,
@@ -1546,11 +1546,44 @@ impl Engine {
             taker,
             order_executor: self.vault_order_executor,
         });
-        let digest = permit2_digest(&order, self.permit2, self.chain_id);
-        let signature = match self.signer.sign_digest(digest).await {
-            Ok(sig) => sig,
-            Err(e) => {
+        // Bound the signature by what is left of the reply budget.
+        //
+        // `replyBy` was checked on the way in, but pricing has taken time since,
+        // and on an MPC backend signing is a network round trip rather than a
+        // microsecond of local ECDSA. Two things go wrong without a bound. A
+        // signature that lands after `replyBy` produces a quote the venue has
+        // already stopped listening for — yet the reservation below would still
+        // pin that inventory for the whole TTL, against nothing. And because
+        // `run_connected` awaits `dispatch` inline, a backend sitting on its own
+        // poll timeout would stall the socket for every *other* RFQ and level
+        // update too, turning one slow signature into a dead session.
+        //
+        // Dropping the future cancels our wait, not the provider's work: a
+        // remote signer may still finish and bill the request. That is the right
+        // trade — the alternative is holding the socket for a signature we can
+        // no longer use. Local signing never reaches the timeout.
+        let budget_ms = reply_by_ms.saturating_sub(unix_now_ms());
+        if budget_ms == 0 {
+            warn!(rfq_id = %req.rfq_id, "reply budget spent before signing");
+            return reject(RejectReason::Busy);
+        }
+        let payload = permit2_payload(&order, self.permit2, self.chain_id);
+        let signing = tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms),
+            self.signer.sign_typed(&payload),
+        );
+        let signature = match signing.await {
+            Ok(Ok(sig)) => sig,
+            Ok(Err(e)) => {
                 error!(error = %format!("{e:#}"), rfq_id = %req.rfq_id, "signing failed");
+                return reject(RejectReason::Busy);
+            }
+            Err(_) => {
+                warn!(
+                    budget_ms,
+                    rfq_id = %req.rfq_id,
+                    "signing did not finish inside the reply budget"
+                );
                 return reject(RejectReason::Busy);
             }
         };
@@ -2040,6 +2073,58 @@ mod tests {
         let _ = b.next_delay();
         b.reset();
         assert_eq!(b.next_delay(), std::time::Duration::from_secs(1));
+    }
+
+    /// A signer that takes longer than any reply budget, for pinning the
+    /// timeout. Stands in for an MPC backend whose policy path needs a human,
+    /// or whose provider is simply slow.
+    struct SlowSigner {
+        address: Address,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::signer::Signer for SlowSigner {
+        async fn sign_digest(&self, _digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            unreachable!("the reply budget must cut this off long before it returns")
+        }
+
+        fn address(&self) -> Address {
+            self.address
+        }
+    }
+
+    /// A signature that misses `replyBy` is worthless — the venue has stopped
+    /// listening — but signing it anyway costs twice over: the reservation
+    /// below pins inventory for the whole TTL against a quote nobody will take,
+    /// and because `run_connected` awaits `dispatch` inline, the socket stalls
+    /// for every other RFQ and level update while we wait.
+    #[tokio::test]
+    async fn a_signature_that_misses_the_reply_budget_rejects_and_reserves_nothing() {
+        let mut engine = test_engine();
+        let address = engine.signer.address();
+        engine.signer = Arc::new(SlowSigner { address });
+        let prices = fresh_prices();
+
+        let mut req = exact_input_request("rfq_slow");
+        // A realistic budget: the venue's pilot default.
+        req.reply_by = format_iso_ms(unix_now_ms() + 750);
+
+        let started = std::time::Instant::now();
+        let MakerFrame::QuoteReject(rej) = engine.respond(req, &prices).await else {
+            panic!("a signature that can't arrive in time must not become a quote");
+        };
+        assert_eq!(rej.reason, RejectReason::Busy);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must be bounded by the reply budget, not the signer's own timeout \
+             (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            engine.reservations.is_empty(),
+            "a quote that was never sent must not pin inventory"
+        );
     }
 
     fn test_engine() -> Engine {

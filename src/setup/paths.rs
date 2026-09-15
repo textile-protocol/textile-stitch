@@ -130,11 +130,10 @@ pub fn is_configured(dir: impl AsRef<Path>) -> bool {
 }
 
 /// True if any signer's secret file is present: the hot-wallet stitch.key, or an
-/// MPC api key/token.
+/// MPC api key/token. Reads the shared table so a new backend cannot be added
+/// without this check learning about it.
 fn has_signer_secret(p: &ConfigPaths) -> bool {
-    p.key.exists()
-        || p.dir.join("turnkey-api.key").exists()
-        || p.dir.join("mpcvault-api.token").exists()
+    crate::setup::writer::all_secret_files(&p.dir).any(|f| f.exists())
 }
 
 /// True if writing a config into this folder would replace any existing operator

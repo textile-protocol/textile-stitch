@@ -209,6 +209,41 @@ export const api = {
     ),
 
   /**
+   * The Fireblocks workspace's vault accounts, so the signer form can offer a
+   * dropdown instead of asking the operator to copy an id out of the console.
+   *
+   * The credentials are sent because Fireblocks has no read-only mode — every
+   * request is stamped with the RSA key. They are used for the call and dropped;
+   * nothing is stored until the bot is created.
+   */
+  fireblocksVaults: (body: {
+    apiKey: string
+    apiPrivateKey: string
+    apiBaseUrl?: string
+  }) =>
+    request<{ vaults: { id: string; name: string }[] }>(
+      '/api/signer/fireblocks/vaults',
+      json(body),
+    ),
+
+  /**
+   * Sign one throwaway message for real. Returns the address that signature
+   * recovered to — which is what fills in the operator address — and how long
+   * the round trip took.
+   */
+  fireblocksVerify: (body: {
+    apiKey: string
+    apiPrivateKey: string
+    apiBaseUrl?: string
+    vaultAccountId: string
+    assetId?: string
+  }) =>
+    request<{ address: string; latencyMs: number }>(
+      '/api/signer/fireblocks/verify',
+      json(body),
+    ),
+
+  /**
    * Dry-run: which other bots already use this signer on this chain. Used to warn
    * before create — sharing a wallet races nonces.
    */

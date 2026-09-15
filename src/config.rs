@@ -995,6 +995,30 @@ fn rfq_side_capacity(
 }
 
 impl Config {
+    /// The legs that broadcast transactions from the operator wallet, named for
+    /// an error message. Empty means this config only ever signs orders.
+    ///
+    /// The ladder is deliberately absent: `book_enabled` rests signed Permit2
+    /// orders through `sign_submission`, which costs no nonce. One definition,
+    /// because the panel's `sends_transactions` asks the same question and the
+    /// two silently disagreeing is how a third broadcasting leg would slip past
+    /// the typed-only signer check.
+    pub fn on_chain_legs(&self) -> Vec<&'static str> {
+        [
+            self.pools
+                .iter()
+                .any(|p| p.limit_taker_enabled())
+                .then_some("pools[].limit_taker"),
+            self.pools
+                .iter()
+                .any(|p| p.closer_enabled())
+                .then_some("pools[].closer"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
         let cfg = toml::from_str::<Self>(s)?;
         cfg.validate()?;
@@ -1236,7 +1260,23 @@ impl Config {
                 crate::signer::SignerConfig::Mpcvault(c) => {
                     crate::signer::validate_signer_api_base_url("mpcvault", &c.api_base_url)?;
                 }
+                crate::signer::SignerConfig::Fireblocks(c) => {
+                    crate::signer::validate_signer_api_base_url("fireblocks", &c.api_base_url)?;
+                }
                 crate::signer::SignerConfig::Local => {}
+            }
+            // A backend that can only sign EIP-712 structures covers every
+            // quoting signature, but not the EIP-1559 transaction hash — that is
+            // not typed data. Catch the combination here, where the message can
+            // name the fix, rather than at the first fill hours into a run.
+            if let Some(why) = signer.raw_signing_unavailable() {
+                let on_chain = self.on_chain_legs();
+                anyhow::ensure!(
+                    on_chain.is_empty(),
+                    "this bot {why}, so it cannot run the on-chain legs this config turns on \
+                     ({}). Quoting and the ladder are unaffected — they only sign orders.",
+                    on_chain.join(", ")
+                );
             }
         }
         if let Some(vault) = &self.vault {
@@ -1351,6 +1391,169 @@ mod tests {
         assert!(cfg.feed.staleness_secs > 0);
         // The taker leg is opt-in: the example documents it commented out.
         assert!(!pool.limit_taker_enabled());
+    }
+
+    /// Every `[signer]` shape that shipped before Fireblocks existed, still
+    /// parsing on the current binary.
+    ///
+    /// Adding a variant to a `#[serde(tag = "provider")]` enum is additive, but
+    /// "should be" is not a guarantee an operator can rely on: these are the
+    /// configs already sitting on disk on running bots, and an upgrade that
+    /// can't read them is an outage, not a bug report. So pin them.
+    ///
+    /// Note what each case asserts beyond parsing: `can_sign_raw_digests()` is
+    /// true for all of them, which is what keeps the new typed-only validation
+    /// inert for every pre-existing bot.
+    #[test]
+    fn every_pre_fireblocks_signer_config_still_parses() {
+        let cases: [(&str, &str); 4] = [
+            ("no [signer] section at all", ""),
+            (
+                "explicit local",
+                "[signer]\n            provider = \"local\"\n",
+            ),
+            (
+                "turnkey",
+                "[signer]\n            provider = \"turnkey\"\n\
+                 organization_id = \"org-1\"\n\
+                 sign_with = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n\
+                 operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n",
+            ),
+            (
+                "mpcvault",
+                "[signer]\n            provider = \"mpcvault\"\n\
+                 vault_uuid = \"1111\"\n\
+                 client_signer_pubkey = \"ssh-ed25519 AAAA\"\n\
+                 operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n",
+            ),
+        ];
+        for (what, signer) in cases {
+            let cfg = Config::from_toml(&rfq_only_with_signer(signer))
+                .unwrap_or_else(|e| panic!("{what} must still parse: {e:#}"));
+            assert!(
+                cfg.signer.as_ref().is_none_or(|s| s.can_sign_raw_digests()),
+                "{what}: the typed-only validation must stay inert for signers \
+                 that can sign transactions"
+            );
+        }
+    }
+
+    /// The ladder and the taker legs on a pre-existing signer are untouched by
+    /// the typed-only gate — an upgraded bot keeps running exactly what it ran.
+    #[test]
+    fn an_upgraded_hot_wallet_bot_may_still_run_every_leg() {
+        let toml = rfq_only_with_signer("")
+            .replace("book_enabled = false", "book_enabled = true")
+            .replace(
+                "refresh_threshold_bps = 10",
+                "refresh_threshold_bps = 10\n            limit_taker_enabled = true",
+            );
+        let cfg = Config::from_toml(&toml).expect("a hot wallet signs transactions as before");
+        assert!(cfg.book_enabled);
+        assert!(cfg.pools[0].limit_taker_enabled());
+    }
+
+    /// A minimal RFQ-only config (no ladder, no taker, no closer) with whatever
+    /// `[signer]` section the caller wants appended.
+    fn rfq_only_with_signer(signer: &str) -> String {
+        format!(
+            r#"
+            chain_id = 8453
+            rpc_url = "http://x"
+            indexer_url = "http://x"
+            permit2 = "0x0000000000000000000000000000000000000000"
+            reactor = "0x0000000000000000000000000000000000000000"
+            tick_interval_secs = 5
+            book_enabled = false
+            [feed]
+            url = "https://x"
+            staleness_secs = 30
+            [[pools]]
+            collateral = "0x0000000000000000000000000000000000000001"
+            collateral_decimals = 18
+            debt = "0x0000000000000000000000000000000000000002"
+            debt_decimals = 6
+            buy_offset_bps = 150
+            buy_total_liquidity_debt = "50000000000"
+            buy_min_slice_debt = "10000000"
+            buy_max_orders = 40
+            sell_offset_bps = 150
+            sell_total_liquidity_collateral = "30000000000000000000000"
+            sell_min_slice_debt = "10000000"
+            sell_max_orders = 40
+            ttl_secs = 60
+            refresh_threshold_bps = 10
+            {signer}
+        "#
+        )
+    }
+
+    const FIREBLOCKS_SIGNER: &str = r#"
+            [signer]
+            provider = "fireblocks"
+            vault_account_id = "0"
+            operator_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        "#;
+
+    /// Fireblocks without raw signing covers every EIP-712 signature, which is
+    /// all an RFQ-only bot ever makes. This must parse.
+    #[test]
+    fn a_typed_message_only_signer_is_fine_for_an_rfq_only_bot() {
+        let cfg = Config::from_toml(&rfq_only_with_signer(FIREBLOCKS_SIGNER))
+            .expect("RFQ-only + typed-message signer must be a valid config");
+        assert!(!cfg.book_enabled);
+        assert!(!cfg.signer.as_ref().unwrap().can_sign_raw_digests());
+    }
+
+    /// The ladder only rests *signed orders*: `sign_submission` signs typed data
+    /// and nothing is broadcast, which is why the panel's `sends_transactions`
+    /// excludes it too. A typed-only signer must be allowed to run it, or
+    /// operators get pushed into buying Raw Signing for nothing.
+    #[test]
+    fn a_typed_message_only_signer_may_still_run_the_ladder() {
+        let toml = rfq_only_with_signer(FIREBLOCKS_SIGNER)
+            .replace("book_enabled = false", "book_enabled = true");
+        let cfg = Config::from_toml(&toml).expect("the ladder signs orders, not transactions");
+        assert!(cfg.book_enabled);
+    }
+
+    /// The taker settles on chain, so it genuinely needs raw signing. Reject at
+    /// config time and name the fix, rather than failing at the first fill hours
+    /// into a run.
+    #[test]
+    fn a_typed_message_only_signer_refuses_the_taker_leg() {
+        let toml = rfq_only_with_signer(FIREBLOCKS_SIGNER).replace(
+            "refresh_threshold_bps = 10",
+            "refresh_threshold_bps = 10\n            limit_taker_enabled = true",
+        );
+        let err = Config::from_toml(&toml).expect_err("the taker needs raw signing");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("limit_taker"), "{shown}");
+        assert!(
+            shown.contains("raw_signing"),
+            "the error must name the setting that fixes it: {shown}"
+        );
+    }
+
+    /// With raw signing turned on the same bot is allowed to run them.
+    #[test]
+    fn raw_signing_re_enables_the_on_chain_legs() {
+        let toml = rfq_only_with_signer(&format!(
+            "{FIREBLOCKS_SIGNER}            raw_signing = true\n"
+        ))
+        .replace("book_enabled = false", "book_enabled = true");
+        Config::from_toml(&toml).expect("raw signing covers the on-chain legs");
+    }
+
+    /// The host allowlist applies to Fireblocks like every other backend, so a
+    /// hostile base URL cannot be used to exfiltrate the JWT.
+    #[test]
+    fn a_hostile_fireblocks_api_host_is_rejected() {
+        let toml = rfq_only_with_signer(
+            "[signer]\n            provider = \"fireblocks\"\n            vault_account_id = \"0\"\n            operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n            api_base_url = \"https://evil.example\"\n",
+        );
+        let err = Config::from_toml(&toml).expect_err("attacker host must be refused");
+        assert!(format!("{err:#}").contains("evil.example"), "{err:#}");
     }
 
     #[test]

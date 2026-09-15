@@ -215,6 +215,30 @@ pub fn maker_enroll_digest(
     keccak256(&buf)
 }
 
+/// Domain for the panel's signer connectivity check. Deliberately unrelated to
+/// every other domain the bot signs: a check signature must be worthless
+/// everywhere — no contract verifies it, and the venue has never heard of it —
+/// so producing one can never be turned into a trade, a session, or an enrolment.
+const SIGNER_CHECK_DOMAIN_TYPE: &str = "EIP712Domain(string name,string version)";
+const SIGNER_CHECK_DOMAIN_NAME: &str = "Stitch Signer Check";
+const SIGNER_CHECK_TYPE: &str = "SignerCheck(bytes32 nonce)";
+
+/// EIP-712 digest of the signer connectivity check. See
+/// [`SIGNER_CHECK_DOMAIN_NAME`] for why it has its own domain.
+pub fn signer_check_digest(nonce: B256) -> B256 {
+    let domain = hash_words(&[
+        b256_word(k(SIGNER_CHECK_DOMAIN_TYPE)),
+        b256_word(k(SIGNER_CHECK_DOMAIN_NAME)),
+        b256_word(k(SESSION_DOMAIN_VERSION)),
+    ]);
+    let struct_hash = hash_words(&[b256_word(k(SIGNER_CHECK_TYPE)), b256_word(nonce)]);
+    let mut buf = Vec::with_capacity(66);
+    buf.extend_from_slice(&[0x19, 0x01]);
+    buf.extend_from_slice(&domain.0);
+    buf.extend_from_slice(&struct_hash.0);
+    keccak256(&buf)
+}
+
 /// EIP-712 digest of the venue's `MakerSession` challenge reply.
 ///
 /// `domain_name` comes verbatim from the venue's challenge frame ("Textile

@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.257"
+version = "0.1.258"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; quotes Swap via RFQ firm quotes and optionally fills resting limit orders."
 license = "AGPL-3.0-or-later"
@@ -83,6 +83,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axoupdater = "0.10.0"
 turnkey_client = "0.7"
+# Fireblocks authenticates every request with an RS256 JWT signed by the
+# workspace RSA key. `use_pem` is what reads the operator's PEM as issued.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 zeroize = "1"
 rpassword = "7"
 # Panel-only (feature = "panel"). The Docker Engine API client talks to the local

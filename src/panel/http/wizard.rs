@@ -138,6 +138,76 @@ pub async fn generate_wallet() -> Result<Response, ApiError> {
     .into_response())
 }
 
+/// Fireblocks credentials, posted so the panel can discover what the operator
+/// would otherwise have to copy out of the console by hand.
+///
+/// Both fields are write-only: they are used for the call and dropped. Nothing
+/// here is stored, logged, or echoed back — the response carries vault names and
+/// an address, never a credential. Fireblocks has no read-only mode (every
+/// request is stamped with the RSA key), so the pair that will later sign is
+/// necessarily the pair that reads.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FireblocksCredentials {
+    pub api_key: String,
+    pub api_private_key: String,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+}
+
+impl FireblocksCredentials {
+    fn client(&self) -> Result<crate::signer::fireblocks::Discovery, ApiError> {
+        crate::signer::fireblocks::Discovery::new(
+            &self.api_key,
+            &self.api_private_key,
+            self.api_base_url.as_deref(),
+        )
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))
+    }
+}
+
+/// The workspace's vault accounts, for the signer form's dropdown.
+pub async fn fireblocks_vaults(
+    Json(body): Json<FireblocksCredentials>,
+) -> Result<Response, ApiError> {
+    let vaults = body
+        .client()?
+        .vaults()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({ "vaults": vaults })).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FireblocksVerifyRequest {
+    #[serde(flatten)]
+    pub credentials: FireblocksCredentials,
+    pub vault_account_id: String,
+    #[serde(default)]
+    pub asset_id: Option<String>,
+}
+
+/// Sign one throwaway message for real, and report the address it proves plus
+/// how long it took.
+///
+/// This is what lets the form fill in `operator_address` instead of asking for
+/// it: the address is not merely read back from the API, it is the address a
+/// signature actually recovered to. The latency is the other half — signing is a
+/// create-then-poll round trip, and an operator deserves to know before they
+/// start quoting whether it fits the venue's reply budget.
+pub async fn fireblocks_verify(
+    Json(body): Json<FireblocksVerifyRequest>,
+) -> Result<Response, ApiError> {
+    let verified = body
+        .credentials
+        .client()?
+        .verify(&body.vault_account_id, body.asset_id.as_deref())
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(verified).into_response())
+}
+
 /// The signer half of the wizard payload.
 ///
 /// Tagged on `kind` so the shape and the backend can't disagree, and so a missing
@@ -179,6 +249,18 @@ pub enum SignerRequest {
         #[serde(default)]
         callback_listen_addr: Option<String>,
         api_token: String,
+    },
+    Fireblocks {
+        vault_account_id: String,
+        operator_address: String,
+        #[serde(default)]
+        asset_id: Option<String>,
+        #[serde(default)]
+        api_base_url: Option<String>,
+        #[serde(default)]
+        raw_signing: bool,
+        api_key: String,
+        api_private_key: String,
     },
 }
 
@@ -238,6 +320,23 @@ impl SignerRequest {
                 callback_listen_addr: blank_to_none(callback_listen_addr),
                 api_token,
             }),
+            SignerRequest::Fireblocks {
+                vault_account_id,
+                operator_address,
+                asset_id,
+                api_base_url,
+                raw_signing,
+                api_key,
+                api_private_key,
+            } => Ok(SignerSetup::Fireblocks {
+                vault_account_id,
+                operator_address,
+                asset_id: blank_to_none(asset_id),
+                api_base_url: blank_to_none(api_base_url),
+                raw_signing,
+                api_key,
+                api_private_key,
+            }),
         }
     }
 }
@@ -257,6 +356,9 @@ fn operator_address_of(setup: &SignerSetup) -> Result<String, ApiError> {
             operator_address, ..
         }
         | SignerSetup::Mpcvault {
+            operator_address, ..
+        }
+        | SignerSetup::Fireblocks {
             operator_address, ..
         } => Ok(operator_address.trim().to_lowercase()),
     }

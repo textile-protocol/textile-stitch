@@ -64,6 +64,19 @@ fn secrets_beside(config_path: &Path) -> SignerSecrets {
     SignerSecrets {
         turnkey_api_private_key_file: provision::find_beside(config_path, "turnkey-api.key"),
         mpcvault_api_token_file: provision::find_beside(config_path, "mpcvault-api.token"),
+        fireblocks_api_private_key_file: provision::find_beside(
+            config_path,
+            crate::setup::writer::SignerKind::Fireblocks.secret_file(),
+        ),
+        // Not a file: the writer puts this one in the bot's `stitch.env`,
+        // because it identifies the API user rather than authenticating it.
+        // Read it from there for the same reason the paths above are per-bot —
+        // the panel serves many bots from one process and never sources any of
+        // their env files.
+        fireblocks_api_key: provision::env_value(
+            config_path,
+            crate::signer::fireblocks::API_KEY_ENV,
+        ),
     }
 }
 
@@ -189,6 +202,54 @@ mod tests {
     use axum::routing::post;
     use axum::Router;
     use serde_json::json;
+
+    /// The panel serves many bots from one process and never sources any bot's
+    /// `stitch.env`, so a Fireblocks bot's API key has to be read out of that
+    /// file per call. Reading it from the process environment instead would
+    /// either fail outright or pick up a key belonging to a different workspace.
+    #[test]
+    fn a_fireblocks_bots_api_key_comes_from_its_own_env_file() {
+        let dir = std::env::temp_dir().join(format!("stitch-enroll-fb-{}", std::process::id()));
+        let bot_a = dir.join("bot-a");
+        let bot_b = dir.join("bot-b");
+        for (d, key) in [(&bot_a, "KEY-A"), (&bot_b, "KEY-B")] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("stitch.toml"), "chain_id = 8453\n").unwrap();
+            std::fs::write(
+                d.join("stitch.env"),
+                format!("FIREBLOCKS_API_KEY='{key}'\nRUST_LOG=info\n"),
+            )
+            .unwrap();
+            std::fs::write(d.join("fireblocks-api.key"), "PEM\n").unwrap();
+        }
+
+        let a = secrets_beside(&bot_a.join("stitch.toml"));
+        let b = secrets_beside(&bot_b.join("stitch.toml"));
+        assert_eq!(a.fireblocks_api_key.as_deref(), Some("KEY-A"));
+        assert_eq!(b.fireblocks_api_key.as_deref(), Some("KEY-B"));
+        assert!(a
+            .fireblocks_api_private_key_file
+            .as_ref()
+            .is_some_and(|p| p.starts_with(&bot_a)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bot with no key in its env yields None rather than an empty string, so
+    /// the signer falls through to the environment and reports the real problem
+    /// instead of authenticating with a blank key.
+    #[test]
+    fn a_missing_fireblocks_api_key_is_none_not_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("stitch-enroll-fb-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stitch.toml"), "chain_id = 8453\n").unwrap();
+        std::fs::write(dir.join("stitch.env"), "RUST_LOG=info\n").unwrap();
+        assert_eq!(
+            secrets_beside(&dir.join("stitch.toml")).fireblocks_api_key,
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn seed(h: &Harness, name: &str) {
         let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();

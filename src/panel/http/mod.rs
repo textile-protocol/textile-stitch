@@ -276,6 +276,14 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/feed/mid", get(wizard::feed_mid))
         .route("/api/wallets/generate", post(wizard::generate_wallet))
         .route("/api/signer/check", post(wizard::check_signer))
+        .route(
+            "/api/signer/fireblocks/vaults",
+            post(wizard::fireblocks_vaults),
+        )
+        .route(
+            "/api/signer/fireblocks/verify",
+            post(wizard::fireblocks_verify),
+        )
         .route("/api/bots", get(bots::list).post(wizard::create))
         .route("/api/bots/{name}", get(bots::show).delete(bots::remove))
         .route("/api/bots/{name}/name", patch(bots::rename))

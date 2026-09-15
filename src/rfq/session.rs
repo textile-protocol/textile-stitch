@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
-use crate::protocol::eip712::maker_session_digest;
+use crate::protocol::typed_data::maker_session_payload;
 use crate::signer::DynSigner;
 
 use super::wire::{MakerFrame, SessionAcceptedFrame, SessionFrame, VenueFrame};
@@ -166,7 +166,7 @@ async fn handshake(
         .parse()
         .context("venue challenge is not 32-byte hex")?;
     let issued_at = unix_now_ms();
-    let digest = maker_session_digest(
+    let payload = maker_session_payload(
         &challenge.domain.name,
         maker_id,
         signer.address(),
@@ -174,7 +174,7 @@ async fn handshake(
         issued_at,
     );
     let signature = signer
-        .sign_digest(digest)
+        .sign_typed(&payload)
         .await
         .context("signing the maker session challenge")?;
 
