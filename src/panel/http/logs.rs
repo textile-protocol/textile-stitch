@@ -832,6 +832,10 @@ mod tests {
             !reason.contains("raw_signing"),
             "raw signing is not the fix for an approval: {reason}"
         );
+        assert!(
+            !reason.contains("Raw Signing"),
+            "must not suggest enabling raw signing: {reason}"
+        );
         assert_eq!(
             v["custodyApprovals"], true,
             "and the UI needs the flag to offer that route: {body}"
@@ -850,9 +854,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["canWithdraw"], false);
         // Unlike an approval, a withdraw has no custodial route here, so this
-        // one really is blocked and raw signing really is the fix.
+        // one really is blocked. The remedy we stand behind is a hot wallet for
+        // the bot that has to transact, not the Raw Signing entitlement.
         let reason = v["withdrawBlockedReason"].as_str().unwrap_or_default();
-        assert!(reason.contains("raw_signing"), "{reason}");
+        assert!(
+            reason.contains("hot wallet"),
+            "the reason must name the fix we recommend: {reason}"
+        );
+        assert!(
+            !reason.contains("Raw Signing"),
+            "must not suggest enabling raw signing: {reason}"
+        );
         assert!(reason.contains("can't withdraw for it"), "{reason}");
     }
 

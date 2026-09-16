@@ -85,9 +85,6 @@ const CONTRACT_CALL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// rule that asks a human, short enough that a browser request does not hang
 /// on it indefinitely.
 const CONTRACT_CALL_TIMEOUT: Duration = Duration::from_secs(180);
-/// Names the contract-call path in operator-facing failures, and selects the
-/// policy remedy in [`FireblocksSigner::explain_failure`].
-const CONTRACT_CALL_WHAT: &str = "contract-call";
 /// `/v1/blockchains` is a workspace-wide list, not a per-account one, so one
 /// page covers every chain any real workspace has.
 const BLOCKCHAIN_PAGE_LIMIT: usize = 200;
@@ -105,6 +102,62 @@ const TERMINAL_FAILURES: &[&str] = &[
     "CANCELLING",
     "TIMEOUT",
 ];
+
+/// Which signing operation a request was for.
+///
+/// This is an enum rather than a label string because the policy remedy differs
+/// by operation: a Typed Message rule does not authorize a `RAW` request, so
+/// quoting the typed-message advice at a raw rejection sends the operator to
+/// write a rule that cannot unblock them. Matching exhaustively means the next
+/// operation added has to answer for itself instead of silently inheriting
+/// another one's remedy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    TypedMessage,
+    Raw,
+    ContractCall,
+}
+
+impl Operation {
+    /// The Transaction Authorization Policy rule that would let this request
+    /// through.
+    ///
+    /// No branch suggests getting Raw Signing enabled. A raw rejection only
+    /// reaches an operator who already set `raw_signing = true`, so it names the
+    /// rule that covers the request they made; a signer that will sign arbitrary
+    /// bytes has arbitrary transaction authority over the vault, and that is not
+    /// something to recommend to someone who has not already chosen it.
+    fn policy_remedy(self) -> &'static str {
+        match self {
+            Operation::TypedMessage => {
+                "Add a Typed Message policy rule for it in the Fireblocks console."
+            }
+            Operation::Raw => {
+                "A Typed Message rule does not cover this request: raw signing needs its own \
+                 policy rule for that vault account."
+            }
+            // Same policy engine, different rule. Pointing a contract call at the
+            // Typed Message rule sends the operator to a screen that is already
+            // correct, so name the one that is actually missing.
+            Operation::ContractCall => {
+                "A contract call needs a Contract Call rule. Note this is NOT raw signing — a \
+                 Contract Call rule needs no entitlement from Fireblocks, just a rule in the \
+                 console."
+            }
+        }
+    }
+}
+
+/// How the operator sees the operation named in an error.
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Operation::TypedMessage => "typed-message",
+            Operation::Raw => "raw",
+            Operation::ContractCall => "contract-call",
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct FireblocksSigner {
@@ -255,7 +308,7 @@ impl FireblocksSigner {
     }
 
     /// Create a signing transaction and poll it until a signature appears.
-    async fn sign_via(&self, body: Value, what: &str) -> anyhow::Result<(RawSig, Duration)> {
+    async fn sign_via(&self, body: Value, what: Operation) -> anyhow::Result<(RawSig, Duration)> {
         let started = Instant::now();
         let created = self
             .send(reqwest::Method::POST, "/v1/transactions", Some(&body))
@@ -320,7 +373,7 @@ impl FireblocksSigner {
     /// not have. Safety does not rest on the status either way: the caller
     /// verifies the signature recovers to the configured operator address over
     /// the digest we computed.
-    fn check_terminal(&self, tx: &Value, what: &str) -> anyhow::Result<Option<RawSig>> {
+    fn check_terminal(&self, tx: &Value, what: Operation) -> anyhow::Result<Option<RawSig>> {
         if let Some(sig) = tx["signedMessages"]
             .as_array()
             .and_then(|m| m.first())
@@ -341,7 +394,7 @@ impl FireblocksSigner {
     ///
     /// A policy rejection is the failure every new Fireblocks bot hits, and the
     /// bare status does not hint at the fix, so name it.
-    fn explain_failure(&self, status: &str, sub_status: &str, what: &str) -> String {
+    fn explain_failure(&self, status: &str, sub_status: &str, what: Operation) -> String {
         let detail = if sub_status.is_empty() {
             String::new()
         } else {
@@ -351,25 +404,12 @@ impl FireblocksSigner {
         if !matches!(status, "BLOCKED" | "REJECTED") {
             return base;
         }
-        // Same policy engine, different rule. Pointing a contract call at the
-        // Typed Message rule sends the operator to a screen that is already
-        // correct, so name the one that is actually missing.
-        if what == CONTRACT_CALL_WHAT {
-            return format!(
-                "{base}. This is the Transaction Authorization Policy: a contract call needs a \
-                 Contract Call rule allowing vault account {} and the API user this key belongs \
-                 to. Note this is NOT raw signing — a Contract Call rule needs no entitlement \
-                 from Fireblocks, just a rule in the console.",
-                self.vault_account_id
-            );
-        }
         format!(
             "{base}. This is normally the Transaction Authorization Policy: signing needs a \
              rule that allows it for vault account {} and the API user this key belongs to. \
-             For typed-message signing add a Typed Message policy rule in the Fireblocks \
-             console; raw signing additionally has to be enabled on the workspace by \
-             Fireblocks before any rule will help.",
-            self.vault_account_id
+             {}",
+            self.vault_account_id,
+            what.policy_remedy()
         )
     }
 
@@ -529,7 +569,10 @@ impl FireblocksSigner {
         let status = tx["status"].as_str().unwrap_or_default();
         if TERMINAL_FAILURES.contains(&status) {
             let sub = tx["subStatus"].as_str().unwrap_or_default();
-            anyhow::bail!("{}", self.explain_failure(status, sub, CONTRACT_CALL_WHAT));
+            anyhow::bail!(
+                "{}",
+                self.explain_failure(status, sub, Operation::ContractCall)
+            );
         }
         if status != "COMPLETED" {
             return Ok(None);
@@ -585,7 +628,7 @@ impl Signer for FireblocksSigner {
             "TYPED_MESSAGE",
             json!([{ "content": payload.typed_data(), "type": "EIP712" }]),
         );
-        let (sig, elapsed) = self.sign_via(body, "typed-message").await?;
+        let (sig, elapsed) = self.sign_via(body, Operation::TypedMessage).await?;
         tracing::debug!(?elapsed, "Fireblocks typed-message signature");
         finalize_signature(
             payload.digest(),
@@ -598,22 +641,23 @@ impl Signer for FireblocksSigner {
     }
 
     /// Opaque 32-byte digests — the EIP-1559 transaction hash, and nothing else
-    /// the bot signs. Only reachable with `raw_signing = true`, because raw
-    /// signing is the entitlement this backend exists to avoid needing.
+    /// the bot signs. Only reachable with `raw_signing = true`, which exists for
+    /// operators who already hold the entitlement; the error below does not
+    /// suggest acquiring it, because a signer that will sign arbitrary bytes has
+    /// arbitrary transaction authority over the vault.
     async fn sign_digest(&self, digest: B256) -> anyhow::Result<[u8; 65]> {
         anyhow::ensure!(
             self.raw_signing,
             "this bot signs with Fireblocks typed messages, which cannot sign an on-chain \
-             transaction — a transaction hash is not EIP-712 typed data. Either send the \
-             transaction from the Fireblocks console (Permit2 approvals are a one-time \
-             ERC-20 approve), or ask Fireblocks to enable Raw Signing on the workspace and \
-             set [signer].raw_signing = true."
+             transaction — a transaction hash is not EIP-712 typed data. A Permit2 approval \
+             does not come through here: the panel has Fireblocks send those as a contract \
+             call. Anything that signs per fill should sign with a hot wallet instead."
         );
         let body = self.envelope(
             "RAW",
             json!([{ "content": hex::encode(digest.as_slice()) }]),
         );
-        let (sig, elapsed) = self.sign_via(body, "raw").await?;
+        let (sig, elapsed) = self.sign_via(body, Operation::Raw).await?;
         tracing::debug!(?elapsed, "Fireblocks raw signature");
         finalize_signature(digest, &sig.r, &sig.s, sig.v, self.operator_address)
     }
@@ -1098,6 +1142,47 @@ mod tests {
         }
     }
 
+    /// A `BLOCKED`/`REJECTED` answer has to name a rule that would actually
+    /// unblock the request that was refused. `sign_digest` files its request as
+    /// `RAW`, and a Typed Message rule does not authorize one, so quoting the
+    /// typed-message remedy there leaves an operator writing a rule that cannot
+    /// help while the taker and closer stay stuck.
+    #[test]
+    fn the_policy_remedy_matches_the_operation_that_was_refused() {
+        let typed = Operation::TypedMessage.policy_remedy();
+        assert!(typed.contains("Typed Message policy rule"), "{typed}");
+
+        let raw = Operation::Raw.policy_remedy();
+        assert!(
+            raw.contains("raw signing needs its own"),
+            "a raw rejection must point at the raw rule: {raw}"
+        );
+        assert!(
+            !raw.contains("Add a Typed Message policy rule"),
+            "a Typed Message rule does not authorize a RAW request: {raw}"
+        );
+        // A contract call is a third rule again — and explicitly not the
+        // entitlement, which is the thing operators assume it needs.
+        let call = Operation::ContractCall.policy_remedy();
+        assert!(call.contains("Contract Call rule"), "{call}");
+        assert!(call.contains("NOT raw signing"), "{call}");
+        assert!(!call.contains("Typed Message"), "wrong rule: {call}");
+
+        // No branch sends the operator off to buy Raw Signing.
+        for remedy in [typed, raw, call] {
+            assert!(!remedy.contains("Raw Signing"), "{remedy}");
+        }
+    }
+
+    /// The operation is interpolated into every error the operator reads, so the
+    /// enum has to render the same wire-ish names the messages always used.
+    #[test]
+    fn an_operation_renders_the_name_the_operator_sees() {
+        assert_eq!(Operation::TypedMessage.to_string(), "typed-message");
+        assert_eq!(Operation::Raw.to_string(), "raw");
+        assert_eq!(Operation::ContractCall.to_string(), "contract-call");
+    }
+
     /// Fireblocks spells these two endpoints differently and the wrong one 404s
     /// silently at setup time, so pin both against the published SDK routes.
     /// Fireblocks documents its base URL with `/v1` on the end; our paths carry
@@ -1270,7 +1355,7 @@ mod tests {
     #[test]
     fn a_blocked_contract_call_names_the_rule_that_is_missing() {
         let signer = test_signer();
-        let msg = signer.explain_failure("BLOCKED", "", CONTRACT_CALL_WHAT);
+        let msg = signer.explain_failure("BLOCKED", "", Operation::ContractCall);
         assert!(msg.contains("Contract Call rule"), "{msg}");
         assert!(
             msg.contains("NOT raw signing"),
@@ -1279,11 +1364,12 @@ mod tests {
         assert!(!msg.contains("Typed Message"), "wrong rule: {msg}");
 
         // The signing path keeps its own advice.
-        let signing = signer.explain_failure("BLOCKED", "", "typed-message");
+        let signing = signer.explain_failure("BLOCKED", "", Operation::TypedMessage);
         assert!(signing.contains("Typed Message policy rule"), "{signing}");
 
         // A non-policy failure gets no rule advice at all.
-        let failed = signer.explain_failure("FAILED", "INSUFFICIENT_FUNDS", CONTRACT_CALL_WHAT);
+        let failed =
+            signer.explain_failure("FAILED", "INSUFFICIENT_FUNDS", Operation::ContractCall);
         assert!(!failed.contains("Contract Call rule"), "{failed}");
         assert!(failed.contains("INSUFFICIENT_FUNDS"), "{failed}");
     }

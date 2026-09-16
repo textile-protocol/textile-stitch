@@ -218,7 +218,7 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # operator_address = "0x<the EVM address that vault account resolves to>"
 # asset_id         = "ETH"                 # optional, default; picks the key format, not a network
 # api_base_url     = "https://api.fireblocks.io"  # optional, default (only official hosts allowed unless STITCH_ALLOW_CUSTOM_SIGNER_API=1)
-# raw_signing      = false                 # optional, default; true only if Fireblocks enabled Raw Signing
+# raw_signing      = false                 # optional, default; leave off — see docs/signer-fireblocks.md
 # poll_interval_ms = 50                    # optional; signing is create-then-poll, so this is latency
 # poll_timeout_secs    = 30                # optional
 # max_concurrent_signs = 4                 # optional

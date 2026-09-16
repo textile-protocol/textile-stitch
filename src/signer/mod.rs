@@ -165,11 +165,17 @@ impl SignerConfig {
 
     /// Why this backend can't sign transactions, in the backend's own words.
     ///
-    /// The capability is generic but the remedy never is — "ask Fireblocks to
-    /// enable Raw Signing" means nothing for a future backend with the same
-    /// limitation. So the explanation lives with the backend that knows it, and
-    /// the two enforcement sites (config validation and the panel's approve /
-    /// withdraw gate) quote it rather than each hardcoding one vendor's name.
+    /// The capability is generic but the remedy never is — a fix phrased for one
+    /// vendor means nothing for the next backend with the same limitation. So the
+    /// explanation lives with the backend that knows it, and the two enforcement
+    /// sites (config validation and the panel's approve / withdraw gate) quote it
+    /// rather than each hardcoding one vendor's name.
+    ///
+    /// The remedy deliberately does *not* suggest turning raw signing on. A
+    /// signer that will sign arbitrary bytes has arbitrary transaction authority
+    /// over the vault, which throws away the containment this backend exists to
+    /// provide — so `raw_signing` stays a setting for operators who already have
+    /// the entitlement, not something we recommend anyone go and buy.
     pub fn raw_signing_unavailable(&self) -> Option<&'static str> {
         match self {
             SignerConfig::Local | SignerConfig::Turnkey(_) | SignerConfig::Mpcvault(_) => None,
@@ -178,8 +184,8 @@ impl SignerConfig {
                 "signs Fireblocks typed messages, which cannot sign an on-chain transaction. \
                  Permit2 approvals do not need one — the panel has Fireblocks send those as a \
                  CONTRACT_CALL, which needs a Contract Call policy rule and no entitlement. \
-                 Anything that signs per fill does: ask Fireblocks to enable Raw Signing on the \
-                 workspace and set [signer].raw_signing = true",
+                 Anything that signs per fill does: give that bot a hot wallet, which a \
+                 Fireblocks bot does not need to quote RFQ or rest the ladder",
             ),
         }
     }

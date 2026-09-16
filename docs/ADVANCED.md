@@ -348,9 +348,10 @@ Four options:
   operator's own Fireblocks workspace. Signs EIP-712 **typed messages**, which
   needs only a Typed Message policy rule the operator writes themselves, not the
   Raw Signing entitlement Fireblocks has to enable for you. That covers RFQ
-  quoting; the on-chain legs need `raw_signing = true` and the entitlement to go
-  with it. Signing is create-then-poll rather than one call, so measure the
-  latency before relying on it to quote.
+  quoting and the ladder. The on-chain legs need `raw_signing = true`, so on a
+  default setup they don't run here — give that bot a hot wallet rather than
+  going after the entitlement. Signing is create-then-poll rather than one call,
+  so measure the latency before relying on it to quote.
 
 Secrets always come from the environment, never the config file (same rule as the
 existing key). Each secret has a `_FILE` variant (a path) that takes precedence
@@ -440,9 +441,10 @@ network, so one vault account covers every corridor.
 With `raw_signing = false` (the default) the bot signs typed messages only. That
 covers RFQ quoting *and* the ladder — both only sign Permit2 orders — but not the
 EIP-1559 transaction hash, so `limit_taker` and closer pools are rejected at
-config time with a message saying so. The one on-chain need left is the Permit2
-approval, which can be sent from the Fireblocks console instead of by `stitch
-approve`.
+config time with a message saying so — run those on a hot-wallet bot. The one
+on-chain need left is the Permit2 approval, and that no longer needs raw signing:
+the panel has Fireblocks send it as a contract call, which takes a Contract Call
+policy rule and no entitlement.
 
 For the full walkthrough (API user and co-signer, the vault account, the Typed
 Message policy rule, and the panel's Verify step), see [Fireblocks signer

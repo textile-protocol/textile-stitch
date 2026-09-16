@@ -1526,12 +1526,19 @@ mod tests {
             "refresh_threshold_bps = 10",
             "refresh_threshold_bps = 10\n            limit_taker_enabled = true",
         );
-        let err = Config::from_toml(&toml).expect_err("the taker needs raw signing");
+        let err = Config::from_toml(&toml).expect_err("the taker settles on chain");
         let shown = format!("{err:#}");
         assert!(shown.contains("limit_taker"), "{shown}");
+        // The remedy is a hot wallet for that bot, not buying an entitlement
+        // that would let this key sign arbitrary bytes. See
+        // `SignerConfig::raw_signing_unavailable`.
         assert!(
-            shown.contains("raw_signing"),
-            "the error must name the setting that fixes it: {shown}"
+            shown.contains("hot wallet"),
+            "the error must point at the fix we actually recommend: {shown}"
+        );
+        assert!(
+            !shown.contains("Raw Signing"),
+            "must not suggest enabling raw signing: {shown}"
         );
     }
 

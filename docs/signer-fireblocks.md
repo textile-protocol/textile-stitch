@@ -214,24 +214,27 @@ on chain. Stitch rejects those at config time and says so.
 Quoting and the ladder are unaffected — RFQ quotes and resting `book_enabled`
 orders are signed Permit2 orders, not transactions, and cost no nonce.
 
-Two ways forward:
-
 **Stay typed-only (recommended to start).** Quote RFQ, rest the ladder, skip the
 taker and closer. The one on-chain thing you still need is the Permit2 approval —
 a plain ERC-20 `approve` per input token, once per chain — and the panel can
 send that for you. See [Permit2 approvals without raw
 signing](#permit2-approvals-without-raw-signing) below.
 
-**Enable Raw Signing.** Only needed for the taker and closer legs (and to let
-`stitch approve` run from here). Ask Fireblocks to turn it on for the workspace,
-add a policy rule for raw signing scoped to your vault account, and set:
+**Want the taker or the closer? Run them on a second bot with a hot wallet.** A
+hot key that only ever holds what that bot trades is cheap to create, cheap to
+rotate, and the blast radius if the host is compromised is whatever you funded it
+with. Keep the Fireblocks bot doing what it's good at — quoting RFQ and resting
+the ladder.
 
-```toml
-raw_signing = true
-```
-
-Then everything works as it does on the other backends, including `stitch
-approve`, the taker and the closer.
+The alternative is Raw Signing, and we don't recommend asking for it. It turns
+the vault key from "can sign the EIP-712 structures this bot produces" into "can
+sign any 32 bytes", which is arbitrary transaction authority over the vault — the
+exact containment this backend exists to give you. Approvals no longer need it at
+all, so what's left behind the entitlement is the taker and the closer. If your
+workspace already has it, `raw_signing = true` still works and those legs run
+from here; you'll need a policy rule for raw signing scoped to your vault account
+alongside the Typed Message one. That's a choice for someone who already made it,
+not a step in this guide.
 
 ## Permit2 approvals without raw signing
 
@@ -270,6 +273,9 @@ see [The on-chain legs](#the-on-chain-legs).
 
 - **`Fireblocks refused the typed-message request: BLOCKED`** — no Typed Message
   policy rule, or one that doesn't cover this vault account and API user. Step 3.
+- **`Fireblocks refused the raw request: BLOCKED`** — only reachable with
+  `raw_signing = true`. The Typed Message rule doesn't cover raw signing; that
+  needs its own policy rule scoped to the same vault account and API user.
 - **Signing works but takes seconds** — the policy rule is routing to a human
   approver instead of the co-signer. Make it auto-approve.
 - **`vault account N has no EVM wallet`** — the vault has no EVM asset wallet at
