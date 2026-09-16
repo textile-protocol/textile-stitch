@@ -598,7 +598,16 @@ pub struct SentTransaction {
     pub elapsed: Duration,
 }
 
-/// The `legacyId` of a `/v1/blockchains` row, when it is the EVM chain asked for.
+/// The native asset id of a `/v1/blockchains` row, when it is the EVM chain
+/// asked for.
+///
+/// `nativeAssetId`, not `legacyId`. They are different namespaces and the row
+/// carries both: `legacyId` identifies the *blockchain* (`BSC_TEST`) and
+/// `nativeAssetId` identifies its *asset* (`BNB_TEST`), which is what the
+/// Transaction API files a request under. Reading `legacyId` gets a 400 with
+/// `code 1503, asset not supported`, and it does so only on the chains where the
+/// two happen to differ, which is why it survived a test written against BSC
+/// mainnet.
 fn match_chain(blockchain: &Value, chain_id: u64) -> Option<String> {
     let onchain = blockchain.get("onchain")?;
     if onchain["protocol"].as_str()? != "EVM" {
@@ -612,7 +621,7 @@ fn match_chain(blockchain: &Value, chain_id: u64) -> Option<String> {
         _ => return None,
     };
     (listed == chain_id)
-        .then(|| blockchain["legacyId"].as_str())?
+        .then(|| blockchain["nativeAssetId"].as_str())?
         .map(str::to_string)
 }
 
@@ -1268,8 +1277,21 @@ mod tests {
     /// the match is deliberately strict about what counts as a hit.
     #[test]
     fn resolves_a_chain_id_to_the_asset_id_fireblocks_files_under() {
+        // The real shape, and the reason this function exists. A row carries
+        // both ids and they are not the same namespace: `legacyId` names the
+        // blockchain, `nativeAssetId` names its asset. The Transaction API
+        // wants the asset, and answering `BSC_TEST` gets a 400.
+        let bsc_testnet = json!({
+            "legacyId": "BSC_TEST",
+            "nativeAssetId": "BNB_TEST",
+            "displayName": "BNB Smart Chain Testnet",
+            "onchain": { "protocol": "EVM", "chainId": "97", "test": true },
+        });
+        assert_eq!(match_chain(&bsc_testnet, 97).as_deref(), Some("BNB_TEST"));
+
         let bsc = json!({
-            "legacyId": "BNB_BSC",
+            "legacyId": "BSC",
+            "nativeAssetId": "BNB_BSC",
             "displayName": "BNB Smart Chain",
             "onchain": { "protocol": "EVM", "chainId": "56", "test": false },
         });
@@ -1281,6 +1303,7 @@ mod tests {
         // reads as "your workspace doesn't have this chain".
         let numeric = json!({
             "legacyId": "ETH",
+            "nativeAssetId": "ETH",
             "onchain": { "protocol": "EVM", "chainId": 1, "test": false },
         });
         assert_eq!(match_chain(&numeric, 1).as_deref(), Some("ETH"));
@@ -1289,13 +1312,18 @@ mod tests {
         // means nothing on them.
         let solana = json!({
             "legacyId": "SOL",
+            "nativeAssetId": "SOL",
             "onchain": { "protocol": "SOL", "chainId": "56", "test": false },
         });
         assert_eq!(match_chain(&solana, 56), None);
 
         // A row with no chain id at all (most non-EVM chains) is skipped, not
         // a panic.
-        let bare = json!({ "legacyId": "BTC", "onchain": { "protocol": "BTC", "test": false } });
+        let bare = json!({
+            "legacyId": "BTC",
+            "nativeAssetId": "BTC",
+            "onchain": { "protocol": "BTC", "test": false }
+        });
         assert_eq!(match_chain(&bare, 56), None);
     }
 
