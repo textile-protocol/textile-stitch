@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { ApiError, api } from '../api'
 import { Banner, Button, Field, Input, Select, TextArea } from './ui'
 
-export type SignerKind = 'local' | 'turnkey' | 'mpcvault' | 'fireblocks'
+export type SignerKind = 'local' | 'fireblocks' | 'turnkey' | 'mpcvault'
 /** How the local hot wallet is provided. Create is the default. */
 export type LocalMode = 'create' | 'import'
 export type KeyForm = 'privateKey' | 'seedPhrase'
@@ -66,9 +66,9 @@ export function SignerFields({
           }
         >
           <option value="local">Hot wallet (local)</option>
+          <option value="fireblocks">MPC — Fireblocks</option>
           <option value="turnkey">MPC — Turnkey</option>
           <option value="mpcvault">MPC — MPCVault · Experimental</option>
-          <option value="fireblocks">MPC — Fireblocks</option>
         </Select>
       </Field>
 
