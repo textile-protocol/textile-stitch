@@ -429,13 +429,28 @@ impl FireblocksSigner {
     /// a transaction under an `assetId`, and for a contract call that id *is*
     /// the network — get it wrong and the approve either bounces with
     /// `ENV_UNSUPPORTED_ASSET` or, far worse, lands on a chain the operator did
-    /// not mean. `/v1/blockchains` carries `onchain.chainId` next to the
-    /// `legacyId` the Transaction API wants, so the workspace answers the
-    /// question and a chain Textile adds later needs no code change here.
+    /// not mean. `/v1/blockchains` carries `onchain.chainId`, so the workspace
+    /// answers the question and a chain Textile adds later needs no code change
+    /// here.
+    ///
+    /// Two calls, because three ids are in play and none of the pairs are
+    /// interchangeable. The blockchain row names itself twice (`id`, a UUID,
+    /// and `legacyId`, e.g. `BSC_TEST`) and names its asset once, as
+    /// `nativeAssetId` — also a UUID. The Transaction API takes none of those:
+    /// it wants the asset's *legacy* id (`BNB_TEST`), which only
+    /// `/v1/assets/{id}` returns. Fireblocks says as much in their own API
+    /// notes: "not all Fireblocks services fully support the new Assets UUID,
+    /// please use only the legacy ID until further notice."
     ///
     /// Mainnet and its testnet share a chain id nowhere, so matching on the id
     /// alone is unambiguous.
     pub async fn evm_asset_id(&self, chain_id: u64) -> anyhow::Result<String> {
+        let native = self.native_asset_of_chain(chain_id).await?;
+        self.legacy_asset_id(&native).await
+    }
+
+    /// The `nativeAssetId` of the `/v1/blockchains` row for `chain_id`.
+    async fn native_asset_of_chain(&self, chain_id: u64) -> anyhow::Result<String> {
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_BLOCKCHAIN_PAGES {
             let path = match &cursor {
@@ -465,6 +480,25 @@ impl FireblocksSigner {
              Sandbox is testnet-only, so a mainnet corridor cannot be sent from one; otherwise \
              the chain may not be enabled on the workspace."
         )
+    }
+
+    /// Trade an asset UUID for the legacy id the Transaction API accepts.
+    ///
+    /// `/v1/assets/{id}` takes "the ID or legacyId", so this is also a no-op
+    /// pass-through on a workspace whose blockchain rows still carry legacy
+    /// ids. That is the point: it is right either way, and the alternative is a
+    /// 400 quoting an opaque UUID the operator has never seen.
+    async fn legacy_asset_id(&self, asset: &str) -> anyhow::Result<String> {
+        let path = format!("/v1/assets/{}", percent_encode(asset));
+        let row = self
+            .send(reqwest::Method::GET, &path, None)
+            .await
+            .with_context(|| format!("looking up Fireblocks asset {asset}"))?;
+        row["legacyId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("Fireblocks asset {asset} came back with no legacyId: {row}"))
     }
 
     /// Have Fireblocks build, sign and broadcast one EVM contract call.
@@ -598,16 +632,13 @@ pub struct SentTransaction {
     pub elapsed: Duration,
 }
 
-/// The native asset id of a `/v1/blockchains` row, when it is the EVM chain
+/// The `nativeAssetId` of a `/v1/blockchains` row, when it is the EVM chain
 /// asked for.
 ///
-/// `nativeAssetId`, not `legacyId`. They are different namespaces and the row
-/// carries both: `legacyId` identifies the *blockchain* (`BSC_TEST`) and
-/// `nativeAssetId` identifies its *asset* (`BNB_TEST`), which is what the
-/// Transaction API files a request under. Reading `legacyId` gets a 400 with
-/// `code 1503, asset not supported`, and it does so only on the chains where the
-/// two happen to differ, which is why it survived a test written against BSC
-/// mainnet.
+/// `nativeAssetId`, not `legacyId`: the row's `legacyId` names the *blockchain*
+/// (`BSC_TEST`) and is not an asset id at all. Neither is the answer the caller
+/// ultimately wants — this is a UUID and `FireblocksSigner::legacy_asset_id` trades it
+/// for `BNB_TEST` — but it is the only field here that points at an asset.
 fn match_chain(blockchain: &Value, chain_id: u64) -> Option<String> {
     let onchain = blockchain.get("onchain")?;
     if onchain["protocol"].as_str()? != "EVM" {
@@ -1276,43 +1307,47 @@ mod tests {
     /// The chain id is what stops an approve landing on the wrong network, so
     /// the match is deliberately strict about what counts as a hit.
     #[test]
-    fn resolves_a_chain_id_to_the_asset_id_fireblocks_files_under() {
+    fn resolves_a_chain_id_to_the_native_asset_of_the_chain() {
         // The real shape, and the reason this function exists. A row carries
-        // both ids and they are not the same namespace: `legacyId` names the
-        // blockchain, `nativeAssetId` names its asset. The Transaction API
-        // wants the asset, and answering `BSC_TEST` gets a 400.
+        // ids in three namespaces: `id` and `legacyId` name the blockchain,
+        // `nativeAssetId` names its asset. Only the last one is an asset id,
+        // and `legacyId` is the tempting wrong answer because it is the only
+        // human-readable string in the row.
         let bsc_testnet = json!({
+            "id": "0fdf8a4e-0d3f-4e1c-9b28-b0a3a1b4a7d1",
             "legacyId": "BSC_TEST",
-            "nativeAssetId": "BNB_TEST",
+            "nativeAssetId": "7661fc10-f8b1-416f-b023-5812402dfb71",
             "displayName": "BNB Smart Chain Testnet",
             "onchain": { "protocol": "EVM", "chainId": "97", "test": true },
         });
-        assert_eq!(match_chain(&bsc_testnet, 97).as_deref(), Some("BNB_TEST"));
-
-        let bsc = json!({
-            "legacyId": "BSC",
-            "nativeAssetId": "BNB_BSC",
-            "displayName": "BNB Smart Chain",
-            "onchain": { "protocol": "EVM", "chainId": "56", "test": false },
-        });
-        assert_eq!(match_chain(&bsc, 56).as_deref(), Some("BNB_BSC"));
-        assert_eq!(match_chain(&bsc, 1), None, "a different chain is not a hit");
+        assert_eq!(
+            match_chain(&bsc_testnet, 97).as_deref(),
+            Some("7661fc10-f8b1-416f-b023-5812402dfb71")
+        );
+        assert_eq!(
+            match_chain(&bsc_testnet, 56),
+            None,
+            "a different chain is not a hit"
+        );
 
         // The schema says string, so that is the shape to expect — but a number
         // costs nothing to accept and the alternative is a silent no-match that
         // reads as "your workspace doesn't have this chain".
         let numeric = json!({
             "legacyId": "ETH",
-            "nativeAssetId": "ETH",
+            "nativeAssetId": "1a2b3c4d-0000-4000-8000-00000000eeee",
             "onchain": { "protocol": "EVM", "chainId": 1, "test": false },
         });
-        assert_eq!(match_chain(&numeric, 1).as_deref(), Some("ETH"));
+        assert_eq!(
+            match_chain(&numeric, 1).as_deref(),
+            Some("1a2b3c4d-0000-4000-8000-00000000eeee")
+        );
 
         // Non-EVM rows share the response and must never match: a chain id
         // means nothing on them.
         let solana = json!({
             "legacyId": "SOL",
-            "nativeAssetId": "SOL",
+            "nativeAssetId": "5c5c5c5c-0000-4000-8000-00000000ffff",
             "onchain": { "protocol": "SOL", "chainId": "56", "test": false },
         });
         assert_eq!(match_chain(&solana, 56), None);
@@ -1321,7 +1356,7 @@ mod tests {
         // a panic.
         let bare = json!({
             "legacyId": "BTC",
-            "nativeAssetId": "BTC",
+            "nativeAssetId": "9d9d9d9d-0000-4000-8000-000000001111",
             "onchain": { "protocol": "BTC", "test": false }
         });
         assert_eq!(match_chain(&bare, 56), None);
