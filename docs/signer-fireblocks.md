@@ -201,10 +201,9 @@ you have room; well above that and you'll quote unreliably, winning less than
 your prices deserve. If Verify reports a slow signature, the usual cause is a
 policy rule that isn't auto-approving.
 
-This is why Fireblocks is marked experimental in the panel. Nothing about it is
-unsafe, since every signature is verified before use, but whether it's fast
-enough depends on your workspace, and that's yours to measure, not ours to
-promise.
+Nothing about it is unsafe, since every signature is verified before use, but
+whether it's fast enough depends on your workspace, and that's yours to measure,
+not ours to promise.
 
 ## The on-chain legs
 

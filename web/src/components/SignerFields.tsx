@@ -68,7 +68,7 @@ export function SignerFields({
           <option value="local">Hot wallet (local)</option>
           <option value="turnkey">MPC — Turnkey</option>
           <option value="mpcvault">MPC — MPCVault · Experimental</option>
-          <option value="fireblocks">MPC — Fireblocks · Experimental</option>
+          <option value="fireblocks">MPC — Fireblocks</option>
         </Select>
       </Field>
 
