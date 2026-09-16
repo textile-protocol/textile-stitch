@@ -8,6 +8,8 @@
 //! in an exported compose file. It has to be safe in all three, so validation is
 //! stricter than any single one of them requires.
 
+use std::collections::HashMap;
+
 use anyhow::{bail, Result};
 
 /// Label carrying the bot id on containers the panel created. Presence of this
@@ -46,6 +48,33 @@ pub const LABEL_RFQ_RESERVATIONS: &str = "com.textile.stitch.rfq-reservations";
 /// The value [`LABEL_RFQ_RESERVATIONS`] carries on an image that reserves per
 /// wallet token.
 pub const RFQ_RESERVATIONS_TOKEN: &str = "token";
+
+/// Image label listing the one-shot verbs the bot binary's CLI accepts,
+/// comma-separated (`approve,dry-run,withdraw`).
+///
+/// Set on the *image* by `packages/stitch-bot/Dockerfile`. A one-shot runs the
+/// bot's own image, which is only as new as the last time that bot was updated,
+/// so the panel can offer a verb the binary has never heard of — the container
+/// then exits 1 with `unknown argument: <verb>` and the operator reads it as a
+/// failed operation rather than one that never started.
+///
+/// An image without the label predates it, so it can only be assumed to have
+/// the verbs that predate it too (`approve`, `dry-run`). Gate a verb on this
+/// only when the verb is newer than the label; see
+/// [`crate::panel::http::logs`].
+///
+/// The label landed a few days after `withdraw` itself, so an image built in
+/// that window has the verb and doesn't say so. It gets refused and told to
+/// update, which costs an update it didn't strictly need — the other way round
+/// is a run that dies on the command line with the wallet already claimed.
+pub const LABEL_COMMANDS: &str = "com.textile.stitch.commands";
+
+/// Whether an image's labels say its binary accepts `verb` as a command.
+pub fn image_declares_command(labels: &HashMap<String, String>, verb: &str) -> bool {
+    labels
+        .get(LABEL_COMMANDS)
+        .is_some_and(|list| list.split(',').any(|declared| declared.trim() == verb))
+}
 
 /// Compose's own service label, present on containers `docker compose` created.
 /// The panel reads it to adopt an existing hand-written fleet.

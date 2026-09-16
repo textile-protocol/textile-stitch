@@ -25,6 +25,13 @@ RUN apt-get update \
 # `sha-*` tag, so the panel cannot infer this from the tag it was given.
 LABEL com.textile.stitch.rfq-reservations="token"
 
+# The one-shot verbs this binary's CLI accepts. The panel launches a one-shot
+# from the *bot's* image, which on a host set up months ago is an older binary
+# than the panel: without this it can only find out by running the container and
+# reading `unknown argument: <verb>` out of the log tail, which looks like the
+# operation failed when it never started.
+LABEL com.textile.stitch.commands="approve,dry-run,withdraw"
+
 COPY --from=builder /src/target/release/stitch /usr/local/bin/stitch
 COPY deploy/container-entrypoint.sh /usr/local/bin/stitch-container-entrypoint
 

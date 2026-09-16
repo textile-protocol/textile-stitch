@@ -331,6 +331,74 @@ pub fn withdraw_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The one-shot verb a bot's image has to declare before the panel launches it.
+///
+/// `approve` and `dry-run` are older than the label that answers this, so every
+/// image in the field runs them and asking would refuse working fleets. Only
+/// verbs that shipped after the label are gated — `withdraw` is the first.
+fn declared_verb_needed(which: &OneShot) -> Option<&'static str> {
+    match which {
+        OneShot::Withdraw { .. } => Some(which.as_str()),
+        OneShot::Approve | OneShot::DryRun => None,
+    }
+}
+
+/// Why a bot can't run `verb` yet, in the operator's terms.
+///
+/// Shared with the bot status body so the button carries the same sentence the
+/// run would have answered with.
+pub fn stale_image_reason(bot: &str, verb: &str) -> String {
+    format!(
+        "{bot} runs a stitch image from before `{verb}` existed, so the run would exit with \
+         `unknown argument: {verb}` without touching the wallet. Use Update on this bot to move \
+         it to a current image, then try again."
+    )
+}
+
+/// Refuse a one-shot whose verb the bot's image has never heard of.
+///
+/// The one-shot launches the bot's own image, not the panel's — a host set up
+/// months ago and never updated still runs whatever `:latest` resolved to then.
+/// Without this the container starts, the CLI rejects the verb, and the operator
+/// reads `Error: unknown argument: withdraw` in the log tail as a withdraw that
+/// failed rather than one that never ran.
+async fn require_declared_verb(
+    state: &AppState,
+    bot: &Bot,
+    which: &OneShot,
+) -> Result<(), ApiError> {
+    let Some(verb) = declared_verb_needed(which) else {
+        return Ok(());
+    };
+    // The process runtime runs this panel's own binary, so the verb is whatever
+    // this build has. There is no image to ask.
+    if state.cfg.runtime != crate::panel::PanelRuntime::Docker {
+        return Ok(());
+    }
+    // Exactly the reference the one-shot will launch from, and the same pull it
+    // would do: labels can't be read off an image that isn't on the host yet.
+    let image = provision::image_of(bot, &state.cfg);
+    state
+        .docker
+        .ensure_image(&image, false)
+        .await
+        .map_err(|e| {
+            ApiError::conflict(format!(
+                "couldn't fetch {image} to check what it supports ({e:#}). Try again when the \
+             registry is reachable."
+            ))
+        })?;
+    let labels = state
+        .docker
+        .local_image_labels(&image)
+        .await
+        .map_err(|e| ApiError::conflict(format!("couldn't inspect {image} ({e:#})")))?;
+    if crate::panel::naming::image_declares_command(&labels, verb) {
+        return Ok(());
+    }
+    Err(ApiError::conflict(stale_image_reason(&bot.name, verb)))
+}
+
 /// The bot to stop before a withdraw can run, when there is one.
 pub fn withdraw_blocked_by(bot: &Bot, fleet: &Fleet) -> Option<String> {
     if is_live(bot) {
@@ -655,6 +723,9 @@ pub(super) async fn reserve_approval(
 async fn one_shot(state: AppState, name: &str, which: OneShot) -> Result<Response, ApiError> {
     let (bot, _fleet) = state.bot_and_fleet(name).await?;
     super::require_editable(&bot)?;
+    // Before the wallet claim and the config lock: a run the binary would reject
+    // on sight shouldn't hold either of them, however briefly.
+    require_declared_verb(&state, &bot, &which).await?;
     // A dry run signs nothing and sends nothing, so none of this applies to it. An
     // approval broadcasts, so it takes the wallet to itself — and the wallet it holds
     // and the config the container loads have to stay the same, right through to the
@@ -890,7 +961,20 @@ mod tests {
         let mut c = container(&format!("stitch-{name}"), state);
         c.labels.insert(LABEL_BOT.to_string(), name.to_string());
         c.mounts = dir_layout_mounts(&h.root.join(name).display().to_string());
+        let image = c.image.clone();
         h.docker.add_container(c);
+        // A current image says which one-shot verbs its binary has; the withdraw
+        // gate refuses one that doesn't. The test for that clears it again.
+        declare_commands(h, &image);
+    }
+
+    /// Label an image the way `packages/stitch-bot/Dockerfile` does.
+    fn declare_commands(h: &Harness, image: &str) {
+        h.docker.set_image_label(
+            image,
+            crate::panel::naming::LABEL_COMMANDS,
+            "approve,dry-run,withdraw",
+        );
     }
 
     /// Seed a bot whose taker leg is on, so its own process broadcasts
@@ -1085,6 +1169,54 @@ mod tests {
                 .any(|w| w == ["--to", "0x000000000000000000000000000000000000dEaD"]),
             "{cmd:?}"
         );
+    }
+
+    /// An operator who set a host up months ago and never updated it runs a
+    /// binary from before `withdraw` existed. Launching anyway spends a wallet
+    /// claim and prints `unknown argument: withdraw` into the log tail, which
+    /// reads as a withdraw that failed rather than one that never started.
+    #[tokio::test]
+    async fn withdraw_is_refused_on_an_image_that_predates_the_command() {
+        let h = harness("withdraw-old-image");
+        seed_in_state(&h, "bot-a", ContainerState::Exited);
+        h.docker
+            .clear_image_labels("ghcr.io/textile-protocol/textile-stitch:latest");
+        h.docker.set_one_shot_exit(0);
+
+        let (status, body) = h
+            .post_json(
+                "/api/bots/bot-a/withdraw",
+                serde_json::json!({
+                    "token": "native",
+                    "amount": "all",
+                    "to": "0x000000000000000000000000000000000000dEaD",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Update"), "the fix must be named: {body}");
+        assert!(h.docker.one_shot_specs().is_empty(), "nothing may run");
+
+        // And the button is off before the click, with the same sentence and no
+        // Stop offered — stopping something would not help here.
+        let (_, body) = h.get("/api/bots/bot-a").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canWithdraw"], false, "{body}");
+        assert!(
+            v["withdrawBlockedReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Update"),
+            "{body}"
+        );
+        assert!(v["withdrawBlockedBy"].is_null(), "{body}");
+
+        // Approve is older than the label, so an image without it still runs:
+        // gating every verb would refuse fleets that work today.
+        let (status, body) = h
+            .post_json("/api/bots/bot-a/approve", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]

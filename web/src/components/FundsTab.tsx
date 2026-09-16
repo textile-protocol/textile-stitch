@@ -9,7 +9,9 @@
 // committed to would fail. The form offers Stop right there rather than
 // sending the operator to another tab to find it. The server applies the
 // same rule (`canWithdraw` is its answer), so the form only shows it before
-// the click.
+// the click. `canWithdraw` also covers the blocks with nothing to stop: a
+// signer that can't broadcast, and a bot still on an image from before
+// `stitch withdraw` existed, which needs Update rather than a Stop.
 //
 // A vault maker's assets are the vault's: the rows above are read there, which
 // is where the balance its quotes draw on actually is. Gas stays the signer
@@ -229,9 +231,13 @@ function WithdrawForm({
   const own = (funding.operatorAddress ?? '').toLowerCase()
   const toOwnWallet = to.trim().toLowerCase() === own
   const toOk = isAddress(to) && !toOwnWallet
-  // The server's answer to "is anything quoting from this wallet right now".
-  const blockedBy = bot.canWithdraw ? null : (bot.withdrawBlockedBy ?? bot.name)
-  const formOk = (all || amountOk(amount, chosen.decimals)) && toOk && blockedBy === null
+  // The server's answer to "can this bot withdraw right now". Most blocks are
+  // something live on the wallet, and name the bot to stop; some (a signer that
+  // can't broadcast, an image older than `withdraw`) have nothing to stop, so
+  // the Stop button hangs off `withdrawBlockedBy`, not off the block itself.
+  const blocked = !bot.canWithdraw
+  const blockedBy = blocked ? bot.withdrawBlockedBy : null
+  const formOk = (all || amountOk(amount, chosen.decimals)) && toOk && !blocked
 
   // The bot's own address is never a destination: moving money to itself
   // is a no-op that costs gas, and it is the address most likely to be on
@@ -345,18 +351,22 @@ function WithdrawForm({
 
   return (
     <div className="space-y-4">
-      {blockedBy !== null && (
+      {blocked && (
         <Banner tone="warning">
           <p>
-            <strong>Stop {blockedBy === bot.name ? 'the bot' : blockedBy} first.</strong>{' '}
+            {blockedBy !== null && (
+              <strong>Stop {blockedBy === bot.name ? 'the bot' : blockedBy} first. </strong>
+            )}
             {bot.withdrawBlockedReason ??
               'It has live quotes against this balance; withdrawing under them fails fills.'}
           </p>
-          <div className="mt-2">
-            <Button busy={busy === 'stop'} onClick={() => onStop(blockedBy)}>
-              Stop {blockedBy === bot.name ? botLabel(bot) : blockedBy}
-            </Button>
-          </div>
+          {blockedBy !== null && (
+            <div className="mt-2">
+              <Button busy={busy === 'stop'} onClick={() => onStop(blockedBy)}>
+                Stop {blockedBy === bot.name ? botLabel(bot) : blockedBy}
+              </Button>
+            </div>
+          )}
         </Banner>
       )}
 

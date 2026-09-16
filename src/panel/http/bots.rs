@@ -193,7 +193,34 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
 
 async fn with_version(mut body: BotBody, bot: &Bot, state: &AppState, wait: bool) -> BotBody {
     body.version = running_version(state, bot, wait).await;
+    // Only when nothing else already blocks it: a live bot on the wallet is the
+    // more immediate answer, and it comes with a bot to stop.
+    if body.can_withdraw {
+        if let Some(reason) = stale_withdraw_image(state, bot).await {
+            body.can_withdraw = false;
+            body.withdraw_blocked_reason = Some(reason);
+            // Not a nonce or inventory conflict, so there is nothing to stop:
+            // the Funds tab must not offer a Stop button that changes nothing.
+            body.withdraw_blocked_by = None;
+        }
+    }
     body
+}
+
+/// Why the Withdraw button has to stay off because of the image, if it does.
+///
+/// `withdraw` is younger than some of the images in the field, and a one-shot
+/// runs the bot's own image — see [`logs::stale_image_reason`]. The labels are
+/// the only evidence: an inspect that fails says nothing either way, so leave
+/// the gate alone and let the run answer.
+async fn stale_withdraw_image(state: &AppState, bot: &Bot) -> Option<String> {
+    if state.cfg.runtime != PanelRuntime::Docker {
+        return None;
+    }
+    let image = provision::image_of(bot, &state.cfg);
+    let labels = state.docker.local_image_labels(&image).await.ok()?;
+    (!crate::panel::naming::image_declares_command(&labels, "withdraw"))
+        .then(|| logs::stale_image_reason(&bot.name, "withdraw"))
 }
 
 async fn running_version(state: &AppState, bot: &Bot, wait: bool) -> Option<String> {
