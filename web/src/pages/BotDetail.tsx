@@ -476,7 +476,11 @@ export default function BotDetail() {
           */}
           {!vaultFunded && (
             <Card title="Permit2 allowances">
-              <Permit2Allowances bot={bot.name} refreshKey={approvedAt} />
+              <Permit2Allowances
+                bot={bot.name}
+                refreshKey={approvedAt}
+                custodyApprovals={bot.custodyApprovals}
+              />
             </Card>
           )}
           <Card title="One-off runs">

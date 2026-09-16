@@ -74,6 +74,14 @@ export interface Bot {
   canMigrate: boolean
   migrateBlockedReason: string | null
   canApprove: boolean
+  /**
+   * Whether this bot's Permit2 approvals go through its custodian instead of a
+   * one-shot container. True for a Fireblocks signer without raw signing:
+   * `canApprove` stays false there — the bot genuinely cannot sign a
+   * transaction — but the panel can ask Fireblocks to send the approve as a
+   * `CONTRACT_CALL`, which needs no raw-signing entitlement.
+   */
+  custodyApprovals: boolean
   approveBlockedReason: string | null
   /** Bot that must be stopped to unblock approval — this one, or a sibling. */
   approveBlockedBy: string | null
@@ -517,4 +525,18 @@ export interface Funding {
    */
   removeBlockedBy: string | null
   checkedAtUnix: number
+}
+
+/** One Permit2 approval sent by the bot's custodian. */
+export interface CustodyApproval {
+  token: string
+  /** The Permit2 the allowance was granted to. */
+  spender: string
+  /** `null` when the allowance already covered the commitment. */
+  txHash: string | null
+  /** Fireblocks' own transaction id, for finding the call in their console. */
+  fireblocksTxId: string | null
+  elapsedMs: number | null
+  /** True when nothing was sent because the allowance was already good. */
+  alreadyApproved: boolean
 }

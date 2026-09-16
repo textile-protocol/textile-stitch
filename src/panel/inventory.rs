@@ -246,6 +246,18 @@ pub struct ConfigSummary {
     /// a second process holding the same key unsafe to run concurrently, so the
     /// panel needs to know before it offers one.
     pub sends_transactions: bool,
+    /// Whether this bot's Permit2 approvals can be sent by its custodian
+    /// instead of by the bot.
+    ///
+    /// True exactly where [`cannot_sign_transactions`](Self::cannot_sign_transactions)
+    /// is set *and* the custodian has an API that will broadcast on the
+    /// operator's behalf — today, Fireblocks without `raw_signing`, whose
+    /// `CONTRACT_CALL` operation needs none of raw signing's entitlement. Kept
+    /// separate from the reason above because the two are not the same
+    /// question: a backend could lose the ability to sign a transaction without
+    /// gaining a way to have one sent for it, and then the wizard must go back
+    /// to telling the operator to do it by hand.
+    pub custody_approvals: bool,
     /// Why this bot's signer cannot sign a transaction, if it cannot.
     ///
     /// `Some` only for a backend that signs EIP-712 structures but not an
@@ -833,6 +845,7 @@ pub fn summarise(
             .signer
             .as_ref()
             .and_then(|s| s.raw_signing_unavailable()),
+        custody_approvals: crate::panel::http::custody::custody_approvals_available(&parsed),
         venue: venue_seat(&parsed, config_path, runtime),
     })
 }

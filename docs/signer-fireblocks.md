@@ -218,8 +218,9 @@ Two ways forward:
 
 **Stay typed-only (recommended to start).** Quote RFQ, rest the ladder, skip the
 taker and closer. The one on-chain thing you still need is the Permit2 approval —
-a plain ERC-20 `approve` per input token, once per chain. Send it from the
-Fireblocks console; `stitch approve` won't do it for you without raw signing.
+a plain ERC-20 `approve` per input token, once per chain — and the panel can
+send that for you. See [Permit2 approvals without raw
+signing](#permit2-approvals-without-raw-signing) below.
 
 **Enable Raw Signing.** Only needed for the taker and closer legs (and to let
 `stitch approve` run from here). Ask Fireblocks to turn it on for the workspace,
@@ -231,6 +232,39 @@ raw_signing = true
 
 Then everything works as it does on the other backends, including `stitch
 approve`, the taker and the closer.
+
+## Permit2 approvals without raw signing
+
+`stitch approve` builds a transaction and signs its hash, which is exactly what
+typed messages can't do. But `CONTRACT_CALL` is a different Fireblocks
+operation from `RAW`: Fireblocks builds, nonces, signs and broadcasts the call
+itself, and it needs **none of raw signing's entitlement**. The panel uses it,
+so the approvals happen in the wizard instead of by hand.
+
+What you need:
+
+1. A **Contract Call** policy rule in the console, scoped to your operator vault
+   account and the API user this key belongs to. This is an ordinary policy
+   rule — there is nothing to buy and no CSM conversation.
+2. A little native gas in the vault on the chain you're trading. The approve is
+   ~46k gas, so this is cents on every chain except Ethereum.
+
+Then either let the add-bot wizard do it — it sends one approval per token on
+its way to a live bot — or open the bot's **Tools** tab and press **Approve**
+next to each token that reads "Not approved".
+
+The panel picks the Fireblocks asset id for the chain by reading
+`/v1/blockchains` from your workspace, so it files the call under the right
+network without you configuring anything. A chain your workspace doesn't have
+is reported as such rather than guessed at.
+
+The request stays open until the call is mined, which is normally a few
+seconds. If it sits there, the usual cause is a policy rule routing to a human
+approver rather than auto-approving — the same thing that makes Verify slow.
+
+This covers approvals and nothing else. The taker and closer legs still build
+and sign their own transactions on every fill, so they still need raw signing;
+see [The on-chain legs](#the-on-chain-legs).
 
 ## Troubleshooting
 
@@ -265,6 +299,14 @@ approve`, the taker and the closer.
   doesn't match the vault. Re-run Verify and let it fill the field in.
 - **`this signer signs EIP-712 typed messages only`** — the config turns on the
   taker or closer leg. See [The on-chain legs](#the-on-chain-legs).
+- **`Fireblocks refused the contract-call request: BLOCKED`** — no Contract Call
+  policy rule, or one that doesn't cover this vault account and API user. Note
+  this is *not* the raw-signing entitlement: a contract call needs a rule, not a
+  purchase. See [Permit2 approvals without raw
+  signing](#permit2-approvals-without-raw-signing).
+- **`this Fireblocks workspace lists no EVM blockchain with chain id N`** — the
+  chain isn't enabled on the workspace, or you're on a Sandbox (testnet-only)
+  and the corridor is on a mainnet.
 - **Quotes rejected as `Busy` with `signing did not finish inside the reply
   budget` in the log** — signing is slower than the venue's window. Same cause as
   a slow Verify: a policy rule that isn't auto-approving.

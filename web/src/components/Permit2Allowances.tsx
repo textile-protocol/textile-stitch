@@ -15,14 +15,25 @@ import type { Allowances } from '../types'
 export default function Permit2Allowances({
   bot,
   refreshKey = 0,
+  custodyApprovals = false,
 }: {
   bot: string
   /** Bump to re-read after an approval run. */
   refreshKey?: number
+  /**
+   * Whether this bot's approvals are sent by its custodian rather than by a
+   * one-shot container. Adds a per-row Approve button, because the one under
+   * One-off runs is disabled for these bots — the bot itself cannot sign a
+   * transaction, even though its custodian can send one.
+   */
+  custodyApprovals?: boolean
 }) {
   const [data, setData] = useState<Allowances | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [sending, setSending] = useState<string | null>(null)
+  const [sendError, setSendError] = useState<string | null>(null)
+  const [sent, setSent] = useState<Record<string, string>>({})
 
   const load = useCallback(
     async (signal?: { cancelled: boolean }) => {
@@ -49,6 +60,20 @@ export default function Permit2Allowances({
       signal.cancelled = true
     }
   }, [load, refreshKey])
+
+  const approveViaCustody = async (token: string) => {
+    setSending(token)
+    setSendError(null)
+    try {
+      const res = await api.approveViaCustody(bot, token)
+      if (res.txHash) setSent((prev) => ({ ...prev, [token]: res.txHash! }))
+      await load()
+    } catch (e) {
+      setSendError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setSending(null)
+    }
+  }
 
   if (loading && !data) {
     return (
@@ -79,8 +104,17 @@ export default function Permit2Allowances({
           {missing.length === 1
             ? `${missing[0]!.symbol} is not approved yet. `
             : `${missing.length} tokens are not approved yet. `}
-          Until they are, this bot can post orders that fail to fill. Run{' '}
-          <strong>Approve allowances</strong> under One-off runs.
+          Until they are, this bot can post orders that fail to fill.{' '}
+          {custodyApprovals ? (
+            <>
+              This bot signs through a custodian, so approve each token from the
+              row below — the custodian sends the transaction.
+            </>
+          ) : (
+            <>
+              Run <strong>Approve allowances</strong> under One-off runs.
+            </>
+          )}
         </Banner>
       ) : (
         <Banner tone="success">
@@ -112,10 +146,42 @@ export default function Permit2Allowances({
                 </span>
               </div>
             </div>
-            <AllowanceStatus approved={t.approved} />
+            <div className="flex shrink-0 items-center gap-2">
+              {custodyApprovals && t.approved === false && (
+                <Button
+                  variant="ghost"
+                  busy={sending === t.token}
+                  disabled={sending !== null}
+                  onClick={() => void approveViaCustody(t.token)}
+                >
+                  Approve
+                </Button>
+              )}
+              <AllowanceStatus approved={t.approved} />
+            </div>
           </li>
         ))}
       </ul>
+
+      {sendError && <Banner tone="danger">{sendError}</Banner>}
+
+      {Object.entries(sent).length > 0 && (
+        <Banner tone="success">
+          Sent{' '}
+          {Object.entries(sent)
+            .map(([, hash]) => hash)
+            .join(', ')}
+          .
+        </Banner>
+      )}
+
+      {custodyApprovals && (
+        <p className="text-xs text-faint">
+          Approving here asks this bot&apos;s custodian to send the transaction,
+          which needs a Contract Call policy rule on the workspace — not raw
+          signing. The request stays open until the call is mined.
+        </p>
+      )}
 
       {unknown.length > 0 && !data.readError && (
         <p className="text-xs text-faint">

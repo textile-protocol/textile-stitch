@@ -12,6 +12,7 @@ import type {
   BotVersions,
   CorridorList,
   CreateBotResult,
+  CustodyApproval,
   Fleet,
   Funding,
   MigrationResult,
@@ -338,6 +339,19 @@ export const api = {
   approveUrl: (name: string) => `/api/bots/${encodeURIComponent(name)}/approve`,
   /** URL of the withdraw one-shot; same streaming shape as approve. */
   withdrawUrl: (name: string) => `/api/bots/${encodeURIComponent(name)}/withdraw`,
+
+  /**
+   * Send one Permit2 approval through the bot's custodian.
+   *
+   * Plain JSON rather than a stream: nothing is running locally to produce log
+   * lines. The request stays open until the call mines, so the caller gets a
+   * transaction hash back, or an error naming the policy rule to add.
+   */
+  approveViaCustody: (name: string, token: string) =>
+    request<CustodyApproval>(
+      `/api/bots/${encodeURIComponent(name)}/approve/custody`,
+      { method: 'POST', body: JSON.stringify({ token }) },
+    ),
 
   enrollRfq: (name: string) =>
     request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/rfq/enroll`, {

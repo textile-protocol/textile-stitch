@@ -60,7 +60,7 @@ async fn signer_for_bot(cfg: &Config, config_path: &Path) -> Result<DynSigner, A
 }
 
 /// The signer secrets sitting next to this bot's config, if any.
-fn secrets_beside(config_path: &Path) -> SignerSecrets {
+pub(super) fn secrets_beside(config_path: &Path) -> SignerSecrets {
     SignerSecrets {
         turnkey_api_private_key_file: provision::find_beside(config_path, "turnkey-api.key"),
         mpcvault_api_token_file: provision::find_beside(config_path, "mpcvault-api.token"),

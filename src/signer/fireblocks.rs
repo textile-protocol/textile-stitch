@@ -76,6 +76,24 @@ const MAX_POLL_INTERVAL_MS: u64 = 500;
 /// clock skew rather than sitting on the limit.
 const JWT_TTL_SECS: u64 = 25;
 
+/// A contract call is a block, not a quote. Nothing is racing a 750ms reply
+/// budget here, and every poll costs an RSA-signed token against a workspace
+/// rate limit, so this is seconds where signing is milliseconds.
+const CONTRACT_CALL_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long to wait for a contract call to mine before handing the operator
+/// back the transaction id. Generous enough to cover a slow chain and a policy
+/// rule that asks a human, short enough that a browser request does not hang
+/// on it indefinitely.
+const CONTRACT_CALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// Names the contract-call path in operator-facing failures, and selects the
+/// policy remedy in [`FireblocksSigner::explain_failure`].
+const CONTRACT_CALL_WHAT: &str = "contract-call";
+/// `/v1/blockchains` is a workspace-wide list, not a per-account one, so one
+/// page covers every chain any real workspace has.
+const BLOCKCHAIN_PAGE_LIMIT: usize = 200;
+/// Cap the cursor walk rather than trust a cursor that echoes itself.
+const MAX_BLOCKCHAIN_PAGES: usize = 20;
+
 /// Transaction statuses that mean the request is dead and polling should stop.
 /// `BLOCKED` and `REJECTED` are the policy answers — the ones an operator who
 /// has not written a Typed Message rule will actually hit.
@@ -330,18 +348,29 @@ impl FireblocksSigner {
             format!(" ({sub_status})")
         };
         let base = format!("Fireblocks refused the {what} request: {status}{detail}");
-        if matches!(status, "BLOCKED" | "REJECTED") {
-            format!(
-                "{base}. This is normally the Transaction Authorization Policy: signing needs a \
-                 rule that allows it for vault account {} and the API user this key belongs to. \
-                 For typed-message signing add a Typed Message policy rule in the Fireblocks \
-                 console; raw signing additionally has to be enabled on the workspace by \
-                 Fireblocks before any rule will help.",
-                self.vault_account_id
-            )
-        } else {
-            base
+        if !matches!(status, "BLOCKED" | "REJECTED") {
+            return base;
         }
+        // Same policy engine, different rule. Pointing a contract call at the
+        // Typed Message rule sends the operator to a screen that is already
+        // correct, so name the one that is actually missing.
+        if what == CONTRACT_CALL_WHAT {
+            return format!(
+                "{base}. This is the Transaction Authorization Policy: a contract call needs a \
+                 Contract Call rule allowing vault account {} and the API user this key belongs \
+                 to. Note this is NOT raw signing — a Contract Call rule needs no entitlement \
+                 from Fireblocks, just a rule in the console.",
+                self.vault_account_id
+            );
+        }
+        format!(
+            "{base}. This is normally the Transaction Authorization Policy: signing needs a \
+             rule that allows it for vault account {} and the API user this key belongs to. \
+             For typed-message signing add a Typed Message policy rule in the Fireblocks \
+             console; raw signing additionally has to be enabled on the workspace by \
+             Fireblocks before any rule will help.",
+            self.vault_account_id
+        )
     }
 
     /// The shared `source` / `assetId` envelope both operations take.
@@ -353,6 +382,195 @@ impl FireblocksSigner {
             "extraParameters": { "rawMessageData": { "messages": messages } },
         })
     }
+
+    /// The Fireblocks asset id for an EVM chain, read from the workspace.
+    ///
+    /// Deliberately not a table of `56 => "BNB_BSC"` guesses. Fireblocks files
+    /// a transaction under an `assetId`, and for a contract call that id *is*
+    /// the network — get it wrong and the approve either bounces with
+    /// `ENV_UNSUPPORTED_ASSET` or, far worse, lands on a chain the operator did
+    /// not mean. `/v1/blockchains` carries `onchain.chainId` next to the
+    /// `legacyId` the Transaction API wants, so the workspace answers the
+    /// question and a chain Textile adds later needs no code change here.
+    ///
+    /// Mainnet and its testnet share a chain id nowhere, so matching on the id
+    /// alone is unambiguous.
+    pub async fn evm_asset_id(&self, chain_id: u64) -> anyhow::Result<String> {
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_BLOCKCHAIN_PAGES {
+            let path = match &cursor {
+                Some(c) => format!(
+                    "/v1/blockchains?protocol=EVM&pageSize={BLOCKCHAIN_PAGE_LIMIT}&pageCursor={}",
+                    percent_encode(c)
+                ),
+                None => format!("/v1/blockchains?protocol=EVM&pageSize={BLOCKCHAIN_PAGE_LIMIT}"),
+            };
+            let page = self
+                .send(reqwest::Method::GET, &path, None)
+                .await
+                .context("listing the blockchains this Fireblocks workspace supports")?;
+            let rows = page["data"]
+                .as_array()
+                .ok_or_else(|| anyhow!("Fireblocks returned no blockchain list; got {page}"))?;
+            if let Some(id) = rows.iter().find_map(|b| match_chain(b, chain_id)) {
+                return Ok(id);
+            }
+            match page["next"].as_str().filter(|c| !c.is_empty()) {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        anyhow::bail!(
+            "this Fireblocks workspace lists no EVM blockchain with chain id {chain_id}. A \
+             Sandbox is testnet-only, so a mainnet corridor cannot be sent from one; otherwise \
+             the chain may not be enabled on the workspace."
+        )
+    }
+
+    /// Have Fireblocks build, sign and broadcast one EVM contract call.
+    ///
+    /// This is not a [`Signer`] method and cannot be one. Everywhere else the
+    /// bot builds a transaction, signs the hash, and broadcasts through its own
+    /// RPC — which is exactly what typed-message signing cannot do. A
+    /// `CONTRACT_CALL` inverts the flow: Fireblocks builds, prices, nonces,
+    /// signs and broadcasts it, and hands back a hash. That needs no raw
+    /// signing entitlement, which is the whole point, but it also means the
+    /// caller never sees a signature and the `Signer` trait has nowhere to put
+    /// it. So this hangs off the concrete client, for the panel to drive.
+    ///
+    /// Waits for `COMPLETED` rather than taking `txHash` the moment it appears:
+    /// the caller's next move is to re-read the allowance, and a hash from
+    /// `BROADCASTING` would have it read a chain that has not applied the call.
+    pub async fn contract_call(
+        &self,
+        asset_id: &str,
+        to: Address,
+        calldata: &[u8],
+        note: &str,
+    ) -> anyhow::Result<SentTransaction> {
+        let body = self.contract_call_body(asset_id, to, calldata, note);
+        let started = Instant::now();
+        let created = self
+            .send(reqwest::Method::POST, "/v1/transactions", Some(&body))
+            .await?;
+        let id = created["id"]
+            .as_str()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Fireblocks did not return a transaction id for the contract call: {created}"
+                )
+            })?
+            .to_string();
+        if let Some(hash) = self.settled(&created, &id)? {
+            return Ok(SentTransaction {
+                id,
+                tx_hash: hash,
+                elapsed: started.elapsed(),
+            });
+        }
+
+        let deadline = started + CONTRACT_CALL_TIMEOUT;
+        loop {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "Fireblocks transaction {id} had not completed after {:?}. It may still be \
+                     in flight — check the Fireblocks console before sending it again. The usual \
+                     cause is a Contract Call policy rule that routes to a human approver rather \
+                     than auto-approving.",
+                    CONTRACT_CALL_TIMEOUT
+                );
+            }
+            tokio::time::sleep(CONTRACT_CALL_POLL_INTERVAL).await;
+            let tx = self
+                .send(
+                    reqwest::Method::GET,
+                    &format!("/v1/transactions/{id}"),
+                    None,
+                )
+                .await?;
+            if let Some(hash) = self.settled(&tx, &id)? {
+                return Ok(SentTransaction {
+                    id,
+                    tx_hash: hash,
+                    elapsed: started.elapsed(),
+                });
+            }
+        }
+    }
+
+    /// The request body, split out so the shape can be asserted without a
+    /// server. `assetId` here is the *chain*, unlike the signing paths where it
+    /// only picks a key format.
+    fn contract_call_body(
+        &self,
+        asset_id: &str,
+        to: Address,
+        calldata: &[u8],
+        note: &str,
+    ) -> Value {
+        json!({
+            "operation": "CONTRACT_CALL",
+            "assetId": asset_id,
+            "source": { "type": "VAULT_ACCOUNT", "id": self.vault_account_id },
+            "destination": {
+                "type": "ONE_TIME_ADDRESS",
+                "oneTimeAddress": { "address": format!("{to:#x}") },
+            },
+            // The call moves no native value; the approve is entirely calldata.
+            "amount": "0",
+            "note": note,
+            "extraParameters": { "contractCallData": format!("0x{}", hex::encode(calldata)) },
+        })
+    }
+
+    /// `Ok(Some(hash))` once the call is mined, `Ok(None)` while in flight,
+    /// `Err` on a status that will never mine.
+    fn settled(&self, tx: &Value, id: &str) -> anyhow::Result<Option<String>> {
+        let status = tx["status"].as_str().unwrap_or_default();
+        if TERMINAL_FAILURES.contains(&status) {
+            let sub = tx["subStatus"].as_str().unwrap_or_default();
+            anyhow::bail!("{}", self.explain_failure(status, sub, CONTRACT_CALL_WHAT));
+        }
+        if status != "COMPLETED" {
+            return Ok(None);
+        }
+        tx["txHash"]
+            .as_str()
+            .filter(|h| !h.is_empty())
+            .map(|h| Some(h.to_string()))
+            .ok_or_else(|| {
+                anyhow!("Fireblocks reported transaction {id} COMPLETED with no txHash: {tx}")
+            })
+    }
+}
+
+/// A contract call Fireblocks broadcast on the operator's behalf.
+#[derive(Debug, Clone)]
+pub struct SentTransaction {
+    /// The Fireblocks transaction id, for looking the call up in the console.
+    pub id: String,
+    /// The on-chain hash, once mined.
+    pub tx_hash: String,
+    /// Submit to `COMPLETED`, for the operator to judge the policy by.
+    pub elapsed: Duration,
+}
+
+/// The `legacyId` of a `/v1/blockchains` row, when it is the EVM chain asked for.
+fn match_chain(blockchain: &Value, chain_id: u64) -> Option<String> {
+    let onchain = blockchain.get("onchain")?;
+    if onchain["protocol"].as_str()? != "EVM" {
+        return None;
+    }
+    // Declared a string in the schema, but a number costs nothing to accept
+    // and the alternative is a silent no-match.
+    let listed = match &onchain["chainId"] {
+        Value::String(s) => s.parse::<u64>().ok()?,
+        Value::Number(n) => n.as_u64()?,
+        _ => return None,
+    };
+    (listed == chain_id)
+        .then(|| blockchain["legacyId"].as_str())?
+        .map(str::to_string)
 }
 
 #[async_trait]
@@ -856,7 +1074,29 @@ pub(crate) fn parse_rsa_pem(pem: &str) -> anyhow::Result<jsonwebtoken::EncodingK
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::U256;
     use serde_json::json;
+
+    /// A client with no working credentials, for asserting on request shapes.
+    ///
+    /// Nothing here reaches the network: the JWT key is never used by the body
+    /// builders, and the failure messages read only the vault id.
+    fn test_signer() -> FireblocksSigner {
+        FireblocksSigner {
+            http: reqwest::Client::new(),
+            api_key: "test-key".into(),
+            // A throwaway RSA key so the struct is constructible; unused here.
+            jwt_key: std::sync::Arc::new(jsonwebtoken::EncodingKey::from_secret(b"unused")),
+            base_url: DEFAULT_API_BASE_URL.to_string(),
+            vault_account_id: "0".into(),
+            asset_id: DEFAULT_ASSET_ID.to_string(),
+            operator_address: Address::ZERO,
+            raw_signing: false,
+            poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
+            poll_timeout: Duration::from_secs(1),
+            max_concurrent_signs: 1,
+        }
+    }
 
     /// Fireblocks spells these two endpoints differently and the wrong one 404s
     /// silently at setup time, so pin both against the published SDK routes.
@@ -937,6 +1177,115 @@ mod tests {
             VAULT_PAGE_LIMIT, 200,
             "the documented default; no max is published"
         );
+    }
+
+    /// The chain id is what stops an approve landing on the wrong network, so
+    /// the match is deliberately strict about what counts as a hit.
+    #[test]
+    fn resolves_a_chain_id_to_the_asset_id_fireblocks_files_under() {
+        let bsc = json!({
+            "legacyId": "BNB_BSC",
+            "displayName": "BNB Smart Chain",
+            "onchain": { "protocol": "EVM", "chainId": "56", "test": false },
+        });
+        assert_eq!(match_chain(&bsc, 56).as_deref(), Some("BNB_BSC"));
+        assert_eq!(match_chain(&bsc, 1), None, "a different chain is not a hit");
+
+        // The schema says string, so that is the shape to expect — but a number
+        // costs nothing to accept and the alternative is a silent no-match that
+        // reads as "your workspace doesn't have this chain".
+        let numeric = json!({
+            "legacyId": "ETH",
+            "onchain": { "protocol": "EVM", "chainId": 1, "test": false },
+        });
+        assert_eq!(match_chain(&numeric, 1).as_deref(), Some("ETH"));
+
+        // Non-EVM rows share the response and must never match: a chain id
+        // means nothing on them.
+        let solana = json!({
+            "legacyId": "SOL",
+            "onchain": { "protocol": "SOL", "chainId": "56", "test": false },
+        });
+        assert_eq!(match_chain(&solana, 56), None);
+
+        // A row with no chain id at all (most non-EVM chains) is skipped, not
+        // a panic.
+        let bare = json!({ "legacyId": "BTC", "onchain": { "protocol": "BTC", "test": false } });
+        assert_eq!(match_chain(&bare, 56), None);
+    }
+
+    /// The approve is a contract call, not a transfer: no value moves, the
+    /// token is the destination, and the whole intent is in the calldata.
+    #[test]
+    fn a_contract_call_carries_no_value_and_targets_the_token() {
+        let signer = test_signer();
+        let token: Address = "0x55d398326f99059fF775485246999027B3197955"
+            .parse()
+            .unwrap();
+        let permit2: Address = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+            .parse()
+            .unwrap();
+        let calldata = crate::closer::executor::encode_approve(permit2, U256::MAX);
+        let body = signer.contract_call_body("BNB_BSC", token, &calldata, "note");
+
+        assert_eq!(body["operation"], "CONTRACT_CALL");
+        assert_ne!(
+            body["operation"], "RAW",
+            "raw signing is the thing we avoid"
+        );
+        assert_eq!(body["assetId"], "BNB_BSC", "the chain, not the key format");
+        assert_eq!(body["source"]["type"], "VAULT_ACCOUNT");
+        assert_eq!(body["destination"]["type"], "ONE_TIME_ADDRESS");
+        assert_eq!(
+            body["destination"]["oneTimeAddress"]["address"],
+            "0x55d398326f99059ff775485246999027b3197955",
+            "the token contract, never the spender"
+        );
+        assert_eq!(body["amount"], "0", "an approve sends no native value");
+
+        let data = body["extraParameters"]["contractCallData"]
+            .as_str()
+            .expect("calldata is a hex string");
+        assert!(
+            data.starts_with("0x095ea7b3"),
+            "approve(address,uint256): {data}"
+        );
+        assert!(
+            data.contains("000000000022d473030f116ddee9f6b43ac78ba3"),
+            "the spender is Permit2: {data}"
+        );
+        assert!(
+            data.ends_with(&"f".repeat(64)),
+            "an unlimited allowance: {data}"
+        );
+        assert!(
+            body["extraParameters"].get("rawMessageData").is_none(),
+            "rawMessageData belongs to RAW and TYPED_MESSAGE, not a contract call"
+        );
+    }
+
+    /// A contract call that is refused by policy needs a different remedy from
+    /// a refused signature, and pointing at the wrong one sends the operator to
+    /// a console screen that is already correct.
+    #[test]
+    fn a_blocked_contract_call_names_the_rule_that_is_missing() {
+        let signer = test_signer();
+        let msg = signer.explain_failure("BLOCKED", "", CONTRACT_CALL_WHAT);
+        assert!(msg.contains("Contract Call rule"), "{msg}");
+        assert!(
+            msg.contains("NOT raw signing"),
+            "the entitlement is the thing operators assume they need: {msg}"
+        );
+        assert!(!msg.contains("Typed Message"), "wrong rule: {msg}");
+
+        // The signing path keeps its own advice.
+        let signing = signer.explain_failure("BLOCKED", "", "typed-message");
+        assert!(signing.contains("Typed Message policy rule"), "{signing}");
+
+        // A non-policy failure gets no rule advice at all.
+        let failed = signer.explain_failure("FAILED", "INSUFFICIENT_FUNDS", CONTRACT_CALL_WHAT);
+        assert!(!failed.contains("Contract Call rule"), "{failed}");
+        assert!(failed.contains("INSUFFICIENT_FUNDS"), "{failed}");
     }
 
     #[test]

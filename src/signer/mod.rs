@@ -176,9 +176,10 @@ impl SignerConfig {
             SignerConfig::Fireblocks(c) if c.raw_signing => None,
             SignerConfig::Fireblocks(_) => Some(
                 "signs Fireblocks typed messages, which cannot sign an on-chain transaction. \
-                 Send it from the Fireblocks console instead — a Permit2 approval is a one-time \
-                 ERC-20 approve per token. To do it from here, have Fireblocks enable Raw \
-                 Signing on the workspace and set [signer].raw_signing = true",
+                 Permit2 approvals do not need one — the panel has Fireblocks send those as a \
+                 CONTRACT_CALL, which needs a Contract Call policy rule and no entitlement. \
+                 Anything that signs per fill does: ask Fireblocks to enable Raw Signing on the \
+                 workspace and set [signer].raw_signing = true",
             ),
         }
     }

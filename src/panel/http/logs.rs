@@ -227,6 +227,17 @@ fn can_transact(bot: &Bot) -> bool {
 /// yet when the check runs — [`WalletLocks`] does that.
 pub fn approve_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
     signer_can_broadcast(bot, "approve")?;
+    approve_wallet_check(bot, fleet)
+}
+
+/// The nonce half of [`approve_check`], without the "can this signer produce a
+/// transaction at all" question.
+///
+/// Split out for the custody route, where the answer to that question is no and
+/// the approval goes out through the custodian's API instead. The wallet race
+/// is still real there — Fireblocks reads the pending nonce off the chain like
+/// anything else — so that half applies unchanged.
+pub(super) fn approve_wallet_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
     if can_transact(bot) {
         anyhow::bail!(
             "{} is {} with its taker or closer leg on, so it can broadcast from the same wallet \
@@ -251,10 +262,25 @@ pub fn approve_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
 /// `canApprove` gate stops before it starts the run, and the reason — which the
 /// backend supplies, so it stays right for the next one — names what to do.
 fn signer_can_broadcast(bot: &Bot, action: &str) -> anyhow::Result<()> {
-    match bot.config.as_ref().and_then(|c| c.cannot_sign_transactions) {
-        None => Ok(()),
-        Some(why) => anyhow::bail!("{} {why}, so the panel can't {action} for it.", bot.name),
+    let Some(why) = bot.config.as_ref().and_then(|c| c.cannot_sign_transactions) else {
+        return Ok(());
+    };
+    // An approval on a custodial signer is not blocked, just sent a different
+    // way — see `crate::panel::http::custody`. Saying "the panel can't approve
+    // for it" next to a working Approve button would be a plain lie, so name
+    // the route that does work.
+    if action == "approve" && bot.config.as_ref().is_some_and(|c| c.custody_approvals) {
+        // Deliberately not `why`: that explains the signer's limits and ends at
+        // raw signing, which is the wrong thing to reach for here. This path
+        // is not blocked, only different.
+        anyhow::bail!(
+            "{} cannot sign an on-chain transaction itself, so its Permit2 approvals are sent \
+             by its custodian rather than by a run here. Use Approve on the token rows, or let \
+             the add-bot wizard send them.",
+            bot.name
+        );
     }
+    anyhow::bail!("{} {why}, so the panel can't {action} for it.", bot.name)
 }
 
 /// The live bot that must be stopped before an approval can run, if any.
@@ -586,7 +612,7 @@ pub async fn dry_run(
 /// Returns the bot the caller must launch from (rebound to the read the claim was
 /// taken against) and the claim, or `None` when the bot has no identifiable wallet —
 /// nothing can be signed with it, so the run fails on its own for want of a key.
-async fn reserve_approval(
+pub(super) async fn reserve_approval(
     state: &AppState,
     name: &str,
     mut bot: Bot,
@@ -795,11 +821,21 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["canApprove"], false);
         let reason = v["approveBlockedReason"].as_str().unwrap_or_default();
+        // The one-shot is still refused — the bot cannot sign a transaction —
+        // but the approval itself is not blocked any more, so the reason must
+        // point at the custodian rather than at raw signing.
         assert!(
-            reason.contains("Fireblocks console"),
+            reason.contains("sent by its custodian"),
             "the reason must say what to do instead: {reason}"
         );
-        assert!(reason.contains("raw_signing"), "{reason}");
+        assert!(
+            !reason.contains("raw_signing"),
+            "raw signing is not the fix for an approval: {reason}"
+        );
+        assert_eq!(
+            v["custodyApprovals"], true,
+            "and the UI needs the flag to offer that route: {body}"
+        );
         // No bot to stop — this is not a nonce conflict, so the UI must not
         // offer a Stop button that would do nothing.
         assert!(v["approveBlockedBy"].is_null(), "{body}");
@@ -813,9 +849,11 @@ mod tests {
         let (_, body) = h.get("/api/bots/bot-a").await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["canWithdraw"], false);
-        assert!(v["withdrawBlockedReason"]
-            .as_str()
-            .is_some_and(|r| r.contains("Fireblocks console")));
+        // Unlike an approval, a withdraw has no custodial route here, so this
+        // one really is blocked and raw signing really is the fix.
+        let reason = v["withdrawBlockedReason"].as_str().unwrap_or_default();
+        assert!(reason.contains("raw_signing"), "{reason}");
+        assert!(reason.contains("can't withdraw for it"), "{reason}");
     }
 
     /// With raw signing on, the same backend is allowed to broadcast — the gate

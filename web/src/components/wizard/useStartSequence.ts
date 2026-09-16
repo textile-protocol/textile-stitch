@@ -330,6 +330,30 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
       return fail(stage, message, extra)
     }
 
+    /**
+     * Send this bot's outstanding Permit2 approvals through its custodian.
+     *
+     * One request per token, each open until the call mines, because there is
+     * no local process to stream log lines from — the transaction is built,
+     * signed and broadcast on the custodian's side. Fails the run on the first
+     * refusal rather than trying the rest: the usual cause is a missing policy
+     * rule, which the second token would hit too.
+     */
+    async function sendCustodyApprovals(funding: Funding): Promise<void> {
+      const pending = funding.tokens.filter(
+        (t) => t.approvalNeeded && t.approved !== true,
+      )
+      for (const token of pending) {
+        try {
+          await api.approveViaCustody(bot, token.token)
+        } catch (e) {
+          check()
+          await failSettling('approve', errorText(e))
+        }
+        check()
+      }
+    }
+
     async function execute(): Promise<void> {
       // 1. Approve spending, only if the chain says something is missing.
       setStage('approving')
@@ -357,16 +381,25 @@ export function useStartSequence(bot: string, handlers: StartSequenceHandlers = 
           return failSettling('approve', errorText(e))
         }
         check()
-        if (!current.canApprove) {
-          return failSettling(
-            'approve',
-            current.approveBlockedReason ?? copy.approveBlocked,
-            { blockedBy: current.approveBlockedBy },
-          )
+        // A custodial signer that cannot sign a transaction still has a
+        // custodian that can send one. `canApprove` is false for these bots and
+        // stays false — the bot itself genuinely cannot sign — so this branch
+        // comes first, or the gate below would refuse the very thing the
+        // operator is here to do.
+        let result: ApproveStreamResult = { kind: 'exit', ok: true }
+        if (current.custodyApprovals) {
+          await sendCustodyApprovals(funding)
+        } else {
+          if (!current.canApprove) {
+            return failSettling(
+              'approve',
+              current.approveBlockedReason ?? copy.approveBlocked,
+              { blockedBy: current.approveBlockedBy },
+            )
+          }
+          result = await streamApprove()
+          check()
         }
-
-        const result = await streamApprove()
-        check()
         if (result.kind === 'error' && isWalletBusy(result.message)) {
           // Another approval holds the wallet. Wait for the chain to show it.
           setStage('approve-busy')

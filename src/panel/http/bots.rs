@@ -58,6 +58,10 @@ pub struct BotBody {
     pub migrate_blocked_reason: Option<String>,
     /// Whether an approval run can be started right now.
     pub can_approve: bool,
+    /// Whether this bot's approvals go through its custodian rather than a
+    /// one-shot container. The wizard offers a different button for these, and
+    /// `canApprove` stays false because the bot itself still cannot sign.
+    pub custody_approvals: bool,
     /// Why not, when it can't. Same reason as `migrateBlockedReason`: the operator
     /// should read it before clicking, not after.
     pub approve_blocked_reason: Option<String>,
@@ -176,6 +180,7 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
         can_migrate: migrate_check.is_ok(),
         migrate_blocked_reason: migrate_check.err().map(|e| format!("{e:#}")),
         can_approve: approve_check.is_ok(),
+        custody_approvals: bot.config.as_ref().is_some_and(|c| c.custody_approvals),
         approve_blocked_reason: approve_check.err().map(|e| format!("{e:#}")),
         approve_blocked_by: super::logs::approve_blocked_by(bot, fleet),
         can_withdraw: withdraw_check.is_ok(),

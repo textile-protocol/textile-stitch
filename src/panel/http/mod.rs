@@ -16,6 +16,7 @@
 pub mod allowances;
 pub mod assets;
 pub mod bots;
+pub mod custody;
 pub mod enroll;
 pub mod funding;
 pub mod logs;
@@ -316,6 +317,10 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/allowances", get(allowances::allowances))
         .route("/api/bots/{name}/funding", get(funding::funding))
         .route("/api/bots/{name}/approve", post(logs::approve))
+        .route(
+            "/api/bots/{name}/approve/custody",
+            post(custody::approve_via_custody),
+        )
         .route("/api/bots/{name}/withdraw", post(logs::withdraw))
         .route(
             "/api/desktop",
