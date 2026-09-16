@@ -379,6 +379,23 @@ mod tests {
         );
     }
 
+    /// Ethereum presets point at publicnode. The templates used to ship
+    /// Tenderly's public gateway and Textile's renderer used viem's
+    /// `eth.merkle.io` default, so the same corridor came with two different
+    /// nodes depending on where the operator got the file. Both are publicnode
+    /// now (see `stitchToml.ts`), and this keeps the shipped half of that.
+    #[test]
+    fn ethereum_presets_ship_the_default_public_rpc() {
+        for c in catalog().iter().filter(|c| c.chain_id == 1) {
+            let cfg = crate::config::Config::from_toml(c.toml_template).unwrap();
+            assert_eq!(
+                cfg.rpc_url, "https://ethereum-rpc.publicnode.com",
+                "corridor {} ships a different Ethereum RPC",
+                c.id
+            );
+        }
+    }
+
     #[test]
     fn template_chain_id_matches_catalog_metadata() {
         for c in catalog() {
