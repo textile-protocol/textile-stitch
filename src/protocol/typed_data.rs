@@ -27,8 +27,10 @@
 use alloy_primitives::{hex, Address, B256, U256};
 use serde_json::{json, Value};
 
+use crate::protocol::attest::NavAttestation;
 use crate::protocol::eip712::{
-    maker_enroll_digest, maker_session_digest, permit2_digest, signer_check_digest,
+    maker_enroll_digest, maker_session_digest, nav_attestation_digest, permit2_digest,
+    signer_check_digest,
 };
 use crate::protocol::types::OrderParams;
 
@@ -81,6 +83,9 @@ enum Body {
     SignerCheck {
         nonce: B256,
     },
+    NavAttestation {
+        att: NavAttestation,
+    },
 }
 
 impl Eip712Payload {
@@ -128,6 +133,7 @@ impl Eip712Payload {
                 *issued_at_ms,
             ),
             Body::SignerCheck { nonce } => signer_check_typed_data(*nonce),
+            Body::NavAttestation { att } => nav_attestation_typed_data(att),
         }
     }
 }
@@ -399,6 +405,60 @@ fn maker_enroll_typed_data(
 /// venue does not know the domain. That matters because Verify is offered before
 /// the operator has committed to anything — it must not be a way to extract a
 /// signature that means something elsewhere.
+/// Typed data for countersigning a vault NAV attestation: the exact struct
+/// the risk signer signed, under the vault's own domain. See
+/// `protocol::attest` for what the bot checks before it signs this.
+pub fn nav_attestation_payload(att: &NavAttestation) -> Eip712Payload {
+    Eip712Payload {
+        digest: nav_attestation_digest(att),
+        body: Body::NavAttestation { att: att.clone() },
+    }
+}
+
+fn nav_attestation_typed_data(a: &NavAttestation) -> Value {
+    json!({
+        "types": {
+            "EIP712Domain": [
+                field("name", "string"),
+                field("version", "string"),
+                field("chainId", "uint256"),
+                field("verifyingContract", "address"),
+            ],
+            "NavAttestation": [
+                field("vault", "address"),
+                field("chainId", "uint256"),
+                field("epochId", "uint256"),
+                field("corridorAssetPrice", "uint256"),
+                field("nav", "uint256"),
+                field("lastSettledNav", "uint256"),
+                field("freeSettlement", "uint256"),
+                field("freeCorridor", "uint256"),
+                field("validAfter", "uint256"),
+                field("validUntil", "uint256"),
+            ],
+        },
+        "primaryType": "NavAttestation",
+        "domain": {
+            "name": "OperatorVault",
+            "version": "1",
+            "chainId": uint(a.chain_id),
+            "verifyingContract": addr(a.vault),
+        },
+        "message": {
+            "vault": addr(a.vault),
+            "chainId": uint(a.chain_id),
+            "epochId": uint(a.epoch_id),
+            "corridorAssetPrice": uint(a.corridor_asset_price),
+            "nav": uint(a.nav),
+            "lastSettledNav": uint(a.last_settled_nav),
+            "freeSettlement": uint(a.free_settlement),
+            "freeCorridor": uint(a.free_corridor),
+            "validAfter": uint(a.valid_after),
+            "validUntil": uint(a.valid_until),
+        },
+    })
+}
+
 pub fn signer_check_payload(nonce: B256) -> Eip712Payload {
     Eip712Payload {
         digest: signer_check_digest(nonce),
@@ -584,6 +644,28 @@ mod tests {
     /// The whole reason this module can be trusted: the typed-data JSON, hashed
     /// by a generic EIP-712 encoder, lands on exactly the digest the bot's own
     /// incremental hashing produces. Break either encoding and this fails.
+    /// Pinned to `navAttestationDigest` in `@textile/constants` (viem
+    /// `hashTypedData`), which the Hardhat parity test pins to `VaultLib`.
+    #[test]
+    fn nav_attestation_typed_data_hashes_to_the_vault_digest() {
+        let att = NavAttestation {
+            vault: address!("2222222222222222222222222222222222222222"),
+            chain_id: U256::from(8453u64),
+            epoch_id: U256::from(7u64),
+            corridor_asset_price: U256::from(1_500_000_000_000_000_000u128),
+            nav: U256::from(16_000_000u64),
+            last_settled_nav: U256::from(12_345u64),
+            free_settlement: U256::from(10_000_000u64),
+            free_corridor: U256::from(4_000_000_000_000_000_000u128),
+            valid_after: U256::from(1_700_000_000u64),
+            valid_until: U256::from(1_700_003_600u64),
+        };
+        let expected = b256!("38120dd57a44efe427559d8f5f94a600ff44b7df87ca0a832a81ef0954e01985");
+        let payload = nav_attestation_payload(&att);
+        assert_eq!(payload.digest(), expected);
+        assert_eq!(digest_of(&payload.typed_data()), expected);
+    }
+
     #[test]
     fn permit2_typed_data_hashes_to_the_same_digest() {
         let order = sample();

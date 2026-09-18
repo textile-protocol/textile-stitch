@@ -11,6 +11,7 @@
 //! vendored Solidity and `packages/constants`, so a drift on either side
 //! shows up as a failing digest test rather than a rejected fill.
 
+pub mod attest;
 pub mod eip712;
 pub mod typed_data;
 pub mod types;

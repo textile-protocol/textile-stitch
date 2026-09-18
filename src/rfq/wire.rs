@@ -30,6 +30,8 @@ pub enum VenueFrame {
     QuoteResult(QuoteResultFrame),
     #[serde(rename = "quoteExpired")]
     QuoteExpired(QuoteExpiredFrame),
+    #[serde(rename = "attestRequest")]
+    AttestRequest(AttestRequestFrame),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +145,10 @@ pub enum MakerFrame {
     QuoteResponse(QuoteResponseFrame),
     #[serde(rename = "quoteReject")]
     QuoteReject(QuoteRejectFrame),
+    #[serde(rename = "attestResponse")]
+    AttestResponse(AttestResponseFrame),
+    #[serde(rename = "attestReject")]
+    AttestReject(AttestRejectFrame),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +229,70 @@ pub enum RejectReason {
     ToxicTaker,
     StaleFeed,
     Size,
+    Busy,
+}
+
+// --- NAV attestation co-signing ---
+
+/// `NavAttestation` as the venue sends it: address as-is, every uint a
+/// decimal string. Mirrors `serializeNavAttestation` on the venue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavAttestationWire {
+    pub vault: String,
+    pub chain_id: String,
+    pub epoch_id: String,
+    pub corridor_asset_price: String,
+    pub nav: String,
+    pub last_settled_nav: String,
+    pub free_settlement: String,
+    pub free_corridor: String,
+    pub valid_after: String,
+    pub valid_until: String,
+}
+
+/// The venue asking this bot, as the vault's strategy signer, to countersign
+/// an attestation the risk signer already signed. The vault settles an epoch
+/// only against both signatures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestRequestFrame {
+    pub request_id: String,
+    pub chain_id: u64,
+    pub vault: String,
+    pub epoch_id: String,
+    pub attestation: NavAttestationWire,
+    /// Hard cutoff (absolute venue clock). A later reply is dropped.
+    pub reply_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestResponseFrame {
+    pub request_id: String,
+    pub signature: String,
+    pub signer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestRejectFrame {
+    pub request_id: String,
+    pub reason: AttestRejectReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestRejectReason {
+    /// Not the vault this bot signs for, or not its chain.
+    WrongVault,
+    /// No usable price of our own to check the attested one against.
+    StaleFeed,
+    /// The attested corridor price is too far from our own.
+    Price,
+    /// The attested figures do not match what the chain shows.
+    Figures,
+    /// Could not read the chain in time.
     Busy,
 }
 
@@ -388,6 +458,54 @@ mod tests {
         });
         let v = serde_json::to_value(&session).unwrap();
         assert!(v.get("instanceId").is_none());
+    }
+
+    #[test]
+    fn attest_frames_round_trip_the_documented_shape() {
+        let json = r#"{
+            "type": "attestRequest",
+            "requestId": "att_1",
+            "chainId": 8453,
+            "vault": "0x2222222222222222222222222222222222222222",
+            "epochId": "7",
+            "attestation": {
+                "vault": "0x2222222222222222222222222222222222222222",
+                "chainId": "8453",
+                "epochId": "7",
+                "corridorAssetPrice": "1500000000000000000",
+                "nav": "16000000",
+                "lastSettledNav": "12345",
+                "freeSettlement": "10000000",
+                "freeCorridor": "4000000000000000000",
+                "validAfter": "1700000000",
+                "validUntil": "1700003600"
+            },
+            "replyBy": "2026-08-05T10:00:04.000Z"
+        }"#;
+        let frame: VenueFrame = serde_json::from_str(json).unwrap();
+        let VenueFrame::AttestRequest(req) = &frame else {
+            panic!("wrong variant: {frame:?}");
+        };
+        assert_eq!(req.request_id, "att_1");
+        assert_eq!(req.attestation.free_corridor, "4000000000000000000");
+
+        let reject = MakerFrame::AttestReject(AttestRejectFrame {
+            request_id: "att_1".into(),
+            reason: AttestRejectReason::WrongVault,
+        });
+        let out: serde_json::Value = serde_json::to_value(&reject).unwrap();
+        assert_eq!(out["type"], "attestReject");
+        assert_eq!(out["requestId"], "att_1");
+        assert_eq!(out["reason"], "wrong_vault");
+
+        let ok = MakerFrame::AttestResponse(AttestResponseFrame {
+            request_id: "att_1".into(),
+            signature: "0xabcd".into(),
+            signer: "0x1111111111111111111111111111111111111111".into(),
+        });
+        let out: serde_json::Value = serde_json::to_value(&ok).unwrap();
+        assert_eq!(out["type"], "attestResponse");
+        assert_eq!(out["signature"], "0xabcd");
     }
 
     #[test]

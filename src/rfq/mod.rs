@@ -56,17 +56,19 @@ use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
 use crate::pricing::tick::{is_price_usable, is_stale};
-use crate::protocol::typed_data::permit2_payload;
+use crate::protocol::attest::{check_attestation, price_wad, LiveVault, NavAttestation};
+use crate::protocol::typed_data::{nav_attestation_payload, permit2_payload};
 use crate::signer::DynSigner;
 use crate::time::unix_now;
 
 use crate::protocol::vault::{
     address_from_word, apply_vault_order_policy, clamp_vault_deadline, encode_close_only,
-    encode_corridor_asset, encode_liquid_settlement, encode_max_order_input_corridor,
+    encode_corridor_asset, encode_corridor_decimals, encode_free_corridor, encode_free_settlement,
+    encode_last_settled_nav, encode_liquid_settlement, encode_max_order_input_corridor,
     encode_max_order_input_settlement, encode_max_order_lifetime, encode_paused,
     encode_quotable_corridor, encode_quotable_settlement, encode_settlement_asset,
-    encode_trading_epoch, quotable_settlement_for_route, trading_nonce, vault_nonce_low,
-    VaultQuotePolicy,
+    encode_settlement_decimals, encode_trading_epoch, quotable_settlement_for_route, trading_nonce,
+    vault_nonce_low, VaultQuotePolicy,
 };
 use crate::time::unix_now_ms;
 use iso8601::{format_iso_ms, parse_iso_ms};
@@ -78,7 +80,8 @@ use responder::{
 };
 use session::AuthedSession;
 use wire::{
-    MakerFrame, QuoteRejectFrame, QuoteRequestFrame, QuoteResponseFrame, RejectReason, VenueFrame,
+    AttestRejectFrame, AttestRejectReason, AttestRequestFrame, AttestResponseFrame, MakerFrame,
+    QuoteRejectFrame, QuoteRequestFrame, QuoteResponseFrame, RejectReason, VenueFrame,
 };
 
 /// Everything the responder task needs, resolved once at spawn so the hot
@@ -1049,6 +1052,7 @@ async fn session_loop_inner(
         trading_epoch: rt.trading_epoch.clone(),
         vault_policy: rt.vault_policy.clone(),
         nonce_salt: rand::random(),
+        rpc: Rpc::new(&rt.rpc_url),
     };
     // Upgrade path: a ledger written before `input_token` existed loads as
     // tokenless. Stamp every bound book now, while the quoted pool is still
@@ -1223,6 +1227,9 @@ struct Engine {
     /// sign in the same millisecond with equal counters; without this the
     /// nonces collide and the venue rejects the second reply `nonce_reserved`.
     nonce_salt: u64,
+    /// For the vault reads behind attestation co-signing. Off the quote
+    /// path: a co-sign request is one per settled epoch, not per RFQ.
+    rpc: Rpc,
 }
 
 impl Engine {
@@ -1363,6 +1370,7 @@ impl Engine {
     async fn dispatch(&mut self, frame: VenueFrame, prices: &PriceCache) -> Option<MakerFrame> {
         match frame {
             VenueFrame::QuoteRequest(req) => Some(self.respond(req, prices).await),
+            VenueFrame::AttestRequest(req) => Some(self.cosign(req, prices).await),
             VenueFrame::QuoteResult(r) => {
                 // selected stays reserved until quoteExpired or the deadline.
                 // Everything else is a signature the taker will never submit:
@@ -1620,6 +1628,158 @@ impl Engine {
             fee_amount: plan.fee.to_string(),
             expires_at: format_iso_ms(expires_ms),
             encoded_order: alloy_primitives::hex::encode_prefixed(encode_order_bytes(&order)),
+            signature: alloy_primitives::hex::encode_prefixed(signature),
+            signer: self.signer.address().to_string(),
+        })
+    }
+}
+
+impl Engine {
+    /// Countersign a NAV attestation for the vault this bot signs for.
+    ///
+    /// The bot's key is one of the two the vault needs to settle an epoch, so
+    /// this is a signature over value, not a formality: the figures are
+    /// checked against the bot's own read of the vault and the price against
+    /// its own feed before anything is signed. See `protocol::attest`.
+    async fn cosign(&self, req: AttestRequestFrame, prices: &PriceCache) -> MakerFrame {
+        let reject = |reason| {
+            MakerFrame::AttestReject(AttestRejectFrame {
+                request_id: req.request_id.clone(),
+                reason,
+            })
+        };
+        let Some(vault) = self.vault else {
+            return reject(AttestRejectReason::WrongVault);
+        };
+        let asked = req.vault.parse::<Address>().ok();
+        if asked != Some(vault) || req.chain_id != self.chain_id {
+            return reject(AttestRejectReason::WrongVault);
+        }
+        let att = match NavAttestation::parse(&req.attestation) {
+            Ok(att) => att,
+            Err(e) => {
+                warn!(request_id = %req.request_id, error = %e, "unparseable attestation");
+                return reject(AttestRejectReason::Figures);
+            }
+        };
+        if att.vault != vault
+            || att.chain_id != U256::from(self.chain_id)
+            || att.epoch_id.to_string() != req.epoch_id
+        {
+            return reject(AttestRejectReason::Figures);
+        }
+        // The venue stops waiting at replyBy, and this runs inline in the
+        // session loop, so nothing below may outlive it: a stalled RPC or a
+        // slow MPC signer would otherwise hold quotes and heartbeats hostage.
+        let Some(reply_by_ms) = parse_iso_ms(&req.reply_by) else {
+            warn!(request_id = %req.request_id, raw = %req.reply_by, "unparseable replyBy");
+            return reject(AttestRejectReason::Busy);
+        };
+        let budget = || std::time::Duration::from_millis(reply_by_ms.saturating_sub(unix_now_ms()));
+        if budget().is_zero() {
+            return reject(AttestRejectReason::Busy);
+        }
+
+        // Our own mark for the corridor leg: the book on exactly the vault's
+        // pair, oriented the way the attestation prices it (settlement per
+        // corridor is debt per collateral). From every configured pool, not
+        // just the ones the venue seats this session on: the feed loops run
+        // for all of them, and a vault whose corridor the venue unassigned
+        // still has epochs to settle.
+        let policy = self.vault_policy.read().ok().and_then(|p| *p);
+        let Some(policy) = policy else {
+            return reject(AttestRejectReason::Busy);
+        };
+        let Some(book) = self
+            .configured
+            .iter()
+            .find(|b| b.debt == policy.settlement && b.collateral == policy.corridor)
+        else {
+            return reject(AttestRejectReason::StaleFeed);
+        };
+        let Some(quote) = prices.get(&book.feed_url) else {
+            return reject(AttestRejectReason::StaleFeed);
+        };
+        if is_stale(quote.timestamp, unix_now(), book.staleness_secs)
+            || !is_price_usable(quote.price)
+        {
+            return reject(AttestRejectReason::StaleFeed);
+        }
+
+        let calls = [
+            Call::new(vault, encode_free_settlement()),
+            Call::new(vault, encode_free_corridor()),
+            Call::new(vault, encode_last_settled_nav()),
+            Call::new(vault, encode_settlement_decimals()),
+            Call::new(vault, encode_corridor_decimals()),
+        ];
+        let reader = Batcher::sequential();
+        let read = tokio::time::timeout(budget(), reader.read(&self.rpc, &calls));
+        let words = match read.await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                warn!(request_id = %req.request_id, error = %e, "vault read failed; not co-signing");
+                return reject(AttestRejectReason::Busy);
+            }
+            Err(_) => {
+                warn!(request_id = %req.request_id, "vault read ran past replyBy; not co-signing");
+                return reject(AttestRejectReason::Busy);
+            }
+        };
+        let word = |i: usize| words.get(i).and_then(|o| o.as_ref()).map(decode_uint);
+        let (
+            Some(free_settlement),
+            Some(free_corridor),
+            Some(last_settled_nav),
+            Some(sd),
+            Some(cd),
+        ) = (word(0), word(1), word(2), word(3), word(4))
+        else {
+            return reject(AttestRejectReason::Busy);
+        };
+        let (Ok(settlement_decimals), Ok(corridor_decimals)) = (u8::try_from(sd), u8::try_from(cd))
+        else {
+            return reject(AttestRejectReason::Busy);
+        };
+        let live = LiveVault {
+            free_settlement,
+            free_corridor,
+            last_settled_nav,
+            settlement_decimals,
+            corridor_decimals,
+        };
+        if let Err(reason) = check_attestation(&att, &live, price_wad(quote.price)) {
+            info!(
+                request_id = %req.request_id,
+                epoch = %req.epoch_id,
+                ?reason,
+                attested_nav = %att.nav,
+                attested_price = %att.corridor_asset_price,
+                own_price = quote.price,
+                "refused to co-sign attestation"
+            );
+            return reject(reason);
+        }
+
+        // Dropping the future cancels our wait, not the provider's work, same
+        // as the quote path: better a refused co-sign than a socket held for a
+        // signature the venue has already stopped waiting for.
+        let payload = nav_attestation_payload(&att);
+        let signing = tokio::time::timeout(budget(), self.signer.sign_typed(&payload));
+        let signature = match signing.await {
+            Ok(Ok(sig)) => sig,
+            Ok(Err(e)) => {
+                warn!(request_id = %req.request_id, error = %e, "signer failed on attestation");
+                return reject(AttestRejectReason::Busy);
+            }
+            Err(_) => {
+                warn!(request_id = %req.request_id, "signer ran past replyBy; not co-signing");
+                return reject(AttestRejectReason::Busy);
+            }
+        };
+        info!(request_id = %req.request_id, epoch = %req.epoch_id, nav = %att.nav, "co-signed attestation");
+        MakerFrame::AttestResponse(AttestResponseFrame {
+            request_id: req.request_id,
             signature: alloy_primitives::hex::encode_prefixed(signature),
             signer: self.signer.address().to_string(),
         })
@@ -2435,7 +2595,70 @@ mod tests {
             trading_epoch: Arc::new(RwLock::new(0)),
             vault_policy: Arc::new(RwLock::new(None)),
             nonce_salt: 7,
+            rpc: Rpc::new("http://127.0.0.1:1"),
         }
+    }
+
+    fn attest_request(vault: &str, chain_id: u64) -> VenueFrame {
+        VenueFrame::AttestRequest(AttestRequestFrame {
+            request_id: "att_1".into(),
+            chain_id,
+            vault: vault.into(),
+            epoch_id: "7".into(),
+            attestation: wire::NavAttestationWire {
+                vault: vault.into(),
+                chain_id: chain_id.to_string(),
+                epoch_id: "7".into(),
+                corridor_asset_price: "1500000000000000000".into(),
+                nav: "16000000".into(),
+                last_settled_nav: "12345".into(),
+                free_settlement: "10000000".into(),
+                free_corridor: "4000000000000000000".into(),
+                valid_after: "1700000000".into(),
+                valid_until: "1700003600".into(),
+            },
+            reply_by: "2026-08-05T10:00:04.000Z".into(),
+        })
+    }
+
+    /// A bot without a vault, or asked about another vault or chain, refuses
+    /// before it touches the chain or its key.
+    #[tokio::test]
+    async fn refuses_to_cosign_for_a_vault_it_does_not_sign_for() {
+        let vault = "0x2222222222222222222222222222222222222222";
+        let mut engine = test_engine();
+        let reply = engine
+            .dispatch(attest_request(vault, 8453), &PriceCache::default())
+            .await;
+        let Some(MakerFrame::AttestReject(rej)) = reply else {
+            panic!("expected a reject: {reply:?}");
+        };
+        assert_eq!(rej.reason, AttestRejectReason::WrongVault);
+        assert_eq!(rej.request_id, "att_1");
+
+        engine.vault = Some(vault.parse().unwrap());
+        let reply = engine
+            .dispatch(attest_request(vault, 1), &PriceCache::default())
+            .await;
+        assert!(matches!(
+            reply,
+            Some(MakerFrame::AttestReject(AttestRejectFrame {
+                reason: AttestRejectReason::WrongVault,
+                ..
+            }))
+        ));
+        // Right vault, but the venue's replyBy (2026-08-05 in the fixture) is
+        // long gone: refused before any read or signing.
+        let reply = engine
+            .dispatch(attest_request(vault, 8453), &PriceCache::default())
+            .await;
+        assert!(matches!(
+            reply,
+            Some(MakerFrame::AttestReject(AttestRejectFrame {
+                reason: AttestRejectReason::Busy,
+                ..
+            }))
+        ));
     }
 
     #[test]

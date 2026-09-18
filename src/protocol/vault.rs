@@ -17,6 +17,26 @@ fn encode_view(sig: &str) -> Vec<u8> {
     selector(sig).to_vec()
 }
 
+pub fn encode_free_settlement() -> Vec<u8> {
+    encode_view("freeSettlement()")
+}
+
+pub fn encode_free_corridor() -> Vec<u8> {
+    encode_view("freeCorridor()")
+}
+
+pub fn encode_last_settled_nav() -> Vec<u8> {
+    encode_view("lastSettledNav()")
+}
+
+pub fn encode_settlement_decimals() -> Vec<u8> {
+    encode_view("settlementDecimals()")
+}
+
+pub fn encode_corridor_decimals() -> Vec<u8> {
+    encode_view("corridorDecimals()")
+}
+
 pub fn encode_trading_epoch() -> Vec<u8> {
     encode_view("tradingEpoch()")
 }
