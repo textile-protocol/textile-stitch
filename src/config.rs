@@ -1395,6 +1395,48 @@ mod tests {
         assert!(!pool.limit_taker_enabled());
     }
 
+    /// The Terraform host ships its own copy of the sample, and nothing used to
+    /// check it. It drifted: when `book_enabled` flipped to off by default, that
+    /// copy still had no `book_enabled` and no `[rfq]`, so an operator following
+    /// the README built a bot with BOTH quoting channels dark. Pin it here so
+    /// the next default flip can't quietly do the same thing again.
+    ///
+    /// Read at runtime rather than `include_str!` on purpose: the path leaves
+    /// this crate's directory, and a packaged/vendored build has no `infra/`
+    /// beside it. Missing file → skip, so packaging never breaks on this test.
+    #[test]
+    fn parses_the_terraform_host_example_config() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../infra/terraform/stitch-bots/files/stitch.example.toml");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: {} is not present", path.display());
+            return;
+        };
+        let cfg = Config::from_toml(&raw)
+            .unwrap_or_else(|e| panic!("terraform example config must parse: {e:#}"));
+
+        // The point of the test: this sample must not ship a bot that quotes
+        // nothing. The ladder is off, so RFQ is the channel, and the spreads and
+        // sizes that feed RFQ have to actually be set on both sides.
+        assert!(
+            !cfg.book_enabled,
+            "the terraform sample must not rest a public ladder"
+        );
+        let pool = &cfg.pools[0];
+        assert!(
+            pool.buy_enabled() && pool.sell_enabled(),
+            "both sides need a spread and a size or RFQ quotes nothing"
+        );
+
+        // `[rfq]` stays commented out: `stitch connect` writes the real block.
+        // An uncommented placeholder would carry the zero validation_contract,
+        // which `validate_rfq` rejects.
+        assert!(
+            cfg.rfq.is_none(),
+            "the sample must leave [rfq] to `stitch connect`"
+        );
+    }
+
     /// Every `[signer]` shape that shipped before Fireblocks existed, still
     /// parsing on the current binary.
     ///
