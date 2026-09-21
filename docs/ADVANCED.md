@@ -690,6 +690,12 @@ supported corridors; any valid `stitch.toml` works with the bot.
 
 ### Swap quoting (RFQ)
 
+`book_enabled` defaults to **off**. Swap does not read the public book, so
+resting a ladder nobody can see just parks inventory behind live orders. Running
+one is now an explicit `book_enabled = true` in the config — including for a
+pre-existing bot that upgrades without the key set, which loses its ladder on
+the first restart after the upgrade.
+
 New bots are RFQ-only: `book_enabled = false`, Settings shows the RFQ card,
 and Create/Start refuse to go live until you Connect. Connect registers the
 funding wallet and writes `rfq-api.key`. It does **not** invent a corridor

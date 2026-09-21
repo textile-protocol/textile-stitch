@@ -9,6 +9,14 @@ This guide moves an existing bot from the ladder to RFQ. The mechanical part is
 a few minutes and one restart; the wait is Textile approving your maker, which
 happens in between. Your ladder keeps running until then.
 
+**One thing to check before you upgrade.** `book_enabled` now defaults to off.
+If your `stitch.toml` never set the key — true of any bot created before RFQ
+existed — the ladder stops at the first restart after the upgrade, not when you
+finish this guide. Look for the key: if it isn't there and you want the ladder
+up while you work through the steps below, add `book_enabled = true` as a
+root-level key (above the first `[section]` header) before upgrading. Everything
+else here is unchanged.
+
 - [Getting access](#getting-access) — Connect registers you; confirming your email is what puts you on the tape
 - [Panel and Desktop operators](#panel-and-desktop)
 - [Standalone CLI operators](#standalone-cli) — `stitch` from a terminal, systemd, or Docker without the panel
@@ -144,7 +152,7 @@ env is exported first (`stitch.env` handles this if you wrote it with
 `connect` adds an `[rfq]` block and flips one top-level key:
 
 ```toml
-book_enabled = false   # was absent (defaults true) or explicitly true
+book_enabled = false   # now the default; `connect` writes it out anyway
 
 [rfq]
 enabled = true
@@ -205,8 +213,9 @@ The ladder is still there, just off.
 the bot page with the `book_enabled` switch. Turning it on restarts the bot back
 onto the public book.
 
-**CLI:** set `book_enabled = true` in `stitch.toml` (or delete the line — it
-defaults to true) and restart.
+**CLI:** set `book_enabled = true` in `stitch.toml` and restart. Write it out —
+deleting the line no longer brings the ladder back, because the key now defaults
+to off.
 
 Either way, leave `[rfq]` in place. `enabled = false` parks the responder
 without discarding your maker id, so switching back is one edit rather than

@@ -511,7 +511,7 @@ mod tests {
         // bot sits at Waiting forever with a seated, quotable pair configured.
         // Keyed on the pair, pool 1 gets the slug it actually is.
         let bsc = TWO_POOLS
-            .replace("book_enabled = false\n", "")
+            .replace("book_enabled = false\n", "book_enabled = true\n")
             .replace(
                 "collateral = \"0x0000000000000000000000000000000000000003\"",
                 "collateral = \"0xa8AEA66B361a8d53e8865c62D142167Af28Af058\"",
@@ -561,7 +561,7 @@ mod tests {
             ),
         );
         // Ladder on, so "left alone" is observable rather than vacuous.
-        let no_capacity = no_capacity.replace("book_enabled = false\n", "");
+        let no_capacity = no_capacity.replace("book_enabled = false\n", "book_enabled = true\n");
         let cfg = Config::from_toml(&no_capacity).expect("config parses");
         assert!(
             !cfg.pools[1].rfq_has_usable_capacity(),
@@ -595,10 +595,12 @@ mod tests {
         // Live would enable RFQ, take the bot-wide ladder down, and leave the
         // bot quoting on neither surface — the same all-pools condition
         // `Config::rfq_quotable` applies.
-        let broken = TWO_POOLS.replace("book_enabled = false\n", "").replace(
-            "debt = \"0x0000000000000000000000000000000000000004\"",
-            "debt = \"not-an-address\"",
-        );
+        let broken = TWO_POOLS
+            .replace("book_enabled = false\n", "book_enabled = true\n")
+            .replace(
+                "debt = \"0x0000000000000000000000000000000000000004\"",
+                "debt = \"not-an-address\"",
+            );
         let cfg = Config::from_toml(&broken).expect("config parses");
         assert!(cfg.pools[0].rfq_book_buildable() && cfg.pools[0].rfq_has_usable_capacity());
         assert!(!cfg.pools[1].rfq_book_buildable(), "the sibling is broken");

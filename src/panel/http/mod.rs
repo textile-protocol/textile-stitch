@@ -403,13 +403,25 @@ pub(crate) mod testkit {
 
     /// Catalog templates are RFQ-only. Lifecycle fixtures model leftover book
     /// bots so Start still works without Connect.
+    ///
+    /// Writes an explicit `true` rather than dropping the key: the loader
+    /// default is off, so an absent key models an RFQ-only bot, not a
+    /// leftover one.
     pub fn keep_book_on(toml_path: &std::path::Path) {
         let toml = std::fs::read_to_string(toml_path).expect("reading stitch.toml");
-        let mut next = toml
+        let mut lines = toml
             .lines()
             .filter(|line| !line.trim_start().starts_with("book_enabled"))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        // Root key, so it has to go in before the first table header — after
+        // one it would be read as a field of that table and silently ignored.
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with('['))
+            .unwrap_or(lines.len());
+        lines.insert(at, "book_enabled = true".to_owned());
+        let mut next = lines.join("\n");
         if toml.ends_with('\n') {
             next.push('\n');
         }

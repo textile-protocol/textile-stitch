@@ -923,17 +923,19 @@ fn apply_rfq(doc: &mut DocumentMut, patch: &SettingsPatch) -> Result<()> {
     Ok(())
 }
 
-/// Write `book_enabled = false`, or remove the key when on so a pre-RFQ
-/// template stays byte-identical after a round-trip (the loader default is on).
+/// Write the flag explicitly in both directions.
+///
+/// This used to remove the key for "on" and rely on the loader defaulting to
+/// true. That default is now false, so absence means off — removing the key
+/// would turn the Legacy switch into a no-op that silently leaves the ladder
+/// down. Pin whichever value the operator picked; the round-trip is no longer
+/// byte-identical on a pre-RFQ template, which is the correct trade for a
+/// toggle that has to actually work.
 fn apply_book_enabled(table: &mut Table, enabled: Option<bool>) {
     let Some(enabled) = enabled else {
         return;
     };
-    if enabled {
-        table.remove("book_enabled");
-    } else {
-        set_value(table, "book_enabled", Value::from(false));
-    }
+    set_value(table, "book_enabled", Value::from(enabled));
 }
 
 /// Set or clear `[vault]`. An address makes the bot trade from that
@@ -2055,18 +2057,20 @@ mod tests {
     }
 
     #[test]
-    fn book_enabled_round_trips_and_omits_the_key_when_on() {
+    fn book_enabled_round_trips_explicitly_in_both_directions() {
         let mut patch = read_settings(TEMPLATE).unwrap().to_patch();
         patch.book_enabled = Some(false);
         let off = apply_settings(TEMPLATE, &patch).unwrap();
         assert!(off.contains("book_enabled = false"));
         assert!(!read_settings(&off).unwrap().book_enabled);
 
+        // The loader default is off, so "on" has to be written down — dropping
+        // the key here would leave the Legacy switch flipped and the bot silent.
         patch.book_enabled = Some(true);
         let on = apply_settings(&off, &patch).unwrap();
         assert!(
-            !on.contains("book_enabled"),
-            "the default (on) must not pin an explicit true: {on}"
+            on.contains("book_enabled = true"),
+            "turning the ladder on must pin an explicit true: {on}"
         );
         assert!(read_settings(&on).unwrap().book_enabled);
     }

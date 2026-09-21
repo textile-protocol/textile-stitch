@@ -66,11 +66,17 @@ pub struct Config {
     /// RFQ responder. Omitted → the responder never spawns. See [`RfqConfig`].
     #[serde(default)]
     pub rfq: Option<RfqConfig>,
-    /// Post resting orders on the public ladder. Default true for files that
-    /// omit the key (historical). New bots stamp `false`: they quote Swap via
-    /// RFQ and do not rest orders on the book. Spreads and liquidity still
-    /// size RFQ.
-    #[serde(default = "default_true")]
+    /// Post resting orders on the public ladder. Defaults to **off**: Swap
+    /// does not read the book, so a ladder nobody can see is inventory held
+    /// behind live orders for nothing. Opting back in takes an explicit
+    /// `book_enabled = true`. Spreads and liquidity size RFQ either way.
+    ///
+    /// This default was `true` while the ladder was the primary channel. A
+    /// config written before the flip that omits the key therefore loses its
+    /// ladder on upgrade — deliberate, and the reason the panel now pins an
+    /// explicit `true` rather than relying on absence (see
+    /// `setup::settings::apply_book_enabled`).
+    #[serde(default)]
     pub book_enabled: bool,
     /// Raw experimental gates. Values are uninterpreted strings on purpose:
     /// each consumer matches its own exact token, so a typo fails closed
@@ -99,10 +105,6 @@ pub struct VaultConfig {
     /// executor, so leave this unset until ops publishes the address.
     #[serde(default)]
     pub order_executor: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// The `[rfq]` block: connection details for the venue's maker quote stream.
@@ -2491,11 +2493,22 @@ mod tests {
 
     #[test]
     fn vault_mode_requires_the_ladder_off() {
+        // The ladder now has to be asked for, so the failing case is explicit.
+        let ladder_on = LEAN_POOL_BASE.replace(
+            "tick_interval_secs = 5",
+            "tick_interval_secs = 5\nbook_enabled = true",
+        );
         let on = format!(
+            "{ladder_on}\n[vault]\naddress = \"0x00000000000000000000000000000000000000aa\"\n"
+        );
+        let err = Config::from_toml(&on).expect_err("vault + an explicit ladder must fail");
+        assert!(err.to_string().contains("book_enabled"));
+
+        // And the default now satisfies the rule on its own.
+        let defaulted = format!(
             "{LEAN_POOL_BASE}\n[vault]\naddress = \"0x00000000000000000000000000000000000000aa\"\n"
         );
-        let err = Config::from_toml(&on).expect_err("vault + default book_enabled must fail");
-        assert!(err.to_string().contains("book_enabled"));
+        Config::from_toml(&defaulted).expect("vault + defaulted (off) ladder parses");
 
         let off = LEAN_POOL_BASE.replace(
             "tick_interval_secs = 5",
@@ -2544,11 +2557,20 @@ mod tests {
     }
 
     #[test]
-    fn book_enabled_defaults_on_and_can_be_turned_off() {
+    fn book_enabled_defaults_off_and_can_be_turned_on() {
         let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
-        assert!(cfg.book_enabled, "omitted book_enabled must stay on");
+        assert!(
+            !cfg.book_enabled,
+            "omitted book_enabled must leave the ladder off"
+        );
 
         // Root-level key — appending after [[pools]] would land on the pool.
+        let on = LEAN_POOL_BASE.replace(
+            "tick_interval_secs = 5",
+            "tick_interval_secs = 5\nbook_enabled = true",
+        );
+        assert!(Config::from_toml(&on).unwrap().book_enabled);
+
         let off = LEAN_POOL_BASE.replace(
             "tick_interval_secs = 5",
             "tick_interval_secs = 5\nbook_enabled = false",

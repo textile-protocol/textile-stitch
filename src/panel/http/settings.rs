@@ -1947,9 +1947,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_legacy_card_can_put_a_migrated_bot_back_on_the_ladder() {
-        // New bots are RFQ-only. Turning `book_enabled` back on has to remove
-        // the key (the config default is true) and restart the bot, so the
-        // ladder is genuinely live rather than just reported as on.
+        // New bots are RFQ-only. Turning `book_enabled` back on has to write an
+        // explicit `true` and restart the bot, so the ladder is genuinely live
+        // rather than just reported as on. Removing the key would do the
+        // opposite now that the config default is off — the switch would report
+        // success and leave the bot quoting nothing.
         let h = harness("settings-book-back-on");
         seed(&h, "bot-a");
         let config = h.root.join("bot-a/stitch.toml");
@@ -1968,8 +1970,8 @@ mod tests {
 
         let toml = std::fs::read_to_string(&config).unwrap();
         assert!(
-            !toml.contains("book_enabled"),
-            "on is the absent-key default, not a written true: {toml}"
+            toml.contains("book_enabled = true"),
+            "on has to be pinned explicitly, not left to an absent key: {toml}"
         );
         let cfg = crate::config::Config::from_toml(&toml).unwrap();
         assert!(cfg.book_enabled);
