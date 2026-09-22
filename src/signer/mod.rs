@@ -69,6 +69,15 @@ pub trait Signer: Send + Sync {
     /// The Ethereum address this signer controls.
     fn address(&self) -> Address;
 
+    /// Whether this backend can sign an EIP-1559 transaction hash.
+    ///
+    /// Typed-message-only backends can still quote, but must reject work that
+    /// would acknowledge an on-chain broadcast before discovering that the
+    /// signer cannot produce it.
+    fn can_sign_transactions(&self) -> bool {
+        true
+    }
+
     /// How many signatures the poster may request concurrently. Remote MPC
     /// backends override this from config; local signing is instant so the
     /// default is fine.

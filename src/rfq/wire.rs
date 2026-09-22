@@ -32,6 +32,8 @@ pub enum VenueFrame {
     QuoteExpired(QuoteExpiredFrame),
     #[serde(rename = "attestRequest")]
     AttestRequest(AttestRequestFrame),
+    #[serde(rename = "closeRedeemRequest")]
+    CloseRedeemRequest(CloseRedeemRequestFrame),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +151,10 @@ pub enum MakerFrame {
     AttestResponse(AttestResponseFrame),
     #[serde(rename = "attestReject")]
     AttestReject(AttestRejectFrame),
+    #[serde(rename = "closeRedeemAck")]
+    CloseRedeemAck(CloseRedeemAckFrame),
+    #[serde(rename = "closeRedeemReject")]
+    CloseRedeemReject(CloseRedeemRejectFrame),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +285,56 @@ pub struct AttestResponseFrame {
 pub struct AttestRejectFrame {
     pub request_id: String,
     pub reason: AttestRejectReason,
+}
+
+/// Close a redeem epoch on the vault this bot signs for.
+///
+/// Not a signature — a transaction. `closeRedeemEpoch` gates on `msg.sender`,
+/// and the venue's keeper is on the permissionless path, which waits
+/// `redemptionEpochDuration + valuationTimeout`. This key does not, so the
+/// venue asks it to send the close. Closing bumps the trading epoch and kills
+/// every order signed under the old one, so the bot checks the epoch against
+/// its own chain read first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseRedeemRequestFrame {
+    pub request_id: String,
+    pub chain_id: u64,
+    pub vault: String,
+    pub epoch_id: String,
+    /// Hard cutoff (absolute venue clock). A later reply is dropped.
+    pub reply_by: String,
+}
+
+/// Accepted. Not "mined", and not even "sent": the close plans a nonce,
+/// estimates gas and waits on a receipt, all of it past the reply budget. The
+/// venue does not watch it — it reads the epoch's state on its next tick.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseRedeemAckFrame {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseRedeemRejectFrame {
+    pub request_id: String,
+    pub reason: CloseRedeemRejectReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseRedeemRejectReason {
+    /// Not the vault this bot signs for, or not its chain.
+    WrongVault,
+    /// Our own read says this is not an open redeem epoch, or not yet due.
+    NotDue,
+    /// A close for this epoch is already in flight from this bot.
+    InFlight,
+    /// The signing key holds no native balance to pay for the close.
+    Unfunded,
+    /// Could not read the chain, sign, or broadcast in time.
+    Busy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

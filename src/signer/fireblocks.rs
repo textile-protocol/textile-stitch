@@ -706,6 +706,10 @@ impl Signer for FireblocksSigner {
         self.operator_address
     }
 
+    fn can_sign_transactions(&self) -> bool {
+        self.raw_signing
+    }
+
     fn max_concurrent_signs(&self) -> usize {
         self.max_concurrent_signs
     }

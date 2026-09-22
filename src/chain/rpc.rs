@@ -103,6 +103,30 @@ pub fn is_inflight_limit_error(err: &str) -> bool {
     err.contains("in-flight transaction limit")
 }
 
+/// Marker for a send whose node may have accepted the transaction before the
+/// caller lost certainty about its outcome. Retrying with the next nonce can
+/// spend gas twice, so callers that coordinate one-shot work must keep their
+/// claim until chain state proves what happened.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct TransactionMayStillLand {
+    message: String,
+}
+
+fn may_still_land_error(err: anyhow::Error) -> anyhow::Error {
+    TransactionMayStillLand {
+        message: format!("{err:#}"),
+    }
+    .into()
+}
+
+/// Whether a failed send crossed the broadcast boundary and therefore must
+/// not be retried merely because no receipt was observed.
+pub fn transaction_may_still_land(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<TransactionMayStillLand>().is_some())
+}
+
 /// The operator-facing explanation for geth's in-flight limit. `stuck_nonce` is
 /// the nonce the pool is already holding (latest, i.e. the one our send skipped).
 fn inflight_hint(delegate: Option<Address>, stuck_nonce: Option<u64>) -> String {
@@ -155,16 +179,19 @@ impl Rpc {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
     }
 
-    async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let resp: Value = self
-            .client
+    async fn response(&self, method: &str, params: Value) -> reqwest::Result<Value> {
+        self.client
             .post(&self.url)
             .json(&Self::request(method, params))
             .send()
             .await?
             .error_for_status()?
             .json()
-            .await?;
+            .await
+    }
+
+    async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let resp = self.response(method, params).await?;
         if let Some(err) = resp.get("error") {
             anyhow::bail!("rpc {method} error: {err}");
         }
@@ -263,11 +290,33 @@ impl Rpc {
     }
 
     pub async fn send_raw(&self, raw: &Bytes) -> anyhow::Result<B256> {
-        let r = self
-            .call("eth_sendRawTransaction", json!([hex::encode_prefixed(raw)]))
-            .await?;
-        let s = r.as_str().unwrap_or_default();
-        Ok(s.parse()?)
+        self.send_raw_tracked(raw)
+            .await
+            .map_err(SendRawFailure::into_error)
+    }
+
+    /// Submit a signed transaction without erasing whether the node gave a
+    /// definitive JSON-RPC rejection or the transport lost the outcome.
+    async fn send_raw_tracked(&self, raw: &Bytes) -> Result<B256, SendRawFailure> {
+        let method = "eth_sendRawTransaction";
+        let response = self
+            .response(method, json!([hex::encode_prefixed(raw)]))
+            .await
+            .map_err(|err| SendRawFailure::Unknown(err.into()))?;
+        if let Some(err) = response.get("error") {
+            return Err(SendRawFailure::Rejected(anyhow::anyhow!(
+                "rpc {method} error: {err}"
+            )));
+        }
+        let result = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                SendRawFailure::Unknown(anyhow::anyhow!("rpc {method}: no transaction hash"))
+            })?;
+        result
+            .parse()
+            .map_err(|err| SendRawFailure::Unknown(anyhow::Error::new(err)))
     }
 
     pub async fn receipt(&self, hash: B256) -> anyhow::Result<Option<Value>> {
@@ -275,6 +324,22 @@ impl Rpc {
             .call("eth_getTransactionReceipt", json!([hash.to_string()]))
             .await?;
         Ok(if r.is_null() { None } else { Some(r) })
+    }
+}
+
+#[derive(Debug)]
+enum SendRawFailure {
+    /// The node returned a JSON-RPC error, so it did not accept the tx.
+    Rejected(anyhow::Error),
+    /// The request or response failed without proving whether the node accepted it.
+    Unknown(anyhow::Error),
+}
+
+impl SendRawFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Rejected(err) | Self::Unknown(err) => err,
+        }
     }
 }
 
@@ -365,13 +430,13 @@ impl Wallet {
 
     /// Sign + broadcast one attempt. Same nonce twice is a replacement, not a
     /// second transaction — that is what makes the bump loop safe.
-    async fn send_plan(
+    async fn send_plan_tracked(
         &self,
         to: Address,
         data: Bytes,
         value: U256,
         plan: &TxPlan,
-    ) -> anyhow::Result<B256> {
+    ) -> Result<B256, SendPlanFailure> {
         let tx = Eip1559Tx {
             chain_id: self.chain_id,
             nonce: plan.nonce,
@@ -382,11 +447,30 @@ impl Wallet {
             value,
             data,
         };
-        let signed = sign_tx(self.signer.as_ref(), &tx).await?;
-        match self.rpc.send_raw(&signed.raw).await {
+        let signed = sign_tx(self.signer.as_ref(), &tx)
+            .await
+            .map_err(SendPlanFailure::SafeToRetry)?;
+        match self.rpc.send_raw_tracked(&signed.raw).await {
             Ok(hash) => Ok(hash),
-            Err(e) => Err(self.explain_send_error(e).await),
+            Err(SendRawFailure::Rejected(err)) => Err(SendPlanFailure::SafeToRetry(
+                self.explain_send_error(err).await,
+            )),
+            // A transport failure can arrive after the node accepted the raw
+            // transaction. Keep the claim until chain state reconciles it.
+            Err(SendRawFailure::Unknown(err)) => Err(SendPlanFailure::BroadcastUnknown(err)),
         }
+    }
+
+    async fn send_plan(
+        &self,
+        to: Address,
+        data: Bytes,
+        value: U256,
+        plan: &TxPlan,
+    ) -> anyhow::Result<B256> {
+        self.send_plan_tracked(to, data, value, plan)
+            .await
+            .map_err(SendPlanFailure::into_error)
     }
 
     /// Turn a bare node rejection into something an operator can act on. Only
@@ -424,7 +508,10 @@ impl Wallet {
         timeout: Duration,
     ) -> anyhow::Result<Value> {
         let plan = self.plan_tx(to, &data, value).await?;
-        let hash = self.send_plan(to, data.clone(), value, &plan).await?;
+        let hash = self
+            .send_plan_tracked(to, data.clone(), value, &plan)
+            .await
+            .map_err(SendPlanFailure::into_error)?;
         // One line that answers "why is this not landing?" without a block
         // explorer: a stuck transaction is almost always a nonce or a fee.
         tracing::info!(
@@ -437,7 +524,12 @@ impl Wallet {
         let mut next_bump = std::time::Instant::now() + BUMP_AFTER;
         loop {
             for hash in &hashes {
-                if let Some(r) = self.rpc.receipt(*hash).await? {
+                if let Some(r) = self
+                    .rpc
+                    .receipt(*hash)
+                    .await
+                    .map_err(may_still_land_error)?
+                {
                     let status = r.get("status").and_then(Value::as_str).unwrap_or("0x1");
                     if status == "0x0" {
                         anyhow::bail!("tx {hash} reverted");
@@ -448,12 +540,12 @@ impl Wallet {
             let now = std::time::Instant::now();
             if now >= deadline {
                 let last = hashes.last().copied().unwrap_or_default();
-                anyhow::bail!(
+                return Err(may_still_land_error(anyhow::anyhow!(
                     "tx {last} (nonce {}) not mined within timeout, after re-sending it at a \
                      higher fee. It may still land — re-run to check before sending anything \
                      else, and if it is still pending, replace that nonce from your wallet",
                     plan.nonce
-                );
+                )));
             }
             if now >= next_bump {
                 plan = plan.bumped();
@@ -474,6 +566,20 @@ impl Wallet {
                 next_bump = now + BUMP_AFTER;
             }
             tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+    }
+}
+
+enum SendPlanFailure {
+    SafeToRetry(anyhow::Error),
+    BroadcastUnknown(anyhow::Error),
+}
+
+impl SendPlanFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::SafeToRetry(err) => err,
+            Self::BroadcastUnknown(err) => may_still_land_error(err),
         }
     }
 }
@@ -530,6 +636,41 @@ mod tests {
         assert_eq!(parse_quantity(&json!("0x1a")).unwrap(), U256::from(26u8));
         assert_eq!(parse_quantity(&json!("0x0")).unwrap(), U256::ZERO);
         assert_eq!(parse_quantity(&json!("0x")).unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn only_post_broadcast_errors_are_marked_as_may_still_land() {
+        let before = SendPlanFailure::SafeToRetry(anyhow::anyhow!("signing failed"));
+        assert!(!transaction_may_still_land(&before.into_error()));
+
+        let uncertain =
+            SendPlanFailure::BroadcastUnknown(anyhow::anyhow!("send response was lost"));
+        assert!(transaction_may_still_land(&uncertain.into_error()));
+
+        let receipt_timeout = may_still_land_error(anyhow::anyhow!("receipt timed out"));
+        assert!(transaction_may_still_land(&receipt_timeout));
+    }
+
+    #[tokio::test]
+    async fn send_raw_distinguishes_node_rejection_from_transport_uncertainty() {
+        let rejected = fixed_node(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"insufficient funds"}}"#,
+        )
+        .await;
+        let rejection = Rpc::new(rejected)
+            .send_raw_tracked(&Bytes::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(rejection, SendRawFailure::Rejected(_)));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let unknown = Rpc::new(unavailable)
+            .send_raw_tracked(&Bytes::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(unknown, SendRawFailure::Unknown(_)));
     }
 
     /// A JSON-RPC node that answers every call with one fixed body.

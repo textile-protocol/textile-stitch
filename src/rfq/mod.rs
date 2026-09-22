@@ -40,7 +40,7 @@ pub mod wire;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use alloy_primitives::{Address, Bytes, U256};
 use anyhow::Context as _;
@@ -51,7 +51,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::book::taker::encode_order_bytes;
 use crate::chain::multicall::{decode_uint, Batcher, Call};
-use crate::chain::rpc::{Rpc, Wallet};
+use crate::chain::rpc::{transaction_may_still_land, Rpc, Wallet};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
@@ -63,12 +63,14 @@ use crate::time::unix_now;
 
 use crate::protocol::vault::{
     address_from_word, apply_vault_order_policy, clamp_vault_deadline, encode_close_only,
-    encode_corridor_asset, encode_corridor_decimals, encode_free_corridor, encode_free_settlement,
+    encode_close_redeem_epoch, encode_closed_redeem_epoch_id, encode_corridor_asset,
+    encode_corridor_decimals, encode_epochs, encode_free_corridor, encode_free_settlement,
     encode_last_settled_nav, encode_liquid_settlement, encode_max_order_input_corridor,
     encode_max_order_input_settlement, encode_max_order_lifetime, encode_paused,
-    encode_quotable_corridor, encode_quotable_settlement, encode_settlement_asset,
-    encode_settlement_decimals, encode_trading_epoch, quotable_settlement_for_route, trading_nonce,
-    vault_nonce_low, VaultQuotePolicy,
+    encode_quotable_corridor, encode_quotable_settlement, encode_redemption_epoch_duration,
+    encode_settlement_asset, encode_settlement_decimals, encode_trading_epoch,
+    quotable_settlement_for_route, trading_nonce, vault_nonce_low, RedeemEpochView,
+    VaultQuotePolicy,
 };
 use crate::time::unix_now_ms;
 use iso8601::{format_iso_ms, parse_iso_ms};
@@ -80,9 +82,15 @@ use responder::{
 };
 use session::AuthedSession;
 use wire::{
-    AttestRejectFrame, AttestRejectReason, AttestRequestFrame, AttestResponseFrame, MakerFrame,
-    QuoteRejectFrame, QuoteRequestFrame, QuoteResponseFrame, RejectReason, VenueFrame,
+    AttestRejectFrame, AttestRejectReason, AttestRequestFrame, AttestResponseFrame,
+    CloseRedeemAckFrame, CloseRedeemRejectFrame, CloseRedeemRejectReason, CloseRedeemRequestFrame,
+    MakerFrame, QuoteRejectFrame, QuoteRequestFrame, QuoteResponseFrame, RejectReason, VenueFrame,
 };
+
+/// How long a redeem-epoch close may spend waiting for its receipt. Well past
+/// the venue's reply budget on purpose — the ack has already gone back, and
+/// this is only the window in which a fee bump can still rescue the nonce.
+const CLOSE_REDEEM_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Everything the responder task needs, resolved once at spawn so the hot
 /// path never re-reads config or environment.
@@ -111,6 +119,9 @@ pub struct RfqRuntime {
     trading_epoch: Arc<RwLock<u64>>,
     /// Per-order caps and lifetime. Unused when `vault` is None.
     vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
+    /// Redeem epochs with a close in flight. Process-scoped so reconnecting
+    /// the maker stream cannot forget a transaction task that is still alive.
+    closing: Arc<Mutex<HashMap<U256, u64>>>,
 }
 
 /// How old a wallet reading may be before a `max` side goes dark.
@@ -382,6 +393,7 @@ fn build_runtime(
             .transpose()?,
         trading_epoch: Arc::new(RwLock::new(0)),
         vault_policy: Arc::new(RwLock::new(None)),
+        closing: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 
@@ -552,6 +564,7 @@ async fn run(rt: RfqRuntime) {
             rt.vault_order_executor,
             rt.trading_epoch.clone(),
             rt.vault_policy.clone(),
+            rt.closing.clone(),
         ));
     }
 
@@ -1053,6 +1066,8 @@ async fn session_loop_inner(
         vault_policy: rt.vault_policy.clone(),
         nonce_salt: rand::random(),
         rpc: Rpc::new(&rt.rpc_url),
+        rpc_url: rt.rpc_url.clone(),
+        closing: rt.closing.clone(),
     };
     // Upgrade path: a ledger written before `input_token` existed loads as
     // tokenless. Stamp every bound book now, while the quoted pool is still
@@ -1230,6 +1245,14 @@ struct Engine {
     /// For the vault reads behind attestation co-signing. Off the quote
     /// path: a co-sign request is one per settled epoch, not per RFQ.
     rpc: Rpc,
+    /// Kept alongside `rpc` so a redeem close can build its own [`Wallet`]:
+    /// the broadcast outlives the frame that asked for it, and nothing that
+    /// sends a transaction may borrow the session loop.
+    rpc_url: String,
+    /// Process-scoped redeem epochs with a close in flight. The venue asks
+    /// again every tick until the chain says Closed, and a second close would
+    /// be a second nonce spent on a revert.
+    closing: Arc<Mutex<HashMap<U256, u64>>>,
 }
 
 impl Engine {
@@ -1371,6 +1394,7 @@ impl Engine {
         match frame {
             VenueFrame::QuoteRequest(req) => Some(self.respond(req, prices).await),
             VenueFrame::AttestRequest(req) => Some(self.cosign(req, prices).await),
+            VenueFrame::CloseRedeemRequest(req) => Some(self.close_redeem(req).await),
             VenueFrame::QuoteResult(r) => {
                 // selected stays reserved until quoteExpired or the deadline.
                 // Everything else is a signature the taker will never submit:
@@ -1635,6 +1659,194 @@ impl Engine {
 }
 
 impl Engine {
+    /// Close a redeem epoch for the vault this bot signs for.
+    ///
+    /// `closeRedeemEpoch` gates on `msg.sender`. This key may close whenever
+    /// it likes; the venue's keeper is on the permissionless path and waits
+    /// `redemptionEpochDuration + valuationTimeout` (audit v0.2 L-02), which
+    /// on a five-minute redeem epoch is still a day. So the venue asks.
+    ///
+    /// The checks below are the bot's own. Closing bumps the trading epoch,
+    /// which kills every order signed under it and holds the vault close-only
+    /// until settlement — a frame is not enough to spend that on, so the
+    /// epoch is read from the chain and has to be an open redeem epoch with
+    /// shares in it, past its own duration, with no other close outstanding.
+    ///
+    /// The ack goes back before the transaction does. A nonce, a gas
+    /// estimate and a receipt run far past any reply budget, and this runs
+    /// inline in the session loop, so the broadcast moves to its own task and
+    /// the venue reads the outcome off the chain on its next tick.
+    async fn close_redeem(&self, req: CloseRedeemRequestFrame) -> MakerFrame {
+        let reject = |reason| {
+            MakerFrame::CloseRedeemReject(CloseRedeemRejectFrame {
+                request_id: req.request_id.clone(),
+                reason,
+            })
+        };
+        let Some(vault) = self.vault else {
+            return reject(CloseRedeemRejectReason::WrongVault);
+        };
+        let asked = req.vault.parse::<Address>().ok();
+        if asked != Some(vault) || req.chain_id != self.chain_id {
+            return reject(CloseRedeemRejectReason::WrongVault);
+        }
+        if !self.signer.can_sign_transactions() {
+            warn!(
+                signer = %self.signer.address(),
+                "signer cannot broadcast a redeem epoch close"
+            );
+            return reject(CloseRedeemRejectReason::Busy);
+        }
+        let Ok(epoch_id) = req.epoch_id.parse::<U256>() else {
+            warn!(request_id = %req.request_id, raw = %req.epoch_id, "unparseable epoch id");
+            return reject(CloseRedeemRejectReason::NotDue);
+        };
+        // Same rule as the co-sign path: nothing here may outlive the venue's
+        // deadline, or a slow RPC holds quotes and heartbeats hostage.
+        let Some(reply_by_ms) = parse_iso_ms(&req.reply_by) else {
+            warn!(request_id = %req.request_id, raw = %req.reply_by, "unparseable replyBy");
+            return reject(CloseRedeemRejectReason::Busy);
+        };
+        let Some(budget) = remaining_reply_budget(reply_by_ms, unix_now_ms()) else {
+            return reject(CloseRedeemRejectReason::Busy);
+        };
+
+        let calls = [
+            Call::new(vault, encode_epochs(epoch_id)),
+            Call::new(vault, encode_redemption_epoch_duration()),
+            Call::new(vault, encode_closed_redeem_epoch_id()),
+            Call::new(vault, encode_trading_epoch()),
+        ];
+        let reader = Batcher::sequential();
+        let words = match tokio::time::timeout(budget, reader.read(&self.rpc, &calls)).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                warn!(request_id = %req.request_id, error = %e, "vault read failed; not closing");
+                return reject(CloseRedeemRejectReason::Busy);
+            }
+            Err(_) => {
+                warn!(request_id = %req.request_id, "vault read ran past replyBy; not closing");
+                return reject(CloseRedeemRejectReason::Busy);
+            }
+        };
+        let word = |i: usize| words.get(i).and_then(|o| o.as_ref());
+        let (Some(raw_epoch), Some(duration), Some(outstanding), Some(trading_epoch)) = (
+            word(0),
+            word(1).map(decode_uint),
+            word(2).map(decode_uint),
+            word(3).map(decode_uint).map(|epoch| epoch.to::<u64>()),
+        ) else {
+            return reject(CloseRedeemRejectReason::Busy);
+        };
+        let Some(view) = RedeemEpochView::decode(raw_epoch.as_ref()) else {
+            warn!(request_id = %req.request_id, "vault does not speak the epoch ABI");
+            return reject(CloseRedeemRejectReason::Busy);
+        };
+        // One closed redeem epoch at a time: the contract reverts with
+        // RedeemEpochOutstanding, so there is nothing to spend a nonce on.
+        if outstanding != U256::ZERO || !view.closable_now(duration.saturating_to(), unix_now()) {
+            release_close_claim(&self.closing, epoch_id);
+            info!(
+                request_id = %req.request_id,
+                epoch = %epoch_id,
+                state = view.state,
+                units = %view.units,
+                outstanding = %outstanding,
+                "refused to close redeem epoch"
+            );
+            return reject(CloseRedeemRejectReason::NotDue);
+        }
+
+        // Gas is the operator's, and a close with none is a broadcast that
+        // fails after the venue has been told it is handled.
+        let Some(budget) = remaining_reply_budget(reply_by_ms, unix_now_ms()) else {
+            return reject(CloseRedeemRejectReason::Busy);
+        };
+        match tokio::time::timeout(budget, self.rpc.get_balance(self.signer.address())).await {
+            Ok(Ok(balance)) if balance == U256::ZERO => {
+                warn!(
+                    signer = %self.signer.address(),
+                    "no native balance to close a redeem epoch"
+                );
+                return reject(CloseRedeemRejectReason::Unfunded);
+            }
+            Ok(Ok(_)) => {}
+            // A balance we could not read is not a balance of zero.
+            Ok(Err(e)) => {
+                debug!(error = %format!("{e:#}"), "gas balance read failed; closing anyway");
+            }
+            Err(_) => {
+                warn!("gas balance read ran past replyBy; not closing");
+                return reject(CloseRedeemRejectReason::Busy);
+            }
+        }
+
+        // Do not acknowledge after the venue's timer has already discarded
+        // the request, even if the balance future completed on the boundary.
+        if remaining_reply_budget(reply_by_ms, unix_now_ms()).is_none() {
+            return reject(CloseRedeemRejectReason::Busy);
+        }
+
+        if !self.claim_close(epoch_id, trading_epoch) {
+            return reject(CloseRedeemRejectReason::InFlight);
+        }
+
+        let wallet = Wallet::new(&self.rpc_url, self.signer.clone(), self.chain_id);
+        let closing = self.closing.clone();
+        let request_id = req.request_id.clone();
+        tokio::spawn(async move {
+            let data = Bytes::from(encode_close_redeem_epoch(epoch_id));
+            let sent = wallet
+                .send_and_wait(vault, data, U256::ZERO, CLOSE_REDEEM_RECEIPT_TIMEOUT)
+                .await;
+            let release = match sent {
+                Ok(_) => {
+                    info!(request_id = %request_id, epoch = %epoch_id, "closed redeem epoch");
+                    true
+                }
+                Err(e) => {
+                    let may_land = transaction_may_still_land(&e);
+                    warn!(
+                    request_id = %request_id,
+                    epoch = %epoch_id,
+                    claim_held = may_land,
+                    error = %format!("{e:#}"),
+                    "redeem epoch close failed"
+                    );
+                    !may_land
+                }
+            };
+            if release {
+                release_close_claim(&closing, epoch_id);
+            }
+        });
+
+        MakerFrame::CloseRedeemAck(CloseRedeemAckFrame {
+            request_id: req.request_id,
+        })
+    }
+
+    /// Take the close for `epoch_id`, or `false` if this bot already has one
+    /// in flight. A poisoned lock counts as held: a close nobody is tracking
+    /// is worse than one that waits for the next ask.
+    fn claim_close(&self, epoch_id: U256, trading_epoch: u64) -> bool {
+        let claimed = self
+            .closing
+            .lock()
+            .map(|mut held| held.insert(epoch_id, trading_epoch).is_none())
+            .unwrap_or(false);
+        if claimed {
+            // Closing bumps tradingEpoch and makes the vault close-only. Stop
+            // publishing and signing against the pre-close snapshot now; the
+            // inventory loop keeps this dark while the claim is held, then a
+            // post-close refresh installs the new epoch and policy.
+            if let Ok(mut policy) = self.vault_policy.write() {
+                *policy = None;
+            }
+        }
+        claimed
+    }
+
     /// Countersign a NAV attestation for the vault this bot signs for.
     ///
     /// The bot's key is one of the two the vault needs to settle an epoch, so
@@ -1786,6 +1998,36 @@ impl Engine {
     }
 }
 
+fn release_close_claim(closing: &Mutex<HashMap<U256, u64>>, epoch_id: U256) {
+    if let Ok(mut held) = closing.lock() {
+        held.remove(&epoch_id);
+    }
+}
+
+/// Drop ambiguous close claims once the chain's trading epoch proves their
+/// transaction landed. Returns whether any close is still unresolved.
+fn reconcile_close_claims(closing: &Mutex<HashMap<U256, u64>>, trading_epoch: u64) -> bool {
+    closing
+        .lock()
+        .map(|mut held| {
+            held.retain(|_, submitted_at| *submitted_at == trading_epoch);
+            !held.is_empty()
+        })
+        .unwrap_or(true)
+}
+
+fn remaining_reply_budget(reply_by_ms: u64, now_ms: u64) -> Option<std::time::Duration> {
+    let remaining_ms = reply_by_ms.saturating_sub(now_ms);
+    (remaining_ms > 0).then(|| std::time::Duration::from_millis(remaining_ms))
+}
+
+fn refreshed_vault_policy(
+    close_in_flight: bool,
+    policy: VaultQuotePolicy,
+) -> Option<VaultQuotePolicy> {
+    (!close_in_flight).then_some(policy)
+}
+
 /// Latest feed quote per URL, shared between the fetch loops and the session
 /// task. `std::sync::RwLock` — nothing holds it across an await.
 #[derive(Clone, Default)]
@@ -1893,6 +2135,7 @@ async fn inventory_loop(
     vault_order_executor: Option<Address>,
     trading_epoch: Arc<RwLock<u64>>,
     vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
+    closing: Arc<Mutex<HashMap<U256, u64>>>,
 ) {
     let mut vault_pair: Option<(Address, Address, Address, u64)> = None;
     let mut batcher: Option<Batcher> = None;
@@ -1947,14 +2190,18 @@ async fn inventory_loop(
                     if let Ok(mut slot) = trading_epoch.write() {
                         *slot = epoch;
                     }
+                    let close_in_flight = reconcile_close_claims(&closing, epoch);
                     if let Ok(mut slot) = vault_policy.write() {
-                        *slot = Some(VaultQuotePolicy {
-                            settlement,
-                            corridor,
-                            max_input_settlement: max_settlement,
-                            max_input_corridor: max_corridor,
-                            max_lifetime_secs: max_lifetime,
-                        });
+                        *slot = refreshed_vault_policy(
+                            close_in_flight,
+                            VaultQuotePolicy {
+                                settlement,
+                                corridor,
+                                max_input_settlement: max_settlement,
+                                max_input_corridor: max_corridor,
+                                max_lifetime_secs: max_lifetime,
+                            },
+                        );
                     }
                 }
                 Err(e) => warn!(
@@ -2510,6 +2757,25 @@ mod tests {
         }
     }
 
+    struct TypedOnlySigner {
+        address: Address,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::signer::Signer for TypedOnlySigner {
+        async fn sign_digest(&self, _digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
+            unreachable!("a typed-only signer must be rejected before transaction signing")
+        }
+
+        fn address(&self) -> Address {
+            self.address
+        }
+
+        fn can_sign_transactions(&self) -> bool {
+            false
+        }
+    }
+
     /// A signature that misses `replyBy` is worthless — the venue has stopped
     /// listening — but signing it anyway costs twice over: the reservation
     /// below pins inventory for the whole TTL against a quote nobody will take,
@@ -2596,7 +2862,145 @@ mod tests {
             vault_policy: Arc::new(RwLock::new(None)),
             nonce_salt: 7,
             rpc: Rpc::new("http://127.0.0.1:1"),
+            rpc_url: "http://127.0.0.1:1".into(),
+            closing: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn close_redeem_request(vault: &str, chain_id: u64) -> VenueFrame {
+        VenueFrame::CloseRedeemRequest(CloseRedeemRequestFrame {
+            request_id: "cls_1".into(),
+            chain_id,
+            vault: vault.into(),
+            epoch_id: "3".into(),
+            reply_by: "2026-08-05T10:00:04.000Z".into(),
+        })
+    }
+
+    /// A bot without a vault, or asked about another vault or chain, refuses
+    /// before it touches the chain or its key — the close spends a nonce and
+    /// kills every order signed under the trading epoch.
+    #[tokio::test]
+    async fn refuses_to_close_for_a_vault_it_does_not_sign_for() {
+        let vault = "0x2222222222222222222222222222222222222222";
+        let mut engine = test_engine();
+        let reply = engine
+            .dispatch(close_redeem_request(vault, 8453), &PriceCache::default())
+            .await;
+        let Some(MakerFrame::CloseRedeemReject(rej)) = reply else {
+            panic!("expected a reject for a bot with no vault");
+        };
+        assert_eq!(rej.reason, CloseRedeemRejectReason::WrongVault);
+
+        engine.vault = Some(vault.parse().unwrap());
+        let other = "0x3333333333333333333333333333333333333333";
+        let reply = engine
+            .dispatch(close_redeem_request(other, 8453), &PriceCache::default())
+            .await;
+        let Some(MakerFrame::CloseRedeemReject(rej)) = reply else {
+            panic!("expected a reject for another vault");
+        };
+        assert_eq!(rej.reason, CloseRedeemRejectReason::WrongVault);
+
+        let reply = engine
+            .dispatch(close_redeem_request(vault, 1), &PriceCache::default())
+            .await;
+        let Some(MakerFrame::CloseRedeemReject(rej)) = reply else {
+            panic!("expected a reject for another chain");
+        };
+        assert_eq!(rej.reason, CloseRedeemRejectReason::WrongVault);
+    }
+
+    /// A replyBy already in the past is not worth an RPC: the venue has
+    /// stopped listening, and it asks again next tick.
+    #[tokio::test]
+    async fn refuses_a_close_it_cannot_answer_in_time() {
+        let vault = "0x2222222222222222222222222222222222222222";
+        let mut engine = test_engine();
+        engine.vault = Some(vault.parse().unwrap());
+        let VenueFrame::CloseRedeemRequest(mut req) = close_redeem_request(vault, 8453) else {
+            unreachable!()
+        };
+        req.reply_by = "2020-01-01T00:00:00.000Z".into();
+        let reply = engine
+            .dispatch(VenueFrame::CloseRedeemRequest(req), &PriceCache::default())
+            .await;
+        let Some(MakerFrame::CloseRedeemReject(rej)) = reply else {
+            panic!("expected a reject for an expired budget");
+        };
+        assert_eq!(rej.reason, CloseRedeemRejectReason::Busy);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_close_when_the_signer_cannot_broadcast_transactions() {
+        let vault = "0x2222222222222222222222222222222222222222";
+        let mut engine = test_engine();
+        engine.vault = Some(vault.parse().unwrap());
+        engine.signer = Arc::new(TypedOnlySigner {
+            address: engine.signer.address(),
+        });
+
+        let reply = engine
+            .dispatch(close_redeem_request(vault, 8453), &PriceCache::default())
+            .await;
+        let Some(MakerFrame::CloseRedeemReject(rej)) = reply else {
+            panic!("expected a reject for a signer that cannot send transactions");
+        };
+        assert_eq!(rej.reason, CloseRedeemRejectReason::Busy);
+    }
+
+    #[test]
+    fn each_close_rpc_gets_only_the_reply_budget_that_remains() {
+        assert_eq!(
+            remaining_reply_budget(1_500, 1_250),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(remaining_reply_budget(1_500, 1_500), None);
+        assert_eq!(remaining_reply_budget(1_500, 1_750), None);
+    }
+
+    #[test]
+    fn inventory_refresh_cannot_relight_quotes_while_a_close_is_in_flight() {
+        let policy = VaultQuotePolicy {
+            settlement: DEBT.parse().unwrap(),
+            corridor: COLLATERAL.parse().unwrap(),
+            max_input_settlement: U256::MAX,
+            max_input_corridor: U256::MAX,
+            max_lifetime_secs: 60,
+        };
+        assert!(refreshed_vault_policy(true, policy).is_none());
+        let restored = refreshed_vault_policy(false, policy).expect("refresh restores policy");
+        assert_eq!(restored.settlement, policy.settlement);
+    }
+
+    /// One close per epoch. The venue asks every tick until the chain says
+    /// Closed; a second nonce would only buy a revert.
+    #[test]
+    fn claims_an_epoch_close_once() {
+        let engine = test_engine();
+        *engine.vault_policy.write().unwrap() = Some(VaultQuotePolicy {
+            settlement: DEBT.parse().unwrap(),
+            corridor: COLLATERAL.parse().unwrap(),
+            max_input_settlement: U256::MAX,
+            max_input_corridor: U256::MAX,
+            max_lifetime_secs: 60,
+        });
+        let mut reconnected = test_engine();
+        reconnected.closing = engine.closing.clone();
+
+        assert!(engine.claim_close(U256::from(3), 7));
+        assert!(engine.vault_policy.read().unwrap().is_none());
+        assert!(!reconnected.claim_close(U256::from(3), 7));
+        assert!(engine.claim_close(U256::from(4), 7));
+    }
+
+    #[test]
+    fn an_epoch_bump_reconciles_an_ambiguous_close_claim() {
+        let closing = Mutex::new(HashMap::from([(U256::from(3), 7)]));
+
+        assert!(reconcile_close_claims(&closing, 7));
+        assert!(!reconcile_close_claims(&closing, 8));
+        assert!(closing.lock().unwrap().is_empty());
     }
 
     fn attest_request(vault: &str, chain_id: u64) -> VenueFrame {

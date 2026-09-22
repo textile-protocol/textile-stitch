@@ -81,6 +81,83 @@ pub fn encode_max_order_lifetime() -> Vec<u8> {
     encode_view("maxOrderLifetime()")
 }
 
+pub fn encode_redemption_epoch_duration() -> Vec<u8> {
+    encode_view("redemptionEpochDuration()")
+}
+
+pub fn encode_closed_redeem_epoch_id() -> Vec<u8> {
+    encode_view("closedRedeemEpochId()")
+}
+
+/// `epochs(uint256)` — the public getter on the epoch map. Every member is a
+/// value type, so the return is a flat run of 32-byte words in declaration
+/// order; see [`RedeemEpochView::decode`].
+pub fn encode_epochs(epoch_id: U256) -> Vec<u8> {
+    let mut out = encode_view("epochs(uint256)");
+    out.extend_from_slice(&epoch_id.to_be_bytes::<32>());
+    out
+}
+
+/// `closeRedeemEpoch(uint256)` — a write, not a view. The operator admin and
+/// the strategy signer may call it whenever they like; everyone else waits
+/// `redemptionEpochDuration + valuationTimeout` (audit v0.2 L-02).
+pub fn encode_close_redeem_epoch(epoch_id: U256) -> Vec<u8> {
+    let mut out = encode_view("closeRedeemEpoch(uint256)");
+    out.extend_from_slice(&epoch_id.to_be_bytes::<32>());
+    out
+}
+
+/// `EpochState.Open` — the only state a close may act on.
+const EPOCH_STATE_OPEN: u64 = 1;
+
+/// The part of an `Epoch` a close decision needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedeemEpochView {
+    pub state: u64,
+    pub is_deposit: bool,
+    pub opened_at: u64,
+    pub units: U256,
+}
+
+impl RedeemEpochView {
+    /// Words 0..=6 of the getter's return: state, isDeposit, openedAt,
+    /// cutoff, closedAt, inCorridor, units. A short return is a vault that
+    /// does not speak this ABI, which is not something to guess at.
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() < 7 * 32 {
+            return None;
+        }
+        let word = |i: usize| -> &[u8] { &raw[i * 32..(i + 1) * 32] };
+        let small = |i: usize| -> Option<u64> {
+            let w = word(i);
+            if w[..24].iter().any(|b| *b != 0) {
+                return None;
+            }
+            Some(u64::from_be_bytes(w[24..32].try_into().ok()?))
+        };
+        Some(Self {
+            state: small(0)?,
+            is_deposit: word(1)[31] != 0,
+            opened_at: small(2)?,
+            units: U256::from_be_slice(word(6)),
+        })
+    }
+
+    /// Whether the bot should close this epoch now: an open redeem epoch with
+    /// shares in it, past its own duration.
+    ///
+    /// The duration is the venue's gate too, so this is not second-guessing
+    /// the keeper — it is refusing to bump the trading epoch (and kill every
+    /// signed order) on a frame that does not match the chain. `units == 0`
+    /// closes nothing and costs a re-quote, so it waits.
+    pub fn closable_now(&self, redemption_epoch_duration: u64, now_secs: u64) -> bool {
+        self.state == EPOCH_STATE_OPEN
+            && !self.is_deposit
+            && self.units > U256::ZERO
+            && now_secs.saturating_sub(self.opened_at) >= redemption_epoch_duration
+    }
+}
+
 /// Live vault limits used on the quote path. Inventory stays quotable;
 /// per-order caps and lifetime clamp each signed order separately.
 #[derive(Debug, Clone, Copy)]
@@ -226,6 +303,93 @@ mod tests {
         assert_eq!(
             &encode_max_order_lifetime(),
             &hex::decode("9c454e9d").unwrap()
+        );
+        assert_eq!(
+            &encode_redemption_epoch_duration(),
+            &hex::decode("de2ab60a").unwrap()
+        );
+        assert_eq!(
+            &encode_closed_redeem_epoch_id(),
+            &hex::decode("944eb53d").unwrap()
+        );
+    }
+
+    #[test]
+    fn epoch_calls_carry_the_id_after_the_selector() {
+        let id = U256::from(3u64);
+        let epochs = encode_epochs(id);
+        assert_eq!(&epochs[..4], &hex::decode("c6b61e4c").unwrap()[..]);
+        assert_eq!(epochs.len(), 36);
+        assert_eq!(U256::from_be_slice(&epochs[4..]), id);
+
+        let close = encode_close_redeem_epoch(id);
+        assert_eq!(&close[..4], &hex::decode("c05c4a5b").unwrap()[..]);
+        assert_eq!(U256::from_be_slice(&close[4..]), id);
+    }
+
+    /// The real return of `epochs(3)` on the BSC tvUSDT-cNGN vault
+    /// (0x180c8ef3…b77a): an open redeem epoch holding ~3.002 shares.
+    const LIVE_OPEN_REDEEM_EPOCH: &str = concat!(
+        "0000000000000000000000000000000000000000000000000000000000000001",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000006ab24783",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000029a923ad4738b03f",
+    );
+
+    #[test]
+    fn decodes_a_live_open_redeem_epoch() {
+        let raw = hex::decode(LIVE_OPEN_REDEEM_EPOCH).unwrap();
+        let view = RedeemEpochView::decode(&raw).expect("seven words is enough");
+        assert_eq!(view.state, 1, "Open");
+        assert!(!view.is_deposit);
+        assert_eq!(view.opened_at, 1_790_068_611);
+        assert_eq!(view.units, U256::from(3_001_969_853_750_358_079u64));
+    }
+
+    #[test]
+    fn a_short_return_decodes_to_nothing() {
+        // A vault that does not speak this ABI. Guessing at a close that
+        // bumps the trading epoch is not the move.
+        let raw = hex::decode(LIVE_OPEN_REDEEM_EPOCH).unwrap();
+        assert!(RedeemEpochView::decode(&raw[..6 * 32]).is_none());
+    }
+
+    #[test]
+    fn only_a_due_open_redeem_epoch_with_shares_is_closable() {
+        let opened_at = 1_790_068_611u64;
+        let base = RedeemEpochView {
+            state: 1,
+            is_deposit: false,
+            opened_at,
+            units: U256::from(5u64),
+        };
+        assert!(base.closable_now(300, opened_at + 300));
+        assert!(
+            !base.closable_now(300, opened_at + 299),
+            "inside the duration"
+        );
+        assert!(
+            !RedeemEpochView {
+                units: U256::ZERO,
+                ..base
+            }
+            .closable_now(300, opened_at + 300),
+            "an empty epoch closes nothing and costs a re-quote"
+        );
+        assert!(
+            !RedeemEpochView {
+                is_deposit: true,
+                ..base
+            }
+            .closable_now(300, opened_at + 300),
+            "deposit epochs close on their own cutoff, permissionlessly"
+        );
+        assert!(
+            !RedeemEpochView { state: 2, ..base }.closable_now(300, opened_at + 300),
+            "already Closed"
         );
     }
 
