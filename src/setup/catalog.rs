@@ -137,6 +137,14 @@ const CORRIDORS: &[Corridor] = &[
         toml_template: include_str!("templates/cngn-usdt-bsc-testnet.toml"),
         pending_deploy: false,
     },
+    Corridor {
+        id: "cngn-usdc-base-sepolia",
+        display_name: "cNGN / USDC",
+        network_label: "Base Sepolia",
+        chain_id: 84532,
+        toml_template: include_str!("templates/cngn-usdc-base-sepolia.toml"),
+        pending_deploy: false,
+    },
 ];
 
 /// All corridors, in display order (first is the recommended default).

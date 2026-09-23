@@ -12,6 +12,7 @@ pub fn explorer_base_url(chain_id: u64) -> Option<&'static str> {
         56 => "https://bscscan.com",
         97 => "https://testnet.bscscan.com",
         8453 => "https://basescan.org",
+        84532 => "https://sepolia.basescan.org",
         42220 => "https://celoscan.io",
         4663 => "https://robinhoodchain.blockscout.com",
         _ => return None,
@@ -73,6 +74,10 @@ mod tests {
         assert_eq!(
             address_explorer_url(97, ADDR).as_deref(),
             Some("https://testnet.bscscan.com/address/0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+        );
+        assert_eq!(
+            address_explorer_url(84532, ADDR).as_deref(),
+            Some("https://sepolia.basescan.org/address/0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
         );
     }
 

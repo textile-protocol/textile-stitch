@@ -1,0 +1,63 @@
+# Textile Stitch — cNGN/USDC on Base Sepolia (chain 84532).
+# The wallet key is NOT here; export STITCH_PRIVATE_KEY (or STITCH_PRIVATE_KEY_FILE).
+#
+# Testnet notes:
+#   - Get test tokens: Base Sepolia ETH from any Base faucet
+#     (https://docs.base.org/base-chain/network-information/network-faucets),
+#     USDC from https://faucet.circle.com, cNGN from https://cngn.co/faucet.
+#   - The reactor runs a 5 bps SellFirstFeeController, same as BSC testnet, so
+#     both the maker and taker legs work here.
+#   - Circle's faucet hands out 10 USDC at a time, so the slices below are 1 USDC
+#     rather than the 10 the mainnet preset uses.
+
+chain_id        = 84532                                         # Base Sepolia
+rpc_url         = "https://sepolia.base.org"                    # public Base Sepolia RPC; swap for your own if you have one
+indexer_url     = "https://api.textilecredit.com"               # serves chain 84532; staging is https://api.s1.textilecredit.com
+permit2         = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor         = "0x3a6e177120c72fB8A95546605D4921FaDDFAe4D9"  # SETTLEMENT_V3_FILLER_REACTOR (Base Sepolia)
+tick_interval_secs = 5
+
+# Swap is RFQ. This bot does not rest a public ladder. Connect in the
+# Stitch panel writes [rfq] (maker id, stream URL, credential).
+book_enabled = false
+
+# Textile's own price endpoint. Returns { price, timestamp } where price is
+# debt-per-collateral (USDC per cNGN, e.g. ~0.000728).
+[feed]
+url            = "https://api.textilecredit.com/price?chainId=84532&pair=cngn-usdc"
+staleness_secs = 900
+# cNGN prices off Textile's cron sampler (`/price` restamps once a minute), so
+# a mark is routinely tens of seconds old and a 60s RFQ window would leave the
+# corridor dark between samples. Four sample intervals, so two missed cron
+# ticks still quote.
+rfq_staleness_secs = 240
+
+[[pools]]
+collateral = "0xe2387F04d3858e7Cb64Ef5Ed6617f9B2fcEEAfa2"  # cNGN testnet (soft asset, 6dp)
+collateral_decimals = 6
+debt = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"        # Circle faucet USDC (stable, 6dp)
+debt_decimals = 6
+
+# Buy low: bid below the mid, paying USDC for cNGN. Funds USDC + Permit2 on USDC.
+buy_offset_bps = 1                                # 1 bps below mid
+buy_total_liquidity_debt = "max"                  # quote all funded USDC
+buy_min_slice_debt = "1000000"                    # 1 USDC smallest slice (6dp)
+buy_max_orders = 40
+
+# Sell high: ask above the mid, selling cNGN for USDC. Funds cNGN + Permit2 on cNGN.
+sell_offset_bps = 1                               # 1 bps above mid
+sell_total_liquidity_collateral = "max"           # quote all funded cNGN
+sell_min_slice_debt = "1000000"                   # 1 USDC-equivalent slice (6dp)
+sell_max_orders = 40
+
+ttl_secs = 120
+refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
+
+# Swap quoting. Connect in the Stitch panel writes maker id, stream URL,
+# and rfq-api.key. Leave this block commented until then.
+# [rfq]
+# enabled = false
+# url = "wss://api.textilecredit.com/v2/maker/stream"
+# maker_id = "mk_your_maker_id"
+# api_key_env = "STITCH_RFQ_API_KEY"
+# validation_contract = "0x0000000000000000000000000000000000000000"

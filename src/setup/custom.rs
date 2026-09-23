@@ -41,7 +41,8 @@ const DEFAULT_INDEXER_URL: &str = "https://api.textilecredit.com";
 /// configured for this chain" when the constant is absent, so a bot on a
 /// reactor-less chain would create fine and then fail *every* submission. Keying
 /// on the reactor (not just `getChain`) keeps out chains like Arbitrum and the
-/// Sepolia testnets, which the indexer can reach but has no reactor for.
+/// Ethereum / Celo Sepolia testnets, which the indexer can reach but has no
+/// reactor for.
 ///
 /// Source of truth: `packages/constants/src/addresses.*.json`
 /// (`SETTLEMENT_V3_FILLER_REACTOR`); keep this in sync when a reactor is deployed
@@ -54,6 +55,7 @@ const INDEXER_SUPPORTED_CHAINS: &[u64] = &[
     137,   // Polygon
     4663,  // Robinhood Chain
     8453,  // Base
+    84532, // Base Sepolia
     42220, // Celo
 ];
 
@@ -419,7 +421,7 @@ mod tests {
         // SETTLEMENT_V3_FILLER_REACTOR, so `submitFillerOrder` would reject every
         // order. The allowlist keys on the reactor, not just reachability, so this
         // must be refused.
-        for chain in [42161u64, 11155111, 84532, 11142220] {
+        for chain in [42161u64, 11155111, 11142220] {
             let err = CustomCorridor {
                 chain_id: chain,
                 ..valid()

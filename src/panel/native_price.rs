@@ -87,7 +87,7 @@ pub fn gas_token(chain_id: u64) -> Option<GasToken> {
             fallback_usd: 1000.0,
             tx_gas_usd: 5.0,
         },
-        8453 | 42161 | 4663 => GasToken {
+        8453 | 84532 | 42161 | 4663 => GasToken {
             symbol: "ETH",
             coingecko_id: "ethereum",
             fallback_usd: 1000.0,

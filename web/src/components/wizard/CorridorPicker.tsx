@@ -30,6 +30,7 @@ const CHAIN_DOT: Record<number, string> = {
   56: '#f0b90b',
   97: '#f0b90b',
   8453: '#0052ff',
+  84532: '#0052ff',
   42220: '#fcff52',
   4663: '#00c805',
 }
