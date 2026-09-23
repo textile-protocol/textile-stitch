@@ -110,6 +110,9 @@ pub fn encode_close_redeem_epoch(epoch_id: U256) -> Vec<u8> {
 /// `EpochState.Open` — the only state a close may act on.
 const EPOCH_STATE_OPEN: u64 = 1;
 
+/// `EpochState.Closed` — the only state an attestation can settle.
+const EPOCH_STATE_CLOSED: u64 = 2;
+
 /// The part of an `Epoch` a close decision needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedeemEpochView {
@@ -141,6 +144,12 @@ impl RedeemEpochView {
             opened_at: small(2)?,
             units: U256::from_be_slice(word(6)),
         })
+    }
+
+    /// Whether an attestation for this epoch could settle it now. Deposit and
+    /// redeem epochs share the getter layout, so this holds for both.
+    pub fn is_closed(&self) -> bool {
+        self.state == EPOCH_STATE_CLOSED
     }
 
     /// Whether the bot should close this epoch now: an open redeem epoch with
@@ -347,6 +356,16 @@ mod tests {
         assert!(!view.is_deposit);
         assert_eq!(view.opened_at, 1_790_068_611);
         assert_eq!(view.units, U256::from(3_001_969_853_750_358_079u64));
+        assert!(!view.is_closed(), "an open epoch can't be attested");
+    }
+
+    #[test]
+    fn only_a_closed_epoch_can_be_attested() {
+        let mut raw = hex::decode(LIVE_OPEN_REDEEM_EPOCH).unwrap();
+        raw[31] = 2; // EpochState.Closed
+        assert!(RedeemEpochView::decode(&raw).unwrap().is_closed());
+        raw[31] = 3; // Processed: already settled
+        assert!(!RedeemEpochView::decode(&raw).unwrap().is_closed());
     }
 
     #[test]

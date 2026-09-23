@@ -90,6 +90,35 @@ const SECONDS_PER_YEAR: u128 = 365 * 24 * 60 * 60;
 /// compromised key could set it to zero and buy itself years of "accrual".
 pub const ATTESTATION_IN_FLIGHT_SECS: u128 = 10 * 60;
 
+/// The longest validity window this bot co-signs. Warp's honest attestations
+/// run `attest.max_validity_secs` from the block it read (3600 in the deployed
+/// config), and the vault accepts an attestation at any moment inside its
+/// window. Without a ceiling here, a compromised risk key could get a
+/// co-signature on a window that never ends, hold it, and settle later at a
+/// price that suited it (audit 2026-09-22, attestation-validity-window). If
+/// Warp's ceiling (`MAX_ATTEST_VALIDITY_SECS` in packages/warp/src/config/mod.rs)
+/// is ever raised, raise this with it.
+pub const MAX_ATTESTATION_VALIDITY_SECS: u64 = 60 * 60;
+
+/// Slack for this host's clock against the chain's block timestamps.
+pub const ATTESTATION_CLOCK_SKEW_SECS: u64 = 60;
+
+/// The window must be current and short: already open, not yet over, and
+/// ending no later than [`MAX_ATTESTATION_VALIDITY_SECS`] from now. A window
+/// that opens in the future is refused too, since it would let a signature
+/// made at today's price be used later without ever being long.
+pub fn check_window(att: &NavAttestation, now_secs: u64) -> Result<(), AttestRejectReason> {
+    let now = U256::from(now_secs);
+    let skew = U256::from(ATTESTATION_CLOCK_SKEW_SECS);
+    if att.valid_after > now + skew || att.valid_until <= now {
+        return Err(AttestRejectReason::Window);
+    }
+    if att.valid_until > now + U256::from(MAX_ATTESTATION_VALIDITY_SECS) + skew {
+        return Err(AttestRejectReason::Window);
+    }
+    Ok(())
+}
+
 /// What live settlement may exceed the signed floor by, plus one unit for
 /// rounding: the yield ceiling over the in-flight window.
 pub fn accrual_allowance(live_settlement: U256) -> U256 {
@@ -244,6 +273,63 @@ mod tests {
         assert_eq!(
             nav(U256::from(5u64), U256::from(9u64), U256::ZERO, 6, 18),
             U256::from(5u64)
+        );
+    }
+
+    /// `honest()` runs 1_700_000_000..1_700_003_600, exactly Warp's shape.
+    const SIGNED_AT: u64 = 1_700_000_000;
+
+    fn with_window(after: u64, until: U256) -> NavAttestation {
+        NavAttestation {
+            valid_after: U256::from(after),
+            valid_until: until,
+            ..honest(PRICE)
+        }
+    }
+
+    #[test]
+    fn a_warp_shaped_window_passes_while_it_is_open() {
+        assert_eq!(check_window(&honest(PRICE), SIGNED_AT), Ok(()));
+        assert_eq!(check_window(&honest(PRICE), SIGNED_AT + 3_599), Ok(()));
+        // This host's clock a little behind the chain is fine.
+        assert_eq!(check_window(&honest(PRICE), SIGNED_AT - 30), Ok(()));
+    }
+
+    #[test]
+    fn a_window_that_never_ends_is_refused() {
+        // The banked-attestation shape from the audit: validUntil = 2^256 - 1.
+        let banked = with_window(SIGNED_AT, U256::MAX);
+        assert_eq!(
+            check_window(&banked, SIGNED_AT),
+            Err(AttestRejectReason::Window)
+        );
+        // Just past the ceiling (plus skew) is refused too.
+        let long = with_window(
+            SIGNED_AT,
+            U256::from(SIGNED_AT + MAX_ATTESTATION_VALIDITY_SECS + ATTESTATION_CLOCK_SKEW_SECS + 1),
+        );
+        assert_eq!(
+            check_window(&long, SIGNED_AT),
+            Err(AttestRejectReason::Window)
+        );
+    }
+
+    #[test]
+    fn a_future_dated_window_is_refused() {
+        // Short, but it opens in a year: today's price, usable next year.
+        let year = 365 * 24 * 60 * 60;
+        let later = with_window(SIGNED_AT + year, U256::from(SIGNED_AT + year + 3_600));
+        assert_eq!(
+            check_window(&later, SIGNED_AT),
+            Err(AttestRejectReason::Window)
+        );
+    }
+
+    #[test]
+    fn an_expired_window_is_refused() {
+        assert_eq!(
+            check_window(&honest(PRICE), SIGNED_AT + 3_600),
+            Err(AttestRejectReason::Window)
         );
     }
 

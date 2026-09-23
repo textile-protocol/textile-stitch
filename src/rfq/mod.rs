@@ -56,7 +56,9 @@ use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
 use crate::pricing::tick::{is_price_usable, is_stale};
-use crate::protocol::attest::{check_attestation, price_wad, LiveVault, NavAttestation};
+use crate::protocol::attest::{
+    check_attestation, check_window, price_wad, LiveVault, NavAttestation,
+};
 use crate::protocol::typed_data::{nav_attestation_payload, permit2_payload};
 use crate::signer::DynSigner;
 use crate::time::unix_now;
@@ -1891,6 +1893,18 @@ impl Engine {
         if budget().is_zero() {
             return reject(AttestRejectReason::Busy);
         }
+        // Everything below checks the figures at this moment. A long or
+        // future-dated window would let the risk key use this signature long
+        // after that, so it is refused before any read.
+        if let Err(reason) = check_window(&att, unix_now()) {
+            info!(
+                request_id = %req.request_id,
+                valid_after = %att.valid_after,
+                valid_until = %att.valid_until,
+                "attestation window refused; not co-signing"
+            );
+            return reject(reason);
+        }
 
         // Our own mark for the corridor leg: the book on exactly the vault's
         // pair, oriented the way the attestation prices it (settlement per
@@ -1924,6 +1938,7 @@ impl Engine {
             Call::new(vault, encode_last_settled_nav()),
             Call::new(vault, encode_settlement_decimals()),
             Call::new(vault, encode_corridor_decimals()),
+            Call::new(vault, encode_epochs(att.epoch_id)),
         ];
         let reader = Batcher::sequential();
         let read = tokio::time::timeout(budget(), reader.read(&self.rpc, &calls));
@@ -1953,6 +1968,19 @@ impl Engine {
         else {
             return reject(AttestRejectReason::Busy);
         };
+        // Warp only attests closed epochs; the strategy key holds itself to the
+        // same rule rather than signing for an epoch that is still taking requests.
+        let Some(epoch) = words
+            .get(5)
+            .and_then(|o| o.as_ref())
+            .and_then(|raw| RedeemEpochView::decode(raw.as_ref()))
+        else {
+            return reject(AttestRejectReason::Busy);
+        };
+        if !epoch.is_closed() {
+            info!(request_id = %req.request_id, epoch = %req.epoch_id, state = epoch.state, "epoch not closed; not co-signing");
+            return reject(AttestRejectReason::NotClosed);
+        }
         let live = LiveVault {
             free_settlement,
             free_corridor,

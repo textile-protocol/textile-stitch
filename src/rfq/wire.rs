@@ -350,6 +350,11 @@ pub enum AttestRejectReason {
     Figures,
     /// Could not read the chain in time.
     Busy,
+    /// The validity window is not a short, current one: it opens in the
+    /// future, has already ended, or runs longer than the bot will sign for.
+    Window,
+    /// The epoch is not closed on chain, so it cannot be settled yet.
+    NotClosed,
 }
 
 #[cfg(test)]
