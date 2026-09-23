@@ -159,41 +159,49 @@ pub fn permit2_digest(o: &OrderParams, permit2: Address, chain_id: u64) -> B256 
     keccak256(&buf)
 }
 
-// --- Maker session auth (the RFQ venue's WebSocket challenge) ---
+// --- OperatorVault NAV attestation ---
 
-/// The venue's session domain has NO chainId or verifyingContract — the
-/// signature authenticates a maker to an off-chain stream, not to a contract,
-/// and the LIVE/TEST split rides on the domain *name* the venue sends.
-/// `VaultLib.attestationDigest`: domain `OperatorVault` / `1` / chainId /
+/// `VaultLib.attestationDigest`: domain `OperatorVault` / version / chainId /
 /// the vault itself, so nothing signed for one vault means anything on
-/// another. Both vault signers sign this same digest.
+/// another. Both vault signers sign this same digest. Version `2` vaults hash
+/// nine fields; version `1` vaults, still deployed, hash `nav` as well (see
+/// [`NavAttestation`] for how the version is picked).
 const ATTESTATION_DOMAIN_TYPE: &str =
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
 const ATTESTATION_NAME: &str = "OperatorVault";
-const ATTESTATION_VERSION: &str = "1";
-const NAV_ATTESTATION_TYPE: &str = "NavAttestation(address vault,uint256 chainId,uint256 epochId,uint256 corridorAssetPrice,uint256 nav,uint256 lastSettledNav,uint256 freeSettlement,uint256 freeCorridor,uint256 validAfter,uint256 validUntil)";
+const NAV_ATTESTATION_TYPE: &str = "NavAttestation(address vault,uint256 chainId,uint256 epochId,uint256 corridorAssetPrice,uint256 lastSettledNav,uint256 freeSettlement,uint256 freeCorridor,uint256 validAfter,uint256 validUntil)";
+const NAV_ATTESTATION_V1_TYPE: &str = "NavAttestation(address vault,uint256 chainId,uint256 epochId,uint256 corridorAssetPrice,uint256 nav,uint256 lastSettledNav,uint256 freeSettlement,uint256 freeCorridor,uint256 validAfter,uint256 validUntil)";
 
 pub fn nav_attestation_digest(a: &NavAttestation) -> B256 {
     let domain = hash_words(&[
         b256_word(k(ATTESTATION_DOMAIN_TYPE)),
         b256_word(k(ATTESTATION_NAME)),
-        b256_word(k(ATTESTATION_VERSION)),
+        b256_word(k(a.version())),
         u256_word(a.chain_id),
         addr_word(a.vault),
     ]);
-    let struct_hash = hash_words(&[
-        b256_word(k(NAV_ATTESTATION_TYPE)),
+    let type_string = match a.nav {
+        Some(_) => NAV_ATTESTATION_V1_TYPE,
+        None => NAV_ATTESTATION_TYPE,
+    };
+    let words: Vec<[u8; 32]> = [
+        b256_word(k(type_string)),
         addr_word(a.vault),
         u256_word(a.chain_id),
         u256_word(a.epoch_id),
         u256_word(a.corridor_asset_price),
-        u256_word(a.nav),
+    ]
+    .into_iter()
+    .chain(a.nav.map(u256_word))
+    .chain([
         u256_word(a.last_settled_nav),
         u256_word(a.free_settlement),
         u256_word(a.free_corridor),
         u256_word(a.valid_after),
         u256_word(a.valid_until),
-    ]);
+    ])
+    .collect();
+    let struct_hash = hash_words(&words);
     let mut buf = Vec::with_capacity(66);
     buf.extend_from_slice(&[0x19, 0x01]);
     buf.extend_from_slice(&domain.0);
@@ -201,6 +209,11 @@ pub fn nav_attestation_digest(a: &NavAttestation) -> B256 {
     keccak256(&buf)
 }
 
+// --- Maker session auth (the RFQ venue's WebSocket challenge) ---
+
+/// The venue's session domain has NO chainId or verifyingContract — the
+/// signature authenticates a maker to an off-chain stream, not to a contract,
+/// and the LIVE/TEST split rides on the domain *name* the venue sends.
 const SESSION_DOMAIN_TYPE: &str = "EIP712Domain(string name,string version)";
 const MAKER_SESSION_TYPE: &str =
     "MakerSession(string makerId,address signingAddress,bytes32 challenge,uint256 issuedAt)";

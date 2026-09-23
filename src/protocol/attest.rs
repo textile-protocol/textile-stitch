@@ -32,13 +32,22 @@ pub struct LiveVault {
 }
 
 /// Decoded `NavAttestation`, field for field the struct the vault hashes.
+///
+/// Two versions are live. Vaults built before the struct dropped `nav` hash
+/// ten fields under domain version `1`; newer ones derive NAV from the floors
+/// and the price, and hash the other nine under version `2`. `nav` being set
+/// is what says which, and the venue sends it only for the older vaults.
+/// Nothing here reads the chain to confirm the version: a signature over the
+/// wrong one is worthless rather than dangerous, since the vault hashes its
+/// own domain and struct and simply rejects it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavAttestation {
     pub vault: Address,
     pub chain_id: U256,
     pub epoch_id: U256,
     pub corridor_asset_price: U256,
-    pub nav: U256,
+    /// Version `1` only. `None` is a version `2` attestation.
+    pub nav: Option<U256>,
     pub last_settled_nav: U256,
     pub free_settlement: U256,
     pub free_corridor: U256,
@@ -57,13 +66,40 @@ impl NavAttestation {
             chain_id: u(&w.chain_id)?,
             epoch_id: u(&w.epoch_id)?,
             corridor_asset_price: u(&w.corridor_asset_price)?,
-            nav: u(&w.nav)?,
+            nav: w.nav.as_deref().map(u).transpose()?,
             last_settled_nav: u(&w.last_settled_nav)?,
             free_settlement: u(&w.free_settlement)?,
             free_corridor: u(&w.free_corridor)?,
             valid_after: u(&w.valid_after)?,
             valid_until: u(&w.valid_until)?,
         })
+    }
+
+    /// The EIP-712 domain version of the vault this attestation is for.
+    pub fn version(&self) -> &'static str {
+        if self.nav.is_some() {
+            "1"
+        } else {
+            "2"
+        }
+    }
+
+    /// What the signed floors are worth at the signed price: the NAV a
+    /// version `2` vault derives, and the one a version `1` attestation must
+    /// carry.
+    pub fn derived_nav(&self, live: &LiveVault) -> U256 {
+        nav(
+            self.free_settlement,
+            self.free_corridor,
+            self.corridor_asset_price,
+            live.settlement_decimals,
+            live.corridor_decimals,
+        )
+    }
+
+    /// The attested NAV, or the derived one where the struct has none. For logs.
+    pub fn nav_or_derived(&self, live: &LiveVault) -> U256 {
+        self.nav.unwrap_or_else(|| self.derived_nav(live))
     }
 }
 
@@ -186,9 +222,10 @@ fn abs_diff(a: U256, b: U256) -> U256 {
 /// the corridor floor exactly (nothing moves them between Warp's read and
 /// ours except a fill, which the vault rejects anyway), and the settlement
 /// floor within what the yield adapter could have accrued while the
-/// attestation was in flight. The signed NAV must be what those floors are worth at the
-/// signed price, and the price must sit near the bot's own mark; the chain
-/// has no price to check it against.
+/// attestation was in flight. A version `1` attestation's signed NAV must be
+/// what those floors are worth at the signed price (a version `2` vault
+/// derives it the same way, so there is nothing to check), and the price must
+/// sit near the bot's own mark; the chain has no price to check it against.
 pub fn check_attestation(
     att: &NavAttestation,
     live: &LiveVault,
@@ -202,14 +239,10 @@ pub fn check_attestation(
     {
         return Err(AttestRejectReason::Figures);
     }
-    let signed_nav = nav(
-        att.free_settlement,
-        att.free_corridor,
-        att.corridor_asset_price,
-        live.settlement_decimals,
-        live.corridor_decimals,
-    );
-    if att.nav != signed_nav {
+    if att
+        .nav
+        .is_some_and(|signed| signed != att.derived_nav(live))
+    {
         return Err(AttestRejectReason::Figures);
     }
     if abs_diff(att.corridor_asset_price, own_price_wad) > bps_of(own_price_wad, MAX_PRICE_GAP_BPS)
@@ -241,7 +274,7 @@ mod tests {
             chain_id: U256::from(8453u64),
             epoch_id: U256::from(7u64),
             corridor_asset_price: price,
-            nav: nav(l.free_settlement, l.free_corridor, price, 6, 18),
+            nav: Some(nav(l.free_settlement, l.free_corridor, price, 6, 18)),
             last_settled_nav: l.last_settled_nav,
             free_settlement: l.free_settlement,
             free_corridor: l.free_corridor,
@@ -342,7 +375,7 @@ mod tests {
     fn a_marked_down_attestation_is_refused() {
         // The zero attestation the vault alone would accept.
         let mut att = honest(PRICE);
-        att.nav = U256::ZERO;
+        att.nav = Some(U256::ZERO);
         att.free_settlement = U256::ZERO;
         att.free_corridor = U256::ZERO;
         assert_eq!(
@@ -354,14 +387,14 @@ mod tests {
         let l = live();
         let mut att = honest(PRICE);
         att.free_settlement = l.free_settlement * U256::from(9_950u64) / U256::from(10_000u64);
-        att.nav = nav(att.free_settlement, att.free_corridor, PRICE, 6, 18);
+        att.nav = Some(nav(att.free_settlement, att.free_corridor, PRICE, 6, 18));
         assert_eq!(
             check_attestation(&att, &live(), PRICE),
             Err(AttestRejectReason::Figures)
         );
         let mut att = honest(PRICE);
         att.free_corridor -= U256::from(1u64);
-        att.nav = nav(att.free_settlement, att.free_corridor, PRICE, 6, 18);
+        att.nav = Some(nav(att.free_settlement, att.free_corridor, PRICE, 6, 18));
         assert_eq!(
             check_attestation(&att, &live(), PRICE),
             Err(AttestRejectReason::Figures)
@@ -389,7 +422,7 @@ mod tests {
         let mut att = honest(PRICE);
         att.valid_after = U256::ZERO;
         att.free_settlement = U256::ZERO;
-        att.nav = nav(att.free_settlement, att.free_corridor, PRICE, 6, 18);
+        att.nav = Some(nav(att.free_settlement, att.free_corridor, PRICE, 6, 18));
         assert_eq!(
             check_attestation(&att, &live(), PRICE),
             Err(AttestRejectReason::Figures)
@@ -400,7 +433,7 @@ mod tests {
     fn floors_above_live_or_a_stale_replay_guard_are_refused() {
         let mut att = honest(PRICE);
         att.free_corridor += U256::from(1u64);
-        att.nav = nav(att.free_settlement, att.free_corridor, PRICE, 6, 18);
+        att.nav = Some(nav(att.free_settlement, att.free_corridor, PRICE, 6, 18));
         assert_eq!(
             check_attestation(&att, &live(), PRICE),
             Err(AttestRejectReason::Figures)
@@ -416,10 +449,62 @@ mod tests {
     #[test]
     fn a_nav_that_disagrees_with_its_own_floors_is_refused() {
         let mut att = honest(PRICE);
-        att.nav -= U256::from(1u64);
+        att.nav = att.nav.map(|n| n - U256::from(1u64));
         assert_eq!(
             check_attestation(&att, &live(), PRICE),
             Err(AttestRejectReason::Figures)
+        );
+    }
+
+    /// A version `2` vault derives NAV itself, so its attestation has none.
+    fn honest_v2(price: U256) -> NavAttestation {
+        NavAttestation {
+            nav: None,
+            ..honest(price)
+        }
+    }
+
+    #[test]
+    fn the_version_follows_whether_nav_is_there() {
+        assert_eq!(honest(PRICE).version(), "1");
+        assert_eq!(honest_v2(PRICE).version(), "2");
+    }
+
+    #[test]
+    fn a_v2_attestation_passes_without_a_nav() {
+        assert_eq!(check_attestation(&honest_v2(PRICE), &live(), PRICE), Ok(()));
+        assert_eq!(
+            honest_v2(PRICE).nav_or_derived(&live()),
+            U256::from(16_000_000u64)
+        );
+    }
+
+    #[test]
+    fn a_v2_attestation_gets_every_other_check() {
+        let mut att = honest_v2(PRICE);
+        att.free_settlement = U256::ZERO;
+        att.free_corridor = U256::ZERO;
+        assert_eq!(
+            check_attestation(&att, &live(), PRICE),
+            Err(AttestRejectReason::Figures)
+        );
+        let mut att = honest_v2(PRICE);
+        att.last_settled_nav += U256::from(1u64);
+        assert_eq!(
+            check_attestation(&att, &live(), PRICE),
+            Err(AttestRejectReason::Figures)
+        );
+        assert_eq!(
+            check_attestation(&honest_v2(PRICE), &live(), price_wad(1.5 * 1.02)),
+            Err(AttestRejectReason::Price)
+        );
+        let banked = NavAttestation {
+            valid_until: U256::MAX,
+            ..honest_v2(PRICE)
+        };
+        assert_eq!(
+            check_window(&banked, SIGNED_AT),
+            Err(AttestRejectReason::Window)
         );
     }
 
@@ -444,7 +529,7 @@ mod tests {
             chain_id: "8453".into(),
             epoch_id: "7".into(),
             corridor_asset_price: "1500000000000000000".into(),
-            nav: "16000000".into(),
+            nav: Some("16000000".into()),
             last_settled_nav: "12345".into(),
             free_settlement: "10000000".into(),
             free_corridor: "4000000000000000000".into(),
@@ -453,7 +538,9 @@ mod tests {
         };
         assert_eq!(NavAttestation::parse(&w).unwrap(), honest(PRICE));
         let mut bad = w.clone();
-        bad.nav = "sixteen".into();
+        bad.nav = Some("sixteen".into());
         assert!(NavAttestation::parse(&bad).is_err());
+        let v2 = NavAttestationWire { nav: None, ..w };
+        assert_eq!(NavAttestation::parse(&v2).unwrap(), honest_v2(PRICE));
     }
 }

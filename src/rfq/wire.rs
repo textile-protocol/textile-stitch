@@ -242,6 +242,9 @@ pub enum RejectReason {
 
 /// `NavAttestation` as the venue sends it: address as-is, every uint a
 /// decimal string. Mirrors `serializeNavAttestation` on the venue.
+///
+/// `nav` is there only for vaults built before the struct dropped it (domain
+/// version `1`); newer vaults derive it themselves and the venue leaves it out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NavAttestationWire {
@@ -249,7 +252,8 @@ pub struct NavAttestationWire {
     pub chain_id: String,
     pub epoch_id: String,
     pub corridor_asset_price: String,
-    pub nav: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nav: Option<String>,
     pub last_settled_nav: String,
     pub free_settlement: String,
     pub free_corridor: String,
@@ -549,6 +553,18 @@ mod tests {
         };
         assert_eq!(req.request_id, "att_1");
         assert_eq!(req.attestation.free_corridor, "4000000000000000000");
+        assert_eq!(req.attestation.nav.as_deref(), Some("16000000"));
+
+        // A v2 vault's attestation has no `nav`. It must still parse: a frame
+        // that fails to parse is dropped without a reply.
+        let v2 = json.replace(r#""nav": "16000000","#, "");
+        assert_ne!(v2, json);
+        let frame: VenueFrame = serde_json::from_str(&v2).unwrap();
+        let VenueFrame::AttestRequest(req) = &frame else {
+            panic!("wrong variant: {frame:?}");
+        };
+        assert_eq!(req.attestation.nav, None);
+        assert_eq!(req.attestation.last_settled_nav, "12345");
 
         let reject = MakerFrame::AttestReject(AttestRejectFrame {
             request_id: "att_1".into(),

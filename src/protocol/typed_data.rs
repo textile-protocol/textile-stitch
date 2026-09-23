@@ -397,17 +397,10 @@ fn maker_enroll_typed_data(
     })
 }
 
-/// A throwaway payload for proving a signer works, used by the panel's Verify
-/// button and nothing else.
-///
-/// It signs under its own domain (`Stitch Signer Check`) with its own struct, so
-/// the resulting signature authorises nothing: no contract verifies it and the
-/// venue does not know the domain. That matters because Verify is offered before
-/// the operator has committed to anything — it must not be a way to extract a
-/// signature that means something elsewhere.
 /// Typed data for countersigning a vault NAV attestation: the exact struct
-/// the risk signer signed, under the vault's own domain. See
-/// `protocol::attest` for what the bot checks before it signs this.
+/// the risk signer signed, under the vault's own domain. Version `1` or `2`
+/// per [`NavAttestation::version`]: types, domain and message all follow it.
+/// See `protocol::attest` for what the bot checks before it signs this.
 pub fn nav_attestation_payload(att: &NavAttestation) -> Eip712Payload {
     Eip712Payload {
         digest: nav_attestation_digest(att),
@@ -416,6 +409,37 @@ pub fn nav_attestation_payload(att: &NavAttestation) -> Eip712Payload {
 }
 
 fn nav_attestation_typed_data(a: &NavAttestation) -> Value {
+    let nav_field = a.nav.map(|_| field("nav", "uint256"));
+    let fields: Vec<Value> = [
+        field("vault", "address"),
+        field("chainId", "uint256"),
+        field("epochId", "uint256"),
+        field("corridorAssetPrice", "uint256"),
+    ]
+    .into_iter()
+    .chain(nav_field)
+    .chain([
+        field("lastSettledNav", "uint256"),
+        field("freeSettlement", "uint256"),
+        field("freeCorridor", "uint256"),
+        field("validAfter", "uint256"),
+        field("validUntil", "uint256"),
+    ])
+    .collect();
+    let mut message = json!({
+        "vault": addr(a.vault),
+        "chainId": uint(a.chain_id),
+        "epochId": uint(a.epoch_id),
+        "corridorAssetPrice": uint(a.corridor_asset_price),
+        "lastSettledNav": uint(a.last_settled_nav),
+        "freeSettlement": uint(a.free_settlement),
+        "freeCorridor": uint(a.free_corridor),
+        "validAfter": uint(a.valid_after),
+        "validUntil": uint(a.valid_until),
+    });
+    if let Some(nav) = a.nav {
+        message["nav"] = uint(nav);
+    }
     json!({
         "types": {
             "EIP712Domain": [
@@ -424,41 +448,27 @@ fn nav_attestation_typed_data(a: &NavAttestation) -> Value {
                 field("chainId", "uint256"),
                 field("verifyingContract", "address"),
             ],
-            "NavAttestation": [
-                field("vault", "address"),
-                field("chainId", "uint256"),
-                field("epochId", "uint256"),
-                field("corridorAssetPrice", "uint256"),
-                field("nav", "uint256"),
-                field("lastSettledNav", "uint256"),
-                field("freeSettlement", "uint256"),
-                field("freeCorridor", "uint256"),
-                field("validAfter", "uint256"),
-                field("validUntil", "uint256"),
-            ],
+            "NavAttestation": fields,
         },
         "primaryType": "NavAttestation",
         "domain": {
             "name": "OperatorVault",
-            "version": "1",
+            "version": a.version(),
             "chainId": uint(a.chain_id),
             "verifyingContract": addr(a.vault),
         },
-        "message": {
-            "vault": addr(a.vault),
-            "chainId": uint(a.chain_id),
-            "epochId": uint(a.epoch_id),
-            "corridorAssetPrice": uint(a.corridor_asset_price),
-            "nav": uint(a.nav),
-            "lastSettledNav": uint(a.last_settled_nav),
-            "freeSettlement": uint(a.free_settlement),
-            "freeCorridor": uint(a.free_corridor),
-            "validAfter": uint(a.valid_after),
-            "validUntil": uint(a.valid_until),
-        },
+        "message": message,
     })
 }
 
+/// A throwaway payload for proving a signer works, used by the panel's Verify
+/// button and nothing else.
+///
+/// It signs under its own domain (`Stitch Signer Check`) with its own struct, so
+/// the resulting signature authorises nothing: no contract verifies it and the
+/// venue does not know the domain. That matters because Verify is offered before
+/// the operator has committed to anything — it must not be a way to extract a
+/// signature that means something elsewhere.
 pub fn signer_check_payload(nonce: B256) -> Eip712Payload {
     Eip712Payload {
         digest: signer_check_digest(nonce),
@@ -653,7 +663,7 @@ mod tests {
             chain_id: U256::from(8453u64),
             epoch_id: U256::from(7u64),
             corridor_asset_price: U256::from(1_500_000_000_000_000_000u128),
-            nav: U256::from(16_000_000u64),
+            nav: Some(U256::from(16_000_000u64)),
             last_settled_nav: U256::from(12_345u64),
             free_settlement: U256::from(10_000_000u64),
             free_corridor: U256::from(4_000_000_000_000_000_000u128),
@@ -664,6 +674,51 @@ mod tests {
         let payload = nav_attestation_payload(&att);
         assert_eq!(payload.digest(), expected);
         assert_eq!(digest_of(&payload.typed_data()), expected);
+    }
+
+    fn golden_attestation(nav: Option<U256>) -> NavAttestation {
+        NavAttestation {
+            vault: address!("2222222222222222222222222222222222222222"),
+            chain_id: U256::from(31337u64),
+            epoch_id: U256::from(7u64),
+            corridor_asset_price: U256::from(2_000_000_000_000_000_000u128),
+            nav,
+            last_settled_nav: U256::from(12_345u64),
+            free_settlement: U256::from(10_000_000u64),
+            free_corridor: U256::from(3_000_000u64),
+            valid_after: U256::from(1_699_999_940u64),
+            valid_until: U256::from(1_700_003_600u64),
+        }
+    }
+
+    /// Both struct versions, pinned to viem `hashTypedData` over the same
+    /// figures: version `2` without `nav`, version `1` with it.
+    #[test]
+    fn nav_attestation_digest_follows_the_vault_version() {
+        let cases = [
+            (
+                None,
+                "2",
+                b256!("1565411125af749a35a4e0f4e6c71ddf116ab76b1cbd72787e6cad74fa4e7cef"),
+            ),
+            (
+                Some(U256::from(16_000_000u64)),
+                "1",
+                b256!("5d2043bf33a542b4d043fa14ab217e88311779968bb04325946c7adcefa0709f"),
+            ),
+        ];
+        for (nav, version, expected) in cases {
+            let payload = nav_attestation_payload(&golden_attestation(nav));
+            let td = payload.typed_data();
+            assert_eq!(td["domain"]["version"], version);
+            assert_eq!(td["message"].get("nav").is_some(), nav.is_some());
+            assert_eq!(
+                td["types"]["NavAttestation"].as_array().unwrap().len(),
+                if nav.is_some() { 10 } else { 9 }
+            );
+            assert_eq!(payload.digest(), expected, "digest, version {version}");
+            assert_eq!(digest_of(&td), expected, "typed data, version {version}");
+        }
     }
 
     #[test]

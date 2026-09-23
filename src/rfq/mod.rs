@@ -1993,7 +1993,8 @@ impl Engine {
                 request_id = %req.request_id,
                 epoch = %req.epoch_id,
                 ?reason,
-                attested_nav = %att.nav,
+                version = att.version(),
+                nav = %att.nav_or_derived(&live),
                 attested_price = %att.corridor_asset_price,
                 own_price = quote.price,
                 "refused to co-sign attestation"
@@ -2017,7 +2018,13 @@ impl Engine {
                 return reject(AttestRejectReason::Busy);
             }
         };
-        info!(request_id = %req.request_id, epoch = %req.epoch_id, nav = %att.nav, "co-signed attestation");
+        info!(
+            request_id = %req.request_id,
+            epoch = %req.epoch_id,
+            version = att.version(),
+            nav = %att.nav_or_derived(&live),
+            "co-signed attestation"
+        );
         MakerFrame::AttestResponse(AttestResponseFrame {
             request_id: req.request_id,
             signature: alloy_primitives::hex::encode_prefixed(signature),
@@ -3042,7 +3049,7 @@ mod tests {
                 chain_id: chain_id.to_string(),
                 epoch_id: "7".into(),
                 corridor_asset_price: "1500000000000000000".into(),
-                nav: "16000000".into(),
+                nav: Some("16000000".into()),
                 last_settled_nav: "12345".into(),
                 free_settlement: "10000000".into(),
                 free_corridor: "4000000000000000000".into(),
