@@ -275,7 +275,8 @@ async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow:
     }
     let signer = build_signer(&cfg).await?;
     let permit2: Address = cfg.permit2.parse().context("invalid permit2 address")?;
-    let wallet = Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id);
+    let wallet =
+        Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id).with_gas_caps(cfg.gas_caps());
     let mode = if exact {
         ApprovalMode::Exact
     } else {
@@ -314,7 +315,8 @@ async fn run_withdraw(
             .with_context(|| format!("reading config {config_path}"))?,
     )?;
     let signer = build_signer(&cfg).await?;
-    let wallet = Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id);
+    let wallet =
+        Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id).with_gas_caps(cfg.gas_caps());
     let plan =
         stitch_bot::chain::withdraw::plan_withdraw(&cfg, &wallet, &token, &amount, &to).await?;
     let hash = stitch_bot::chain::withdraw::send_withdraw(&wallet, &plan).await?;
@@ -561,7 +563,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
 
     // Blue-leg I/O: a signing wallet (pays gas, sends fill()) and the subgraph
     // discoverer. The discoverer is only built when a subgraph is configured.
-    let wallet = Wallet::new(cfg.rpc_url.clone(), signer.clone(), cfg.chain_id);
+    let wallet = Wallet::new(cfg.rpc_url.clone(), signer.clone(), cfg.chain_id)
+        .with_gas_caps(cfg.gas_caps());
 
     // Preflight: a maker can't fill orders it hasn't approved Permit2 to pull,
     // so block a live start on a missing approval (orders would post but

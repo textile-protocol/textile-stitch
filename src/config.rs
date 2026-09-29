@@ -88,7 +88,25 @@ pub struct Config {
     /// off — vault makers do not rest on the book.
     #[serde(default)]
     pub vault: Option<VaultConfig>,
+    /// Ceilings on what one transaction may bid. Omit for the chain's
+    /// built-in ones ([`crate::chain::gas_caps::GasCaps::for_chain`]).
+    #[serde(default)]
+    pub gas: Option<GasConfig>,
     pub pools: Vec<PoolConfig>,
+}
+
+/// The `[gas]` block. Each key replaces one built-in ceiling; a missing key
+/// keeps the chain's default. A send whose node-suggested fees go over a
+/// ceiling is refused, and a stuck send stops bumping at it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GasConfig {
+    /// Highest `max_fee_per_gas` (and tip), in gwei.
+    #[serde(default)]
+    pub max_fee_per_gas_gwei: Option<f64>,
+    /// Most a single transaction may cost at its gas limit, in whole units of
+    /// the chain's gas token (ETH, BNB, CELO, ...).
+    #[serde(default)]
+    pub max_tx_fee: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -439,6 +457,17 @@ fn assert_feed_url_with(raw: &str, field: &str, allow_cleartext: bool) -> anyhow
 /// positions the closer sees, so cleartext is loopback-only here too.
 pub fn assert_subgraph_url(raw: &str, field: &str) -> anyhow::Result<()> {
     assert_feed_url(raw, field)
+}
+
+/// A `[gas]` ceiling, when set, is a positive finite number. Zero or negative
+/// would refuse every send, which is what stopping the bot is for.
+fn assert_gas_ceiling(value: Option<f64>, field: &str) -> anyhow::Result<()> {
+    match value {
+        Some(v) if !(v.is_finite() && v > 0.0) => {
+            anyhow::bail!("{field} must be a positive number, got {v}")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Predicate form of [`assert_subgraph_url`], for the Start guards.
@@ -1027,6 +1056,14 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The gas ceilings every wallet this config builds signs under: the
+    /// chain's built-in ones, with any `[gas]` keys applied.
+    pub fn gas_caps(&self) -> crate::chain::gas_caps::GasCaps {
+        let gas = self.gas.clone().unwrap_or_default();
+        crate::chain::gas_caps::GasCaps::for_chain(self.chain_id)
+            .with_overrides(gas.max_fee_per_gas_gwei, gas.max_tx_fee)
+    }
+
     /// True when the RFQ responder should run: the master switch is on and
     /// there is at least one pool to quote. The public ladder is a separate
     /// switch ([`Self::book_enabled`]).
@@ -1102,6 +1139,10 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         assert_feed_url(&self.feed.url, "[feed].url")?;
+        if let Some(gas) = &self.gas {
+            assert_gas_ceiling(gas.max_fee_per_gas_gwei, "[gas].max_fee_per_gas_gwei")?;
+            assert_gas_ceiling(gas.max_tx_fee, "[gas].max_tx_fee")?;
+        }
         // `Discoverer::new` takes this string as-is and validates nothing, so a
         // typo'd endpoint only surfaces as a failed send on every closer tick —
         // a leg that silently never trades. Catch it at load instead.
@@ -3032,5 +3073,28 @@ mod tests {
     fn the_docker_override_stays_shut_for_a_compose_host() {
         assert!(assert_rfq_stream_url_with("ws://app:10000/v2/maker/stream", false).is_err());
         assert!(assert_feed_url_with("http://app:8916/api/price", "[feed].url", false).is_err());
+    }
+
+    #[test]
+    fn gas_ceilings_default_to_the_chain_and_take_gas_overrides() {
+        use crate::chain::gas_caps::GasCaps;
+        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert_eq!(cfg.gas_caps(), GasCaps::for_chain(1));
+
+        let cfg =
+            Config::from_toml(&format!("{LEAN_POOL_BASE}\n[gas]\nmax_tx_fee = 0.5\n")).unwrap();
+        assert_eq!(
+            cfg.gas_caps(),
+            GasCaps::for_chain(1).with_overrides(None, Some(0.5))
+        );
+    }
+
+    #[test]
+    fn a_gas_ceiling_that_would_refuse_every_send_is_rejected() {
+        for bad in ["0", "-1.0", "nan"] {
+            let toml = format!("{LEAN_POOL_BASE}\n[gas]\nmax_fee_per_gas_gwei = {bad}\n");
+            let err = Config::from_toml(&toml).expect_err(bad);
+            assert!(err.to_string().contains("max_fee_per_gas_gwei"), "{err}");
+        }
     }
 }

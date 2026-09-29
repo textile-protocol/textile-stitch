@@ -18,40 +18,35 @@ if [ -n "${STITCH_CONFIG_TOML:-}" ]; then
   unset STITCH_CONFIG_TOML
 fi
 
-if [ -n "${STITCH_PRIVATE_KEY:-}" ]; then
-  printf '%s\n' "${STITCH_PRIVATE_KEY}" > "${key_path}"
-  export STITCH_PRIVATE_KEY_FILE="${key_path}"
-  unset STITCH_PRIVATE_KEY
-fi
+# file_secret VAR FILE_VAR PATH: if VAR is set, write it to PATH (0600 via the
+# umask above), export FILE_VAR=PATH and unset VAR, so the secret is not in the
+# exec'd environment that `docker inspect`, Docker's on-disk container config
+# and /proc all expose. Unset or empty VAR means the operator mounted the file
+# instead; leave everything alone.
+file_secret() {
+  eval "secret_value=\${$1:-}"
+  if [ -n "${secret_value}" ]; then
+    printf '%s\n' "${secret_value}" > "$3"
+    export "$2=$3"
+    unset "$1"
+  fi
+  unset secret_value
+}
 
-# The maker credential from `stitch connect`. A new bot quotes Swap over RFQ and
-# rests no public ladder, so without this it starts and serves nothing. Filed the
-# same way as the wallet key rather than left in the environment, which
-# `docker inspect` and /proc expose. Only the default `[rfq].api_key_env` name is
-# handled here; a custom one is the operator's to pass.
-if [ -n "${STITCH_RFQ_API_KEY:-}" ]; then
-  rfq_key_path="${runtime_dir}/rfq-api.key"
-  printf '%s\n' "${STITCH_RFQ_API_KEY}" > "${rfq_key_path}"
-  export STITCH_RFQ_API_KEY_FILE="${rfq_key_path}"
-  unset STITCH_RFQ_API_KEY
-fi
-
-# MPC-wallet credentials (only one signer is used at a time; whichever the
-# config selects). Each secret env var, if present, is written to a 0600 file and
-# the matching *_FILE var is exported, same as the local key above. The Turnkey
-# public key is not secret, so it stays a plain env var.
-if [ -n "${TURNKEY_API_PRIVATE_KEY:-}" ]; then
-  turnkey_key_path="${runtime_dir}/turnkey-api.key"
-  printf '%s\n' "${TURNKEY_API_PRIVATE_KEY}" > "${turnkey_key_path}"
-  export TURNKEY_API_PRIVATE_KEY_FILE="${turnkey_key_path}"
-  unset TURNKEY_API_PRIVATE_KEY
-fi
-
-if [ -n "${MPCVAULT_API_TOKEN:-}" ]; then
-  mpcvault_token_path="${runtime_dir}/mpcvault-api.token"
-  printf '%s\n' "${MPCVAULT_API_TOKEN}" > "${mpcvault_token_path}"
-  export MPCVAULT_API_TOKEN_FILE="${mpcvault_token_path}"
-  unset MPCVAULT_API_TOKEN
-fi
+# Every secret the bot reads from the environment. Only one signer backend is
+# used at a time (whichever the config selects), but all of them are filed so
+# a stray one doesn't ride along. File names match what the panel provisions
+# (src/panel/provision.rs). A new secret env var belongs in this list, and in
+# tests/container_entrypoint.rs.
+#
+# STITCH_RFQ_API_KEY is the maker credential from `stitch connect`. Only the
+# default `[rfq].api_key_env` name is handled; a custom one is the operator's
+# to pass. The Turnkey API public key and FIREBLOCKS_API_KEY are identifiers,
+# not secrets, so they stay plain env vars.
+file_secret STITCH_PRIVATE_KEY STITCH_PRIVATE_KEY_FILE "${key_path}"
+file_secret STITCH_RFQ_API_KEY STITCH_RFQ_API_KEY_FILE "${runtime_dir}/rfq-api.key"
+file_secret TURNKEY_API_PRIVATE_KEY TURNKEY_API_PRIVATE_KEY_FILE "${runtime_dir}/turnkey-api.key"
+file_secret MPCVAULT_API_TOKEN MPCVAULT_API_TOKEN_FILE "${runtime_dir}/mpcvault-api.token"
+file_secret FIREBLOCKS_API_PRIVATE_KEY FIREBLOCKS_API_PRIVATE_KEY_FILE "${runtime_dir}/fireblocks-api.key"
 
 exec "$@"

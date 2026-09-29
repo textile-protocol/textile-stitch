@@ -50,6 +50,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::book::taker::encode_order_bytes;
+use crate::chain::gas_caps::GasCaps;
 use crate::chain::multicall::{decode_uint, Batcher, Call};
 use crate::chain::rpc::{transaction_may_still_land, Rpc, Wallet};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
@@ -107,6 +108,8 @@ pub struct RfqRuntime {
     reactor: Address,
     validation_contract: Address,
     rpc_url: String,
+    /// `[gas]` ceilings for every wallet the responder builds.
+    gas_caps: GasCaps,
     books: Vec<CorridorBook>,
     signer: DynSigner,
     /// `rfq-reservations.json` next to stitch.toml. None only when the process
@@ -379,6 +382,7 @@ fn build_runtime(
             .parse()
             .context("invalid [rfq].validation_contract")?,
         rpc_url: cfg.rpc_url.clone(),
+        gas_caps: cfg.gas_caps(),
         books,
         signer,
         reservations_path: config_dir.map(|dir| dir.join(RESERVATIONS_FILE)),
@@ -556,7 +560,8 @@ async fn run(rt: RfqRuntime) {
     let inventory = InventoryCache::default();
     let tokens = wallet_tokens(&rt.books);
     if !tokens.is_empty() || rt.vault.is_some() {
-        let wallet = Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id);
+        let wallet =
+            Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id).with_gas_caps(rt.gas_caps);
         tokio::spawn(inventory_loop(
             wallet,
             rt.permit2,
@@ -1069,6 +1074,7 @@ async fn session_loop_inner(
         nonce_salt: rand::random(),
         rpc: Rpc::new(&rt.rpc_url),
         rpc_url: rt.rpc_url.clone(),
+        gas_caps: rt.gas_caps,
         closing: rt.closing.clone(),
     };
     // Upgrade path: a ledger written before `input_token` existed loads as
@@ -1251,6 +1257,8 @@ struct Engine {
     /// the broadcast outlives the frame that asked for it, and nothing that
     /// sends a transaction may borrow the session loop.
     rpc_url: String,
+    /// `[gas]` ceilings for that [`Wallet`].
+    gas_caps: GasCaps,
     /// Process-scoped redeem epochs with a close in flight. The venue asks
     /// again every tick until the chain says Closed, and a second close would
     /// be a second nonce spent on a revert.
@@ -1793,7 +1801,8 @@ impl Engine {
             return reject(CloseRedeemRejectReason::InFlight);
         }
 
-        let wallet = Wallet::new(&self.rpc_url, self.signer.clone(), self.chain_id);
+        let wallet = Wallet::new(&self.rpc_url, self.signer.clone(), self.chain_id)
+            .with_gas_caps(self.gas_caps);
         let closing = self.closing.clone();
         let request_id = req.request_id.clone();
         tokio::spawn(async move {
@@ -2898,6 +2907,7 @@ mod tests {
             nonce_salt: 7,
             rpc: Rpc::new("http://127.0.0.1:1"),
             rpc_url: "http://127.0.0.1:1".into(),
+            gas_caps: GasCaps::for_chain(8453),
             closing: Arc::new(Mutex::new(HashMap::new())),
         }
     }

@@ -153,6 +153,36 @@ Nothing above is tunable from `stitch.toml` on purpose. The 2-second cadence
 is set by how long a reading may be trusted before a side goes dark, not by
 how fresh it could be.
 
+### Gas Ceilings
+
+Stitch takes the tip, the fee cap and the gas limit for every transaction it
+sends from your RPC's answers. It won't sign one that goes over either of two
+ceilings, and a stuck transaction stops re-bidding once it reaches them:
+
+| Chain | Fee cap per gas | Most one transaction may cost |
+| --- | --- | --- |
+| Ethereum | 500 gwei | 0.1 ETH |
+| Base, Arbitrum, Robinhood Chain, OP (and testnets) | 50 gwei | 0.01 ETH |
+| BNB Smart Chain | 100 gwei | 0.05 BNB |
+| Celo | 500 gwei | 10 CELO |
+| Polygon | 5000 gwei | 50 POL |
+| anything else | 1000 gwei | 0.1 of the gas token |
+
+"Most one transaction may cost" is gas limit x fee cap, the worst case, not
+what it usually pays. Normal fees sit far below both. They're there so a
+broken or hostile RPC can't have Stitch tip most of its gas balance away in one
+send. If a send is refused, the error prints what the RPC answered: a number
+wildly off the chain's usual fee means switch RPCs, not raise the cap. If fees
+on your chain really are that high, override either ceiling with a `[gas]`
+table in `stitch.toml` (the end of the file is fine). A key you leave out keeps
+the default:
+
+```toml
+[gas]
+max_fee_per_gas_gwei = 1000   # fee cap per gas, in gwei
+max_tx_fee = 0.25             # whole units of the gas token
+```
+
 ### Liquidity And Order Sizing
 
 Stitch can post one order per side or a ladder of smaller orders:
@@ -559,7 +589,8 @@ transaction pays 0.1. A floor-priced transaction only lands when a validator
 that accepts the floor builds the block, which can take minutes.
 
 Stitch now re-sends the same nonce at a 25% higher fee every 12 seconds until
-the receipt arrives, so this should clear itself. If you still see it:
+the receipt arrives or the fee reaches its [gas ceiling](#gas-ceilings), so
+this should clear itself. If you still see it:
 
 - Re-run `stitch approve`. It reads the allowance first and skips tokens that
   are already approved, so re-running is free and tells you whether the earlier

@@ -12,6 +12,7 @@ use std::time::Duration;
 use alloy_primitives::{hex, Address, Bytes, B256, U256};
 use serde_json::{json, Value};
 
+use crate::chain::gas_caps::GasCaps;
 use crate::chain::tx::{sign_tx, Eip1559Tx};
 use crate::net::http_client;
 use crate::signer::DynSigner;
@@ -39,7 +40,11 @@ fn plan_fees(base_fee: U256, suggested_gas_price: U256, node_tip: U256) -> (U256
     let priority = node_tip.max(implied_tip).max(U256::from(MIN_PRIORITY_WEI));
     // Double the base fee for headroom against a rise between planning and
     // inclusion; the tip rides on top.
-    let max_fee = base_fee.saturating_mul(U256::from(2u8)) + priority;
+    // Saturating: these are the node's numbers, and a huge answer has to reach
+    // the `GasCaps` check in `plan_tx`, not overflow here.
+    let max_fee = base_fee
+        .saturating_mul(U256::from(2u8))
+        .saturating_add(priority);
     (priority, max_fee)
 }
 
@@ -350,9 +355,13 @@ pub struct Wallet {
     signer: DynSigner,
     address: Address,
     chain_id: u64,
+    /// What a send may bid, whatever the node suggests.
+    gas_caps: GasCaps,
 }
 
 impl Wallet {
+    /// A wallet with `chain_id`'s built-in gas ceilings. Use
+    /// [`Self::with_gas_caps`] to apply the operator's `[gas]` overrides.
     pub fn new(rpc_url: impl Into<String>, signer: DynSigner, chain_id: u64) -> Self {
         let address = signer.address();
         Self {
@@ -360,7 +369,12 @@ impl Wallet {
             signer,
             address,
             chain_id,
+            gas_caps: GasCaps::for_chain(chain_id),
         }
+    }
+
+    pub fn with_gas_caps(self, gas_caps: GasCaps) -> Self {
+        Self { gas_caps, ..self }
     }
 
     pub fn address(&self) -> Address {
@@ -396,10 +410,13 @@ impl Wallet {
     pub async fn native_transfer_reserve(&self, to: Address) -> anyhow::Result<U256> {
         let plan = self.plan_tx(to, &Bytes::new(), U256::ZERO).await?;
         let gas = plan.gas_limit.max(U256::from(NATIVE_TRANSFER_GAS));
-        Ok(plan.bumped().max_fee.saturating_mul(gas))
+        let bid = plan.bumped(self.gas_caps).unwrap_or(plan).max_fee;
+        Ok(bid.saturating_mul(gas))
     }
 
-    /// Nonce + fees + gas for one send, read from the node.
+    /// Nonce + fees + gas for one send, read from the node. Refuses a plan
+    /// over [`GasCaps`] rather than clamping it: a node answering that high is
+    /// broken or hostile, and a clamped bid off its numbers is still a guess.
     async fn plan_tx(&self, to: Address, data: &Bytes, value: U256) -> anyhow::Result<TxPlan> {
         let nonce = self.rpc.transaction_count(self.address).await?;
         let node_tip = self.rpc.max_priority_fee().await.ok();
@@ -420,6 +437,18 @@ impl Wallet {
         }
         let est = self.rpc.estimate_gas(self.address, to, data, value).await?;
         let gas_limit = est.saturating_mul(U256::from(12u8)) / U256::from(10u8); // +20%
+        if let Some(why) = self.gas_caps.violation(max_fee, gas_limit) {
+            tracing::warn!(
+                node_tip = ?node_tip, node_gas_price = ?node_price, base_fee = %base_fee,
+                gas_estimate = %est, "refusing to sign: {why}"
+            );
+            anyhow::bail!(
+                "not sending: {why}. The RPC answered tip {node_tip:?}, gas price \
+                 {node_price:?}, base fee {base_fee}, gas estimate {est}. If fees on this \
+                 chain really are that high, raise the ceiling under [gas] in stitch.toml; \
+                 otherwise the RPC at rpc_url is misbehaving"
+            );
+        }
         Ok(TxPlan {
             nonce,
             priority,
@@ -520,6 +549,7 @@ impl Wallet {
         );
         let mut plan = plan;
         let mut hashes = vec![hash];
+        let mut at_ceiling = false;
         let deadline = std::time::Instant::now() + timeout;
         let mut next_bump = std::time::Instant::now() + BUMP_AFTER;
         loop {
@@ -548,20 +578,32 @@ impl Wallet {
                 )));
             }
             if now >= next_bump {
-                plan = plan.bumped();
-                match self.send_plan(to, data.clone(), value, &plan).await {
-                    Ok(hash) => {
-                        tracing::info!(
-                            %hash, nonce = plan.nonce, max_fee = %plan.max_fee,
-                            "still pending; re-sent the same nonce at a higher fee"
+                match plan.bumped(self.gas_caps) {
+                    Some(next) => {
+                        plan = next;
+                        match self.send_plan(to, data.clone(), value, &plan).await {
+                            Ok(hash) => {
+                                tracing::info!(
+                                    %hash, nonce = plan.nonce, max_fee = %plan.max_fee,
+                                    "still pending; re-sent the same nonce at a higher fee"
+                                );
+                                hashes.push(hash);
+                            }
+                            // A rejected bump (fee bump too small, pool full) is not
+                            // fatal: the original attempt is still live.
+                            Err(e) => {
+                                tracing::warn!(error = %e, "fee bump re-send rejected; still waiting")
+                            }
+                        }
+                    }
+                    None if !at_ceiling => {
+                        at_ceiling = true;
+                        tracing::warn!(
+                            nonce = plan.nonce, max_fee = %plan.max_fee,
+                            "still pending at the [gas] fee ceiling; not bidding higher, still waiting"
                         );
-                        hashes.push(hash);
                     }
-                    // A rejected bump (fee bump too small, pool full) is not
-                    // fatal: the original attempt is still live.
-                    Err(e) => {
-                        tracing::warn!(error = %e, "fee bump re-send rejected; still waiting")
-                    }
+                    None => {}
                 }
                 next_bump = now + BUMP_AFTER;
             }
@@ -595,18 +637,22 @@ struct TxPlan {
 }
 
 impl TxPlan {
-    fn bumped(self) -> Self {
+    /// The same nonce at a higher fee, held under `caps`. `None` once the fee
+    /// cap is already at the ceiling: there is nothing higher to re-send at.
+    /// The tip is kept at or under the fee cap, as EIP-1559 requires.
+    fn bumped(self, caps: GasCaps) -> Option<Self> {
         // +1 wei so a rounding-down division can never produce an equal (and
         // therefore rejected) replacement fee.
         let bump = |v: U256| {
             v.saturating_mul(U256::from(BUMP_NUMERATOR)) / U256::from(BUMP_DENOMINATOR)
                 + U256::from(1u8)
         };
-        Self {
-            priority: bump(self.priority),
-            max_fee: bump(self.max_fee),
+        let max_fee = bump(self.max_fee).min(caps.fee_ceiling(self.gas_limit));
+        (max_fee > self.max_fee).then(|| Self {
+            priority: bump(self.priority).min(max_fee),
+            max_fee,
             ..self
-        }
+        })
     }
 }
 
@@ -854,7 +900,7 @@ mod tests {
             max_fee: U256::from(150_000_000u64),
             gas_limit: U256::from(56_194u64),
         };
-        let bumped = plan.bumped();
+        let bumped = plan.bumped(GasCaps::for_chain(1)).unwrap();
         assert_eq!(bumped.nonce, plan.nonce, "a bump replaces, never queues");
         assert_eq!(bumped.gas_limit, plan.gas_limit);
         // geth needs +10% on both fee fields to accept the replacement.
@@ -870,7 +916,7 @@ mod tests {
             max_fee: U256::ZERO,
             gas_limit: U256::from(21_000u64),
         };
-        assert!(plan.bumped().priority > U256::ZERO);
+        assert!(plan.bumped(GasCaps::for_chain(1)).unwrap().priority > U256::ZERO);
     }
 
     #[test]
@@ -897,7 +943,142 @@ mod tests {
             reserve > first_bid,
             "one fee bump of headroom: {reserve} vs {first_bid}"
         );
-        assert_eq!(reserve, plan.gas_limit * plan.bumped().max_fee);
+        assert_eq!(
+            reserve,
+            plan.gas_limit * plan.bumped(GasCaps::for_chain(1)).unwrap().max_fee
+        );
+    }
+
+    const GWEI: u128 = 1_000_000_000;
+
+    /// A node that answers the fee and gas reads with the given numbers:
+    /// `eth_maxPriorityFeePerGas` = tip, `baseFeePerGas` = base fee,
+    /// `eth_gasPrice` = both, `eth_estimateGas` = estimate. Nonce 0.
+    async fn fee_node(tip: u128, base_fee: u128, estimate: u64) -> String {
+        use axum::{routing::post, Json, Router};
+        let hex = |v: u128| format!("0x{v:x}");
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| async move {
+                let result = match req["method"].as_str().unwrap_or_default() {
+                    "eth_maxPriorityFeePerGas" => json!(hex(tip)),
+                    "eth_gasPrice" => json!(hex(base_fee + tip)),
+                    "eth_getBlockByNumber" => json!({ "baseFeePerGas": hex(base_fee) }),
+                    "eth_estimateGas" => json!(hex(estimate.into())),
+                    _ => json!("0x0"),
+                };
+                Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        format!("http://{addr}")
+    }
+
+    fn to() -> Address {
+        address!("70997970C51812dc3A010C7d01b50e0d17dc79C8")
+    }
+
+    #[tokio::test]
+    async fn a_node_tip_that_would_spend_most_of_the_balance_is_refused() {
+        // The audit's replay (F-21): a ~16,665 gwei tip on a 50k-gas estimate
+        // plans a 60k gas limit whose worst case is ~1 ETH, most of a 1 ETH
+        // gas float, paid to the block producer.
+        let url = fee_node(16_664_666_666_666, 1_000_000_000, 50_000).await;
+        let wallet = Wallet::new(url, local_signer(), 1);
+        let err = wallet
+            .plan_tx(to(), &Bytes::new(), U256::ZERO)
+            .await
+            .expect_err("a hostile tip must not be signed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("max_fee_per_gas_gwei"), "{msg}");
+        assert!(
+            msg.contains("16664666666666"),
+            "names the node's tip: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legal_price_on_a_huge_gas_estimate_is_refused() {
+        // 40 gwei is under Base's 50 gwei ceiling, but 40 gwei x 1.2M gas is
+        // 0.048 ETH, over its 0.01 ETH per-transaction ceiling.
+        let url = fee_node(40 * GWEI, 0, 1_000_000).await;
+        let wallet = Wallet::new(url, local_signer(), 8453);
+        let err = wallet
+            .plan_tx(to(), &Bytes::new(), U256::ZERO)
+            .await
+            .expect_err("over the per-transaction ceiling");
+        assert!(format!("{err:#}").contains("max_tx_fee"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn normal_fees_plan_unchanged() {
+        // Base on a normal day: 0.005 gwei base fee, 0.001 gwei tip (under
+        // the floor), 150k gas.
+        let url = fee_node(GWEI / 1_000, 5 * GWEI / 1_000, 150_000).await;
+        let wallet = Wallet::new(url, local_signer(), 8453);
+        let plan = wallet
+            .plan_tx(to(), &Bytes::new(), U256::ZERO)
+            .await
+            .unwrap();
+        let (priority, max_fee) = plan_fees(
+            U256::from(5 * GWEI / 1_000),
+            U256::from(6 * GWEI / 1_000),
+            U256::from(GWEI / 1_000),
+        );
+        assert_eq!((plan.priority, plan.max_fee), (priority, max_fee));
+        assert_eq!(plan.gas_limit, U256::from(180_000u64));
+    }
+
+    #[tokio::test]
+    async fn an_operator_ceiling_overrides_the_built_in_one() {
+        let url = fee_node(80 * GWEI, 0, 21_000).await;
+        let wallet = Wallet::new(&url, local_signer(), 8453);
+        assert!(wallet
+            .plan_tx(to(), &Bytes::new(), U256::ZERO)
+            .await
+            .is_err());
+        let raised = GasCaps::for_chain(8453).with_overrides(Some(100.0), None);
+        let wallet = Wallet::new(&url, local_signer(), 8453).with_gas_caps(raised);
+        let plan = wallet
+            .plan_tx(to(), &Bytes::new(), U256::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(plan.priority, U256::from(80 * GWEI));
+    }
+
+    #[test]
+    fn bumps_stop_at_the_ceiling() {
+        let caps = GasCaps::for_chain(8453); // 50 gwei
+        let plan = TxPlan {
+            nonce: 3,
+            priority: U256::from(45 * GWEI),
+            max_fee: U256::from(45 * GWEI),
+            gas_limit: U256::from(21_000u64),
+        };
+        let bumped = plan.bumped(caps).expect("room for one more bump");
+        assert_eq!(bumped.max_fee, U256::from(50 * GWEI));
+        assert!(
+            bumped.priority <= bumped.max_fee,
+            "tip never over the fee cap"
+        );
+        assert_eq!(bumped.bumped(caps), None, "nothing higher to re-send at");
+    }
+
+    #[test]
+    fn bumps_also_stop_at_the_per_transaction_ceiling() {
+        // Base's 0.01 ETH over a 1M gas limit leaves 10 gwei per gas.
+        let caps = GasCaps::for_chain(8453);
+        let plan = TxPlan {
+            nonce: 3,
+            priority: U256::from(GWEI),
+            max_fee: U256::from(9 * GWEI),
+            gas_limit: U256::from(1_000_000u64),
+        };
+        let bumped = plan.bumped(caps).unwrap();
+        assert_eq!(bumped.max_fee, U256::from(10 * GWEI));
+        assert_eq!(bumped.bumped(caps), None);
     }
 
     /// End-to-end proof the EIP-1559 encode → sign → broadcast → receipt path is
