@@ -190,6 +190,13 @@ pub struct LevelsFrame {
     pub bids: Vec<Level>,
     /// Maker sells collateral.
     pub asks: Vec<Level>,
+    /// The mid this book was priced from: debt-per-collateral, decimal-
+    /// normalized, RAY scaled — the same units as each level's `rate_ray`.
+    /// Bid and ask are this mid less and plus the configured offsets, so it
+    /// lets the venue say how the spread splits between the two sides.
+    /// Informational only: routing never reads it. Omitted when not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid_rate_ray: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

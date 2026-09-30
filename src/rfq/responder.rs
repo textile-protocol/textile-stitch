@@ -402,11 +402,17 @@ pub fn levels_for(
             }
         }
     }
+    // Only alongside a side it priced: a bookless frame has no split to explain.
+    let mid_rate_ray = (!bids.is_empty() || !asks.is_empty())
+        .then(|| rate_ray(mid, book.debt_decimals, book.collateral_decimals))
+        .filter(|rate| !rate.is_zero())
+        .map(|rate| rate.to_string());
     LevelsFrame {
         corridor_id: book.slug.clone(),
         as_of,
         bids,
         asks,
+        mid_rate_ray,
     }
 }
 
@@ -759,6 +765,27 @@ mod tests {
         );
         assert!(frame.asks.is_empty());
         assert_eq!(frame.bids.len(), 1);
+    }
+
+    #[test]
+    fn levels_carry_the_mid_they_were_priced_from() {
+        let b = book();
+        let frame = levels(&b, 1.0, U256::ZERO, U256::ZERO, "t0".into());
+        // Same units as the levels: the mid sits between the two sides.
+        assert_eq!(
+            frame.mid_rate_ray.as_deref(),
+            Some("1000000000000000000000000000")
+        );
+
+        // Nothing published, nothing to explain.
+        let full = U256::from(u64::MAX);
+        let empty = levels(&b, 1.0, full, full, "t1".into());
+        assert!(empty.bids.is_empty() && empty.asks.is_empty());
+        assert_eq!(empty.mid_rate_ray, None);
+
+        // Omitted on the wire when absent, so an older venue sees the same frame.
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("midRateRay"));
     }
 
     #[test]
