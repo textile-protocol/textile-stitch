@@ -395,7 +395,7 @@ impl Staging {
     /// partial file, and that file is ours to clean up too.
     fn create<F>(&mut self, name: &str, write: F) -> Result<()>
     where
-        F: FnOnce(&Path) -> Result<()>,
+        F: FnOnce(&Path, &mut std::fs::File) -> Result<()>,
     {
         let to = self.path(name);
         // `create_new` rather than an `exists()` probe: the probe is a read, so two
@@ -404,23 +404,20 @@ impl Staging {
         // that one is mid-flight — after it had already removed the old container.
         // Exclusive create makes exactly one of them the owner, decided by the kernel.
         //
-        // The handle is dropped immediately: it exists to win the race, not to write.
-        // `write` still gets the path, so a copy or a byte write works unchanged onto
-        // the empty file this leaves behind.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&to)
-        {
-            Ok(_) => {}
+        // `write` gets the handle, not just the path. The directory can already belong
+        // to the bot's uid (the staging handover runs before the ledgers are
+        // collected), and reopening by name would follow whatever link was swapped in
+        // after the create. The path is only for messages.
+        let mut file = match open_exclusive(&to) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 bail!("{} already exists", to.display())
             }
             Err(e) => return Err(e).with_context(|| format!("creating {}", to.display())),
-        }
+        };
         self.created.push(name.to_string());
         self.remember_written(name);
-        write(&to)
+        write(&to, &mut file)
     }
 
     /// Record an entry this attempt wrote over rather than created, so it is handed
@@ -567,7 +564,7 @@ async fn stage(
 ) -> Result<Staged> {
     let target = staging.dir.clone();
     let mut moved = vec!["stitch.toml".to_string()];
-    staging.create("stitch.toml", |to| copy_into(source_toml, to))?;
+    staging.create("stitch.toml", |to, file| copy_into(source_toml, to, file))?;
 
     // Resolve the signer from the *source* config, not the staged target. Turnkey
     // keeps its API public key in the sibling stitch.env, which hasn't been copied
@@ -579,7 +576,7 @@ async fn stage(
     // necessarily the canonical one.
     match find_beside(source_toml, &signer.secret_file) {
         Some(found) => {
-            staging.create(&signer.secret_file, |to| copy_into(&found, to))?;
+            staging.create(&signer.secret_file, |to, file| copy_into(&found, to, file))?;
             moved.push(signer.secret_file.clone());
         }
         None => bail!(
@@ -596,7 +593,7 @@ async fn stage(
     // though signer_runtime_at already lifted the public key into the create spec
     // — a later recreate from the directory would lose it.
     if let Some(env) = find_beside(source_toml, "stitch.env") {
-        staging.create("stitch.env", |to| copy_into(&env, to))?;
+        staging.create("stitch.env", |to, file| copy_into(&env, to, file))?;
         moved.push("stitch.env".to_string());
     }
 
@@ -629,32 +626,51 @@ async fn stage(
     Ok(Staged { moved, spec })
 }
 
+/// Create `path` only if nothing, a link included, is there yet.
+fn open_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
 /// Copy a file. Copy rather than rename so a failure leaves the old container's
-/// mounts intact.
-fn copy_into(from: &Path, to: &Path) -> Result<()> {
-    std::fs::copy(from, to)
+/// mounts intact. Written through the staged file's handle, carrying the source's
+/// permissions over the way `std::fs::copy` does.
+fn copy_into(from: &Path, to: &Path, file: &mut std::fs::File) -> Result<()> {
+    copy_with_permissions(from, file)
         .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
     // Secrets must not become readable by anyone else in their new home.
-    restrict_if_secret(to)?;
+    restrict_if_secret(to, file)?;
     Ok(())
 }
 
+fn copy_with_permissions(from: &Path, file: &mut std::fs::File) -> std::io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    std::io::copy(&mut source, file)?;
+    file.set_permissions(source.metadata()?.permissions())
+}
+
 #[cfg(unix)]
-fn restrict_if_secret(path: &Path) -> Result<()> {
+fn restrict_if_secret(path: &Path, file: &std::fs::File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let is_secret = path
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.ends_with(".key") || n.ends_with(".token"));
     if is_secret {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("chmod 600 {}", path.display()))?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_if_secret(_path: &Path) -> Result<()> {
+fn restrict_if_secret(_path: &Path, _file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
@@ -676,10 +692,8 @@ fn copy_host_ledgers(source_dir: &Path, staging: &mut Staging) -> Result<Vec<Str
             continue;
         }
         let from = source_dir.join(&name);
-        staging.create(&name, |to| {
-            std::fs::copy(&from, to)
-                .map(|_| ())
-                .with_context(|| format!("copying ledger {name}"))
+        staging.create(&name, |to, file| {
+            copy_into(&from, to, file).with_context(|| format!("copying ledger {name}"))
         })?;
         copied.push(name);
     }
@@ -706,15 +720,19 @@ async fn recover_ledgers(
     {
         let to = staging.path(&name);
         if to.exists() {
-            std::fs::write(&to, &bytes).with_context(|| {
+            // Replaced by rename, not rewritten in place: the directory may already be
+            // the bot's, and writing through the name would follow a link there.
+            setup::write_file_atomic(&to, &bytes).with_context(|| {
                 format!("replacing {} with the container's ledger", to.display())
             })?;
             // Written by us even though we didn't create it, so the bot has to own it
             // — but it isn't ours to delete on a rollback.
             staging.remember_written(&name);
         } else {
-            staging.create(&name, |to| {
-                std::fs::write(to, &bytes).with_context(|| format!("writing {}", to.display()))
+            staging.create(&name, |to, file| {
+                use std::io::Write;
+                file.write_all(&bytes)
+                    .with_context(|| format!("writing {}", to.display()))
             })?;
         }
         written.push(name);
@@ -729,6 +747,7 @@ mod tests {
     use crate::panel::docker::ContainerState;
     use crate::panel::inventory::discover;
     use crate::panel::naming::LABEL_COMPOSE_SERVICE;
+    use std::io::Write;
 
     const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
@@ -977,16 +996,16 @@ mod tests {
         let (_cfg, root) = test_cfg("stagingclaim");
         let mut first = Staging::open(root.join("bot1")).unwrap();
         first
-            .create("stitch.toml", |to| {
-                std::fs::write(to, "first").map_err(Into::into)
+            .create("stitch.toml", |_, file| {
+                file.write_all(b"first").map_err(Into::into)
             })
             .unwrap();
 
         // A second attempt must not be able to claim the same name.
         let mut second = Staging::open(root.join("bot1")).unwrap();
         let err = second
-            .create("stitch.toml", |to| {
-                std::fs::write(to, "second").map_err(Into::into)
+            .create("stitch.toml", |_, file| {
+                file.write_all(b"second").map_err(Into::into)
             })
             .unwrap_err();
         assert!(format!("{err:#}").contains("already exists"));
@@ -996,6 +1015,57 @@ mod tests {
             std::fs::read_to_string(root.join("bot1/stitch.toml")).unwrap(),
             "first"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A target directory holding `name` as a link to a file outside it, the way the
+    /// bot's uid could leave it once the directory is handed over.
+    #[cfg(unix)]
+    fn target_with_link(tag: &str, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let (_cfg, root) = test_cfg(tag);
+        let dir = root.join("bot1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = root.join("outside.conf");
+        std::fs::write(&outside, "ORIGINAL").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(name)).unwrap();
+        (root, dir, outside)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_never_writes_through_a_link_left_in_the_target() {
+        let (root, dir, outside) = target_with_link("staginglink", "stitch.toml");
+        let mut staging = Staging::open(dir).unwrap();
+        let err = staging
+            .create("stitch.toml", |_, file| {
+                file.write_all(b"pwned").map_err(Into::into)
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "ORIGINAL");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recovered_ledger_replaces_a_link_instead_of_writing_through_it() {
+        let name = format!("0xabc{LEDGER_SUFFIX}");
+        let (root, dir, outside) = target_with_link("ledgerlink", &name);
+        let mut staging = Staging::open(dir.clone()).unwrap();
+        let reader = FakeFiles {
+            files: vec![(name.clone(), b"{\"live\":true}".to_vec())],
+            error: None,
+        };
+        recover_ledgers(&reader, "bot1", &mut staging)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "ORIGINAL");
+        let ledger = dir.join(&name);
+        assert!(!std::fs::symlink_metadata(&ledger)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), "{\"live\":true}");
         std::fs::remove_dir_all(&root).ok();
     }
 

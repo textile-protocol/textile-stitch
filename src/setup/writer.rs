@@ -283,9 +283,15 @@ fn upsert_env_assignment(env_path: &Path, key: &str, value: &str) -> Result<()> 
     if !replaced {
         out.push_str(&assignment);
     }
-    write_toml_atomic(env_path, &out)?;
-    restrict_to_owner(env_path)?;
-    Ok(())
+    write_env_file(env_path, &out)
+}
+
+/// `stitch.env` can carry a signer credential (the Fireblocks API key, say), so it
+/// is staged owner-only like a key file. Not chmodded by path after the rename:
+/// by then the name may be a link someone else put there.
+fn write_env_file(env_path: &Path, body: &str) -> Result<()> {
+    write_key_file_atomic(env_path, body.as_bytes())
+        .with_context(|| format!("writing {}", env_path.display()))
 }
 
 /// The `stitch.env` body: point the bot at the key file and set a sane log level.
@@ -377,8 +383,7 @@ pub fn write_config_signer_from_toml(
     // leaves the old toml still selecting the old, untouched signer, so the config
     // stays consistent. Drop the old signer's secrets only after everything commits.
     write_signer_secrets(&paths, signer)?;
-    write_toml_atomic(&paths.env, &render_env_for(&paths, signer))?;
-    restrict_to_owner(&paths.env)?;
+    write_env_file(&paths.env, &render_env_for(&paths, signer))?;
     write_toml_atomic(&paths.toml, &toml)?;
     remove_other_secrets(&paths, signer);
 
@@ -410,8 +415,7 @@ pub fn apply_signer(dir: impl AsRef<Path>, signer: &SignerSetup) -> Result<()> {
     // last — all atomic replaces.
     let write = (|| -> Result<()> {
         write_signer_secrets(&paths, signer)?;
-        write_toml_atomic(&paths.env, &render_env_for(&paths, signer))?;
-        restrict_to_owner(&paths.env)?;
+        write_env_file(&paths.env, &render_env_for(&paths, signer))?;
         // Signer rewrite replaces stitch.env wholesale. Put the RFQ key pointer
         // back so a later signer change doesn't silently drop RFQ auth.
         point_env_at_rfq_key(&paths)?;
@@ -799,24 +803,22 @@ pub fn write_key(dir: impl AsRef<Path>, key_raw: &str) -> Result<alloy_primitive
 /// left intact rather than truncated or removed. `write_key_file` already creates
 /// the temp owner-only on both platforms, so the secret is never world-readable.
 fn write_key_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = key_tmp_path(path);
-    write_key_file(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    replace_file(&tmp, path).map_err(|e| {
-        // Best-effort cleanup so a failed rename doesn't strand the staged key.
-        let _ = std::fs::remove_file(&tmp);
-        anyhow::Error::new(e).context(format!("replacing {}", path.display()))
-    })?;
-    Ok(())
+    let tmp = staging_path(path);
+    let staged =
+        write_key_file(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    commit_staged(&tmp, path, staged)
 }
 
-/// The owner-only staging path next to a secret file, derived from its name (e.g.
-/// `.turnkey-api.key.tmp`) so each secret stages to its own temp without collision.
-fn key_tmp_path(path: &Path) -> PathBuf {
+/// The sibling temp a write stages through, derived from the target's name (e.g.
+/// `.turnkey-api.key.tmp`) so each file stages to its own temp without collision.
+///
+/// The name is predictable, and in the panel's layout the directory belongs to the
+/// bot's uid while the panel writes as root. So the temp is only ever created
+/// fresh, never opened by a name someone else filled first: see
+/// [`create_staging_file`].
+fn staging_path(path: &Path) -> PathBuf {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("stitch.key");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     dir.join(format!(".{name}.tmp"))
 }
 
@@ -828,16 +830,119 @@ pub fn write_toml_atomic(path: &Path, contents: &str) -> Result<()> {
 /// Replace a file atomically: write a sibling temp file, then rename it over
 /// the target so a crash mid-write can't leave a half-written file behind.
 pub fn write_file_atomic(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    replace_file(&tmp, path).with_context(|| {
+    let tmp = staging_path(path);
+    let staged = write_staging_file(&tmp, contents.as_ref(), 0o666)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    commit_staged(&tmp, path, staged)
+}
+
+/// The file a staged write produced, by device and inode. Checked again after the
+/// rename, because the rename goes by name and whoever can write the directory can
+/// swap the temp for a link between our write and our rename.
+///
+/// On Unix the file stays open until the check. An inode number only names our
+/// file while something holds it: once the temp is unlinked and closed, the
+/// filesystem can hand the same number to whatever is created next (ext4 does,
+/// straight away), and a link planted in its place would then pass as ours.
+#[derive(Debug)]
+struct Staged {
+    #[cfg(unix)]
+    id: (u64, u64),
+    #[cfg(unix)]
+    _open: std::fs::File,
+}
+
+#[cfg(unix)]
+fn staged_from(file: std::fs::File) -> std::io::Result<Staged> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    Ok(Staged {
+        id: (meta.dev(), meta.ino()),
+        _open: file,
+    })
+}
+
+/// Windows closes the handle here: an open file can't be renamed over.
+#[cfg(windows)]
+fn staged_from(_file: std::fs::File) -> std::io::Result<Staged> {
+    Ok(Staged {})
+}
+
+/// Stage `contents` in a freshly created temp. `mode` is the Unix create mode.
+fn write_staging_file(tmp: &Path, contents: &[u8], mode: u32) -> std::io::Result<Staged> {
+    use std::io::Write;
+    let mut file = create_staging_file(tmp, mode)?;
+    file.write_all(contents)?;
+    staged_from(file)
+}
+
+/// Create the temp exclusively, never through a link.
+///
+/// The panel runs as root and writes into a directory the bot's uid owns, so a
+/// create-and-truncate by a predictable name would write, create or chmod whatever
+/// a link planted there points at: a sibling bot's key, or the panel's own files.
+/// `create_new` fails on any existing entry, a dangling link included, and
+/// `O_NOFOLLOW` says the same thing in case that ever gets loosened.
+fn create_staging_file(tmp: &Path, mode: u32) -> std::io::Result<std::fs::File> {
+    clear_stale_staging(tmp)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW).mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    opts.open(tmp)
+}
+
+/// Clear a temp that an earlier crashed write left behind, but only a plain file.
+/// Anything else sitting there (a link, above all) was put there by someone else,
+/// so the write stops rather than guess what they meant.
+fn clear_stale_staging(tmp: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(tmp) {
+        Ok(meta) if meta.file_type().is_file() => std::fs::remove_file(tmp),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a regular file", tmp.display()),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Rename the staged temp over `path`, then make sure what landed is the file we
+/// wrote. If it isn't, the temp was swapped mid-write and whatever the rename put
+/// at `path` came from someone else. It's removed (by name, so a link's target is
+/// untouched) rather than left for the panel to read through or mount into a bot.
+fn commit_staged(tmp: &Path, path: &Path, staged: Staged) -> Result<()> {
+    replace_file(tmp, path).map_err(|e| {
         // Best-effort cleanup so a failed rename doesn't strand the temp file.
-        let _ = std::fs::remove_file(&tmp);
-        format!("replacing {}", path.display())
+        let _ = std::fs::remove_file(tmp);
+        anyhow::Error::new(e).context(format!("replacing {}", path.display()))
     })?;
-    Ok(())
+    if landed(path, staged)? {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(path);
+    anyhow::bail!(
+        "{} was swapped out while it was being written, so it was not kept",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn landed(path: &Path, staged: Staged) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("checking {}", path.display()))?;
+    Ok((meta.dev(), meta.ino()) == staged.id)
+}
+
+#[cfg(windows)]
+fn landed(_path: &Path, _staged: Staged) -> Result<bool> {
+    Ok(true)
 }
 
 /// Rename `tmp` over `path`, replacing any existing file. `std::fs::rename`
@@ -855,14 +960,6 @@ fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
         }
         Err(e) => Err(e),
     }
-}
-
-/// Lock a file down so only its owner can read or write it.
-#[cfg(unix)]
-fn restrict_to_owner(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms).with_context(|| format!("chmod 600 {}", path.display()))
 }
 
 /// Windows: drop inherited ACEs and grant only the current user, via icacls.
@@ -886,34 +983,18 @@ fn restrict_to_owner(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write the key file with owner-only permissions from creation (Unix), so the
-/// secret is never briefly world-readable.
+/// Stage the key file owner-only from creation (Unix), so the secret is never
+/// briefly world-readable. The temp is always freshly created, so the mode holds.
 #[cfg(unix)]
-fn write_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    // `mode(0o600)` below only applies when the file is created. If a key file
-    // (or placeholder) already exists, tighten it to 0600 BEFORE we truncate and
-    // write, so an old group/world-readable file can't expose the new key during
-    // the write window.
-    if path.exists() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)?;
-    Ok(())
+fn write_key_file(path: &Path, bytes: &[u8]) -> Result<Staged> {
+    Ok(write_staging_file(path, bytes, 0o600)?)
 }
 
 /// Windows has no umask. Lock the key file to the current user with icacls BEFORE
 /// the secret is written, so the key never lands under inherited or pre-existing
 /// ACLs during the write.
 #[cfg(windows)]
-fn write_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_key_file(path: &Path, bytes: &[u8]) -> Result<Staged> {
     // Start from a clean ACL. A reused key file can carry explicit ACEs for other
     // principals (e.g. Everyone) that `icacls /grant:r` does NOT drop, and
     // truncating an existing file preserves its DACL. Deleting it first means the
@@ -925,7 +1006,7 @@ fn write_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, b"")?;
     restrict_to_owner(path)?;
     std::fs::write(path, bytes)?;
-    Ok(())
+    Ok(Staged {})
 }
 
 #[cfg(test)]
@@ -1530,6 +1611,140 @@ mod tests {
         let paths = write_config(&dir, corridor, KEY).unwrap();
         let mode = std::fs::metadata(&paths.key).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bot directory whose staging name for `target` is a link, planted by the
+    /// bot's uid, to a file outside it. Returns (bot dir, outside file).
+    #[cfg(unix)]
+    fn planted_staging_link(tag: &str, target: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = unique_dir(tag);
+        let bot = root.join("bot-a");
+        let private = root.join("panel-private");
+        std::fs::create_dir_all(&bot).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        let outside = private.join("target.conf");
+        std::fs::write(&outside, "ORIGINAL\n").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&outside, bot.join(format!(".{target}.tmp"))).unwrap();
+        (bot, outside)
+    }
+
+    #[cfg(unix)]
+    fn assert_outside_untouched(outside: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "ORIGINAL\n");
+        let mode = std::fs::metadata(outside).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "the link's target must not be chmodded"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_not_a_link(path: &Path) {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            assert!(
+                !meta.file_type().is_symlink(),
+                "{} became a link",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_write_never_follows_a_planted_staging_link() {
+        let (bot, outside) = planted_staging_link("link-toml", "stitch.toml");
+        let toml = bot.join("stitch.toml");
+        std::fs::write(&toml, "old = 1\n").unwrap();
+        assert!(write_toml_atomic(&toml, "pwned = true\n").is_err());
+        assert_outside_untouched(&outside);
+        assert_not_a_link(&toml);
+        assert_eq!(std::fs::read_to_string(&toml).unwrap(), "old = 1\n");
+        std::fs::remove_dir_all(bot.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_write_never_creates_a_file_through_a_dangling_link() {
+        let (bot, outside) = planted_staging_link("link-dangling", "panel.json");
+        std::fs::remove_file(&outside).unwrap();
+        let label = bot.join("panel.json");
+        assert!(write_file_atomic(&label, "{}").is_err());
+        assert!(!outside.exists(), "the write created the link's target");
+        assert_not_a_link(&label);
+        std::fs::remove_dir_all(bot.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_write_never_follows_a_planted_staging_link() {
+        let (bot, outside) = planted_staging_link("link-key", RFQ_API_KEY_FILE);
+        assert!(write_rfq_api_key(&bot, "tx_live_SECRET_MAKER_KEY").is_err());
+        assert_outside_untouched(&outside);
+        assert_not_a_link(&bot.join(RFQ_API_KEY_FILE));
+        std::fs::remove_dir_all(bot.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_env_upsert_never_follows_a_planted_staging_link() {
+        let (bot, outside) = planted_staging_link("link-env", "stitch.env");
+        let env = bot.join("stitch.env");
+        assert!(upsert_env_assignment(&env, "RUST_LOG", "debug").is_err());
+        assert_outside_untouched(&outside);
+        assert_not_a_link(&env);
+        std::fs::remove_dir_all(bot.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_swapped_for_a_link_before_the_rename_is_not_kept() {
+        // The directory's owner can replace the temp between our write and our
+        // rename; the rename would then install their link as the config.
+        let (bot, outside) = planted_staging_link("link-swap", "stitch.toml");
+        let tmp = bot.join(".stitch.toml.tmp");
+        std::fs::remove_file(&tmp).unwrap();
+        let toml = bot.join("stitch.toml");
+        let staged = write_staging_file(&tmp, b"new = 2\n", 0o666).unwrap();
+        std::fs::remove_file(&tmp).unwrap();
+        std::os::unix::fs::symlink(&outside, &tmp).unwrap();
+
+        let err = commit_staged(&tmp, &toml, staged).unwrap_err();
+        assert!(format!("{err:#}").contains("swapped out"), "{err:#}");
+        assert!(
+            std::fs::symlink_metadata(&toml).is_err(),
+            "the link was kept"
+        );
+        assert_outside_untouched(&outside);
+        std::fs::remove_dir_all(bot.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_env_upsert_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir("env-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = dir.join("stitch.env");
+        upsert_env_assignment(&env, "RUST_LOG", "debug").unwrap();
+        let mode = std::fs::metadata(&env).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_temp_left_by_a_crashed_write_does_not_block_the_next_one() {
+        let dir = unique_dir("stale-tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stitch.toml");
+        std::fs::write(dir.join(".stitch.toml.tmp"), "half a wri").unwrap();
+        write_toml_atomic(&path, "new = 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new = 2\n");
+        assert!(!dir.join(".stitch.toml.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -13,11 +13,22 @@ import {
   Tag,
 } from '../components/ui'
 import { formatUsd } from '../format'
+import {
+  arrangeFleet,
+  rankFleet,
+  readFleetOrder,
+  saveFleetOrder,
+  type RowTotal,
+} from '../fleetOrder'
 import { totalUsd, unpricedSymbols } from '../funding'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
 const POLL_MS = 5000
+
+/** When to rank without the wallets still unread: just past the server's
+ * six-second chain budget, so a read that is coming has had its chance. */
+const FIRST_READ_CAP_MS = 8000
 
 export default function Fleet() {
   const [data, setData] = useState<FleetData | null>(null)
@@ -31,6 +42,14 @@ export default function Fleet() {
   // of the list depends on it. Each bot is its own request, so one slow
   // chain leaves that bot's value unknown rather than stalling the rest.
   const [values, setValues] = useState<Record<string, RowTotal>>({})
+  // The order rows render in, read once and kept for the visit: rows update in
+  // place and never move. See fleetOrder.ts.
+  const [order] = useState(readFleetOrder)
+  // Bots whose first wallet read came back, either way. The next visit's order
+  // is only saved once all have, or the cap has passed, so a wallet still being
+  // read isn't saved at the bottom.
+  const [settled, setSettled] = useState<ReadonlySet<string>>(new Set())
+  const [capped, setCapped] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -64,6 +83,8 @@ export default function Fleet() {
     const names = botNames ? botNames.split('\n') : []
     if (names.length === 0) return
     let cancelled = false
+    const markSettled = (name: string) =>
+      setSettled((s) => (s.has(name) ? s : new Set([...s, name])))
     const read = () => {
       for (const name of names) {
         void api
@@ -77,17 +98,31 @@ export default function Fleet() {
                 unpriced: unpricedSymbols(funding),
               },
             }))
+            markSettled(name)
           })
-          .catch(() => {})
+          .catch(() => {
+            // Ranked as unknown: bottom of its band.
+            if (!cancelled) markSettled(name)
+          })
       }
     }
     read()
     const timer = window.setInterval(read, VALUE_POLL_MS)
+    const cap = window.setTimeout(() => setCapped(true), FIRST_READ_CAP_MS)
     return () => {
       cancelled = true
       clearInterval(timer)
+      clearTimeout(cap)
     }
   }, [botNames])
+
+  // Rank for the next visit, and keep re-ranking as reads land so the saved
+  // order is the latest one. Never touches what this visit renders.
+  const firstRoundDone =
+    capped || (botNames ? botNames.split('\n') : []).every((n) => settled.has(n))
+  useEffect(() => {
+    if (data && firstRoundDone) saveFleetOrder(rankFleet(data.bots, values))
+  }, [data, values, firstRoundDone])
 
   if (!data && error) return <ErrorState error={error} onRetry={() => void load()} />
   if (!data) return <Loading what="the fleet" />
@@ -130,9 +165,7 @@ export default function Fleet() {
         </Empty>
       ) : (
         <ul className="space-y-3">
-          {[...data.bots]
-            .sort((a, b) => fleetOrder(a, b, values))
-            .map((bot) => (
+          {arrangeFleet(data.bots, order).map((bot) => (
             <li key={bot.name}>
               <BotRow
                 bot={bot}
@@ -232,12 +265,6 @@ function BotRow({
 
 const VALUE_POLL_MS = 5000
 
-/** What one wallet is worth: the priced sides summed, the unpriced ones named. */
-interface RowTotal {
-  usd: number | null
-  unpriced: string[]
-}
-
 /** The same figure and the same "+ unpriced" caveat as the bot page's header,
  * so a wallet holding an unpriceable balance never reads as a few dollars. */
 function RowValue({ value }: { value: RowTotal | undefined }) {
@@ -258,26 +285,4 @@ function RowValue({ value }: { value: RowTotal | undefined }) {
       )}
     </span>
   )
-}
-
-/**
- * Three bands, then value within each:
- *   1. running (live, or waiting on Textile), richest first
- *   2. not running with money in the wallet, richest first
- *   3. not running with nothing in it
- * A value not read yet sorts as unknown at the bottom of its band, then by
- * name, so the list is stable while the first reads land.
- */
-function fleetOrder(a: Bot, b: Bot, values: Record<string, RowTotal>): number {
-  // An unpriced holding counts as money: it could be worth anything.
-  const holdsMoney = (v: RowTotal | undefined) =>
-    v !== undefined && ((v.usd !== null && v.usd > 0) || v.unpriced.length > 0)
-  const band = (bot: Bot) => (bot.running ? 0 : holdsMoney(values[bot.name]) ? 1 : 2)
-  const ba = band(a)
-  const bb = band(b)
-  if (ba !== bb) return ba - bb
-  const va = values[a.name]?.usd ?? -1
-  const vb = values[b.name]?.usd ?? -1
-  if (va !== vb) return vb - va
-  return botLabel(a).localeCompare(botLabel(b))
 }
