@@ -665,6 +665,13 @@ function ExperimentalSubsection({
   )
 }
 
+/**
+ * How often the Textile card re-checks an unconfirmed email, and the ceiling
+ * it backs off to while the venue can't be reached.
+ */
+const RFQ_POLL_MS = 5_000
+const RFQ_POLL_MAX_MS = 120_000
+
 function RfqCard({
   botName,
   loaded,
@@ -692,6 +699,9 @@ function RfqCard({
   const [checking, setChecking] = useState(false)
   const [emailVerified, setEmailVerified] = useState<boolean | null>(null)
   const [venueMessage, setVenueMessage] = useState<string | null>(null)
+  const [pollMs, setPollMs] = useState(RFQ_POLL_MS)
+  const [polls, setPolls] = useState(0)
+  const checkInFlight = useRef(false)
 
   const ga = loaded.rfqDefaultUnlocked
   const connected = loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== ''
@@ -734,25 +744,53 @@ function RfqCard({
     }
   }
 
-  async function checkStatus() {
-    setChecking(true)
-    setConnectError(null)
-    setVenueMessage(null)
+  /**
+   * Ask the panel what Textile says. `background` is the poll: no spinner, and
+   * it neither clears nor raises the banner, so a send error the operator is
+   * reading stays put and a venue blip only stretches the next wait.
+   * One check at a time: two landing after the click would both seat the bot.
+   */
+  async function checkStatus(background = false) {
+    if (checkInFlight.current) return
+    checkInFlight.current = true
+    if (!background) {
+      setChecking(true)
+      setConnectError(null)
+      setVenueMessage(null)
+    }
     try {
       const res = await api.checkRfqStatus(botName)
       setEmailVerified(res.emailVerified)
       setVenueMessage(res.message)
+      setPollMs(RFQ_POLL_MS)
       if (res.contactEmail && !contactEmail.trim()) {
         setContactEmail(res.contactEmail)
       }
       if (res.enrollment) setEnrollment(res.enrollment)
       if (res.settings) onConnected(res.settings, res.message)
     } catch (e) {
-      setConnectError(e instanceof ApiError ? e.message : String(e))
+      if (background) setPollMs((ms) => Math.min(ms * 2, RFQ_POLL_MAX_MS))
+      else setConnectError(e instanceof ApiError ? e.message : String(e))
     } finally {
-      setChecking(false)
+      checkInFlight.current = false
+      if (!background) setChecking(false)
+      setPolls((n) => n + 1)
     }
   }
+
+  // Poll while the only thing missing is the click on the email link, so the
+  // card flips to live without a Check status press. Never once Textile says
+  // confirmed: from there rfq/status seats the bot, which rewrites the config
+  // and restarts a running bot, so that call happens once, not on a timer.
+  // A blocked maker has nothing to wait for. Re-armed after every check.
+  const awaitingEmail = waiting && !makerFlagged && emailVerified !== true && editable
+  useEffect(() => {
+    if (!awaitingEmail || sending || checking) return
+    const timer = window.setTimeout(() => void checkStatus(true), pollMs)
+    return () => clearTimeout(timer)
+    // checkStatus is recreated every render; `polls` re-arms after each check.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [awaitingEmail, sending, checking, pollMs, polls])
 
   async function switchToRfqOnly() {
     setMigrating(true)

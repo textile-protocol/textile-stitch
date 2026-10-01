@@ -2,7 +2,7 @@
 // the whole Textile side in one place. A bot with no maker
 // credential gets the Connect form (an email, one button: register the bot
 // and send the confirmation link); a bot that is registered waits for the
-// link to be clicked. Either way it polls the panel's rfq/status every 30 s
+// link to be clicked. Either way it polls the panel's rfq/status every 5 s
 // (backing off to two minutes on venue errors) and, the moment Textile
 // reports the address confirmed, runs the shared start runner so the bot goes
 // live without another click.
@@ -35,7 +35,7 @@ export interface EmailVerifyWaitProps {
   initialError?: string | null
 }
 
-const CHECK_MS = 30_000
+const CHECK_MS = 5_000
 const CHECK_MAX_MS = 120_000
 
 /** Same bar the venue applies, so a typo stops here rather than at the venue. */
