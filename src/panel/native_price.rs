@@ -87,11 +87,14 @@ pub fn gas_token(chain_id: u64) -> Option<GasToken> {
             fallback_usd: 1000.0,
             tx_gas_usd: 5.0,
         },
+        // The L2s, Celo and Polygon budget 6 cents per approve, so the usual
+        // two Permit2 approvals clear on $0.12 of gas. A real approve there
+        // costs well under a cent; the rest is headroom for a gas spike.
         8453 | 84532 | 42161 | 4663 => GasToken {
             symbol: "ETH",
             coingecko_id: "ethereum",
             fallback_usd: 1000.0,
-            tx_gas_usd: 0.50,
+            tx_gas_usd: 0.06,
         },
         // BNB Smart Chain is the cheap one: gas sits at 0.05-0.1 gwei and an
         // approve is ~46k gas, so one costs well under a cent. A dollar here
@@ -107,13 +110,13 @@ pub fn gas_token(chain_id: u64) -> Option<GasToken> {
             symbol: "CELO",
             coingecko_id: "celo",
             fallback_usd: 0.05,
-            tx_gas_usd: 0.50,
+            tx_gas_usd: 0.06,
         },
         137 => GasToken {
             symbol: "POL",
             coingecko_id: "polygon-ecosystem-token",
             fallback_usd: 0.10,
-            tx_gas_usd: 0.50,
+            tx_gas_usd: 0.06,
         },
         _ => return None,
     })

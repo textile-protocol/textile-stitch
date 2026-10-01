@@ -1430,7 +1430,7 @@ mod tests {
 
         assert_eq!(v["gate"]["passes"], true, "{body}");
         assert_eq!(v["gate"]["minTokenUsd"], 20.0);
-        assert_eq!(v["gate"]["minGasUsd"], 1.0);
+        assert_eq!(v["gate"]["minGasUsd"], 0.12);
         assert_eq!(v["gate"]["fundedTokens"], json!(["USDT"]));
         assert_eq!(v["gate"]["approvalsMissing"], json!(["USDT", "cNGN"]));
         assert_eq!(v["gate"]["needsSide"], false);
@@ -2113,15 +2113,16 @@ mod tests {
     /// the gate has to ask for gas per transaction, per chain.
     #[test]
     fn the_gas_floor_scales_with_the_chain_and_the_approvals() {
-        // Celo: cheap, two approvals to send.
-        assert_eq!(min_gas_usd(42220, 2), 1.0);
-        assert_eq!(min_gas_usd(42220, 0), 0.5, "the start still needs gas");
+        // Celo: cheap, two approvals to send clear on 12 cents.
+        assert_eq!(min_gas_usd(42220, 2), 0.12);
+        assert_eq!(min_gas_usd(42220, 0), 0.06, "the start still needs gas");
         // Ethereum: two approves there are dollars, not cents. A flat $1 floor
         // used to certify a wallet that could not pay for one of them.
         assert_eq!(min_gas_usd(1, 2), 10.0);
         assert!(min_gas_usd(1, 1) > 1.0);
         // Base pays in ETH too, but at L2 prices.
-        assert_eq!(min_gas_usd(8453, 2), 1.0);
+        assert_eq!(min_gas_usd(8453, 2), 0.12);
+        assert_eq!(min_gas_usd(137, 2), 0.12);
         // BNB Smart Chain: two approves are fractions of a cent, so the gate
         // clears on a few cents of BNB rather than two dollars of it.
         assert_eq!(min_gas_usd(56, 2), 0.05);
