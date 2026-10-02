@@ -1,9 +1,10 @@
 // What the wallet holds, as one number, and how to keep reading it.
 //
-// The bot page's header, its Funds tab and every fleet row show the same
-// figure from the same read, so the rule for it lives here once: priced
-// sides summed, unpriced sides named, and nothing at all when nothing could
-// be priced, rather than a total that quietly reads low.
+// The bot page's header and its Funds tab show the same figure from the same
+// read, so the rule for it lives here once: priced sides summed, unpriced
+// sides named, and nothing at all when nothing could be priced, rather than a
+// total that quietly reads low. Fleet rows apply the same rule to the capital
+// alone, which for a vault maker is the vault and not its signing key.
 
 import { useCallback, useEffect, useState } from 'react'
 import { api } from './api'
@@ -33,32 +34,64 @@ export function walletDust(funding: Funding | null): FundingToken[] {
   )
 }
 
-/** Dollars the bot has, or null when nothing could be priced. */
-export function totalUsd(funding: Funding | null): number | null {
-  if (!funding) return null
-  const priced = [...allTokens(funding).map((t) => t.usd), funding.gas.usd].filter(
-    (u): u is number => u !== null,
-  )
+/** One priced or unpriced holding: a token row or the gas coin. */
+type Holding = Pick<FundingToken, 'symbol' | 'balance' | 'usd'>
+
+/** Everything the read produced: both addresses' tokens and the signer's gas. */
+function everything(funding: Funding): Holding[] {
+  return [...allTokens(funding), funding.gas]
+}
+
+/**
+ * What the bot quotes against. With a vault that is the vault's quotable
+ * inventory and nothing else: the signer wallet's gas and dust pay for
+ * transactions, they are not liquidity. Without a vault the wallet is the
+ * capital, gas included.
+ */
+function capital(funding: Funding): Holding[] {
+  return funding.capitalSource === 'vault' ? funding.tokens : everything(funding)
+}
+
+/** The priced holdings summed, or null when none could be priced. */
+function sumUsd(holdings: Holding[]): number | null {
+  const priced = holdings.map((h) => h.usd).filter((u): u is number => u !== null)
   if (priced.length === 0) return null
   return priced.reduce((a, b) => a + b, 0)
+}
+
+/** Symbols with a balance that could be read but not priced. The same token
+ * can come back unpriced at both addresses; it is one missing price to
+ * report, not two. */
+function unpricedIn(holdings: Holding[]): string[] {
+  return [
+    ...new Set(
+      holdings
+        .filter((h) => h.usd === null && h.balance !== null && h.balance !== '0')
+        .map((h) => h.symbol),
+    ),
+  ]
+}
+
+/** Dollars the bot has, or null when nothing could be priced. */
+export function totalUsd(funding: Funding | null): number | null {
+  return funding ? sumUsd(everything(funding)) : null
 }
 
 /** Symbols with a balance the panel could read but not price, the gas coin
  * included: a custom chain's coin with no dollar price is still money. */
 export function unpricedSymbols(funding: Funding | null): string[] {
-  if (!funding) return []
-  const held = (usd: number | null, balance: string | null) =>
-    usd === null && balance !== null && balance !== '0'
-  // The same token can come back unpriced at both addresses; it is one
-  // missing price to report, not two.
-  return [
-    ...new Set([
-      ...allTokens(funding)
-        .filter((t) => held(t.usd, t.balance))
-        .map((t) => t.symbol),
-      ...(held(funding.gas.usd, funding.gas.balance) ? [funding.gas.symbol] : []),
-    ]),
-  ]
+  return funding ? unpricedIn(everything(funding)) : []
+}
+
+/** Dollars of capital the bot quotes against: the vault's when there is one,
+ * else the same as `totalUsd`. Null when nothing could be priced. */
+export function capitalUsd(funding: Funding | null): number | null {
+  return funding ? sumUsd(capital(funding)) : null
+}
+
+/** `unpricedSymbols`, for the capital `capitalUsd` sums. */
+export function capitalUnpricedSymbols(funding: Funding | null): string[] {
+  return funding ? unpricedIn(capital(funding)) : []
 }
 
 /**

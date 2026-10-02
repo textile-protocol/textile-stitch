@@ -20,7 +20,8 @@ import {
   saveFleetOrder,
   type RowTotal,
 } from '../fleetOrder'
-import { totalUsd, unpricedSymbols } from '../funding'
+import { fundsFromVault } from '../capital'
+import { capitalUnpricedSymbols, capitalUsd } from '../funding'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
@@ -39,7 +40,8 @@ export default function Fleet() {
   const handoff = (useLocation().state as { note?: string } | null)?.note ?? null
   const [note, setNote] = useState<string | null>(handoff)
   // Dollar value per bot, read here rather than per row because the order
-  // of the list depends on it. Each bot is its own request, so one slow
+  // of the list depends on it. A vault maker is worth its vault, not the
+  // gas on the key that signs for it. Each bot is its own request, so one slow
   // chain leaves that bot's value unknown rather than stalling the rest.
   const [values, setValues] = useState<Record<string, RowTotal>>({})
   // The order rows render in, read once and kept for the visit: rows update in
@@ -94,8 +96,8 @@ export default function Fleet() {
             setValues((v) => ({
               ...v,
               [name]: {
-                usd: totalUsd(funding),
-                unpriced: unpricedSymbols(funding),
+                usd: capitalUsd(funding),
+                unpriced: capitalUnpricedSymbols(funding),
               },
             }))
             markSettled(name)
@@ -188,7 +190,7 @@ function BotRow({
   updateAvailable,
 }: {
   bot: Bot
-  /** The wallet's worth, undefined while unread. */
+  /** The capital's worth, undefined while unread. */
   value: RowTotal | undefined
   updateAvailable: boolean
 }) {
@@ -212,6 +214,7 @@ function BotRow({
               <span className="font-mono text-xs text-faint">{bot.name}</span>
             )}
             <StatePill state={bot.state} status={bot.status} venue={bot.config?.venue} />
+            {fundsFromVault(bot.config) && <Tag>vault</Tag>}
             {updateAvailable && <Tag>update available</Tag>}
             {!bot.container && <Tag>no container</Tag>}
           </div>
@@ -231,7 +234,7 @@ function BotRow({
             </div>
           )}
         </div>
-        {bot.config && <RowValue value={value} />}
+        {bot.config && <RowValue value={value} vaulted={fundsFromVault(bot.config)} />}
       </Link>
 
       {(blocking.length > 0 || advisory.length > 0) && (
@@ -265,16 +268,17 @@ function BotRow({
 
 const VALUE_POLL_MS = 5000
 
-/** The same figure and the same "+ unpriced" caveat as the bot page's header,
- * so a wallet holding an unpriceable balance never reads as a few dollars. */
-function RowValue({ value }: { value: RowTotal | undefined }) {
+/** The capital the bot quotes against, with the same "+ unpriced" caveat as
+ * the bot page's header, so a wallet holding an unpriceable balance never reads
+ * as a few dollars. For a vault maker that is the vault's quotable inventory. */
+function RowValue({ value, vaulted }: { value: RowTotal | undefined; vaulted: boolean }) {
   const usd = value?.usd ?? null
   const unpriced = value?.unpriced ?? []
   return (
     <span className="shrink-0 text-right sm:ml-auto">
       <span
         className="text-base font-bold tabular-nums text-ink"
-        title={value === undefined ? 'Reading the wallet' : 'Everything in the wallet, in dollars'}
+        title={rowValueTitle(value === undefined, vaulted)}
       >
         {usd === null ? <span className="text-faint">—</span> : formatUsd(usd)}
       </span>
@@ -285,4 +289,9 @@ function RowValue({ value }: { value: RowTotal | undefined }) {
       )}
     </span>
   )
+}
+
+function rowValueTitle(reading: boolean, vaulted: boolean): string {
+  if (reading) return vaulted ? 'Reading the vault' : 'Reading the wallet'
+  return vaulted ? 'What the vault can quote, in dollars' : 'Everything in the wallet, in dollars'
 }
