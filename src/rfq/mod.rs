@@ -683,6 +683,10 @@ async fn run(rt: RfqRuntime) {
                 backoff.note(&e);
             }
         }
+        if let Some(modules) = &rt.modules {
+            modules.quote_status(crate::modules::runtime::QuoteState::WaitingForSession,
+                "RFQ session disconnected or authentication incomplete. Check the RFQ connection and bot logs.", unix_now());
+        }
         tokio::time::sleep(backoff.next_delay()).await;
     }
 }
@@ -1380,12 +1384,29 @@ impl Engine {
     /// publishes nothing — the venue's >5 s gap rule takes the corridor dark,
     /// which is exactly the stale-feed behavior we want.
     fn level_frames(&mut self, prices: &PriceCache, now_ms: u64) -> Vec<MakerFrame> {
+        use crate::modules::runtime::QuoteState;
         self.sync_vault_epoch();
         let now_secs = now_ms / 1_000;
         let inventory = self.inventory.view(now_secs);
         let policy = self.vault_policy.read().ok().and_then(|g| *g);
         if self.vault.is_some() && policy.is_none() {
+            if let Some(modules) = &self.modules {
+                modules.quote_status(
+                    QuoteState::WaitingForVault,
+                    "Waiting for vault policy reads from RPC",
+                    now_secs,
+                );
+            }
             return Vec::new();
+        }
+        if self.books.is_empty() {
+            if let Some(modules) = &self.modules {
+                modules.quote_status(
+                    QuoteState::NoCorridor,
+                    "The RFQ venue has not accepted a matching corridor for this bot",
+                    now_secs,
+                );
+            }
         }
         self.module_tick(prices, now_secs);
         let order_caps: Vec<(Address, U256)> = policy
@@ -1401,13 +1422,24 @@ impl Engine {
             .filter_map(|book| {
                 if let Some(policy) = policy {
                     if !policy.matches_pair(book.debt, book.collateral) {
+                        if let Some(modules) = &self.modules {
+                            modules.quote_status(QuoteState::NoCorridor, "The configured tokens do not match this vault", now_secs);
+                        }
                         return None;
                     }
                 }
-                let quote = prices.get(&book.feed_url)?;
+                let Some(quote) = prices.get(&book.feed_url) else {
+                    if let Some(modules) = &self.modules {
+                        modules.quote_status(QuoteState::WaitingForPrice, "Waiting for the first reference price. Check the price feed and bot logs.", now_secs);
+                    }
+                    return None;
+                };
                 if is_stale(quote.timestamp, now_secs, book.staleness_secs)
                     || !is_price_usable(quote.price)
                 {
+                    if let Some(modules) = &self.modules {
+                        modules.quote_status(QuoteState::StalePrice, "Reference price is stale, future-dated or invalid. Check the price feed.", now_secs);
+                    }
                     return None;
                 }
                 let effective = self.module_book(book, &quote, now_secs)?;

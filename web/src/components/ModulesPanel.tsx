@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import DynamicSpreadsLive from './DynamicSpreadsLive'
+import {
+  HistoricalSimulationForm,
+  HistoricalAnalysis,
+} from './HistoricalSimulation'
 import { formatAtomic } from '../format'
 import {
   downloadJson,
@@ -8,6 +13,7 @@ import {
   type ModulesConfig,
   type ModulesView,
   type SimulationReport,
+  type HistoricalSimulation,
 } from '../modules'
 import {
   Banner,
@@ -42,6 +48,11 @@ export default function ModulesPanel({
   name: string
   editable: boolean
 }) {
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now() / 1000), 1000)
+    return () => clearInterval(timer)
+  }, [])
   const [view, setView] = useState<ModulesView | null>(null)
   const [draftRevision, setDraftRevision] = useState('')
   const [draft, setDraft] = useState<ModulesConfig | null>(null)
@@ -52,6 +63,9 @@ export default function ModulesPanel({
   const [dataset, setDataset] = useState<unknown>(null)
   const [fileName, setFileName] = useState('')
   const [report, setReport] = useState<SimulationReport | null>(null)
+  const [historical, setHistorical] = useState<HistoricalSimulation | null>(
+    null
+  )
   const [decisionFilter, setDecisionFilter] = useState('all')
 
   useEffect(() => {
@@ -79,7 +93,7 @@ export default function ModulesPanel({
     return error ? <ErrorState error={error} /> : <Loading what="modules" />
   const changed = JSON.stringify(draft) !== JSON.stringify(view.config)
   const status = view.status
-  const fresh = moduleStatusFresh(status, view.running, Date.now() / 1000)
+  const fresh = moduleStatusFresh(status, view.running, now)
   const latest = status?.decisions.at(-1)?.decision
   const activeConfig = status?.config
 
@@ -113,6 +127,7 @@ export default function ModulesPanel({
   }
   async function simulate() {
     if (!draft || !dataset) return
+    setHistorical(null)
     setBusy(true)
     setError(null)
     try {
@@ -125,6 +140,7 @@ export default function ModulesPanel({
     }
   }
   async function importFile(file: File | undefined) {
+    setHistorical(null)
     setReport(null)
     setDataset(null)
     setFileName('')
@@ -169,7 +185,7 @@ export default function ModulesPanel({
         </div>
         <span className="bg-hover rounded-full px-3 py-1 text-sm">
           {fresh && activeConfig
-            ? `${activeConfig.mode} · observing`
+            ? `${activeConfig.mode} · evaluating`
             : view.running
               ? 'Waiting for current telemetry'
               : 'Bot stopped'}
@@ -208,6 +224,7 @@ export default function ModulesPanel({
       )}
       {section === 'overview' && (
         <>
+          <DynamicSpreadsLive view={view} now={now} />
           <div className="grid gap-4 sm:grid-cols-3">
             <Card title="Corridor inventory">
               <p className="text-3xl font-bold">
@@ -218,7 +235,13 @@ export default function ModulesPanel({
                 yield.
               </p>
             </Card>
-            <Card title="Proposed buy / sell spread">
+            <Card
+              title={
+                activeConfig?.mode === 'live'
+                  ? 'Quote policy · buy / sell'
+                  : 'Proposed buy / sell spread'
+              }
+            >
               <p className="text-xl font-bold">
                 {fresh && latest
                   ? `${spread(latest.buy_bps)} / ${spread(latest.sell_bps)}`
@@ -271,9 +294,10 @@ export default function ModulesPanel({
           )}
           {!status?.decisions.length && (
             <Banner tone="info">
-              No decisions yet. Start the bot with modules enabled to collect
-              observations. Imported historical data can be simulated while the
-              bot is stopped.
+              Evaluations start once the running bot has an authenticated RFQ
+              session, an accepted corridor, fresh prices and vault data. No
+              customer trade is required. Historical simulations also work while
+              the bot is stopped.
             </Banner>
           )}
         </>
@@ -519,10 +543,32 @@ export default function ModulesPanel({
           </p>
         </>
       )}
-      {section === 'simulation' && (
-        <>
+      <div className={section === 'simulation' ? 'contents' : 'hidden'}>
+        <HistoricalSimulationForm
+          name={name}
+          config={draft}
+          settlementDecimals={view.settlement_decimals}
+          corridorDecimals={Number(view.dataset_template.corridor_decimals)}
+          busy={busy}
+          onStart={() => {
+            setBusy(true)
+            setError(null)
+            setReport(null)
+            setHistorical(null)
+          }}
+          onResult={(result) => {
+            setHistorical(result)
+            setReport(result.report)
+          }}
+          onError={setError}
+          onDone={() => setBusy(false)}
+        />
+        <details className="text-sm">
+          <summary className="mb-3 cursor-pointer font-bold">
+            Advanced: import your own dataset
+          </summary>
           <Card
-            title="Test historical activity"
+            title="Import historical activity"
             action={
               <Button
                 onClick={() =>
@@ -544,6 +590,7 @@ export default function ModulesPanel({
             <Field label="Historical dataset (JSON)">
               <Input
                 type="file"
+                disabled={busy}
                 accept=".json,application/json"
                 onChange={(e) => void importFile(e.target.files?.[0])}
               />
@@ -555,7 +602,7 @@ export default function ModulesPanel({
             </p>
             <Button
               variant="primary"
-              disabled={!dataset}
+              disabled={!dataset || busy}
               busy={busy}
               onClick={() => void simulate()}
             >
@@ -595,131 +642,137 @@ export default function ModulesPanel({
               </p>
             </details>
           </Card>
-          {report && (
-            <>
-              <Banner tone="warning">
-                Conditional simulation. Fixed customer activity and immediate
-                settlement can overstate real returns.{' '}
-                {report.dealer_observations === 0
-                  ? 'No dealer observations: no spot rebalance fills are simulated.'
+        </details>
+        {historical && <HistoricalAnalysis result={historical} />}
+        {report && (
+          <>
+            <Banner tone="warning">
+              Conditional simulation. Fixed customer activity and immediate
+              settlement can overstate real returns.{' '}
+              {report.dealer_observations === 0
+                ? 'No dealer observations: no spot rebalance fills are simulated.'
+                : historical?.options.dealer_scenario
+                  ? `${report.dealer_observations.toLocaleString()} hypothetical dealer opportunities modeled.`
                   : `${report.dealer_observations.toLocaleString()} dealer observations supplied.`}
-              </Banner>
-              <Card
-                title="Portfolio value over time"
-                action={
-                  <Button
-                    onClick={() =>
-                      downloadJson('stitch-module-simulation.json', report)
-                    }
-                  >
-                    Export results
-                  </Button>
-                }
-              >
-                <svg
-                  viewBox="0 0 700 200"
-                  role="img"
-                  aria-label="Simulated baseline and module portfolio values over time"
-                  className="w-full"
+            </Banner>
+            <Card
+              title="Portfolio value over time"
+              action={
+                <Button
+                  onClick={() =>
+                    downloadJson(
+                      'stitch-module-simulation.json',
+                      historical ?? report
+                    )
+                  }
                 >
-                  <polyline
-                    points={equityCoordinates(report.equity, 'baseline')}
-                    fill="none"
-                    stroke="currentColor"
-                    opacity="0.4"
-                    strokeWidth="2"
-                  />
-                  <polyline
-                    points={equityCoordinates(report.equity, 'candidate')}
-                    fill="none"
-                    stroke="var(--tx-accent)"
-                    strokeWidth="3"
-                  />
-                </svg>
-                <p className="text-muted text-xs">
-                  Gray: baseline · Purple: draft modules ·{' '}
-                  {clock(report.equity[0]?.at ?? 0)} –{' '}
-                  {clock(report.equity.at(-1)?.at ?? 0)}
-                </p>
-                <div className="mt-4 overflow-x-auto">
-                  <table className="w-full text-left text-sm">
-                    <thead>
-                      <tr>
-                        <th className="py-2">Metric</th>
-                        <th>Baseline</th>
-                        <th>With modules</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(
+                  Export results
+                </Button>
+              }
+            >
+              <svg
+                viewBox="0 0 700 200"
+                role="img"
+                aria-label="Simulated baseline and module portfolio values over time"
+                className="w-full"
+              >
+                <polyline
+                  points={equityCoordinates(report.equity, 'baseline')}
+                  fill="none"
+                  stroke="currentColor"
+                  opacity="0.4"
+                  strokeWidth="2"
+                />
+                <polyline
+                  points={equityCoordinates(report.equity, 'candidate')}
+                  fill="none"
+                  stroke="var(--tx-accent)"
+                  strokeWidth="3"
+                />
+              </svg>
+              <p className="text-muted text-xs">
+                Gray: baseline · Purple: draft modules ·{' '}
+                {clock(report.equity[0]?.at ?? 0)} –{' '}
+                {clock(report.equity.at(-1)?.at ?? 0)}
+              </p>
+              <div className="mt-4 overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead>
+                    <tr>
+                      <th className="py-2">Metric</th>
+                      <th>Baseline</th>
+                      <th>With modules</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(
+                      [
                         [
-                          [
-                            'Net return',
-                            (m) =>
-                              `${m.return_pct.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`,
-                          ],
-                          [
-                            'Ending value (settlement)',
-                            (m) =>
-                              formatAtomic(
-                                m.ending_nav,
-                                view.settlement_decimals
-                              ),
-                          ],
-                          [
-                            'Maximum drawdown',
-                            (m) => percent(m.max_drawdown_bps),
-                          ],
-                          [
-                            'Highest corridor share',
-                            (m) => percent(m.max_inventory_bps),
-                          ],
-                          [
-                            'Customer fills',
-                            (m) => m.customer_fills.toLocaleString(),
-                          ],
-                          [
-                            'Spot rebalance fills',
-                            (m) => m.rebalance_fills.toLocaleString(),
-                          ],
-                          [
-                            'Execution costs (settlement)',
-                            (m) =>
-                              formatAtomic(
-                                m.execution_costs,
-                                view.settlement_decimals
-                              ),
-                          ],
-                        ] satisfies [
-                          string,
-                          (m: SimulationReport['baseline']) => string,
-                        ][]
-                      ).map(([label, render]) => (
-                        <tr className="border-line-soft border-t" key={label}>
-                          <td className="py-2">{label}</td>
-                          <td>{render(report.baseline)}</td>
-                          <td>{render(report.candidate)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <p className="text-muted mt-3 text-xs">
-                  Results use the draft captured when this run started. Re-run
-                  after changing settings.
-                </p>
-              </Card>
-              <Card title="Assumptions and limitations">
-                <ul className="text-muted space-y-2 text-sm">
-                  {report.assumptions.map((a) => (
-                    <li key={a}>{a}</li>
-                  ))}
-                </ul>
-              </Card>
-            </>
-          )}
-        </>
-      )}
+                          'Modeled return',
+                          (m) =>
+                            `${m.return_pct.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`,
+                        ],
+                        [
+                          'Ending value (settlement)',
+                          (m) =>
+                            formatAtomic(
+                              m.ending_nav,
+                              view.settlement_decimals
+                            ),
+                        ],
+                        [
+                          'Maximum drawdown',
+                          (m) => percent(m.max_drawdown_bps),
+                        ],
+                        [
+                          'Highest corridor share',
+                          (m) => percent(m.max_inventory_bps),
+                        ],
+                        [
+                          'Customer fills',
+                          (m) => m.customer_fills.toLocaleString(),
+                        ],
+                        [
+                          'Spot rebalance fills',
+                          (m) => m.rebalance_fills.toLocaleString(),
+                        ],
+                        [
+                          'Execution costs (settlement)',
+                          (m) =>
+                            formatAtomic(
+                              m.execution_costs,
+                              view.settlement_decimals
+                            ),
+                        ],
+                      ] satisfies [
+                        string,
+                        (m: SimulationReport['baseline']) => string,
+                      ][]
+                    ).map(([label, render]) => (
+                      <tr className="border-line-soft border-t" key={label}>
+                        <td className="py-2">{label}</td>
+                        <td>{render(report.baseline)}</td>
+                        <td>{render(report.candidate)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-muted mt-3 text-xs">
+                Results use the draft captured when this run started. Re-run
+                after changing settings.
+              </p>
+            </Card>
+            <Card title="Assumptions and limitations">
+              <ul className="text-muted space-y-2 text-sm">
+                {report.assumptions.map((a) => (
+                  <li key={a}>{a}</li>
+                ))}
+              </ul>
+            </Card>
+          </>
+        )}
+      </div>
       {section === 'decisions' && (
         <Card
           title="Recent decisions"

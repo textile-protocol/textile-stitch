@@ -147,6 +147,85 @@ pub async fn simulate(
     Ok(Json(report))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoricalSimulation {
+    pub config: ModulesConfig,
+    pub options: crate::modules::history::Options,
+}
+
+pub async fn simulate_history(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<HistoricalSimulation>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::modules::history;
+    let (_lock, bot) = super::bots::lock_config(&name, &state).await?;
+    let (_, raw, cfg) = read(&bot)?;
+    body.config.validate().map_err(ApiError::bad_request)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(ApiError::bad_request)?
+        .as_secs();
+    body.options.validate(now).map_err(ApiError::bad_request)?;
+    let book = crate::rfq::responder::book_from_pool(
+        &cfg.pools[0],
+        &cfg.feed.url,
+        crate::config::rfq_staleness_secs_for_pool(&cfg.feed, &cfg.pools[0]),
+    )
+    .map_err(ApiError::bad_request)?
+    .ok_or_else(|| ApiError::bad_request("No quotable corridor"))?;
+    let source = history::collect(&cfg, &body.options)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let (dataset, coverage) = history::dataset(&source, &body.options, book.staleness_secs)
+        .map_err(ApiError::bad_request)?;
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let mut report = replay::run(&dataset, &body.config, &book)?;
+        // Replace imported-data descriptions with the assumptions actually used
+        // by automatic collection. Keep the common execution/accounting limits.
+        report.assumptions[1] = "Observed fill prices are proxy customer acceptance limits. Rejected requests and how demand changes with a different quote are unknown; a rejected historical fill is not proof of an avoided loss.".into();
+        report.assumptions[2] = if body.options.dealer_scenario.is_some() {
+            "Hypothetical dealer scenario: depth replenishes at each fresh price observation, at the entered discount. No historical dealer availability or execution is established.".into()
+        } else {
+            "No historical executable dealer quotes are stored. Spot rebalance fills are disabled; use an explicit hypothetical dealer scenario to explore that module.".into()
+        };
+        report.assumptions.push("Textile reference observations are a proxy for the operator feed, including any historical center adjustments. Publication and database ingestion must both precede use. Same-second prices precede fills; intra-block ordering is unknown.".into());
+        report.assumptions.push("Baseline uses the bot's current quote settings with modules disabled, not its realized historical strategy. Starting free balances, reserves and order caps come from the archived vault. Later capital flows, changes in restrictions and off-venue trades are excluded.".into());
+        report.assumptions.push("Dynamic spreads start with an empty rolling window and warm up during this run. Only stored observations are used; moves between samples and unrecorded operator-feed adjustments are unknown.".into());
+        if body.options.cost_per_trade.is_zero() {
+            report.assumptions.push("Execution cost is set to zero. Returns are before unrecorded gas and execution costs, not net investor returns.".into());
+        }
+        let delta = report.candidate.return_pct - report.baseline.return_pct;
+        let conclusion = if coverage.replayed_trades == 0 {
+            "No customer trades could be evaluated. This period cannot establish whether inventory balancing or dynamic spreads improve execution."
+        } else if coverage.skipped_stale_trades > 0 || coverage.fresh_seconds < coverage.total_seconds {
+            "Incomplete price coverage limits this comparison. Review the skipped trades and try a better-covered period before drawing a conclusion."
+        } else {
+            "This is evidence for this fixed activity scenario only. Test other periods and execution costs before choosing parameters; historical fills alone cannot establish future profitability."
+        };
+        Ok(serde_json::json!({
+            "report": report, "dataset": dataset, "options": body.options, "coverage": coverage,
+            "source": {
+                "vault": source.vault, "chain_id": source.chain_id,
+                "from": source.from, "to": source.to, "collected_at": source.collected_at,
+                "price_source": source.price_source, "indexed_through": source.indexed_through,
+                "snapshot": source.snapshot, "config_revision": revision(&raw),
+                "staleness_secs": book.staleness_secs,
+                "baseline_settings": history::baseline_settings(&book),
+            },
+            "analysis": {
+                "return_delta_pp": delta,
+                "drawdown_delta_bps": i64::from(report.candidate.max_drawdown_bps) - i64::from(report.baseline.max_drawdown_bps),
+                "inventory_delta_bps": i64::from(report.candidate.max_inventory_bps) - i64::from(report.baseline.max_inventory_bps),
+                "fill_delta": i64::from(report.candidate.customer_fills) - i64::from(report.baseline.customer_fills),
+                "conclusion": conclusion,
+            }
+        }))
+    }).await.map_err(ApiError::bad_request)?.map_err(ApiError::bad_request)?;
+    Ok(Json(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testkit::{harness, Harness, TEST_KEY};
@@ -190,6 +269,10 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         let config = serde_json::to_value(ModulesConfig::default()).unwrap();
+        assert_eq!(h.post_json(
+            "/api/bots/bot-a/modules/simulate-history",
+            serde_json::json!({"config":config, "options":{"from":1000,"to":1600,"cost_per_trade":"0","dealer_scenario":null}}),
+        ).await.0, StatusCode::NOT_FOUND);
         assert_eq!(
             h.put_json(
                 "/api/bots/bot-a/modules",

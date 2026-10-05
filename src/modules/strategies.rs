@@ -42,7 +42,16 @@ pub fn inventory(cfg: &InventoryConfig, ctx: &Context, share: u32) -> QuotePropo
     }
 }
 
-pub fn spread_extra(cfg: &SpreadsConfig, now: u64, history: &[PricePoint]) -> Option<u32> {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpreadWindow {
+    pub samples: usize,
+    pub history_secs: u64,
+    pub low: Option<f64>,
+    pub high: Option<f64>,
+    pub extra_bps: Option<u32>,
+}
+
+pub fn spread_window(cfg: &SpreadsConfig, now: u64, history: &[PricePoint]) -> SpreadWindow {
     let points: Vec<_> = history
         .iter()
         .filter(|p| {
@@ -52,14 +61,27 @@ pub fn spread_extra(cfg: &SpreadsConfig, now: u64, history: &[PricePoint]) -> Op
                 && p.price > 0.0
         })
         .collect();
-    let first = points.first()?;
-    let last = points.last()?;
-    if last.timestamp.saturating_sub(first.timestamp) < cfg.warmup_secs {
-        return None;
-    }
+    let history_secs = points
+        .first()
+        .zip(points.last())
+        .map_or(0, |(first, last)| {
+            last.timestamp.saturating_sub(first.timestamp)
+        });
     let low = points.iter().map(|p| p.price).fold(f64::INFINITY, f64::min);
     let high = points.iter().map(|p| p.price).fold(0.0, f64::max);
-    Some((((high / low - 1.0) * 10_000.0 * cfg.multiplier).ceil() as u32).min(cfg.max_extra_bps))
+    SpreadWindow {
+        samples: points.len(),
+        history_secs,
+        low: (!points.is_empty()).then_some(low),
+        high: (!points.is_empty()).then_some(high),
+        extra_bps: (history_secs >= cfg.warmup_secs && !points.is_empty()).then(|| {
+            (((high / low - 1.0) * 10_000.0 * cfg.multiplier).ceil() as u32).min(cfg.max_extra_bps)
+        }),
+    }
+}
+
+pub fn spread_extra(cfg: &SpreadsConfig, now: u64, history: &[PricePoint]) -> Option<u32> {
+    spread_window(cfg, now, history).extra_bps
 }
 
 pub fn rebalance(

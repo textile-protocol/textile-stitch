@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Adapter between pure module decisions and RFQ's sole order/reservation owner.
 use super::*;
+use crate::modules::runtime::QuoteState;
 use crate::modules::{self as policy, dealer, Context, Mode};
 use crate::protocol::types::OrderParams;
 use tokio::sync::oneshot;
@@ -96,10 +97,16 @@ impl Engine {
         let changes_quotes = modules.config.mode == Mode::Live
             && (modules.config.inventory.enabled || modules.config.spreads.enabled);
         let Some(context) = self.module_context(book, quote, now) else {
+            modules.quote_status(
+                QuoteState::WaitingForVault,
+                "Waiting for vault balances, quote inventory and a matching token pair",
+                now,
+            );
             modules.status("Waiting for fresh vault balances and matching corridor orientation");
             // Observation and rebalancing must not gate otherwise unchanged quotes.
             return (!changes_quotes).then(|| book.clone());
         };
+        modules.quote_status(QuoteState::Evaluating, "Evaluating the quote policy", now);
         let decision = modules.decide(&context);
         Some(if changes_quotes {
             policy::apply(book, &decision)

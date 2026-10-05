@@ -27,6 +27,35 @@ pub struct Observation {
     pub settlement: U256,
     #[serde(with = "atomic")]
     pub corridor: U256,
+    /// Optional for status files written by older bot releases.
+    #[serde(default)]
+    pub inputs: Option<DecisionInputs>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DecisionInputs {
+    pub price_at: u64,
+    pub balances_at: u64,
+    pub base_buy_bps: Option<u32>,
+    pub base_sell_bps: Option<u32>,
+    pub inventory_buy_bps: Option<u32>,
+    pub inventory_sell_bps: Option<u32>,
+    pub spread_window: super::strategies::SpreadWindow,
+}
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteState {
+    WaitingForSession,
+    WaitingForVault,
+    WaitingForPrice,
+    StalePrice,
+    NoCorridor,
+    Evaluating,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct QuoteStatus {
+    pub at: u64,
+    pub state: QuoteState,
+    pub message: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -36,6 +65,8 @@ pub struct Status {
     pub decisions: Vec<Observation>,
     pub rebalance_status: String,
     pub next_attempt_at: u64,
+    #[serde(default)]
+    pub quote_status: Option<QuoteStatus>,
 }
 #[derive(Serialize, Deserialize)]
 struct Attempt {
@@ -55,7 +86,7 @@ pub struct Runtime {
     pub balances: Arc<RwLock<Option<Balances>>>,
     state: Arc<Mutex<State>>,
     dir: PathBuf,
-    writer: tokio::sync::mpsc::Sender<Status>,
+    writer: tokio::sync::watch::Sender<Status>,
 }
 impl Runtime {
     pub fn new(config: ModulesConfig, dir: &Path) -> Result<Self> {
@@ -77,13 +108,21 @@ impl Runtime {
             decisions: vec![],
             rebalance_status: "Waiting for fresh vault data".into(),
             next_attempt_at,
+            quote_status: Some(QuoteStatus {
+                at: crate::time::unix_now(),
+                state: QuoteState::WaitingForSession,
+                message: "Waiting for an authenticated RFQ session".into(),
+            }),
         };
         // Write an initial snapshot synchronously: unwritable storage must fail startup.
         crate::setup::write_toml_atomic(&dir.join(STATUS_FILE), &serde_json::to_string(&status)?)?;
-        let (writer, mut receiver) = tokio::sync::mpsc::channel::<Status>(1);
+        // A slow disk may coalesce snapshots, but must keep the latest state
+        // (especially disconnects) rather than dropping it behind an old write.
+        let (writer, mut receiver) = tokio::sync::watch::channel(status.clone());
         let status_path = dir.join(STATUS_FILE);
         tokio::spawn(async move {
-            while let Some(snapshot) = receiver.recv().await {
+            while receiver.changed().await.is_ok() {
+                let snapshot = receiver.borrow_and_update().clone();
                 let path = status_path.clone();
                 let write = tokio::task::spawn_blocking(move || -> Result<()> {
                     crate::setup::write_toml_atomic(&path, &serde_json::to_string(&snapshot)?)
@@ -130,6 +169,23 @@ impl Runtime {
             history.drain(..history.len() - 3601);
         }
         let decision = evaluate(&self.config, context, history);
+        let inventory = decision
+            .inventory_bps
+            .filter(|_| self.config.inventory.enabled)
+            .map(|share| strategies::inventory(&self.config.inventory, context, share));
+        let inputs = DecisionInputs {
+            price_at: context.price_at,
+            balances_at: context.balances_at,
+            base_buy_bps: context.base_buy_bps,
+            base_sell_bps: context.base_sell_bps,
+            inventory_buy_bps: inventory
+                .as_ref()
+                .map_or(context.base_buy_bps, |p| p.buy_bps),
+            inventory_sell_bps: inventory
+                .as_ref()
+                .map_or(context.base_sell_bps, |p| p.sell_bps),
+            spread_window: strategies::spread_window(&self.config.spreads, context.now, history),
+        };
         if state
             .status
             .decisions
@@ -141,20 +197,39 @@ impl Runtime {
                 price: context.price,
                 settlement: context.settlement,
                 corridor: context.corridor,
+                inputs: Some(inputs),
             });
             if state.status.decisions.len() > MAX_DECISIONS {
                 state.status.decisions.remove(0);
             }
             state.status.at = context.now;
-            let _ = self.writer.try_send(state.status.clone());
+            let _ = self.writer.send_replace(state.status.clone());
         }
         decision
+    }
+    /// Diagnostic only. Never changes quote eligibility, prices or reservations.
+    pub fn quote_status(&self, state: QuoteState, message: &str, now: u64) {
+        let mut s = self.state.lock().expect("module state poisoned");
+        if s.status
+            .quote_status
+            .as_ref()
+            .is_some_and(|q| q.at == now && q.state == state && q.message == message)
+        {
+            return;
+        }
+        s.status.quote_status = Some(QuoteStatus {
+            at: now,
+            state,
+            message: message.into(),
+        });
+        s.status.at = now;
+        let _ = self.writer.send_replace(s.status.clone());
     }
     pub fn status(&self, message: impl Into<String>) {
         let mut s = self.state.lock().expect("module state poisoned");
         s.status.rebalance_status = message.into();
         s.status.at = crate::time::unix_now();
-        let _ = self.writer.try_send(s.status.clone());
+        let _ = self.writer.send_replace(s.status.clone());
     }
     /// Persist pacing BEFORE any network request. Restarts never reset it.
     pub fn begin_quote(&self, request: dealer::QuoteRequest) -> Result<()> {

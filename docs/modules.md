@@ -51,6 +51,14 @@ order_lifetime_secs = 60
 
 Numbers are starter configuration, not recommendations for a particular currency. Measure feed quality, market depth and trading costs before selecting live parameters.
 
+## Live visibility
+
+Open **Modules → Overview → Dynamic spreads · live monitor**. It shows the running mode, dynamic addition on each enabled side, observed high/low range, number of source samples and warmup progress. The breakdown separates base spreads, inventory adjustments and the final module quote policy. The chart and recent changes use the last 200 recorded evaluations; they are quote calculations, not executed trades.
+
+Live mode alone does not produce observations. The bot must be running with an authenticated RFQ session, an accepted corridor, a fresh reference price and vault data. No customer trade is required: the level-publication loop evaluates the policy. Waiting for a connection, RPC data or a usable feed is reported separately from a blocked evaluation. Zero extra spread is valid when sampled prices are unchanged, or when the multiplier/cap is zero. Warmup advances with new source timestamps, not repeated polling of the same price.
+
+The panel polls every five seconds and expires live readings independently of successful requests. It keeps old history visible but does not call it current. Running settings remain authoritative when saved settings differ after a failed or pending restart. Update both the bot and the panel to get input breakdowns and connection diagnostics; older status files still load, with an explanation of the missing details. Telemetry writes coalesce to the newest snapshot so a slow disk does not discard a later disconnect behind an older evaluation.
+
 ## Dealer execution
 
 The existing Textile RFQ endpoint serves customer-initiated requests; it cannot make this vault spend as a taker. Stitch therefore exposes a dealer adapter that reuses existing constrained vault orders, the Warp co-signer and the reactor / VaultOrderExecutor. No contracts change. **A compatible dealer must be supplied; this PR does not deploy a buyer or imply that any corridor has liquidity.** Without one, the panel reports that a spot sale is indicated but cannot execute.
@@ -87,7 +95,21 @@ The reservation file and `modules-attempt.json` must survive restarts. An unread
 
 ## Historical simulation
 
-The Modules panel accepts a historical JSON dataset and compares a baseline portfolio against a separate portfolio running the selected draft policies. It calls the same pure strategy functions used for live quoting. Each portfolio starts from the same holdings and evolves from its own simulated fills. A later observed balance never overwrites its holdings.
+Choose a period in **Modules → Historical simulation**, enter your estimated execution cost, and select **Collect data and run**. JSON upload is optional under Advanced. Collection uses the Textile API configured by `indexer_url`; the browser cannot supply an arbitrary data-service URL. It requires the same `modules_enabled = true` flag as the rest of Modules. It never saves settings, starts the bot, signs, or sends transactions.
+
+The collector resolves the registered vault's exact chain and token pair. It reads free balances, reserves and order limits at the last block **strictly before** the period starts, loads raw `MarketRateObservation` rows for the corridor's registered reference source, and fetches maker-attributed swaps from a pinned subgraph snapshot. No new recording setup or database migration is needed. Both database ingestion and source observation must precede use of a price. Late older observations cannot rewind the simulated feed.
+
+The API must have archive-capable RPC access, a registered vault, stored prices and a healthy trade index covering the requested end time. Missing archive state, missing boundary prices, incomplete trade history and oversized periods produce actionable errors. Current balances never replace unavailable historical balances. Periods span 5 minutes to 30 days and end at least 5 minutes ago; presets end 10 minutes ago. Raw collection is capped at 10,000 prices and 5,000 swaps, and the combined replay at 10,000 events. Shorten dense periods instead of silently downsampling volatility. The public data endpoint is restricted to known vaults, shares the chain read budget, and coalesces requests in a bounded cache.
+
+The report compares a baseline portfolio using the **current quote settings with modules disabled** against a separate portfolio running the selected draft policies. It calls the same pure strategy functions used for live quoting. Each portfolio starts from the same archived free holdings and evolves from its own simulated fills. Later observed balances never overwrite either portfolio. This is a fixed-capital experiment, not reconstruction of realized vault or LP returns.
+
+Results show return differences, drawdown, peak corridor exposure, fills, modeled execution costs and portfolio value over time. The data section shows the source, actual requested period, starting block, index coverage, fresh-price coverage, largest observation gap and stale-price trades skipped. Export the collected replay dataset or the full result including captured parameters, baseline quote settings, source metadata, coverage and assumptions. A run without customer trades cannot establish the benefit of quote strategies; incomplete coverage is called out in the conclusion.
+
+Automatic collection uses executed fill prices as **proxy customer limits**. It cannot discover rejected RFQs or customer willingness to pay different prices. Stored reference prices may differ from the operator's adjusted feed, and sparse observations miss price moves between samples. Dynamic spreads warm up from an empty rolling window during each run. Same-second prices precede fills, whose intra-block order is unknown. Changing spreads may reject historical trades without proving that those losses could actually have been avoided.
+
+Historical executable dealer quotes are not currently stored, so the automatic default simulates no spot rebalance fills. The optional **hypothetical dealer scenario** uses the entered price discount and corridor-token depth, replenished on each fresh price observation. Results label this assumption explicitly; it is not evidence of executable historical liquidity. Keep the rebalance module enabled in the draft to evaluate it. Test different depth, discount and execution-cost assumptions.
+
+### Optional JSON import
 
 Download the empty template in the panel. Fill in the actual chain, asset pair, token precisions, initial balances, per-order limits, reserves and settlement-denominated execution cost per fill. Add chronological events:
 
@@ -112,7 +134,7 @@ This event is illustrative. `at` is when data became available to the strategy; 
 
 Customer fills require an acceptable price and sufficient funds. Spot sales require dealer prices and depth in the dataset: absent observations mean zero simulated rebalance fills. Dealer prices must be net of spread, slippage and dealer fees. `cost_per_trade` adds settlement-denominated gas/other execution costs to every modeled fill. Compare multiple cost assumptions, calm periods and falling-currency periods. Exports include the selected configuration and all model limitations.
 
-This is a conditional simulation with immediate settlement. It does not model latency, concurrent quote reservations, failed transactions, demand changes, deposits/withdrawals, yield accrual, or management/performance fees. It can overstate achievable results. Results are simulated net return, marked portfolio value, drawdown, maximum exposure, fill counts and costs; they are not realized LP returns or evidence of future profit. Data is limited to 10,000 events and a 1.9 MB upload. Existing historical activity is not silently relabeled as executable dealer liquidity.
+This is a conditional simulation with immediate settlement. It does not model latency, concurrent quote reservations, failed transactions, demand changes, deposits/withdrawals, yield accrual, changing vault restrictions, off-venue trades, or management/performance fees. It can overstate achievable results. Returns deduct only the costs entered; zero cost means before unrecorded execution expenses. Results are not realized LP returns or evidence of future profit. Imported data is limited to 10,000 events and a 1.9 MB upload. Existing historical activity is not silently relabeled as executable dealer liquidity.
 
 ## Implementation boundary
 

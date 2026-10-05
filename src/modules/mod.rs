@@ -4,6 +4,7 @@
 //! Modules never receive a signer, RPC client or authority to move funds.
 pub mod config;
 pub mod dealer;
+pub mod history;
 pub mod replay;
 pub mod runtime;
 mod strategies;

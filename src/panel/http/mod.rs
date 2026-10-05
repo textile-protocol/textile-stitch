@@ -304,6 +304,10 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             get(modules::show).put(modules::update),
         )
         .route("/api/bots/{name}/modules/simulate", post(modules::simulate))
+        .route(
+            "/api/bots/{name}/modules/simulate-history",
+            post(modules::simulate_history),
+        )
         .route("/api/bots/{name}/settings", get(settings::show))
         .route("/api/bots/{name}/settings", patch(settings::update))
         .route("/api/bots/{name}/rfq/enroll", post(enroll::enroll))

@@ -370,6 +370,85 @@ async fn dealer_pacing_survives_restart_and_corrupt_pacing_blocks_start() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test]
+async fn recorded_spread_inputs_explain_the_decision_and_read_legacy_status() {
+    let dir =
+        std::env::temp_dir().join(format!("stitch-spread-telemetry-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = ModulesConfig::default();
+    let rt = runtime::Runtime::new(cfg, &dir).unwrap();
+    let path = dir.join(runtime::STATUS_FILE);
+    async fn read_at(path: &std::path::Path, at: u64) -> serde_json::Value {
+        for _ in 0..100 {
+            let value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            if value["decisions"]
+                .as_array()
+                .and_then(|v| v.last())
+                .is_some_and(|v| v["decision"]["at"] == at)
+            {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("telemetry snapshot was not written");
+    }
+    let mut ctx = Context {
+        settlement: u(70_000_000),
+        corridor: u(30_000_000),
+        ..context()
+    };
+    assert!(rt.decide(&ctx).blocked);
+    let first = read_at(&path, 100).await;
+    assert_eq!(
+        first["decisions"][0]["inputs"]["spread_window"]["extra_bps"],
+        serde_json::Value::Null
+    );
+    ctx.now = 140;
+    ctx.price_at = 140;
+    ctx.balances_at = 140;
+    ctx.price = 1.01;
+    let d = rt.decide(&ctx);
+    assert!(!d.blocked);
+    let mut value = read_at(&path, 140).await;
+    let inputs = &value["decisions"][1]["inputs"];
+    assert_eq!(inputs["spread_window"]["samples"], 2);
+    assert_eq!(inputs["spread_window"]["history_secs"], 40);
+    assert_eq!(inputs["spread_window"]["low"], 1.0);
+    assert_eq!(inputs["spread_window"]["high"], 1.01);
+    assert_eq!(inputs["spread_window"]["extra_bps"], d.volatility_bps);
+    assert_eq!(inputs["base_buy_bps"], 20);
+    assert_eq!(
+        d.buy_bps.unwrap(),
+        inputs["inventory_buy_bps"].as_u64().unwrap() as u32 + d.volatility_bps
+    );
+    // A burst before the writer can run must retain the final diagnostic.
+    for at in 141..150 {
+        rt.quote_status(runtime::QuoteState::WaitingForSession, "Disconnected", at);
+    }
+    for _ in 0..100 {
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if snapshot["quote_status"]["at"] == 149 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(snapshot["quote_status"]["at"], 149);
+    assert_eq!(snapshot["quote_status"]["state"], "waiting_for_session");
+    value.as_object_mut().unwrap().remove("quote_status");
+    for observation in value["decisions"].as_array_mut().unwrap() {
+        observation.as_object_mut().unwrap().remove("inputs");
+    }
+    let legacy: runtime::Status = serde_json::from_value(value).unwrap();
+    assert!(legacy.quote_status.is_none());
+    assert!(legacy.decisions.iter().all(|o| o.inputs.is_none()));
+    drop(rt);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn economic_inventory_includes_settlement_that_is_not_currently_quotable() {
     let ctx = Context {
