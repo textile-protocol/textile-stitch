@@ -35,6 +35,15 @@
 //! approval still outstanding — otherwise the gate would certify a wallet with
 //! a dollar of ETH on it and the second approve would die for gas.
 //!
+//! A corridor that trades the chain's gas coin as an ERC-20 (CELO on Celo)
+//! reads the same coins twice: once as its token row, once as gas. Those
+//! coins are split, not counted twice. The signer wallet's row for that token
+//! shows what the bot can quote, the balance less the gas reserve
+//! ([`crate::chain::gas_reserve`]), and the gas row shows the rest: the
+//! reserve, or the whole balance when it holds less. So the gas check weighs
+//! only the coins the bot will keep for gas, and the remove gate counts each
+//! coin once.
+//!
 //! Everything after the config parse is a 200. A chain that won't answer, a
 //! feed that is down, a price nobody can find — each of those degrades its own
 //! row to "unknown" with a reason, never the whole request, because the screen
@@ -56,6 +65,7 @@ use super::allowances::{read_allowance, short_token, token_symbols};
 use super::settings::config_path;
 use super::{ApiError, AppState};
 use crate::chain::approve::{approval_action, required_approvals, ApprovalAction, ApprovalMode};
+use crate::chain::gas_reserve::GasReserve;
 use crate::chain::rpc::Rpc;
 use crate::closer::executor::encode_balance_of;
 use crate::config::Config;
@@ -184,7 +194,9 @@ pub struct FundingGasBody {
     /// `CELO`, `BNB`, `ETH`, `POL`, or the plain word `gas` on a chain the
     /// panel doesn't know.
     pub symbol: &'static str,
-    /// Wei, decimal. `null` when the read failed.
+    /// Wei, decimal. `null` when the read failed. When a wallet token row is
+    /// the gas coin's ERC-20, only the part kept for gas (see the module
+    /// docs); the rest is on that row.
     pub balance: Option<String>,
     pub balance_text: Option<String>,
     pub price: Option<f64>,
@@ -454,6 +466,7 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
         capital_errors.push(format!("{e:#}"));
     }
     let quotable = inventory.as_ref().and_then(|r| r.as_ref().ok());
+    let gas_reserve = cfg.gas_reserve();
 
     // One price per plan, shared by both sets of rows: the same token at two
     // addresses is worth the same, and a screen showing both must not imply
@@ -474,6 +487,11 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
                 (None, Some(Err(_))) => None,
                 (None, _) => value_of(read.map(|r| &r.balance), &mut capital_errors),
             };
+            // Without a vault these rows are the signer wallet, gas included.
+            let balance = match vault {
+                Some(_) => balance,
+                None => balance.map(|b| gas_reserve.spendable(plan.address, b)),
+            };
             row_of(
                 plan,
                 read.and_then(|r| r.symbol.clone()),
@@ -492,7 +510,8 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
                 row_of(
                     plan,
                     tokens.get(i).map(|t| t.symbol.clone()),
-                    value_of(dust.get(i), &mut wallet_errors),
+                    value_of(dust.get(i), &mut wallet_errors)
+                        .map(|b| gas_reserve.spendable(plan.address, b)),
                     None,
                     &prices[i],
                 )
@@ -500,7 +519,8 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
             .collect::<Vec<_>>()
     });
 
-    let gas_balance = value_of(native_balance.as_ref(), &mut wallet_errors);
+    let gas_balance = value_of(native_balance.as_ref(), &mut wallet_errors)
+        .map(|b| gas_share(b, &gas_reserve, &plans));
     let gas_usd = match (gas_balance, native) {
         (Some(b), Some(p)) => Some(units(b, 18) * p.usd),
         _ => None,
@@ -577,6 +597,19 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
         remove_blocked_by,
         checked_at_unix: now_unix(),
     })
+}
+
+/// The part of the signer wallet's native balance its gas row reports. When a
+/// token row is the gas coin's ERC-20 those rows read the same coins, so gas
+/// keeps the reserve (or all of a smaller balance) and the row keeps the rest
+/// ([`GasReserve::spendable`]); the two always add back up to `native`.
+/// Otherwise gas is the whole balance.
+fn gas_share(native: U256, gas_reserve: &GasReserve, plans: &[TokenPlan]) -> U256 {
+    if plans.iter().any(|p| gas_reserve.covers(p.address)) {
+        native.min(gas_reserve.amount())
+    } else {
+        native
+    }
 }
 
 /// A read's value, keeping its failure for `readError` instead of dropping it.
@@ -1198,6 +1231,22 @@ mod tests {
         add_container(h, name);
     }
 
+    /// GoldToken: CELO's ERC-20 face on Celo, the same coins as gas.
+    const CELO: &str = "0x471EcE3750Da237f93B8E339c536989b8978a438";
+    const COIN: u128 = 1_000_000_000_000_000_000;
+
+    /// The Celo bot with its soft side swapped for `soft` at 18 decimals: a
+    /// CELO/USDT bot when `soft` is [`CELO`].
+    fn seed_soft(h: &Harness, name: &str, soft: &str, rpc_url: &str, api: &MockApi) {
+        seed(h, name, rpc_url, &api.base, &feed_of(api));
+        let path = h.root.join(name).join("stitch.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(CNGN, soft)
+            .replace("collateral_decimals = 6", "collateral_decimals = 18");
+        std::fs::write(&path, toml).unwrap();
+    }
+
     /// A vault address the seeded bot's key is not: the OperatorVault holds
     /// the trading capital, the key only signs for it.
     const VAULT: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
@@ -1436,6 +1485,81 @@ mod tests {
         assert_eq!(v["gate"]["needsSide"], false);
         assert_eq!(v["gate"]["needsGas"], false);
         assert!(v["checkedAtUnix"].as_u64().unwrap() > 1_700_000_000);
+    }
+
+    /// 100 CELO in the wallet is 100 coins, not 200: the default 5 are gas,
+    /// the other 95 are what the bot quotes.
+    #[tokio::test]
+    async fn a_celo_corridor_splits_the_coins_between_gas_and_inventory() {
+        let h = harness("funding-celo-split");
+        let node = mock_rpc(
+            MockChain::default()
+                .balance(USDT, 25_000_000)
+                .balance(CELO, 100 * COIN)
+                .symbol(CELO, "CELO")
+                .native(100 * COIN),
+        )
+        .await;
+        let api = mock_api(200, 200, 0.08).await;
+        seed_soft(&h, "bot-a", CELO, &node.url, &api);
+
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert!(v["readError"].is_null(), "{body}");
+        let celo = token(&v, "CELO");
+        assert_eq!(celo["balanceText"], "95", "{body}");
+        assert_eq!(v["gas"]["balanceText"], "5", "{body}");
+        let gas_usd = v["gas"]["usd"].as_f64().unwrap();
+        assert!((gas_usd - 0.4).abs() < 1e-9, "{body}");
+        assert_eq!(v["gate"]["needsGas"], false, "{body}");
+        // The stable side is untouched.
+        assert_eq!(v["tokens"][0]["role"], "stable", "{body}");
+        assert_eq!(v["tokens"][0]["balance"], "25000000", "{body}");
+    }
+
+    /// Below the reserve, every coin is gas and the row has nothing to quote.
+    #[tokio::test]
+    async fn a_celo_wallet_under_the_reserve_is_all_gas() {
+        let h = harness("funding-celo-low");
+        let node = mock_rpc(
+            MockChain::default()
+                .balance(USDT, 0)
+                .balance(CELO, 3 * COIN)
+                .symbol(CELO, "CELO")
+                .native(3 * COIN),
+        )
+        .await;
+        let api = mock_api(200, 200, 0.08).await;
+        seed_soft(&h, "bot-a", CELO, &node.url, &api);
+
+        let (_, body) = h.get("/api/bots/bot-a/funding").await;
+        let v = Harness::parse(&body);
+        assert_eq!(token(&v, "CELO")["balance"], "0", "{body}");
+        assert_eq!(v["gas"]["balanceText"], "3", "{body}");
+    }
+
+    /// A token calling itself CELO at any other address is inventory, and gas
+    /// is the whole native balance.
+    #[tokio::test]
+    async fn a_token_named_celo_elsewhere_is_not_gas() {
+        let h = harness("funding-celo-spoof");
+        let fake = "0x000000000000000000000000000000000000CE10";
+        let node = mock_rpc(
+            MockChain::default()
+                .balance(USDT, 0)
+                .balance(fake, 100 * COIN)
+                .symbol(fake, "CELO")
+                .native(100 * COIN),
+        )
+        .await;
+        let api = mock_api(200, 200, 0.08).await;
+        seed_soft(&h, "bot-a", fake, &node.url, &api);
+
+        let (_, body) = h.get("/api/bots/bot-a/funding").await;
+        let v = Harness::parse(&body);
+        assert_eq!(token(&v, "CELO")["balanceText"], "100", "{body}");
+        assert_eq!(v["gas"]["balanceText"], "100", "{body}");
     }
 
     /// The screenshot this was reported from: a BSC wallet holding $0.07 of

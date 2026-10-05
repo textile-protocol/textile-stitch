@@ -29,6 +29,7 @@ use stitch_bot::book::taker::{resolve_fee_bps, take_pool_once, TakeOutcome, Take
 use stitch_bot::chain::approve::{
     ensure_maker_is_plain_eoa, run_approvals, unapproved_tokens, ApprovalMode,
 };
+use stitch_bot::chain::gas_reserve::GasReserve;
 use stitch_bot::chain::multicall::Batcher;
 use stitch_bot::chain::rpc::Wallet;
 use stitch_bot::closer::discover::Discoverer;
@@ -83,12 +84,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The maker's on-chain inventory for a pair: `(collateral, debt)` wallet
 /// balances, atomic. Signed orders don't move tokens until they fill (Permit2),
-/// so the wallet balance IS the inventory.
+/// so the wallet balance IS the inventory, less the gas reserve when one side
+/// is the chain's gas coin.
 async fn read_inventory(
     wallet: &stitch_bot::chain::rpc::Wallet,
     maker: Address,
     collateral: Address,
     debt: Address,
+    gas_reserve: &GasReserve,
 ) -> anyhow::Result<(u128, u128)> {
     let calldata = Bytes::from(encode_balance_of(maker));
     let coll = wallet
@@ -100,8 +103,11 @@ async fn read_inventory(
         .await
         .context("reading debt balance")?;
     Ok((
-        u256_to_u128(coll, "collateral balance")?,
-        u256_to_u128(debt_bal, "debt balance")?,
+        u256_to_u128(
+            gas_reserve.spendable(collateral, coll),
+            "collateral balance",
+        )?,
+        u256_to_u128(gas_reserve.spendable(debt, debt_bal), "debt balance")?,
     ))
 }
 
@@ -733,11 +739,13 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         }
     };
     info!(batched = reader.is_batched(), "ladder chain reads resolved");
+    let gas_reserve = cfg.gas_reserve();
     let ctx = TickCtx {
         poster: &poster,
         wallet: &wallet,
         reader,
         state_path: &slot_nonce_state_path,
+        gas_reserve,
     };
     // Sides quoting "max" liquidity target an even share of each token's funded
     // balance instead of letting the first corridor keep draining it.
@@ -873,7 +881,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         .entry(pair.clone())
                         .or_insert_with(|| LeanState::new(&params));
                     if lean_state.needs_inventory(now) {
-                        match read_inventory(&wallet, maker, collateral, debt).await {
+                        match read_inventory(&wallet, maker, collateral, debt, &gas_reserve).await {
                             Ok((coll, debt_bal)) => lean_state.set_inventory(
                                 coll,
                                 pool.collateral_decimals,
@@ -1005,6 +1013,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             .parse()
                             .unwrap_or(U256::ZERO),
                         max_orders: pool.limit_taker_max_orders.unwrap_or(10) as usize,
+                        gas_reserve,
                     };
                     let pending = taker_pending.entry(pair.clone()).or_default();
                     for (side, outcome) in take_pool_once(

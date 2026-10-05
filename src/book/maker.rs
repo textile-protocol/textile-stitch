@@ -157,6 +157,9 @@ pub struct TickCtx<'a> {
     /// per-tick probe isn't itself a request. See [`crate::chain::multicall`].
     pub reader: crate::chain::multicall::Batcher,
     pub state_path: &'a Path,
+    /// Gas held out of the funded budget when a side's input is the chain's
+    /// gas coin.
+    pub gas_reserve: crate::chain::gas_reserve::GasReserve,
 }
 
 /// Quoting state that lives across ticks: last posted price per side and the
@@ -425,6 +428,7 @@ async fn capped_input(
         poster.maker,
         input_token,
         poster.permit2,
+        &ctx.gas_reserve,
         configured,
         reusable_input,
         poster.dry_run,

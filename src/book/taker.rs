@@ -29,6 +29,7 @@ use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::chain::gas_reserve::GasReserve;
 use crate::chain::rpc::Wallet;
 use crate::closer::executor::{encode_approve, encode_balance_of};
 use crate::pricing::quote::sell_amounts_at;
@@ -215,6 +216,9 @@ pub struct TakerCtx {
     /// Per-order minimum profit, valued in debt atomic units (gas/dust guard).
     pub min_profit_debt: U256,
     pub max_orders: usize,
+    /// Gas held out of the spendable balance when the token a fill pays out
+    /// is the chain's gas coin. The fill's own gas comes out of that coin.
+    pub gas_reserve: GasReserve,
 }
 
 /// A profitable resting order: what filling it spends and clears.
@@ -534,7 +538,8 @@ async fn take_direction_once(
             &Bytes::from(encode_balance_of(wallet.address())),
         )
         .await?;
-    let batch = plan_batch(candidates, balance, ctx.max_orders);
+    let spendable = ctx.gas_reserve.spendable(output_token, balance);
+    let batch = plan_batch(candidates, spendable, ctx.max_orders);
     if batch.is_empty() {
         return Ok(TakeOutcome::Nothing);
     }
@@ -689,6 +694,7 @@ mod tests {
             fee_bps: 5,
             min_profit_debt: U256::ZERO,
             max_orders: 10,
+            gas_reserve: GasReserve::default(),
         }
     }
 

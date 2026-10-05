@@ -24,7 +24,9 @@
 //! can't blow the reply budget), the nonce ledger (RFQ nonces live in a
 //! disjoint namespace, see [`nonce`]) and — the point of dual-run —
 //! **inventory**. RFQ quotes `min(balance, Permit2 allowance)` in full, minus
-//! only its own in-flight quotes ([`reserve`]); a ladder holding the whole
+//! its own in-flight quotes ([`reserve`]) and, when the token is the chain's
+//! gas coin, the gas reserve
+//! ([`crate::chain::gas_reserve`]); a ladder holding the whole
 //! wallet on the book does not shrink a firm quote, and a firm quote does not
 //! shrink the next ladder. Two channels pledging one balance means a fill can
 //! revert when both land at once, which beats halving the depth of both.
@@ -51,6 +53,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::book::taker::encode_order_bytes;
 use crate::chain::gas_caps::GasCaps;
+use crate::chain::gas_reserve::GasReserve;
 use crate::chain::multicall::{decode_uint, Batcher, Call};
 use crate::chain::rpc::{transaction_may_still_land, Rpc, Wallet};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
@@ -110,6 +113,9 @@ pub struct RfqRuntime {
     rpc_url: String,
     /// `[gas]` ceilings for every wallet the responder builds.
     gas_caps: GasCaps,
+    /// Gas held out of the wallet's funded figure when a quoted token is the
+    /// chain's gas coin.
+    gas_reserve: GasReserve,
     books: Vec<CorridorBook>,
     signer: DynSigner,
     /// `rfq-reservations.json` next to stitch.toml. None only when the process
@@ -383,6 +389,7 @@ fn build_runtime(
             .context("invalid [rfq].validation_contract")?,
         rpc_url: cfg.rpc_url.clone(),
         gas_caps: cfg.gas_caps(),
+        gas_reserve: cfg.gas_reserve(),
         books,
         signer,
         reservations_path: config_dir.map(|dir| dir.join(RESERVATIONS_FILE)),
@@ -566,6 +573,7 @@ async fn run(rt: RfqRuntime) {
             wallet,
             rt.permit2,
             tokens,
+            rt.gas_reserve,
             inventory.clone(),
             rt.vault,
             rt.vault_order_executor,
@@ -2140,18 +2148,23 @@ fn funded_calls(owner: Address, permit2: Address, tokens: &[Address]) -> Vec<Cal
         .collect()
 }
 
-/// `min(balance, allowance)` per token, in `tokens` order. A token whose pair
-/// of reads did not both come back is `None`: it keeps its last reading until
-/// the TTL drops it, rather than reading as zero and taking the side dark on
-/// one reverting token.
-fn decode_funded(tokens: &[Address], results: &[Option<Bytes>]) -> Vec<(Address, Option<U256>)> {
+/// `min(balance, allowance)` per token, in `tokens` order, with the gas
+/// reserve taken off the balance of the chain's gas coin (see
+/// [`GasReserve::funded`]). A token whose pair of reads did not both come back
+/// is `None`: it keeps its last reading until the TTL drops it, rather than
+/// reading as zero and taking the side dark on one reverting token.
+fn decode_funded(
+    tokens: &[Address],
+    results: &[Option<Bytes>],
+    gas_reserve: &GasReserve,
+) -> Vec<(Address, Option<U256>)> {
     tokens
         .iter()
         .enumerate()
         .map(|(i, token)| {
             let funded = match (results.get(i * 2), results.get(i * 2 + 1)) {
                 (Some(Some(balance)), Some(Some(allowance))) => {
-                    Some(decode_uint(balance).min(decode_uint(allowance)))
+                    Some(gas_reserve.funded(*token, decode_uint(balance), decode_uint(allowance)))
                 }
                 _ => None,
             };
@@ -2174,6 +2187,7 @@ async fn inventory_loop(
     wallet: Wallet,
     permit2: Address,
     tokens: Vec<Address>,
+    gas_reserve: GasReserve,
     cache: InventoryCache,
     vault: Option<Address>,
     vault_order_executor: Option<Address>,
@@ -2254,11 +2268,13 @@ async fn inventory_loop(
                 ),
             }
         } else if vault.is_none() {
+            // Only the wallet path holds gas back: a vault's capital never
+            // pays for the bot's transactions, the signer wallet does.
             let calls = funded_calls(wallet.address(), permit2, &tokens);
             match reader.read(wallet.rpc(), &calls).await {
                 Ok(results) => {
                     let now = unix_now();
-                    for (token, funded) in decode_funded(&tokens, &results) {
+                    for (token, funded) in decode_funded(&tokens, &results, &gas_reserve) {
                         match funded {
                             Some(funded) => cache.set(token, funded, now),
                             // One token reverting must not cost the others
@@ -2461,7 +2477,7 @@ mod tests {
         // Token 0: approved for less than it holds. Token 1: the other way.
         let results = vec![word(100), word(40), word(7), word(900)];
         assert_eq!(
-            decode_funded(&tokens, &results),
+            decode_funded(&tokens, &results, &GasReserve::default()),
             vec![
                 (tokens[0], Some(U256::from(40u64))),
                 (tokens[1], Some(U256::from(7u64))),
@@ -2474,7 +2490,7 @@ mod tests {
         let tokens: Vec<Address> = vec![COLLATERAL.parse().unwrap(), DEBT.parse().unwrap()];
         // Token 0's allowance call reverted; token 1 answered in full.
         let results = vec![word(100), None, word(7), word(900)];
-        let decoded = decode_funded(&tokens, &results);
+        let decoded = decode_funded(&tokens, &results, &GasReserve::default());
         assert_eq!(decoded[0], (tokens[0], None), "keeps its last reading");
         assert_eq!(decoded[1], (tokens[1], Some(U256::from(7u64))));
     }
@@ -2482,8 +2498,29 @@ mod tests {
     #[test]
     fn a_truncated_batch_reads_as_missing_rather_than_zero() {
         let tokens: Vec<Address> = vec![COLLATERAL.parse().unwrap(), DEBT.parse().unwrap()];
-        let decoded = decode_funded(&tokens, &[word(100), word(40)]);
+        let decoded = decode_funded(&tokens, &[word(100), word(40)], &GasReserve::default());
         assert_eq!(decoded[1], (tokens[1], None));
+    }
+
+    #[test]
+    fn the_gas_coin_is_quoted_net_of_the_gas_reserve() {
+        const COIN: u64 = 1_000_000_000_000_000_000;
+        let celo = crate::chain::gas_reserve::native_erc20(42220).unwrap();
+        let usdt: Address = DEBT.parse().unwrap();
+        let reserve = GasReserve::for_chain(42220);
+        // CELO: 10 held, 5 kept for gas, approved without limit -> 5.
+        // USDT: untouched by the reserve.
+        let results = vec![word(10 * COIN), word(u64::MAX), word(100), word(u64::MAX)];
+        assert_eq!(
+            decode_funded(&[celo, usdt], &results, &reserve),
+            vec![
+                (celo, Some(U256::from(5 * COIN))),
+                (usdt, Some(U256::from(100u64))),
+            ]
+        );
+        // Under the reserve, the gas coin quotes nothing rather than wrapping.
+        let drained = decode_funded(&[celo], &[word(2 * COIN), word(u64::MAX)], &reserve);
+        assert_eq!(drained, vec![(celo, Some(U256::ZERO))]);
     }
 
     fn vault_inventory_results() -> Vec<Option<Bytes>> {

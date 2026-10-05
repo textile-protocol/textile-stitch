@@ -14,12 +14,20 @@
 //! bids for gas (the wallet's own fee plan, one bump of headroom), or the node
 //! would refuse it for lack of gas and the operator would read that as
 //! "withdraw is broken".
+//!
+//! A corridor token that IS the gas coin (CELO's GoldToken on Celo, matched by
+//! address in [`crate::chain::gas_reserve`]) is sent as the gas coin: a value
+//! transfer, the same coins. `all` of it keeps back the gas reserve, or the
+//! transfer's fee when that is larger, so withdrawing the trading inventory
+//! leaves the bot the gas the panel shows as gas. Draining that too is
+//! `native`.
 use std::time::Duration;
 
 use alloy_primitives::{Address, Bytes, U256};
 use anyhow::{bail, Context};
 use tracing::info;
 
+use crate::chain::gas_reserve::GasReserve;
 use crate::chain::rpc::Wallet;
 use crate::closer::executor::{encode_balance_of, encode_transfer};
 use crate::config::Config;
@@ -49,6 +57,54 @@ fn known_token_decimals(cfg: &Config, wanted: Address) -> Option<u8> {
             None
         }
     })
+}
+
+/// What a `--token` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asset {
+    /// A corridor token, moved by ERC-20 `transfer`.
+    Erc20 { token: Address, decimals: u8 },
+    /// The gas coin, moved by value transfer. `all` leaves at least `keep`
+    /// wei behind; the transfer's fee is paid out of it when it covers it.
+    Gas { keep: U256 },
+}
+
+/// Resolve `--token`: `native`, the gas coin's ERC-20 address (routed as the
+/// gas coin, keeping the gas reserve on `all`), or a corridor token whose
+/// decimals `decimals_of` knows.
+fn resolve_asset(
+    token: &str,
+    gas_reserve: &GasReserve,
+    decimals_of: impl Fn(Address) -> Option<u8>,
+) -> anyhow::Result<Asset> {
+    let token = token.trim();
+    if token.eq_ignore_ascii_case("native") {
+        return Ok(Asset::Gas { keep: U256::ZERO });
+    }
+    let addr: Address = token
+        .parse()
+        .with_context(|| format!("--token {token:?} is not an address (or `native`)"))?;
+    if gas_reserve.covers(addr) {
+        return Ok(Asset::Gas {
+            keep: gas_reserve.amount(),
+        });
+    }
+    let decimals = decimals_of(addr).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{addr} is not a token this bot's corridors trade; withdraw only moves those \
+             (and `native` for gas)"
+        )
+    })?;
+    Ok(Asset::Erc20 {
+        token: addr,
+        decimals,
+    })
+}
+
+/// `all` of the gas coin: the balance less the transfer's fee or `keep`,
+/// whichever is larger, floored at zero.
+fn all_of_gas(balance: U256, transfer_fee: U256, keep: U256) -> U256 {
+    balance.saturating_sub(transfer_fee.max(keep))
 }
 
 /// A human decimal amount ("12.5") in atomic units for `decimals`, or `None`
@@ -112,39 +168,30 @@ pub async fn plan_withdraw(
         bail!("that is the bot's own wallet; nothing to move");
     }
 
-    let native = token.trim().eq_ignore_ascii_case("native");
-    let (token_addr, symbol, decimals) = if native {
-        (None, "native".to_string(), 18u8)
-    } else {
-        let addr: Address = token
-            .trim()
-            .parse()
-            .with_context(|| format!("--token {token:?} is not an address (or `native`)"))?;
-        let decimals = known_token_decimals(cfg, addr).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{addr} is not a token this bot's corridors trade; withdraw only moves those \
-                 (and `native` for gas)"
-            )
-        })?;
-        (Some(addr), addr.to_string(), decimals)
+    let asset = resolve_asset(token, &cfg.gas_reserve(), |addr| {
+        known_token_decimals(cfg, addr)
+    })?;
+    let (token_addr, symbol, decimals) = match asset {
+        Asset::Erc20 { token, decimals } => (Some(token), token.to_string(), decimals),
+        Asset::Gas { .. } => (None, "native".to_string(), 18u8),
     };
 
     let amount = if amount.trim().eq_ignore_ascii_case("all") {
-        match token_addr {
-            Some(t) => {
+        match asset {
+            Asset::Erc20 { token, .. } => {
                 let data = Bytes::from(encode_balance_of(wallet.address()));
                 wallet
-                    .read_uint(t, &data)
+                    .read_uint(token, &data)
                     .await
                     .with_context(|| format!("reading the {symbol} balance"))?
             }
-            None => {
-                let (balance, reserve) = tokio::try_join!(
+            Asset::Gas { keep } => {
+                let (balance, fee) = tokio::try_join!(
                     wallet.rpc().get_balance(wallet.address()),
                     wallet.native_transfer_reserve(to),
                 )
                 .context("reading the gas balance and the transfer's cost")?;
-                balance.saturating_sub(reserve)
+                all_of_gas(balance, fee, keep)
             }
         }
     } else {
@@ -212,6 +259,73 @@ mod tests {
         assert_eq!(parse_decimal_amount("0.000001", 6), Some(U256::from(1u64)));
         assert_eq!(parse_decimal_amount(".5", 2), Some(U256::from(50u64)));
         assert_eq!(parse_decimal_amount("7.", 0), Some(U256::from(7u64)));
+    }
+
+    const CELO: Address = alloy_primitives::address!("471EcE3750Da237f93B8E339c536989b8978a438");
+    const USDT: Address = alloy_primitives::address!("48065fbBE25f71C9282ddf5e1cD6D6A887483D5e");
+
+    /// A Celo CELO/USDT bot: both are corridor tokens.
+    fn celo_corridor(addr: Address) -> Option<u8> {
+        [(CELO, 18u8), (USDT, 6u8)]
+            .into_iter()
+            .find_map(|(a, d)| (a == addr).then_some(d))
+    }
+
+    #[test]
+    fn the_gas_coins_erc20_address_is_sent_as_the_gas_coin() {
+        let reserve = GasReserve::for_chain(42220);
+        for spelled in [CELO.to_string(), format!("{CELO:#x}")] {
+            assert_eq!(
+                resolve_asset(&spelled, &reserve, celo_corridor).unwrap(),
+                Asset::Gas {
+                    keep: reserve.amount()
+                },
+                "{spelled}"
+            );
+        }
+        assert_eq!(
+            resolve_asset(" NATIVE ", &reserve, celo_corridor).unwrap(),
+            Asset::Gas { keep: U256::ZERO }
+        );
+    }
+
+    #[test]
+    fn other_tokens_and_other_chains_stay_erc20_transfers() {
+        let reserve = GasReserve::for_chain(42220);
+        assert_eq!(
+            resolve_asset(&USDT.to_string(), &reserve, celo_corridor).unwrap(),
+            Asset::Erc20 {
+                token: USDT,
+                decimals: 6
+            }
+        );
+        // The same address on a chain where it is just a token.
+        assert_eq!(
+            resolve_asset(
+                &CELO.to_string(),
+                &GasReserve::for_chain(8453),
+                celo_corridor
+            )
+            .unwrap(),
+            Asset::Erc20 {
+                token: CELO,
+                decimals: 18
+            }
+        );
+        let stranger = "0x000000000000000000000000000000000000CE10";
+        assert!(resolve_asset(stranger, &reserve, celo_corridor).is_err());
+    }
+
+    #[test]
+    fn all_of_the_gas_coin_keeps_the_larger_of_fee_and_reserve() {
+        let n = |v: u64| U256::from(v);
+        // The reserve covers the fee: the fee is paid out of it.
+        assert_eq!(all_of_gas(n(100), n(1), n(5)), n(95));
+        // A reserve of zero (and `native`) still keeps the fee.
+        assert_eq!(all_of_gas(n(100), n(1), n(0)), n(99));
+        assert_eq!(all_of_gas(n(100), n(7), n(5)), n(93));
+        // Less than that held: nothing to send, never a wrap.
+        assert_eq!(all_of_gas(n(4), n(1), n(5)), n(0));
     }
 
     #[test]

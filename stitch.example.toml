@@ -170,6 +170,8 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # [gas]
 # max_fee_per_gas_gwei = 50   # fee cap per gas, in gwei
 # max_tx_fee = 0.01           # most one transaction may cost, in the gas token
+# native_reserve = 5          # Celo only: CELO kept for gas when a corridor trades
+#                             # CELO itself (default 5). 0 quotes every coin.
 
 # ----- Leftover experimental tokens. Ignored. The Settings RFQ card and
 # RFQ-as-default path are always on. Old files may still carry these keys.

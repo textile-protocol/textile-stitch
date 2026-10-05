@@ -66,7 +66,7 @@ impl GasCaps {
                 .map(|g| wei(g * WEI_PER_GWEI))
                 .unwrap_or(self.max_fee_per_gas),
             max_tx_fee: max_tx_fee
-                .map(|t| wei(t * WEI_PER_TOKEN))
+                .map(whole_tokens_to_wei)
                 .unwrap_or(self.max_tx_fee),
         }
     }
@@ -106,6 +106,11 @@ impl GasCaps {
 /// validation has already refused anything else.
 fn wei(v: f64) -> U256 {
     U256::from(v.max(0.0) as u128)
+}
+
+/// Whole gas tokens as `[gas]` writes them (`0.5` CELO) to wei, rounding down.
+pub(crate) fn whole_tokens_to_wei(tokens: f64) -> U256 {
+    wei(tokens * WEI_PER_TOKEN)
 }
 
 #[cfg(test)]

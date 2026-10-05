@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Textile, Inc.
 //! Funded-input budgeting: how much of a token the maker can actually commit
 //! to new orders this tick. The budget per token is
-//! `min(balance, Permit2 allowance)` minus what the book will hold after earlier
+//! `min(balance, Permit2 allowance)` (the chain's gas coin net of its gas
+//! reserve, see [`crate::chain::gas_reserve`]) minus what the book will hold after earlier
 //! replacements in this tick — with the side's own live input counted as
 //! reusable (a replacement supersedes it).
 //!
@@ -20,6 +21,7 @@ use anyhow::Context;
 use tracing::{info, warn};
 
 use crate::chain::approve::{buy_input_amount, sell_input_amount};
+use crate::chain::gas_reserve::GasReserve;
 use crate::chain::multicall::{decode_uint, Batcher, Call};
 use crate::chain::rpc::Wallet;
 use crate::closer::executor::{encode_allowance, encode_balance_of};
@@ -133,12 +135,14 @@ pub fn take_max_share(
 }
 
 /// `min(balance, Permit2 allowance)` on-chain minus nothing yet — the fresh
-/// budget for a token, with the indexer's live commitments attached.
+/// budget for a token, with the indexer's live commitments attached. The gas
+/// coin's balance comes in net of `gas_reserve`.
 ///
 /// The balance and the allowance go out together: they are read once per
 /// token per tick and there is no reason to pay two round trips for a pair
 /// that has to agree on a block anyway. `reader` is resolved once by the
 /// caller (see [`crate::chain::multicall`]).
+#[allow(clippy::too_many_arguments)]
 async fn read_funded_budget(
     indexer: &Indexer,
     wallet: &Wallet,
@@ -147,6 +151,7 @@ async fn read_funded_budget(
     maker: Address,
     token: Address,
     permit2: Address,
+    gas_reserve: &GasReserve,
 ) -> anyhow::Result<FundedInputBudget> {
     let results = reader
         .read(
@@ -174,7 +179,7 @@ async fn read_funded_budget(
         .parse::<U256>()
         .with_context(|| format!("could not parse committed input {committed}"))?;
     Ok(FundedInputBudget {
-        funded: balance.min(allowance),
+        funded: gas_reserve.funded(token, balance, allowance),
         committed,
     })
 }
@@ -223,6 +228,7 @@ pub async fn funded_input_cap(
     maker: Address,
     token: Address,
     permit2: Address,
+    gas_reserve: &GasReserve,
     configured: InputLiquidity,
     reusable_input: U256,
     dry_run: bool,
@@ -231,7 +237,18 @@ pub async fn funded_input_cap(
     label: &str,
 ) -> Option<u128> {
     if let std::collections::hash_map::Entry::Vacant(e) = budgets.funded_inputs.entry(token) {
-        match read_funded_budget(indexer, wallet, reader, chain_id, maker, token, permit2).await {
+        match read_funded_budget(
+            indexer,
+            wallet,
+            reader,
+            chain_id,
+            maker,
+            token,
+            permit2,
+            gas_reserve,
+        )
+        .await
+        {
             Ok(budget) => {
                 e.insert(budget);
             }

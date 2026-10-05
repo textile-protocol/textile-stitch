@@ -183,6 +183,24 @@ max_fee_per_gas_gwei = 1000   # fee cap per gas, in gwei
 max_tx_fee = 0.25             # whole units of the gas token
 ```
 
+On Celo the gas coin is also an ERC-20 (CELO at
+`0x471EcE3750Da237f93B8E339c536989b8978a438`), so a corridor that trades CELO
+quotes the same coins Stitch pays gas with. Without a floor, one big fill could
+leave the bot unable to send anything, withdraws included. So whenever a side's
+token is that exact address, Stitch keeps 5 CELO out of what it quotes, on RFQ,
+the ladder and the taker alike, and the panel shows those 5 as gas rather than
+inventory. That's about eighty large transactions at a busy-day 200 gwei. A
+token that merely calls itself CELO at another address gets no reserve. Change
+the amount with `native_reserve` in whole CELO; `0` quotes every coin:
+
+```toml
+[gas]
+native_reserve = 10
+```
+
+`stitch withdraw --token 0x471E… --amount all` keeps the reserve too. Use
+`--token native --amount all` to empty the wallet completely.
+
 ### Liquidity And Order Sizing
 
 Stitch can post one order per side or a ladder of smaller orders:

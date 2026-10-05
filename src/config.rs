@@ -107,6 +107,12 @@ pub struct GasConfig {
     /// the chain's gas token (ETH, BNB, CELO, ...).
     #[serde(default)]
     pub max_tx_fee: Option<f64>,
+    /// Gas coins kept out of inventory when a corridor trades the chain's gas
+    /// coin as an ERC-20 (CELO on Celo), in whole units. Omit for the chain's
+    /// default ([`crate::chain::gas_reserve`]); `0` quotes every coin and can
+    /// leave the bot with no gas after a fill. No effect on other chains.
+    #[serde(default)]
+    pub native_reserve: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -466,6 +472,17 @@ fn assert_gas_ceiling(value: Option<f64>, field: &str) -> anyhow::Result<()> {
     match value {
         Some(v) if !(v.is_finite() && v > 0.0) => {
             anyhow::bail!("{field} must be a positive number, got {v}")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `[gas].native_reserve`, when set, is a finite number of coins, zero
+/// included: zero is the explicit way to quote the whole balance.
+fn assert_gas_reserve(value: Option<f64>, field: &str) -> anyhow::Result<()> {
+    match value {
+        Some(v) if !(v.is_finite() && v >= 0.0) => {
+            anyhow::bail!("{field} must be zero or a positive number, got {v}")
         }
         _ => Ok(()),
     }
@@ -1065,6 +1082,14 @@ impl Config {
             .with_overrides(gas.max_fee_per_gas_gwei, gas.max_tx_fee)
     }
 
+    /// What every quoting path holds back for gas on this chain: the built-in
+    /// reserve, with `[gas].native_reserve` applied.
+    pub fn gas_reserve(&self) -> crate::chain::gas_reserve::GasReserve {
+        let native_reserve = self.gas.as_ref().and_then(|g| g.native_reserve);
+        crate::chain::gas_reserve::GasReserve::for_chain(self.chain_id)
+            .with_override(native_reserve)
+    }
+
     /// True when the RFQ responder should run: the master switch is on and
     /// there is at least one pool to quote. The public ladder is a separate
     /// switch ([`Self::book_enabled`]).
@@ -1143,6 +1168,7 @@ impl Config {
         if let Some(gas) = &self.gas {
             assert_gas_ceiling(gas.max_fee_per_gas_gwei, "[gas].max_fee_per_gas_gwei")?;
             assert_gas_ceiling(gas.max_tx_fee, "[gas].max_tx_fee")?;
+            assert_gas_reserve(gas.native_reserve, "[gas].native_reserve")?;
         }
         // `Discoverer::new` takes this string as-is and validates nothing, so a
         // typo'd endpoint only surfaces as a failed send on every closer tick —
@@ -3088,6 +3114,31 @@ mod tests {
             cfg.gas_caps(),
             GasCaps::for_chain(1).with_overrides(None, Some(0.5))
         );
+    }
+
+    #[test]
+    fn the_gas_reserve_defaults_to_the_chain_and_takes_an_override() {
+        use crate::chain::gas_reserve::GasReserve;
+        let cfg = Config::from_toml(LEAN_POOL_BASE).unwrap();
+        assert_eq!(cfg.gas_reserve(), GasReserve::for_chain(cfg.chain_id));
+
+        let cfg =
+            Config::from_toml(&format!("{LEAN_POOL_BASE}\n[gas]\nnative_reserve = 2.5\n")).unwrap();
+        assert_eq!(
+            cfg.gas_reserve(),
+            GasReserve::for_chain(cfg.chain_id).with_override(Some(2.5))
+        );
+        // Zero is the explicit opt-out, not an error.
+        Config::from_toml(&format!("{LEAN_POOL_BASE}\n[gas]\nnative_reserve = 0\n")).unwrap();
+    }
+
+    #[test]
+    fn a_negative_or_unreadable_gas_reserve_is_rejected() {
+        for bad in ["-1.0", "nan", "inf"] {
+            let toml = format!("{LEAN_POOL_BASE}\n[gas]\nnative_reserve = {bad}\n");
+            let err = Config::from_toml(&toml).expect_err(bad);
+            assert!(err.to_string().contains("native_reserve"), "{err}");
+        }
     }
 
     #[test]

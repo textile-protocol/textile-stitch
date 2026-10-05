@@ -43,8 +43,8 @@ pub struct CorridorBook {
     pub staleness_secs: u64,
 }
 
-/// Latest funded amounts (`min(balance, Permit2 allowance)` minus the live
-/// book) keyed by token. Empty / missing entries fail closed for every RFQ
+/// Latest funded amounts (`min(balance, Permit2 allowance)`, with the gas
+/// reserve off the gas coin's balance) keyed by token. Empty / missing entries fail closed for every RFQ
 /// side — Exact caps still cannot outrun a missing or smaller wallet.
 #[derive(Debug, Clone, Default)]
 pub struct InventoryView {
