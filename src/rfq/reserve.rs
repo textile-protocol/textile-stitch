@@ -182,6 +182,19 @@ impl Reservations {
             .fold(U256::ZERO, |sum, r| sum.saturating_add(r.input))
     }
 
+    /// The named claim must still exist and be the only executable reservation.
+    /// Used before releasing a rebalance signature: custody signing may have
+    /// overlapped new customer quotes, including unattributable legacy claims.
+    pub fn is_only_live_claim(&self, rfq_id: &str, now_secs: u64) -> bool {
+        self.by_rfq
+            .get(rfq_id)
+            .is_some_and(|r| r.release_at > now_secs)
+            && self
+                .by_rfq
+                .iter()
+                .all(|(id, r)| id == rfq_id || r.release_at <= now_secs)
+    }
+
     /// Sum of [`Self::reserved`] across every named corridor on one side.
     ///
     /// Two pools that pay the same token (Celo cNGN and wBRL both bid USDT)
@@ -431,6 +444,15 @@ impl Reservations {
         }
     }
 
+    /// Require durable claims before handing an order to an external dealer.
+    pub fn flush(&self) -> anyhow::Result<()> {
+        let path = self
+            .persist_path
+            .as_deref()
+            .context("persistent reservations required")?;
+        self.write(path)
+    }
+
     fn write(&self, path: &Path) -> anyhow::Result<()> {
         let stored = StoredLedger {
             version: 1,
@@ -471,6 +493,21 @@ fn normalize_token_opt(raw: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusive_claim_requires_its_own_live_reservation_and_no_other_live_claims() {
+        let mut ledger = Reservations::new();
+        assert!(!ledger.is_only_live_claim("rebalance", 100));
+        ledger.reserve("rebalance", "corridor", false, U256::from(20), 200);
+        assert!(ledger.is_only_live_claim("rebalance", 100));
+        ledger.reserve("legacy", "unknown-corridor", true, U256::from(1), 110);
+        assert!(!ledger.is_only_live_claim("rebalance", 100));
+        assert!(!ledger.is_only_live_claim("rebalance", 110 + RELEASE_SKEW_SECS - 1));
+        assert!(ledger.is_only_live_claim("rebalance", 110 + RELEASE_SKEW_SECS));
+        assert!(!ledger.is_only_live_claim("rebalance", 200 + RELEASE_SKEW_SECS));
+        ledger.release("rebalance");
+        assert!(!ledger.is_only_live_claim("rebalance", 150));
+    }
 
     #[test]
     fn corridor_peeks_before_release() {

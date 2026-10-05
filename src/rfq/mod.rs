@@ -33,6 +33,7 @@
 
 pub mod iso8601;
 pub mod math;
+mod modules;
 pub mod nonce;
 pub mod order;
 pub mod reserve;
@@ -133,6 +134,7 @@ pub struct RfqRuntime {
     /// Redeem epochs with a close in flight. Process-scoped so reconnecting
     /// the maker stream cannot forget a transaction task that is still alive.
     closing: Arc<Mutex<HashMap<U256, u64>>>,
+    modules: Option<crate::modules::runtime::Runtime>,
 }
 
 /// How old a wallet reading may be before a `max` side goes dark.
@@ -407,6 +409,14 @@ fn build_runtime(
         trading_epoch: Arc::new(RwLock::new(0)),
         vault_policy: Arc::new(RwLock::new(None)),
         closing: Arc::new(Mutex::new(HashMap::new())),
+        modules: if cfg.modules_enabled && cfg.modules.mode != crate::modules::Mode::Off {
+            Some(crate::modules::runtime::Runtime::new(
+                cfg.modules.clone(),
+                config_dir.context("modules need a persistent config directory")?,
+            )?)
+        } else {
+            None
+        },
     })
 }
 
@@ -581,6 +591,9 @@ async fn run(rt: RfqRuntime) {
             rt.vault_policy.clone(),
             rt.closing.clone(),
         ));
+    }
+    if let (Some(vault), Some(modules)) = (rt.vault, rt.modules.clone()) {
+        tokio::spawn(modules::balance_loop(Rpc::new(&rt.rpc_url), vault, modules));
     }
 
     // The reservation ledger outlives sessions AND process restarts: every
@@ -1084,6 +1097,8 @@ async fn session_loop_inner(
         rpc_url: rt.rpc_url.clone(),
         gas_caps: rt.gas_caps,
         closing: rt.closing.clone(),
+        modules: rt.modules.clone(),
+        pending_rebalance: None,
     };
     // Upgrade path: a ledger written before `input_token` existed loads as
     // tokenless. Stamp every bound book now, while the quoted pool is still
@@ -1271,6 +1286,8 @@ struct Engine {
     /// again every tick until the chain says Closed, and a second close would
     /// be a second nonce spent on a revert.
     closing: Arc<Mutex<HashMap<U256, u64>>>,
+    modules: Option<crate::modules::runtime::Runtime>,
+    pending_rebalance: Option<modules::PendingRebalance>,
 }
 
 impl Engine {
@@ -1370,6 +1387,7 @@ impl Engine {
         if self.vault.is_some() && policy.is_none() {
             return Vec::new();
         }
+        self.module_tick(prices, now_secs);
         let order_caps: Vec<(Address, U256)> = policy
             .map(|policy| {
                 vec![
@@ -1392,8 +1410,9 @@ impl Engine {
                 {
                     return None;
                 }
+                let effective = self.module_book(book, &quote, now_secs)?;
                 Some(MakerFrame::Levels(levels_for(
-                    book,
+                    &effective,
                     quote.price,
                     self.reservations.reserved(&book.slug, true, now_secs),
                     self.reservations.reserved(&book.slug, false, now_secs),
@@ -1414,6 +1433,9 @@ impl Engine {
             VenueFrame::AttestRequest(req) => Some(self.cosign(req, prices).await),
             VenueFrame::CloseRedeemRequest(req) => Some(self.close_redeem(req).await),
             VenueFrame::QuoteResult(r) => {
+                if r.rfq_id.starts_with("module-rebalance:") {
+                    return None;
+                }
                 // selected stays reserved until quoteExpired or the deadline.
                 // Everything else is a signature the taker will never submit:
                 // losers are not handed out, and no_quote / invalid / late
@@ -1444,6 +1466,9 @@ impl Engine {
                 None
             }
             VenueFrame::QuoteExpired(e) => {
+                if e.rfq_id.starts_with("module-rebalance:") {
+                    return None;
+                }
                 // The taker's accept window lapsed without a submit. Drop the
                 // claim now so the next request on this side is not sized
                 // against a quote the venue has already un-counted.
@@ -1472,6 +1497,9 @@ impl Engine {
             })
         };
 
+        if req.rfq_id.starts_with("module-rebalance:") {
+            return reject(RejectReason::Busy);
+        }
         let Some(book) = book_for_request(&self.books, &req) else {
             warn!(corridor = %req.corridor_id, "quote request for an unknown corridor");
             return reject(RejectReason::Busy);
@@ -1543,8 +1571,11 @@ impl Engine {
             return reject(RejectReason::Busy);
         };
 
+        let Some(effective_book) = self.module_book(&book, &quote, now_secs) else {
+            return reject(RejectReason::Busy);
+        };
         let plan = match decide_quote(
-            &book,
+            &effective_book,
             &req,
             quote.price,
             self.reservations.reserved(&book.slug, true, now_secs),
@@ -1556,6 +1587,24 @@ impl Engine {
             Ok(plan) => plan,
             Err(reason) => return reject(reason),
         };
+        if let Some(modules) = &self.modules {
+            if modules.config.mode == crate::modules::Mode::Live
+                && modules.config.inventory.enabled
+                && plan.bid
+            {
+                let Some(context) = self.module_context(&book, &quote, now_secs) else {
+                    return reject(RejectReason::Busy);
+                };
+                if !crate::modules::post_buy_allowed(
+                    &modules.config,
+                    &context,
+                    plan.input,
+                    plan.output,
+                ) {
+                    return reject(RejectReason::Size);
+                }
+            }
+        }
         let plan = if self.vault.is_some() {
             let Some(policy) = self.vault_policy.read().ok().and_then(|g| *g) else {
                 return reject(RejectReason::Busy);
@@ -1663,6 +1712,10 @@ impl Engine {
             Some(format!("{:#x}", plan.input_token)),
         );
 
+        if self.modules.is_some() && self.reservations.flush().is_err() {
+            error!("module-enabled quote withheld: reservation persistence failed");
+            return reject(RejectReason::Busy);
+        }
         MakerFrame::QuoteResponse(QuoteResponseFrame {
             rfq_id: req.rfq_id,
             sell_amount: plan.sell_amount.to_string(),
@@ -2538,6 +2591,141 @@ mod tests {
         ]
     }
 
+    #[tokio::test]
+    async fn vault_quote_inventory_keeps_refreshing_while_module_rpc_is_blocked() {
+        use crate::chain::multicall::{Call3, Result3};
+        use alloy_sol_types::SolValue;
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let module_reads = Arc::new(AtomicUsize::new(0));
+        let quote_reads = Arc::new(AtomicUsize::new(0));
+        let module_count = module_reads.clone();
+        let quote_count = quote_reads.clone();
+        let module_read_started = Arc::new(tokio::sync::Notify::new());
+        let started = module_read_started.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let started = started.clone();
+                let module_count = module_count.clone();
+                let quote_count = quote_count.clone();
+                async move {
+                    let result = if req["method"] == "eth_getCode" {
+                        "0x01".to_string()
+                    } else {
+                        let data = alloy_primitives::hex::decode(
+                            req["params"][0]["data"].as_str().unwrap(),
+                        )
+                        .unwrap();
+                        let (calls,) =
+                            <(Vec<Call3>,)>::abi_decode_params_validate(&data[4..]).unwrap();
+                        let values = match calls.len() {
+                            3 => vec![word(2), word(1), word(120)], // assets and lifetime
+                            10 => {
+                                quote_count.fetch_add(1, Ordering::SeqCst);
+                                vault_inventory_results()
+                            }
+                            2 => {
+                                assert_eq!(calls[0].callData.as_ref(), encode_free_settlement());
+                                assert_eq!(calls[1].callData.as_ref(), encode_free_corridor());
+                                module_count.fetch_add(1, Ordering::SeqCst);
+                                started.notify_one();
+                                // Keep module balances unavailable, as for a hung RPC.
+                                std::future::pending::<Vec<Option<Bytes>>>().await
+                            }
+                            count => panic!("unexpected inventory batch of {count} calls"),
+                        };
+                        let results: Vec<Result3> = values
+                            .into_iter()
+                            .map(|value| Result3 {
+                                success: value.is_some(),
+                                returnData: value.unwrap_or_default(),
+                            })
+                            .collect();
+                        alloy_primitives::hex::encode_prefixed((results,).abi_encode_params())
+                    };
+                    Json(json!({ "jsonrpc": "2.0", "id": req["id"], "result": result }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut engine = test_engine();
+        let dir = enable_modules(&mut engine, crate::modules::Mode::Shadow, 0, 0);
+        engine.inventory = InventoryCache::default();
+        *engine.trading_epoch.write().unwrap() = 0;
+        *engine.vault_policy.write().unwrap() = None;
+        let modules = engine.modules.clone().unwrap();
+        *modules.balances.write().unwrap() = None;
+        let refresh = tokio::spawn(inventory_loop(
+            Wallet::new(&url, engine.signer.clone(), engine.chain_id),
+            engine.permit2,
+            vec![],
+            GasReserve::default(),
+            engine.inventory.clone(),
+            engine.vault,
+            None,
+            engine.trading_epoch.clone(),
+            engine.vault_policy.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        ));
+        let module_refresh = tokio::spawn(modules::balance_loop(
+            Rpc::new(&url),
+            engine.vault.unwrap(),
+            modules.clone(),
+        ));
+        let reached_module_read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            module_read_started.notified(),
+        )
+        .await;
+        // Keep the module RPC hung for longer than quote inventory's TTL.
+        // At least two further ordinary refreshes must complete during that time.
+        tokio::time::sleep(std::time::Duration::from_secs(INVENTORY_TTL_SECS + 2)).await;
+        refresh.abort();
+        module_refresh.abort();
+        let _ = module_refresh.await;
+        let _ = refresh.await;
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(dir).unwrap();
+        reached_module_read.expect("module loop must reach the blocked read");
+        assert!(quote_reads.load(Ordering::SeqCst) >= 3);
+        assert_eq!(
+            module_reads.load(Ordering::SeqCst),
+            1,
+            "no overlapping module reads"
+        );
+
+        let now = unix_now();
+        let inventory = engine.inventory.view(now);
+        assert_eq!(
+            inventory.funded(DEBT.parse().unwrap()),
+            Some(U256::from(10))
+        );
+        assert_eq!(
+            inventory.funded(COLLATERAL.parse().unwrap()),
+            Some(U256::from(2_000))
+        );
+        assert_eq!(*engine.trading_epoch.read().unwrap(), 4);
+        let policy = engine.vault_policy.read().unwrap().unwrap();
+        assert_eq!(policy.max_input_settlement, U256::from(500));
+        assert_eq!(policy.max_input_corridor, U256::from(600));
+        assert!(modules.balances.read().unwrap().is_none());
+        assert!(
+            engine
+                .inventory
+                .view(now + INVENTORY_TTL_SECS + 1)
+                .funded(DEBT.parse().unwrap())
+                .is_none(),
+            "a hung module read must not extend quote inventory freshness"
+        );
+    }
+
     #[test]
     fn the_vault_batch_decodes_in_view_order() {
         let (settlement, corridor, epoch, max_s, max_c) =
@@ -2946,6 +3134,8 @@ mod tests {
             rpc_url: "http://127.0.0.1:1".into(),
             gas_caps: GasCaps::for_chain(8453),
             closing: Arc::new(Mutex::new(HashMap::new())),
+            modules: None,
+            pending_rebalance: None,
         }
     }
 
@@ -4485,5 +4675,538 @@ mod tests {
         assert!(!api_key_configured("K", Some(&dir), none));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    fn enable_modules(
+        engine: &mut Engine,
+        mode: crate::modules::Mode,
+        settlement: u64,
+        corridor: u64,
+    ) -> std::path::PathBuf {
+        use crate::modules::{
+            runtime::{Balances, Runtime},
+            ModulesConfig,
+        };
+        let dir = std::env::temp_dir().join(format!("stitch-rfq-module-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = ModulesConfig::default();
+        cfg.mode = mode;
+        cfg.spreads.enabled = false;
+        let runtime = Runtime::new(cfg, &dir).unwrap();
+        *runtime.balances.write().unwrap() = Some(Balances {
+            settlement: U256::from(settlement),
+            corridor: U256::from(corridor),
+            at: unix_now(),
+        });
+        engine.modules = Some(runtime);
+        engine.vault = Some(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+        );
+        engine.reservations = Reservations::with_persist_path(dir.join(RESERVATIONS_FILE));
+        *engine.trading_epoch.write().unwrap() = 3;
+        *engine.vault_policy.write().unwrap() = Some(VaultQuotePolicy {
+            settlement: DEBT.parse().unwrap(),
+            corridor: COLLATERAL.parse().unwrap(),
+            max_input_settlement: U256::MAX,
+            max_input_corridor: U256::MAX,
+            max_lifetime_secs: 120,
+        });
+        dir
+    }
+    #[tokio::test]
+    async fn modules_shadow_preserves_firm_price_while_live_enforces_exposure() {
+        let prices = fresh_prices();
+        let mut shadow = test_engine();
+        let _dir = enable_modules(
+            &mut shadow,
+            crate::modules::Mode::Shadow,
+            1_000_000_000,
+            9_000_000_000,
+        );
+        let MakerFrame::QuoteResponse(quote) =
+            shadow.respond(exact_input_request("shadow"), &prices).await
+        else {
+            panic!("shadow must preserve base quotes");
+        };
+        assert_eq!(quote.buy_amount, "979902009");
+        let mut live = test_engine();
+        let _dir = enable_modules(
+            &mut live,
+            crate::modules::Mode::Live,
+            1_000_000_000,
+            9_000_000_000,
+        );
+        assert!(matches!(
+            live.respond(exact_input_request("live"), &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+        let levels = live.level_frames(&prices, unix_now_ms());
+        let MakerFrame::Levels(levels) = &levels[0] else {
+            panic!("expected levels");
+        };
+        assert!(
+            levels.bids.is_empty(),
+            "indicative levels must agree with firm quote veto"
+        );
+    }
+    #[tokio::test]
+    async fn modules_outstanding_buy_prevents_two_quotes_crossing_the_inventory_cap() {
+        let mut engine = test_engine();
+        let _dir = enable_modules(
+            &mut engine,
+            crate::modules::Mode::Live,
+            7_000_000_000,
+            3_000_000_000,
+        );
+        let prices = fresh_prices();
+        assert!(matches!(
+            engine.respond(exact_input_request("first"), &prices).await,
+            MakerFrame::QuoteResponse(_)
+        ));
+        assert!(matches!(
+            engine.respond(exact_input_request("second"), &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+    }
+
+    fn rebalance_only_without_fresh_balances(stale: bool) -> (Engine, std::path::PathBuf) {
+        let mut engine = test_engine();
+        let dir = enable_modules(
+            &mut engine,
+            crate::modules::Mode::Live,
+            2_000_000_000,
+            8_000_000_000,
+        );
+        let modules = engine.modules.as_mut().unwrap();
+        modules.config.inventory.enabled = false;
+        modules.config.spreads.enabled = false;
+        modules.config.rebalance.enabled = true;
+        modules.config.rebalance.dealer = Some(crate::modules::config::DealerConfig {
+            url: "http://127.0.0.1:1".into(),
+            taker: "0x0000000000000000000000000000000000000003".into(),
+            api_key_env: None,
+        });
+        if stale {
+            modules.balances.write().unwrap().as_mut().unwrap().at = 0;
+        } else {
+            *modules.balances.write().unwrap() = None;
+        }
+        (engine, dir)
+    }
+
+    #[tokio::test]
+    async fn rebalance_only_preserves_levels_without_fresh_module_balances() {
+        for stale in [false, true] {
+            let (mut engine, dir) = rebalance_only_without_fresh_balances(stale);
+            let (mut baseline, _) = rebalance_only_without_fresh_balances(stale);
+            baseline.modules = None;
+            let prices = fresh_prices();
+            let now_ms = unix_now_ms();
+            let expected = baseline.level_frames(&prices, now_ms);
+            assert!(!expected.is_empty());
+            assert_eq!(
+                serde_json::to_value(engine.level_frames(&prices, now_ms)).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "rebalance-only must preserve both quote sides (stale={stale})"
+            );
+            assert!(engine.pending_rebalance.is_none());
+            assert!(engine.reservations.is_empty());
+            assert!(
+                !dir.join("modules-attempt.json").exists(),
+                "rebalancing must still wait for fresh economic balances"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rebalance_only_preserves_firm_quotes_without_fresh_module_balances() {
+        for stale in [false, true] {
+            for bid in [true, false] {
+                let (mut engine, _) = rebalance_only_without_fresh_balances(stale);
+                let (mut baseline, _) = rebalance_only_without_fresh_balances(stale);
+                baseline.modules = None;
+                let prices = fresh_prices();
+                let mut request = exact_input_request("rebalance-only-customer");
+                if !bid {
+                    std::mem::swap(&mut request.sell_token, &mut request.buy_token);
+                }
+                let MakerFrame::QuoteResponse(expected) =
+                    baseline.respond(request.clone(), &prices).await
+                else {
+                    panic!("baseline should quote both directions");
+                };
+                let reply = engine.respond(request, &prices).await;
+                let MakerFrame::QuoteResponse(actual) = reply else {
+                    panic!("rebalance-only should quote (stale={stale}, bid={bid}): {reply:?}");
+                };
+                assert_eq!(actual.sell_amount, expected.sell_amount);
+                assert_eq!(actual.buy_amount, expected.buy_amount);
+                assert_eq!(actual.fee_amount, expected.fee_amount);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_quote_strategies_still_require_module_balances() {
+        for inventory in [true, false] {
+            let (mut engine, _) = rebalance_only_without_fresh_balances(false);
+            let cfg = &mut engine.modules.as_mut().unwrap().config;
+            cfg.inventory.enabled = inventory;
+            cfg.spreads.enabled = !inventory;
+            let prices = fresh_prices();
+            assert!(engine.level_frames(&prices, unix_now_ms()).is_empty());
+            assert!(matches!(
+                engine
+                    .respond(exact_input_request("missing-balances"), &prices)
+                    .await,
+                MakerFrame::QuoteReject(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn modules_stale_economic_balances_and_reversed_pair_stop_live_quotes() {
+        let mut engine = test_engine();
+        let _dir = enable_modules(
+            &mut engine,
+            crate::modules::Mode::Live,
+            7_000_000_000,
+            3_000_000_000,
+        );
+        let prices = fresh_prices();
+        engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .balances
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .at = unix_now() - 10;
+        assert!(matches!(
+            engine.respond(exact_input_request("stale"), &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+        engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .balances
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .at = unix_now();
+        let mut limits = engine.vault_policy.write().unwrap();
+        let p = limits.as_mut().unwrap();
+        std::mem::swap(&mut p.settlement, &mut p.corridor);
+        drop(limits);
+        assert!(matches!(
+            engine
+                .respond(exact_input_request("reversed"), &prices)
+                .await,
+            MakerFrame::QuoteReject(_)
+        ));
+    }
+    #[tokio::test]
+    async fn module_rebalance_reservations_survive_venue_release_frames_and_reload() {
+        let mut engine = test_engine();
+        let dir = enable_modules(
+            &mut engine,
+            crate::modules::Mode::Live,
+            7_000_000_000,
+            3_000_000_000,
+        );
+        let key = "module-rebalance:pending";
+        engine.reservations.reserve_paying(
+            key,
+            "cngn-usdc",
+            false,
+            U256::from(100),
+            unix_now() + 60,
+            Some(COLLATERAL),
+        );
+        engine
+            .dispatch(
+                VenueFrame::QuoteExpired(QuoteExpiredFrame { rfq_id: key.into() }),
+                &fresh_prices(),
+            )
+            .await;
+        assert_eq!(engine.reservations.len(), 1);
+        let loaded = Reservations::load(dir.join(RESERVATIONS_FILE), unix_now()).unwrap();
+        assert_eq!(
+            loaded.reserved("cngn-usdc", false, unix_now()),
+            U256::from(100)
+        );
+    }
+
+    struct RebalanceFixture {
+        engine: Engine,
+        prices: PriceCache,
+        dir: std::path::PathBuf,
+        received: Arc<Mutex<Option<serde_json::Value>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    async fn rebalance_fixture() -> RebalanceFixture {
+        use crate::modules::{config::DealerConfig, dealer, runtime::Runtime, Mode};
+        use axum::{routing::post, Json, Router};
+        let received = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let seen = received.clone();
+        let app = Router::new()
+            .route(
+                "/quote",
+                post(|Json(r): Json<dealer::QuoteRequest>| async move {
+                    Json(dealer::Quote {
+                        request_id: r.request_id,
+                        taker: "0x0000000000000000000000000000000000000003".into(),
+                        sell_amount: r.sell_amount,
+                        buy_amount: r.min_buy_amount,
+                        expires_at: r.deadline,
+                    })
+                }),
+            )
+            .route(
+                "/execute",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().unwrap() = Some(body);
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut engine = test_engine();
+        let dir = enable_modules(&mut engine, Mode::Live, 2_000_000_000, 8_000_000_000);
+        let previous = engine.modules.take().unwrap();
+        let mut cfg = previous.config.clone();
+        cfg.rebalance.enabled = true;
+        cfg.rebalance.dealer = Some(DealerConfig {
+            url: format!("http://{addr}"),
+            taker: "0x0000000000000000000000000000000000000003".into(),
+            api_key_env: None,
+        });
+        let runtime = Runtime::new(cfg, &dir).unwrap();
+        *runtime.balances.write().unwrap() = *previous.balances.read().unwrap();
+        engine.modules = Some(runtime);
+        RebalanceFixture {
+            engine,
+            prices: fresh_prices(),
+            dir,
+            received,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    async fn module_spot_rebalance_signs_only_after_reserving_and_never_counts_submission_as_fill()
+    {
+        let RebalanceFixture {
+            mut engine,
+            prices,
+            dir,
+            received,
+            server,
+        } = rebalance_fixture().await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                engine.module_tick(&prices, unix_now());
+                if received.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dealer should receive one locally constructed order");
+        let body = received.lock().unwrap().clone().unwrap();
+        assert_eq!(body["chainId"], 8453);
+        assert_eq!(body["strategySignature"].as_str().unwrap().len(), 132);
+        let bytes = alloy_primitives::hex::decode(body["encodedOrder"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            Address::from_slice(&bytes[7 * 32 + 12..8 * 32]),
+            engine.vault.unwrap()
+        );
+        let loaded = Reservations::load(dir.join(RESERVATIONS_FILE), unix_now()).unwrap();
+        assert_eq!(
+            loaded.reserved("cngn-usdc", false, unix_now()),
+            U256::from(200_000_000u64)
+        );
+        assert_eq!(
+            engine
+                .modules
+                .as_ref()
+                .unwrap()
+                .balances
+                .read()
+                .unwrap()
+                .unwrap()
+                .corridor,
+            U256::from(8_000_000_000u64),
+            "submission must not manufacture a fill"
+        );
+        engine.module_tick(&prices, unix_now());
+        assert_eq!(
+            engine.reservations.len(),
+            1,
+            "no duplicate while the first order can still fill"
+        );
+        server.abort();
+    }
+
+    struct GatedSigner {
+        inner: DynSigner,
+        started: tokio::sync::Notify,
+        resume: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::signer::Signer for GatedSigner {
+        async fn sign_digest(&self, digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
+            self.started.notify_one();
+            self.resume.acquire().await.unwrap().forget();
+            self.inner.sign_digest(digest).await
+        }
+
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+    }
+
+    async fn pending_rebalance_signer(
+        engine: &mut Engine,
+        prices: &PriceCache,
+    ) -> Arc<GatedSigner> {
+        let local = engine.signer.clone();
+        let custody = Arc::new(GatedSigner {
+            inner: local.clone(),
+            started: tokio::sync::Notify::new(),
+            resume: tokio::sync::Semaphore::new(0),
+        });
+        engine.signer = custody.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while engine.pending_rebalance.is_none() {
+                engine.module_tick(&prices, unix_now());
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            custody.started.notified().await;
+        })
+        .await
+        .expect("rebalance must reach the custody signer");
+        engine.signer = local;
+        custody
+    }
+    #[tokio::test]
+    async fn module_signature_is_withheld_when_customer_quote_arrives_during_signing() {
+        let RebalanceFixture {
+            mut engine,
+            prices,
+            dir,
+            received,
+            server,
+        } = rebalance_fixture().await;
+        let custody = pending_rebalance_signer(&mut engine, &prices).await;
+        assert_eq!(
+            engine.reservations.len(),
+            1,
+            "reserve before custody signing"
+        );
+
+        // The engine can quote a customer while custody approves the module order.
+        let mut customer = exact_input_request("customer-during-rebalance-signing");
+        customer.sell_token = DEBT.into();
+        customer.buy_token = COLLATERAL.into();
+        assert!(matches!(
+            engine.respond(customer, &prices).await,
+            MakerFrame::QuoteResponse(_)
+        ));
+        assert_eq!(engine.reservations.len(), 2);
+        finish_rebalance_signing(&mut engine, &prices, &custody).await;
+        assert!(
+            received.lock().unwrap().is_none(),
+            "dealer must not receive the overlapping order"
+        );
+        let loaded = Reservations::load(dir.join(RESERVATIONS_FILE), unix_now()).unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "withholding a signature does not release durable claims"
+        );
+        server.abort();
+    }
+
+    async fn finish_rebalance_signing(
+        engine: &mut Engine,
+        prices: &PriceCache,
+        custody: &GatedSigner,
+    ) {
+        custody.resume.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while engine.pending_rebalance.is_some() {
+                engine.module_tick(&prices, unix_now());
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed signature must return to the ledger owner");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn module_signature_is_rechecked_against_current_vault_state() {
+        for changed in [
+            "epoch",
+            "order cap",
+            "stale balances",
+            "missing reservation",
+        ] {
+            let RebalanceFixture {
+                mut engine,
+                prices,
+                received,
+                server,
+                ..
+            } = rebalance_fixture().await;
+            let custody = pending_rebalance_signer(&mut engine, &prices).await;
+            match changed {
+                "epoch" => *engine.trading_epoch.write().unwrap() += 1,
+                "order cap" => {
+                    engine
+                        .vault_policy
+                        .write()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .max_input_corridor = U256::from(1);
+                }
+                "stale balances" => {
+                    engine
+                        .modules
+                        .as_ref()
+                        .unwrap()
+                        .balances
+                        .write()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .at = 0;
+                }
+                "missing reservation" => engine.reservations = Reservations::new(),
+                _ => unreachable!(),
+            }
+            finish_rebalance_signing(&mut engine, &prices, &custody).await;
+            assert!(
+                received.lock().unwrap().is_none(),
+                "changed {changed} must withhold the signature"
+            );
+            server.abort();
+        }
     }
 }

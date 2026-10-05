@@ -1,3 +1,4 @@
+import type { ModulesConfig, ModulesView, SimulationReport } from './modules'
 // The one place that talks to the panel API.
 //
 // Every call goes through `request`, so the 401-means-sign-in rule and the
@@ -155,6 +156,9 @@ export interface DesktopSwitches {
 }
 
 export const api = {
+  modules: (name: string) => request<ModulesView>(`/api/bots/${encodeURIComponent(name)}/modules`),
+  saveModules: (name: string, revision: string, config: ModulesConfig) => request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/modules`, { method: 'PUT', body: JSON.stringify({ revision, config }) }),
+  simulateModules: (name: string, config: ModulesConfig, dataset: unknown) => request<SimulationReport>(`/api/bots/${encodeURIComponent(name)}/modules/simulate`, json({ config, dataset })),
   /** The desktop app's own switches, relayed through the panel. */
   desktop: () => request<DesktopSwitches>('/api/desktop'),
   setDesktop: (body: { autostart?: boolean; keepAwake?: boolean }) =>

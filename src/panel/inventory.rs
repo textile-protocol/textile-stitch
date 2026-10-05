@@ -212,6 +212,7 @@ impl Warning {
 /// load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigSummary {
+    pub modules_enabled: bool,
     /// The corridor id: stamped into the config when it was written from a
     /// known corridor, else the shipped catalog's id for the pair.
     pub corridor_id: Option<String>,
@@ -795,6 +796,7 @@ pub fn summarise(
     let corridor = setup::config_identity(toml_str);
     let signer = setup::read_signer(toml_str);
     Ok(ConfigSummary {
+        modules_enabled: parsed.modules_enabled,
         corridor_id: corridor.as_ref().map(|c| c.id.clone()),
         corridor_label: fleet_corridor_label(
             parsed.pools.len(),

@@ -24,6 +24,7 @@ pub mod logs;
 // use it too; panel tests keep their old path through this re-export.
 #[cfg(test)]
 pub(crate) use crate::chain::mock_node as mock_chain;
+mod modules;
 pub mod origin;
 pub mod session;
 pub mod settings;
@@ -298,6 +299,11 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/versions", get(bots::versions))
         .route("/api/bots/{name}/rollback", post(bots::rollback))
         .route("/api/bots/{name}/migrate", post(bots::migrate_layout))
+        .route(
+            "/api/bots/{name}/modules",
+            get(modules::show).put(modules::update),
+        )
+        .route("/api/bots/{name}/modules/simulate", post(modules::simulate))
         .route("/api/bots/{name}/settings", get(settings::show))
         .route("/api/bots/{name}/settings", patch(settings::update))
         .route("/api/bots/{name}/rfq/enroll", post(enroll::enroll))

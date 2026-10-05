@@ -1,0 +1,398 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Textile, Inc.
+use alloy_primitives::{address, U256};
+use stitch_bot::{
+    config::RfqCapacity,
+    modules::{config::DealerConfig, dealer, replay::*, *},
+    pricing::quote::Spread,
+    rfq::responder::CorridorBook,
+};
+
+fn u(v: u64) -> U256 {
+    U256::from(v)
+}
+fn config() -> ModulesConfig {
+    let mut c = ModulesConfig::default();
+    c.spreads.enabled = false;
+    c
+}
+fn context() -> Context {
+    Context {
+        now: 100,
+        price: 1.0,
+        price_at: 100,
+        balances_at: 100,
+        staleness_secs: 10,
+        settlement: u(40_000_000),
+        corridor: u(60_000_000),
+        available_settlement: u(40_000_000),
+        available_corridor: u(60_000_000),
+        reserved_settlement: U256::ZERO,
+        reserved_corridor: U256::ZERO,
+        settlement_decimals: 6,
+        corridor_decimals: 6,
+        max_sell: u(10_000_000),
+        base_buy_bps: Some(20),
+        base_sell_bps: Some(20),
+    }
+}
+fn book() -> CorridorBook {
+    CorridorBook {
+        slug: "test".into(),
+        collateral: address!("0000000000000000000000000000000000000001"),
+        debt: address!("0000000000000000000000000000000000000002"),
+        collateral_decimals: 6,
+        debt_decimals: 6,
+        buy_spread: Some(Spread::Bps(20)),
+        sell_spread: Some(Spread::Bps(20)),
+        buy_capacity_debt: Some(RfqCapacity::Wallet),
+        sell_capacity_collateral: Some(RfqCapacity::Wallet),
+        feed_url: "http://localhost/price".into(),
+        staleness_secs: 10,
+    }
+}
+#[test]
+fn inventory_disables_accumulation_at_cap_and_cheapens_unloading() {
+    let d = evaluate(&config(), &context(), &[]);
+    assert_eq!(d.inventory_bps, Some(6000));
+    assert_eq!(d.buy_bps, None);
+    assert_eq!(d.sell_bps, Some(5));
+    let mut ctx = context();
+    ctx.corridor = u(40_000_000);
+    ctx.settlement = u(60_000_000);
+    let d = evaluate(&config(), &ctx, &[]);
+    assert!(d.buy_bps.unwrap() > 20);
+    assert!(d.sell_bps.unwrap() < 20);
+}
+#[test]
+fn reservations_do_not_disappear_from_exposure_and_block_new_risk() {
+    let mut ctx = context();
+    ctx.corridor = u(40_000_000);
+    ctx.settlement = u(60_000_000);
+    ctx.reserved_settlement = u(1);
+    let mut cfg = config();
+    cfg.rebalance.enabled = true;
+    let d = evaluate(&cfg, &ctx, &[]);
+    assert_eq!(d.inventory_bps, Some(4000));
+    assert!(d.buy_bps.is_none());
+    ctx.corridor = u(80_000_000);
+    ctx.reserved_corridor = u(10_000_000);
+    let d = evaluate(&cfg, &ctx, &[]);
+    assert!(d.rebalance_sell.is_zero());
+    assert!(d.inventory_bps.unwrap() > 5000);
+}
+#[test]
+fn stale_future_and_missing_value_fail_closed() {
+    for ctx in [
+        Context {
+            price_at: 89,
+            ..context()
+        },
+        Context {
+            price_at: 101,
+            ..context()
+        },
+        Context {
+            balances_at: 96,
+            ..context()
+        },
+        Context {
+            price: f64::NAN,
+            ..context()
+        },
+        Context {
+            settlement: U256::ZERO,
+            corridor: U256::ZERO,
+            ..context()
+        },
+    ] {
+        let d = evaluate(&config(), &ctx, &[]);
+        assert!(d.blocked);
+        assert!(d.buy_bps.is_none());
+        assert!(d.sell_bps.is_none());
+        assert!(d.rebalance_sell.is_zero());
+    }
+}
+#[test]
+fn warmup_then_bounded_volatility_never_uses_a_future_point() {
+    let mut cfg = config();
+    cfg.spreads.enabled = true;
+    assert!(evaluate(&cfg, &context(), &[]).blocked);
+    let history = [
+        PricePoint {
+            timestamp: 50,
+            price: 1.0,
+        },
+        PricePoint {
+            timestamp: 100,
+            price: 0.99,
+        },
+    ];
+    let d = evaluate(&cfg, &context(), &history);
+    assert!(!d.blocked);
+    assert_eq!(d.volatility_bps, 100);
+    let extended = [
+        history[0],
+        history[1],
+        PricePoint {
+            timestamp: 101,
+            price: 100.0,
+        },
+    ];
+    assert_eq!(d, evaluate(&cfg, &context(), &extended));
+}
+#[test]
+fn rebalance_limits_trade_to_nav_fraction_and_quotable_inventory() {
+    let mut cfg = config();
+    cfg.rebalance.enabled = true;
+    assert_eq!(evaluate(&cfg, &context(), &[]).rebalance_sell, u(2_000_000));
+    let ctx = Context {
+        available_corridor: u(100),
+        ..context()
+    };
+    assert_eq!(evaluate(&cfg, &ctx, &[]).rebalance_sell, u(100));
+    let ctx = Context {
+        max_sell: u(50),
+        ..ctx
+    };
+    assert_eq!(evaluate(&cfg, &ctx, &[]).rebalance_sell, u(50));
+}
+#[test]
+fn exact_post_trade_check_rejects_even_sub_basis_point_limit_breaches() {
+    let cfg = config();
+    assert!(!post_buy_allowed(&cfg, &context(), u(1), u(1)));
+    assert!(post_buy_allowed(&cfg, &context(), U256::ZERO, U256::ZERO));
+    let ctx = Context {
+        settlement: u(70_000_000),
+        corridor: u(30_000_000),
+        ..context()
+    };
+    assert!(post_buy_allowed(&cfg, &ctx, u(1_000_000), u(1_000_000)));
+}
+#[test]
+fn offsets_are_exact_and_operator_disabled_sides_stay_disabled() {
+    let mut b = book();
+    assert_eq!(base_spreads(&b, 1.0), (Some(20), Some(20)));
+    b.buy_spread = None;
+    b.buy_capacity_debt = None;
+    let ctx = Context {
+        base_buy_bps: None,
+        ..context()
+    };
+    let d = evaluate(&config(), &ctx, &[]);
+    assert!(apply(&b, &d).buy_capacity_debt.is_none());
+}
+#[test]
+fn strict_configs_reject_bad_limits_and_unknown_keys() {
+    let mut c = config();
+    c.inventory.target_bps = c.inventory.max_bps;
+    assert!(c.validate().is_err());
+    let mut c = config();
+    c.rebalance.cooldown_secs = 1;
+    assert!(c.validate().is_err());
+    assert!(toml::from_str::<ModulesConfig>("modde = 'live'").is_err());
+    let mut c = config();
+    c.spreads.multiplier = f64::INFINITY;
+    assert!(c.validate().is_err());
+}
+fn dealer_terms() -> (DealerConfig, dealer::QuoteRequest, dealer::Quote) {
+    let cfg = DealerConfig {
+        url: "http://localhost:3333".into(),
+        taker: "0x0000000000000000000000000000000000000003".into(),
+        api_key_env: None,
+    };
+    let request = dealer::QuoteRequest {
+        request_id: "id".into(),
+        chain_id: 1,
+        vault: "vault".into(),
+        sell_token: "sell".into(),
+        buy_token: "buy".into(),
+        sell_amount: u(100),
+        min_buy_amount: u(99),
+        deadline: 150,
+    };
+    let quote = dealer::Quote {
+        request_id: "id".into(),
+        taker: cfg.taker.clone(),
+        sell_amount: u(100),
+        buy_amount: u(99),
+        expires_at: 145,
+    };
+    (cfg, request, quote)
+}
+#[test]
+fn dealer_cannot_change_counterparty_size_price_or_deadline() {
+    let (cfg, req, q) = dealer_terms();
+    assert!(dealer::validate_quote(&cfg, &req, &q, 100).is_ok());
+    for changed in [
+        dealer::Quote {
+            buy_amount: u(98),
+            ..q.clone()
+        },
+        dealer::Quote {
+            sell_amount: u(101),
+            ..q.clone()
+        },
+        dealer::Quote {
+            expires_at: 151,
+            ..q.clone()
+        },
+        dealer::Quote {
+            expires_at: 105,
+            ..q.clone()
+        },
+        dealer::Quote {
+            request_id: "another".into(),
+            ..q.clone()
+        },
+        dealer::Quote {
+            taker: "0x0000000000000000000000000000000000000004".into(),
+            ..q
+        },
+    ] {
+        assert!(dealer::validate_quote(&cfg, &req, &changed, 100).is_err());
+    }
+}
+fn data() -> Dataset {
+    let b = book();
+    Dataset {
+        version: 1,
+        chain_id: 1,
+        corridor_token: b.collateral.to_string(),
+        settlement_token: b.debt.to_string(),
+        corridor_decimals: 6,
+        settlement_decimals: 6,
+        initial_settlement: u(40_000_000),
+        initial_corridor: u(60_000_000),
+        max_order_settlement: u(100_000_000),
+        max_order_corridor: u(100_000_000),
+        reserve_settlement: U256::ZERO,
+        reserve_corridor: U256::ZERO,
+        cost_per_trade: U256::ZERO,
+        events: vec![
+            Event {
+                at: 100,
+                price_at: 100,
+                price: 1.0,
+                trade: None,
+                dealer: Some(Liquidity {
+                    max_corridor: u(100_000_000),
+                    net_price: 1.0,
+                }),
+            },
+            Event {
+                at: 500,
+                price_at: 500,
+                price: 0.5,
+                trade: None,
+                dealer: None,
+            },
+        ],
+    }
+}
+#[test]
+fn replay_protects_against_a_drop_only_when_executable_liquidity_exists() {
+    let mut cfg = config();
+    cfg.rebalance.enabled = true;
+    let d = data();
+    let report = run(&d, &cfg, &book()).unwrap();
+    assert_eq!(report.baseline.ending_nav, u(70_000_000));
+    assert_eq!(report.candidate.ending_nav, u(71_000_000));
+    assert_eq!(report.candidate.rebalance_fills, 1);
+    let mut d = d;
+    d.events[0].dealer = None;
+    let report = run(&d, &cfg, &book()).unwrap();
+    assert_eq!(report.candidate.ending_nav, report.baseline.ending_nav);
+    assert_eq!(report.candidate.rebalance_fills, 0);
+}
+#[test]
+fn replay_costs_can_erase_the_benefit_and_portfolios_do_not_share_balances() {
+    let mut cfg = config();
+    cfg.rebalance.enabled = true;
+    let mut d = data();
+    d.cost_per_trade = u(1_500_000);
+    let report = run(&d, &cfg, &book()).unwrap();
+    assert_eq!(report.baseline.ending_nav, u(70_000_000));
+    assert!(report.candidate.ending_nav < report.baseline.ending_nav);
+    assert_eq!(report.candidate.execution_costs, u(1_500_000));
+}
+#[test]
+fn customer_acceptance_and_operator_side_switches_control_simulated_fills() {
+    let mut d = data();
+    d.events[0].dealer = None;
+    d.events[0].trade = Some(Trade {
+        vault_buys: true,
+        corridor_amount: u(1_000_000),
+        limit_price: 0.998,
+    });
+    let report = run(&d, &config(), &book()).unwrap();
+    assert_eq!(report.baseline.customer_fills, 1);
+    assert_eq!(report.candidate.customer_fills, 0);
+    let mut b = book();
+    b.buy_capacity_debt = None;
+    let report = run(&d, &config(), &b).unwrap();
+    assert_eq!(report.baseline.customer_fills, 0);
+}
+#[test]
+fn replay_refuses_future_prices_wrong_tokens_unsorted_events_and_wrong_versions() {
+    let mut d = data();
+    d.events[0].price_at = 101;
+    assert!(run(&d, &config(), &book()).is_err());
+    let mut d = data();
+    d.events.reverse();
+    assert!(run(&d, &config(), &book()).is_err());
+    let mut d = data();
+    d.corridor_token = d.settlement_token.clone();
+    assert!(run(&d, &config(), &book()).is_err());
+    let mut d = data();
+    d.version = 2;
+    assert!(run(&d, &config(), &book()).is_err());
+}
+#[tokio::test]
+async fn dealer_pacing_survives_restart_and_corrupt_pacing_blocks_start() {
+    let dir = std::env::temp_dir().join(format!("stitch-module-test-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut dealer, mut request, _) = dealer_terms();
+    dealer.url = "http://127.0.0.1:1".into();
+    let mut cfg = config();
+    cfg.rebalance.dealer = Some(dealer);
+    request.deadline = stitch_bot::time::unix_now() + 60;
+    let rt = runtime::Runtime::new(cfg.clone(), &dir).unwrap();
+    rt.begin_quote(request).unwrap();
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("modules-attempt.json")).unwrap())
+            .unwrap();
+    assert!(stored["next_attempt_at"].as_u64().unwrap() > stitch_bot::time::unix_now());
+    assert!(runtime::Runtime::new(cfg.clone(), &dir).is_ok());
+    std::fs::write(dir.join("modules-attempt.json"), "broken").unwrap();
+    assert!(runtime::Runtime::new(cfg, &dir).is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn economic_inventory_includes_settlement_that_is_not_currently_quotable() {
+    let ctx = Context {
+        settlement: u(90_000_000),
+        corridor: u(10_000_000),
+        available_settlement: u(1_000_000),
+        ..context()
+    };
+    let d = evaluate(&config(), &ctx, &[]);
+    assert_eq!(d.inventory_bps, Some(1000));
+    assert!(d.buy_limit <= ctx.available_settlement);
+}
+
+#[test]
+fn different_token_precisions_produce_the_same_exposure_and_sale_size() {
+    let mut cfg = config();
+    cfg.rebalance.enabled = true;
+    let ctx = Context {
+        settlement_decimals: 18,
+        settlement: U256::from(40u64) * U256::from(10u64).pow(U256::from(18u64)),
+        ..context()
+    };
+    let d = evaluate(&cfg, &ctx, &[]);
+    assert_eq!(d.inventory_bps, Some(6000));
+    assert_eq!(d.rebalance_sell, u(2_000_000));
+}

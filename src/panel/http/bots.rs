@@ -80,6 +80,7 @@ pub struct BotBody {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigBody {
+    pub modules_enabled: bool,
     pub corridor_id: Option<String>,
     pub corridor_label: Option<String>,
     /// Every pair the bot quotes, in pool order.
@@ -115,6 +116,7 @@ pub struct WarningBody {
 impl From<&ConfigSummary> for ConfigBody {
     fn from(c: &ConfigSummary) -> Self {
         Self {
+            modules_enabled: c.modules_enabled,
             corridor_id: c.corridor_id.clone(),
             pairs: c.pairs.clone(),
             network_label: c.network_label.clone(),

@@ -19,6 +19,8 @@ Stitch quotes Swap by default, plus an optional second job:
   when their price is at or beyond your own quote, priced by the same spreads
   as your Swap quotes.
 
+First-party FX protection modules are available behind `modules_enabled = true` in `stitch.toml`. See [module configuration, simulation and spot rebalancing](docs/modules.md).
+
 ## Contents
 
 - [Quick Start](#quick-start)

@@ -1,3 +1,4 @@
+import ModulesPanel from '../components/ModulesPanel'
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { BOT_TABS, TAB_LABEL, botLabel, botPath, parseBotTab, type BotTab } from '../botRoutes'
@@ -59,7 +60,8 @@ export default function BotDetail() {
   // After create, land on Tools so Approve allowances is the next obvious step.
   // Tab lives in `?tab=` so switching bots from the title keeps the same section.
   const fallbackTab: BotTab = handoff?.needsPermit2 ? 'tools' : 'funds'
-  const tab = parseBotTab(searchParams.get('tab'), fallbackTab)
+  const requestedTab = parseBotTab(searchParams.get('tab'), fallbackTab)
+  const tab = requestedTab === 'modules' && bot && !bot.config?.modulesEnabled ? fallbackTab : requestedTab
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
 
   useEffect(() => {
@@ -410,7 +412,7 @@ export default function BotDetail() {
           className="flex flex-nowrap gap-x-0.5 overflow-x-auto overflow-y-hidden overscroll-x-contain [touch-action:pan-x_pan-y] border-b border-line-soft [scrollbar-width:none] [-ms-overflow-style:none] sm:gap-x-1 [&::-webkit-scrollbar]:hidden"
           aria-label="Bot sections"
         >
-          {BOT_TABS.map((t) => (
+          {BOT_TABS.filter((t) => t !== 'modules' || bot.config?.modulesEnabled).map((t) => (
             <Link
               key={t}
               to={botPath(name, t)}
@@ -431,6 +433,8 @@ export default function BotDetail() {
           className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-canvas to-transparent sm:hidden"
         />
       </div>
+
+      {tab === 'modules' && bot.config?.modulesEnabled && <ModulesPanel key={name} name={name} editable={bot.editable} />}
 
       {tab === 'settings' &&
         (bot.editable ? (

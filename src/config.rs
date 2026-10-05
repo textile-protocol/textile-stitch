@@ -44,6 +44,11 @@ pub const MAX_TWAP_MAX_DEVIATION_BPS: u32 = 10_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// Master gate for module runtime, recording, simulation and panel controls.
+    #[serde(default)]
+    pub modules_enabled: bool,
+    #[serde(default)]
+    pub modules: crate::modules::ModulesConfig,
     pub chain_id: u64,
     pub rpc_url: String,
     /// Textile indexer base URL (receives signed orders, serves the estimate).
@@ -1321,6 +1326,23 @@ impl Config {
                     );
                 }
             }
+        }
+        if self.modules_enabled {
+            self.modules.validate()?;
+            anyhow::ensure!(
+                self.vault.is_some() && self.pools.len() == 1 && self.rfq_active(),
+                "modules require an OperatorVault, one corridor and enabled RFQ"
+            );
+            anyhow::ensure!(
+                !self.book_enabled && self.on_chain_legs().is_empty(),
+                "modules require RFQ-only operation; disable the ladder, limit taker and closer"
+            );
+            anyhow::ensure!(
+                self.pools
+                    .iter()
+                    .all(|p| p.lean_mode() == LeanMode::Off && p.twap_window_secs.is_none()),
+                "modules cannot be combined with legacy lean or TWAP settings"
+            );
         }
         if let Some(signer) = &self.signer {
             match signer {

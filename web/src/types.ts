@@ -17,6 +17,7 @@ export interface WarningBody {
 }
 
 export interface ConfigBody {
+  modulesEnabled?: boolean
   corridorId: string | null
   corridorLabel: string | null
   /** Every pair the bot quotes, in pool order: "cNGN / USDT", "wBRL / USDT". */

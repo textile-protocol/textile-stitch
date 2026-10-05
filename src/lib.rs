@@ -28,6 +28,7 @@ pub mod book;
 pub mod chain;
 pub mod closer;
 pub mod config;
+pub mod modules;
 pub mod net;
 #[cfg(feature = "panel")]
 pub mod panel;
