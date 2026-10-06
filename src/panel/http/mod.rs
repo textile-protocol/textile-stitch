@@ -29,6 +29,7 @@ pub mod origin;
 pub mod session;
 pub mod settings;
 pub mod updates;
+pub mod vault;
 pub mod verify;
 pub mod wizard;
 
@@ -316,6 +317,11 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             post(verify::verify_email),
         )
         .route("/api/bots/{name}/rfq/status", post(verify::maker_status))
+        .route(
+            "/api/bots/{name}/vault",
+            post(vault::link).delete(vault::unlink),
+        )
+        .route("/api/bots/{name}/vault/check", post(vault::check))
         .route("/api/bots/{name}/config", get(settings::raw))
         .route("/api/bots/{name}/config", put(settings::save_raw))
         .route("/api/bots/{name}/pools", post(settings::add_pool))

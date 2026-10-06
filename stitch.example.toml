@@ -161,6 +161,14 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # `restricted=<new vault>` swap sees no liquidity. Connect again in the panel
 # and use the maker id it issues. The bot refuses the session rather than
 # quote through the mismatch.
+#
+# In the panel, Corridors → Experimental → Trade from a vault does all of this
+# in one step: it checks the vault (same pair as the bot, strategy signer is
+# the bot's key, registered with Textile), writes this block with the
+# order_executor Textile names for it, turns the ladder and the taker leg off,
+# re-enrolls with the vault as funding wallet and restarts the bot. Disconnect
+# there to go back to the bot's own wallet. By hand, do the same: edit this
+# block, then Connect again.
 # [vault]
 # address = "0xYourOperatorVault"
 # order_executor = "0x0000000000000000000000000000000000000000"  # optional: the chain's VaultOrderExecutor, once the venue lists one.

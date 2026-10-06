@@ -12,7 +12,24 @@ import {
   Toggle,
 } from './ui'
 import { shortAddress } from '../format'
-import type { Bot, Corridor, Settings, Spread } from '../types'
+import type {
+  Bot,
+  Corridor,
+  Settings,
+  Spread,
+  VaultCheck,
+  VaultCheckResult,
+  VaultCheckStatus,
+} from '../types'
+import {
+  CHECK_MARK,
+  checksFromError,
+  foldRepeatedDetails,
+  isVaultAddress,
+  sameAddress,
+  savedMessage,
+  vaultAddressError,
+} from '../vault'
 
 /**
  * The Corridors tab: every pool on this bot, its spreads and price feed, plus
@@ -260,7 +277,22 @@ export default function SettingsForm({
         draft={draft}
         editable={loaded.editable}
         onChange={set}
-      />
+      >
+        <VaultSubsection
+          // One form serves every bot: an address typed for one must not be
+          // checked, or connected, against the next.
+          key={bot.name}
+          bot={bot}
+          settings={loaded}
+          dirty={dirty}
+          onChanged={(next, message) => {
+            setPool(next.poolIndex)
+            setLoaded(next)
+            setDraft(next)
+            onSaved(message)
+          }}
+        />
+      </ExperimentalCard>
 
 
       {error && <Banner tone="danger">{error}</Banner>}
@@ -491,10 +523,13 @@ function ExperimentalCard({
   draft,
   editable,
   onChange,
+  children,
 }: {
   draft: Settings
   editable: boolean
   onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void
+  /** More subsections, after the built-in ones. */
+  children?: ReactNode
 }) {
   const [open, setOpen] = useState(false)
   const leanOn = draft.leanEnabled || draft.leanShadow
@@ -638,6 +673,8 @@ function ExperimentalCard({
               </div>
             </div>
           </ExperimentalSubsection>
+
+          {children}
         </div>
       )}
     </Card>
@@ -662,6 +699,305 @@ function ExperimentalSubsection({
       </header>
       {children}
     </section>
+  )
+}
+
+/** How long typing has to pause before the panel is asked to check a vault. */
+const VAULT_CHECK_DEBOUNCE_MS = 600
+
+const CHECK_TONE: Record<VaultCheckStatus, string> = {
+  ok: 'text-success',
+  fail: 'text-danger',
+  warn: 'text-warning',
+  skipped: 'text-faint',
+}
+
+/**
+ * Point the bot at an OperatorVault, or back at its own wallet.
+ *
+ * The panel runs every check and the Textile re-connect. This asks it for a
+ * dry run once the box holds a well-formed address, and offers Save only when
+ * a dry run passed for exactly that address. Moving onto or off a vault
+ * changes the maker Textile knows the bot as, which is why it isn't part of
+ * the form's own Save.
+ */
+function VaultSubsection({
+  bot,
+  settings,
+  dirty,
+  onChanged,
+}: {
+  bot: Bot
+  settings: Settings
+  dirty: boolean
+  onChanged: (settings: Settings, message: string) => void
+}) {
+  const [input, setInput] = useState('')
+  const [checked, setChecked] = useState<{
+    address: string
+    result: VaultCheckResult
+  } | null>(null)
+  const [checking, setChecking] = useState(false)
+  const [checkError, setCheckError] = useState<string | null>(null)
+  // Bumped by "Check again", so the same address can be asked twice.
+  const [recheck, setRecheck] = useState(0)
+  const [busy, setBusy] = useState<'link' | 'unlink' | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [refusedChecks, setRefusedChecks] = useState<VaultCheck[] | null>(null)
+
+  const address = input.trim()
+  const wellFormed = isVaultAddress(address)
+  const formatError = vaultAddressError(input)
+  const linked = settings.vaultAddress
+  const editable = settings.editable
+  const name = bot.displayName ?? bot.name
+
+  useEffect(() => {
+    if (!wellFormed) {
+      setChecked(null)
+      setCheckError(null)
+      return
+    }
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      setChecking(true)
+      setCheckError(null)
+      api
+        .checkVault(bot.name, address, controller.signal)
+        .then((result) => setChecked({ address, result }))
+        .catch((e) => {
+          if (!controller.signal.aborted) {
+            setCheckError(e instanceof ApiError ? e.message : String(e))
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setChecking(false)
+        })
+    }, VAULT_CHECK_DEBOUNCE_MS)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+      setChecking(false)
+    }
+  }, [bot.name, address, wellFormed, recheck])
+
+  // A result only counts for the address it was run on.
+  const result = checked?.address === address ? checked.result : null
+  const shownChecks = refusedChecks ?? result?.checks ?? null
+  const canLink =
+    editable && busy === null && !checking && result?.ok === true
+  const relink = sameAddress(address, linked)
+  const explorerUrl = sameAddress(bot.config?.vaultAddress, linked)
+    ? bot.config?.vaultExplorerUrl
+    : null
+
+  function edit(next: string) {
+    setInput(next)
+    setError(null)
+    setRefusedChecks(null)
+  }
+
+  function confirmText(lines: string[]): string {
+    const discard = dirty ? ['', 'Unsaved changes on this page are discarded.'] : []
+    return [...lines, ...discard].join('\n')
+  }
+
+  async function link() {
+    if (!canLink) return
+    const restart = bot.running ? ' and restarts it' : ''
+    if (
+      !window.confirm(
+        confirmText([
+          `Connect vault ${shortAddress(address)} to ${name}?`,
+          '',
+          `The panel re-connects the bot to Textile with the vault as its funding wallet, turns the public ladder and the taker leg off (the taker fills from the bot's own wallet, not the vault)${restart}.`,
+        ]),
+      )
+    ) {
+      return
+    }
+    setBusy('link')
+    setError(null)
+    setRefusedChecks(null)
+    try {
+      const res = await api.linkVault(bot.name, address)
+      setInput('')
+      setChecked(null)
+      onChanged(res.settings, savedMessage(res))
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+      setRefusedChecks(checksFromError(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function unlink() {
+    const restart = bot.running ? ' and restarts it' : ''
+    if (
+      !window.confirm(
+        confirmText([
+          `Disconnect vault ${shortAddress(linked)}?`,
+          '',
+          `${name} goes back to trading from its own wallet. The panel re-connects it to Textile with that wallet as the funding wallet${restart}. The wallet then needs funds and Permit2 approvals (Funds tab) before it can quote.`,
+        ]),
+      )
+    ) {
+      return
+    }
+    setBusy('unlink')
+    setError(null)
+    setRefusedChecks(null)
+    try {
+      const res = await api.unlinkVault(bot.name)
+      onChanged(res.settings, savedMessage(res))
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <ExperimentalSubsection
+      title="Trade from a vault"
+      description="Quote Swap from an OperatorVault's balances instead of this bot's wallet. The vault has to trade this bot's pair, and its strategy signer has to be this bot. Connecting turns the taker leg off: it fills from the bot's own wallet, not the vault."
+    >
+      <div className="space-y-3">
+        <p className="text-sm">
+          {linked ? (
+            <>
+              Trades from vault{' '}
+              {explorerUrl ? (
+                <a
+                  href={explorerUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-mono underline"
+                  title={linked}
+                >
+                  {shortAddress(linked)}
+                </a>
+              ) : (
+                <span className="font-mono" title={linked}>
+                  {shortAddress(linked)}
+                </span>
+              )}
+              .
+            </>
+          ) : (
+            'Trades from its own wallet.'
+          )}
+        </p>
+
+        <Field
+          label={linked ? 'Switch to another vault' : 'Vault address'}
+          hint={
+            formatError ? (
+              <span className="text-danger">{formatError}</span>
+            ) : (
+              'Checked as you type. Nothing changes until you save.'
+            )
+          }
+        >
+          <Input
+            value={input}
+            placeholder="0x…"
+            spellCheck={false}
+            autoComplete="off"
+            aria-invalid={formatError !== null}
+            className="font-mono"
+            disabled={!editable || busy !== null}
+            onChange={(e) => edit(e.target.value)}
+          />
+        </Field>
+
+        {checking && (
+          <p className="text-xs text-faint">Checking the vault…</p>
+        )}
+        {checkError && <Banner tone="danger">{checkError}</Banner>}
+        {result?.summary && !refusedChecks && (
+          <p className="text-xs text-muted">
+            {result.summary.settlementSymbol ?? '?'} ↔{' '}
+            {result.summary.corridorSymbol ?? '?'}
+            {result.summary.yieldEnabled != null &&
+              ` · yield ${result.summary.yieldEnabled ? 'on' : 'off'}`}
+            {result.summary.orderExecutor &&
+              ` · fills through executor ${shortAddress(result.summary.orderExecutor)}`}
+          </p>
+        )}
+        {shownChecks && <VaultChecklist checks={shownChecks} />}
+
+        <div className="flex flex-wrap gap-2">
+          <Button
+            variant="primary"
+            busy={busy === 'link'}
+            disabled={!canLink}
+            onClick={() => void link()}
+          >
+            {relink ? 'Reconnect this vault' : 'Save and connect'}
+          </Button>
+          <Button
+            busy={checking}
+            disabled={!wellFormed || busy !== null}
+            onClick={() => {
+              setError(null)
+              setRefusedChecks(null)
+              setRecheck((n) => n + 1)
+            }}
+          >
+            Check again
+          </Button>
+          {linked && (
+            <Button
+              variant="danger"
+              busy={busy === 'unlink'}
+              disabled={!editable || busy !== null}
+              onClick={() => void unlink()}
+            >
+              Disconnect vault
+            </Button>
+          )}
+        </div>
+        {busy && (
+          <p className="text-xs text-faint">
+            {busy === 'link'
+              ? 'Checking the vault, connecting to Textile and saving. This takes a few seconds.'
+              : 'Connecting to Textile with the bot\'s own wallet and saving.'}
+          </p>
+        )}
+        {error && <Banner tone="danger">{error}</Banner>}
+      </div>
+    </ExperimentalSubsection>
+  )
+}
+
+/** The vault checks as a compact list: a mark, the check, and why. */
+function VaultChecklist({ checks }: { checks: VaultCheck[] }) {
+  return (
+    <ul className="space-y-1.5 rounded-lg border border-line-soft p-3">
+      {foldRepeatedDetails(checks).map((c) => (
+        <li key={c.id} className="flex gap-2 text-sm">
+          <span
+            aria-hidden
+            className={`w-4 shrink-0 text-center font-bold ${CHECK_TONE[c.status]}`}
+          >
+            {CHECK_MARK[c.status].icon}
+          </span>
+          <span className="min-w-0">
+            <span className="sr-only">{CHECK_MARK[c.status].words}: </span>
+            <span className={c.status === 'skipped' ? 'text-faint' : ''}>
+              {c.label}
+            </span>
+            {c.showDetail && (
+              <span className="block break-words text-xs text-faint">
+                {c.detail}
+              </span>
+            )}
+          </span>
+        </li>
+      ))}
+    </ul>
   )
 }
 
@@ -966,7 +1302,8 @@ export function changedFields(
     'rfqValidationContract',
     'rfqCorridor',
     'bookEnabled',
-    'vaultAddress',
+    // Not `vaultAddress`: moving onto or off a vault re-enrolls the bot with
+    // Textile, so it goes through Trade from a vault, never a plain save.
   ]
   for (const key of keys) {
     if (JSON.stringify(loaded[key]) !== JSON.stringify(draft[key])) {

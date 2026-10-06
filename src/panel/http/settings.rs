@@ -399,8 +399,9 @@ pub struct SettingsUpdate {
     pub rfq_api_key: Option<String>,
     #[serde(default)]
     pub book_enabled: Option<bool>,
-    /// An address to trade from that OperatorVault; empty to trade from the
-    /// bot's own wallet; omitted to leave it alone.
+    /// Accepted only when it is the vault the bot already has (or empty when
+    /// it has none). Changing it goes through `/vault`; see
+    /// [`refuse_vault_change`].
     #[serde(default)]
     pub vault_address: Option<String>,
 }
@@ -493,10 +494,32 @@ impl SettingsUpdate {
             patch.book_enabled = Some(v);
         }
         if let Some(v) = &self.vault_address {
-            patch.vault_address = Some(v.trim().to_string());
+            refuse_vault_change(&current.vault_address, v)?;
         }
         Ok(patch)
     }
+}
+
+/// A settings save never moves the bot onto or off a vault. That takes a new
+/// maker registration with the vault as funding wallet, a new maker key and
+/// the ladder and taker off — the vault endpoints do all of it, and a save
+/// that only rewrote `[vault]` would leave the bot quoting the vault's funds
+/// under the old maker. Sending the current value back is fine.
+fn refuse_vault_change(current: &str, requested: &str) -> Result<(), ApiError> {
+    let same = match (
+        current.trim().parse::<alloy_primitives::Address>(),
+        requested.trim().parse::<alloy_primitives::Address>(),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => current.trim().is_empty() && requested.trim().is_empty(),
+    };
+    if same {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "A settings save can't change the vault. Use Trade from a vault under Corridors → \
+         Experimental: it checks the vault, reconnects the bot to Textile and restarts it.",
+    ))
 }
 
 /// Turning the legacy public ladder back on only means something if a side can
@@ -672,7 +695,7 @@ pub struct AddPoolBody {
 /// A chain's operator-facing name, from the shipped catalog. Falls back to the
 /// number for a chain this binary ships no corridor on, which is the only case
 /// where an operator has to see one.
-fn network_name(chain_id: u64) -> String {
+pub(super) fn network_name(chain_id: u64) -> String {
     setup::catalog()
         .iter()
         .find(|c| c.chain_id == chain_id)
@@ -1324,7 +1347,16 @@ pub(super) async fn save_and_restart(
         if pre_save.state.is_running() {
             // All-or-nothing: check the claims and the fleet, then write+restart or refuse
             // without writing — nothing that can't be applied lands on disk.
-            return apply_live_change(state, &pre_save, path, toml, would_be_wallet, pool).await;
+            return apply_live_change(
+                state,
+                &pre_save,
+                path,
+                toml,
+                would_be_wallet,
+                pool,
+                extra.as_ref(),
+            )
+            .await;
         }
         if !pre_save.state.is_terminal() && pre_save.container_name.is_some() {
             // Paused or restarting: the process holds the old config in memory and can't
@@ -1440,31 +1472,36 @@ pub(super) async fn save_and_restart(
         "restartError": restart_error,
         "message": message,
     });
-    if let (Some(obj), Some(add)) = (
-        body.as_object_mut(),
-        extra.as_ref().and_then(|v| v.as_object()),
-    ) {
-        let note = add.get("note").and_then(|v| v.as_str()).map(str::to_string);
-        for (k, v) in add {
-            if k == "note" {
-                continue;
-            }
-            obj.insert(k.clone(), v.clone());
-        }
-        if let Some(note) = note.filter(|n| !n.is_empty()) {
-            let current = obj
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            obj.insert(
-                "message".to_string(),
-                serde_json::Value::String(format!("{current} {note}")),
-            );
-        }
-    }
+    merge_extra(&mut body, extra.as_ref());
 
     Ok(Json(body).into_response())
+}
+
+/// Fold a caller's extra fields into a save response. Keys replace the save's
+/// own (a caller's `message` speaks for the whole action); `note` is appended
+/// to the message instead.
+fn merge_extra(body: &mut serde_json::Value, extra: Option<&serde_json::Value>) {
+    let (Some(obj), Some(add)) = (body.as_object_mut(), extra.and_then(|v| v.as_object())) else {
+        return;
+    };
+    let note = add.get("note").and_then(|v| v.as_str()).map(str::to_string);
+    for (k, v) in add {
+        if k == "note" {
+            continue;
+        }
+        obj.insert(k.clone(), v.clone());
+    }
+    if let Some(note) = note.filter(|n| !n.is_empty()) {
+        let current = obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        obj.insert(
+            "message".to_string(),
+            serde_json::Value::String(format!("{current} {note}")),
+        );
+    }
 }
 
 /// Apply a safety-relevant change to a *running* bot, all-or-nothing.
@@ -1485,6 +1522,7 @@ async fn apply_live_change(
     toml: &str,
     new_wallet: Option<WalletId>,
     pool: usize,
+    extra: Option<&serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let container = pre_save.container_name.as_deref().ok_or_else(|| {
         ApiError::conflict(format!("{} has no container to restart", pre_save.name))
@@ -1538,7 +1576,7 @@ async fn apply_live_change(
         let fresh = read_toml(path)?;
         let view = setup::read_settings_at(&fresh, pool).map_err(ApiError::bad_request)?;
         let (rfq_panel, rfq_default) = rfq_surface(&fresh, &state.cfg.bots_dir);
-        Ok(Json(serde_json::json!({
+        let mut body = serde_json::json!({
             "settings": SettingsBody::from_view(
                 &view,
                 true,
@@ -1549,8 +1587,14 @@ async fn apply_live_change(
             "restarted": restarted,
             "restartError": restart_error,
             "message": message,
-        }))
-        .into_response())
+        });
+        // Only when the restart went through. Otherwise the message has to say
+        // what happened to the bot (stopped, rolled back, wallets held), and
+        // the caller's message would talk over it.
+        if restarted {
+            merge_extra(&mut body, extra);
+        }
+        Ok(Json(body).into_response())
     };
 
     let e = match state.docker.restart(container, STOP_GRACE_SECS).await {

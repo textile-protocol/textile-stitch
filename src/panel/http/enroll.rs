@@ -12,7 +12,7 @@ use axum::extract::{Path as UrlPath, State};
 use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::settings::{config_path, read_toml, save_and_restart};
 use super::{ApiError, AppState};
@@ -32,7 +32,13 @@ pub struct EnrollBody {
     pub venue_url: Option<String>,
 }
 
-async fn signer_for_bot(cfg: &Config, config_path: &Path) -> Result<DynSigner, ApiError> {
+/// The signer the bot itself runs with, built from its config and the secrets
+/// beside it. Enroll signs `MakerEnroll` with this, so the maker is tied to
+/// the key that will sign its quotes.
+pub(super) async fn signer_for_bot(
+    cfg: &Config,
+    config_path: &Path,
+) -> Result<DynSigner, ApiError> {
     match cfg.signer.clone().unwrap_or(SignerConfig::Local) {
         SignerConfig::Local => {
             let key = provision::find_beside(config_path, "stitch.key").ok_or_else(|| {
@@ -94,7 +100,7 @@ pub(super) fn secrets_beside(config_path: &Path) -> SignerSecrets {
 ///
 /// Docker only. In process mode the child reads the host config directly, so the
 /// sibling key resolves whatever the layout is.
-fn refuse_connect_on_unmigrated_flat_layout(
+pub(super) fn refuse_connect_on_unmigrated_flat_layout(
     bot: &Bot,
     runtime: crate::panel::PanelRuntime,
 ) -> Result<(), ApiError> {
@@ -131,23 +137,7 @@ pub async fn enroll(
         crate::venue::enroll::apply_enrollment(&current_toml, &cfg, &enrolled, rfq_default)
             .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
-    let dir = path.parent().ok_or_else(|| {
-        ApiError::internal(&anyhow::anyhow!(
-            "{}'s config has no parent directory",
-            bot.name
-        ))
-    })?;
-    setup::write_rfq_api_key(dir, &enrolled.api_key)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    crate::panel::provision::hand_over_paths_to_bot(
-        dir,
-        &[
-            setup::RFQ_API_KEY_FILE.to_string(),
-            "stitch.env".to_string(),
-        ],
-        state.cfg.bot_uid,
-    )
-    .map_err(|e| ApiError::internal(&e))?;
+    store_maker_key(&state, bot_dir(&bot, &path)?, &enrolled.api_key)?;
 
     let message = match outcome {
         crate::venue::enroll::EnrollOutcome::Flagged => format!(
@@ -177,15 +167,45 @@ pub async fn enroll(
         0,
         Some(json!({
             "message": message,
-            "enrollment": {
-                "makerSlug": enrolled.maker_slug,
-                "environment": enrolled.environment,
-                "corridors": enrolled.corridors,
-                "flagged": enrolled.flagged,
-            }
+            "enrollment": enrollment_body(&enrolled),
         })),
     )
     .await
+}
+
+/// The directory a bot's config sits in, where its maker key goes too.
+pub(super) fn bot_dir<'a>(bot: &Bot, path: &'a Path) -> Result<&'a Path, ApiError> {
+    path.parent().ok_or_else(|| {
+        ApiError::internal(&anyhow::anyhow!(
+            "{}'s config has no parent directory",
+            bot.name
+        ))
+    })
+}
+
+/// Write the maker key beside the config and hand it, and the `stitch.env`
+/// that points at it, to the bot's uid so the container can read them.
+pub(super) fn store_maker_key(state: &AppState, dir: &Path, key: &str) -> Result<(), ApiError> {
+    setup::write_rfq_api_key(dir, key).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    crate::panel::provision::hand_over_paths_to_bot(
+        dir,
+        &[
+            setup::RFQ_API_KEY_FILE.to_string(),
+            "stitch.env".to_string(),
+        ],
+        state.cfg.bot_uid,
+    )
+    .map_err(|e| ApiError::internal(&e))
+}
+
+/// What the venue said about the maker, for the UI. Never the key.
+pub(super) fn enrollment_body(enrolled: &crate::venue::enroll::EnrollResponse) -> Value {
+    json!({
+        "makerSlug": enrolled.maker_slug,
+        "environment": enrolled.environment,
+        "corridors": enrolled.corridors,
+        "flagged": enrolled.flagged,
+    })
 }
 
 #[cfg(test)]

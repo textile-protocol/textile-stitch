@@ -65,6 +65,24 @@ pub fn encode_close_only() -> Vec<u8> {
     encode_view("closeOnly()")
 }
 
+/// The key whose signatures the vault accepts as its own orders. A bot can
+/// only trade a vault whose strategy signer is the bot's signing address.
+pub fn encode_strategy_signer() -> Vec<u8> {
+    encode_view("strategySigner()")
+}
+
+/// The vault's operator admin: the only role that can rotate the strategy
+/// signer (`setStrategySigner`).
+pub fn encode_operator_admin() -> Vec<u8> {
+    encode_view("operatorAdmin()")
+}
+
+/// The yield adapter idle settlement is staked in. The zero address means the
+/// vault has none.
+pub fn encode_yield_adapter() -> Vec<u8> {
+    encode_view("yieldAdapter()")
+}
+
 pub fn encode_max_order_input_settlement() -> Vec<u8> {
     encode_view("maxOrderInputSettlement()")
 }
@@ -300,6 +318,9 @@ mod tests {
         );
         assert_eq!(&encode_corridor_asset(), &hex::decode("f0f85843").unwrap());
         assert_eq!(&encode_close_only(), &hex::decode("c7dc844d").unwrap());
+        assert_eq!(&encode_strategy_signer(), &hex::decode("35787368").unwrap());
+        assert_eq!(&encode_operator_admin(), &hex::decode("a4e0c181").unwrap());
+        assert_eq!(&encode_yield_adapter(), &hex::decode("43d0c32d").unwrap());
         assert_eq!(
             &encode_max_order_input_settlement(),
             &hex::decode("cb06c682").unwrap()

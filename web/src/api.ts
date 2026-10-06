@@ -23,14 +23,22 @@ import type {
   SessionInfo,
   Settings,
   UpdatesStatus,
+  VaultCheckResult,
+  VaultLinkResult,
 } from './types'
 
 export class ApiError extends Error {
   readonly status: number
+  /**
+   * The parsed JSON error body, when there was one. Most routes only put
+   * `error` in it; a refused vault connect also sends the checklist.
+   */
+  readonly body: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, body: unknown = null) {
     super(message)
     this.status = status
+    this.body = body
     this.name = 'ApiError'
   }
 
@@ -92,7 +100,8 @@ async function request<T>(
   }
 
   if (!res.ok) {
-    const error = new ApiError(res.status, await errorMessage(res))
+    const { message, body } = await readError(res)
+    const error = new ApiError(res.status, message, body)
     if (error.needsLogin && !AUTH_PATHS.has(path.split('?')[0] ?? path)) {
       onUnauthorized?.()
     }
@@ -116,11 +125,13 @@ async function requestText(path: string): Promise<string> {
   return request<string>(path, undefined, (res) => res.text())
 }
 
-async function errorMessage(res: Response): Promise<string> {
+async function readError(
+  res: Response,
+): Promise<{ message: string; body: unknown }> {
   const body = await res.text().catch(() => '')
   try {
     const parsed = JSON.parse(body) as { error?: string }
-    if (parsed.error) return parsed.error
+    if (parsed.error) return { message: parsed.error, body: parsed }
   } catch {
     // Not our JSON envelope. Axum's own rejections (a malformed body, a bad
     // content type) are plain text, and they name the offending field, which is
@@ -128,8 +139,10 @@ async function errorMessage(res: Response): Promise<string> {
     // answer with HTML, hence the guard below.
   }
   const text = body.trim()
-  if (text && !text.startsWith('<') && text.length <= 500) return text
-  return `${res.status} ${res.statusText}`
+  if (text && !text.startsWith('<') && text.length <= 500) {
+    return { message: text, body: null }
+  }
+  return { message: `${res.status} ${res.statusText}`, body: null }
 }
 
 const json = (body: unknown): RequestInit => ({
@@ -376,6 +389,31 @@ export const api = {
       `/api/bots/${encodeURIComponent(name)}/rfq/status`,
       { method: 'POST', body: JSON.stringify({}) },
     ),
+
+  /** Run every vault check against this bot. Writes nothing. */
+  checkVault: (name: string, address: string, signal?: AbortSignal) =>
+    request<VaultCheckResult>(`/api/bots/${encodeURIComponent(name)}/vault/check`, {
+      method: 'POST',
+      body: JSON.stringify({ address }),
+      signal,
+    }),
+
+  /**
+   * Move the bot onto a vault: the same checks, then a Textile re-connect with
+   * the vault as funding wallet and a restart. A refusal's `ApiError.body`
+   * carries the checklist.
+   */
+  linkVault: (name: string, address: string) =>
+    request<VaultLinkResult>(
+      `/api/bots/${encodeURIComponent(name)}/vault`,
+      json({ address }),
+    ),
+
+  /** Back to the bot's own wallet: re-connects to Textile and restarts. */
+  unlinkVault: (name: string) =>
+    request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/vault`, {
+      method: 'DELETE',
+    }),
 
   rawConfig: (name: string) =>
     request<{ toml: string; path: string; editable: boolean }>(

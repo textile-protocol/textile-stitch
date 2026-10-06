@@ -958,17 +958,85 @@ fn apply_vault(doc: &mut DocumentMut, address: Option<&str>) -> Result<()> {
     if parsed.is_zero() {
         bail!("vault address can't be the zero address");
     }
+    set_value(
+        vault_table_mut(doc),
+        "address",
+        Value::from(format!("{parsed:?}")),
+    );
+    Ok(())
+}
+
+fn vault_table_mut(doc: &mut DocumentMut) -> &mut Table {
     if doc.get("vault").and_then(Item::as_table).is_none() {
         let mut table = Table::new();
         table.set_implicit(false);
         doc.insert("vault", Item::Table(table));
     }
-    let table = doc
-        .get_mut("vault")
+    doc.get_mut("vault")
         .and_then(Item::as_table_mut)
-        .expect("just inserted [vault]");
-    set_value(table, "address", Value::from(format!("{parsed:?}")));
-    Ok(())
+        .expect("just inserted [vault]")
+}
+
+/// The config for a bot that trades from `vault`: everything the panel's
+/// "Trade from a vault" flow rewrites before it re-enrolls.
+///
+/// - `[vault].address` is the vault, checksummed.
+/// - `[vault].order_executor` is `order_executor`, or removed when `None`. It
+///   comes from the venue's vault check, which names the chain's executor only
+///   for a vault that stakes idle settlement; a value left over from another
+///   vault would be wrong for this one.
+/// - The public ladder is off. `Config` refuses `[vault]` with it on.
+/// - The taker leg is off on every pool. It fills from the signer wallet's own
+///   funds and approvals, not the vault's, so leaving it on would trade money
+///   the operator just moved out of the picture.
+///
+/// Validated through `Config::from_toml`, so a caller never holds a candidate
+/// the bot would refuse to load.
+pub fn link_vault(
+    toml_str: &str,
+    vault: alloy_primitives::Address,
+    order_executor: Option<alloy_primitives::Address>,
+) -> Result<String> {
+    anyhow::ensure!(!vault.is_zero(), "vault address can't be the zero address");
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .context("parsing stitch.toml")?;
+    let table = vault_table_mut(&mut doc);
+    set_value(table, "address", Value::from(vault.to_checksum(None)));
+    match order_executor {
+        Some(executor) => set_value(
+            table,
+            "order_executor",
+            Value::from(executor.to_checksum(None)),
+        ),
+        None => {
+            table.remove("order_executor");
+        }
+    }
+    apply_book_enabled(doc.as_table_mut(), Some(false));
+    let pools = doc
+        .get("pools")
+        .and_then(Item::as_array_of_tables)
+        .map_or(0, |a| a.len());
+    for index in 0..pools {
+        apply_taker(pool_mut(&mut doc, index)?, false);
+    }
+    let edited = doc.to_string();
+    Config::from_toml(&edited).context("the config with this vault is not valid")?;
+    Ok(edited)
+}
+
+/// The config for a bot that trades from its own wallet again: `[vault]`
+/// removed, nothing else touched. The taker leg stays as it is (off, after
+/// [`link_vault`]); turning it back on is the operator's call.
+pub fn unlink_vault(toml_str: &str) -> Result<String> {
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .context("parsing stitch.toml")?;
+    doc.as_table_mut().remove("vault");
+    let edited = doc.to_string();
+    Config::from_toml(&edited).context("the config without its vault is not valid")?;
+    Ok(edited)
 }
 
 /// The patch Connect/Reconnect should apply: RFQ fields only. Never rewriting
@@ -1637,6 +1705,64 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("zero address"));
+    }
+
+    #[test]
+    fn linking_a_vault_writes_the_whole_vault_setup() {
+        let vault: alloy_primitives::Address = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+            .parse()
+            .unwrap();
+        let executor: alloy_primitives::Address = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc"
+            .parse()
+            .unwrap();
+        // A panel bot: ladder on and the taker on, both of which a vault rules out.
+        let busy = apply_rfq_default_preset(TEMPLATE)
+            .unwrap()
+            .replace("book_enabled = false", "book_enabled = true");
+        assert!(Config::from_toml(&busy).unwrap().pools[0].limit_taker_enabled());
+
+        let linked = link_vault(&busy, vault, Some(executor)).unwrap();
+        let cfg = Config::from_toml(&linked).unwrap();
+        let written = cfg.vault.as_ref().unwrap();
+        assert_eq!(
+            written.address, "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+            "checksummed"
+        );
+        assert_eq!(
+            written.order_executor.as_deref(),
+            Some("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
+        );
+        assert!(!cfg.book_enabled);
+        assert!(cfg.pools.iter().all(|p| !p.limit_taker_enabled()));
+
+        // Relinking to a vault the venue routes direct drops the executor the
+        // previous vault had, rather than carrying it over.
+        let relinked = link_vault(&linked, vault, None).unwrap();
+        let cfg = Config::from_toml(&relinked).unwrap();
+        assert!(cfg.vault.unwrap().order_executor.is_none(), "{relinked}");
+    }
+
+    #[test]
+    fn linking_refuses_an_executor_that_is_the_vault() {
+        let vault: alloy_primitives::Address = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+            .parse()
+            .unwrap();
+        let err = link_vault(TEMPLATE, vault, Some(vault)).unwrap_err();
+        assert!(format!("{err:#}").contains("vault itself"), "{err:#}");
+        assert!(link_vault(TEMPLATE, alloy_primitives::Address::ZERO, None).is_err());
+    }
+
+    #[test]
+    fn unlinking_removes_only_the_vault() {
+        let vault: alloy_primitives::Address = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+            .parse()
+            .unwrap();
+        let linked = link_vault(TEMPLATE, vault, None).unwrap();
+        let back = unlink_vault(&linked).unwrap();
+        assert!(!back.contains("[vault]"), "{back}");
+        let cfg = Config::from_toml(&back).unwrap();
+        assert!(cfg.vault.is_none());
+        assert!(!cfg.book_enabled, "the ladder stays off");
     }
 
     #[test]

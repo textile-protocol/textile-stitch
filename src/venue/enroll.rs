@@ -79,6 +79,7 @@ pub fn maker_venue_origin(stream_or_origin: &str) -> String {
         "/v2/maker/enroll",
         "/v2/maker/verify-email",
         "/v2/maker/status",
+        "/v2/maker/vault-check",
     ] {
         if let Some(base) = http.strip_suffix(suffix) {
             return base.to_string();

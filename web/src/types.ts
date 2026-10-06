@@ -213,6 +213,48 @@ export interface SaveResult {
   enrollment?: RfqEnrollment
 }
 
+/** `fail` blocks connecting a vault; `warn` and `skipped` don't. */
+export type VaultCheckStatus = 'ok' | 'fail' | 'warn' | 'skipped'
+
+/** One row of the vault checklist. Mirrors `Check` in src/panel/http/vault.rs. */
+export interface VaultCheck {
+  id: string
+  label: string
+  status: VaultCheckStatus
+  detail: string
+}
+
+/** What the panel read about a vault. Null fields didn't answer. */
+export interface VaultSummary {
+  vault: string
+  explorerUrl: string | null
+  settlementAsset: string | null
+  settlementSymbol: string | null
+  corridorAsset: string | null
+  corridorSymbol: string | null
+  strategySigner: string | null
+  /** Idle settlement is staked in a yield adapter. */
+  yieldEnabled: boolean | null
+  paused: boolean | null
+  closeOnly: boolean | null
+  /** What `[vault].order_executor` becomes on connect. Null leaves it unset. */
+  orderExecutor: string | null
+  /** False when Textile's API couldn't run its own check; connecting still does. */
+  textileChecked: boolean
+}
+
+/** `POST /vault/check`, and the body of a refused `POST /vault`. */
+export interface VaultCheckResult {
+  ok: boolean
+  checks: VaultCheck[]
+  summary: VaultSummary | null
+}
+
+export interface VaultLinkResult extends SaveResult {
+  checks?: VaultCheck[]
+  summary?: VaultSummary | null
+}
+
 /** What the panel says back about the operator's address. */
 export interface RfqEmailResult {
   message: string

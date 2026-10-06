@@ -911,7 +911,12 @@ fn vault_inventory(
 
 /// One no-argument view returning a single word. `what` names the call, so a
 /// failure says which view rather than just which address.
-async fn read_word(rpc: &Rpc, to: Address, data: Vec<u8>, what: &str) -> anyhow::Result<U256> {
+pub(super) async fn read_word(
+    rpc: &Rpc,
+    to: Address,
+    data: Vec<u8>,
+    what: &str,
+) -> anyhow::Result<U256> {
     let out = rpc.eth_call(to, &Bytes::from(data)).await?;
     anyhow::ensure!(
         out.len() >= 32,
@@ -931,7 +936,7 @@ async fn read_native(rpc_url: &str, owner: Option<Address>) -> Option<anyhow::Re
 
 /// One chain read under the screen's budget. A read that runs out of time
 /// fails like any other read, with a message that says which node it was.
-async fn budgeted<T>(
+pub(super) async fn budgeted<T>(
     rpc_url: &str,
     read: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
@@ -957,7 +962,7 @@ async fn read_balance(rpc: &Rpc, token: Address, owner: Address) -> anyhow::Resu
 }
 
 /// ERC-20 `symbol()`, for a token the corridor catalog can't name.
-async fn read_symbol(rpc: &Rpc, token: Address) -> anyhow::Result<String> {
+pub(super) async fn read_symbol(rpc: &Rpc, token: Address) -> anyhow::Result<String> {
     let data = Bytes::from(keccak256(b"symbol()")[..4].to_vec());
     let out = rpc.eth_call(token, &data).await?;
     decode_string_return(&out)
