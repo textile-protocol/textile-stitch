@@ -27,6 +27,7 @@ import ReconnectTextile from '../components/ReconnectTextile'
 import RfqOverrides from '../components/RfqOverrides'
 import RenameBot from '../components/RenameBot'
 import VersionRollback from '../components/VersionRollback'
+import { Disclosure } from '../components/ModuleControls'
 import PrivateBalance, { Dots } from '../components/PrivateBalance'
 import { useBalancesHidden } from '../balancePrivacy'
 import { dashboardWallet, fundsFromVault } from '../capital'
@@ -505,10 +506,10 @@ export default function BotDetail() {
             />
           </Card>
           {/*
-            After the one-off runs: it's the recovery tool for a bad release,
-            not something to reach for on the way past.
+            After the one-off runs, and collapsed: it's the recovery tool for a
+            bad release, not something to reach for on the way past.
           */}
-          <Card title="Roll back to an earlier version">
+          <Disclosure title="Roll back to an earlier version">
             <VersionRollback
               bot={bot}
               onRolledBack={(message) => {
@@ -517,7 +518,7 @@ export default function BotDetail() {
                 void loadUpdates()
               }}
             />
-          </Card>
+          </Disclosure>
           <Card title="Textile connection">
             <div className="space-y-4">
               <ReconnectTextile bot={bot.name} onDone={() => void load()} />
