@@ -27,6 +27,8 @@ import ReconnectTextile from '../components/ReconnectTextile'
 import RfqOverrides from '../components/RfqOverrides'
 import RenameBot from '../components/RenameBot'
 import VersionRollback from '../components/VersionRollback'
+import PrivateBalance, { Dots } from '../components/PrivateBalance'
+import { useBalancesHidden } from '../balancePrivacy'
 import { dashboardWallet, fundsFromVault } from '../capital'
 import { imageLabel, shortAddress, shortImage, formatUsd, hostOf } from '../format'
 import { totalUsd, unpricedSymbols, useFunding } from '../funding'
@@ -615,14 +617,27 @@ function RemoveBot({
   )
 }
 
+/** The headline number. Clicking it masks every balance in the panel, the
+ * same switch as the fleet list; a dash stays a dash, since "not read" isn't
+ * a balance. */
 function TotalValue({ funding }: { funding: Funding | null }) {
+  const [hidden, toggle] = useBalancesHidden()
   const size = 'text-3xl font-bold tracking-tight sm:text-4xl'
   const total = totalUsd(funding)
   if (total === null) return <span className={`text-faint ${size}`}>—</span>
   const unpriced = unpricedSymbols(funding)
   return (
-    <span className="block">
-      <span className={`tabular-nums ${size}`}>{formatUsd(total)}</span>
+    <span className="flex flex-wrap items-center">
+      <PrivateBalance
+        hidden={hidden}
+        onToggle={toggle}
+        masked={<Dots size="lg" />}
+        title="Total value, in dollars"
+        icon="lg"
+        align="start"
+      >
+        <span className={`tabular-nums ${size}`}>{formatUsd(total)}</span>
+      </PrivateBalance>
       {unpriced.length > 0 && (
         <span className="ml-2 text-xs text-warning" title={`Not priced: ${unpriced.join(', ')}`}>
           + unpriced {unpriced.join(', ')}

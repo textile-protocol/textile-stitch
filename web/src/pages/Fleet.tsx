@@ -21,6 +21,8 @@ import {
   type RowTotal,
 } from '../fleetOrder'
 import { fundsFromVault, textileVaultUrl } from '../capital'
+import { useBalancesHidden } from '../balancePrivacy'
+import PrivateBalance, { Dots } from '../components/PrivateBalance'
 import { capitalUnpricedSymbols, capitalUsd } from '../funding'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
@@ -52,6 +54,7 @@ export default function Fleet() {
   // read isn't saved at the bottom.
   const [settled, setSettled] = useState<ReadonlySet<string>>(new Set())
   const [capped, setCapped] = useState(false)
+  const [balancesHidden, toggleBalances] = useBalancesHidden()
 
   const load = useCallback(async () => {
     try {
@@ -172,6 +175,8 @@ export default function Fleet() {
               <BotRow
                 bot={bot}
                 value={values[bot.name]}
+                balancesHidden={balancesHidden}
+                onToggleBalances={toggleBalances}
                 updateAvailable={
                   behind.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
                 }
@@ -187,11 +192,15 @@ export default function Fleet() {
 function BotRow({
   bot,
   value,
+  balancesHidden,
+  onToggleBalances,
   updateAvailable,
 }: {
   bot: Bot
   /** The capital's worth, undefined while unread. */
   value: RowTotal | undefined
+  balancesHidden: boolean
+  onToggleBalances: () => void
   updateAvailable: boolean
 }) {
   const blocking = bot.warnings.filter((w) => w.blocksEditing)
@@ -202,10 +211,13 @@ function BotRow({
 
   // The whole row opens the bot: a fleet is for picking a bot, and every
   // action lives on the bot's page. The name's link stretches over the row
-  // (`after:inset-0`) rather than wrapping it, so the vault button can be its
-  // own link sitting above it; an <a> can't nest inside another.
+  // (`after:inset-0`) rather than wrapping it, so the vault button and the
+  // balance can sit above it with their own clicks; an <a> can't nest inside
+  // another, nor a <button> inside an <a>.
+  //
+  // `overflow-hidden` clips the row's hover fill to the card's rounded corners.
   return (
-    <Card className="!p-0">
+    <Card className="overflow-hidden !p-0">
       <div className="relative flex flex-col gap-3 p-4 hover:bg-hover sm:flex-row sm:items-center">
         <div className="flex min-w-0 flex-1 flex-col gap-1.5">
           <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
@@ -239,7 +251,14 @@ function BotRow({
             </div>
           )}
         </div>
-        {bot.config && <RowValue value={value} vaulted={fundsFromVault(bot.config)} />}
+        {bot.config && (
+          <RowValue
+            value={value}
+            vaulted={fundsFromVault(bot.config)}
+            hidden={balancesHidden}
+            onToggle={onToggleBalances}
+          />
+        )}
       </div>
 
       {(blocking.length > 0 || advisory.length > 0) && (
@@ -293,17 +312,42 @@ const VALUE_POLL_MS = 5000
 /** The capital the bot quotes against, with the same "+ unpriced" caveat as
  * the bot page's header, so a wallet holding an unpriceable balance never reads
  * as a few dollars. For a vault maker that is the vault's quotable inventory. */
-function RowValue({ value, vaulted }: { value: RowTotal | undefined; vaulted: boolean }) {
+function RowValue({
+  value,
+  vaulted,
+  hidden,
+  onToggle,
+}: {
+  value: RowTotal | undefined
+  vaulted: boolean
+  /** Masks the amount. A dash stays a dash: "not read" isn't a balance. */
+  hidden: boolean
+  onToggle: () => void
+}) {
   const usd = value?.usd ?? null
   const unpriced = value?.unpriced ?? []
   return (
     <span className="shrink-0 text-right sm:ml-auto">
-      <span
-        className="text-base font-bold tabular-nums text-ink"
-        title={rowValueTitle(value === undefined, vaulted)}
-      >
-        {usd === null ? <span className="text-faint">—</span> : formatUsd(usd)}
-      </span>
+      {usd === null ? (
+        <span
+          className="text-base font-bold text-faint"
+          title={rowValueTitle(value === undefined, vaulted)}
+        >
+          —
+        </span>
+      ) : (
+        <PrivateBalance
+          hidden={hidden}
+          onToggle={onToggle}
+          masked={<Dots size="md" />}
+          title={rowValueTitle(false, vaulted)}
+          // Above the row's stretched link, so the click masks rather than
+          // opening the bot.
+          className="relative z-10"
+        >
+          <span className="text-base font-bold tabular-nums">{formatUsd(usd)}</span>
+        </PrivateBalance>
+      )}
       {unpriced.length > 0 && (
         <span className="ml-2 text-xs text-warning" title={`Not priced: ${unpriced.join(', ')}`}>
           + unpriced {unpriced.join(', ')}

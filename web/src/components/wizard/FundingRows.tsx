@@ -5,9 +5,10 @@
 // balance sheet. Neither screen owns these, so neither can drift from the
 // other's wording.
 
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { formatAmount, formatUsd, groupAddress, hostOf, shortAddress } from '../../format'
 import { Button } from '../ui'
+import PrivateBalance, { Dots } from '../PrivateBalance'
 import { fund } from './wizardCopy'
 import type { Funding, FundingToken } from '../../types'
 
@@ -110,7 +111,13 @@ export function AddressBlock({ funding, address }: { funding: Funding; address: 
  * panel could read the balance but not price it, the server's own reason is
  * shown verbatim: it knows whether a feed is down or the pair simply has no
  * dollar price. */
-export function TokenRow({ token: t }: { token: FundingToken }) {
+export function TokenRow({
+  token: t,
+  privacy,
+}: {
+  token: FundingToken
+  privacy?: BalancePrivacy
+}) {
   return (
     <li className="grid grid-cols-[1fr_auto] items-center gap-3 px-3 py-2.5">
       <div className="min-w-0">
@@ -119,12 +126,12 @@ export function TokenRow({ token: t }: { token: FundingToken }) {
           <p className="text-xs text-warning">{fund.priceError(t.symbol, t.priceError)}</p>
         )}
       </div>
-      <div className="text-right tabular-nums">
-        <p className="text-sm">
+      <Amounts privacy={privacy} read={t.balanceText !== null}>
+        <span className="text-sm">
           {t.balanceText !== null ? `${formatAmount(t.balanceText)} ${t.symbol}` : '—'}
-        </p>
-        <p className="text-xs text-muted">{formatUsd(t.usd)}</p>
-      </div>
+        </span>
+        <span className="text-xs text-muted">{formatUsd(t.usd)}</span>
+      </Amounts>
     </li>
   )
 }
@@ -166,7 +173,15 @@ export function ApprovalRow({ token: t }: { token: FundingToken }) {
  * much to deposit, and the gate line under the rows says when it is enough.
  * Saying it a third time here read as three different instructions.
  */
-export function GasRow({ funding, pill: showPill = true }: { funding: Funding; pill?: boolean }) {
+export function GasRow({
+  funding,
+  pill: showPill = true,
+  privacy,
+}: {
+  funding: Funding
+  pill?: boolean
+  privacy?: BalancePrivacy
+}) {
   const g = funding.gas
   const pill: Pill =
     g.balance === null || g.ok === null
@@ -186,16 +201,57 @@ export function GasRow({ funding, pill: showPill = true }: { funding: Funding; p
           {g.symbol} <span className="font-normal text-faint">for gas</span>
         </p>
       </div>
-      <div className="text-right tabular-nums">
-        <p className="text-sm">
+      <Amounts privacy={privacy} read={g.balanceText !== null}>
+        <span className="text-sm">
           {g.balanceText !== null ? `${formatAmount(g.balanceText)} ${g.symbol}` : '—'}
-        </p>
-        <p className="text-xs text-muted">
+        </span>
+        <span className="text-xs text-muted">
           {formatUsd(g.usd)}
           {g.priceSource === 'fallback' && g.usd !== null ? ` ${fund.estimated}` : ''}
-        </p>
-      </div>
+        </span>
+      </Amounts>
     </li>
+  )
+}
+
+/** The balance switch, for the screens that let a row's amounts be masked.
+ * The wizard passes none: it's there to watch money arrive. */
+export interface BalancePrivacy {
+  hidden: boolean
+  onToggle: () => void
+}
+
+/** A row's amount and its dollar value, right-aligned. With `privacy` the pair
+ * is one button that masks both lines at once. A balance that wasn't read
+ * stays a dash either way: dots would claim a value was read and hidden. */
+function Amounts({
+  privacy,
+  read,
+  children,
+}: {
+  privacy?: BalancePrivacy
+  /** Whether the chain read produced a balance for this row. */
+  read: boolean
+  children: ReactNode
+}) {
+  if (!privacy || !read) {
+    return <div className="flex flex-col items-end text-right tabular-nums">{children}</div>
+  }
+  return (
+    <PrivateBalance
+      hidden={privacy.hidden}
+      onToggle={privacy.onToggle}
+      icon="sm"
+      className="justify-self-end text-right tabular-nums"
+      masked={
+        <>
+          <Dots size="sm" />
+          <Dots size="xs" className="text-muted" />
+        </>
+      }
+    >
+      {children}
+    </PrivateBalance>
   )
 }
 

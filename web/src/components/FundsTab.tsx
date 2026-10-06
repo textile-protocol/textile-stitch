@@ -27,6 +27,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
+import { maskBalance, useBalancesHidden } from '../balancePrivacy'
 import { botLabel } from '../botRoutes'
 import { fundsFromVault } from '../capital'
 import { formatAmount, isAddress, shortAddress } from '../format'
@@ -38,6 +39,7 @@ import { Banner, Button, Card, Field, Input, Select } from './ui'
 import {
   GasRow,
   TokenRow,
+  type BalancePrivacy,
   VaultAddress,
   orderTokens,
   orderedTokens,
@@ -73,6 +75,10 @@ export default function FundsTab({
   // What the signing key itself still holds. Empty on a clean vault maker,
   // and the whole balance sheet on every other bot.
   const dust = walletDust(funding)
+  // Clicking any amount masks every balance in the panel, the fleet list and
+  // the header included.
+  const [hidden, toggleHidden] = useBalancesHidden()
+  const privacy = { hidden, onToggle: toggleHidden }
   const withdraw = funding ? (
     <WithdrawForm
       bot={bot}
@@ -110,15 +116,17 @@ export default function FundsTab({
           {funding && (
             <ul className="divide-y divide-line-soft rounded-lg border border-line-soft">
               {orderedTokens(funding).map((t) => (
-                <TokenRow key={t.token} token={t} />
+                <TokenRow key={t.token} token={t} privacy={privacy} />
               ))}
               {/* Without a vault this is the same wallet as the rows above, so
                   the gas sits with them. With one it belongs to the signer
                   wallet's own list, below. */}
-              {!vaulted && <GasRow funding={funding} pill={false} />}
+              {!vaulted && <GasRow funding={funding} pill={false} privacy={privacy} />}
             </ul>
           )}
-          {funding && vaulted && <SignerWallet funding={funding} dust={dust} />}
+          {funding && vaulted && (
+            <SignerWallet funding={funding} dust={dust} privacy={privacy} />
+          )}
         </div>
       </Card>
 
@@ -147,7 +155,15 @@ export default function FundsTab({
  * separate because these are the balances that die with the key — the vault's
  * do not.
  */
-function SignerWallet({ funding, dust }: { funding: Funding; dust: FundingToken[] }) {
+function SignerWallet({
+  funding,
+  dust,
+  privacy,
+}: {
+  funding: Funding
+  dust: FundingToken[]
+  privacy: BalancePrivacy
+}) {
   return (
     <div>
       <p className="mb-2 text-xs font-bold uppercase tracking-wide text-faint">
@@ -155,9 +171,9 @@ function SignerWallet({ funding, dust }: { funding: Funding; dust: FundingToken[
       </p>
       <ul className="divide-y divide-line-soft rounded-lg border border-line-soft">
         {orderTokens(dust).map((t) => (
-          <TokenRow key={t.token} token={t} />
+          <TokenRow key={t.token} token={t} privacy={privacy} />
         ))}
-        <GasRow funding={funding} pill={false} />
+        <GasRow funding={funding} pill={false} privacy={privacy} />
       </ul>
       {dust.length > 0 && (
         <p className="mt-2 text-xs text-warning">
@@ -221,6 +237,9 @@ function WithdrawForm({
 }) {
   const { tokens, native } = choicesOf(rows, funding)
   const choices = [...tokens, native]
+  // The form can't put dots in a select option or an input, so a masked
+  // balance reads as the plain-text mask there. Typing an amount still works.
+  const [hidden] = useBalancesHidden()
   const [tokenKey, setTokenKey] = useState(tokens[0]?.key ?? NATIVE)
   const [amount, setAmount] = useState('')
   const [all, setAll] = useState(false)
@@ -258,7 +277,7 @@ function WithdrawForm({
         : `Sends to ${shortAddress(to.trim())} on ${funding.networkLabel ?? `chain ${funding.chainId}`}.`
 
   const shownAmount = all
-    ? `all of the ${chosen.label}${chosen.balanceText ? ` (${formatAmount(chosen.balanceText)})` : ''}`
+    ? `all of the ${chosen.label}${chosen.balanceText ? ` (${maskBalance(formatAmount(chosen.balanceText), hidden)})` : ''}`
     : `${amount.trim()} ${chosen.label}`
 
   function run() {
@@ -390,7 +409,7 @@ function WithdrawForm({
             {choices.map((c) => (
               <option key={c.key} value={c.key}>
                 {c.label}
-                {c.balanceText !== null ? ` · ${formatAmount(c.balanceText)}` : ''}
+                {c.balanceText !== null ? ` · ${maskBalance(formatAmount(c.balanceText), hidden)}` : ''}
               </option>
             ))}
           </Select>
@@ -407,7 +426,7 @@ function WithdrawForm({
         >
           <div className="flex items-center gap-2">
             <Input
-              value={all ? (chosen.balanceText ?? '') : amount}
+              value={all ? maskBalance(chosen.balanceText ?? '', hidden && chosen.balanceText !== null) : amount}
               disabled={all}
               inputMode="decimal"
               placeholder="0.00"
