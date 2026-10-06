@@ -18,7 +18,7 @@
 // wallet's, because that is what pays for the transactions.
 //
 // The Withdraw form stays on a vault maker, titled and framed as the signing
-// key's: the vault's money is not reachable from here (it leaves by the vault's
+// key's, and collapsed until opened: the vault's money is not reachable from here (it leaves by the vault's
 // own redeem flow), but the key's own gas and anything sent to it by mistake
 // are, and a withdraw is the only way to either. Hiding the card would make
 // them unreachable and Remove would delete the key with them.
@@ -33,6 +33,7 @@ import { formatAmount, isAddress, shortAddress } from '../format'
 import { walletDust } from '../funding'
 import { LEVEL_CLASS, appendLine } from '../logBuffer'
 import { streamSse } from '../sse'
+import { Disclosure } from './ModuleControls'
 import { Banner, Button, Card, Field, Input, Select } from './ui'
 import {
   GasRow,
@@ -72,6 +73,19 @@ export default function FundsTab({
   // What the signing key itself still holds. Empty on a clean vault maker,
   // and the whole balance sheet on every other bot.
   const dust = walletDust(funding)
+  const withdraw = funding ? (
+    <WithdrawForm
+      bot={bot}
+      funding={funding}
+      tokens={vaulted ? (funding.walletTokens ?? []) : funding.tokens}
+      busy={busy}
+      onStop={onStop}
+      onStart={onStart}
+      onWithdrew={onWithdrew}
+    />
+  ) : (
+    <p className="text-sm text-muted">Reading the wallet.</p>
+  )
 
   return (
     <div className="space-y-4">
@@ -108,28 +122,21 @@ export default function FundsTab({
         </div>
       </Card>
 
-      <Card title={vaulted ? 'Withdraw from the signer wallet' : 'Withdraw'}>
-        {vaulted && (
+      {vaulted ? (
+        // Collapsed by default: on a vault maker this is a rare cleanup (gas,
+        // stray tokens), not the bot's money, so it shouldn't sit open under
+        // the vault's balances.
+        <Disclosure title="Withdraw from the signer wallet">
           <p className="mb-4 text-sm text-muted">
             Only what the signing key holds: its gas, and anything sent to it by
             mistake. The vault&rsquo;s money is not reachable from here — it leaves by
             the vault&rsquo;s own redeem flow.
           </p>
-        )}
-        {funding ? (
-          <WithdrawForm
-            bot={bot}
-            funding={funding}
-            tokens={vaulted ? (funding.walletTokens ?? []) : funding.tokens}
-            busy={busy}
-            onStop={onStop}
-            onStart={onStart}
-            onWithdrew={onWithdrew}
-          />
-        ) : (
-          <p className="text-sm text-muted">Reading the wallet.</p>
-        )}
-      </Card>
+          {withdraw}
+        </Disclosure>
+      ) : (
+        <Card title="Withdraw">{withdraw}</Card>
+      )}
     </div>
   )
 }
