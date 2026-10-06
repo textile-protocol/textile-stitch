@@ -17,9 +17,9 @@
 // is where the balance its quotes draw on actually is. Gas stays the signer
 // wallet's, because that is what pays for the transactions.
 //
-// The Withdraw form stays on a vault maker, titled and framed as the signing
-// key's, and collapsed until opened: the vault's money is not reachable from here (it leaves by the vault's
-// own redeem flow), but the key's own gas and anything sent to it by mistake
+// The Withdraw form is collapsed until opened, on every bot. It stays on a
+// vault maker, titled and framed as the signing key's: the vault's money is
+// not reachable from here (it leaves by the vault's own redeem flow), but the key's own gas and anything sent to it by mistake
 // are, and a withdraw is the only way to either. Hiding the card would make
 // them unreachable and Remove would delete the key with them.
 //
@@ -130,10 +130,11 @@ export default function FundsTab({
         </div>
       </Card>
 
+      {/* Collapsed by default on every bot: withdrawing is an occasional
+          action, not something to scroll past under the balances each visit.
+          It's a <details>, so the form stays mounted and a running withdraw
+          keeps its output while closed. */}
       {vaulted ? (
-        // Collapsed by default: on a vault maker this is a rare cleanup (gas,
-        // stray tokens), not the bot's money, so it shouldn't sit open under
-        // the vault's balances.
         <Disclosure title="Withdraw from the signer wallet">
           <p className="mb-4 text-sm text-muted">
             Only what the signing key holds: its gas, and anything sent to it by
@@ -143,7 +144,7 @@ export default function FundsTab({
           {withdraw}
         </Disclosure>
       ) : (
-        <Card title="Withdraw">{withdraw}</Card>
+        <Disclosure title="Withdraw">{withdraw}</Disclosure>
       )}
     </div>
   )
