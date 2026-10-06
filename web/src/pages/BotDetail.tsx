@@ -434,7 +434,7 @@ export default function BotDetail() {
         />
       </div>
 
-      {tab === 'modules' && bot.config?.modulesEnabled && <ModulesPanel key={name} name={name} editable={bot.editable} />}
+      {tab === 'modules' && bot.config?.modulesEnabled && <ModulesPanel key={name} name={name} editable={bot.editable} pair={bot.config.pairs[0]} />}
 
       {tab === 'settings' &&
         (bot.editable ? (

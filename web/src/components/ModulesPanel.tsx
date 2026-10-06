@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import DynamicSpreadsLive from './DynamicSpreadsLive'
+import ModulesOverview from './ModulesOverview'
+import ModuleParameters from './ModuleParameters'
+import ScrollTabs from './ScrollTabs'
+import { moduleParameterErrors, type ModuleKey } from '../modulePresentation'
 import {
   HistoricalSimulationForm,
   HistoricalAnalysis,
@@ -9,7 +12,6 @@ import { formatAtomic } from '../format'
 import {
   downloadJson,
   equityCoordinates,
-  moduleStatusFresh,
   type ModulesConfig,
   type ModulesView,
   type SimulationReport,
@@ -24,7 +26,6 @@ import {
   Input,
   Loading,
   Select,
-  Toggle,
 } from './ui'
 
 const percent = (bps: number | null) =>
@@ -34,19 +35,16 @@ const percent = (bps: number | null) =>
 const clock = (at: number) => new Date(at * 1000).toLocaleString()
 const spread = (bps: number | null) =>
   bps === null ? 'Paused' : `${bps.toLocaleString()} bps`
-const names = {
-  inventory: 'Inventory balancing',
-  spreads: 'Dynamic spreads',
-  rebalance: 'Spot rebalancing',
-}
 type Section = 'overview' | 'parameters' | 'simulation' | 'decisions'
 
 export default function ModulesPanel({
   name,
   editable,
+  pair,
 }: {
   name: string
   editable: boolean
+  pair?: string
 }) {
   const [now, setNow] = useState(() => Date.now() / 1000)
   useEffect(() => {
@@ -67,6 +65,7 @@ export default function ModulesPanel({
     null
   )
   const [decisionFilter, setDecisionFilter] = useState('all')
+  const [selectedModule, setSelectedModule] = useState<ModuleKey>('inventory')
 
   useEffect(() => {
     let cancelled = false
@@ -93,18 +92,13 @@ export default function ModulesPanel({
     return error ? <ErrorState error={error} /> : <Loading what="modules" />
   const changed = JSON.stringify(draft) !== JSON.stringify(view.config)
   const status = view.status
-  const fresh = moduleStatusFresh(status, view.running, now)
-  const latest = status?.decisions.at(-1)?.decision
-  const activeConfig = status?.config
+  const parameterErrors = moduleParameterErrors(draft)
+  const valid = parameterErrors.length === 0
+  const [currency = 'Corridor currency', settlement = 'Settlement currency'] =
+    pair?.split(' / ') ?? []
 
-  function update<K extends keyof ModulesConfig>(
-    key: K,
-    value: ModulesConfig[K]
-  ) {
-    setDraft((current) => current && { ...current, [key]: value })
-  }
   async function save() {
-    if (!view || !draft) return
+    if (!view || !draft || !editable || !valid || busy) return
     setBusy(true)
     setError(null)
     setNote(null)
@@ -126,7 +120,7 @@ export default function ModulesPanel({
     }
   }
   async function simulate() {
-    if (!draft || !dataset) return
+    if (!draft || !dataset || !valid || busy) return
     setHistorical(null)
     setBusy(true)
     setError(null)
@@ -157,55 +151,27 @@ export default function ModulesPanel({
       setError('The file must contain a valid historical JSON dataset.')
     }
   }
-  const numeric = (
-    label: string,
-    value: number,
-    onChange: (v: number) => void,
-    hint?: string
-  ) => (
-    <Field label={label} hint={hint}>
-      <Input
-        type="number"
-        min="0"
-        step="any"
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-      />
-    </Field>
-  )
-
   return (
-    <div className="space-y-4">
+    <section aria-label="Module workspace" className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-xl font-bold">FX protection modules</h2>
+          <h2 className="text-xl font-bold">Modules</h2>
           <p className="text-muted text-sm">
-            Textile strategies for this vault’s inventory and quotes.
+            Manage your holdings and quote margins.
           </p>
         </div>
-        <span className="bg-hover rounded-full px-3 py-1 text-sm">
-          {fresh && activeConfig
-            ? `${activeConfig.mode} · evaluating`
-            : view.running
-              ? 'Waiting for current telemetry'
-              : 'Bot stopped'}
-        </span>
       </div>
-      <div className="flex flex-wrap gap-2" aria-label="Module sections">
-        {(['overview', 'parameters', 'simulation', 'decisions'] as const).map(
-          (s) => (
-            <Button
-              key={s}
-              variant={section === s ? 'primary' : 'ghost'}
-              onClick={() => setSection(s)}
-            >
-              {s === 'simulation'
-                ? 'Historical simulation'
-                : s.charAt(0).toUpperCase() + s.slice(1)}
-            </Button>
-          )
-        )}
-      </div>
+      <ScrollTabs
+        label="Module sections"
+        value={section}
+        onChange={setSection}
+        items={[
+          { value: 'overview', label: 'Overview' },
+          { value: 'parameters', label: 'Parameters' },
+          { value: 'simulation', label: 'Historical simulation' },
+          { value: 'decisions', label: 'Decisions' },
+        ]}
+      />
       {error && (
         <Banner tone="danger" onDismiss={() => setError(null)}>
           {error}
@@ -217,345 +183,101 @@ export default function ModulesPanel({
         </Banner>
       )}
       {changed && (
-        <Banner tone="warning">
-          Unsaved parameters. Simulations use this draft; the running bot keeps
-          its current configuration.
+        <Banner tone="info">
+          You have unsaved changes. Live settings stay unchanged until you save.
         </Banner>
       )}
       {section === 'overview' && (
-        <>
-          <DynamicSpreadsLive view={view} now={now} />
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Card title="Corridor inventory">
-              <p className="text-3xl font-bold">
-                {fresh && latest ? percent(latest.inventory_bps) : '—'}
-              </p>
-              <p className="text-muted mt-2 text-xs">
-                Share of free vault value, including settlement deployed for
-                yield.
-              </p>
-            </Card>
-            <Card
-              title={
-                activeConfig?.mode === 'live'
-                  ? 'Quote policy · buy / sell'
-                  : 'Proposed buy / sell spread'
-              }
-            >
-              <p className="text-xl font-bold">
-                {fresh && latest
-                  ? `${spread(latest.buy_bps)} / ${spread(latest.sell_bps)}`
-                  : '—'}
-              </p>
-              <p className="text-muted mt-2 text-xs">
-                Shadow proposals do not change live quotes.
-              </p>
-            </Card>
-            <Card title="Spot rebalancing">
-              <p className="text-sm">
-                {fresh ? status?.rebalance_status : 'No current status'}
-              </p>
-              <p className="text-muted mt-2 text-xs">
-                Dealer acceptance is not a confirmed fill.
-              </p>
-            </Card>
-          </div>
-          <div className="grid gap-4 sm:grid-cols-3">
-            {(['inventory', 'spreads', 'rebalance'] as const).map((key) => (
-              <Card key={key} title={names[key]}>
-                <p className="text-muted mb-3 text-sm">
-                  {key === 'inventory'
-                    ? 'Encourage trades that reduce excess corridor currency. Stop accumulating at the limit.'
-                    : key === 'spreads'
-                      ? 'Add a volatility buffer, with optional inventory weighting for each side.'
-                      : 'Sell excess corridor currency for settlement through a configured dealer.'}
-                </p>
-                <p className="text-sm font-bold">
-                  Saved setting:{' '}
-                  {view.config[key].enabled ? view.config.mode : 'off'}
-                </p>
-                <Button
-                  className="mt-3"
-                  onClick={() => setSection('parameters')}
-                >
-                  Configure
-                </Button>
-              </Card>
-            ))}
-          </div>
-          {latest && fresh && (
-            <Card title="Latest decision">
-              <ul className="space-y-1 text-sm">
-                {latest.reasons.map((r, i) => (
-                  <li key={i}>{r}</li>
-                ))}
-              </ul>
-            </Card>
-          )}
-          {!status?.decisions.length && (
-            <Banner tone="info">
-              Evaluations start once the running bot has an authenticated RFQ
-              session, an accepted corridor, fresh prices and vault data. No
-              customer trade is required. Historical simulations also work while
-              the bot is stopped.
-            </Banner>
-          )}
-        </>
+        <ModulesOverview
+          view={view}
+          now={now}
+          currency={currency}
+          onConfigure={(key) => {
+            setSelectedModule(key)
+            setSection('parameters')
+          }}
+          onSimulate={() => setSection('simulation')}
+          onDecisions={() => setSection('decisions')}
+        />
       )}
       {section === 'parameters' && (
         <>
-          <Card title="Operation mode">
-            <Field
-              label="Mode"
-              hint="Shadow records proposals. Live applies enabled strategies. Off stops new module activity; signed orders remain valid until expiry."
-            >
-              <Select
-                value={draft.mode}
-                onChange={(e) =>
-                  update('mode', e.target.value as ModulesConfig['mode'])
-                }
-              >
-                <option value="off">Off</option>
-                <option value="shadow">Shadow</option>
-                <option value="live">Live</option>
-              </Select>
-            </Field>
-          </Card>
-          <div className="grid gap-4 lg:grid-cols-3">
-            <Card title="Inventory balancing">
-              <div className="space-y-3">
-                <Toggle
-                  label="Enable inventory balancing"
-                  checked={draft.inventory.enabled}
-                  onChange={(enabled) =>
-                    update('inventory', { ...draft.inventory, enabled })
-                  }
-                />
-                {numeric(
-                  'Target share (bps)',
-                  draft.inventory.target_bps,
-                  (target_bps) =>
-                    update('inventory', { ...draft.inventory, target_bps }),
-                  '100 bps = 1% of vault value.'
-                )}
-                {numeric(
-                  'Maximum share (bps)',
-                  draft.inventory.max_bps,
-                  (max_bps) =>
-                    update('inventory', { ...draft.inventory, max_bps })
-                )}
-                {numeric(
-                  'Maximum price skew (bps)',
-                  draft.inventory.max_skew_bps,
-                  (max_skew_bps) =>
-                    update('inventory', { ...draft.inventory, max_skew_bps })
-                )}
-                {numeric(
-                  'Minimum spread (bps)',
-                  draft.inventory.spread_floor_bps,
-                  (spread_floor_bps) =>
-                    update('inventory', {
-                      ...draft.inventory,
-                      spread_floor_bps,
-                    })
-                )}
+          <fieldset disabled={busy} className="min-w-0">
+            <ModuleParameters
+              draft={draft}
+              onChange={setDraft}
+              selected={selectedModule}
+              onSelect={setSelectedModule}
+              currency={currency}
+              settlement={settlement}
+            />
+          </fieldset>
+          {!valid && (
+            <Banner tone="warning">
+              <div role="alert">
+                <p className="mb-1 font-bold">A few settings need attention</p>
+                {parameterErrors.map((message) => (
+                  <p key={message} className="mt-1">
+                    {message}
+                  </p>
+                ))}
               </div>
-            </Card>
-            <Card title="Dynamic spreads">
-              <div className="space-y-3">
-                <Toggle
-                  label="Enable dynamic spreads"
-                  checked={draft.spreads.enabled}
-                  onChange={(enabled) =>
-                    update('spreads', { ...draft.spreads, enabled })
-                  }
-                />
-                <Toggle
-                  label="Weight volatility by inventory"
-                  checked={draft.spreads.inventory_aware ?? false}
-                  onChange={(inventory_aware) =>
-                    update('spreads', { ...draft.spreads, inventory_aware })
-                  }
-                />
-                <p className="text-muted text-xs">
-                  Above target, add more protection when buying corridor tokens
-                  and less when selling. Below target, reverse it. Requires
-                  inventory balancing; otherwise additions stay equal. Existing
-                  spread floors still apply.
+            </Banner>
+          )}
+          <div className="border-line bg-surface z-10 rounded-xl border p-4 shadow-sm sm:sticky sm:bottom-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-bold">
+                  {!valid
+                    ? 'Check your settings before continuing'
+                    : changed
+                      ? 'Your changes are ready to test'
+                      : 'Settings are up to date'}
                 </p>
-                {numeric(
-                  'Price window (seconds)',
-                  draft.spreads.window_secs,
-                  (window_secs) =>
-                    update('spreads', { ...draft.spreads, window_secs })
-                )}
-                {numeric(
-                  'Warmup (seconds)',
-                  draft.spreads.warmup_secs,
-                  (warmup_secs) =>
-                    update('spreads', { ...draft.spreads, warmup_secs })
-                )}
-                {numeric(
-                  'Movement multiplier',
-                  draft.spreads.multiplier,
-                  (multiplier) =>
-                    update('spreads', { ...draft.spreads, multiplier })
-                )}
-                {numeric(
-                  'Maximum extra spread (bps)',
-                  draft.spreads.max_extra_bps,
-                  (max_extra_bps) =>
-                    update('spreads', { ...draft.spreads, max_extra_bps }),
-                  'Maximum volatility addition on either side, including inventory weighting.'
-                )}
+                <p className="text-muted mt-1 text-xs">
+                  {editable
+                    ? 'Saving restarts a running bot. A stopped bot stays stopped.'
+                    : 'Read-only access. You can explore a draft and simulate it, but cannot save.'}
+                </p>
               </div>
-            </Card>
-            <Card title="Spot rebalancing">
-              <div className="space-y-3">
-                <Toggle
-                  label="Enable spot rebalancing"
-                  checked={draft.rebalance.enabled}
-                  onChange={(enabled) =>
-                    update('rebalance', { ...draft.rebalance, enabled })
-                  }
-                />
-                {numeric(
-                  'Trigger share (bps)',
-                  draft.rebalance.trigger_bps,
-                  (trigger_bps) =>
-                    update('rebalance', { ...draft.rebalance, trigger_bps })
-                )}
-                {numeric(
-                  'Maximum sale / NAV (bps)',
-                  draft.rebalance.max_trade_bps,
-                  (max_trade_bps) =>
-                    update('rebalance', { ...draft.rebalance, max_trade_bps })
-                )}
-                {numeric(
-                  'Maximum slippage (bps)',
-                  draft.rebalance.max_slippage_bps,
-                  (max_slippage_bps) =>
-                    update('rebalance', {
-                      ...draft.rebalance,
-                      max_slippage_bps,
-                    })
-                )}
-                {numeric(
-                  'Cooldown (seconds)',
-                  draft.rebalance.cooldown_secs,
-                  (cooldown_secs) =>
-                    update('rebalance', { ...draft.rebalance, cooldown_secs })
-                )}
-                {numeric(
-                  'Order lifetime (seconds)',
-                  draft.rebalance.order_lifetime_secs,
-                  (order_lifetime_secs) =>
-                    update('rebalance', {
-                      ...draft.rebalance,
-                      order_lifetime_secs,
-                    })
-                )}
-              </div>
-            </Card>
-          </div>
-          <Card title="Rebalance dealer">
-            <div className="space-y-3">
-              <Toggle
-                label="Configure a dealer"
-                checked={!!draft.rebalance.dealer}
-                onChange={(enabled) =>
-                  update('rebalance', {
-                    ...draft.rebalance,
-                    dealer: enabled
-                      ? { url: '', taker: '', api_key_env: null }
-                      : null,
-                  })
-                }
-              />
-              {draft.rebalance.dealer ? (
-                <div className="grid gap-3 sm:grid-cols-3">
-                  <Field label="Dealer URL">
-                    <Input
-                      value={draft.rebalance.dealer.url}
-                      onChange={(e) =>
-                        update('rebalance', {
-                          ...draft.rebalance,
-                          dealer: {
-                            ...draft.rebalance.dealer!,
-                            url: e.target.value,
-                          },
-                        })
-                      }
-                    />
-                  </Field>
-                  <Field label="Counterparty wallet">
-                    <Input
-                      value={draft.rebalance.dealer.taker}
-                      onChange={(e) =>
-                        update('rebalance', {
-                          ...draft.rebalance,
-                          dealer: {
-                            ...draft.rebalance.dealer!,
-                            taker: e.target.value,
-                          },
-                        })
-                      }
-                    />
-                  </Field>
-                  <Field
-                    label="Credential environment variable"
-                    hint="Variable name only. Keep the credential in the bot’s environment."
+              <div className="flex flex-wrap gap-2">
+                {changed && (
+                  <Button
+                    disabled={busy}
+                    variant="ghost"
+                    onClick={() => {
+                      setDraft(view.config)
+                      setDraftRevision(view.revision)
+                    }}
                   >
-                    <Input
-                      value={draft.rebalance.dealer.api_key_env ?? ''}
-                      onChange={(e) =>
-                        update('rebalance', {
-                          ...draft.rebalance,
-                          dealer: {
-                            ...draft.rebalance.dealer!,
-                            api_key_env: e.target.value || null,
-                          },
-                        })
-                      }
-                    />
-                  </Field>
-                </div>
-              ) : (
-                <p className="text-muted text-sm">
-                  Rebalancing can propose sales and run simulations. Live sales
-                  require a dealer that supports the Stitch rebalance API and
-                  obtains Warp’s co-signature.
-                </p>
-              )}
+                    Discard
+                  </Button>
+                )}
+                <Button
+                  disabled={busy || !valid}
+                  onClick={() => setSection('simulation')}
+                >
+                  Test on history
+                </Button>
+                <Button
+                  variant="primary"
+                  busy={busy}
+                  disabled={!editable || !changed || !valid}
+                  onClick={() => void save()}
+                >
+                  {draft.mode === 'live'
+                    ? 'Save & apply live'
+                    : 'Save settings'}
+                </Button>
+              </div>
             </div>
-          </Card>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              variant="primary"
-              busy={busy}
-              disabled={!editable || !changed}
-              onClick={() => void save()}
-            >
-              {draft.mode === 'live'
-                ? 'Save and apply live modules'
-                : 'Save module settings'}
-            </Button>
-            <Button
-              onClick={() => {
-                setDraft(view.config)
-                setDraftRevision(view.revision)
-              }}
-            >
-              Discard draft
-            </Button>
-            <Button onClick={() => setSection('simulation')}>
-              Test draft first
-            </Button>
           </div>
-          <p className="text-muted text-xs">
-            Saving restarts a running bot. A stopped bot stays stopped.
-          </p>
         </>
+      )}
+      {section === 'simulation' && !valid && (
+        <Banner tone="warning">
+          Correct your draft in Parameters before running a simulation.
+        </Banner>
       )}
       <div className={section === 'simulation' ? 'contents' : 'hidden'}>
         <HistoricalSimulationForm
@@ -563,7 +285,7 @@ export default function ModulesPanel({
           config={draft}
           settlementDecimals={view.settlement_decimals}
           corridorDecimals={Number(view.dataset_template.corridor_decimals)}
-          busy={busy}
+          busy={busy || !valid}
           onStart={() => {
             setBusy(true)
             setError(null)
@@ -616,7 +338,7 @@ export default function ModulesPanel({
             </p>
             <Button
               variant="primary"
-              disabled={!dataset || busy}
+              disabled={!dataset || busy || !valid}
               busy={busy}
               onClick={() => void simulate()}
             >
@@ -858,6 +580,6 @@ export default function ModulesPanel({
           </div>
         </Card>
       )}
-    </div>
+    </section>
   )
 }

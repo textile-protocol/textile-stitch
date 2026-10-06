@@ -86,3 +86,33 @@ body {
   outline: 2px solid var(--tx-accent);
   outline-offset: 2px;
 }
+
+/* Module ranges share the panel tokens and keep native keyboard semantics. */
+.module-range {
+  appearance: none;
+  height: 6px;
+  border-radius: 999px;
+  margin-block: 12px;
+}
+.module-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--tx-bg-secondary);
+  border: 3px solid var(--tx-accent);
+}
+.module-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--tx-bg-secondary);
+  border: 3px solid var(--tx-accent);
+}
+
+.scroll-tabs {
+  scrollbar-width: none;
+}
+.scroll-tabs::-webkit-scrollbar {
+  display: none;
+}

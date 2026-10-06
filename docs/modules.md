@@ -20,7 +20,7 @@ Above the target, buying more corridor currency becomes less attractive and sell
 
 **Dynamic spreads** adds a bounded spread based on the high/low range of observed prices in a rolling window. It uses source timestamps already received, not future data. It waits for the warmup interval and rejects stale or future prices. By default, the same extra spread is added to both enabled sides after inventory skew. The same decision changes indicative levels and firm quotes.
 
-Enable **Weight volatility by inventory** in Parameters, or set `modules.spreads.inventory_aware = true`, to reduce the volatility buffer on trades that move holdings toward the inventory target. Inventory balancing must also be enabled; otherwise the additions remain equal. Existing configurations default to false, so upgrading does not change their quotes.
+Enable **Favor inventory reduction** under Parameters → Dynamic spreads, or set `modules.spreads.inventory_aware = true`, to reduce the volatility buffer on trades that move holdings toward the inventory target. Inventory balancing must also be enabled; otherwise the additions remain equal. Existing configurations default to false, so upgrading does not change their quotes.
 
 Above target, buys retain the full volatility buffer. The sell buffer falls linearly with exposure, reaching zero at the maximum share, where buys remain paused. Below target, sells retain the full buffer and the buy buffer falls toward zero at zero corridor holdings. At target the additions are equal. The discount is rounded down to whole bps: `extra * min(distance_from_target, band) / band`, with `band = max - target` above target and `band = target` below. Each side stays within `max_extra_bps`. This does not reduce the inventory-adjusted spread itself, so its floor, disabled sides, reservations and purchase limits remain in force. `max_skew_bps` still bounds the inventory module's adjustment; volatility weighting only changes its own extra spread.
 
@@ -60,11 +60,19 @@ Numbers are starter configuration, not recommendations for a particular currency
 
 ## Live visibility
 
-Open **Modules → Overview → Dynamic spreads · live monitor**. It shows the running mode, dynamic addition on each enabled side, observed high/low range, number of source samples and warmup progress. The breakdown separates base spreads, inventory adjustments and the final module quote policy. Buy and sell additions are derived from the recorded policy, including side limits, rather than recalculated from today's settings. The chart and recent changes show both sides over the last 200 recorded evaluations; they are quote calculations, not executed trades. A paused side is shown as off, not as a zero addition, and old observations without a breakdown leave gaps.
+Overview shows current holdings, buy/sell margins and saved module switches. Expand **Details & recent activity → Dynamic spreads · live monitor** for the running mode, dynamic addition on each enabled side, observed high/low range, number of source samples and warmup progress. The breakdown separates base spreads, inventory adjustments and the final module quote policy. Buy and sell additions are derived from the recorded policy, including side limits, rather than recalculated from today's settings. The chart and recent changes show both sides over the last 200 recorded evaluations; they are quote calculations, not executed trades. A paused side is shown as off, not as a zero addition, and old observations without a breakdown leave gaps.
 
 Live mode alone does not produce observations. The bot must be running with an authenticated RFQ session, an accepted corridor, a fresh reference price and vault data. No customer trade is required: the level-publication loop evaluates the policy. Waiting for a connection, RPC data or a usable feed is reported separately from a blocked evaluation. Zero extra spread is valid when sampled prices are unchanged, or when the multiplier/cap is zero. Warmup advances with new source timestamps, not repeated polling of the same price.
 
 The panel polls every five seconds and expires live readings independently of successful requests. It keeps old history visible but does not call it current. Running settings remain authoritative when saved settings differ after a failed or pending restart. Update both the bot and the panel to get input breakdowns and connection diagnostics; older status files still load, with an explanation of the missing details. Telemetry writes coalesce to the newest snapshot so a slow disk does not discard a later disconnect behind an older evaluation.
+
+## Configuring modules in the panel
+
+Parameters edits one module at a time. Percentages replace basis points in the form (0.01% = 1 bps); the saved TOML and API units are unchanged. Sliders have exact numeric inputs. Main controls stay visible; price floors, timing and dealer connection details are collapsed by default. Preview is the panel name for `shadow` mode.
+
+The interactive examples use draft settings and explicit hypothetical inputs. Inventory examples start with a 0.20% base margin; spread examples show only the extra volatility margin. They do not model returns, reservations, freshness or execution. Historical simulation remains the way to compare a draft against recorded activity. Neither type of preview saves settings. Invalid numeric combinations block save and simulation without silently adjusting related fields.
+
+For new module UIs, use the shared controls in `web/src/components/ModuleControls.tsx`: a named enable switch, one or two main numeric controls, a labeled illustration, and optional disclosures. Keep live measurements in Overview and hypothetical inputs in Parameters. Reuse panel color tokens, native keyboard controls and the same percentage units. Add numeric constraints and illustration regression cases alongside `modulePresentation.ts`; keep server validation authoritative.
 
 ## Dealer execution
 

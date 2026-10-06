@@ -84,6 +84,26 @@ export default function DynamicSpreadsLive({
     .reverse()
   const modeDiffers =
     status && JSON.stringify(view.config) !== JSON.stringify(status.config)
+  if (!last)
+    return (
+      <Card title="Spread readings">
+        <p className="text-sm">{health.message}</p>
+      </Card>
+    )
+  if (last && !inputs)
+    return (
+      <Card title="Detailed spread readings">
+        <p className="text-sm">
+          The last bot report uses the older format. Update the bot on its card
+          above to collect the price window and spread breakdown. Updating only
+          the panel is not enough.
+        </p>
+        <p className="text-muted mt-3 text-xs">
+          Existing quote decisions remain available in the decision history.
+          Missing detail is not treated as zero.
+        </p>
+      </Card>
+    )
   return (
     <Card
       title="Dynamic spreads · live monitor"
@@ -159,12 +179,6 @@ export default function DynamicSpreadsLive({
           </p>
         </div>
       </div>
-      {current && !inputs && (
-        <p className="text-muted mt-3 text-sm">
-          This bot reports the original telemetry format. Update the bot and
-          restart it to see the price window and spread breakdown.
-        </p>
-      )}
       <div className="mt-5 overflow-x-auto">
         <table className="w-full text-left text-sm">
           <caption className="mb-2 text-left font-bold">
