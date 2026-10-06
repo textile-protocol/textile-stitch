@@ -18,7 +18,13 @@ This first release supports one RFQ corridor per bot, funded by an OperatorVault
 
 Above the target, buying more corridor currency becomes less attractive and selling it becomes more attractive. Below target, the skew reverses. The configured spread floor bounds tightening. Buys stop at the maximum share; exact post-trade arithmetic also checks the limit. An outstanding inventory-increasing quote blocks another buy until its reservation is released. A proposed or unconfirmed sale never reduces measured exposure.
 
-**Dynamic spreads** adds a bounded spread based on the high/low range of observed prices in a rolling window. It uses source timestamps already received, not future data. It waits for the warmup interval and rejects stale or future prices. Its extra spread is added after inventory skew, so inventory cannot erase that risk premium. The same decision changes indicative levels and firm quotes.
+**Dynamic spreads** adds a bounded spread based on the high/low range of observed prices in a rolling window. It uses source timestamps already received, not future data. It waits for the warmup interval and rejects stale or future prices. By default, the same extra spread is added to both enabled sides after inventory skew. The same decision changes indicative levels and firm quotes.
+
+Enable **Weight volatility by inventory** in Parameters, or set `modules.spreads.inventory_aware = true`, to reduce the volatility buffer on trades that move holdings toward the inventory target. Inventory balancing must also be enabled; otherwise the additions remain equal. Existing configurations default to false, so upgrading does not change their quotes.
+
+Above target, buys retain the full volatility buffer. The sell buffer falls linearly with exposure, reaching zero at the maximum share, where buys remain paused. Below target, sells retain the full buffer and the buy buffer falls toward zero at zero corridor holdings. At target the additions are equal. The discount is rounded down to whole bps: `extra * min(distance_from_target, band) / band`, with `band = max - target` above target and `band = target` below. Each side stays within `max_extra_bps`. This does not reduce the inventory-adjusted spread itself, so its floor, disabled sides, reservations and purchase limits remain in force. `max_skew_bps` still bounds the inventory module's adjustment; volatility weighting only changes its own extra spread.
+
+For example, with target 30%, maximum 60% and current inventory 45%, a 20 bps volatility buffer adds 20 bps to buys and 10 bps to sells. At 60% or more, it adds nothing to sells and purchases stay paused. This favors reducing excess exposure; it does not predict the currency's direction or guarantee a buyer. Historical and imported-data simulations use this same calculation and export the selected setting with the report.
 
 **Automatic spot rebalancing** requests a sale when corridor exposure reaches its trigger. The sale is bounded by excess above target, a NAV fraction, spendable corridor inventory and the vault's per-order cap. It waits while any quote claims inventory, and it persists its cooldown before contacting a dealer. It never opens derivatives or sends vault funds to an exchange account.
 
@@ -35,6 +41,7 @@ spread_floor_bps = 5
 
 [modules.spreads]
 enabled = true
+inventory_aware = false # true weights the buffer when inventory balancing is enabled
 window_secs = 300
 warmup_secs = 30
 multiplier = 1.0
@@ -53,7 +60,7 @@ Numbers are starter configuration, not recommendations for a particular currency
 
 ## Live visibility
 
-Open **Modules → Overview → Dynamic spreads · live monitor**. It shows the running mode, dynamic addition on each enabled side, observed high/low range, number of source samples and warmup progress. The breakdown separates base spreads, inventory adjustments and the final module quote policy. The chart and recent changes use the last 200 recorded evaluations; they are quote calculations, not executed trades.
+Open **Modules → Overview → Dynamic spreads · live monitor**. It shows the running mode, dynamic addition on each enabled side, observed high/low range, number of source samples and warmup progress. The breakdown separates base spreads, inventory adjustments and the final module quote policy. Buy and sell additions are derived from the recorded policy, including side limits, rather than recalculated from today's settings. The chart and recent changes show both sides over the last 200 recorded evaluations; they are quote calculations, not executed trades. A paused side is shown as off, not as a zero addition, and old observations without a breakdown leave gaps.
 
 Live mode alone does not produce observations. The bot must be running with an authenticated RFQ session, an accepted corridor, a fresh reference price and vault data. No customer trade is required: the level-publication loop evaluates the policy. Waiting for a connection, RPC data or a usable feed is reported separately from a blocked evaluation. Zero extra spread is valid when sampled prices are unchanged, or when the multiplier/cap is zero. Warmup advances with new source timestamps, not repeated polling of the same price.
 

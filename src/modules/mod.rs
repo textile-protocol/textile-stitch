@@ -128,10 +128,15 @@ pub fn evaluate(config: &ModulesConfig, ctx: &Context, history: &[PricePoint]) -
         match strategies::spread_extra(&config.spreads, ctx.now, history) {
             Some(extra) => {
                 d.volatility_bps = extra;
-                d.buy_bps = d.buy_bps.map(|b| b.saturating_add(extra).min(9999));
-                d.sell_bps = d.sell_bps.map(|b| b.saturating_add(extra));
+                let (buy_extra, sell_extra) = strategies::spread_additions(config, share, extra);
+                d.buy_bps = d.buy_bps.map(|b| b.saturating_add(buy_extra).min(9999));
+                d.sell_bps = d.sell_bps.map(|b| b.saturating_add(sell_extra));
                 if extra > 0 {
-                    d.reasons.push(format!("Market movement adds {extra} bps"));
+                    d.reasons.push(if config.spreads.inventory_aware && config.inventory.enabled {
+                        format!("Inventory-aware volatility buffer: buy +{buy_extra} bps, sell +{sell_extra} bps before side limits")
+                    } else {
+                        format!("Market movement adds {extra} bps")
+                    });
                 }
             }
             None => return blocked(d, "Collecting price history for dynamic spreads"),

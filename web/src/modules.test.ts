@@ -4,6 +4,7 @@ import {
   moduleStatusFresh,
   simulationAmount,
   dynamicSpreadState,
+  dynamicSpreadAdditions,
   type ModulesView,
   type ModuleStatus,
 } from './modules'
@@ -182,5 +183,81 @@ describe('dynamic spread visibility', () => {
       current: false,
       message: 'Waiting for the first reference price',
     })
+  })
+  it('shows actual per-side additions instead of repeating the common buffer', () => {
+    const o = view().status!.decisions[0]!
+    o.decision.volatility_bps = 20
+    o.decision.buy_bps = 60
+    o.decision.sell_bps = 15
+    o.inputs = {
+      price_at: 100,
+      balances_at: 100,
+      base_buy_bps: 20,
+      base_sell_bps: 20,
+      inventory_buy_bps: 40,
+      inventory_sell_bps: 5,
+      spread_window: {
+        samples: 3,
+        history_secs: 120,
+        low: 1,
+        high: 1.002,
+        extra_bps: 20,
+      },
+    }
+    expect(dynamicSpreadAdditions(o)).toEqual({ buy: 20, sell: 10 })
+    o.decision.buy_bps = null
+    expect(dynamicSpreadAdditions(o)).toEqual({ buy: null, sell: 10 })
+    o.decision.sell_bps = 5
+    expect(dynamicSpreadAdditions(o)).toEqual({ buy: null, sell: 0 })
+    o.inputs.inventory_buy_bps = 9995
+    o.decision.buy_bps = 9999
+    expect(dynamicSpreadAdditions(o).buy).toBe(4)
+  })
+  it('withholds additions for blocked or legacy observations without a breakdown', () => {
+    const o = view().status!.decisions[0]!
+    o.decision.volatility_bps = 20
+    expect(dynamicSpreadAdditions(o)).toEqual({
+      buy: undefined,
+      sell: undefined,
+    })
+    o.inputs = { inventory_buy_bps: 5, inventory_sell_bps: 5 } as NonNullable<
+      typeof o.inputs
+    >
+    o.decision.blocked = true
+    expect(dynamicSpreadAdditions(o)).toEqual({
+      buy: undefined,
+      sell: undefined,
+    })
+    expect(dynamicSpreadAdditions(undefined)).toEqual({
+      buy: undefined,
+      sell: undefined,
+    })
+  })
+  it('explains a zero sell buffer at the inventory ceiling even when prices moved', () => {
+    const v = view()
+    v.status!.config.spreads.inventory_aware = true
+    const o = v.status!.decisions[0]!
+    o.decision.volatility_bps = 20
+    o.decision.inventory_bps = 9945
+    o.decision.buy_bps = null
+    o.decision.sell_bps = 5
+    o.inputs = {
+      inventory_buy_bps: null,
+      inventory_sell_bps: 5,
+    } as NonNullable<typeof o.inputs>
+    expect(dynamicSpreadState(v, 101).message).toContain(
+      'Inventory weighting removes'
+    )
+    o.decision.inventory_bps = v.status!.config.inventory.target_bps
+    o.decision.buy_bps = 9999
+    o.decision.sell_bps = null
+    o.inputs.inventory_buy_bps = 9999
+    expect(dynamicSpreadState(v, 101).message).not.toContain(
+      'Inventory weighting removes'
+    )
+    v.status!.config.mode = 'shadow'
+    expect(dynamicSpreadState(v, 101).message).toContain(
+      'leaves live quotes unchanged'
+    )
   })
 })

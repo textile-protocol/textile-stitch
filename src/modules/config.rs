@@ -57,6 +57,9 @@ impl Default for InventoryConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SpreadsConfig {
     pub enabled: bool,
+    /// Reduce the volatility buffer on inventory-reducing trades.
+    /// Requires enabled inventory balancing to take effect.
+    pub inventory_aware: bool,
     pub window_secs: u64,
     pub warmup_secs: u64,
     pub multiplier: f64,
@@ -66,6 +69,7 @@ impl Default for SpreadsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            inventory_aware: false,
             window_secs: 300,
             warmup_secs: 30,
             multiplier: 1.0,

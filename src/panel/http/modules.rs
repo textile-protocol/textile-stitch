@@ -293,8 +293,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let view = Harness::parse(&body);
         assert_eq!(view["config"]["mode"], "shadow");
+        assert_eq!(view["config"]["spreads"]["inventory_aware"], false);
         let mut config = view["config"].clone();
         config["inventory"]["target_bps"] = serde_json::json!(2500);
+        config["spreads"]["inventory_aware"] = serde_json::json!(true);
         let (status, body) = h
             .put_json(
                 "/api/bots/bot-a/modules",
@@ -307,6 +309,7 @@ mod tests {
             Config::from_toml(&std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap())
                 .unwrap();
         assert_eq!(stored.modules.inventory.target_bps, 2500);
+        assert!(stored.modules.spreads.inventory_aware);
         assert!(stored.modules_enabled);
         assert!(stored.vault.is_some());
         assert_eq!(stored.chain_id, 56);

@@ -267,7 +267,7 @@ export default function ModulesPanel({
                   {key === 'inventory'
                     ? 'Encourage trades that reduce excess corridor currency. Stop accumulating at the limit.'
                     : key === 'spreads'
-                      ? 'Widen spreads when recent market prices move. Wait for enough fresh history.'
+                      ? 'Add a volatility buffer, with optional inventory weighting for each side.'
                       : 'Sell excess corridor currency for settlement through a configured dealer.'}
                 </p>
                 <p className="text-sm font-bold">
@@ -370,6 +370,19 @@ export default function ModulesPanel({
                     update('spreads', { ...draft.spreads, enabled })
                   }
                 />
+                <Toggle
+                  label="Weight volatility by inventory"
+                  checked={draft.spreads.inventory_aware ?? false}
+                  onChange={(inventory_aware) =>
+                    update('spreads', { ...draft.spreads, inventory_aware })
+                  }
+                />
+                <p className="text-muted text-xs">
+                  Above target, add more protection when buying corridor tokens
+                  and less when selling. Below target, reverse it. Requires
+                  inventory balancing; otherwise additions stay equal. Existing
+                  spread floors still apply.
+                </p>
                 {numeric(
                   'Price window (seconds)',
                   draft.spreads.window_secs,
@@ -392,7 +405,8 @@ export default function ModulesPanel({
                   'Maximum extra spread (bps)',
                   draft.spreads.max_extra_bps,
                   (max_extra_bps) =>
-                    update('spreads', { ...draft.spreads, max_extra_bps })
+                    update('spreads', { ...draft.spreads, max_extra_bps }),
+                  'Maximum volatility addition on either side, including inventory weighting.'
                 )}
               </div>
             </Card>
@@ -646,6 +660,16 @@ export default function ModulesPanel({
         {historical && <HistoricalAnalysis result={historical} />}
         {report && (
           <>
+            <p className="text-sm">
+              Dynamic spreads in this run:{' '}
+              {!report.config.spreads.enabled
+                ? 'disabled'
+                : report.config.spreads.inventory_aware &&
+                    report.config.inventory.enabled
+                  ? 'weighted by inventory'
+                  : 'equal volatility additions'}
+              .
+            </p>
             <Banner tone="warning">
               Conditional simulation. Fixed customer activity and immediate
               settlement can overstate real returns.{' '}

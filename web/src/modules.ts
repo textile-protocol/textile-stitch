@@ -9,6 +9,8 @@ export interface ModulesConfig {
   }
   spreads: {
     enabled: boolean
+    /** Absent in status/config responses from older releases; defaults off. */
+    inventory_aware?: boolean
     window_secs: number
     warmup_secs: number
     multiplier: number
@@ -82,6 +84,22 @@ export interface ModulesView {
   running: boolean
   settlement_decimals: number
   dataset_template: Record<string, unknown>
+}
+
+/** Recorded changes, including side vetoes and caps; never recalculate from
+ * today's configuration or assume the common volatility buffer was applied. */
+export function dynamicSpreadAdditions(
+  observation: ModuleStatus['decisions'][number] | undefined
+): { buy: number | null | undefined; sell: number | null | undefined } {
+  if (!observation?.inputs || observation.decision.blocked)
+    return { buy: undefined, sell: undefined }
+  const { decision, inputs } = observation
+  const delta = (before: number | null, after: number | null) =>
+    after === null ? null : before === null ? undefined : after - before
+  return {
+    buy: delta(inputs.inventory_buy_bps, decision.buy_bps),
+    sell: delta(inputs.inventory_sell_bps, decision.sell_bps),
+  }
 }
 export interface SimulationMetrics {
   ending_nav: string
@@ -237,17 +255,29 @@ export function dynamicSpreadState(
       current: true,
     }
   const shadow = status.config.mode === 'shadow'
+  const additions = dynamicSpreadAdditions(last)
+  const inventoryRemovesBuffer =
+    status.config.spreads.inventory_aware &&
+    status.config.inventory.enabled &&
+    !!last?.decision.volatility_bps &&
+    (last.decision.inventory_bps === 0 ||
+      (last.decision.inventory_bps ?? 0) >= status.config.inventory.max_bps) &&
+    (additions.buy === 0 || additions.sell === 0) &&
+    (additions.buy === 0 || additions.buy === null) &&
+    (additions.sell === 0 || additions.sell === null)
   return {
     label: shadow ? 'Shadow · preview only' : 'Live quote policy',
     current: true,
     message: shadow
       ? 'These adjustments are recorded for comparison. Shadow mode leaves live quotes unchanged.'
-      : last?.decision.volatility_bps === 0
-        ? status.config.spreads.multiplier === 0 ||
-          status.config.spreads.max_extra_bps === 0
-          ? 'The running multiplier or maximum addition is zero, so dynamic spreads add nothing.'
-          : 'The observed prices are unchanged within the rolling window. The module is active and adds 0 bps.'
-        : 'The dynamic addition is included in quote calculations. Available inventory, vault controls and venue checks still determine whether a quote is offered.',
+      : inventoryRemovesBuffer
+        ? 'Inventory weighting removes the extra volatility buffer on the enabled side at this exposure. Inventory-adjusted spreads and side limits still apply.'
+        : last?.decision.volatility_bps === 0
+          ? status.config.spreads.multiplier === 0 ||
+            status.config.spreads.max_extra_bps === 0
+            ? 'The running multiplier or maximum addition is zero, so dynamic spreads add nothing.'
+            : 'The observed prices are unchanged within the rolling window. The module is active and adds 0 bps.'
+          : 'The dynamic addition is included in quote calculations. Available inventory, vault controls and venue checks still determine whether a quote is offered.',
   }
 }
 export function equityCoordinates(

@@ -84,6 +84,35 @@ pub fn spread_extra(cfg: &SpreadsConfig, now: u64, history: &[PricePoint]) -> Op
     spread_window(cfg, now, history).extra_bps
 }
 
+/// Buy/sell volatility additions, in bps, before applying side availability.
+/// At target both receive `extra`. The risk-increasing side keeps that full
+/// buffer. On the reducing side the discount reaches `extra` at the inventory
+/// ceiling (above target) or zero inventory (below target). Round the discount
+/// down so small imbalances retain the common buffer. Both sides stay within
+/// the already capped extra; the reducing side cannot tighten past the
+/// inventory-adjusted quote (and therefore its spread floor).
+pub fn spread_additions(cfg: &ModulesConfig, share: u32, extra: u32) -> (u32, u32) {
+    if !cfg.spreads.inventory_aware || !cfg.inventory.enabled {
+        return (extra, extra);
+    }
+    let target = cfg.inventory.target_bps;
+    let above = share >= target;
+    let band = if above {
+        cfg.inventory.max_bps - target
+    } else {
+        target
+    };
+    let distance = share.abs_diff(target).min(band);
+    // Validated configs bound extra < 5000 and distance < 10000.
+    let skew = extra * distance / band;
+    let reducing = extra - skew;
+    if above {
+        (extra, reducing)
+    } else {
+        (reducing, extra)
+    }
+}
+
 pub fn rebalance(
     cfg: &RebalanceConfig,
     inventory: &InventoryConfig,

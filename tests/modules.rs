@@ -141,6 +141,150 @@ fn warmup_then_bounded_volatility_never_uses_a_future_point() {
     ];
     assert_eq!(d, evaluate(&cfg, &context(), &extended));
 }
+
+fn inventory_aware_config() -> ModulesConfig {
+    let mut cfg = ModulesConfig::default();
+    cfg.inventory.target_bps = 4000;
+    cfg.inventory.max_bps = 8000;
+    cfg.inventory.max_skew_bps = 40;
+    cfg.spreads.inventory_aware = true;
+    cfg.spreads.multiplier = 0.008;
+    cfg
+}
+fn spread_history() -> [PricePoint; 2] {
+    // An exact binary range avoids floating-point rounding at an integer bps
+    // boundary: 1250 bps * .008 = a 10 bps common volatility buffer.
+    [
+        PricePoint {
+            timestamp: 50,
+            price: 1.125,
+        },
+        PricePoint {
+            timestamp: 100,
+            price: 1.0,
+        },
+    ]
+}
+fn inventory_context(share: u32) -> Context {
+    Context {
+        corridor: u(u64::from(share) * 10_000),
+        settlement: u(u64::from(10_000 - share) * 10_000),
+        ..context()
+    }
+}
+
+#[test]
+fn volatility_weighting_tracks_both_sides_of_target_and_preserves_the_inventory_ceiling() {
+    let cfg = inventory_aware_config();
+    for (share, buy, sell) in [
+        (0, Some(5), Some(70)),
+        (2000, Some(10), Some(50)),
+        (4000, Some(30), Some(30)),
+        (6000, Some(50), Some(10)),
+        (8000, None, Some(5)),
+        (9945, None, Some(5)),
+        (10000, None, Some(5)),
+    ] {
+        let d = evaluate(&cfg, &inventory_context(share), &spread_history());
+        assert!(!d.blocked);
+        assert_eq!(d.inventory_bps, Some(share));
+        assert_eq!(d.volatility_bps, 10);
+        assert_eq!((d.buy_bps, d.sell_bps), (buy, sell), "share {share}");
+        if share >= cfg.inventory.max_bps {
+            assert!(d.buy_limit.is_zero());
+        }
+    }
+}
+
+#[test]
+fn weighting_is_opt_in_and_requires_inventory_balancing() {
+    let old: ModulesConfig = toml::from_str("[spreads]\nenabled = true").unwrap();
+    assert!(!old.spreads.inventory_aware);
+    let mut cfg = inventory_aware_config();
+    cfg.spreads.inventory_aware = false;
+    let ctx = inventory_context(6000);
+    let symmetric = evaluate(&cfg, &ctx, &spread_history());
+    assert_eq!(
+        (symmetric.buy_bps, symmetric.sell_bps),
+        (Some(50), Some(15))
+    );
+    cfg.spreads.inventory_aware = true;
+    cfg.inventory.enabled = false;
+    let no_inventory = evaluate(&cfg, &ctx, &spread_history());
+    assert_eq!(
+        (no_inventory.buy_bps, no_inventory.sell_bps),
+        (Some(30), Some(30))
+    );
+    cfg.inventory.enabled = true;
+    cfg.spreads.enabled = false;
+    let no_spreads = evaluate(&cfg, &ctx, &[]);
+    assert_eq!(
+        (no_spreads.buy_bps, no_spreads.sell_bps),
+        (Some(40), Some(5))
+    );
+    let restored: ModulesConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(cfg, restored);
+}
+
+#[test]
+fn weighted_buffers_stay_within_caps_and_keep_paused_sides_closed() {
+    let mut cfg = inventory_aware_config();
+    cfg.spreads.max_extra_bps = 6;
+    let mut ctx = inventory_context(6000);
+    let d = evaluate(&cfg, &ctx, &spread_history());
+    assert_eq!((d.buy_bps, d.sell_bps), (Some(46), Some(8)));
+    ctx.reserved_settlement = u(1);
+    assert!(evaluate(&cfg, &ctx, &spread_history()).buy_bps.is_none());
+    ctx.reserved_settlement = U256::ZERO;
+    ctx.base_buy_bps = None;
+    ctx.base_sell_bps = None;
+    let d = evaluate(&cfg, &ctx, &spread_history());
+    assert_eq!((d.buy_bps, d.sell_bps), (None, None));
+    assert!(apply(&book(), &d).buy_capacity_debt.is_none());
+    cfg.spreads.max_extra_bps = 0;
+    let d = evaluate(&cfg, &inventory_context(6000), &spread_history());
+    assert_eq!((d.buy_bps, d.sell_bps), (Some(40), Some(5)));
+}
+
+#[test]
+fn higher_volatility_increases_the_inventory_bias_without_breaching_floors_or_caps() {
+    let mut cfg = inventory_aware_config();
+    let ctx = inventory_context(6000);
+    let mut prior_bias = 0;
+    for multiplier in [0.0, 0.004, 0.008, 0.016, 0.032, 1.0, 10.0] {
+        cfg.spreads.multiplier = multiplier;
+        let d = evaluate(&cfg, &ctx, &spread_history());
+        let buy_extra = d.buy_bps.unwrap() - 40;
+        let sell_extra = d.sell_bps.unwrap() - 5;
+        assert!(buy_extra <= cfg.spreads.max_extra_bps);
+        assert!(sell_extra <= cfg.spreads.max_extra_bps);
+        let bias = buy_extra - sell_extra;
+        assert!(bias >= prior_bias);
+        prior_bias = bias;
+        assert!(d.sell_bps.unwrap() >= cfg.inventory.spread_floor_bps);
+    }
+    assert!(evaluate(&cfg, &ctx, &[]).blocked);
+    assert!(
+        evaluate(
+            &cfg,
+            &Context {
+                price_at: 89,
+                ..ctx
+            },
+            &spread_history()
+        )
+        .blocked
+    );
+    let mut future = spread_history().to_vec();
+    future.push(PricePoint {
+        timestamp: 101,
+        price: 100.0,
+    });
+    assert_eq!(
+        evaluate(&cfg, &ctx, &future),
+        evaluate(&cfg, &ctx, &spread_history())
+    );
+}
 #[test]
 fn rebalance_limits_trade_to_nav_fraction_and_quotable_inventory() {
     let mut cfg = config();
@@ -333,6 +477,43 @@ fn customer_acceptance_and_operator_side_switches_control_simulated_fills() {
     let report = run(&d, &config(), &b).unwrap();
     assert_eq!(report.baseline.customer_fills, 0);
 }
+
+#[test]
+fn replay_uses_inventory_weighting_to_price_a_sale_and_charges_its_execution_cost() {
+    let mut cfg = inventory_aware_config();
+    let mut d = data();
+    d.cost_per_trade = u(100);
+    d.events = spread_history()
+        .iter()
+        .map(|p| Event {
+            at: p.timestamp,
+            price_at: p.timestamp,
+            price: p.price,
+            trade: None,
+            dealer: None,
+        })
+        .collect();
+    d.events[1].trade = Some(Trade {
+        vault_buys: false,
+        corridor_amount: u(1_000_000),
+        limit_price: 1.0012,
+    });
+    // The same live decision offers a 10 bps sale; a 12 bps customer limit
+    // accepts it. The symmetric buffer instead asks 15 bps and misses it.
+    assert_eq!(
+        evaluate(&cfg, &inventory_context(6000), &spread_history()).sell_bps,
+        Some(10)
+    );
+    let aware = run(&d, &cfg, &book()).unwrap();
+    assert_eq!(aware.candidate.customer_fills, 1);
+    assert_eq!(aware.candidate.execution_costs, u(100));
+    assert!(aware.config.spreads.inventory_aware);
+    cfg.spreads.inventory_aware = false;
+    let symmetric = run(&d, &cfg, &book()).unwrap();
+    assert_eq!(symmetric.candidate.customer_fills, 0);
+    assert_eq!(aware.baseline.ending_nav, symmetric.baseline.ending_nav);
+    assert_eq!(aware.candidate.rebalance_fills, 0);
+}
 #[test]
 fn replay_refuses_future_prices_wrong_tokens_unsorted_events_and_wrong_versions() {
     let mut d = data();
@@ -439,10 +620,15 @@ async fn recorded_spread_inputs_explain_the_decision_and_read_legacy_status() {
     assert_eq!(snapshot["quote_status"]["at"], 149);
     assert_eq!(snapshot["quote_status"]["state"], "waiting_for_session");
     value.as_object_mut().unwrap().remove("quote_status");
+    value["config"]["spreads"]
+        .as_object_mut()
+        .unwrap()
+        .remove("inventory_aware");
     for observation in value["decisions"].as_array_mut().unwrap() {
         observation.as_object_mut().unwrap().remove("inputs");
     }
     let legacy: runtime::Status = serde_json::from_value(value).unwrap();
+    assert!(!legacy.config.spreads.inventory_aware);
     assert!(legacy.quote_status.is_none());
     assert!(legacy.decisions.iter().all(|o| o.inputs.is_none()));
     drop(rt);

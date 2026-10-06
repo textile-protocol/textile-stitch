@@ -1,10 +1,16 @@
-import { dynamicSpreadState, type ModulesView } from '../modules'
+import {
+  dynamicSpreadAdditions,
+  dynamicSpreadState,
+  type ModulesView,
+} from '../modules'
 import { Banner, Card } from './ui'
 
 const bps = (v: number | null | undefined) =>
   v == null ? '—' : `${v.toLocaleString()} bps`
 const side = (v: number | null | undefined) =>
   v === null ? 'Paused / off' : bps(v)
+const addition = (v: number | null | undefined) =>
+  v === undefined ? '—' : v === null ? 'Side off' : `+${bps(v)}`
 const price = (v: number | null | undefined) =>
   v == null ? '—' : v.toLocaleString(undefined, { maximumSignificantDigits: 7 })
 const time = (at: number) => new Date(at * 1000).toLocaleTimeString()
@@ -33,26 +39,32 @@ export default function DynamicSpreadsLive({
   const health = dynamicSpreadState(view, now)
   const current = health.current && !!last
   const complete = current && !last.decision.blocked
-  const points = (status?.decisions ?? []).filter((o) => o.decision.at <= now)
+  const added = dynamicSpreadAdditions(complete ? last : undefined)
+  const inventoryAware =
+    config.spreads.inventory_aware && config.inventory.enabled
+  const points = (status?.decisions ?? [])
+    .filter((o) => o.decision.at <= now)
+    .map((o) => ({ ...o, additions: dynamicSpreadAdditions(o) }))
   const first = points[0]?.decision.at ?? 0
   const end = points.at(-1)?.decision.at ?? first
   const max = Math.max(
     1,
     config.spreads.max_extra_bps,
-    ...points.map((o) => o.decision.volatility_bps)
+    ...points.flatMap((o) => [o.additions.buy ?? 0, o.additions.sell ?? 0])
   )
-  const segments = points.reduce<(typeof points)[]>((lines, o) => {
-    const previous = lines.at(-1)?.at(-1)
-    if (o.decision.blocked) return [...lines, []]
-    if (!previous || o.decision.at - previous.decision.at > 10)
-      return [...lines, [o]]
-    return [...lines.slice(0, -1), [...lines.at(-1)!, o]]
-  }, [])
-  const coordinates = (line: typeof points) =>
+  const segments = (key: 'buy' | 'sell') =>
+    points.reduce<(typeof points)[]>((lines, o) => {
+      const previous = lines.at(-1)?.at(-1)
+      if (o.additions[key] == null) return [...lines, []]
+      if (!previous || o.decision.at - previous.decision.at > 10)
+        return [...lines, [o]]
+      return [...lines.slice(0, -1), [...lines.at(-1)!, o]]
+    }, [])
+  const coordinates = (line: typeof points, key: 'buy' | 'sell') =>
     line
       .map(
         (o) =>
-          `${20 + ((o.decision.at - first) / Math.max(1, end - first)) * 660},${125 - (o.decision.volatility_bps / max) * 100}`
+          `${20 + ((o.decision.at - first) / Math.max(1, end - first)) * 660},${125 - (o.additions[key]! / max) * 100}`
       )
       .join(' ')
   const recent = points
@@ -61,6 +73,8 @@ export default function DynamicSpreadsLive({
       return (
         !previous ||
         o.decision.blocked !== previous.decision.blocked ||
+        o.additions.buy !== previous.additions.buy ||
+        o.additions.sell !== previous.additions.sell ||
         o.decision.volatility_bps !== previous.decision.volatility_bps ||
         o.decision.buy_bps !== previous.decision.buy_bps ||
         o.decision.sell_bps !== previous.decision.sell_bps
@@ -103,18 +117,16 @@ export default function DynamicSpreadsLive({
       <div className="grid gap-4 sm:grid-cols-3">
         <div className="bg-canvas rounded-xl p-4">
           <p className="text-muted text-xs">
-            Dynamic addition · each enabled side
+            Dynamic addition · vault buys / sells
           </p>
-          <p className="my-2 text-3xl font-bold">
-            {complete ? `+${bps(last.decision.volatility_bps)}` : '—'}
+          <p className="my-2 text-xl font-bold">
+            {addition(added.buy)} / {addition(added.sell)}
           </p>
           <p className="text-muted text-xs">
-            {complete &&
-            last.decision.volatility_bps === config.spreads.max_extra_bps &&
-            config.spreads.max_extra_bps > 0
-              ? 'At the configured cap'
-              : `Capped at ${config.spreads.max_extra_bps} bps`}{' '}
-            · 100 bps = 1%
+            {complete
+              ? `${bps(last.decision.volatility_bps)} buffer before inventory weighting. `
+              : ''}
+            Cap: {config.spreads.max_extra_bps} bps per side · 100 bps = 1%
           </p>
         </div>
         <div className="bg-canvas rounded-xl p-4">
@@ -160,8 +172,8 @@ export default function DynamicSpreadsLive({
           </caption>
           <thead>
             <tr className="text-muted">
-              <th className="py-2">Spread component</th>
-              <th>Vault buys</th>
+              <th className="py-2 pr-3">Spread component</th>
+              <th className="pr-3">Vault buys</th>
               <th>Vault sells</th>
             </tr>
           </thead>
@@ -184,11 +196,7 @@ export default function DynamicSpreadsLive({
                     )
                   : '—',
               ],
-              [
-                'Dynamic addition',
-                complete ? `+${bps(last.decision.volatility_bps)}` : '—',
-                complete ? `+${bps(last.decision.volatility_bps)}` : '—',
-              ],
+              ['Dynamic addition', addition(added.buy), addition(added.sell)],
               [
                 config.mode === 'shadow'
                   ? 'Proposed spread (shadow)'
@@ -198,8 +206,8 @@ export default function DynamicSpreadsLive({
               ],
             ].map(([label, buy, sell]) => (
               <tr key={label} className="border-line-soft border-t">
-                <td className="py-2">{label}</td>
-                <td>{buy}</td>
+                <td className="py-2 pr-3">{label}</td>
+                <td className="pr-3">{buy}</td>
                 <td>{sell}</td>
               </tr>
             ))}
@@ -208,10 +216,26 @@ export default function DynamicSpreadsLive({
       </div>
       <p className="text-muted mt-2 text-xs">
         Price range × {config.spreads.multiplier} multiplier, rounded up to
-        whole basis points and capped at {config.spreads.max_extra_bps} bps.
+        whole basis points and capped at {config.spreads.max_extra_bps} bps.{' '}
+        {inventoryAware
+          ? 'Inventory weighting keeps the full buffer on the side moving away from target and reduces it on the side moving toward target. Each side stays within the cap.'
+          : config.spreads.inventory_aware
+            ? 'Inventory balancing is off, so additions remain equal before side limits.'
+            : 'Both sides receive the same buffer before side limits.'}{' '}
         Floors, spread limits and paused sides can affect the final policy. This
         is quote telemetry, not a record of executed trades.
       </p>
+      {inventoryAware && current && last.decision.inventory_bps !== null && (
+        <p className="mt-2 text-sm">
+          Corridor inventory: {(last.decision.inventory_bps / 100).toFixed(2)}%{' '}
+          · target: {(config.inventory.target_bps / 100).toFixed(2)}% ·{' '}
+          {last.decision.inventory_bps > config.inventory.target_bps
+            ? 'Favoring corridor sales'
+            : last.decision.inventory_bps < config.inventory.target_bps
+              ? 'Favoring corridor purchases'
+              : 'At target: equal buffers'}
+        </p>
+      )}
       {current && inputs && (
         <p className="text-muted mt-2 text-xs">
           Evaluation {time(last.decision.at)} · source price{' '}
@@ -232,7 +256,7 @@ export default function DynamicSpreadsLive({
           <svg
             viewBox="0 0 700 155"
             role="img"
-            aria-label="Recent dynamic spread additions in basis points; gaps indicate missing or blocked evaluations"
+            aria-label="Recent buy and sell dynamic spread additions in basis points; gaps indicate unavailable or paused sides"
             className="mt-2 w-full"
           >
             <line
@@ -255,36 +279,42 @@ export default function DynamicSpreadsLive({
             >
               0 bps
             </text>
-            {segments
-              .filter((line) => line.length > 0)
-              .map((line, i) =>
-                line.length === 1 ? (
-                  <circle
-                    key={i}
-                    cx={
-                      20 +
-                      ((line[0]!.decision.at - first) /
-                        Math.max(1, end - first)) *
-                        660
-                    }
-                    cy={125 - (line[0]!.decision.volatility_bps / max) * 100}
-                    r="2"
-                    fill="var(--tx-accent)"
-                  />
-                ) : (
-                  <polyline
-                    key={i}
-                    points={coordinates(line)}
-                    stroke="var(--tx-accent)"
-                    strokeWidth="2.5"
-                    fill="none"
-                  />
+            {(['buy', 'sell'] as const).flatMap((key) =>
+              segments(key)
+                .filter((line) => line.length > 0)
+                .map((line, i) =>
+                  line.length === 1 ? (
+                    <circle
+                      key={`${key}-${i}`}
+                      cx={
+                        20 +
+                        ((line[0]!.decision.at - first) /
+                          Math.max(1, end - first)) *
+                          660
+                      }
+                      cy={125 - (line[0]!.additions[key]! / max) * 100}
+                      r="2"
+                      fill={key === 'buy' ? 'var(--tx-accent)' : 'currentColor'}
+                    />
+                  ) : (
+                    <polyline
+                      key={`${key}-${i}`}
+                      points={coordinates(line, key)}
+                      stroke={
+                        key === 'buy' ? 'var(--tx-accent)' : 'currentColor'
+                      }
+                      strokeDasharray={key === 'sell' ? '5 4' : undefined}
+                      strokeWidth="2.5"
+                      fill="none"
+                    />
+                  )
                 )
-              )}
+            )}
           </svg>
           <p className="text-muted text-xs">
-            {time(first)} – {time(end)} · last {points.length} evaluations (up
-            to 200). Gaps indicate missing or blocked evaluations.
+            Solid accent: vault buys · dashed: vault sells. {time(first)} –{' '}
+            {time(end)} · last {points.length} evaluations (up to 200). Gaps
+            indicate unavailable or paused sides.
           </p>
           <div className="mt-4 overflow-x-auto">
             <table className="w-full text-left text-xs">
@@ -293,22 +323,20 @@ export default function DynamicSpreadsLive({
               </caption>
               <thead className="text-muted">
                 <tr>
-                  <th className="py-2">Time</th>
-                  <th>Dynamic addition</th>
-                  <th>Buy / sell policy</th>
+                  <th className="py-2 pr-3">Time</th>
+                  <th className="pr-3">Dynamic buy / sell</th>
+                  <th className="pr-3">Buy / sell policy</th>
                   <th>State</th>
                 </tr>
               </thead>
               <tbody>
                 {recent.map((o) => (
                   <tr key={o.decision.at} className="border-line-soft border-t">
-                    <td className="py-2">{time(o.decision.at)}</td>
-                    <td>
-                      {o.decision.blocked
-                        ? '—'
-                        : bps(o.decision.volatility_bps)}
+                    <td className="py-2 pr-3">{time(o.decision.at)}</td>
+                    <td className="pr-3">
+                      {addition(o.additions.buy)} / {addition(o.additions.sell)}
                     </td>
-                    <td>
+                    <td className="pr-3">
                       {side(o.decision.buy_bps)} / {side(o.decision.sell_bps)}
                     </td>
                     <td>
