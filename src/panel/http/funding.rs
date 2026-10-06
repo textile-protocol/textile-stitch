@@ -115,6 +115,9 @@ const DOLLAR_TOKENS: &[(u64, &str)] = &[
     // Celo
     (42220, "0x48065fbbe25f71c9282ddf5e1cd6d6a887483d5e"), // USDT
     (42220, "0xceba9300f2b948710d2653dd7b07f33a8b32118c"), // USDC
+    // Polygon PoS
+    (137, "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"), // USDT0
+    (137, "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"), // USDC
     // Robinhood Chain
     (4663, "0x5fc5360d0400a0fd4f2af552add042d716f1d168"), // USDG
 ];
@@ -2125,6 +2128,11 @@ mod tests {
         assert!(is_dollar_token(
             42220,
             "0x48065fbbe25f71c9282ddf5e1cd6d6a887483d5e"
+        ));
+        // Polygon USDT, the debt side of the Tesouro corridor.
+        assert!(is_dollar_token(
+            137,
+            "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
         ));
         // The same token on another chain is a different token.
         assert!(!is_dollar_token(
