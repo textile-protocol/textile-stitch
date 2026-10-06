@@ -65,3 +65,17 @@ export function dashboardWallet(
 export function fundsFromVault(config: ConfigBody | null | undefined): boolean {
   return !!config?.vaultAddress
 }
+
+/** The Textile app, where a vault's LP page lives. */
+const TEXTILE_APP_ORIGIN = 'https://app.textilecredit.com'
+
+/**
+ * The vault's detail page on the Textile app (`/s/vaults/:chainId/:address`),
+ * where LPs deposit and redeem. Null when the bot doesn't fund from a vault.
+ */
+export function textileVaultUrl(
+  config: ConfigBody | null | undefined,
+): string | null {
+  if (!config?.vaultAddress) return null
+  return `${TEXTILE_APP_ORIGIN}/s/vaults/${config.chainId}/${config.vaultAddress}`
+}

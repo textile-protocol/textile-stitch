@@ -20,7 +20,7 @@ import {
   saveFleetOrder,
   type RowTotal,
 } from '../fleetOrder'
-import { fundsFromVault } from '../capital'
+import { fundsFromVault, textileVaultUrl } from '../capital'
 import { capitalUnpricedSymbols, capitalUsd } from '../funding'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
@@ -198,23 +198,28 @@ function BotRow({
   const advisory = bot.warnings.filter((w) => !w.blocksEditing)
   const pairs = bot.config?.pairs ?? []
   const network = bot.config?.networkLabel ?? (bot.config ? `chain ${bot.config.chainId}` : null)
+  const vaultUrl = textileVaultUrl(bot.config)
 
-  // The whole row is the link: a fleet is for picking a bot, and every
-  // action lives on the bot's page. No buttons here to compete with it.
+  // The whole row opens the bot: a fleet is for picking a bot, and every
+  // action lives on the bot's page. The name's link stretches over the row
+  // (`after:inset-0`) rather than wrapping it, so the vault button can be its
+  // own link sitting above it; an <a> can't nest inside another.
   return (
     <Card className="!p-0">
-      <Link
-        to={botPath(bot.name)}
-        className="flex flex-col gap-3 p-4 no-underline hover:bg-hover sm:flex-row sm:items-center"
-      >
+      <div className="relative flex flex-col gap-3 p-4 hover:bg-hover sm:flex-row sm:items-center">
         <div className="flex min-w-0 flex-1 flex-col gap-1.5">
           <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-            <span className="font-bold text-ink">{botLabel(bot)}</span>
+            <Link
+              to={botPath(bot.name)}
+              className="font-bold text-ink no-underline after:absolute after:inset-0"
+            >
+              {botLabel(bot)}
+            </Link>
             {bot.displayName && (
               <span className="font-mono text-xs text-faint">{bot.name}</span>
             )}
             <StatePill state={bot.state} status={bot.status} venue={bot.config?.venue} />
-            {fundsFromVault(bot.config) && <Tag>vault</Tag>}
+            {vaultUrl && <VaultButton href={vaultUrl} />}
             {updateAvailable && <Tag>update available</Tag>}
             {!bot.container && <Tag>no container</Tag>}
           </div>
@@ -235,7 +240,7 @@ function BotRow({
           )}
         </div>
         {bot.config && <RowValue value={value} vaulted={fundsFromVault(bot.config)} />}
-      </Link>
+      </div>
 
       {(blocking.length > 0 || advisory.length > 0) && (
         <div className="space-y-2 px-4 pb-4">
@@ -263,6 +268,23 @@ function BotRow({
         </div>
       )}
     </Card>
+  )
+}
+
+/** Opens the bot's vault on the Textile app. Accent-tinted so it reads as a
+ * link, not one of the row's grey status tags. `relative z-10` lifts it over
+ * the row's stretched link so the click lands here, not on the bot. */
+function VaultButton({ href }: { href: string }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      title="Open this vault on Textile"
+      className="relative z-10 rounded-md bg-accent-tint px-1.5 py-0.5 text-xs font-bold text-accent no-underline hover:bg-accent hover:text-on-accent"
+    >
+      vault ↗
+    </a>
   )
 }
 
