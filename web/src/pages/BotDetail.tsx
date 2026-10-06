@@ -7,6 +7,7 @@ import {
   Banner,
   Button,
   Card,
+  DangerZone,
   ErrorState,
   Loading,
   StatePill,
@@ -525,33 +526,36 @@ export default function BotDetail() {
               <RfqOverrides bot={bot.name} onSaved={() => void load()} />
             </div>
           </Card>
-          {bot.container && (
-            <Card title="Recreate the container">
-              <p className="text-sm text-muted">
-                Throws the container away and builds a new one from the config and key on
-                disk, on the current bot image. Config, key and money stay. Use it when
-                the container is wedged or to pick up a new image; brief gap in quoting.
-              </p>
-              <div className="mt-3">
-                <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
-                  Recreate
-                </Button>
-              </div>
+          <DangerZone>
+            {bot.container && (
+              <Card title="Recreate the container">
+                <p className="text-sm text-muted">
+                  Throws the container away and builds a new one from the config and key
+                  on disk, on the current bot image. Config, key and money stay. Use it
+                  when the container is wedged or to pick up a new image; brief gap in
+                  quoting.
+                </p>
+                <div className="mt-3">
+                  <Button busy={busy === 'recreate'} onClick={() => void act('recreate')}>
+                    Recreate
+                  </Button>
+                </div>
+              </Card>
+            )}
+            {/*
+              Last, and gated: Remove deletes the private key, and the key is the
+              only way to reach whatever the wallet holds. Below the floor it is a
+              cleanup; above it, it is losing money with a confirm dialog in front.
+            */}
+            <Card title={bot.container ? 'Remove this bot' : 'Delete this bot'}>
+              <RemoveBot
+                funding={funding}
+                hasContainer={!!bot.container}
+                busy={busy === 'remove'}
+                onRemove={() => void remove()}
+              />
             </Card>
-          )}
-          {/*
-            Last, and gated: Remove deletes the private key, and the key is the
-            only way to reach whatever the wallet holds. Below the floor it is a
-            cleanup; above it, it is losing money with a confirm dialog in front.
-          */}
-          <Card title={bot.container ? 'Remove this bot' : 'Delete this bot'}>
-            <RemoveBot
-              funding={funding}
-              hasContainer={!!bot.container}
-              busy={busy === 'remove'}
-              onRemove={() => void remove()}
-            />
-          </Card>
+          </DangerZone>
         </>
       )}
 

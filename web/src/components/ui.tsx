@@ -36,6 +36,31 @@ export function Card({
   )
 }
 
+/**
+ * Fences off the cards whose actions can't be taken back (recreate, remove).
+ * The red border and heading are the point: an operator scanning the page
+ * should see they've crossed into it before they read a single button.
+ */
+export function DangerZone({ children }: { children: ReactNode }) {
+  return (
+    <section
+      aria-labelledby="danger-zone-title"
+      className="space-y-3 rounded-xl border-2 border-danger/40 bg-danger-bg/30 p-4"
+    >
+      <header>
+        <h2 id="danger-zone-title" className="text-base font-bold text-danger">
+          Danger zone
+        </h2>
+        <p className="text-sm text-muted">
+          These act on the bot's container and files directly. Read each one before
+          you press it.
+        </p>
+      </header>
+      {children}
+    </section>
+  )
+}
+
 type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'ghost'
 
 const BUTTON_STYLES: Record<ButtonVariant, string> = {
