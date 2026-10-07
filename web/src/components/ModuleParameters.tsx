@@ -1,5 +1,6 @@
 import { useId, useState } from 'react'
 import type { ModulesConfig } from '../modules'
+import ModulePresets from './ModulePresets'
 import {
   inventoryIllustration,
   moduleKeys,
@@ -173,6 +174,16 @@ export default function ModuleParameters({
           <p className="bg-hover mx-5 mt-4 rounded-lg px-3 py-2 text-sm">
             This module is off. You can prepare its settings before enabling it.
           </p>
+        )}
+        {selected !== 'rebalance' && (
+          <ModulePresets
+            key={selected}
+            draft={draft}
+            onChange={onChange}
+            module={selected}
+            currency={currency}
+            settlement={settlement}
+          />
         )}
         <div className="grid lg:grid-cols-[1.15fr_1fr]">
           <div className="space-y-6 p-5 sm:p-6">
