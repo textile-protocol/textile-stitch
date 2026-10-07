@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!-- The panel is reachable only from a tailnet, so there is nothing to index. -->
     <meta name="robots" content="noindex, nofollow" />
-    <title>Stitch</title>
+    <!-- Lives under src/ so Vite hashes it: the panel caches every non-index asset as immutable. -->
+    <link rel="icon" type="image/svg+xml" href="/src/favicon.svg" />
+    <title>Stitch | Textile FX</title>
   </head>
   <body>
     <div id="root"></div>
