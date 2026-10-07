@@ -5,8 +5,10 @@
 //! it, [`gas_caps`] bounds what a send may bid whatever the node suggests,
 //! [`gas_reserve`] keeps gas back when a corridor trades the gas coin itself,
 //! [`multicall`] batches read-only calls so a polling loop costs one round
-//! trip instead of one per view, and [`approve`] is the one-time Permit2
-//! allowance every quoted token needs before a filler can execute an order.
+//! trip instead of one per view, [`snapshot`] puts the bot's latest reads on
+//! disk so the panel doesn't ask the chain again, and [`approve`] is the
+//! one-time Permit2 allowance every quoted token needs before a filler can
+//! execute an order.
 
 pub mod approve;
 pub mod gas_caps;
@@ -15,5 +17,6 @@ pub mod gas_reserve;
 pub(crate) mod mock_node;
 pub mod multicall;
 pub mod rpc;
+pub mod snapshot;
 pub mod tx;
 pub mod withdraw;

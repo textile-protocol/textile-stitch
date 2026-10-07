@@ -17,7 +17,10 @@ pub(super) struct PendingRebalance {
     signature: oneshot::Receiver<Option<[u8; 65]>>,
 }
 
-/// Module-only reads must not delay quote-inventory refreshes, including in shadow
+/// Module balances for a chain without Multicall3. Where Multicall3 exists the
+/// inventory loop reads them in its own batch instead (see `inventory_loop`).
+/// Here they would be two more sequential calls in front of every quote
+/// refresh, and module-only reads must not delay those, including in shadow
 /// mode. One process-scoped loop bounds concurrency even when its RPC hangs.
 pub(super) async fn balance_loop(
     rpc: Rpc,

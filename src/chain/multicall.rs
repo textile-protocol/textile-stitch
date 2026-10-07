@@ -136,6 +136,12 @@ fn calldata(signature: &str, args: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// `getEthBalance(owner)`: Multicall3's view of an address's native balance,
+/// so the gas coin can ride the same batch as the token reads.
+pub fn encode_get_eth_balance(owner: Address) -> Vec<u8> {
+    calldata("getEthBalance(address)", owner.abi_encode())
+}
+
 /// The `aggregate3` calldata for a batch — pure, so the encoding is asserted
 /// in a test rather than on a live node.
 pub fn encode_aggregate3(calls: &[Call]) -> Vec<u8> {

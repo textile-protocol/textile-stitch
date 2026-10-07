@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import { poll } from '../poll'
 import ModulesOverview from './ModulesOverview'
 import ModuleParameters from './ModuleParameters'
 import ScrollTabs from './ScrollTabs'
@@ -80,11 +81,10 @@ export default function ModulesPanel({
         if (!cancelled) setError(String(e))
       }
     }
-    void load()
-    const interval = setInterval(() => void load(), 5000)
+    const stop = poll(load, 5000, { immediate: true })
     return () => {
       cancelled = true
-      clearInterval(interval)
+      stop()
     }
   }, [name])
 

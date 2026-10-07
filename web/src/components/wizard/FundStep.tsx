@@ -17,6 +17,7 @@
 
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { ApiError, api } from '../../api'
+import { poll } from '../../poll'
 import { formatAmount, formatClock } from '../../format'
 import { LEVEL_CLASS } from '../../logBuffer'
 import { Banner, Button, Card, Spinner } from '../ui'
@@ -141,11 +142,12 @@ export default function FundStep({ bot, onStarted, onStartOver }: FundStepProps)
   }, [bot, triggerRun])
 
   // The poll. Stops the moment the runner takes over (it reads funding itself)
-  // and while a load is in flight.
+  // and while a load is in flight. Paused while the tab is hidden (the
+  // operator is off in their wallet sending funds) and reads the moment they
+  // come back.
   useEffect(() => {
     if (state.phase !== 'checking') return
-    const timer = window.setInterval(() => void refresh(), state.pollMs)
-    return () => clearInterval(timer)
+    return poll(refresh, state.pollMs)
   }, [state.phase, state.pollMs, refresh])
 
   async function checkNow() {

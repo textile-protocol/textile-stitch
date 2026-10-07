@@ -6,9 +6,10 @@
 //! `eth_getCode`, and `eth_call` for ERC-20 `balanceOf`, `allowance`,
 //! `symbol()` and no-argument views — from fixed tables keyed by address, and
 //! can sit on a request to model a node that has hung. With
-//! [`MockChain::with_multicall3`] it also serves `aggregate3`, dispatching
-//! each inner call through the same tables, which is what lets a test assert
-//! that batching changes the request count and nothing else.
+//! [`MockChain::with_multicall3`] it also serves `aggregate3` and
+//! `getEthBalance`, dispatching each inner call through the same tables, which
+//! is what lets a test assert that batching changes the request count and
+//! nothing else.
 //!
 //! Lives under `chain` rather than `panel` so the default build's tests can
 //! reach it; `panel::http::mock_chain` re-exports it under its old name.
@@ -193,8 +194,15 @@ const AGGREGATE3: &str = "82ad56cb";
 /// what an address without that function answers.
 fn eth_call(chain: &MockChain, to: &str, data: &str) -> Vec<u8> {
     let selector = data.get(2..10).unwrap_or("");
-    if to == MULTICALL3 && selector == AGGREGATE3 {
-        return aggregate3(chain, data);
+    // Only where Multicall3 is deployed: anywhere else that address is empty,
+    // and an empty address answers every call with no data.
+    if to == MULTICALL3 && chain.code.contains_key(MULTICALL3) {
+        return match selector {
+            AGGREGATE3 => aggregate3(chain, data),
+            // getEthBalance(address)
+            "4d2301cc" => chain.native_wei.to_be_bytes::<32>().to_vec(),
+            _ => Vec::new(),
+        };
     }
     if let Some(word) = chain.views.get(&(to.to_string(), selector.to_string())) {
         return word.to_be_bytes::<32>().to_vec();

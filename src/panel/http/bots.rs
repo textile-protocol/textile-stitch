@@ -872,7 +872,10 @@ async fn refuse_funded_key_delete(state: &AppState, bot: &Bot) -> Result<(), Api
     if owned_config_target(bot, &state.cfg).is_none() {
         return Ok(());
     }
-    let funding = super::funding::read_funding(state, bot).await?;
+    // Straight from the chain: this decides whether a key is deleted, and the
+    // bot's own snapshot can be seconds old.
+    let funding =
+        super::funding::read_funding(state, bot, super::funding::FundingSource::Chain).await?;
     match funding.remove_blocked_by {
         Some(why) => Err(ApiError::conflict(why)),
         None => Ok(()),

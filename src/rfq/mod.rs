@@ -55,8 +55,11 @@ use tracing::{debug, error, info, warn};
 use crate::book::taker::encode_order_bytes;
 use crate::chain::gas_caps::GasCaps;
 use crate::chain::gas_reserve::GasReserve;
-use crate::chain::multicall::{decode_uint, Batcher, Call};
+use crate::chain::multicall::{
+    decode_uint, encode_get_eth_balance, Batcher, Call, CANONICAL_MULTICALL3,
+};
 use crate::chain::rpc::{transaction_may_still_land, Rpc, Wallet};
+use crate::chain::snapshot::{record, Publisher, RecordedRead};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
@@ -122,6 +125,10 @@ pub struct RfqRuntime {
     /// `rfq-reservations.json` next to stitch.toml. None only when the process
     /// has no config dir (env-only key); then the ledger is memory-only.
     reservations_path: Option<std::path::PathBuf>,
+    /// The folder holding stitch.toml, where the bot leaves its latest chain
+    /// reads for the panel ([`crate::chain::snapshot`]). None for an env-only
+    /// process, which then publishes nothing.
+    config_dir: Option<std::path::PathBuf>,
     /// OperatorVault this bot quotes for. `None` is the EOA sign+fund path.
     vault: Option<Address>,
     /// VaultOrderExecutor to list beside the taker on vault orders. Always
@@ -395,6 +402,7 @@ fn build_runtime(
         books,
         signer,
         reservations_path: config_dir.map(|dir| dir.join(RESERVATIONS_FILE)),
+        config_dir: config_dir.map(Path::to_path_buf),
         vault: cfg
             .vault
             .as_ref()
@@ -590,10 +598,11 @@ async fn run(rt: RfqRuntime) {
             rt.trading_epoch.clone(),
             rt.vault_policy.clone(),
             rt.closing.clone(),
+            rt.modules.clone(),
+            rt.config_dir
+                .as_deref()
+                .map(|dir| Publisher::spawn(dir, rt.chain_id)),
         ));
-    }
-    if let (Some(vault), Some(modules)) = (rt.vault, rt.modules.clone()) {
-        tokio::spawn(modules::balance_loop(Rpc::new(&rt.rpc_url), vault, modules));
     }
 
     // The reservation ledger outlives sessions AND process restarts: every
@@ -2267,6 +2276,13 @@ fn decode_funded(
 /// a probe that cannot reach the node reads one call at a time for that cycle
 /// and tries again on the next, rather than pinning the process to the
 /// expensive path because the node blipped at startup.
+///
+/// A vault running modules also needs the vault's free balances. Where
+/// Multicall3 exists those two views ride in this same batch, so modules cost
+/// no request of their own; `allowFailure` keeps a reverting module view from
+/// taking quote inventory dark. Without Multicall3 they would be two more
+/// sequential calls in front of every refresh, so that chain gets the separate
+/// [`modules::balance_loop`] instead.
 #[allow(clippy::too_many_arguments)]
 async fn inventory_loop(
     wallet: Wallet,
@@ -2279,6 +2295,8 @@ async fn inventory_loop(
     trading_epoch: Arc<RwLock<u64>>,
     vault_policy: Arc<RwLock<Option<VaultQuotePolicy>>>,
     closing: Arc<Mutex<HashMap<U256, u64>>>,
+    modules: Option<crate::modules::runtime::Runtime>,
+    snapshot: Option<Publisher>,
 ) {
     let mut vault_pair: Option<(Address, Address, Address, u64)> = None;
     let mut batcher: Option<Batcher> = None;
@@ -2290,6 +2308,15 @@ async fn inventory_loop(
                         batched = resolved.is_batched(),
                         "rfq inventory reads resolved"
                     );
+                    if let (false, Some(address), Some(modules)) =
+                        (resolved.is_batched(), vault, modules.clone())
+                    {
+                        tokio::spawn(modules::balance_loop(
+                            wallet.rpc().clone(),
+                            address,
+                            modules,
+                        ));
+                    }
                     batcher = Some(resolved);
                 }
                 Err(e) => debug!(
@@ -2312,6 +2339,13 @@ async fn inventory_loop(
             }
         }
         if let Some((address, settlement, corridor, max_lifetime)) = vault_pair {
+            let module_balances = modules.as_ref().filter(|_| reader.is_batched());
+            let also = snapshot_calls(
+                snapshot.as_ref(),
+                reader,
+                wallet.address(),
+                &[settlement, corridor],
+            );
             match read_vault_inventory(
                 wallet.rpc(),
                 reader,
@@ -2320,16 +2354,36 @@ async fn inventory_loop(
                 vault_order_executor,
                 settlement,
                 corridor,
+                module_balances.is_some(),
+                also,
             )
             .await
             {
-                Ok((settlement_qty, corridor_qty, epoch, max_settlement, max_corridor)) => {
+                Ok(VaultReading {
+                    inventory: (settlement_qty, corridor_qty, epoch, max_settlement, max_corridor),
+                    free,
+                    recorded,
+                }) => {
                     // Stamp after the RPC batch. A pre-read clock can already
                     // exceed INVENTORY_TTL_SECS on a slow endpoint, which would
                     // keep both sides dark forever.
                     let now = unix_now();
                     cache.set(settlement, settlement_qty, now);
                     cache.set(corridor, corridor_qty, now);
+                    if let Some(snapshot) = &snapshot {
+                        snapshot.publish(now, recorded);
+                    }
+                    if let (Some(modules), Some((free_settlement, free_corridor))) =
+                        (module_balances, free)
+                    {
+                        if let Ok(mut slot) = modules.balances.write() {
+                            *slot = Some(crate::modules::runtime::Balances {
+                                settlement: free_settlement,
+                                corridor: free_corridor,
+                                at: now,
+                            });
+                        }
+                    }
                     if let Ok(mut slot) = trading_epoch.write() {
                         *slot = epoch;
                     }
@@ -2355,10 +2409,17 @@ async fn inventory_loop(
         } else if vault.is_none() {
             // Only the wallet path holds gas back: a vault's capital never
             // pays for the bot's transactions, the signer wallet does.
-            let calls = funded_calls(wallet.address(), permit2, &tokens);
+            let calls = [
+                funded_calls(wallet.address(), permit2, &tokens),
+                snapshot_calls(snapshot.as_ref(), reader, wallet.address(), &[]),
+            ]
+            .concat();
             match reader.read(wallet.rpc(), &calls).await {
                 Ok(results) => {
                     let now = unix_now();
+                    if let Some(snapshot) = &snapshot {
+                        snapshot.publish(now, record(&calls, &results));
+                    }
                     for (token, funded) in decode_funded(&tokens, &results, &gas_reserve) {
                         match funded {
                             Some(funded) => cache.set(token, funded, now),
@@ -2501,6 +2562,62 @@ fn decode_vault_inventory(
     ))
 }
 
+/// The vault's free balances for modules, appended after the ten quote views.
+fn module_balance_calls(vault: Address) -> Vec<Call> {
+    vec![
+        Call::new(vault, encode_free_settlement()),
+        Call::new(vault, encode_free_corridor()),
+    ]
+}
+
+/// `(freeSettlement, freeCorridor)` off the tail of the batch, or `None` when
+/// either view failed. Never an error: modules wait on a missing reading, and
+/// quote inventory must not.
+fn decode_module_balances(tail: &[Option<Bytes>]) -> Option<(U256, U256)> {
+    match tail {
+        [Some(settlement), Some(corridor)] => {
+            Some((decode_uint(settlement), decode_uint(corridor)))
+        }
+        _ => None,
+    }
+}
+
+/// Reads that only the panel uses, riding the batch the bot sends anyway: the
+/// signer's gas balance and its balance of each of `tokens`. Nothing without
+/// a snapshot to publish, and nothing on a chain without Multicall3, where
+/// each would be a request of its own.
+fn snapshot_calls(
+    snapshot: Option<&Publisher>,
+    reader: Batcher,
+    owner: Address,
+    tokens: &[Address],
+) -> Vec<Call> {
+    if snapshot.is_none() || !reader.is_batched() {
+        return Vec::new();
+    }
+    std::iter::once(Call::new(
+        CANONICAL_MULTICALL3,
+        encode_get_eth_balance(owner),
+    ))
+    .chain(
+        tokens
+            .iter()
+            .map(|token| Call::new(*token, encode_balance_of(owner))),
+    )
+    .collect()
+}
+
+/// One vault refresh: what to quote, the module balances when asked for, and
+/// every read that answered, for the panel.
+struct VaultReading {
+    inventory: (U256, U256, u64, U256, U256),
+    free: Option<(U256, U256)>,
+    recorded: Vec<RecordedRead>,
+}
+
+/// The quote views, then the module balances when `with_module_balances`,
+/// then `also` — in one batch either way.
+#[allow(clippy::too_many_arguments)]
 async fn read_vault_inventory(
     rpc: &Rpc,
     reader: Batcher,
@@ -2509,10 +2626,28 @@ async fn read_vault_inventory(
     order_executor: Option<Address>,
     settlement: Address,
     corridor: Address,
-) -> anyhow::Result<(U256, U256, u64, U256, U256)> {
-    let calls = vault_inventory_calls(permit2, vault, settlement, corridor);
+    with_module_balances: bool,
+    also: Vec<Call>,
+) -> anyhow::Result<VaultReading> {
+    let quote_calls = vault_inventory_calls(permit2, vault, settlement, corridor);
+    let quote_views = quote_calls.len();
+    let module_calls = match with_module_balances {
+        true => module_balance_calls(vault),
+        false => Vec::new(),
+    };
+    let module_views = module_calls.len();
+    let calls = [quote_calls, module_calls, also].concat();
     let results = reader.read(rpc, &calls).await?;
-    decode_vault_inventory(&results, order_executor.is_some())
+    let (quote, tail) = results.split_at(quote_views.min(results.len()));
+    let inventory = decode_vault_inventory(quote, order_executor.is_some())?;
+    let free = with_module_balances
+        .then(|| decode_module_balances(&tail[..module_views.min(tail.len())]))
+        .flatten();
+    Ok(VaultReading {
+        inventory,
+        free,
+        recorded: record(&calls, &results),
+    })
 }
 
 #[cfg(test)]
@@ -2623,61 +2758,107 @@ mod tests {
         ]
     }
 
-    #[tokio::test]
-    async fn vault_quote_inventory_keeps_refreshing_while_module_rpc_is_blocked() {
+    /// A vault RPC for the inventory loop. `batched` deploys Multicall3; without
+    /// it every view is its own `eth_call`. `module_views` answers
+    /// `freeSettlement()`/`freeCorridor()`: `None` reverts inside a batch, and
+    /// on the sequential path hangs forever, the way a stuck node would.
+    /// Returns the URL plus counters for quote batches, module reads, and every
+    /// request.
+    async fn vault_rpc(
+        batched: bool,
+        module_views: Option<(u64, u64)>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use crate::chain::multicall::{Call3, Result3};
         use alloy_sol_types::SolValue;
         use axum::{routing::post, Json, Router};
         use serde_json::{json, Value};
-
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let module_reads = Arc::new(AtomicUsize::new(0));
         let quote_reads = Arc::new(AtomicUsize::new(0));
-        let module_count = module_reads.clone();
-        let quote_count = quote_reads.clone();
-        let module_read_started = Arc::new(tokio::sync::Notify::new());
-        let started = module_read_started.clone();
+        let module_reads = Arc::new(AtomicUsize::new(0));
+        let (quote_count, module_count) = (quote_reads.clone(), module_reads.clone());
+        // One answer per calldata, the same tables batched or not.
+        let single = move |data: &[u8]| -> Option<Bytes> {
+            let quote_views = [
+                encode_quotable_settlement(),
+                encode_liquid_settlement(),
+                encode_quotable_corridor(),
+                encode_max_order_input_settlement(),
+                encode_max_order_input_corridor(),
+                encode_close_only(),
+                encode_paused(),
+                encode_trading_epoch(),
+            ];
+            let results = vault_inventory_results();
+            if data == encode_settlement_asset() {
+                word(2)
+            } else if data == encode_corridor_asset() {
+                word(1)
+            } else if data == encode_max_order_lifetime() {
+                word(120)
+            } else if let Some(i) = quote_views.iter().position(|v| v.as_slice() == data) {
+                results[i].clone()
+            } else if data == encode_free_settlement() {
+                module_views.and_then(|(s, _)| word(s))
+            } else if data == encode_free_corridor() {
+                module_views.and_then(|(_, c)| word(c))
+            } else {
+                // The two Permit2 allowances.
+                word(u64::MAX)
+            }
+        };
         let app = Router::new().route(
             "/",
             post(move |Json(req): Json<Value>| {
-                let started = started.clone();
-                let module_count = module_count.clone();
-                let quote_count = quote_count.clone();
+                let (quote_count, module_count) = (quote_count.clone(), module_count.clone());
                 async move {
                     let result = if req["method"] == "eth_getCode" {
-                        "0x01".to_string()
+                        if batched { "0x01" } else { "0x" }.to_string()
                     } else {
                         let data = alloy_primitives::hex::decode(
                             req["params"][0]["data"].as_str().unwrap(),
                         )
                         .unwrap();
-                        let (calls,) =
-                            <(Vec<Call3>,)>::abi_decode_params_validate(&data[4..]).unwrap();
-                        let values = match calls.len() {
-                            3 => vec![word(2), word(1), word(120)], // assets and lifetime
-                            10 => {
-                                quote_count.fetch_add(1, Ordering::SeqCst);
-                                vault_inventory_results()
+                        if batched {
+                            let (calls,) =
+                                <(Vec<Call3>,)>::abi_decode_params_validate(&data[4..]).unwrap();
+                            match calls.len() {
+                                3 => {}
+                                10 | 12 => {
+                                    quote_count.fetch_add(1, Ordering::SeqCst);
+                                }
+                                count => panic!("unexpected inventory batch of {count} calls"),
                             }
-                            2 => {
-                                assert_eq!(calls[0].callData.as_ref(), encode_free_settlement());
-                                assert_eq!(calls[1].callData.as_ref(), encode_free_corridor());
+                            if calls.len() == 12 {
                                 module_count.fetch_add(1, Ordering::SeqCst);
-                                started.notify_one();
-                                // Keep module balances unavailable, as for a hung RPC.
-                                std::future::pending::<Vec<Option<Bytes>>>().await
                             }
-                            count => panic!("unexpected inventory batch of {count} calls"),
-                        };
-                        let results: Vec<Result3> = values
-                            .into_iter()
-                            .map(|value| Result3 {
-                                success: value.is_some(),
-                                returnData: value.unwrap_or_default(),
-                            })
-                            .collect();
-                        alloy_primitives::hex::encode_prefixed((results,).abi_encode_params())
+                            let results: Vec<Result3> = calls
+                                .iter()
+                                .map(|c| single(c.callData.as_ref()))
+                                .map(|value| Result3 {
+                                    success: value.is_some(),
+                                    returnData: value.unwrap_or_default(),
+                                })
+                                .collect();
+                            alloy_primitives::hex::encode_prefixed((results,).abi_encode_params())
+                        } else {
+                            if data == encode_trading_epoch() {
+                                quote_count.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if data == encode_free_settlement() {
+                                module_count.fetch_add(1, Ordering::SeqCst);
+                            }
+                            match single(&data) {
+                                Some(out) => alloy_primitives::hex::encode_prefixed(out),
+                                // Keep module balances unavailable, as for a hung RPC.
+                                None => std::future::pending::<String>().await,
+                            }
+                        }
                     };
                     Json(json!({ "jsonrpc": "2.0", "id": req["id"], "result": result }))
                 }
@@ -2686,15 +2867,23 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, quote_reads, module_reads, server)
+    }
+
+    /// An engine with modules on and nothing read yet.
+    fn module_engine() -> (Engine, std::path::PathBuf) {
         let mut engine = test_engine();
         let dir = enable_modules(&mut engine, crate::modules::Mode::Shadow, 0, 0);
         engine.inventory = InventoryCache::default();
         *engine.trading_epoch.write().unwrap() = 0;
         *engine.vault_policy.write().unwrap() = None;
-        let modules = engine.modules.clone().unwrap();
-        *modules.balances.write().unwrap() = None;
-        let refresh = tokio::spawn(inventory_loop(
-            Wallet::new(&url, engine.signer.clone(), engine.chain_id),
+        *engine.modules.as_ref().unwrap().balances.write().unwrap() = None;
+        (engine, dir)
+    }
+
+    fn spawn_inventory_loop(engine: &Engine, url: &str) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(inventory_loop(
+            Wallet::new(url, engine.signer.clone(), engine.chain_id),
             engine.permit2,
             vec![],
             GasReserve::default(),
@@ -2704,35 +2893,12 @@ mod tests {
             engine.trading_epoch.clone(),
             engine.vault_policy.clone(),
             Arc::new(Mutex::new(HashMap::new())),
-        ));
-        let module_refresh = tokio::spawn(modules::balance_loop(
-            Rpc::new(&url),
-            engine.vault.unwrap(),
-            modules.clone(),
-        ));
-        let reached_module_read = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            module_read_started.notified(),
-        )
-        .await;
-        // Keep the module RPC hung for longer than quote inventory's TTL.
-        // At least two further ordinary refreshes must complete during that time.
-        tokio::time::sleep(std::time::Duration::from_secs(INVENTORY_TTL_SECS + 2)).await;
-        refresh.abort();
-        module_refresh.abort();
-        let _ = module_refresh.await;
-        let _ = refresh.await;
-        server.abort();
-        let _ = server.await;
-        std::fs::remove_dir_all(dir).unwrap();
-        reached_module_read.expect("module loop must reach the blocked read");
-        assert!(quote_reads.load(Ordering::SeqCst) >= 3);
-        assert_eq!(
-            module_reads.load(Ordering::SeqCst),
-            1,
-            "no overlapping module reads"
-        );
+            engine.modules.clone(),
+            None,
+        ))
+    }
 
+    fn assert_quote_inventory_fresh(engine: &Engine) {
         let now = unix_now();
         let inventory = engine.inventory.view(now);
         assert_eq!(
@@ -2747,11 +2913,163 @@ mod tests {
         let policy = engine.vault_policy.read().unwrap().unwrap();
         assert_eq!(policy.max_input_settlement, U256::from(500));
         assert_eq!(policy.max_input_corridor, U256::from(600));
-        assert!(modules.balances.read().unwrap().is_none());
+    }
+
+    /// A wallet bot publishes what it read for the panel, gas included, and
+    /// the panel's extra reads ride the same batch: no request of their own.
+    #[tokio::test]
+    async fn the_inventory_batch_publishes_its_reads_for_the_panel() {
+        use crate::chain::mock_node::{mock_rpc, MockChain};
+        use std::sync::atomic::Ordering;
+        let node = mock_rpc(
+            MockChain::default()
+                .balance(COLLATERAL, 5_000)
+                .balance(DEBT, 7_000)
+                .native(42)
+                .with_multicall3(),
+        )
+        .await;
+        let engine = test_engine();
+        let dir =
+            std::env::temp_dir().join(format!("stitch-rfq-snapshot-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokens: Vec<Address> = vec![COLLATERAL.parse().unwrap(), DEBT.parse().unwrap()];
+        let refresh = tokio::spawn(inventory_loop(
+            Wallet::new(&node.url, engine.signer.clone(), engine.chain_id),
+            engine.permit2,
+            tokens.clone(),
+            GasReserve::default(),
+            engine.inventory.clone(),
+            None,
+            None,
+            engine.trading_epoch.clone(),
+            engine.vault_policy.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+            Some(Publisher::spawn(&dir, engine.chain_id)),
+        ));
+        let owner = engine.signer.address();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(s) = crate::chain::snapshot::load(&dir) {
+                    return s;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("snapshot published");
+        refresh.abort();
+        let _ = refresh.await;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(snapshot.is_fresh(engine.chain_id, unix_now(), 5));
+        assert_eq!(
+            snapshot
+                .lookup(tokens[1], &encode_balance_of(owner))
+                .map(|b| decode_uint(&b)),
+            Some(U256::from(7_000))
+        );
+        assert!(snapshot
+            .lookup(tokens[0], &encode_allowance(owner, engine.permit2))
+            .is_some());
+        assert_eq!(
+            snapshot
+                .lookup(CANONICAL_MULTICALL3, &encode_get_eth_balance(owner))
+                .map(|b| decode_uint(&b)),
+            Some(U256::from(42))
+        );
+        // The Multicall3 probe and one batch: the panel's reads cost nothing.
+        assert_eq!(node.hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn module_balances_ride_the_quote_inventory_batch() {
+        use std::sync::atomic::Ordering;
+        let (url, quote_reads, module_reads, server) = vault_rpc(true, Some((700, 800))).await;
+        let (engine, dir) = module_engine();
+        let refresh = spawn_inventory_loop(&engine, &url);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        refresh.abort();
+        let _ = refresh.await;
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert_quote_inventory_fresh(&engine);
+        let balances = engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .balances
+            .read()
+            .unwrap()
+            .expect("module balances published from the inventory batch");
+        assert_eq!(balances.settlement, U256::from(700));
+        assert_eq!(balances.corridor, U256::from(800));
+        // No 2-call module batch: `vault_rpc` panics on any batch size other
+        // than assets (3) and inventory (10 or 12).
+        assert_eq!(
+            quote_reads.load(Ordering::SeqCst),
+            module_reads.load(Ordering::SeqCst),
+            "every inventory batch carries the module views"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reverting_module_view_does_not_take_quote_inventory_dark() {
+        let (url, _, _, server) = vault_rpc(true, None).await;
+        let (engine, dir) = module_engine();
+        let refresh = spawn_inventory_loop(&engine, &url);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        refresh.abort();
+        let _ = refresh.await;
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert_quote_inventory_fresh(&engine);
+        assert!(engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .balances
+            .read()
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn without_multicall3_a_hung_module_read_does_not_block_quote_inventory() {
+        use std::sync::atomic::Ordering;
+        let (url, quote_reads, module_reads, server) = vault_rpc(false, None).await;
+        let (engine, dir) = module_engine();
+        let refresh = spawn_inventory_loop(&engine, &url);
+        // Keep the module RPC hung for longer than quote inventory's TTL.
+        // At least two further ordinary refreshes must complete during that time.
+        tokio::time::sleep(std::time::Duration::from_secs(INVENTORY_TTL_SECS + 2)).await;
+        refresh.abort();
+        let _ = refresh.await;
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert!(quote_reads.load(Ordering::SeqCst) >= 3);
+        assert_eq!(
+            module_reads.load(Ordering::SeqCst),
+            1,
+            "the separate module loop reached its read once, and never overlapped"
+        );
+        assert_quote_inventory_fresh(&engine);
+        assert!(engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .balances
+            .read()
+            .unwrap()
+            .is_none());
         assert!(
             engine
                 .inventory
-                .view(now + INVENTORY_TTL_SECS + 1)
+                .view(unix_now() + INVENTORY_TTL_SECS + 1)
                 .funded(DEBT.parse().unwrap())
                 .is_none(),
             "a hung module read must not extend quote inventory freshness"

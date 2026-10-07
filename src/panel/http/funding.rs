@@ -47,26 +47,30 @@
 //! Everything after the config parse is a 200. A chain that won't answer, a
 //! feed that is down, a price nobody can find — each of those degrades its own
 //! row to "unknown" with a reason, never the whole request, because the screen
-//! has to keep rendering and keep polling. Every outbound call is bounded on
-//! its own (one slow `eth_call` costs that row, not the picture), and the reads
-//! run concurrently, so the handler answers in about six seconds even with a
-//! dead RPC and dead price sources.
+//! has to keep rendering and keep polling. The chain reads go out as one
+//! Multicall3 batch in which a revert costs only its own row (see
+//! [`super::chain_reads`]), beside the price lookups, each bounded on its own,
+//! so the handler answers in about six seconds even with a dead RPC and dead
+//! price sources.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{keccak256, Address, Bytes, U256};
+use alloy_primitives::{keccak256, Address, U256};
 use axum::extract::{Path as UrlPath, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
-use super::allowances::{read_allowance, short_token, token_symbols};
+use super::allowances::{allowance_ask, short_token, token_symbols};
+use super::chain_reads::{
+    read_cached, timed_out, token_uint, word, Answer, Ask, ChainConstants, Read, CHAIN_BUDGET,
+};
 use super::settings::config_path;
 use super::{ApiError, AppState};
 use crate::chain::approve::{approval_action, required_approvals, ApprovalAction, ApprovalMode};
 use crate::chain::gas_reserve::GasReserve;
-use crate::chain::rpc::Rpc;
+use crate::chain::snapshot::ChainReads as ChainReadsSnapshot;
 use crate::closer::executor::encode_balance_of;
 use crate::config::Config;
 use crate::panel::inventory::Bot;
@@ -134,11 +138,6 @@ fn is_dollar_token(chain_id: u64, key: &str) -> bool {
 
 /// Why both rows of a pool that quotes against something else read "unknown".
 const NOT_A_DOLLAR_PAIR: &str = "the panel can't price this token in dollars";
-
-/// Each chain read gets this long, on its own. The shared RPC client allows
-/// fifteen seconds per request, which is fine for a bot and far too long for
-/// a screen polling every five.
-const CHAIN_BUDGET: Duration = Duration::from_secs(6);
 
 /// Each price lookup gets this long. They run beside the chain reads, so they
 /// never extend the response past the chain budget.
@@ -371,9 +370,26 @@ struct TokenPlan {
 
 /// What came back from the chain for one token.
 struct TokenRead {
-    balance: anyhow::Result<U256>,
+    /// `None` when it wasn't asked: a vault's own asset is read through its
+    /// inventory views instead.
+    balance: Option<anyhow::Result<U256>>,
     allowance: Option<anyhow::Result<U256>>,
     symbol: Option<String>,
+}
+
+/// How old the bot's own reads may be and still answer this screen. The bot
+/// refreshes every couple of seconds, so a file older than this is a bot that
+/// has stopped reading, and the chain is asked instead.
+const SNAPSHOT_MAX_AGE_SECS: u64 = 10;
+
+/// Where [`read_funding`] may take its answers from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FundingSource {
+    /// The running bot's own recent reads where it has them, the chain for
+    /// the rest. What a screen that polls should use.
+    PreferBot,
+    /// The chain, every read. For a decision that can't be undone.
+    Chain,
 }
 
 /// `GET /api/bots/{name}/funding`
@@ -382,7 +398,21 @@ pub async fn funding(
     UrlPath(name): UrlPath<String>,
 ) -> Result<Response, ApiError> {
     let bot = state.bot(&name).await?;
-    Ok(Json(read_funding(&state, &bot).await?).into_response())
+    Ok(Json(read_funding(&state, &bot, FundingSource::PreferBot).await?).into_response())
+}
+
+/// The bot's recent reads, when `source` allows them and the bot is running.
+fn bot_snapshot(
+    source: FundingSource,
+    bot: &Bot,
+    config: &std::path::Path,
+    chain_id: u64,
+) -> Option<ChainReadsSnapshot> {
+    if source != FundingSource::PreferBot || !bot.state.is_running() {
+        return None;
+    }
+    crate::chain::snapshot::load(config.parent()?)
+        .filter(|s| s.is_fresh(chain_id, now_unix(), SNAPSHOT_MAX_AGE_SECS))
 }
 
 /// One read of everything the bot's money sits in. Shared with the remove
@@ -400,7 +430,14 @@ pub async fn funding(
 /// from. A vault view that timed out must not refuse a delete: the vault
 /// outlives the key, so the gate only cares whether the wallet's own balances
 /// were read.
-pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, ApiError> {
+///
+/// With [`FundingSource::PreferBot`], a running bot's own reads stand in for
+/// the chain where it made them (see [`crate::chain::snapshot`]).
+pub async fn read_funding(
+    state: &AppState,
+    bot: &Bot,
+    source: FundingSource,
+) -> Result<FundingBody, ApiError> {
     let path = config_path(bot)?;
     let toml = std::fs::read_to_string(&path).map_err(|e| {
         ApiError::internal(&anyhow::anyhow!(e).context(format!("reading {}", path.display())))
@@ -453,17 +490,38 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
         .as_ref()
         .and_then(|v| v.order_executor.as_deref())
         .is_some();
-    let (reads, inventory, dust, native_balance, feed_prices, native) = tokio::join!(
-        read_tokens(&cfg.rpc_url, capital, permit2_owner, &plans),
-        read_inventory(&cfg.rpc_url, vault, executor_routed),
-        read_balances(&cfg.rpc_url, dust_owner, &plans),
-        read_native(&cfg.rpc_url, wallet),
+    let snapshot = bot_snapshot(source, bot, &path, cfg.chain_id);
+    let owners = Owners {
+        capital,
+        permit2: permit2_owner,
+        vault,
+        vault_assets: vault
+            .map(|v| known_vault_assets(&state.chain_constants, cfg.chain_id, v))
+            .unwrap_or_default(),
+        dust: dust_owner,
+        gas: wallet,
+    };
+    let (asks, slots) = funding_asks(&owners, &plans);
+    let (answers, feed_prices, native) = tokio::join!(
+        read_cached(
+            &cfg.rpc_url,
+            cfg.chain_id,
+            &state.chain_constants,
+            snapshot.as_ref(),
+            &asks
+        ),
         fetch_feed_prices(&plans),
         tokio::time::timeout(
             PRICE_BUDGET,
             state.native_prices.get(cfg.chain_id, api_origin.as_deref()),
         ),
     );
+    let ChainReads {
+        tokens: reads,
+        inventory,
+        dust,
+        native: native_balance,
+    } = chain_reads(&slots, &asks, &answers, vault, executor_routed);
     let native = native.ok().flatten();
     if let Some(Err(e)) = &inventory {
         capital_errors.push(format!("{e:#}"));
@@ -488,7 +546,7 @@ pub async fn read_funding(state: &AppState, bot: &Bot) -> Result<FundingBody, Ap
             let balance = match (quotable.and_then(|q| q.get(&plan.key).copied()), &inventory) {
                 (Some(q), _) => Some(q),
                 (None, Some(Err(_))) => None,
-                (None, _) => value_of(read.map(|r| &r.balance), &mut capital_errors),
+                (None, _) => value_of(read.and_then(|r| r.balance.as_ref()), &mut capital_errors),
             };
             // Without a vault these rows are the signer wallet, gas included.
             let balance = match vault {
@@ -775,75 +833,169 @@ fn parse_token(raw: &str, role: &str) -> Result<Address, ApiError> {
     })
 }
 
-/// Every token read at once, each under its own budget.
-///
-/// An empty vec when there is no owner to read for. Every failure, the budget
-/// included, stays inside its own read: one slow `eth_call` degrades that row
-/// to "unknown" and the rows that answered still show their balances. The
-/// public nodes these configs point at rate-limit one call at a time, so a
-/// batch-wide timeout used to blank a fully funded wallet.
-async fn read_tokens(
-    rpc_url: &str,
-    owner: Option<Address>,
+/// The addresses `/funding` reads at. Each is `None` when there is nothing
+/// to read there.
+struct Owners {
+    /// Where the money the bot quotes against sits: the vault, else the wallet.
+    capital: Option<Address>,
+    /// Permit2, when the capital is a wallet whose allowances matter.
     permit2: Option<Address>,
-    plans: &[TokenPlan],
-) -> Vec<TokenRead> {
-    let Some(owner) = owner else {
-        return Vec::new();
-    };
-    let rpc = Rpc::new(rpc_url.to_string());
-    futures_util::future::join_all(plans.iter().map(|plan| {
-        let rpc = rpc.clone();
-        async move {
-            let balance = budgeted(rpc_url, read_balance(&rpc, plan.address, owner));
-            let allowance = async {
-                match permit2 {
-                    Some(permit2) => Some(
-                        budgeted(rpc_url, read_allowance(&rpc, plan.address, owner, permit2)).await,
-                    ),
-                    None => None,
-                }
-            };
-            let symbol = async {
-                if plan.ticker.is_some() {
-                    return None;
-                }
-                budgeted(rpc_url, read_symbol(&rpc, plan.address))
-                    .await
-                    .ok()
-            };
-            let (balance, allowance, symbol) = tokio::join!(balance, allowance, symbol);
-            TokenRead {
-                balance,
-                allowance,
-                symbol,
-            }
-        }
-    }))
-    .await
+    vault: Option<Address>,
+    /// The vault's settlement and corridor assets, when an earlier poll has
+    /// already read them. Their rows come from the inventory views, so their
+    /// `balanceOf` at the vault is not asked.
+    vault_assets: Vec<Address>,
+    /// The signer wallet, when it is a second address beside the vault.
+    dust: Option<Address>,
+    /// The signer wallet, which pays the gas.
+    gas: Option<Address>,
 }
 
-/// The same tokens at a second address: balances only. What the signer wallet
-/// still holds of its own when the trading capital sits in a vault — there are
-/// no allowances to ask about there, and the symbols are already known.
-async fn read_balances(
-    rpc_url: &str,
-    owner: Option<Address>,
-    plans: &[TokenPlan],
-) -> Vec<anyhow::Result<U256>> {
-    let Some(owner) = owner else {
-        return Vec::new();
+/// Where one token's reads sit in the batch.
+struct TokenSlots {
+    balance: Option<usize>,
+    allowance: Option<usize>,
+    symbol: Option<usize>,
+}
+
+/// Where each answer lands in the batch [`funding_asks`] builds.
+struct Slots {
+    /// Empty when there is no capital address to read.
+    tokens: Vec<TokenSlots>,
+    /// The five views [`vault_inventory`] reads, in its order.
+    inventory: Option<[usize; 5]>,
+    dust: Vec<usize>,
+    native: Option<usize>,
+}
+
+/// Every chain question this screen has, as one list, and where each answer
+/// will land.
+fn funding_asks(owners: &Owners, plans: &[TokenPlan]) -> (Vec<Ask>, Slots) {
+    let mut asks: Vec<Ask> = Vec::new();
+    let mut push = |ask: Ask| {
+        asks.push(ask);
+        asks.len() - 1
     };
-    let rpc = Rpc::new(rpc_url.to_string());
-    futures_util::future::join_all(
-        plans
+    let tokens = match owners.capital {
+        None => Vec::new(),
+        Some(owner) => plans
             .iter()
-            .map(|plan| budgeted(rpc_url, read_balance(&rpc, plan.address, owner))),
-    )
-    .await
+            .map(|plan| TokenSlots {
+                balance: (!owners.vault_assets.contains(&plan.address))
+                    .then(|| push(balance_ask(plan.address, owner))),
+                allowance: owners
+                    .permit2
+                    .map(|permit2| push(allowance_ask(plan.address, owner, permit2))),
+                symbol: plan
+                    .ticker
+                    .is_none()
+                    .then(|| push(symbol_ask(plan.address))),
+            })
+            .collect(),
+    };
+    let inventory = owners.vault.map(|vault| {
+        [
+            (encode_settlement_asset(), "settlementAsset()", true),
+            (encode_corridor_asset(), "corridorAsset()", true),
+            (encode_quotable_settlement(), "quotableSettlement()", false),
+            (encode_liquid_settlement(), "liquidSettlement()", false),
+            (encode_quotable_corridor(), "quotableCorridor()", false),
+        ]
+        .map(|(data, view, fixed)| {
+            let ask = Ask::call(vault, data, format!("{view} on {vault}"));
+            push(if fixed { ask.constant() } else { ask })
+        })
+    });
+    let dust = match owners.dust {
+        None => Vec::new(),
+        Some(owner) => plans
+            .iter()
+            .map(|plan| push(balance_ask(plan.address, owner)))
+            .collect(),
+    };
+    let native = owners.gas.map(|owner| push(Ask::native(owner)));
+    let slots = Slots {
+        tokens,
+        inventory,
+        dust,
+        native,
+    };
+    (asks, slots)
 }
 
-/// What the vault will actually quote, by lowercase token address.
+fn balance_ask(token: Address, owner: Address) -> Ask {
+    Ask::call(
+        token,
+        encode_balance_of(owner),
+        format!("balanceOf() on {token}"),
+    )
+}
+
+/// ERC-20 `symbol()`, for a token the corridor catalog can't name. Fixed at
+/// deploy, so asked once.
+pub(super) fn symbol_ask(token: Address) -> Ask {
+    Ask::call(
+        token,
+        keccak256(b"symbol()")[..4].to_vec(),
+        format!("symbol() on {token}"),
+    )
+    .constant()
+}
+
+/// The vault's two assets, if an earlier read already learned them. Fixed in
+/// the vault's constructor.
+fn known_vault_assets(constants: &ChainConstants, chain_id: u64, vault: Address) -> Vec<Address> {
+    [encode_settlement_asset(), encode_corridor_asset()]
+        .into_iter()
+        .filter_map(|data| constants.get(chain_id, &Read::Call { to: vault, data }))
+        .map(|out| word(&Ok(out), "vault asset").map(address_from_word))
+        .filter_map(Result::ok)
+        .collect()
+}
+
+/// The answers, decoded into what the rest of the handler weighs.
+struct ChainReads {
+    tokens: Vec<TokenRead>,
+    inventory: Option<anyhow::Result<HashMap<String, U256>>>,
+    dust: Vec<anyhow::Result<U256>>,
+    native: Option<anyhow::Result<U256>>,
+}
+
+fn chain_reads(
+    slots: &Slots,
+    asks: &[Ask],
+    answers: &[Answer],
+    vault: Option<Address>,
+    executor_routed: bool,
+) -> ChainReads {
+    let missing: Answer = Err("the RPC returned no answer for this read".to_string());
+    let answer = |i: usize| answers.get(i).unwrap_or(&missing);
+    let uint = |i: usize| token_uint(answer(i), &asks[i].what);
+    let view = |i: usize| word(answer(i), &asks[i].what);
+    ChainReads {
+        tokens: slots
+            .tokens
+            .iter()
+            .map(|t| TokenRead {
+                balance: t.balance.map(uint),
+                allowance: t.allowance.map(uint),
+                symbol: t
+                    .symbol
+                    .and_then(|i| answer(i).as_ref().ok())
+                    .and_then(|out| decode_string_return(out)),
+            })
+            .collect(),
+        inventory: vault
+            .zip(slots.inventory)
+            .map(|(vault, slots)| vault_inventory(vault, slots.map(view), executor_routed)),
+        dust: slots.dust.iter().map(|i| uint(*i)).collect(),
+        native: slots.native.map(view),
+    }
+}
+
+/// What the vault will actually quote, by lowercase token address, from
+/// `settlementAsset`, `corridorAsset`, `quotableSettlement`,
+/// `liquidSettlement` and `quotableCorridor`, in that order.
 ///
 /// Not `balanceOf`. `allocateIdle` parks settlement above the liquid floor in
 /// the yield adapter, so a working vault's raw balance reads low — one holding
@@ -858,35 +1010,9 @@ async fn read_balances(
 /// Permit2 pull, so the whole position is quotable; without one only the idle
 /// part is. Same rule as the bot's, from the same function.
 ///
-/// `None` when there is no vault. An error when the views don't answer — a
+/// An error, the first view that failed, when the views don't answer — a
 /// quiet fall back to `balanceOf` would be the wrong number with nothing
 /// saying so.
-async fn read_inventory(
-    rpc_url: &str,
-    vault: Option<Address>,
-    executor_routed: bool,
-) -> Option<anyhow::Result<HashMap<String, U256>>> {
-    let vault = vault?;
-    let rpc = Rpc::new(rpc_url.to_string());
-    let word = |data: Vec<u8>, what: &'static str| {
-        let rpc = rpc.clone();
-        async move { budgeted(rpc_url, read_word(&rpc, vault, data, what)).await }
-    };
-    let (settlement, corridor, quotable, liquid, corridor_qty) = tokio::join!(
-        word(encode_settlement_asset(), "settlementAsset()"),
-        word(encode_corridor_asset(), "corridorAsset()"),
-        word(encode_quotable_settlement(), "quotableSettlement()"),
-        word(encode_liquid_settlement(), "liquidSettlement()"),
-        word(encode_quotable_corridor(), "quotableCorridor()"),
-    );
-    Some(vault_inventory(
-        vault,
-        [settlement, corridor, quotable, liquid, corridor_qty],
-        executor_routed,
-    ))
-}
-
-/// The map from the five reads, or the first of them that failed.
 fn vault_inventory(
     vault: Address,
     reads: [anyhow::Result<U256>; 5],
@@ -909,31 +1035,6 @@ fn vault_inventory(
     ]))
 }
 
-/// One no-argument view returning a single word. `what` names the call, so a
-/// failure says which view rather than just which address.
-pub(super) async fn read_word(
-    rpc: &Rpc,
-    to: Address,
-    data: Vec<u8>,
-    what: &str,
-) -> anyhow::Result<U256> {
-    let out = rpc.eth_call(to, &Bytes::from(data)).await?;
-    anyhow::ensure!(
-        out.len() >= 32,
-        "{what} on {to} returned {} bytes, not a word",
-        out.len()
-    );
-    Ok(U256::from_be_slice(&out[out.len() - 32..]))
-}
-
-/// The gas coin, on the wallet that pays for the transactions. `None` when
-/// there is no signer address to read.
-async fn read_native(rpc_url: &str, owner: Option<Address>) -> Option<anyhow::Result<U256>> {
-    let owner = owner?;
-    let rpc = Rpc::new(rpc_url.to_string());
-    Some(budgeted(rpc_url, rpc.get_balance(owner)).await)
-}
-
 /// One chain read under the screen's budget. A read that runs out of time
 /// fails like any other read, with a message that says which node it was.
 pub(super) async fn budgeted<T>(
@@ -942,36 +1043,13 @@ pub(super) async fn budgeted<T>(
 ) -> anyhow::Result<T> {
     match tokio::time::timeout(CHAIN_BUDGET, read).await {
         Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "the RPC at {rpc_url} didn't answer within {} seconds",
-            CHAIN_BUDGET.as_secs()
-        )),
+        Err(_) => Err(anyhow::anyhow!(timed_out(rpc_url))),
     }
-}
-
-async fn read_balance(rpc: &Rpc, token: Address, owner: Address) -> anyhow::Result<U256> {
-    let data = Bytes::from(encode_balance_of(owner));
-    let out = rpc.eth_call(token, &data).await?;
-    anyhow::ensure!(
-        out.len() >= 32,
-        "balanceOf() on {token} returned {} bytes, not a uint256 — is that address an ERC-20 on \
-         this chain?",
-        out.len()
-    );
-    Ok(U256::from_be_slice(&out[out.len() - 32..]))
-}
-
-/// ERC-20 `symbol()`, for a token the corridor catalog can't name.
-pub(super) async fn read_symbol(rpc: &Rpc, token: Address) -> anyhow::Result<String> {
-    let data = Bytes::from(keccak256(b"symbol()")[..4].to_vec());
-    let out = rpc.eth_call(token, &data).await?;
-    decode_string_return(&out)
-        .ok_or_else(|| anyhow::anyhow!("symbol() on {token} returned no string"))
 }
 
 /// Decode an ABI `string` return, accepting the `bytes32` form some older
 /// tokens use. `None` for anything else, including an empty string.
-fn decode_string_return(out: &[u8]) -> Option<String> {
+pub(super) fn decode_string_return(out: &[u8]) -> Option<String> {
     let text = if out.len() >= 64 {
         let offset = U256::from_be_slice(&out[..32]).try_into().ok()?;
         let len: usize = U256::from_be_slice(out.get(offset..offset + 32)?)
@@ -1293,10 +1371,11 @@ mod tests {
     }
 
     fn add_container(h: &Harness, name: &str) {
-        let mut c = crate::panel::docker::fake::container(
-            &format!("stitch-{name}"),
-            ContainerState::Exited,
-        );
+        add_container_in(h, name, ContainerState::Exited);
+    }
+
+    fn add_container_in(h: &Harness, name: &str, state: ContainerState) {
+        let mut c = crate::panel::docker::fake::container(&format!("stitch-{name}"), state);
         c.image = h.state.cfg.bot_image.clone();
         c.labels.insert(
             crate::panel::naming::LABEL_BOT.to_string(),
@@ -1493,6 +1572,242 @@ mod tests {
         assert_eq!(v["gate"]["needsSide"], false);
         assert_eq!(v["gate"]["needsGas"], false);
         assert!(v["checkedAtUnix"].as_u64().unwrap() > 1_700_000_000);
+    }
+
+    /// `/funding` for one bot on `chain`, and how many requests the node saw.
+    async fn funding_with_hits(
+        name: &str,
+        chain: MockChain,
+        vault: Option<&str>,
+    ) -> (serde_json::Value, usize) {
+        let h = harness(name);
+        let node = mock_rpc(chain).await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        if let Some(vault) = vault {
+            attach_vault(&h, "bot-a", vault, None);
+        }
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut v = Harness::parse(&body);
+        v["checkedAtUnix"] = json!(0);
+        (v, node.hits.load(Ordering::SeqCst))
+    }
+
+    /// Batching changes how many requests the node sees and nothing else: the
+    /// same wallet reads the same with and without Multicall3.
+    #[tokio::test]
+    async fn a_wallet_bot_is_one_request_with_multicall3() {
+        let chain = MockChain::default()
+            .balance(USDT, 25_000_000)
+            .balance(CNGN, 0)
+            .native(20_000_000_000_000_000_000);
+        let (one_by_one, _) = funding_with_hits("funding-seq", chain.clone(), None).await;
+        let (batched, hits) =
+            funding_with_hits("funding-batched", chain.with_multicall3(), None).await;
+        assert_eq!(hits, 1, "balances, allowances and gas in one request");
+        assert_eq!(batched, one_by_one);
+        assert!(batched["readError"].is_null(), "{batched}");
+    }
+
+    #[tokio::test]
+    async fn a_vault_bot_is_one_request_with_multicall3() {
+        let chain = vault_views(
+            MockChain::default()
+                .balance_of(USDT, VAULT, 25_000_000)
+                .balance_of(USDT, WALLET, 1_000_000)
+                .balance(CNGN, 0)
+                .native(20_000_000_000_000_000_000),
+            25_000_000,
+            25_000_000,
+            0,
+        );
+        let (one_by_one, _) =
+            funding_with_hits("funding-vault-seq", chain.clone(), Some(VAULT)).await;
+        let (batched, hits) = funding_with_hits(
+            "funding-vault-batched",
+            chain.with_multicall3(),
+            Some(VAULT),
+        )
+        .await;
+        assert_eq!(hits, 1, "vault views, dust and gas in one request");
+        assert_eq!(batched, one_by_one);
+        assert_eq!(token(&batched, "USDT")["balanceText"], "25", "{batched}");
+    }
+
+    /// A vault's assets are fixed at deploy, so the second poll reads neither
+    /// them nor the vault's `balanceOf` for them (the rows come from its
+    /// inventory views). Counted without Multicall3, where every read is a
+    /// request of its own.
+    #[tokio::test]
+    async fn a_vault_bot_reads_its_assets_once() {
+        let h = harness("funding-vault-constants");
+        let node = mock_rpc(vault_views(
+            MockChain::default()
+                .balance_of(USDT, WALLET, 1_000_000)
+                .native(20_000_000_000_000_000_000),
+            25_000_000,
+            25_000_000,
+            0,
+        ))
+        .await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        attach_vault(&h, "bot-a", VAULT, None);
+
+        let (_, first) = h.get("/api/bots/bot-a/funding").await;
+        let after_first = node.hits.swap(0, Ordering::SeqCst);
+        let (_, second) = h.get("/api/bots/bot-a/funding").await;
+        let after_second = node.hits.load(Ordering::SeqCst);
+        let normalise = |body: &str| {
+            let mut v = Harness::parse(body);
+            v["checkedAtUnix"] = json!(0);
+            v
+        };
+        assert_eq!(normalise(&first), normalise(&second));
+        assert_eq!(
+            after_first - after_second,
+            4,
+            "settlementAsset, corridorAsset and two balanceOf at the vault"
+        );
+    }
+
+    /// A cNGN/USDT bot whose container is running, as the snapshot tests need.
+    fn seed_running(h: &Harness, name: &str, rpc_url: &str, api: &MockApi) {
+        let corridor = setup::find_corridor("cngn-usdt-celo").unwrap();
+        setup::write_config(h.root.join(name), corridor, TEST_KEY).unwrap();
+        let path = h.root.join(name).join("stitch.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("https://forno.celo.org", rpc_url)
+            .replace(
+                "https://api.textilecredit.com/price?chainId=42220&pair=cngn-usdt",
+                &feed_of(api),
+            )
+            .replace("https://api.textilecredit.com", &api.base);
+        std::fs::write(&path, toml).unwrap();
+        add_container_in(h, name, ContainerState::Running);
+    }
+
+    /// What a running wallet bot leaves for the panel: both balances and
+    /// allowances, and the gas, as of `at`.
+    fn write_bot_snapshot(h: &Harness, name: &str, at: u64, usdt: u128) {
+        use crate::chain::multicall::{encode_get_eth_balance, Call, CANONICAL_MULTICALL3};
+        use crate::chain::snapshot::{record, ChainReads, FILE};
+        use crate::closer::executor::encode_allowance;
+        let dir = h.root.join(name);
+        let cfg =
+            Config::from_toml(&std::fs::read_to_string(dir.join("stitch.toml")).unwrap()).unwrap();
+        let owner: Address = WALLET.parse().unwrap();
+        let permit2: Address = cfg.permit2.parse().unwrap();
+        let (usdt_token, cngn): (Address, Address) = (USDT.parse().unwrap(), CNGN.parse().unwrap());
+        let calls = [
+            Call::new(usdt_token, encode_balance_of(owner)),
+            Call::new(usdt_token, encode_allowance(owner, permit2)),
+            Call::new(cngn, encode_balance_of(owner)),
+            Call::new(cngn, encode_allowance(owner, permit2)),
+            Call::new(CANONICAL_MULTICALL3, encode_get_eth_balance(owner)),
+        ];
+        let words = [
+            U256::from(usdt),
+            U256::MAX,
+            U256::ZERO,
+            U256::MAX,
+            U256::from(20_000_000_000_000_000_000u128),
+        ]
+        .map(|w| {
+            Some(alloy_primitives::Bytes::from(
+                w.to_be_bytes::<32>().to_vec(),
+            ))
+        });
+        let snapshot = ChainReads::new(cfg.chain_id, at, record(&calls, &words));
+        std::fs::write(dir.join(FILE), serde_json::to_string(&snapshot).unwrap()).unwrap();
+    }
+
+    /// The chain the snapshot tests disagree with: 1 USDT and 20 CELO.
+    async fn chain_with_one_usdt() -> crate::chain::mock_node::MockNode {
+        mock_rpc(
+            MockChain::default()
+                .balance(USDT, 1_000_000)
+                .balance(CNGN, 0)
+                .native(20_000_000_000_000_000_000),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_running_bot_answers_from_its_own_reads() {
+        let h = harness("funding-snapshot");
+        let node = chain_with_one_usdt().await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed_running(&h, "bot-a", &node.url, &api);
+        write_bot_snapshot(&h, "bot-a", now_unix(), 25_000_000);
+
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert!(v["readError"].is_null(), "{body}");
+        assert_eq!(token(&v, "USDT")["balanceText"], "25", "the bot's number");
+        assert_eq!(token(&v, "USDT")["approved"], true);
+        assert_eq!(v["gas"]["balanceText"], "20");
+        assert_eq!(node.hits.load(Ordering::SeqCst), 0, "no RPC at all");
+    }
+
+    #[tokio::test]
+    async fn a_stale_snapshot_or_a_stopped_bot_reads_the_chain() {
+        let h = harness("funding-snapshot-stale");
+        let node = chain_with_one_usdt().await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed_running(&h, "bot-a", &node.url, &api);
+        write_bot_snapshot(
+            &h,
+            "bot-a",
+            now_unix() - SNAPSHOT_MAX_AGE_SECS - 1,
+            25_000_000,
+        );
+        let (_, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(token(&Harness::parse(&body), "USDT")["balanceText"], "1");
+
+        // Fresh, but the bot isn't running: whatever wrote it isn't reading.
+        let h = harness("funding-snapshot-stopped");
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        write_bot_snapshot(&h, "bot-a", now_unix(), 25_000_000);
+        let (_, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(token(&Harness::parse(&body), "USDT")["balanceText"], "1");
+    }
+
+    /// Deleting a key is the one thing the panel can't undo, so its check never
+    /// takes the bot's word: here the snapshot says the wallet is empty and
+    /// the chain says it holds $25.
+    #[tokio::test]
+    async fn the_remove_gate_reads_the_chain_even_with_a_fresh_snapshot() {
+        let h = harness("funding-snapshot-remove");
+        let node = mock_rpc(
+            MockChain::default()
+                .balance(USDT, 25_000_000)
+                .balance(CNGN, 0)
+                .native(20_000_000_000_000_000_000),
+        )
+        .await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed_running(&h, "bot-a", &node.url, &api);
+        write_bot_snapshot(&h, "bot-a", now_unix(), 0);
+        let bot = h.state.bot("bot-a").await.unwrap();
+
+        let shown = read_funding(&h.state, &bot, FundingSource::PreferBot)
+            .await
+            .unwrap();
+        assert!(
+            shown.remove_blocked_by.is_none(),
+            "the snapshot's empty wallet"
+        );
+        let gate = read_funding(&h.state, &bot, FundingSource::Chain)
+            .await
+            .unwrap();
+        assert!(
+            gate.remove_blocked_by.is_some(),
+            "the chain's $25 blocks removal"
+        );
     }
 
     /// 100 CELO in the wallet is 100 coins, not 200: the default 5 are gas,
@@ -2000,10 +2315,13 @@ mod tests {
         assert_eq!(v["tokens"][0]["symbol"], "USD₮");
         assert_eq!(v["tokens"][1]["symbol"], "cNGN");
 
+        // Another chain, so the symbols just learned on 999 (kept, since they
+        // can't change) don't answer for it.
         let empty = mock_rpc(MockChain::default().native(0)).await;
         let toml = std::fs::read_to_string(&path)
             .unwrap()
-            .replace(&node.url, &empty.url);
+            .replace(&node.url, &empty.url)
+            .replace("chain_id = 999", "chain_id = 998");
         std::fs::write(&path, toml).unwrap();
         let (status, body) = h.get("/api/bots/bot-a/funding").await;
         assert_eq!(status, StatusCode::OK, "{body}");

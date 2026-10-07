@@ -33,11 +33,12 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::chain_reads::{read_all, word, Ask};
 use super::enroll::{
     bot_dir, enrollment_body, refuse_connect_on_unmigrated_flat_layout, signer_for_bot,
     store_maker_key,
 };
-use super::funding::{budgeted, format_units, read_symbol, read_word};
+use super::funding::{budgeted, decode_string_return, format_units, symbol_ask};
 use super::settings::{config_path, network_name, read_toml, save_and_restart};
 use super::{ApiError, AppState};
 use crate::chain::rpc::Rpc;
@@ -764,38 +765,45 @@ fn as_bool(word: U256) -> Option<bool> {
     }
 }
 
-/// Every chain read at once, each under the panel's per-read budget.
+/// Every chain read at once: the code check beside one batch of views.
 async fn read_chain(rpc_url: &str, vault: Address) -> ChainFacts {
     let rpc = Rpc::new(rpc_url.to_string());
-    let word = |data: Vec<u8>, what: &'static str| {
-        let rpc = rpc.clone();
-        async move { budgeted(rpc_url, read_word(&rpc, vault, data, what)).await }
-    };
-    let (code, settlement, corridor, strategy, admin, adapter, paused, close_only, qs, qc) = tokio::join!(
+    let asks: Vec<Ask> = [
+        (encode_settlement_asset(), "settlementAsset()"),
+        (encode_corridor_asset(), "corridorAsset()"),
+        (encode_strategy_signer(), "strategySigner()"),
+        (encode_operator_admin(), "operatorAdmin()"),
+        (encode_yield_adapter(), "yieldAdapter()"),
+        (encode_paused(), "paused()"),
+        (encode_close_only(), "closeOnly()"),
+        (encode_quotable_settlement(), "quotableSettlement()"),
+        (encode_quotable_corridor(), "quotableCorridor()"),
+    ]
+    .into_iter()
+    .map(|(data, view)| Ask::call(vault, data, format!("{view} on {vault}")))
+    .collect();
+    let (code, answers) = tokio::join!(
         budgeted(rpc_url, rpc.get_code(vault)),
-        word(encode_settlement_asset(), "settlementAsset()"),
-        word(encode_corridor_asset(), "corridorAsset()"),
-        word(encode_strategy_signer(), "strategySigner()"),
-        word(encode_operator_admin(), "operatorAdmin()"),
-        word(encode_yield_adapter(), "yieldAdapter()"),
-        word(encode_paused(), "paused()"),
-        word(encode_close_only(), "closeOnly()"),
-        word(encode_quotable_settlement(), "quotableSettlement()"),
-        word(encode_quotable_corridor(), "quotableCorridor()"),
+        read_all(rpc_url, &asks),
     );
-    let address = |r: anyhow::Result<U256>| r.ok().and_then(as_address);
-    let flag = |r: anyhow::Result<U256>| r.ok().and_then(as_bool);
+    let views: Vec<Option<U256>> = asks
+        .iter()
+        .zip(&answers)
+        .map(|(ask, answer)| word(answer, &ask.what).ok())
+        .collect();
+    let address = |i: usize| views[i].and_then(as_address);
+    let flag = |i: usize| views[i].and_then(as_bool);
     ChainFacts {
         has_code: code.map(|c| !c.is_empty()).map_err(|e| format!("{e:#}")),
-        settlement: address(settlement),
-        corridor: address(corridor),
-        strategy_signer: address(strategy),
-        operator_admin: address(admin),
-        yield_adapter: address(adapter),
-        paused: flag(paused),
-        close_only: flag(close_only),
-        quotable_settlement: qs.ok(),
-        quotable_corridor: qc.ok(),
+        settlement: address(0),
+        corridor: address(1),
+        strategy_signer: address(2),
+        operator_admin: address(3),
+        yield_adapter: address(4),
+        paused: flag(5),
+        close_only: flag(6),
+        quotable_settlement: views[7],
+        quotable_corridor: views[8],
     }
 }
 
@@ -808,20 +816,26 @@ async fn read_symbols(cfg: &Config, chain: &ChainFacts) -> HashMap<Address, Stri
         .flatten()
         .filter(|a| !a.is_zero())
         .collect();
-    let rpc = Rpc::new(cfg.rpc_url.clone());
-    let named = futures_util::future::join_all(tokens.iter().map(|token| {
-        let rpc = rpc.clone();
-        let known = known.get(&format!("{token:#x}")).cloned();
-        async move {
-            let symbol = match known {
-                Some(symbol) => Some(symbol),
-                None => budgeted(&cfg.rpc_url, read_symbol(&rpc, *token)).await.ok(),
-            };
-            symbol.map(|s| (*token, s))
-        }
-    }))
-    .await;
-    named.into_iter().flatten().collect()
+    let unknown: Vec<Address> = tokens
+        .iter()
+        .copied()
+        .filter(|token| !known.contains_key(&format!("{token:#x}")))
+        .collect();
+    let asks: Vec<Ask> = unknown.iter().map(|token| symbol_ask(*token)).collect();
+    let answers = read_all(&cfg.rpc_url, &asks).await;
+    let read = unknown.iter().zip(&answers).filter_map(|(token, answer)| {
+        let symbol = decode_string_return(answer.as_ref().ok()?)?;
+        Some((*token, symbol))
+    });
+    tokens
+        .iter()
+        .filter_map(|token| {
+            known
+                .get(&format!("{token:#x}"))
+                .map(|symbol| (*token, symbol.clone()))
+        })
+        .chain(read)
+        .collect()
 }
 
 async fn ask_textile(origin: &str, chain_id: u64, vault: Address, signer: Address) -> Textile {

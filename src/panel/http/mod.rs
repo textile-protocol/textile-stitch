@@ -16,6 +16,7 @@
 pub mod allowances;
 pub mod assets;
 pub mod bots;
+pub mod chain_reads;
 pub mod custody;
 pub mod enroll;
 pub mod funding;
@@ -77,6 +78,9 @@ pub struct AppState {
     /// Dollar prices for each chain's gas token, cached a minute, for the
     /// funding check. See [`crate::panel::native_price`].
     pub native_prices: Arc<crate::panel::native_price::NativePrices>,
+    /// Chain answers that never change (token symbols, a vault's assets), so
+    /// a screen that polls asks once. See [`chain_reads::ChainConstants`].
+    pub chain_constants: Arc<chain_reads::ChainConstants>,
 }
 
 impl AppState {
@@ -96,6 +100,7 @@ impl AppState {
                 auth::MAX_CONCURRENT_VERIFICATIONS,
             )),
             config_locks: Arc::new(settings::ConfigLocks::new()),
+            chain_constants: Arc::new(chain_reads::ChainConstants::default()),
         }
     }
 

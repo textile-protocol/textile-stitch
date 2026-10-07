@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { api } from './api'
+import { poll } from './poll'
 import type { Funding, FundingToken } from './types'
 
 /** Five seconds, like the wizard: money arrives while you watch. */
@@ -116,7 +117,7 @@ export function useFunding(name: string | null): {
     if (!name) return
     let cancelled = false
     const read = () =>
-      void api
+      api
         .funding(name)
         .then((f) => {
           if (!cancelled) setFunding(f)
@@ -125,11 +126,10 @@ export function useFunding(name: string | null): {
           // The header shows a dash and the Funds tab says what it can; the
           // next tick tries again.
         })
-    read()
-    const timer = window.setInterval(read, FUNDING_POLL_MS)
+    const stop = poll(read, FUNDING_POLL_MS, { immediate: true })
     return () => {
       cancelled = true
-      clearInterval(timer)
+      stop()
     }
   }, [name, tick])
 

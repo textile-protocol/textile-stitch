@@ -137,9 +137,19 @@ chain Stitch quotes on does, at the same address.
 
 The RFQ responder re-reads what it may pledge every 2 seconds: a balance and a
 Permit2 allowance for each quotable token, or ten vault views for a vault
-maker. That is one request per cycle — roughly 43k a day — however many
-corridors the venue has seated you on. The ladder (`book_enabled = true`) adds
-one request per input token per `tick_interval_secs`.
+maker (plus the two module balances when modules are on, in the same batch).
+That is one request per cycle — roughly 43k a day — however many corridors
+the venue has seated you on. Every corridor on one chain can share one bot,
+and so one loop; one bot per corridor pays for each. The ladder
+(`book_enabled = true`) adds one request per input token per
+`tick_interval_secs`.
+
+The panel's funding view (the bot page, Fleet, and the setup wizard's funding
+wait) polls every 5 seconds while the tab is visible and nothing while it is
+hidden. For a running bot it answers from the reads the bot just made, which
+the bot leaves in `chain-reads.json` next to `stitch.toml`, so an open tab costs
+no RPC. For a bot that isn't running it reads the chain itself, one request a
+poll.
 
 Stitch probes for Multicall3 at startup and logs which way reads go
 (`rfq inventory reads resolved batched=true`). On a chain without it, every

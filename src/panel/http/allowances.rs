@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
+use super::chain_reads::{read_all, token_uint, Ask};
 use super::settings::config_path;
 use super::{ApiError, AppState};
 use crate::chain::approve::{approval_action, required_approvals, ApprovalAction, ApprovalMode};
@@ -84,9 +85,13 @@ pub async fn allowances(
     let mut current: Vec<Option<U256>> = Vec::with_capacity(required.len());
     match (owner, cfg.permit2.parse::<Address>()) {
         (Some(owner), Ok(permit2)) => {
-            let rpc = Rpc::new(cfg.rpc_url.clone());
-            for req in &required {
-                match read_allowance(&rpc, req.token, owner, permit2).await {
+            let asks: Vec<Ask> = required
+                .iter()
+                .map(|req| allowance_ask(req.token, owner, permit2))
+                .collect();
+            let answers = read_all(&cfg.rpc_url, &asks).await;
+            for (ask, answer) in asks.iter().zip(&answers) {
+                match token_uint(answer, &ask.what) {
                     Ok(v) => current.push(Some(v)),
                     Err(e) => {
                         read_error.get_or_insert(format!("{e:#}"));
@@ -144,6 +149,15 @@ pub async fn allowances(
         read_error,
     })
     .into_response())
+}
+
+/// `allowance(owner, permit2)` on `token`, as one read for a batch.
+pub(super) fn allowance_ask(token: Address, owner: Address, permit2: Address) -> Ask {
+    Ask::call(
+        token,
+        encode_allowance(owner, permit2),
+        format!("allowance() on {token}"),
+    )
 }
 
 pub(super) async fn read_allowance(

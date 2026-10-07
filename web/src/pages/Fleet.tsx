@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { botLabel, botPath } from '../botRoutes'
 import { Link, useLocation } from 'react-router-dom'
 import { ApiError, api } from '../api'
+import { pageVisibility, poll } from '../poll'
 import {
   Banner,
   Button,
@@ -24,6 +25,7 @@ import { fundsFromVault, textileVaultUrl } from '../capital'
 import { useBalancesHidden } from '../balancePrivacy'
 import PrivateBalance, { Dots } from '../components/PrivateBalance'
 import { capitalUnpricedSymbols, capitalUsd } from '../funding'
+import { namesToRead, stillStopped } from '../fleetValues'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
@@ -74,49 +76,66 @@ export default function Fleet() {
   }, [])
 
   useEffect(() => {
-    void load()
     void loadUpdates()
-    const timer = setInterval(() => void load(), POLL_MS)
-    return () => clearInterval(timer)
+    return poll(load, POLL_MS, { immediate: true })
   }, [load, loadUpdates])
 
   const botNames = (data?.bots ?? [])
     .filter((b) => b.config)
     .map((b) => b.name)
     .join('\n')
+  // Read through a ref so a bot starting or stopping changes what the next
+  // round reads without restarting the poll.
+  const runningRef = useRef<ReadonlySet<string>>(new Set())
+  runningRef.current = new Set((data?.bots ?? []).filter((b) => b.running).map((b) => b.name))
   useEffect(() => {
     const names = botNames ? botNames.split('\n') : []
     if (names.length === 0) return
     let cancelled = false
+    // Stopped bots read since they stopped (see fleetValues).
+    let stoppedRead: Set<string> = new Set()
     const markSettled = (name: string) =>
       setSettled((s) => (s.has(name) ? s : new Set([...s, name])))
+    // Each row lands as soon as its own read does; the next round waits for
+    // the whole fleet, so a slow bot never has two reads out at once.
     const read = () => {
-      for (const name of names) {
-        void api
-          .funding(name)
-          .then((funding) => {
-            if (cancelled) return
-            setValues((v) => ({
-              ...v,
-              [name]: {
-                usd: capitalUsd(funding),
-                unpriced: capitalUnpricedSymbols(funding),
-              },
-            }))
-            markSettled(name)
-          })
-          .catch(() => {
-            // Ranked as unknown: bottom of its band.
-            if (!cancelled) markSettled(name)
-          })
-      }
+      const running = runningRef.current
+      stoppedRead = stillStopped(stoppedRead, running)
+      return Promise.all(
+        namesToRead(names, running, stoppedRead).map((name) =>
+          api
+            .funding(name)
+            .then((funding) => {
+              if (cancelled) return
+              if (!running.has(name)) stoppedRead.add(name)
+              setValues((v) => ({
+                ...v,
+                [name]: {
+                  usd: capitalUsd(funding),
+                  unpriced: capitalUnpricedSymbols(funding),
+                },
+              }))
+              markSettled(name)
+            })
+            .catch(() => {
+              // Ranked as unknown: bottom of its band. Not marked read, so
+              // the next round tries a stopped bot again.
+              if (!cancelled) markSettled(name)
+            }),
+        ),
+      )
     }
-    read()
-    const timer = window.setInterval(read, VALUE_POLL_MS)
+    // Subscribed before the poll so that, back in view, stopped bots are due
+    // again by the time the poll's own listener reads.
+    const unsubscribe = pageVisibility.subscribe(() => {
+      if (!pageVisibility.hidden()) stoppedRead = new Set()
+    })
+    const stop = poll(read, VALUE_POLL_MS, { immediate: true })
     const cap = window.setTimeout(() => setCapped(true), FIRST_READ_CAP_MS)
     return () => {
       cancelled = true
-      clearInterval(timer)
+      unsubscribe()
+      stop()
       clearTimeout(cap)
     }
   }, [botNames])
@@ -307,6 +326,8 @@ function VaultButton({ href }: { href: string }) {
   )
 }
 
+/** Running bots only: their funding comes from the bot's own reads, so this
+ * costs no RPC. Stopped bots are read once (see fleetValues). */
 const VALUE_POLL_MS = 5000
 
 /** The capital the bot quotes against, with the same "+ unpriced" caveat as

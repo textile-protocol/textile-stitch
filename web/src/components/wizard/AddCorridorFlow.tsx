@@ -33,6 +33,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../../api'
+import { poll } from '../../poll'
 import { formatClock } from '../../format'
 import { pairSymbols } from '../SpreadExample'
 import { Banner, Button, Card, Spinner } from '../ui'
@@ -341,11 +342,11 @@ export default function AddCorridorFlow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attempt])
 
-  // Watch the wallet until it holds the gas the approvals need.
+  // Watch the wallet until it holds the gas the approvals need. Paused while
+  // the tab is hidden; reads the moment it's back.
   useEffect(() => {
     if (phase !== 'funding') return
-    const id = window.setInterval(() => void readFunding(), POLL_MS)
-    return () => window.clearInterval(id)
+    return poll(readFunding, POLL_MS)
   }, [phase, readFunding])
 
   function retry() {
