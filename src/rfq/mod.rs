@@ -827,8 +827,8 @@ impl Backoff {
 
 /// Venue caps post-auth inbound frames at 40/s. Reconnect replay can
 /// deliver many `quoteExpired`s back-to-back. Debounce those into one
-/// levels flush after this quiet window so the last release is in the
-/// snapshot, and we do not emit one book per expiry.
+/// levels flush after this quiet window, retaining executable claims in
+/// the snapshot without emitting one book per notice.
 const LEVELS_REPUBLISH_COALESCE: std::time::Duration = std::time::Duration::from_millis(25);
 const LEVELS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Venue `SESSION_MSGS_PER_SEC` is 40, counted by `admitMessage` on
@@ -1042,8 +1042,8 @@ fn next_trailing_for_dark_pending(
     Some(tokio::time::Instant::now() + LEVELS_REPUBLISH_COALESCE)
 }
 
-/// Replay can deliver `quoteExpired` for a quote this process already
-/// released. Arm the trailing flush only when a known corridor dropped.
+/// Replay can deliver `quoteExpired` for a claim already pruned at expiry.
+/// Arm the trailing flush only when the claim identifies a known corridor.
 fn trailing_after_quote_expired(
     pending: &mut HashSet<String>,
     slug: Option<String>,
@@ -1160,9 +1160,8 @@ async fn session_loop_inner(
             tokio::select! {
                 // Without `biased;`, Tokio randomizes ready branches.
                 // Inbound first so a ready `quoteExpired` beats a ready
-                // levels tick. The other way around published
-                // reservation-reduced depth after the venue had already
-                // dropped the snapshot. A *due* trailing flush is handled
+                // levels tick, so the republish follows the venue's
+                // snapshot drop and still accounts for executable claims. A *due* trailing flush is handled
                 // above, so inbound only wins until the debounce fires.
                 biased;
                 msg = stream.next() => {
@@ -1483,16 +1482,15 @@ impl Engine {
                 if r.rfq_id.starts_with("module-rebalance:") {
                     return None;
                 }
-                // selected stays reserved until quoteExpired or the deadline.
-                // Everything else is a signature the taker will never submit:
-                // losers are not handed out, and no_quote / invalid / late
-                // never produce an executable order.
+                // Only never-exposed losing replies release early. A selected
+                // signature remains executable despite closing the venue window.
                 match r.result.as_str() {
                     "selected" => {
+                        self.reservations.mark_exposed(&r.rfq_id);
                         info!(rfq_id = %r.rfq_id, result = %r.result, "quote result");
                     }
                     "no_quote" | "lost_price" | "invalid" | "late" => {
-                        if self.reservations.release(&r.rfq_id) {
+                        if self.reservations.release_unexposed(&r.rfq_id) {
                             info!(
                                 rfq_id = %r.rfq_id,
                                 result = %r.result,
@@ -1516,14 +1514,10 @@ impl Engine {
                 if e.rfq_id.starts_with("module-rebalance:") {
                     return None;
                 }
-                // The taker's accept window lapsed without a submit. Drop the
-                // claim now so the next request on this side is not sized
-                // against a quote the venue has already un-counted.
-                if self.reservations.release(&e.rfq_id) {
-                    info!(rfq_id = %e.rfq_id, "quote expired unaccepted; inventory released");
-                } else {
-                    debug!(rfq_id = %e.rfq_id, "quote expired unaccepted; no local reservation");
-                }
+                // This may precede selected during reconnect/replay. It still
+                // identifies a signature the taker can hold, not a revocation.
+                self.reservations.mark_exposed(&e.rfq_id);
+                debug!(rfq_id = %e.rfq_id, "quote window closed; signed inventory remains reserved");
                 None
             }
             VenueFrame::Challenge(_) | VenueFrame::SessionAccepted(_) => {
@@ -1543,6 +1537,12 @@ impl Engine {
                 reason,
             })
         };
+
+        // One signature per live RFQ id. Replayed requests must not replace
+        // the claim for an earlier authorization with a new nonce/amount.
+        if self.reservations.corridor(&req.rfq_id).is_some() {
+            return reject(RejectReason::Busy);
+        }
 
         let manual_id = crate::modules::manual::request_id(&req.rfq_id);
         if req.rfq_id.starts_with("module-rebalance:") && manual_id.is_none() {
@@ -3472,6 +3472,62 @@ mod tests {
         address: Address,
     }
 
+    struct FailingQuoteSigner;
+
+    #[async_trait::async_trait]
+    impl crate::signer::Signer for FailingQuoteSigner {
+        async fn sign_digest(&self, _digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
+            anyhow::bail!("synthetic signing failure")
+        }
+
+        fn address(&self) -> Address {
+            Address::repeat_byte(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_signature_never_creates_a_claim() {
+        let mut engine = test_engine();
+        engine.signer = Arc::new(FailingQuoteSigner);
+        assert!(matches!(
+            engine
+                .respond(exact_input_request("failed"), &fresh_prices())
+                .await,
+            MakerFrame::QuoteReject(_)
+        ));
+        assert!(engine.reservations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn never_exposed_losers_release_once_and_restore_capacity() {
+        for result in ["no_quote", "invalid", "late", "lost_price"] {
+            let mut engine = test_engine();
+            let prices = fresh_prices();
+            assert!(matches!(
+                engine.respond(exact_input_request("loser"), &prices).await,
+                MakerFrame::QuoteResponse(_)
+            ));
+            for _ in 0..2 {
+                engine
+                    .dispatch(
+                        VenueFrame::QuoteResult(QuoteResultFrame {
+                            rfq_id: "loser".into(),
+                            result: result.into(),
+                        }),
+                        &prices,
+                    )
+                    .await;
+            }
+            assert!(engine.reservations.is_empty());
+            let MakerFrame::QuoteResponse(next) =
+                engine.respond(exact_input_request("next"), &prices).await
+            else {
+                panic!("losing quote should free inventory");
+            };
+            assert_eq!(next.buy_amount, "979902009");
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::signer::Signer for TypedOnlySigner {
         async fn sign_digest(&self, _digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
@@ -4415,7 +4471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quote_expired_releases_inventory_so_the_next_request_can_fill() {
+    async fn quote_expired_retains_inventory_for_the_signed_authorization() {
         let mut engine = test_engine();
         let prices = fresh_prices();
         let first = engine.respond(exact_input_request("rfq_1"), &prices).await;
@@ -4431,14 +4487,128 @@ mod tests {
             )
             .await;
         assert!(none.is_none());
-        assert!(engine.reservations.is_empty());
+        assert_eq!(engine.reservations.len(), 1);
 
         let second = engine.respond(exact_input_request("rfq_2"), &prices).await;
         let MakerFrame::QuoteResponse(resp) = second else {
-            panic!("expected a full-size quote after expiry release, got {second:?}");
+            panic!("expected only the unreserved remainder after cancellation, got {second:?}");
         };
-        assert_eq!(resp.buy_amount, "979902009");
-        assert_eq!(engine.reservations.len(), 1);
+        assert_eq!(resp.buy_amount, "520097991");
+        assert_eq!(engine.reservations.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_replay_and_stale_results_cannot_release_an_exposed_quote() {
+        let dir = temp_dir("st01-replay");
+        let path = dir.join(RESERVATIONS_FILE);
+        let mut engine = test_engine();
+        engine.reservations = Reservations::with_persist_path(&path);
+        let prices = fresh_prices();
+        let MakerFrame::QuoteResponse(quote) = engine
+            .dispatch(
+                VenueFrame::QuoteRequest(exact_input_request("old")),
+                &prices,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a real signed quote");
+        };
+        let encoded = alloy_primitives::hex::decode(&quote.encoded_order).unwrap();
+        let deadline = U256::from_be_slice(&encoded[9 * 32..10 * 32]).to::<u64>();
+        let input: U256 = quote.buy_amount.parse().unwrap();
+
+        // Replay can deliver the cancellation before selection. Later stale
+        // losing results and duplicate cancellations must not erase the claim.
+        for json in [
+            r#"{"type":"quoteExpired","rfqId":"old"}"#,
+            r#"{"type":"quoteResult","rfqId":"old","result":"selected"}"#,
+            r#"{"type":"quoteResult","rfqId":"old","result":"late"}"#,
+            r#"{"type":"quoteResult","rfqId":"old","result":"lost_price"}"#,
+            r#"{"type":"quoteExpired","rfqId":"old"}"#,
+        ] {
+            engine
+                .dispatch(serde_json::from_str(json).unwrap(), &prices)
+                .await;
+            assert_eq!(
+                engine.reservations.reserved("cngn-usdc", true, unix_now()),
+                input
+            );
+        }
+        let counter = engine.counter;
+        assert!(matches!(
+            engine.respond(exact_input_request("old"), &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+        assert_eq!(
+            engine.counter, counter,
+            "a duplicate must not sign another nonce"
+        );
+
+        // New Engine simulates process restart, not just a socket reconnect.
+        let mut restarted = test_engine();
+        restarted.reservations = Reservations::load(&path, unix_now()).unwrap();
+        restarted
+            .dispatch(
+                serde_json::from_str(r#"{"type":"quoteResult","rfqId":"old","result":"invalid"}"#)
+                    .unwrap(),
+                &prices,
+            )
+            .await;
+        assert_eq!(
+            restarted.reservations.reserved("cngn-usdc", true, deadline),
+            input
+        );
+        assert_eq!(
+            restarted
+                .reservations
+                .reserved("cngn-usdc", true, deadline + 29),
+            input
+        );
+        assert_eq!(
+            restarted
+                .reservations
+                .reserved("cngn-usdc", true, deadline + 30),
+            U256::ZERO
+        );
+        restarted.reservations.prune(deadline + 30);
+        assert!(Reservations::load(&path, deadline + 30).unwrap().is_empty());
+        assert!(matches!(
+            restarted.respond(exact_input_request("new"), &prices).await,
+            MakerFrame::QuoteResponse(_)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_quote_ignores_every_losing_result() {
+        let mut engine = test_engine();
+        let prices = fresh_prices();
+        assert!(matches!(
+            engine
+                .respond(exact_input_request("selected"), &prices)
+                .await,
+            MakerFrame::QuoteResponse(_)
+        ));
+        for result in [
+            "selected",
+            "selected",
+            "no_quote",
+            "invalid",
+            "late",
+            "lost_price",
+        ] {
+            engine
+                .dispatch(
+                    VenueFrame::QuoteResult(QuoteResultFrame {
+                        rfq_id: "selected".into(),
+                        result: result.into(),
+                    }),
+                    &prices,
+                )
+                .await;
+            assert_eq!(engine.reservations.len(), 1);
+        }
     }
 
     #[test]
@@ -4643,7 +4813,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quote_expired_restores_published_level_depth() {
+    async fn quote_expired_preserves_reserved_published_level_depth() {
         let mut engine = test_engine();
         let prices = fresh_prices();
         let now_ms = unix_now_ms();
@@ -4676,8 +4846,8 @@ mod tests {
         };
         assert_eq!(
             restored.bids[0].size.parse::<u128>().unwrap(),
-            full_bid,
-            "quoteExpired must put full depth back on the next levels frame"
+            reserved_bid,
+            "closing the accept window cannot restore executable inventory"
         );
     }
 
@@ -4728,7 +4898,7 @@ mod tests {
         assert_eq!(
             engine.reservations.len(),
             1,
-            "selected stays reserved until quoteExpired"
+            "selected stays reserved until signed deadline plus skew"
         );
     }
 

@@ -2,18 +2,9 @@
 // Copyright (c) 2026 Textile, Inc.
 //! In-flight RFQ inventory reservations.
 //!
-//! Every signed quote is a live claim on the funding wallet until its order
-//! deadline passes, unless the venue says the taker will never submit it.
-//!
-//! `selected` holds until `deadline + skew` or an explicit `quoteExpired`.
-//! `lost_price`, `no_quote`, `invalid`, and `late` release immediately —
-//! those signatures never leave the venue, so keeping them reserved makes
-//! the corridor look empty for the rest of the TTL.
-//!
-//! `quoteExpired` is the selected-quote exception: the taker was handed the
-//! winning quote and its accept window lapsed without a submit. The venue
-//! un-counts that order at the same moment, so this ledger must drop it or
-//! the next request on the same side keeps seeing a ghost reservation.
+//! Every signed quote claims inventory until its deadline plus clock skew.
+//! Only a confirmed losing/unexposed quote can release early. `quoteExpired`
+//! closes a venue window; it cannot revoke a signature held by a taker.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,6 +32,8 @@ struct Reservation {
     /// Maker-pays token, lowercased. `None` on ledgers written before we
     /// stored it — those still count via corridor + side.
     input_token: Option<String>,
+    /// Selected/window-closed quotes cannot be released by a stale loser frame.
+    exposed: bool,
 }
 
 /// On-disk shape. `input` is a decimal string so a U256 never goes through JSON
@@ -125,6 +118,9 @@ impl Reservations {
                         input,
                         release_at: entry.release_at,
                         input_token: normalize_token_opt(entry.input_token),
+                        // Selection could have happened while disconnected. Loaded
+                        // claims are conservatively exposed, including legacy files.
+                        exposed: true,
                     },
                 );
             }
@@ -168,6 +164,7 @@ impl Reservations {
                 input,
                 release_at: deadline_secs.saturating_add(RELEASE_SKEW_SECS),
                 input_token: normalize_token_opt(input_token.map(|t| t.as_ref().to_string())),
+                exposed: false,
             },
         );
         self.persist();
@@ -381,15 +378,32 @@ impl Reservations {
     }
 
     /// Corridor slug for a live reservation, if any. Peek before
-    /// [`Self::release`] so a `quoteExpired` flush can wait for that
+    /// window notification so a `quoteExpired` flush can wait for that
     /// book to actually publish, not a sibling with a fresh feed.
     pub fn corridor(&self, rfq_id: &str) -> Option<&str> {
         self.by_rfq.get(rfq_id).map(|r| r.corridor.as_str())
     }
 
-    /// Drop one RFQ's claim immediately. Used when the venue says the
-    /// winning quote expired unaccepted (`quoteExpired`). Missing id is a
-    /// no-op so a duplicate or late frame cannot break the ledger.
+    /// Venue selection or window closure proves the signature may be exposed.
+    /// Reload already treats every persisted claim as exposed, so this flag
+    /// need not change the on-disk format or depend on a second disk write.
+    pub fn mark_exposed(&mut self, rfq_id: &str) {
+        if let Some(claim) = self.by_rfq.get_mut(rfq_id) {
+            claim.exposed = true;
+        }
+    }
+
+    /// Release only a confirmed loser that has never been selected. A stale
+    /// result after selection/cancellation (or restart) cannot erase a claim.
+    pub fn release_unexposed(&mut self, rfq_id: &str) -> bool {
+        if self.by_rfq.get(rfq_id).is_some_and(|r| !r.exposed) {
+            return self.release(rfq_id);
+        }
+        false
+    }
+
+    /// Drop a claim only when the caller has proven it cannot execute.
+    /// Venue cancellation is not such proof. Duplicate releases are no-ops.
     pub fn release(&mut self, rfq_id: &str) -> bool {
         let gone = self.by_rfq.remove(rfq_id).is_some();
         if gone {
@@ -605,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn quote_expired_releases_immediately_not_at_deadline_plus_skew() {
+    fn explicit_release_removes_the_claim_once() {
         let mut r = Reservations::new();
         r.reserve("rfq_1", "cngn-usdc", true, U256::from(500u64), 1_000);
         assert!(r.release("rfq_1"));

@@ -130,6 +130,8 @@ pub struct QuoteResultFrame {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// The venue accept window closed. This does not revoke the signed order;
+/// inventory remains reserved through its deadline plus clock skew.
 pub struct QuoteExpiredFrame {
     pub rfq_id: String,
 }
