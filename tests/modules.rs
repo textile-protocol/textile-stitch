@@ -95,6 +95,19 @@ fn stale_future_and_missing_value_fail_closed() {
             ..context()
         },
         Context {
+            price_at: 0,
+            staleness_secs: u64::MAX,
+            ..context()
+        },
+        Context {
+            price_at: 100_000,
+            ..context()
+        },
+        Context {
+            price_at: u64::MAX,
+            ..context()
+        },
+        Context {
             balances_at: 96,
             ..context()
         },

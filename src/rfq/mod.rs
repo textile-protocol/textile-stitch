@@ -2287,9 +2287,9 @@ impl PriceCache {
     }
 }
 
-/// Apply one fetch to the RFQ cache. A live quote replaces the last print; a
-/// failed fetch drops it so the next `quoteRequest` is `StaleFeed`, not a
-/// held mid. The ladder tick still keeps last-print + staleness.
+/// Apply one fetch to the RFQ cache. A successful quote replaces the last print;
+/// a failed fetch (including an invalid HTTP timestamp) drops it so the next
+/// `quoteRequest` is `StaleFeed`. Consumers still check the sample's age at use.
 fn on_feed_fetch(cache: &PriceCache, url: &str, result: anyhow::Result<Quote>) {
     match result {
         Ok(quote) => cache.set(url.to_string(), quote),
@@ -2742,6 +2742,8 @@ async fn read_vault_inventory(
 
 #[cfg(test)]
 mod tests {
+    mod feed_freshness;
+
     use super::wire::{QuoteExpiredFrame, QuoteResultFrame};
     use super::*;
     use crate::config::RfqCapacity;

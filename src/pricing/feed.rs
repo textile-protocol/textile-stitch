@@ -7,12 +7,14 @@
 use serde::Deserialize;
 
 use crate::net::http_client;
+use crate::pricing::tick::feed_age_secs;
+use crate::time::unix_now;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Quote {
     /// Debt per collateral (USDT per cNGN), the operator's fair price.
     pub price: f64,
-    /// Unix seconds the price was observed.
+    /// Nonzero Unix seconds the price was observed; no future skew is allowed.
     pub timestamp: u64,
 }
 
@@ -23,6 +25,8 @@ pub trait PriceFeed {
 }
 
 /// Reference adapter: GET a JSON `{ "price": <f64>, "timestamp": <u64> }`.
+/// The timestamp must be nonzero Unix seconds at or before the local clock.
+/// Age limits remain per consumer (ladder/RFQ/NAV); units are never converted.
 pub struct HttpFeed {
     url: String,
     client: reqwest::Client,
@@ -47,6 +51,10 @@ impl PriceFeed for HttpFeed {
             .error_for_status()?
             .json::<Quote>()
             .await?;
+        anyhow::ensure!(
+            feed_age_secs(quote.timestamp, unix_now()).is_some(),
+            "feed timestamp must be nonzero Unix seconds at or before the bot clock (zero future skew)"
+        );
         Ok(quote)
     }
 }

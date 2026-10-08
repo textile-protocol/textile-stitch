@@ -11,6 +11,7 @@ pub mod runtime;
 mod strategies;
 
 use crate::pricing::quote::{ask_price, bid_price};
+use crate::pricing::tick::is_stale;
 use crate::rfq::{math, responder::CorridorBook};
 use alloy_primitives::U256;
 pub use config::{Mode, ModulesConfig};
@@ -97,8 +98,7 @@ pub fn evaluate(config: &ModulesConfig, ctx: &Context, history: &[PricePoint]) -
     };
     let valid = ctx.price.is_finite()
         && ctx.price > 0.0
-        && ctx.price_at <= ctx.now
-        && ctx.now - ctx.price_at <= ctx.staleness_secs
+        && !is_stale(ctx.price_at, ctx.now, ctx.staleness_secs)
         && ctx.balances_at <= ctx.now
         && ctx.now - ctx.balances_at <= 3
         && ctx.corridor_decimals <= 18

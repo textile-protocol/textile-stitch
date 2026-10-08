@@ -819,7 +819,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             // reset, and place the averaging window in the pre-stall past.
             let now = unix_now();
             if is_stale(quote.timestamp, now, cfg.feed.staleness_secs) {
-                warn!(feed = %feed_url, feed_ts = quote.timestamp, now, "stale feed; skipping pool");
+                warn!(feed = %feed_url, feed_ts = quote.timestamp, now, "stale or invalid feed timestamp; skipping pool");
                 continue;
             }
             // A fresh timestamp with a garbage price (zero, negative, NaN) is

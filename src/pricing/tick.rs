@@ -3,9 +3,23 @@
 //! Pure tick-loop decisions: when the feed is too stale to quote, and when the
 //! bid has moved enough to be worth re-signing.
 
-/// True if the feed hasn't updated within `staleness_secs` — never trade on it.
+/// Age of a nonzero Unix-seconds timestamp, or `None` for an invalid timestamp.
+/// Future skew is deliberately zero, matching the live module price policy.
+/// Comparing against a Unix-seconds clock rejects milliseconds without guessing
+/// a unit or restamping the sample. Checked subtraction also fails closed when
+/// the local clock rolls back behind a previously accepted observation.
+pub fn feed_age_secs(feed_ts: u64, now: u64) -> Option<u64> {
+    if feed_ts == 0 {
+        return None;
+    }
+    now.checked_sub(feed_ts)
+}
+
+/// True if the timestamp is invalid or older than `staleness_secs` — never
+/// trade on it. Recheck at use even if the adapter already checked ingestion.
+/// Exactly the configured age is still fresh; future timestamps are not.
 pub fn is_stale(feed_ts: u64, now: u64, staleness_secs: u64) -> bool {
-    now.saturating_sub(feed_ts) > staleness_secs
+    feed_age_secs(feed_ts, now).is_none_or(|age| age > staleness_secs)
 }
 
 /// True if a feed price can be quoted off: finite and strictly positive.
@@ -79,7 +93,34 @@ mod tests {
     fn stale_only_past_the_window() {
         assert!(!is_stale(100, 120, 30)); // 20s old, window 30
         assert!(is_stale(100, 140, 30)); // 40s old
-        assert!(!is_stale(140, 100, 30)); // clock skew → not stale (saturating)
+        assert!(is_stale(140, 100, 30)); // a future sample is not fresh
+    }
+
+    #[test]
+    fn feed_timestamp_boundaries_fail_closed() {
+        let now = 1_800_000_000;
+        assert!(!is_stale(now, now, 30));
+        assert!(!is_stale(now - 30, now, 30));
+        assert!(is_stale(now - 31, now, 30));
+        assert!(is_stale(now + 1, now, 30));
+        assert!(is_stale(now * 1_000, now, 30));
+        assert!(is_stale(now * 1_000, now + 365 * 86_400, 30));
+        assert!(is_stale(0, now, u64::MAX));
+        assert!(is_stale(u64::MAX, now, u64::MAX));
+        assert!(is_stale(now, 0, 30)); // clock unavailable / before Unix epoch
+        assert!(is_stale(0, 0, 30));
+        assert!(!is_stale(now, now, 0));
+        assert!(is_stale(now - 1, now, 0));
+        // No arithmetic wrap at either end of the unsigned range.
+        assert!(is_stale(1, u64::MAX, 30));
+    }
+
+    #[test]
+    fn held_sample_is_rechecked_after_clock_rollback_and_expiry() {
+        let observed = 1_800_000_000;
+        assert!(!is_stale(observed, observed, 30));
+        assert!(is_stale(observed, observed - 1, 30));
+        assert!(is_stale(observed, observed + 31, 30));
     }
 
     #[test]

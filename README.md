@@ -311,6 +311,21 @@ ttl_secs = 120
 refresh_threshold_bps = 10
 ```
 
+Feed `timestamp` must be a nonzero integer in Unix **seconds**, at or before
+the bot's current clock. The future-skew allowance is **zero seconds**, matching
+the live module price policy. Milliseconds, fractional or string timestamps,
+zero, overflow and future values are rejected, never converted or restamped.
+Keep the feed host and bot clocks synchronized; a bot clock behind its feed
+takes quoting and NAV co-signing dark while timestamps are ahead of its clock.
+A failed or invalid HTTP fetch clears the RFQ cache; clock recovery cannot
+restore that entry without another successful fetch. A previously accepted
+sample held through a clock rollback can become usable again when the clock
+recovers, provided it is still within the age limit. Each quote/level/NAV decision
+also checks held samples: age equal to its configured staleness limit is accepted,
+and age above it is rejected. The ladder uses `staleness_secs`; RFQ and NAV
+retain their existing per-pool RFQ age limits. This rule applies with modules
+off, shadow or live, and before any TWAP fallback.
+
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
 `50000000000`). The default `*_total_liquidity_*` value is `"max"`, which quotes
 all currently funded wallet inventory for that side. Use a fixed numeric amount

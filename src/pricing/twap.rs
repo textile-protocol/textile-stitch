@@ -110,8 +110,8 @@ impl Twap {
     /// observation. With a single just-observed sample this equals that price
     /// (graceful warmup: the TWAP starts at spot and earns its smoothing as
     /// the window fills). Every segment boundary is capped at `now`: a feed
-    /// timestamp ahead of the local clock (ordinary skew — the staleness gate
-    /// tolerates it via saturating arithmetic) must not extend its
+    /// timestamp ahead of the local clock (rejected by the tick's freshness
+    /// gate, but possible for a direct caller here) must not extend its
     /// predecessor's weight past `now`, or the older price would dominate the
     /// average outside the window while the newest observation got none.
     pub fn value(&self, now: u64) -> Option<f64> {
