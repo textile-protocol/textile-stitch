@@ -18,7 +18,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-fn read(bot: &Bot) -> Result<(std::path::PathBuf, String, Config), ApiError> {
+pub(super) fn read(bot: &Bot) -> Result<(std::path::PathBuf, String, Config), ApiError> {
     let path = bot
         .config_panel_path
         .clone()
@@ -268,6 +268,13 @@ mod tests {
             h.get("/api/bots/bot-a/modules").await.0,
             StatusCode::NOT_FOUND
         );
+        assert_eq!(
+            h.get("/api/bots/bot-a/modules/manual-sales").await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(h.post_json("/api/bots/bot-a/modules/manual-sales", serde_json::json!({
+            "taker": "0x2222222222222222222222222222222222222222", "corridorAmount": "100", "minSettlement": "1"
+        })).await.0, StatusCode::NOT_FOUND);
         let config = serde_json::to_value(ModulesConfig::default()).unwrap();
         assert_eq!(h.post_json(
             "/api/bots/bot-a/modules/simulate-history",

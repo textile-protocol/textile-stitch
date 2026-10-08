@@ -85,7 +85,7 @@ pub struct Runtime {
     pub config: ModulesConfig,
     pub balances: Arc<RwLock<Option<Balances>>>,
     state: Arc<Mutex<State>>,
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
     writer: tokio::sync::watch::Sender<Status>,
 }
 impl Runtime {

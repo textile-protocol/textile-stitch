@@ -346,7 +346,10 @@ fn resolve_instance_id(configured: Option<&str>, config_dir: Option<&Path>) -> O
 ///
 /// Order: `{NAME}_FILE` (preferred, same as the wallet), then `{NAME}`, then
 /// `rfq-api.key` next to the config. The last is what the panel writes.
-fn load_rfq_api_key(api_key_env: &str, config_dir: Option<&Path>) -> anyhow::Result<String> {
+pub(crate) fn load_rfq_api_key(
+    api_key_env: &str,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<String> {
     let file_env = format!("{api_key_env}_FILE");
     if let Ok(key) = crate::signer::read_env_secret(&file_env, api_key_env) {
         if !key.is_empty() {
@@ -1538,9 +1541,36 @@ impl Engine {
             })
         };
 
-        if req.rfq_id.starts_with("module-rebalance:") {
+        let manual_id = crate::modules::manual::request_id(&req.rfq_id);
+        if req.rfq_id.starts_with("module-rebalance:") && manual_id.is_none() {
             return reject(RejectReason::Busy);
         }
+        let manual_sale = if let Some(id) = manual_id {
+            let Some(modules) = &self.modules else {
+                return reject(RejectReason::Busy);
+            };
+            match crate::modules::manual::read(&modules.dir, id) {
+                Ok(sale)
+                    if sale.chain_id == self.chain_id
+                        && Some(sale.vault) == self.vault
+                        && req.taker.parse::<Address>().ok() == Some(sale.taker)
+                        && req.sell_token.parse::<Address>().ok()
+                            == Some(sale.settlement_token)
+                        && req.buy_token.parse::<Address>().ok() == Some(sale.corridor_token)
+                        && req.sell_amount.is_none()
+                        && req
+                            .buy_amount
+                            .as_deref()
+                            .and_then(|v| v.parse::<U256>().ok())
+                            == Some(sale.corridor_amount) =>
+                {
+                    Some(sale)
+                }
+                _ => return reject(RejectReason::Busy),
+            }
+        } else {
+            None
+        };
         let Some(book) = book_for_request(&self.books, &req) else {
             warn!(corridor = %req.corridor_id, "quote request for an unknown corridor");
             return reject(RejectReason::Busy);
@@ -1605,6 +1635,15 @@ impl Engine {
                 return reject(RejectReason::Busy);
             };
             deadline_secs = clamped;
+        }
+        if let Some(sale) = &manual_sale {
+            let modules = self.modules.as_ref().expect("manual runtime");
+            deadline_secs = deadline_secs
+                .min(sale.expires_at)
+                .min(now_secs + modules.config.rebalance.order_lifetime_secs);
+            if deadline_secs <= now_secs {
+                return reject(RejectReason::Busy);
+            }
         }
         let expires_ms = (now_ms + req.quote_ttl_ms).min(deadline_secs * 1_000);
         let Ok(taker) = req.taker.parse::<Address>() else {
@@ -1672,8 +1711,36 @@ impl Engine {
             plan
         };
 
+        if let Some(sale) = &manual_sale {
+            let modules = self.modules.as_ref().expect("manual runtime");
+            let Some(ctx) = self.module_context(&book, &quote, now_secs) else {
+                return reject(RejectReason::Busy);
+            };
+            if plan.bid
+                || sale
+                    .allows(&modules.config, &ctx, plan.input, plan.output)
+                    .is_err()
+            {
+                modules.status("Manual sale waiting: check fresh balances, outstanding quotes, size and minimum proceeds");
+                return reject(RejectReason::Size);
+            }
+        }
         let maker = self.vault.unwrap_or_else(|| self.signer.address());
-        let nonce = if self.vault.is_some() {
+        let nonce = if let Some(sale) = &manual_sale {
+            let modules = self.modules.as_ref().expect("manual runtime");
+            let epoch = self.trading_epoch.read().ok().map(|g| *g).unwrap_or(0);
+            let result = crate::modules::manual::pace(
+                &modules.dir,
+                &sale.id,
+                now_secs,
+                modules.config.rebalance.cooldown_secs,
+            )
+            .and_then(|()| crate::modules::manual::nonce(&modules.dir, &sale.id, epoch));
+            match result {
+                Ok(nonce) => nonce,
+                Err(_) => return reject(RejectReason::Busy),
+            }
+        } else if self.vault.is_some() {
             let epoch = self.trading_epoch.read().ok().map(|g| *g).unwrap_or(0);
             if epoch == 0 {
                 warn!("vault tradingEpoch not loaded yet");
@@ -1741,6 +1808,26 @@ impl Engine {
                 return reject(RejectReason::Busy);
             }
         };
+
+        if let Some(sale) = &manual_sale {
+            let modules = self.modules.as_ref().expect("manual runtime");
+            if crate::modules::manual::read(&modules.dir, &sale.id)
+                .ok()
+                .as_ref()
+                != Some(sale)
+                || sale.validate(unix_now()).is_err()
+                || crate::modules::manual::nonce(
+                    &modules.dir,
+                    &sale.id,
+                    self.trading_epoch.read().ok().map(|g| *g).unwrap_or(0),
+                )
+                .ok()
+                    != Some(nonce)
+            {
+                return reject(RejectReason::Busy);
+            }
+            modules.status("Manual sale quoted; awaiting buyer settlement");
+        }
 
         // The reservation starts the moment the signed order exists — even if
         // the send fails, the signature may have left the process.
@@ -5065,6 +5152,85 @@ mod tests {
         dir
     }
     #[tokio::test]
+    async fn manual_sale_requires_local_authorization_and_survives_restart() {
+        use crate::modules::{manual, Mode};
+        let mut engine = test_engine();
+        let dir = enable_modules(&mut engine, Mode::Live, 4_000_000_000, 6_000_000_000);
+        engine.modules.as_mut().unwrap().config.rebalance.enabled = true;
+        let sale = manual::Sale {
+            id: "a".repeat(64),
+            chain_id: 8453,
+            vault: engine.vault.unwrap(),
+            taker: "0x0000000000000000000000000000000000000003"
+                .parse()
+                .unwrap(),
+            corridor_token: COLLATERAL.parse().unwrap(),
+            settlement_token: DEBT.parse().unwrap(),
+            corridor_amount: U256::from(100_000_000u64),
+            min_settlement: U256::from(99_500_000u64),
+            expires_at: unix_now() + 3600,
+            closed: false,
+        };
+        let mut req = exact_input_request(&format!("{}{}:rfq_1", manual::PREFIX, sale.id));
+        req.sell_token = DEBT.into();
+        req.buy_token = COLLATERAL.into();
+        req.sell_amount = None;
+        req.buy_amount = Some(sale.corridor_amount.to_string());
+        let prices = fresh_prices();
+        assert!(matches!(
+            engine.respond(req.clone(), &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+        manual::write(&dir, &sale).unwrap();
+        let mut wrong_buyer = req.clone();
+        wrong_buyer.taker = Address::repeat_byte(5).to_string();
+        assert!(matches!(
+            engine.respond(wrong_buyer, &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+        let mut wrong_size = req.clone();
+        wrong_size.buy_amount = Some("99999999".into());
+        assert!(matches!(
+            engine.respond(wrong_size, &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+        let reply = engine.respond(req.clone(), &prices).await;
+        let MakerFrame::QuoteResponse(first) = reply else {
+            panic!("{reply:?}")
+        };
+        let bytes = alloy_primitives::hex::decode(&first.encoded_order).unwrap();
+        let nonce = U256::from_be_slice(&bytes[8 * 32..9 * 32]);
+        assert_eq!(nonce, manual::nonce(&dir, &sale.id, 3).unwrap());
+        assert!(matches!(
+            engine.respond(req.clone(), &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+        // Simulate the reservation expiring; the same persisted nonce is reused.
+        engine.reservations = Reservations::with_persist_path(dir.join("fresh-reservations.json"));
+        req.rfq_id = format!("{}{}:rfq_2", manual::PREFIX, sale.id);
+        let reply = engine.respond(req.clone(), &prices).await;
+        let MakerFrame::QuoteResponse(next) = reply else {
+            panic!("{reply:?}")
+        };
+        let next_bytes = alloy_primitives::hex::decode(&next.encoded_order).unwrap();
+        assert_eq!(&bytes[8 * 32..9 * 32], &next_bytes[8 * 32..9 * 32]);
+        manual::write(
+            &dir,
+            &manual::Sale {
+                closed: true,
+                ..sale
+            },
+        )
+        .unwrap();
+        engine.reservations = Reservations::new();
+        assert!(matches!(
+            engine.respond(req, &prices).await,
+            MakerFrame::QuoteReject(_)
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn modules_shadow_preserves_firm_price_while_live_enforces_exposure() {
         let prices = fresh_prices();
         let mut shadow = test_engine();
@@ -5338,6 +5504,7 @@ mod tests {
         let previous = engine.modules.take().unwrap();
         let mut cfg = previous.config.clone();
         cfg.rebalance.enabled = true;
+        cfg.rebalance.method = crate::modules::config::RebalanceMethod::Dealer;
         cfg.rebalance.dealer = Some(DealerConfig {
             url: format!("http://{addr}"),
             taker: "0x0000000000000000000000000000000000000003".into(),

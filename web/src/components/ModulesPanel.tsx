@@ -1,3 +1,4 @@
+import ManualSales from './ManualSales'
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { poll } from '../poll'
@@ -36,7 +37,7 @@ const percent = (bps: number | null) =>
 const clock = (at: number) => new Date(at * 1000).toLocaleString()
 const spread = (bps: number | null) =>
   bps === null ? 'Paused' : `${bps.toLocaleString()} bps`
-type Section = 'overview' | 'parameters' | 'simulation' | 'decisions'
+type Section = 'sales' | 'overview' | 'parameters' | 'simulation' | 'decisions'
 
 export default function ModulesPanel({
   name,
@@ -168,6 +169,7 @@ export default function ModulesPanel({
         items={[
           { value: 'overview', label: 'Overview' },
           { value: 'parameters', label: 'Parameters' },
+          { value: 'sales', label: 'Manual sale' },
           { value: 'simulation', label: 'Historical simulation' },
           { value: 'decisions', label: 'Decisions' },
         ]}
@@ -187,12 +189,29 @@ export default function ModulesPanel({
           You have unsaved changes. Live settings stay unchanged until you save.
         </Banner>
       )}
+      {section === 'sales' && (
+        <ManualSales
+          name={name}
+          view={view}
+          editable={editable}
+          currency={currency}
+          settlement={settlement}
+          onConfigure={() => {
+            setSelectedModule('rebalance')
+            setSection('parameters')
+          }}
+        />
+      )}
       {section === 'overview' && (
         <ModulesOverview
           view={view}
           now={now}
           currency={currency}
           onConfigure={(key) => {
+            if (key === 'rebalance') {
+              setSection('sales')
+              return
+            }
             setSelectedModule(key)
             setSection('parameters')
           }}

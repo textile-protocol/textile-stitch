@@ -17,6 +17,7 @@ export interface ModulesConfig {
     max_extra_bps: number
   }
   rebalance: {
+    method?: 'manual' | 'dealer'
     enabled: boolean
     trigger_bps: number
     max_trade_bps: number

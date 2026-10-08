@@ -123,7 +123,10 @@ impl Engine {
         let Some(modules) = self.modules.clone() else {
             return;
         };
-        if modules.config.mode != Mode::Live || !modules.config.rebalance.enabled {
+        if modules.config.mode != Mode::Live
+            || !modules.config.rebalance.enabled
+            || modules.config.rebalance.method != policy::config::RebalanceMethod::Dealer
+        {
             return;
         }
         if let Some(mut pending) = self.pending_rebalance.take() {

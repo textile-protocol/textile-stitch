@@ -1,3 +1,4 @@
+import type { ManualSale } from './manualSales'
 import type { ModulesConfig, ModulesView, SimulationReport, HistoryOptions, HistoricalSimulation } from './modules'
 // The one place that talks to the panel API.
 //
@@ -169,6 +170,23 @@ export interface DesktopSwitches {
 }
 
 export const api = {
+  manualSales: (name: string) =>
+    request<ManualSale[]>(
+      `/api/bots/${encodeURIComponent(name)}/modules/manual-sales`
+    ),
+  createManualSale: (
+    name: string,
+    body: { taker: string; corridorAmount: string; minSettlement: string }
+  ) =>
+    request<ManualSale>(
+      `/api/bots/${encodeURIComponent(name)}/modules/manual-sales`,
+      json(body)
+    ),
+  closeManualSale: (name: string, id: string) =>
+    request<ManualSale>(
+      `/api/bots/${encodeURIComponent(name)}/modules/manual-sales/${encodeURIComponent(id)}/close`,
+      json({})
+    ),
   modules: (name: string) => request<ModulesView>(`/api/bots/${encodeURIComponent(name)}/modules`),
   saveModules: (name: string, revision: string, config: ModulesConfig) => request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/modules`, { method: 'PUT', body: JSON.stringify({ revision, config }) }),
   simulateModuleHistory: (name: string, config: ModulesConfig, options: HistoryOptions) => request<HistoricalSimulation>(`/api/bots/${encodeURIComponent(name)}/modules/simulate-history`, json({ config, options })),

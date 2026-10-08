@@ -146,7 +146,9 @@ pub fn rebalance(
     let reasons = if sell.is_zero() {
         vec![]
     } else {
-        vec![if cfg.dealer.is_some() {
+        vec![if cfg.method == RebalanceMethod::Manual {
+            "Excess corridor inventory: review a manual sale in Fleet"
+        } else if cfg.dealer.is_some() {
             "Excess corridor inventory: request a spot sale"
         } else {
             "Spot sale indicated; no dealer configured"

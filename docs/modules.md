@@ -26,7 +26,7 @@ Above target, buys retain the full volatility buffer. The sell buffer falls line
 
 For example, with target 30%, maximum 60% and current inventory 45%, a 20 bps volatility buffer adds 20 bps to buys and 10 bps to sells. At 60% or more, it adds nothing to sells and purchases stay paused. This favors reducing excess exposure; it does not predict the currency's direction or guarantee a buyer. Historical and imported-data simulations use this same calculation and export the selected setting with the report.
 
-**Automatic spot rebalancing** requests a sale when corridor exposure reaches its trigger. The sale is bounded by excess above target, a NAV fraction, spendable corridor inventory and the vault's per-order cap. It waits while any quote claims inventory, and it persists its cooldown before contacting a dealer. It never opens derivatives or sends vault funds to an exchange account.
+**Spot rebalancing** defaults to a manual sale. Stitch suggests selling when corridor exposure reaches its threshold. In Fleet, choose the buyer wallet, exact corridor amount and minimum net settlement proceeds. The buyer completes the swap through Textile. Sales remain bounded by excess above target, the NAV fraction, spendable inventory, price protection and vault limits. A manual sale can be requested below the suggestion threshold, but never below the inventory target.
 
 ```toml
 [modules]
@@ -49,6 +49,7 @@ max_extra_bps = 100
 
 [modules.rebalance]
 enabled = false
+method = "manual" # default; dealer requires explicit configuration
 trigger_bps = 5000
 max_trade_bps = 200
 max_slippage_bps = 50
@@ -68,7 +69,7 @@ The panel polls every five seconds and expires live readings independently of su
 
 ## Configuring modules in the panel
 
-Parameters edits one module at a time. Percentages replace basis points in the form (0.01% = 1 bps); the saved TOML and API units are unchanged. Sliders have exact numeric inputs. Main controls stay visible; price floors, timing and dealer connection details are collapsed by default. Preview is the panel name for `shadow` mode.
+Parameters edits one module at a time. Percentages replace basis points in the form (0.01% = 1 bps); the saved TOML and API units are unchanged. Sliders have exact numeric inputs. Main controls stay visible; price floors and timing are collapsed by default. Manual sale requests have their own tab; dealer credentials are configured through TOML. Preview is the panel name for `shadow` mode.
 
 Inventory balancing and dynamic spreads each offer three draft-only presets: **Competitive**, **Balanced** and **Defensive**. Selecting one preserves run mode, module switches, the inventory minimum margin and dealer settings. Manual edits remain available. Open **How these presets were chosen** for the tradeoffs and dated market-data check; see [preset settings and evidence](./module-presets.md) for the full rationale. Existing configurations are never automatically migrated to a preset.
 
@@ -76,9 +77,27 @@ The interactive examples use draft settings and explicit hypothetical inputs. In
 
 For new module UIs, use the shared controls in `web/src/components/ModuleControls.tsx`: a named enable switch, one or two main numeric controls, a labeled illustration, and optional disclosures. Keep live measurements in Overview and hypothetical inputs in Parameters. Reuse panel color tokens, native keyboard controls and the same percentage units. Add numeric constraints and illustration regression cases alongside `modulePresentation.ts`; keep server validation authoritative.
 
-## Dealer execution
+## Manual sales in Fleet
 
-The existing Textile RFQ endpoint serves customer-initiated requests; it cannot make this vault spend as a taker. Stitch therefore exposes a dealer adapter that reuses existing constrained vault orders, the Warp co-signer and the reactor / VaultOrderExecutor. No contracts change. **A compatible dealer must be supplied; this PR does not deploy a buyer or imply that any corridor has liquidity.** Without one, the panel reports that a spot sale is indicated but cannot execute.
+Enable spot rebalancing and save in Live mode, then open **Manual sale**. Choose an amount and minimum **net** proceeds to the vault. Use your own buying wallet or enter the wallet of a buyer you invite. Creating the private 24-hour request moves no money. Share its link yourself, or open the buyer page. Fleet never sends a message to the buyer.
+
+The buyer page runs on the Textile web app; Fleet stays private. It obtains a fresh, exact-output RFQ restricted to this vault. The bot checks the request against its locally stored authorization, current prices and balances, sale limits, minimum proceeds and reservations. Normal quote margins determine the price; the entered minimum is a floor, not a guaranteed quote. The existing venue supplies Warp co-signing and settlement calldata. Only the named buyer can fill. No contract changes are required.
+
+The buyer sees the full token payment including the trading fee; network gas is separate. Existing wallet handling covers EOAs, Safe, custody/MPC and hardware wallets, including sequential token approvals and pending-request recovery. A token approval can outlast a quote. Complete it, then explicitly request a fresh quote. Do not queue an expired swap. Only the existing on-chain reconciliation marks a sale completed; a link, wallet proposal or transaction hash does not.
+
+Closing a request stops new quotes. Already-signed orders stay executable until their deadline and remain reserved locally. Every refresh uses the same durable Permit2 nonce, including after a bot restart, so the request can settle at most once. The venue also refuses nonce reuse until the previous order deadline plus clock-skew allowance has passed and confirms that the nonce is unspent. If the vault's trading epoch changes, create a new request. Cooldown applies between different sale requests.
+
+The holdings chart is an estimate using the current reference price and your minimum proceeds. Buying from your own vault moves the FX exposure into your personal wallet. It does not remove that exposure from your combined holdings. A request does not guarantee that a buyer will take it. Historical simulations cannot infer manual buyer activity; any supplied dealer scenario remains an explicitly hypothetical execution model.
+
+### Deployment and migration
+
+Deploy the additive database migration, API and web buyer route, then update Stitch and Fleet together. The single `modules_enabled` switch continues to gate the entire feature. Rebalancing stays disabled until explicitly enabled. Existing configs without `modules.rebalance.method` now use manual mode **even when dealer details are present**. Preserve automatic dealer execution only by explicitly setting `method = "dealer"`.
+
+Keep `manual-sale-*.json`, their `-nonce.json` files, `manual-sale-pacing.json` and the existing reservation ledger in the bot's persistent config directory. Never clear them to refresh a quote. Fleet cannot create requests without the bot's maker credential. One decision owner per vault remains required. The configured venue's `PUBLIC_URL` must point to the matching web deployment for buyer links.
+
+## Dealer execution (optional, later rollout)
+
+The dealer adapter remains available through explicit `modules.rebalance.method = "dealer"`. It reuses constrained vault orders, the Warp co-signer and the reactor / VaultOrderExecutor. A compatible dealer must be supplied; configuring the adapter does not provide a buyer or establish liquidity. Fleet defaults to the manual flow above.
 
 ```toml
 [modules.rebalance.dealer]

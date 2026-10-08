@@ -38,7 +38,7 @@ export default function ModulesOverview({
   const descriptions: Record<ModuleKey, string> = {
     inventory: `Keep ${currency} holdings near your target.`,
     spreads: 'Adjust quote margins as market prices move.',
-    rebalance: `Sell excess ${currency} through a dealer.`,
+    rebalance: `Sell excess ${currency} to your wallet or an invited buyer.`,
   }
   return (
     <div className="space-y-4">

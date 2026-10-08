@@ -5,6 +5,7 @@
 pub mod config;
 pub mod dealer;
 pub mod history;
+pub mod manual;
 pub mod replay;
 pub mod runtime;
 mod strategies;
@@ -19,7 +20,7 @@ pub const VERSION: u32 = 1;
 pub const REGISTRY: [(&str, &str); 3] = [
     ("inventory", "Inventory balancing"),
     ("spreads", "Dynamic spreads"),
-    ("rebalance", "Automatic spot rebalancing"),
+    ("rebalance", "Spot rebalancing"),
 ];
 
 pub mod atomic {

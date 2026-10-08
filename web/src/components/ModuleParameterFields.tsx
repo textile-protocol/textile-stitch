@@ -1,6 +1,5 @@
 import type { ModulesConfig } from '../modules'
 import { Disclosure, ModuleSwitch, NumberControl } from './ModuleControls'
-import { Field, Input, Toggle } from './ui'
 
 type FieldProps = {
   draft: ModulesConfig
@@ -149,13 +148,13 @@ export function RebalanceFields({ draft, onChange, currency }: FieldProps) {
   return (
     <>
       <NumberControl
-        label="Start selling above"
+        label="Suggest a sale above"
         value={draft.rebalance.trigger_bps}
         min={1}
         max={9999}
         sliderMax={9999}
         onChange={(trigger_bps) => rebalance({ trigger_bps })}
-        hint={`Request a sale when ${currency} reaches this share of vault value. Must be above the inventory target and no higher than the purchase limit.`}
+        hint={`Suggest a sale when ${currency} reaches this share of vault value. Must be above the inventory target and no higher than the purchase limit.`}
       />
       <NumberControl
         label="Maximum per sale"
@@ -166,78 +165,23 @@ export function RebalanceFields({ draft, onChange, currency }: FieldProps) {
         onChange={(max_trade_bps) => rebalance({ max_trade_bps })}
         hint="Share of total vault value, not a share of the currency balance."
       />
-      {draft.rebalance.enabled && !draft.rebalance.dealer && (
-        <p className="bg-hover rounded-lg p-3 text-sm">
-          A dealer connection is needed for live sales. You can still test a
-          hypothetical sale in Historical simulation.
+      <div className="bg-accent-tint rounded-xl p-4 text-sm">
+        <p className="font-bold">You decide when to sell</p>
+        <p className="text-muted mt-2">
+          Open Manual sale to choose an amount and minimum proceeds. Use your
+          own wallet or invite a buyer. Each buyer reviews a fresh price and
+          confirms the swap.
         </p>
-      )}
-
-      <Disclosure title="Dealer connection">
-        <div className="space-y-4">
-          <Toggle
-            label="Configure a dealer"
-            checked={!!draft.rebalance.dealer}
-            onChange={(enabled) =>
-              rebalance({
-                dealer: enabled
-                  ? { url: '', taker: '', api_key_env: null }
-                  : null,
-              })
-            }
-          />
-          <p className="text-muted text-xs leading-relaxed">
-            Use a dealer that supports the Stitch rebalance API and obtains
-            Warp’s co-signature. Enter connection details from your provider.
-          </p>
-          {draft.rebalance.dealer && (
-            <>
-              <Field label="Dealer URL">
-                <Input
-                  value={draft.rebalance.dealer.url}
-                  onChange={(e) =>
-                    rebalance({
-                      dealer: {
-                        ...draft.rebalance.dealer!,
-                        url: e.target.value,
-                      },
-                    })
-                  }
-                />
-              </Field>
-              <Field label="Counterparty wallet">
-                <Input
-                  value={draft.rebalance.dealer.taker}
-                  onChange={(e) =>
-                    rebalance({
-                      dealer: {
-                        ...draft.rebalance.dealer!,
-                        taker: e.target.value,
-                      },
-                    })
-                  }
-                />
-              </Field>
-              <Field
-                label="Credential environment variable"
-                hint="Variable name only. Keep the secret in the bot’s environment."
-              >
-                <Input
-                  value={draft.rebalance.dealer.api_key_env ?? ''}
-                  onChange={(e) =>
-                    rebalance({
-                      dealer: {
-                        ...draft.rebalance.dealer!,
-                        api_key_env: e.target.value || null,
-                      },
-                    })
-                  }
-                />
-              </Field>
-            </>
-          )}
-        </div>
-      </Disclosure>
+        {draft.rebalance.method === 'dealer' && (
+          <button
+            type="button"
+            className="mt-3 font-bold underline"
+            onClick={() => rebalance({ method: 'manual' })}
+          >
+            Switch from dealer API to manual sales
+          </button>
+        )}
+      </div>
       <Disclosure title="Advanced · execution limits">
         <div className="space-y-5">
           <NumberControl

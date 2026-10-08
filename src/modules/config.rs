@@ -77,10 +77,19 @@ impl Default for SpreadsConfig {
         }
     }
 }
+/// Manual sales are opt-in per request. Dealer execution requires an explicit method.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceMethod {
+    #[default]
+    Manual,
+    Dealer,
+}
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RebalanceConfig {
     pub enabled: bool,
+    pub method: RebalanceMethod,
     pub trigger_bps: u32,
     /// Maximum NAV fraction sold in a single attempt.
     pub max_trade_bps: u32,
@@ -93,6 +102,7 @@ impl Default for RebalanceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            method: RebalanceMethod::Manual,
             trigger_bps: 5000,
             max_trade_bps: 200,
             max_slippage_bps: 50,
