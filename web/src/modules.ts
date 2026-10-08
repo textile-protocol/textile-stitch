@@ -205,6 +205,19 @@ export function moduleStatusFresh(
   )
 }
 
+/**
+ * Dynamic spreads have not seen enough price history yet. Current bots keep
+ * quoting at the maximum addition and lead with "Warming up dynamic spreads";
+ * older bots blocked both sides with "Collecting price history".
+ */
+export function isWarmingUp(decision: { reasons: string[] }): boolean {
+  return decision.reasons.some(
+    (r) =>
+      r.startsWith('Warming up dynamic spreads') ||
+      r.includes('Collecting price history')
+  )
+}
+
 export function dynamicSpreadState(
   view: ModulesView,
   now: number
@@ -247,12 +260,14 @@ export function dynamicSpreadState(
     }
   if (last?.decision.blocked)
     return {
-      label: last.decision.reasons.some((r) =>
-        r.includes('Collecting price history')
-      )
-        ? 'Warming up'
-        : 'Quote policy blocked',
+      label: isWarmingUp(last.decision) ? 'Warming up' : 'Quote policy blocked',
       message: last.decision.reasons.join('. '),
+      current: true,
+    }
+  if (last && isWarmingUp(last.decision))
+    return {
+      label: 'Warming up · maximum buffer',
+      message: `Collecting ${status.config.spreads.warmup_secs}s of price history. Until then quotes stay live and carry the maximum addition of ${status.config.spreads.max_extra_bps} bps.`,
       current: true,
     }
   const shadow = status.config.mode === 'shadow'

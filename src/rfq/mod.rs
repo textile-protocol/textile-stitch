@@ -387,6 +387,8 @@ fn build_runtime(
         .flatten()
         .collect::<Vec<_>>();
     anyhow::ensure!(!books.is_empty(), "no pools to quote over RFQ");
+    // Modules price off the first corridor (see `module_tick`).
+    let module_price_source = books[0].feed_url.clone();
     Ok(RfqRuntime {
         url: rfq.url.clone(),
         api_key,
@@ -424,6 +426,7 @@ fn build_runtime(
             Some(crate::modules::runtime::Runtime::new(
                 cfg.modules.clone(),
                 config_dir.context("modules need a persistent config directory")?,
+                &module_price_source,
             )?)
         } else {
             None
@@ -5128,7 +5131,7 @@ mod tests {
         let mut cfg = ModulesConfig::default();
         cfg.mode = mode;
         cfg.spreads.enabled = false;
-        let runtime = Runtime::new(cfg, &dir).unwrap();
+        let runtime = Runtime::new(cfg, &dir, "http://localhost/price").unwrap();
         *runtime.balances.write().unwrap() = Some(Balances {
             settlement: U256::from(settlement),
             corridor: U256::from(corridor),
@@ -5510,7 +5513,7 @@ mod tests {
             taker: "0x0000000000000000000000000000000000000003".into(),
             api_key_env: None,
         });
-        let runtime = Runtime::new(cfg, &dir).unwrap();
+        let runtime = Runtime::new(cfg, &dir, "http://localhost/price").unwrap();
         *runtime.balances.write().unwrap() = *previous.balances.read().unwrap();
         engine.modules = Some(runtime);
         RebalanceFixture {

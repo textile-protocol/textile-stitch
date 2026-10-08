@@ -17,6 +17,9 @@ pub use config::{Mode, ModulesConfig};
 use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 1;
+/// Leads the decision reason while dynamic spreads quote at their cap because
+/// the price window has not spanned `warmup_secs` yet. The panel matches on it.
+pub const WARMUP_REASON: &str = "Warming up dynamic spreads";
 pub const REGISTRY: [(&str, &str); 3] = [
     ("inventory", "Inventory balancing"),
     ("spreads", "Dynamic spreads"),
@@ -126,21 +129,28 @@ pub fn evaluate(config: &ModulesConfig, ctx: &Context, history: &[PricePoint]) -
         d.reasons.extend(proposal.reasons);
     }
     if config.spreads.enabled {
-        match strategies::spread_extra(&config.spreads, ctx.now, history) {
-            Some(extra) => {
-                d.volatility_bps = extra;
-                let (buy_extra, sell_extra) = strategies::spread_additions(config, share, extra);
-                d.buy_bps = d.buy_bps.map(|b| b.saturating_add(buy_extra).min(9999));
-                d.sell_bps = d.sell_bps.map(|b| b.saturating_add(sell_extra));
-                if extra > 0 {
-                    d.reasons.push(if config.spreads.inventory_aware && config.inventory.enabled {
-                        format!("Inventory-aware volatility buffer: buy +{buy_extra} bps, sell +{sell_extra} bps before side limits")
-                    } else {
-                        format!("Market movement adds {extra} bps")
-                    });
-                }
-            }
-            None => return blocked(d, "Collecting price history for dynamic spreads"),
+        // A cold window (a fresh start, or source timestamps too sparse to span
+        // the warmup yet) quotes at the cap: the widest buffer this module can
+        // ever add. Pulling both sides instead would take the maker off the
+        // venue after every restart until the feed ticks past the warmup, which
+        // on a 3-minute feed is up to 3 minutes of no liquidity.
+        let measured = strategies::spread_extra(&config.spreads, ctx.now, history);
+        let extra = measured.unwrap_or(config.spreads.max_extra_bps);
+        d.volatility_bps = extra;
+        let (buy_extra, sell_extra) = strategies::spread_additions(config, share, extra);
+        d.buy_bps = d.buy_bps.map(|b| b.saturating_add(buy_extra).min(9999));
+        d.sell_bps = d.sell_bps.map(|b| b.saturating_add(sell_extra));
+        if measured.is_none() {
+            d.reasons.push(format!(
+                "{WARMUP_REASON}: holding the maximum buffer (buy +{buy_extra} bps, sell +{sell_extra} bps) until {}s of price history",
+                config.spreads.warmup_secs
+            ));
+        } else if extra > 0 {
+            d.reasons.push(if config.spreads.inventory_aware && config.inventory.enabled {
+                format!("Inventory-aware volatility buffer: buy +{buy_extra} bps, sell +{sell_extra} bps before side limits")
+            } else {
+                format!("Market movement adds {extra} bps")
+            });
         }
     }
     // A conservative headroom cap: do not spend more than the fair value of

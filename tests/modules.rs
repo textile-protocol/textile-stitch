@@ -8,6 +8,8 @@ use stitch_bot::{
     rfq::responder::CorridorBook,
 };
 
+const FEED: &str = "http://localhost/price";
+
 fn u(v: u64) -> U256 {
     U256::from(v)
 }
@@ -117,7 +119,9 @@ fn stale_future_and_missing_value_fail_closed() {
 fn warmup_then_bounded_volatility_never_uses_a_future_point() {
     let mut cfg = config();
     cfg.spreads.enabled = true;
-    assert!(evaluate(&cfg, &context(), &[]).blocked);
+    let cold = evaluate(&cfg, &context(), &[]);
+    assert!(!cold.blocked);
+    assert_eq!(cold.volatility_bps, cfg.spreads.max_extra_bps);
     let history = [
         PricePoint {
             timestamp: 50,
@@ -140,6 +144,62 @@ fn warmup_then_bounded_volatility_never_uses_a_future_point() {
         },
     ];
     assert_eq!(d, evaluate(&cfg, &context(), &extended));
+}
+#[test]
+fn a_cold_window_quotes_both_sides_at_the_cap_instead_of_pulling_the_book() {
+    // A restart empties the window. The maker must stay on the venue, at the
+    // widest buffer the module can add, until the window spans the warmup.
+    let mut cfg = config();
+    cfg.spreads.enabled = true;
+    cfg.spreads.warmup_secs = 120;
+    cfg.spreads.max_extra_bps = 5;
+    // Spreads in isolation: no inventory skew on either side.
+    cfg.inventory.enabled = false;
+    let ctx = context();
+    let one_sample = [PricePoint {
+        timestamp: 100,
+        price: 1.0,
+    }];
+    let warming = |history: &[PricePoint]| {
+        let d = evaluate(&cfg, &ctx, history);
+        assert!(!d.blocked);
+        assert_eq!(d.buy_bps, Some(25));
+        assert_eq!(d.sell_bps, Some(25));
+        assert!(d.reasons.iter().any(|r| r.starts_with(WARMUP_REASON)));
+        d
+    };
+    warming(&[]);
+    warming(&one_sample);
+    let short = [
+        PricePoint {
+            timestamp: 0,
+            price: 1.0,
+        },
+        PricePoint {
+            timestamp: 100,
+            price: 1.0,
+        },
+    ];
+    warming(&short[1..]);
+    // Spanning the warmup with an unchanged price measures zero extra.
+    let mut warm_ctx = ctx;
+    warm_ctx.now = 130;
+    warm_ctx.price_at = 130;
+    warm_ctx.balances_at = 130;
+    let warm = [
+        PricePoint {
+            timestamp: 10,
+            price: 1.0,
+        },
+        PricePoint {
+            timestamp: 130,
+            price: 1.0,
+        },
+    ];
+    let d = evaluate(&cfg, &warm_ctx, &warm);
+    assert_eq!(d.buy_bps, Some(20));
+    assert_eq!(d.sell_bps, Some(20));
+    assert!(!d.reasons.iter().any(|r| r.starts_with(WARMUP_REASON)));
 }
 
 fn inventory_aware_config() -> ModulesConfig {
@@ -263,7 +323,10 @@ fn higher_volatility_increases_the_inventory_bias_without_breaching_floors_or_ca
         prior_bias = bias;
         assert!(d.sell_bps.unwrap() >= cfg.inventory.spread_floor_bps);
     }
-    assert!(evaluate(&cfg, &ctx, &[]).blocked);
+    // A cold window holds the capped buffer rather than pulling the book.
+    let cold = evaluate(&cfg, &ctx, &[]);
+    assert!(!cold.blocked);
+    assert_eq!(cold.volatility_bps, cfg.spreads.max_extra_bps);
     assert!(
         evaluate(
             &cfg,
@@ -538,15 +601,15 @@ async fn dealer_pacing_survives_restart_and_corrupt_pacing_blocks_start() {
     let mut cfg = config();
     cfg.rebalance.dealer = Some(dealer);
     request.deadline = stitch_bot::time::unix_now() + 60;
-    let rt = runtime::Runtime::new(cfg.clone(), &dir).unwrap();
+    let rt = runtime::Runtime::new(cfg.clone(), &dir, FEED).unwrap();
     rt.begin_quote(request).unwrap();
     let stored: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("modules-attempt.json")).unwrap())
             .unwrap();
     assert!(stored["next_attempt_at"].as_u64().unwrap() > stitch_bot::time::unix_now());
-    assert!(runtime::Runtime::new(cfg.clone(), &dir).is_ok());
+    assert!(runtime::Runtime::new(cfg.clone(), &dir, FEED).is_ok());
     std::fs::write(dir.join("modules-attempt.json"), "broken").unwrap();
-    assert!(runtime::Runtime::new(cfg, &dir).is_err());
+    assert!(runtime::Runtime::new(cfg, &dir, FEED).is_err());
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -557,7 +620,7 @@ async fn recorded_spread_inputs_explain_the_decision_and_read_legacy_status() {
         std::env::temp_dir().join(format!("stitch-spread-telemetry-{}", rand::random::<u64>()));
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = ModulesConfig::default();
-    let rt = runtime::Runtime::new(cfg, &dir).unwrap();
+    let rt = runtime::Runtime::new(cfg, &dir, FEED).unwrap();
     let path = dir.join(runtime::STATUS_FILE);
     async fn read_at(path: &std::path::Path, at: u64) -> serde_json::Value {
         for _ in 0..100 {
@@ -579,7 +642,9 @@ async fn recorded_spread_inputs_explain_the_decision_and_read_legacy_status() {
         corridor: u(30_000_000),
         ..context()
     };
-    assert!(rt.decide(&ctx).blocked);
+    let cold = rt.decide(&ctx);
+    assert!(!cold.blocked);
+    assert!(cold.reasons.iter().any(|r| r.starts_with(WARMUP_REASON)));
     let first = read_at(&path, 100).await;
     assert_eq!(
         first["decisions"][0]["inputs"]["spread_window"]["extra_bps"],
@@ -660,4 +725,65 @@ fn different_token_precisions_produce_the_same_exposure_and_sale_size() {
     let d = evaluate(&cfg, &ctx, &[]);
     assert_eq!(d.inventory_bps, Some(6000));
     assert_eq!(d.rebalance_sell, u(2_000_000));
+}
+
+#[test]
+fn restorable_history_keeps_only_valid_in_window_increasing_samples() {
+    let p = |timestamp, price| PricePoint { timestamp, price };
+    let saved = [
+        p(100, 1.0), // outside a 300s window at now = 1000
+        p(800, 1.0),
+        p(800, 2.0), // same timestamp: not a new sample
+        p(850, f64::NAN),
+        p(900, -1.0),
+        p(950, 1.1),
+        p(940, 1.2),  // out of order
+        p(1001, 1.3), // future
+    ];
+    let kept = runtime::restorable_history(&saved, 1000, 300);
+    let stamps: Vec<_> = kept.iter().map(|p| (p.timestamp, p.price)).collect();
+    assert_eq!(stamps, vec![(800, 1.0), (950, 1.1)]);
+}
+
+#[tokio::test]
+async fn a_restart_resumes_the_saved_window_from_the_same_feed_only() {
+    let dir = std::env::temp_dir().join(format!("stitch-module-history-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = config();
+    cfg.spreads.enabled = true;
+    cfg.spreads.warmup_secs = 120;
+    let now = stitch_bot::time::unix_now();
+    let at = |t: u64| Context {
+        now: t,
+        price_at: t,
+        balances_at: t,
+        ..context()
+    };
+    let warming = |d: &Decision| d.reasons.iter().any(|r| r.starts_with(WARMUP_REASON));
+
+    let first = runtime::Runtime::new(cfg.clone(), &dir, FEED).unwrap();
+    assert!(warming(&first.decide(&at(now - 150))));
+    assert!(!warming(&first.decide(&at(now))));
+    let path = dir.join(runtime::HISTORY_FILE);
+    for _ in 0..100 {
+        let saved = std::fs::read_to_string(&path).unwrap_or_default();
+        if saved.matches("timestamp").count() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    drop(first);
+
+    // Same feed: the first decision after the restart is already warm.
+    let resumed = runtime::Runtime::new(cfg.clone(), &dir, FEED).unwrap();
+    assert!(!warming(&resumed.decide(&at(now))));
+    // A different feed never inherits those samples.
+    let other = runtime::Runtime::new(cfg.clone(), &dir, "http://localhost/other").unwrap();
+    assert!(warming(&other.decide(&at(now))));
+    // A corrupt file is a cold start, not a failed one.
+    std::fs::write(&path, "broken").unwrap();
+    let cold = runtime::Runtime::new(cfg, &dir, FEED).unwrap();
+    assert!(warming(&cold.decide(&at(now))));
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let _ = std::fs::remove_dir_all(dir);
 }

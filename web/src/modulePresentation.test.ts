@@ -156,6 +156,17 @@ describe('concise overview truthfulness', () => {
     v.status!.config.mode = 'live'
     expect(moduleOverviewState(v, 101).title).toBe('Quotes are paused')
   })
+  it('calls a live warm-up at the capped buffer getting ready, not paused', () => {
+    const v = view()
+    v.status!.config.mode = 'live'
+    v.status!.decisions[0]!.decision.blocked = false
+    v.status!.decisions[0]!.decision.reasons = [
+      'Warming up dynamic spreads: holding the maximum buffer (buy +5 bps, sell +5 bps) until 120s of price history',
+    ]
+    expect(moduleOverviewState(v, 101).title).toBe('Getting ready')
+    v.status!.config.mode = 'shadow'
+    expect(moduleOverviewState(v, 101).title).toBe('Previewing your strategy')
+  })
   it('distinguishes off, warmup and all modules disabled', () => {
     const v = view()
     v.status!.decisions[0]!.decision.blocked = true

@@ -14,6 +14,7 @@ import { formatAtomic } from '../format'
 import {
   downloadJson,
   equityCoordinates,
+  isWarmingUp,
   type ModulesConfig,
   type ModulesView,
   type SimulationReport,
@@ -575,7 +576,7 @@ export default function ModulesPanel({
                 ({ decision: d }) =>
                   decisionFilter === 'all' ||
                   (decisionFilter === 'blocked'
-                    ? d.blocked
+                    ? d.blocked || isWarmingUp(d)
                     : d.rebalance_sell !== '0')
               )
               .map(({ decision: d }, i) => (

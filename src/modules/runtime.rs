@@ -11,7 +11,12 @@ use std::{
 
 pub const STATUS_FILE: &str = "modules-status.json";
 const ATTEMPTS_FILE: &str = "modules-attempt.json";
+/// The dynamic-spreads price window, so a restart (every module save is one)
+/// resumes warm instead of quoting at the cap until the feed ticks again.
+pub const HISTORY_FILE: &str = "modules-history.json";
 pub const MAX_DECISIONS: usize = 200;
+/// Most samples the window keeps: one per second over the longest allowed window.
+const MAX_HISTORY: usize = 3601;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Balances {
@@ -73,6 +78,77 @@ struct Attempt {
     version: u32,
     next_attempt_at: u64,
 }
+#[derive(Serialize, Deserialize)]
+struct SavedHistory {
+    version: u32,
+    /// Feed URL the samples came from. A different feed starts cold.
+    source: String,
+    points: Vec<PricePoint>,
+}
+
+/// The saved samples a new run may reuse: valid prices inside the current
+/// window, none in the future, timestamps strictly increasing (the order
+/// `decide` appends in), and no more than the window ever holds.
+pub fn restorable_history(points: &[PricePoint], now: u64, window_secs: u64) -> Vec<PricePoint> {
+    let kept: Vec<PricePoint> = points
+        .iter()
+        .filter(|p| {
+            p.price.is_finite()
+                && p.price > 0.0
+                && p.timestamp <= now
+                && now - p.timestamp <= window_secs
+        })
+        .fold(Vec::new(), |mut out: Vec<PricePoint>, p| {
+            if out.last().is_none_or(|last| p.timestamp > last.timestamp) {
+                out.push(*p);
+            }
+            out
+        });
+    kept[kept.len().saturating_sub(MAX_HISTORY)..].to_vec()
+}
+
+/// Best effort: a missing, unreadable or foreign file only means a cold start,
+/// which quotes at the spread cap. It never fails startup.
+fn load_history(dir: &Path, source: &str, window_secs: u64, now: u64) -> Vec<PricePoint> {
+    let Ok(raw) = std::fs::read_to_string(dir.join(HISTORY_FILE)) else {
+        return vec![];
+    };
+    match serde_json::from_str::<SavedHistory>(&raw) {
+        Ok(saved) if saved.version == VERSION && saved.source == source => {
+            restorable_history(&saved.points, now, window_secs)
+        }
+        Ok(_) => vec![],
+        Err(_) => {
+            tracing::warn!("module price history unreadable; dynamic spreads start cold");
+            vec![]
+        }
+    }
+}
+
+/// Coalescing background writer, like the status snapshot: a slow disk may
+/// skip intermediate windows but always lands the latest one.
+fn spawn_history_writer(dir: &Path, source: String) -> tokio::sync::watch::Sender<Vec<PricePoint>> {
+    let (writer, mut receiver) = tokio::sync::watch::channel(Vec::new());
+    let path = dir.join(HISTORY_FILE);
+    tokio::spawn(async move {
+        while receiver.changed().await.is_ok() {
+            let saved = SavedHistory {
+                version: VERSION,
+                source: source.clone(),
+                points: receiver.borrow_and_update().clone(),
+            };
+            let path = path.clone();
+            let write = tokio::task::spawn_blocking(move || -> Result<()> {
+                crate::setup::write_toml_atomic(&path, &serde_json::to_string(&saved)?)
+            })
+            .await;
+            if !matches!(write, Ok(Ok(()))) {
+                tracing::error!("module price history could not be saved");
+            }
+        }
+    });
+    writer
+}
 
 struct State {
     history: Vec<PricePoint>,
@@ -87,9 +163,12 @@ pub struct Runtime {
     state: Arc<Mutex<State>>,
     pub(crate) dir: PathBuf,
     writer: tokio::sync::watch::Sender<Status>,
+    history_writer: tokio::sync::watch::Sender<Vec<PricePoint>>,
 }
 impl Runtime {
-    pub fn new(config: ModulesConfig, dir: &Path) -> Result<Self> {
+    /// `price_source` is the feed URL the module prices come from; it keys
+    /// the saved price window so a changed feed never inherits old samples.
+    pub fn new(config: ModulesConfig, dir: &Path, price_source: &str) -> Result<Self> {
         let path = dir.join(ATTEMPTS_FILE);
         let next_attempt_at = if path.exists() {
             let attempt: Attempt = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -133,11 +212,18 @@ impl Runtime {
                 }
             }
         });
+        let history = load_history(
+            dir,
+            price_source,
+            config.spreads.window_secs,
+            crate::time::unix_now(),
+        );
         Ok(Self {
+            history_writer: spawn_history_writer(dir, price_source.to_owned()),
             config,
             balances: Arc::new(RwLock::new(None)),
             state: Arc::new(Mutex::new(State {
-                history: vec![],
+                history,
                 status,
                 fetching: false,
                 ready: None,
@@ -149,13 +235,13 @@ impl Runtime {
     pub fn decide(&self, context: &Context) -> Decision {
         let mut state = self.state.lock().expect("module state poisoned");
         let history = &mut state.history;
-        if context.price_at <= context.now
+        let sampled = context.price_at <= context.now
             && context.price.is_finite()
             && context.price > 0.0
             && history
                 .last()
-                .is_none_or(|p| context.price_at > p.timestamp)
-        {
+                .is_none_or(|p| context.price_at > p.timestamp);
+        if sampled {
             history.push(PricePoint {
                 timestamp: context.price_at,
                 price: context.price,
@@ -165,8 +251,12 @@ impl Runtime {
             p.timestamp <= context.now
                 && context.now - p.timestamp <= self.config.spreads.window_secs
         });
-        if history.len() > 3601 {
-            history.drain(..history.len() - 3601);
+        if history.len() > MAX_HISTORY {
+            history.drain(..history.len() - MAX_HISTORY);
+        }
+        // Only a new source sample changes what a restart could reuse.
+        if sampled {
+            let _ = self.history_writer.send_replace(history.clone());
         }
         let decision = evaluate(&self.config, context, history);
         let inventory = decision

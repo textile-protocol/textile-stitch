@@ -1,4 +1,5 @@
 import {
+  isWarmingUp,
   moduleStatusFresh,
   type ModulesConfig,
   type ModulesView,
@@ -142,12 +143,12 @@ export function moduleOverviewState(view: ModulesView, now: number) {
     }
   if (d?.blocked)
     return {
-      title: d.reasons.some((r) => r.includes('Collecting price history'))
+      title: isWarmingUp(d)
         ? 'Getting ready'
         : c.mode === 'shadow'
           ? 'Preview is waiting'
           : 'Quotes are paused',
-      message: d.reasons.some((r) => r.includes('Collecting price history'))
+      message: isWarmingUp(d)
         ? 'Collecting enough price history to calculate spreads.'
         : 'The latest evaluation could not produce quotes. Open details for the reason.',
       current: true,
@@ -163,6 +164,13 @@ export function moduleOverviewState(view: ModulesView, now: number) {
     return {
       title: 'No modules enabled',
       message: 'Choose a module in Parameters to adjust the bot’s behavior.',
+      current: true,
+    }
+  if (d && c.spreads.enabled && isWarmingUp(d))
+    return {
+      title: 'Getting ready',
+      message:
+        'Collecting price history. Quotes stay live with the maximum spread buffer until then.',
       current: true,
     }
   return {
