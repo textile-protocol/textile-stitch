@@ -104,6 +104,7 @@ export const fund = {
   startOver: 'Start over',
   differentBot: 'Set up a different bot',
   retry: 'Retry',
+  skipHint: 'Finish setting up later on the bot page',
 }
 
 /**
@@ -382,5 +383,6 @@ export const wait = {
     'Your address is confirmed, but the running bot could not be restarted onto the new config.',
   restartNow: 'Restart now',
   startFailedTitle: 'The bot did not start',
+  skipHint: 'Finish setting up later on the bot page',
 }
 

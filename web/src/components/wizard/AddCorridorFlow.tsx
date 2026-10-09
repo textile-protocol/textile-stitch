@@ -40,6 +40,8 @@ import { Banner, Button, Card, Spinner } from '../ui'
 import EmailVerifyWait from './EmailVerifyWait'
 import { AddressBlock, ApprovalRow, GasRow, VaultAddress, orderedTokens } from './FundingRows'
 import ProgressList, { type ProgressRow } from './ProgressList'
+import SkipLink from './SkipLink'
+import { leftOver, type LeftOver } from './skip'
 import { templatePair, templateSpreads } from './candidates'
 import { type FundOutcome } from './FundStep'
 import { gateReasons } from './fundMachine'
@@ -86,6 +88,12 @@ export interface AddCorridorFlowProps {
    */
   onStartOver: () => void
   onOpenBot: () => void
+  /**
+   * Leave for the bot page and finish there. Offered only once enrolment is
+   * done, so the corridor is on disk and Textile knows it: from then on the
+   * approval and the email are both things the bot page can do.
+   */
+  onSkip: (left: LeftOver) => void
 }
 
 type WriteKey = 'add' | 'save' | 'enroll'
@@ -106,6 +114,7 @@ export default function AddCorridorFlow({
   onBack,
   onStartOver,
   onOpenBot,
+  onSkip,
 }: AddCorridorFlowProps) {
   const [writes, setWrites] = useState<Record<WriteKey, WriteState>>({
     add: 'pending',
@@ -434,6 +443,7 @@ export default function AddCorridorFlow({
             initial={outcome.status}
             initialError={outcome.kind === 'waiting' ? outcome.error : null}
             onApproved={onOpenBot}
+            onSkip={onSkip}
           />
         )}
       </div>
@@ -670,11 +680,21 @@ export default function AddCorridorFlow({
           </Banner>
         )}
 
-        {failure && (
-          <div className="flex justify-end">
-            <Button variant="primary" onClick={() => runner.retry()}>
-              {progressCopy.retry}
-            </Button>
+        {/* Skip only after enrolment: before it, leaving would put a corridor
+            on a live bot that Textile never hears about. */}
+        {(failure || (writes.enroll === 'done' && !runner.active)) && (
+          <div className="flex items-center justify-end gap-4">
+            {writes.enroll === 'done' && !runner.active && (
+              <SkipLink
+                title={fund.skipHint}
+                onClick={() => onSkip(leftOver(failure?.stage ?? null, 'approve'))}
+              />
+            )}
+            {failure && (
+              <Button variant="primary" onClick={() => runner.retry()}>
+                {progressCopy.retry}
+              </Button>
+            )}
           </div>
         )}
       </div>

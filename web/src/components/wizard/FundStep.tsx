@@ -22,6 +22,8 @@ import { formatAmount, formatClock } from '../../format'
 import { LEVEL_CLASS } from '../../logBuffer'
 import { Banner, Button, Card, Spinner } from '../ui'
 import ProgressList, { type ProgressRow } from './ProgressList'
+import SkipLink from './SkipLink'
+import { leftOver, type LeftOver } from './skip'
 import { AddressBlock, ApprovalRow, GasRow, orderedTokens } from './FundingRows'
 import { INITIAL_FUND, gateReasons, reduceFund } from './fundMachine'
 import { errorText, useStartSequence, type StartOutcome } from './useStartSequence'
@@ -43,20 +45,26 @@ export interface FundStepProps {
    */
   onStarted: (outcome: FundOutcome) => void
   /**
-   * Forget this bot and take the wizard back to its first step. The only
-   * control that can break a step the operator is stuck on: there is no Back
-   * from here, because the wizard ends at a live bot or at one waiting on a
-   * confirmation, never at "I'll do it later". Not a way out of the wizard:
-   * it starts the wizard again, and the bot it forgets keeps its wallet, its
-   * money and its Textile request.
+   * Forget this bot and take the wizard back to its first step. There is no
+   * Back from here: the bot exists. Not a way out of the wizard: it starts the
+   * wizard again, and the bot it forgets keeps its wallet, its money and its
+   * Textile request.
    */
   onStartOver: () => void
+  /**
+   * Leave the wizard for this bot's page and finish there, told what is left.
+   * Everything this step does has a home on that page: Tools approves the
+   * allowances, the header starts the bot. Offered whenever nothing is
+   * mid-flight and the bot has a wallet address; without one the bot page
+   * cannot help, and Start over above is the recovery.
+   */
+  onSkip: (left: LeftOver) => void
 }
 
 /** Default floors for the intro before the first read arrives. */
 const DEFAULT_MIN_GAS_USD = 1
 
-export default function FundStep({ bot, onStarted, onStartOver }: FundStepProps) {
+export default function FundStep({ bot, onStarted, onStartOver, onSkip }: FundStepProps) {
   const [state, dispatch] = useReducer(reduceFund, INITIAL_FUND)
   const startedRef = useRef(false)
   const autoRanRef = useRef(false)
@@ -387,10 +395,10 @@ export default function FundStep({ bot, onStarted, onStartOver }: FundStepProps)
           </Banner>
         )}
 
-        {/* Back, a fresh start, and Retry. There is no way to leave the wizard
-            from here: it ends at a running bot, or at the Waiting screen. The
-            fresh start begins the wizard again rather than abandoning this bot,
-            which keeps its money and its Textile request.
+        {/* A fresh start, Skip, and Retry. Skip is the one way out of the
+            wizard from here, to the bot page, which can do everything this
+            step does. The fresh start begins the wizard again rather than
+            abandoning this bot, which keeps its money and its Textile request.
 
             It is offered ONLY where this step cannot finish on its own, which
             here means a failure the operator has already retried. On the
@@ -411,11 +419,19 @@ export default function FundStep({ bot, onStarted, onStartOver }: FundStepProps)
               </button>
             )}
           </div>
-          {failure && (
-            <Button variant="primary" onClick={retry}>
-              {fund.retry}
-            </Button>
-          )}
+          <div className="flex items-center gap-4">
+            {!busy && state.phase !== 'loading' && address && (
+              <SkipLink
+                title={fund.skipHint}
+                onClick={() => onSkip(leftOver(failure?.stage ?? null, 'approve'))}
+              />
+            )}
+            {failure && (
+              <Button variant="primary" onClick={retry}>
+                {fund.retry}
+              </Button>
+            )}
+          </div>
         </div>
       </div>
     </Card>

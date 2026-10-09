@@ -35,6 +35,7 @@ import Steps, {
   WHERE_LABELS,
 } from '../components/wizard/Steps'
 import WhereStep, { defaultChoice } from '../components/wizard/WhereStep'
+import { skipDestination, type LeftOver } from '../components/wizard/skip'
 import {
   botPools,
   loadCandidates,
@@ -177,11 +178,12 @@ async function openingCorridor(
  * pre-filled or read back — the API has no route that returns key material
  * (Create wallet returns a phrase once at generation time only).
  *
- * It has two endings and no other way out: the bot is running, or it is funded
- * and waiting for Textile to approve the maker. There is no "do this later" on
- * any step from Connect on. A bot created but left unfunded quotes nothing, so
- * dropping the operator on a settings page half way through was a way to end up
- * with a bot that never traded.
+ * It has two endings: the bot is running, or it is funded and waiting for
+ * Textile to approve the maker. The Approve and Live steps also carry a quiet
+ * Skip link to the bot page, which can do everything those two steps do (Tools
+ * approves and the header starts the bot; the Corridors tab connects to Textile
+ * and confirms the email). Kept faint on purpose: a bot left half set up quotes
+ * nothing, so finishing here stays the obvious road.
  *
  * The corridor list comes from Textile, not from this build: a corridor listed
  * on the site shows up here on the next page load, with the config already
@@ -523,6 +525,16 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
 
 
   /**
+   * Off to the bot page to finish a skipped step there. The add lane calls
+   * this directly: its record is cleared once enrolment lands, and the
+   * new-bot record may belong to a different bot.
+   */
+  function leave(name: string, left: LeftOver) {
+    const { path, state } = skipDestination(name, left)
+    navigate(path, state ? { state } : undefined)
+  }
+
+  /**
    * Drop the add lane's own parameters. `?resume=` is left alone: it belongs to
    * the other lane and to another bot.
    */
@@ -770,6 +782,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
             onBack={() => setShortStep(1)}
             onStartOver={startOver}
             onOpenBot={() => navigate(botPath(targetBot, 'funds'))}
+            onSkip={(left) => leave(targetBot, left)}
           />
         )}
       </div>
@@ -843,6 +856,16 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
   function land(name: string) {
     clearResume()
     navigate(botPath(name, 'funds'))
+  }
+
+  /**
+   * Skip the rest of the wizard: the bot page finishes what is left. The
+   * resume record goes too, or every later visit to /add would reopen this
+   * bot's step instead of setting up a new one.
+   */
+  function skipRest(name: string, left: LeftOver) {
+    clearResume()
+    leave(name, left)
   }
 
   /**
@@ -1220,6 +1243,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
             setStep(5)
           }}
           onStartOver={startOver}
+          onSkip={(left) => skipRest(createdBot, left)}
         />
       )}
 
@@ -1233,6 +1257,7 @@ export default function AddBot({ rfqDefault = false }: { rfqDefault?: boolean })
           initial={outcomeStatus(fundOutcome)}
           initialError={outcomeError(fundOutcome)}
           onApproved={() => land(createdBot)}
+          onSkip={(left) => skipRest(createdBot, left)}
         />
       )}
     </div>

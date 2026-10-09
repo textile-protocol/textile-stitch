@@ -17,6 +17,8 @@ import { ApiError, api } from '../../api'
 import { formatClock } from '../../format'
 import { Banner, Button, Card, Field, Input, Spinner } from '../ui'
 import ProgressList, { type ProgressRow } from './ProgressList'
+import SkipLink from './SkipLink'
+import { leftOver, type LeftOver } from './skip'
 import { errorText, useStartSequence } from './useStartSequence'
 import { CONTACT_EMAIL, progress as progressCopy, wait } from './wizardCopy'
 import type { RfqStatusResult } from '../../types'
@@ -33,6 +35,13 @@ export interface EmailVerifyWaitProps {
    * was away, not the "check your inbox" copy.
    */
   initialError?: string | null
+  /**
+   * Leave the wizard for the bot's page and finish there, told what is left:
+   * the Textile card on Corridors while the email is unconfirmed, Tools when
+   * the start run found approvals missing, the header's Start or Restart once
+   * the bot is seated. Offered whenever nothing is mid-flight.
+   */
+  onSkip?: (left: LeftOver) => void
 }
 
 const CHECK_MS = 5_000
@@ -54,6 +63,7 @@ export default function EmailVerifyWait({
   onApproved,
   initial = null,
   initialError = null,
+  onSkip,
 }: EmailVerifyWaitProps) {
   const seatedInitially = !!initial?.emailVerified && !!initial.settings?.rfqEnabled
   const [status, setStatus] = useState<RfqStatusResult | null>(initial)
@@ -480,8 +490,8 @@ export default function EmailVerifyWait({
             venue answering and the panel writing that answer, out of step for a
             moment. The wizard can settle it itself, so the main button runs the
             start sequence (which re-reads the config, asks the venue again if
-            it has to, and starts the bot). No link to Settings: leaving here
-            strands a bot that is neither live nor waiting. */}
+            it has to, and starts the bot). No extra link to Settings: Skip
+            below is the way out, and it is meant to stay quiet. */}
         {view === 'confirmed-not-quotable' && (
           <>
             <p className="text-sm text-muted">{wait.notQuotableBody}</p>
@@ -533,8 +543,8 @@ export default function EmailVerifyWait({
                 )}
               </Banner>
             )}
-            {/* The log tail is inlined rather than linked: this screen is one
-                of the wizard's two endings and has no way out of the flow. */}
+            {/* The log tail is inlined rather than linked: Skip is the only
+                way out of this screen, and it is meant to stay quiet. */}
             {failure && failure.stage === 'verify' && (
               <Banner tone="danger">
                 <p>{progressCopy.verifyFailed}</p>
@@ -556,6 +566,17 @@ export default function EmailVerifyWait({
               </div>
             )}
           </>
+        )}
+
+        {onSkip && !runner.active && !connecting && (
+          <div className="flex justify-end">
+            <SkipLink
+              title={wait.skipHint}
+              onClick={() =>
+                onSkip(leftOver(failure?.stage ?? null, seatedNow ? 'start' : 'connect'))
+              }
+            />
+          </div>
         )}
       </div>
     </Card>
