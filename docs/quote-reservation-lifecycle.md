@@ -84,9 +84,9 @@ contract deployment, migration, key rotation or fund movement is needed or
 performed by this change.
 
 The legacy API response `status: released` means the venue window closed; it
-must not be interpreted as on-chain revocation. The existing no-quote retry
-hint still follows the accept window and may understate the wait or report
-no makers during retained capacity. This is a UI follow-up, not an authority
-to release inventory. Arbitrary revocation and spent-nonce detection are not
+must not be interpreted as on-chain revocation. The no-quote retry hint
+(`reservedUntil`/`retryAfterMs`) reads the same unfilled RFQ orders with the
+same deadline-plus-skew cutoff, so a cancelled quote still gets a countdown
+instead of "no makers". It reports the hold; it never releases inventory. Arbitrary revocation and spent-nonce detection are not
 new early-release paths. Disk-write failure handling and deliberately shared
 v1/RFQ wallet budgets retain their existing behavior and need separate work.
