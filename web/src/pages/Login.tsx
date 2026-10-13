@@ -38,8 +38,8 @@ export default function Login({
   }
 
   return (
-    <div className="grid min-h-screen place-items-center px-6">
-      <div className="w-full max-w-sm space-y-4">
+    <div className="flex min-h-screen flex-col px-6">
+      <div className="mx-auto my-auto w-full max-w-sm space-y-4 py-8">
         <h1 className="text-center text-lg font-bold">
           Stitch
         </h1>
@@ -103,6 +103,8 @@ export default function Login({
           </p>
         )}
       </div>
+      {/* Version only: the config path stays behind sign-in. */}
+      <footer className="pb-8 text-center text-xs text-faint">Stitch v{session.version}</footer>
     </div>
   )
 }
