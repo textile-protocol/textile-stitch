@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { ApiError, api, setUnauthorizedHandler } from './api'
 import OverflowMenu from './components/OverflowMenu'
+import PanelUpdateStatus, { usePanelUpdate } from './components/PanelUpdateStatus'
 import TextileIcon from './components/TextileIcon'
 import { Button, Loading } from './components/ui'
 import Login from './pages/Login'
@@ -9,6 +10,7 @@ import Fleet from './pages/Fleet'
 import AddBot from './pages/AddBot'
 import BotDetail from './pages/BotDetail'
 import { shortImage } from './format'
+import { panelUpdateBusy } from './panelUpdate'
 import type { SessionInfo, UpdatesStatus } from './types'
 
 /** Persisted so the operator's choice survives a reload. */
@@ -110,8 +112,8 @@ function Header({
 }) {
   const { pathname } = useLocation()
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
-  const [panelBusy, setPanelBusy] = useState(false)
-  const [panelNote, setPanelNote] = useState<string | null>(null)
+  const panelUpdate = usePanelUpdate()
+  const panelBusy = panelUpdateBusy(panelUpdate.state)
 
   // Soft check on every navigation (and mount); forced registry refresh on a
   // timer so a parked tab still learns about a newer panel image.
@@ -133,54 +135,6 @@ function Header({
     }
   }, [pathname])
 
-  async function updatePanel() {
-    const target = updates?.panel.targetImage
-    if (
-      !window.confirm(
-        `Update the panel itself to ${target ?? 'the latest image'}?\n\nThe UI will disconnect briefly while the container is recreated. Bots keep running.`,
-      )
-    ) {
-      return
-    }
-    setPanelBusy(true)
-    setPanelNote('Pulling the new panel image and scheduling restart…')
-    try {
-      const res = await api.updatePanel()
-      setPanelNote(res.message)
-      // The helper sleeps ~2s then stop/rm/rename/start. Prefer seeing a failed
-      // poll (the restart gap), but a lightweight panel can finish the swap
-      // between two 2s polls — every session() then succeeds and sawDown never
-      // flips. After a short grace, accept a healthy session as "back".
-      const started = Date.now()
-      const graceMs = 8_000
-      let sawDown = false
-      for (let i = 0; i < 60; i++) {
-        await new Promise((r) => setTimeout(r, 2000))
-        try {
-          await api.session()
-          if (!sawDown && Date.now() - started < graceMs) {
-            setPanelNote('Waiting for the panel to restart…')
-            continue
-          }
-          // Soft API refreshes leave the browser on the old embedded SPA. The new
-          // container serves a fresh index.html (no-cache) + hashed assets — reload
-          // so version, shell, and UI all match the image we just swapped to.
-          setPanelNote('Panel is back — loading the new UI…')
-          window.location.reload()
-          return
-        } catch {
-          sawDown = true
-          setPanelNote('Panel is restarting…')
-        }
-      }
-      setPanelNote('Still waiting for the panel — reload the page in a moment.')
-      setPanelBusy(false)
-    } catch (e) {
-      setPanelNote(e instanceof ApiError ? e.message : String(e))
-      setPanelBusy(false)
-    }
-  }
-
   return (
     <header className="border-b border-line-soft bg-surface">
       <div className="mx-auto flex max-w-5xl items-center gap-2 px-4 py-3 sm:gap-4 sm:px-6">
@@ -198,12 +152,14 @@ function Header({
             <Button
               variant="primary"
               busy={panelBusy}
-              onClick={() => void updatePanel()}
+              onClick={() => void panelUpdate.start(updates.panel.targetImage)}
               title={`Update panel to ${shortImage(updates.panel.targetImage)}`}
               className="max-sm:px-2 max-sm:text-xs"
             >
-              <span className="sm:hidden">Update</span>
-              <span className="hidden sm:inline">Update panel</span>
+              <span className="sm:hidden">{panelBusy ? 'Updating' : 'Update'}</span>
+              <span className="hidden sm:inline">
+                {panelBusy ? 'Updating panel' : 'Update panel'}
+              </span>
             </Button>
           )}
           <button
@@ -217,11 +173,7 @@ function Header({
           <OverflowMenu session={session} onSignedOut={onSignedOut} />
         </div>
       </div>
-      {panelNote && (
-        <div className="mx-auto max-w-5xl px-4 pb-3 text-xs text-muted sm:px-6">
-          {panelNote}
-        </div>
-      )}
+      <PanelUpdateStatus state={panelUpdate.state} onDismiss={panelUpdate.dismiss} />
     </header>
   )
 }
