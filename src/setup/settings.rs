@@ -1051,6 +1051,37 @@ pub fn link_vault(
     Ok(edited)
 }
 
+/// The config with everything modules can't run beside turned off, so a
+/// `modules_enabled = true` added to it loads: the public ladder, and on every
+/// pool the taker leg, the closer, lean (live and shadow) and TWAP. TWAP has no
+/// switch, so its window and deviation go; the closer is off without
+/// `closer_pool`, and its other values stay. Nothing else is touched.
+/// [`Config::module_conflicts`] names what this turns off.
+pub fn turn_off_module_conflicts(toml_str: &str) -> Result<String> {
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .context("parsing stitch.toml")?;
+    apply_book_enabled(doc.as_table_mut(), Some(false));
+    let pools = doc
+        .get("pools")
+        .and_then(Item::as_array_of_tables)
+        .map_or(0, |a| a.len());
+    for index in 0..pools {
+        let pool = pool_mut(&mut doc, index)?;
+        apply_taker(pool, false);
+        for key in [
+            "closer_pool",
+            "lean_enabled",
+            "lean_shadow",
+            "twap_window_secs",
+            "twap_max_deviation_bps",
+        ] {
+            pool.remove(key);
+        }
+    }
+    Ok(doc.to_string())
+}
+
 /// The config for a bot that trades from its own wallet again: `[vault]`
 /// removed, nothing else touched. The taker leg stays as it is (off, after
 /// [`link_vault`]); turning it back on is the operator's call.

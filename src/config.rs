@@ -1096,6 +1096,26 @@ impl Config {
         .collect()
     }
 
+    /// What this config has switched on that modules can't run beside, as the
+    /// panel names it: the settings [`crate::setup::turn_off_module_conflicts`]
+    /// turns off when modules are turned on. Read from the keys themselves, so a
+    /// flag set without the values that would make the leg run still counts:
+    /// it's still in the file, and it's still what gets removed.
+    pub fn module_conflicts(&self) -> Vec<&'static str> {
+        let any = |on: fn(&PoolConfig) -> bool| self.pools.iter().any(on);
+        [
+            self.book_enabled.then_some("the public ladder"),
+            any(|p| p.limit_taker_enabled == Some(true)).then_some("the taker leg"),
+            any(|p| p.closer_pool.is_some()).then_some("the closer"),
+            any(|p| p.lean_mode() != LeanMode::Off).then_some("lean"),
+            any(|p| p.twap_window_secs.is_some() || p.twap_max_deviation_bps.is_some())
+                .then_some("TWAP"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
         let cfg = toml::from_str::<Self>(s)?;
         cfg.validate()?;

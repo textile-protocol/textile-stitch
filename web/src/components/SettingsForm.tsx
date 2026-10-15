@@ -11,7 +11,7 @@ import {
   Loading,
   Toggle,
 } from './ui'
-import { shortAddress } from '../format'
+import { andList, shortAddress } from '../format'
 import { botPath } from '../botRoutes'
 import type {
   Bot,
@@ -293,16 +293,19 @@ export default function SettingsForm({
             onSaved(message)
           }}
         />
-        <ModulesSubsection
-          bot={bot}
-          settings={loaded}
-          dirty={dirty}
-          onChanged={(next, message) => {
-            setLoaded(next)
-            setDraft(next)
-            onSaved(message)
-          }}
-        />
+        {/* Modules only run from a vault, so the section waits for one. */}
+        {loaded.vaultAddress && (
+          <ModulesSubsection
+            bot={bot}
+            settings={loaded}
+            dirty={dirty}
+            onChanged={(next, message) => {
+              setLoaded(next)
+              setDraft(next)
+              onSaved(message)
+            }}
+          />
+        )}
       </ExperimentalCard>
 
 
@@ -984,10 +987,12 @@ function VaultSubsection({
 }
 
 /**
- * The module feature flag. Turning it on adds the Modules tab and starts every
- * module in Preview, so quotes don't change until the operator switches to
- * Live there. What would stop modules running is listed up front, in the
- * server's words, instead of as an error after the click.
+ * The module feature flag, for a bot that trades from a vault. Turning it on
+ * adds the Modules tab and starts every module in Preview, so quotes don't
+ * change until the operator switches to Live there. It also turns off what
+ * modules can't run alongside (the server names it), and says so first. What
+ * it can't fix for the operator is listed up front, in the server's words,
+ * instead of as an error after the click.
  */
 function ModulesSubsection({
   bot,
@@ -1004,6 +1009,7 @@ function ModulesSubsection({
   const [error, setError] = useState<string | null>(null)
   const on = settings.modulesEnabled
   const blockers = on ? [] : settings.modulesBlockers
+  const turnsOff = on ? [] : settings.modulesTurnsOff
   const name = bot.displayName ?? bot.name
 
   async function toggle() {
@@ -1018,6 +1024,12 @@ function ModulesSubsection({
           `Turn on modules for ${name}?`,
           '',
           `Modules start in Preview: they record what they would do without changing quotes. Switch to Live in the Modules tab when you're ready.${restart}`,
+          ...(turnsOff.length > 0
+            ? [
+                '',
+                `This also turns off ${andList(turnsOff)}, which modules can't run alongside. They stay off if you turn modules off later.`,
+              ]
+            : []),
         ]
     const discard = dirty ? ['', 'Unsaved changes on this page are discarded.'] : []
     if (!window.confirm([...lines, ...discard].join('\n'))) return
@@ -1063,6 +1075,12 @@ function ModulesSubsection({
               ))}
             </ul>
           </div>
+        )}
+        {blockers.length === 0 && turnsOff.length > 0 && (
+          <p className="text-xs text-muted">
+            Turning them on also turns off {andList(turnsOff)}, which modules
+            can&apos;t run alongside.
+          </p>
         )}
         <Button
           variant={on ? 'secondary' : 'primary'}

@@ -200,6 +200,8 @@ export interface Settings {
   modulesEnabled: boolean
   /** Why modules can't run on this bot yet: what its loader refuses, then a missing RFQ credential. Empty when nothing blocks them. */
   modulesBlockers: string[]
+  /** What turning modules on also turns off (the ladder, taker leg, closer, lean, TWAP), by name. */
+  modulesTurnsOff: string[]
 }
 
 export interface RfqEnrollment {

@@ -125,6 +125,9 @@ pub async fn set_enabled(
     super::require_editable(&bot)?;
     let path = super::settings::config_path(&bot)?;
     let raw = super::settings::read_toml(&path)?;
+    let turned_off = toml::from_str::<Config>(&raw)
+        .map(|current| current.module_conflicts())
+        .unwrap_or_default();
     let edited = with_modules_flag(&raw, body.enabled).map_err(ApiError::bad_request)?;
     let cfg = Config::from_toml(&edited).map_err(ApiError::bad_request)?;
     if body.enabled {
@@ -132,10 +135,13 @@ pub async fn set_enabled(
             return Err(ApiError::bad_request(blocker));
         }
     }
-    let note = if body.enabled {
-        "Modules start in Preview: they record what they would do without changing quotes. Configure them in the Modules tab."
-    } else {
-        "The Modules tab is hidden. Its settings stay in stitch.toml for when you turn modules back on."
+    let note = match (body.enabled, turned_off.is_empty()) {
+        (false, _) => "The Modules tab is hidden. Its settings stay in stitch.toml for when you turn modules back on.".to_string(),
+        (true, true) => "Modules start in Preview: they record what they would do without changing quotes. Configure them in the Modules tab.".to_string(),
+        (true, false) => format!(
+            "Modules start in Preview: they record what they would do without changing quotes. Configure them in the Modules tab. Turned off, since modules can't run alongside: {}.",
+            and_list(&turned_off)
+        ),
     };
     super::settings::save_and_restart(
         &state,
@@ -170,13 +176,60 @@ pub(super) fn blockers(
         .collect()
 }
 
+/// What turning modules on would still run into, and what it turns off on the
+/// way. `blockers` is read from the config it would write, so a conflict it
+/// clears isn't listed there; `turns_off` names those instead.
+#[derive(Debug, Default)]
+pub(super) struct Readiness {
+    pub blockers: Vec<String>,
+    pub turns_off: Vec<String>,
+}
+
+pub(super) fn readiness(
+    raw: &str,
+    path: &std::path::Path,
+    runtime: crate::panel::PanelRuntime,
+) -> Readiness {
+    let Ok(current) = toml::from_str::<Config>(raw) else {
+        return Readiness::default();
+    };
+    let candidate =
+        with_modules_flag(raw, true).and_then(|toml| Ok(toml::from_str::<Config>(&toml)?));
+    Readiness {
+        blockers: match candidate {
+            Ok(candidate) => blockers(&candidate, path, runtime),
+            Err(e) => vec![format!("{e:#}")],
+        },
+        turns_off: current
+            .module_conflicts()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn and_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// `raw` with the root `modules_enabled` flag set. A root key prints above the
 /// first table, where the loader reads it; everything else, comments
-/// included, stays as written. Turning modules on also puts a saved
-/// `[modules].mode` back to `shadow`: turning them off keeps that table, so a
-/// bot last run in Live would otherwise restart straight into Live and change
-/// quotes. An absent mode already defaults to `shadow`.
+/// included, stays as written. Turning modules on first turns off what they
+/// can't run beside ([`crate::setup::turn_off_module_conflicts`]), and puts a
+/// saved `[modules].mode` back to `shadow`: turning modules off keeps that
+/// table, so a bot last run in Live would otherwise restart straight into Live
+/// and change quotes. An absent mode already defaults to `shadow`.
 pub fn with_modules_flag(raw: &str, enabled: bool) -> anyhow::Result<String> {
+    let raw = if enabled {
+        crate::setup::turn_off_module_conflicts(raw)?
+    } else {
+        raw.to_string()
+    };
     let mut doc = raw.parse::<toml_edit::DocumentMut>()?;
     doc["modules_enabled"] = toml_edit::value(enabled);
     if enabled {
@@ -492,6 +545,91 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("no RFQ credential"), "{body}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    #[test]
+    fn the_conflict_switch_turns_off_exactly_what_it_names() {
+        let h = harness("module-conflicts");
+        seed(&h, false);
+        let raw = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+        doc["book_enabled"] = toml_edit::value(true);
+        let pool = &mut doc["pools"][0];
+        pool["limit_taker_enabled"] = toml_edit::value(true);
+        pool["closer_pool"] = toml_edit::value("0x0000000000000000000000000000000000000003");
+        pool["floor_ray"] = toml_edit::value("1000000000000000000000000000");
+        pool["lean_shadow"] = toml_edit::value(true);
+        pool["lean_floor_bps"] = toml_edit::value(3.0);
+        pool["twap_window_secs"] = toml_edit::value(60);
+        pool["twap_max_deviation_bps"] = toml_edit::value(50);
+        let on = doc.to_string();
+        let before: Config = toml::from_str(&on).unwrap();
+        assert_eq!(
+            before.module_conflicts(),
+            [
+                "the public ladder",
+                "the taker leg",
+                "the closer",
+                "lean",
+                "TWAP"
+            ]
+        );
+
+        let off = crate::setup::turn_off_module_conflicts(&on).unwrap();
+        let after: Config = toml::from_str(&off).unwrap();
+        assert!(after.module_conflicts().is_empty());
+        assert!(after
+            .modules_blockers()
+            .iter()
+            .all(|b| !b.contains("RFQ-only") && !b.contains("lean or TWAP")));
+        // Only the switches: the closer's and lean's other values stay.
+        assert_eq!(after.pools[0].floor_ray, before.pools[0].floor_ray);
+        assert_eq!(
+            after.pools[0].lean_floor_bps,
+            before.pools[0].lean_floor_bps
+        );
+        assert_eq!(
+            after.pools[0].buy_offset_bps,
+            before.pools[0].buy_offset_bps
+        );
+    }
+    #[tokio::test]
+    async fn turning_modules_on_turns_off_what_they_cannot_run_beside() {
+        let h = harness("module-enable-conflicts");
+        seed(&h, false);
+        let path = h.root.join("bot-a/stitch.toml");
+        let mut doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let pool = &mut doc["pools"][0];
+        pool["twap_window_secs"] = toml_edit::value(60);
+        pool["lean_shadow"] = toml_edit::value(true);
+        pool["lean_floor_bps"] = toml_edit::value(3.0);
+        std::fs::write(&path, doc.to_string()).unwrap();
+
+        let (_, body) = h.get("/api/bots/bot-a/settings").await;
+        let settings = Harness::parse(&body);
+        assert_eq!(settings["modulesBlockers"], serde_json::json!([]));
+        assert_eq!(
+            settings["modulesTurnsOff"],
+            serde_json::json!(["lean", "TWAP"])
+        );
+
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules/enabled",
+                serde_json::json!({"enabled": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(Harness::parse(&body)["message"]
+            .as_str()
+            .unwrap()
+            .contains("lean and TWAP"));
+        let saved = Config::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.modules_enabled);
+        assert!(saved.module_conflicts().is_empty());
+        assert_eq!(saved.pools[0].lean_floor_bps, Some(3.0));
     }
     #[test]
     fn blockers_match_what_the_loader_refuses_in_order() {

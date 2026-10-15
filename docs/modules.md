@@ -6,7 +6,7 @@ Modules are first-party Stitch policies for an OperatorVault. Enable the feature
 modules_enabled = true
 ```
 
-In the panel, **Corridors → Experimental → Turn on modules** sets it for you, always in Preview, even if they were last saved in Live. It lists anything that stops the bot loading with modules on (no vault, a second corridor, the ladder or taker leg, TWAP or lean, or no Textile connection) before you try, and **Turn off modules** sets it back.
+In the panel, a bot that trades from a vault has **Corridors → Experimental → Turn on modules**. It sets the flag for you, always in Preview, even if modules were last saved in Live. It also turns off what they can't run alongside: the public ladder, the taker leg, the closer, lean and TWAP (TWAP has no switch, so its window and deviation are removed). Those stay off if you turn modules off later. What it can't fix for you (a second corridor, RFQ off, or no Textile connection) is listed before you try, and **Turn off modules** sets the flag back.
 
 It defaults to false. With the flag absent or false, there is no module runtime, decision recorder, dealer traffic, Modules tab or module API access. Existing quotes use their existing prices and sizing.
 
