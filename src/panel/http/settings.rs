@@ -190,6 +190,9 @@ pub struct SettingsBody {
     pub rfq_api_key_set: bool,
     /// The OperatorVault the bot trades from, or empty for its own wallet.
     pub vault_address: String,
+    pub modules_enabled: bool,
+    /// Why modules can't run on this bot yet. See `modules::blockers`.
+    pub modules_blockers: Vec<String>,
 }
 
 impl SettingsBody {
@@ -199,6 +202,7 @@ impl SettingsBody {
         rfq_api_key_set: bool,
         rfq_panel_unlocked: bool,
         rfq_default_unlocked: bool,
+        modules_blockers: Vec<String>,
     ) -> Self {
         Self {
             rpc_url: v.rpc_url.clone(),
@@ -233,8 +237,22 @@ impl SettingsBody {
             rfq_corridor: v.rfq_corridor.clone(),
             rfq_api_key_set,
             vault_address: v.vault_address.clone(),
+            modules_enabled: v.modules_enabled,
+            modules_blockers,
         }
     }
+}
+
+/// See [`super::modules::blockers`]. Empty for a config the loader refuses: the
+/// settings view can't be built from it either.
+fn modules_blockers_at(
+    toml: &str,
+    path: &std::path::Path,
+    runtime: crate::panel::PanelRuntime,
+) -> Vec<String> {
+    Config::from_toml(toml)
+        .map(|cfg| super::modules::blockers(&cfg, path, runtime))
+        .unwrap_or_default()
 }
 
 fn rfq_key_is_set(config_path: &std::path::Path) -> bool {
@@ -331,6 +349,7 @@ pub async fn show(
         rfq_key_is_set(&path),
         rfq_panel,
         rfq_default,
+        modules_blockers_at(&toml, &path, state.cfg.runtime),
     ))
     .into_response())
 }
@@ -1078,6 +1097,7 @@ pub async fn remove_pool(
             rfq_key_is_set(&path),
             rfq_panel,
             rfq_default,
+            modules_blockers_at(&fresh, &path, state.cfg.runtime),
         ),
         "restarted": restarted,
         "restartError": restart_error,
@@ -1467,6 +1487,7 @@ pub(super) async fn save_and_restart(
             rfq_key_is_set(path),
             rfq_panel,
             rfq_default,
+            modules_blockers_at(&fresh, path, state.cfg.runtime),
         ),
         "restarted": restarted,
         "restartError": restart_error,
@@ -1583,6 +1604,7 @@ async fn apply_live_change(
                 rfq_key_is_set(path),
                 rfq_panel,
                 rfq_default,
+                modules_blockers_at(&fresh, path, state.cfg.runtime),
             ),
             "restarted": restarted,
             "restartError": restart_error,

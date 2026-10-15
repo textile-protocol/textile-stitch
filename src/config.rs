@@ -1073,6 +1073,27 @@ impl Config {
         .collect()
     }
 
+    /// Why `modules_enabled = true` would be refused on this config, in the
+    /// order `validate` reports them. Empty when modules can be turned on. The
+    /// panel shows these before the operator tries, so they read as fixes.
+    pub fn modules_blockers(&self) -> Vec<&'static str> {
+        [
+            (!(self.vault.is_some() && self.pools.len() == 1 && self.rfq_active()))
+                .then_some("modules require an OperatorVault, one corridor and enabled RFQ"),
+            (self.book_enabled || !self.on_chain_legs().is_empty()).then_some(
+                "modules require RFQ-only operation; disable the ladder, limit taker and closer",
+            ),
+            (!self
+                .pools
+                .iter()
+                .all(|p| p.lean_mode() == LeanMode::Off && p.twap_window_secs.is_none()))
+            .then_some("modules cannot be combined with legacy lean or TWAP settings"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
         let cfg = toml::from_str::<Self>(s)?;
         cfg.validate()?;
@@ -1329,20 +1350,9 @@ impl Config {
         }
         if self.modules_enabled {
             self.modules.validate()?;
-            anyhow::ensure!(
-                self.vault.is_some() && self.pools.len() == 1 && self.rfq_active(),
-                "modules require an OperatorVault, one corridor and enabled RFQ"
-            );
-            anyhow::ensure!(
-                !self.book_enabled && self.on_chain_legs().is_empty(),
-                "modules require RFQ-only operation; disable the ladder, limit taker and closer"
-            );
-            anyhow::ensure!(
-                self.pools
-                    .iter()
-                    .all(|p| p.lean_mode() == LeanMode::Off && p.twap_window_secs.is_none()),
-                "modules cannot be combined with legacy lean or TWAP settings"
-            );
+            if let Some(blocker) = self.modules_blockers().first() {
+                anyhow::bail!("{blocker}");
+            }
         }
         if let Some(signer) = &self.signer {
             match signer {

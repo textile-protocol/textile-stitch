@@ -153,6 +153,8 @@ pub struct SettingsView {
     /// it trades from its own wallet. Bot-wide: every corridor on the bot
     /// shares the capital, so they share the vault.
     pub vault_address: String,
+    /// The root `modules_enabled` flag.
+    pub modules_enabled: bool,
 }
 
 impl SettingsView {
@@ -312,6 +314,7 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
             .as_ref()
             .map(|v| v.address.clone())
             .unwrap_or_default(),
+        modules_enabled: cfg.modules_enabled,
     })
 }
 

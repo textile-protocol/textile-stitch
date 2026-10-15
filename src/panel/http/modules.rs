@@ -102,10 +102,135 @@ pub async fn update(
         .parse::<toml_edit::DocumentMut>()
         .map_err(ApiError::bad_request)?;
     doc["modules"] = toml_edit::Item::Table(block.as_table().clone());
+    place_last(&mut doc, "modules");
     let edited = doc.to_string();
     Config::from_toml(&edited).map_err(ApiError::bad_request)?;
     super::settings::save_and_restart(&state, &bot, &path, &edited, 0, None).await
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Enabled {
+    pub enabled: bool,
+}
+/// Turn the module feature flag on or off. Separate from `update` because
+/// `read` refuses every module route while the flag is off. The loader decides
+/// whether this config can run modules, so a blocked bot gets its reason back
+/// and nothing is written.
+pub async fn set_enabled(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<Enabled>,
+) -> Result<Response, ApiError> {
+    let (_lock, bot) = super::bots::lock_config(&name, &state).await?;
+    super::require_editable(&bot)?;
+    let path = super::settings::config_path(&bot)?;
+    let raw = super::settings::read_toml(&path)?;
+    let edited = with_modules_flag(&raw, body.enabled).map_err(ApiError::bad_request)?;
+    let cfg = Config::from_toml(&edited).map_err(ApiError::bad_request)?;
+    if body.enabled {
+        if let Some(blocker) = blockers(&cfg, &path, state.cfg.runtime).into_iter().next() {
+            return Err(ApiError::bad_request(blocker));
+        }
+    }
+    let note = if body.enabled {
+        "Modules start in Preview: they record what they would do without changing quotes. Configure them in the Modules tab."
+    } else {
+        "The Modules tab is hidden. Its settings stay in stitch.toml for when you turn modules back on."
+    };
+    super::settings::save_and_restart(
+        &state,
+        &bot,
+        &path,
+        &edited,
+        0,
+        Some(serde_json::json!({ "note": note })),
+    )
+    .await
+}
+
+const NO_RFQ_CREDENTIAL: &str =
+    "modules require a Textile connection; no RFQ credential reaches this bot";
+
+/// What stops modules running on this bot, in the order they're reported: what
+/// the loader refuses, then the RFQ credential. The credential lives beside the
+/// config rather than in it, and the module runtime is built inside the RFQ
+/// runtime, which never starts without one: the flag would be on and nothing
+/// would run. Checked with the same rule as the Start guard.
+pub(super) fn blockers(
+    cfg: &Config,
+    path: &std::path::Path,
+    runtime: crate::panel::PanelRuntime,
+) -> Vec<String> {
+    let no_credential =
+        cfg.rfq_active() && !crate::panel::inventory::rfq_key_reaches_bot(cfg, path, runtime);
+    cfg.modules_blockers()
+        .into_iter()
+        .map(String::from)
+        .chain(no_credential.then(|| NO_RFQ_CREDENTIAL.to_string()))
+        .collect()
+}
+
+/// `raw` with the root `modules_enabled` flag set. A root key prints above the
+/// first table, where the loader reads it; everything else, comments
+/// included, stays as written. Turning modules on also puts a saved
+/// `[modules].mode` back to `shadow`: turning them off keeps that table, so a
+/// bot last run in Live would otherwise restart straight into Live and change
+/// quotes. An absent mode already defaults to `shadow`.
+pub fn with_modules_flag(raw: &str, enabled: bool) -> anyhow::Result<String> {
+    let mut doc = raw.parse::<toml_edit::DocumentMut>()?;
+    doc["modules_enabled"] = toml_edit::value(enabled);
+    if enabled {
+        if let Some(modules) = doc
+            .get_mut("modules")
+            .and_then(toml_edit::Item::as_table_like_mut)
+        {
+            modules.insert("mode", toml_edit::value("shadow"));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Print the table at `key`, and every table under it, as one block after the
+/// rest of the document. A table built from a separate document keeps that
+/// document's positions, which start at zero, so `[modules.inventory]` would
+/// otherwise land above `[[pools]]` and `[modules]` itself at the very end.
+fn place_last(doc: &mut toml_edit::DocumentMut, key: &str) {
+    let mut next = doc
+        .iter()
+        .filter(|(k, _)| *k != key)
+        .filter_map(|(_, item)| last_position(item))
+        .max()
+        .map_or(0, |p| p + 1);
+    if let Some(table) = doc.get_mut(key).and_then(toml_edit::Item::as_table_mut) {
+        renumber(table, &mut next);
+    }
+}
+/// The highest document position of `item` or anything nested in it.
+fn last_position(item: &toml_edit::Item) -> Option<usize> {
+    let within = |t: &toml_edit::Table| {
+        t.iter()
+            .filter_map(|(_, child)| last_position(child))
+            .chain(t.position())
+            .max()
+    };
+    match item {
+        toml_edit::Item::Table(t) => within(t),
+        toml_edit::Item::ArrayOfTables(a) => a.iter().filter_map(within).max(),
+        _ => None,
+    }
+}
+fn renumber(table: &mut toml_edit::Table, next: &mut usize) {
+    table.set_position(*next);
+    *next += 1;
+    for (_, item) in table.iter_mut() {
+        match item {
+            toml_edit::Item::Table(t) => renumber(t, next),
+            toml_edit::Item::ArrayOfTables(a) => a.iter_mut().for_each(|t| renumber(t, next)),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testkit::{harness, Harness, TEST_KEY};
@@ -118,6 +243,7 @@ mod tests {
             TEST_KEY,
         )
         .unwrap();
+        crate::setup::write_rfq_api_key(h.root.join("bot-a"), "tx_live_module_tests").unwrap();
         let path = h.root.join("bot-a/stitch.toml");
         let mut doc = std::fs::read_to_string(&path)
             .unwrap()
@@ -226,5 +352,204 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+
+    fn table_headers(toml: &str) -> Vec<String> {
+        toml.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('['))
+            .map(String::from)
+            .collect()
+    }
+    #[tokio::test]
+    async fn turning_modules_on_and_off_flips_only_the_root_flag() {
+        let h = harness("module-enable");
+        seed(&h, false);
+        let path = h.root.join("bot-a/stitch.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            h.get("/api/bots/bot-a/modules").await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules/enabled",
+                serde_json::json!({"enabled": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let res = Harness::parse(&body);
+        assert_eq!(res["settings"]["modulesEnabled"], true);
+        assert!(res["message"].as_str().unwrap().contains("Preview"));
+        let on = std::fs::read_to_string(&path).unwrap();
+        let flag = on.find("modules_enabled = true").expect("flag written");
+        assert!(
+            flag < on.find("\n[").unwrap(),
+            "root keys must precede the first table"
+        );
+        assert_eq!(
+            table_headers(&on),
+            table_headers(&before),
+            "no tables added or moved"
+        );
+        assert_eq!(h.get("/api/bots/bot-a/modules").await.0, StatusCode::OK);
+
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules/enabled",
+                serde_json::json!({"enabled": false}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("modules_enabled = false"));
+        assert_eq!(
+            h.get("/api/bots/bot-a/modules").await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    #[tokio::test]
+    async fn turning_modules_back_on_after_live_starts_in_preview() {
+        let h = harness("module-reenable");
+        seed(&h, true);
+        let (_, body) = h.get("/api/bots/bot-a/modules").await;
+        let view = Harness::parse(&body);
+        let mut config = view["config"].clone();
+        config["mode"] = serde_json::json!("live");
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules",
+                serde_json::json!({"revision": view["revision"], "config": config}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for enabled in [false, true] {
+            let (status, body) = h
+                .put_json(
+                    "/api/bots/bot-a/modules/enabled",
+                    serde_json::json!({"enabled": enabled}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (_, body) = h.get("/api/bots/bot-a/modules").await;
+        let view = Harness::parse(&body);
+        assert_eq!(view["config"]["mode"], "shadow");
+        assert_eq!(
+            view["config"]["inventory"]["target_bps"],
+            config["inventory"]["target_bps"]
+        );
+    }
+    #[tokio::test]
+    async fn a_bot_modules_cannot_run_on_says_why_and_keeps_its_config() {
+        let h = harness("module-enable-blocked");
+        seed(&h, false);
+        let path = h.root.join("bot-a/stitch.toml");
+        let mut doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc.remove("vault");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let (_, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(
+            Harness::parse(&body)["modulesBlockers"],
+            serde_json::json!(["modules require an OperatorVault, one corridor and enabled RFQ"])
+        );
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules/enabled",
+                serde_json::json!({"enabled": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("OperatorVault"), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    #[tokio::test]
+    async fn modules_stay_off_until_an_rfq_credential_reaches_the_bot() {
+        let h = harness("module-enable-no-key");
+        seed(&h, false);
+        std::fs::remove_file(h.root.join("bot-a").join(crate::setup::RFQ_API_KEY_FILE)).unwrap();
+        let path = h.root.join("bot-a/stitch.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let (_, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(
+            Harness::parse(&body)["modulesBlockers"],
+            serde_json::json!([NO_RFQ_CREDENTIAL])
+        );
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules/enabled",
+                serde_json::json!({"enabled": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("no RFQ credential"), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    #[test]
+    fn blockers_match_what_the_loader_refuses_in_order() {
+        let h = harness("module-blockers");
+        seed(&h, true);
+        let raw = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(Config::from_toml(&raw)
+            .unwrap()
+            .modules_blockers()
+            .is_empty());
+        let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+        doc["pools"][0]["limit_taker_enabled"] = toml_edit::value(true);
+        doc["pools"][0]["twap_window_secs"] = toml_edit::value(60);
+        let blocked = doc.to_string();
+        let parsed: Config = toml::from_str(&blocked).unwrap();
+        assert_eq!(
+            parsed.modules_blockers(),
+            [
+                "modules require RFQ-only operation; disable the ladder, limit taker and closer",
+                "modules cannot be combined with legacy lean or TWAP settings",
+            ]
+        );
+        assert_eq!(
+            Config::from_toml(&blocked).unwrap_err().to_string(),
+            parsed.modules_blockers()[0]
+        );
+    }
+    #[tokio::test]
+    async fn saved_module_settings_print_as_one_block_after_the_other_tables() {
+        let h = harness("module-layout");
+        seed(&h, true);
+        let path = h.root.join("bot-a/stitch.toml");
+        let before = table_headers(&std::fs::read_to_string(&path).unwrap());
+        for target in [2500, 2600] {
+            let (_, body) = h.get("/api/bots/bot-a/modules").await;
+            let view = Harness::parse(&body);
+            let mut config = view["config"].clone();
+            config["inventory"]["target_bps"] = serde_json::json!(target);
+            let (status, body) = h
+                .put_json(
+                    "/api/bots/bot-a/modules",
+                    serde_json::json!({"revision": view["revision"], "config": config}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let headers = table_headers(&std::fs::read_to_string(&path).unwrap());
+            let block = [
+                "[modules]",
+                "[modules.inventory]",
+                "[modules.spreads]",
+                "[modules.rebalance]",
+            ];
+            assert_eq!(
+                &headers[..before.len()],
+                &before[..],
+                "operator tables keep their order"
+            );
+            assert_eq!(&headers[before.len()..], &block[..], "{headers:?}");
+        }
     }
 }

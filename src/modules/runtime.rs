@@ -18,6 +18,22 @@ pub const MAX_DECISIONS: usize = 200;
 /// Most samples the window keeps: one per second over the longest allowed window.
 const MAX_HISTORY: usize = 3601;
 
+/// Every module file goes through `write_toml_atomic`, which stages in one fixed
+/// temp per target and clears a leftover temp before it starts. Two writers on
+/// the same file would delete or rename each other's temp, and a restart inside
+/// one process has two: the new runtime's first snapshot while the old one's
+/// last is still landing. One lock keeps module writes one at a time; they are
+/// small and coalesced, so it is never held for long.
+static WRITES: Mutex<()> = Mutex::new(());
+
+fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let json = serde_json::to_string(value)?;
+    let _one_at_a_time = WRITES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::setup::write_toml_atomic(path, &json)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Balances {
     pub settlement: U256,
@@ -138,10 +154,9 @@ fn spawn_history_writer(dir: &Path, source: String) -> tokio::sync::watch::Sende
                 points: receiver.borrow_and_update().clone(),
             };
             let path = path.clone();
-            let write = tokio::task::spawn_blocking(move || -> Result<()> {
-                crate::setup::write_toml_atomic(&path, &serde_json::to_string(&saved)?)
-            })
-            .await;
+            let write =
+                tokio::task::spawn_blocking(move || -> Result<()> { write_json(&path, &saved) })
+                    .await;
             if !matches!(write, Ok(Ok(()))) {
                 tracing::error!("module price history could not be saved");
             }
@@ -194,7 +209,7 @@ impl Runtime {
             }),
         };
         // Write an initial snapshot synchronously: unwritable storage must fail startup.
-        crate::setup::write_toml_atomic(&dir.join(STATUS_FILE), &serde_json::to_string(&status)?)?;
+        write_json(&dir.join(STATUS_FILE), &status)?;
         // A slow disk may coalesce snapshots, but must keep the latest state
         // (especially disconnects) rather than dropping it behind an old write.
         let (writer, mut receiver) = tokio::sync::watch::channel(status.clone());
@@ -204,7 +219,7 @@ impl Runtime {
                 let snapshot = receiver.borrow_and_update().clone();
                 let path = status_path.clone();
                 let write = tokio::task::spawn_blocking(move || -> Result<()> {
-                    crate::setup::write_toml_atomic(&path, &serde_json::to_string(&snapshot)?)
+                    write_json(&path, &snapshot)
                 })
                 .await;
                 if !matches!(write, Ok(Ok(()))) {
@@ -333,12 +348,12 @@ impl Runtime {
             return Ok(());
         }
         let next = now.saturating_add(self.config.rebalance.cooldown_secs);
-        crate::setup::write_toml_atomic(
+        write_json(
             &self.dir.join(ATTEMPTS_FILE),
-            &serde_json::to_string(&Attempt {
+            &Attempt {
                 version: VERSION,
                 next_attempt_at: next,
-            })?,
+            },
         )?;
         state.status.next_attempt_at = next;
         state.fetching = true;
@@ -366,5 +381,33 @@ impl Runtime {
     }
     pub fn take_quote(&self) -> Option<(dealer::QuoteRequest, dealer::Quote)> {
         self.state.lock().ok()?.ready.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_writes_to_one_module_file_all_land() {
+        let dir =
+            std::env::temp_dir().join(format!("stitch-module-writes-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(STATUS_FILE);
+        let writers: Vec<_> = (0..8u32)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    (0..100u32).try_for_each(|n| write_json(&path, &(writer, n)))
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let last: (u32, u32) =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(last.1, 99);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

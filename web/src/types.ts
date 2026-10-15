@@ -196,6 +196,10 @@ export interface Settings {
   vaultAddress: string
   /** A maker API key is stored on disk. The secret itself is never returned. */
   rfqApiKeySet: boolean
+  /** The root `modules_enabled` flag. */
+  modulesEnabled: boolean
+  /** Why modules can't run on this bot yet: what its loader refuses, then a missing RFQ credential. Empty when nothing blocks them. */
+  modulesBlockers: string[]
 }
 
 export interface RfqEnrollment {

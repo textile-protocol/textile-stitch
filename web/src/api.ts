@@ -425,6 +425,16 @@ export const api = {
       json({ address }),
     ),
 
+  /**
+   * Turn the module feature flag on or off, restarting a running bot. A bot
+   * modules can't run on gets the loader's reason back and nothing is written.
+   */
+  setModulesEnabled: (name: string, enabled: boolean) =>
+    request<SaveResult>(
+      `/api/bots/${encodeURIComponent(name)}/modules/enabled`,
+      { method: 'PUT', body: JSON.stringify({ enabled }) },
+    ),
+
   /** Back to the bot's own wallet: re-connects to Textile and restarts. */
   unlinkVault: (name: string) =>
     request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/vault`, {

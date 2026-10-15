@@ -12,6 +12,7 @@ import {
   Toggle,
 } from './ui'
 import { shortAddress } from '../format'
+import { botPath } from '../botRoutes'
 import type {
   Bot,
   Corridor,
@@ -287,6 +288,16 @@ export default function SettingsForm({
           dirty={dirty}
           onChanged={(next, message) => {
             setPool(next.poolIndex)
+            setLoaded(next)
+            setDraft(next)
+            onSaved(message)
+          }}
+        />
+        <ModulesSubsection
+          bot={bot}
+          settings={loaded}
+          dirty={dirty}
+          onChanged={(next, message) => {
             setLoaded(next)
             setDraft(next)
             onSaved(message)
@@ -966,6 +977,101 @@ function VaultSubsection({
               : 'Connecting to Textile with the bot\'s own wallet and saving.'}
           </p>
         )}
+        {error && <Banner tone="danger">{error}</Banner>}
+      </div>
+    </ExperimentalSubsection>
+  )
+}
+
+/**
+ * The module feature flag. Turning it on adds the Modules tab and starts every
+ * module in Preview, so quotes don't change until the operator switches to
+ * Live there. What would stop modules running is listed up front, in the
+ * server's words, instead of as an error after the click.
+ */
+function ModulesSubsection({
+  bot,
+  settings,
+  dirty,
+  onChanged,
+}: {
+  bot: Bot
+  settings: Settings
+  dirty: boolean
+  onChanged: (settings: Settings, message: string) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const on = settings.modulesEnabled
+  const blockers = on ? [] : settings.modulesBlockers
+  const name = bot.displayName ?? bot.name
+
+  async function toggle() {
+    const restart = bot.running ? ` ${name} restarts to apply it.` : ''
+    const lines = on
+      ? [
+          `Turn off modules for ${name}?`,
+          '',
+          `Quotes go back to your corridor spreads and the Modules tab is hidden. Module settings stay in stitch.toml, and orders already signed stay valid until they expire.${restart}`,
+        ]
+      : [
+          `Turn on modules for ${name}?`,
+          '',
+          `Modules start in Preview: they record what they would do without changing quotes. Switch to Live in the Modules tab when you're ready.${restart}`,
+        ]
+    const discard = dirty ? ['', 'Unsaved changes on this page are discarded.'] : []
+    if (!window.confirm([...lines, ...discard].join('\n'))) return
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await api.setModulesEnabled(bot.name, !on)
+      onChanged(res.settings, res.message)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <ExperimentalSubsection
+      title="FX protection modules"
+      description="Inventory balancing, dynamic spreads and spot rebalancing for a bot that trades from a vault. They steer corridor holdings toward a target and widen Swap margins when prices move."
+    >
+      <div className="space-y-3">
+        <p className="text-sm">
+          {on ? (
+            <>
+              On. Configure them in the{' '}
+              <Link to={botPath(bot.name, 'modules')} className="underline">
+                Modules tab
+              </Link>
+              .
+            </>
+          ) : (
+            'Off.'
+          )}
+        </p>
+        {blockers.length > 0 && (
+          <div className="rounded-lg bg-hover p-3">
+            <p className="text-sm font-bold">Before you can turn them on</p>
+            <ul className="mt-1 list-disc space-y-1 pl-5 text-xs text-muted">
+              {blockers.map((blocker) => (
+                <li key={blocker} className="first-letter:uppercase">
+                  {blocker}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <Button
+          variant={on ? 'secondary' : 'primary'}
+          busy={busy}
+          disabled={!settings.editable || busy || blockers.length > 0}
+          onClick={() => void toggle()}
+        >
+          {on ? 'Turn off modules' : 'Turn on modules'}
+        </Button>
         {error && <Banner tone="danger">{error}</Banner>}
       </div>
     </ExperimentalSubsection>

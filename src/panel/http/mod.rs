@@ -311,6 +311,10 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             get(modules::show).put(modules::update),
         )
         .route(
+            "/api/bots/{name}/modules/enabled",
+            put(modules::set_enabled),
+        )
+        .route(
             "/api/bots/{name}/modules/manual-sales",
             get(manual_sales::list).post(manual_sales::create),
         )

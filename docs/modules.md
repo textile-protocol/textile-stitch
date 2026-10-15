@@ -6,6 +6,8 @@ Modules are first-party Stitch policies for an OperatorVault. Enable the feature
 modules_enabled = true
 ```
 
+In the panel, **Corridors → Experimental → Turn on modules** sets it for you, always in Preview, even if they were last saved in Live. It lists anything that stops the bot loading with modules on (no vault, a second corridor, the ladder or taker leg, TWAP or lean, or no Textile connection) before you try, and **Turn off modules** sets it back.
+
 It defaults to false. With the flag absent or false, there is no module runtime, decision recorder, dealer traffic, Modules tab or module API access. Existing quotes use their existing prices and sizing.
 
 Enabling the flag opens the Modules panel and starts in **shadow** mode. Shadow records proposals while preserving existing quoting. Choose Live and save to apply enabled policies. Saving uses the normal validated config/restart flow; a stopped bot stays stopped. Off stops new module actions. Previously signed orders remain reserved and executable until expiry, including after the master flag is disabled.
@@ -69,7 +71,7 @@ The panel polls every five seconds and expires live readings independently of su
 
 ## Configuring modules in the panel
 
-Parameters shows the whole module config as one **Quote strategy** card. The run mode (Off, Preview, Live) sits in its header. Each module gets a row with its on/off switch, its two defining settings and its preset. **Edit** opens that row's values in place, one module at a time. Each open module has a **How … works** link in its top-right corner that explains the behavior. Percentages replace basis points in the form (0.01% = 1 bps); the saved TOML and API units are unchanged. Sliders have exact numeric inputs. Main controls come first; price floors, timing and execution limits sit below them in separate, always-visible panels (**Price adjustments**, **Observation timing**, **Execution limits**). Manual sale requests have their own tab; dealer credentials are configured through TOML. Preview is the panel name for `shadow` mode.
+Parameters shows the whole module config as one **Quote strategy** card. The run mode (Off, Preview, Live) sits in its header. Each module gets a row with its on/off switch, its two defining settings and its preset. **Edit** opens that row's values in place, one module at a time. Each open module has a **How … works** link in its top-right corner that explains the behavior. Percentages replace basis points in the form (0.01% = 1 bps); the saved TOML and API units are unchanged. Sliders have exact numeric inputs. Saving writes the `[modules]` tables as one block after the bot's other tables. Main controls come first; price floors, timing and execution limits sit below them in separate, always-visible panels (**Price adjustments**, **Observation timing**, **Execution limits**). Manual sale requests have their own tab; dealer credentials are configured through TOML. Preview is the panel name for `shadow` mode.
 
 Inventory balancing and dynamic spreads each offer three draft-only presets: **Competitive**, **Balanced** and **Defensive**. Pick one from the **Preset** button at the top of an open module. Selecting one preserves run mode, module switches, the inventory minimum margin and dealer settings. Manual edits remain available. Open **How these presets were chosen** at the bottom of the preset list for the tradeoffs and dated market-data check; see [preset settings and evidence](./module-presets.md) for the full rationale. Existing configurations are never automatically migrated to a preset.
 
