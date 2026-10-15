@@ -283,6 +283,37 @@ export const api = {
     ),
 
   /**
+   * Read a Cloud KMS key version's public key and sign one throwaway message
+   * with it. Returns the address the signature recovered to (which fills in the
+   * operator address), the key's protection level, and how long the sign took.
+   * The service-account key is used for the call and dropped.
+   */
+  gcpkmsVerify: (body: {
+    keyVersion: string
+    credentialsJson: string
+    apiBaseUrl?: string
+  }) =>
+    request<{ address: string; protectionLevel: string; latencyMs: number }>(
+      '/api/signer/gcpkms/verify',
+      json(body),
+    ),
+
+  /**
+   * Read an AWS KMS key's public key and sign one throwaway message with it.
+   * Returns the address the signature recovered to (which fills in the
+   * operator address) and how long the sign took. The access key is used for
+   * the call and dropped.
+   */
+  awskmsVerify: (body: {
+    keyId: string
+    accessKeyId: string
+    secretAccessKey: string
+    region?: string
+    apiBaseUrl?: string
+  }) =>
+    request<{ address: string; latencyMs: number }>('/api/signer/awskms/verify', json(body)),
+
+  /**
    * Dry-run: which other bots already use this signer on this chain. Used to warn
    * before create — sharing a wallet races nonces.
    */

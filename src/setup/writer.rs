@@ -24,6 +24,8 @@ pub enum SignerKind {
     Turnkey,
     Mpcvault,
     Fireblocks,
+    Gcpkms,
+    Awskms,
 }
 
 impl SignerKind {
@@ -34,6 +36,8 @@ impl SignerKind {
             SignerKind::Turnkey => "MPC — Turnkey",
             SignerKind::Mpcvault => "MPC — MPCVault",
             SignerKind::Fireblocks => "MPC — Fireblocks",
+            SignerKind::Gcpkms => "HSM — Google Cloud KMS",
+            SignerKind::Awskms => "HSM — AWS KMS",
         }
     }
 
@@ -69,14 +73,18 @@ impl SignerKind {
             SignerKind::Turnkey => "turnkey-api.key",
             SignerKind::Mpcvault => "mpcvault-api.token",
             SignerKind::Fireblocks => "fireblocks-api.key",
+            SignerKind::Gcpkms => "gcpkms-credentials.json",
+            SignerKind::Awskms => "awskms-credentials.ini",
         }
     }
 
-    pub const ALL: [SignerKind; 4] = [
+    pub const ALL: [SignerKind; 6] = [
         SignerKind::Local,
         SignerKind::Turnkey,
         SignerKind::Mpcvault,
         SignerKind::Fireblocks,
+        SignerKind::Gcpkms,
+        SignerKind::Awskms,
     ];
 }
 
@@ -163,6 +171,26 @@ pub enum SignerSetup {
         api_key: String,
         api_private_key: String,
     },
+    /// Google Cloud KMS. The service-account JSON key is the secret
+    /// (→ gcpkms-credentials.json); `operator_address` is resolved from the key
+    /// version by the panel's Verify rather than typed.
+    Gcpkms {
+        key_version: String,
+        operator_address: String,
+        api_base_url: Option<String>,
+        credentials_json: String,
+    },
+    /// AWS KMS. The access key is the secret (→ awskms-credentials.ini, in the
+    /// standard AWS credentials format); `operator_address` is resolved from the
+    /// key by the panel's Verify rather than typed.
+    Awskms {
+        key_id: String,
+        region: Option<String>,
+        operator_address: String,
+        api_base_url: Option<String>,
+        access_key_id: String,
+        secret_access_key: String,
+    },
 }
 
 impl SignerSetup {
@@ -172,6 +200,8 @@ impl SignerSetup {
             SignerSetup::Turnkey { .. } => SignerKind::Turnkey,
             SignerSetup::Mpcvault { .. } => SignerKind::Mpcvault,
             SignerSetup::Fireblocks { .. } => SignerKind::Fireblocks,
+            SignerSetup::Gcpkms { .. } => SignerKind::Gcpkms,
+            SignerSetup::Awskms { .. } => SignerKind::Awskms,
         }
     }
 
@@ -188,6 +218,12 @@ impl SignerSetup {
                 operator_address, ..
             }
             | SignerSetup::Fireblocks {
+                operator_address, ..
+            }
+            | SignerSetup::Gcpkms {
+                operator_address, ..
+            }
+            | SignerSetup::Awskms {
                 operator_address, ..
             } => parse_address(operator_address),
         }
@@ -590,6 +626,12 @@ fn render_env_for(paths: &ConfigPaths, signer: &SignerSetup) -> String {
             "FIREBLOCKS_API_KEY={}\nFIREBLOCKS_API_PRIVATE_KEY_FILE={secret}\n",
             q(api_key.trim())
         ),
+        SignerSetup::Gcpkms { .. } => {
+            format!("{}={secret}\n", crate::signer::gcpkms::CREDENTIALS_FILE_ENV)
+        }
+        SignerSetup::Awskms { .. } => {
+            format!("{}={secret}\n", crate::signer::awskms::CREDENTIALS_FILE_ENV)
+        }
     };
     format!("{head}RUST_LOG=info\n")
 }
@@ -612,6 +654,14 @@ fn write_signer_secrets(paths: &ConfigPaths, signer: &SignerSetup) -> Result<()>
         SignerSetup::Fireblocks {
             api_private_key, ..
         } => format!("{}\n", api_private_key.trim_end()),
+        SignerSetup::Gcpkms {
+            credentials_json, ..
+        } => format!("{}\n", credentials_json.trim()),
+        SignerSetup::Awskms {
+            access_key_id,
+            secret_access_key,
+            ..
+        } => crate::signer::awskms::credentials_ini(access_key_id, secret_access_key)?.to_string(),
     };
     let path = secret_path(paths, signer);
     let res = write_key_file_atomic(&path, line.as_bytes())
@@ -691,6 +741,30 @@ fn signer_table(signer: &SignerSetup) -> toml_edit::Table {
             if *raw_signing {
                 t["raw_signing"] = value(true);
             }
+        }
+        SignerSetup::Gcpkms {
+            key_version,
+            operator_address,
+            api_base_url,
+            ..
+        } => {
+            t["provider"] = value("gcpkms");
+            t["key_version"] = value(key_version.trim());
+            t["operator_address"] = value(operator_address.trim());
+            set_opt(&mut t, "api_base_url", api_base_url);
+        }
+        SignerSetup::Awskms {
+            key_id,
+            region,
+            operator_address,
+            api_base_url,
+            ..
+        } => {
+            t["provider"] = value("awskms");
+            t["key_id"] = value(key_id.trim());
+            t["operator_address"] = value(operator_address.trim());
+            set_opt(&mut t, "region", region);
+            set_opt(&mut t, "api_base_url", api_base_url);
         }
         SignerSetup::Local { .. } => {}
     }
@@ -774,6 +848,39 @@ fn validate_signer(signer: &SignerSetup) -> Result<()> {
             // PEM is the one field an operator supplies by file, and a partial
             // copy is easy to make and invisible afterwards.
             crate::signer::fireblocks::parse_rsa_pem(api_private_key)?;
+        }
+        SignerSetup::Gcpkms {
+            key_version,
+            operator_address,
+            credentials_json,
+            ..
+        } => {
+            crate::signer::gcpkms::validate_key_version(key_version)?;
+            parse_address(operator_address)
+                .context("operator address is not a valid EVM address")?;
+            need(
+                !credentials_json.trim().is_empty(),
+                "the service-account JSON key is required",
+            )?;
+            // A half-pasted or wrong-type file fails here, not at the first sign.
+            crate::signer::gcpkms::validate_credentials_json(credentials_json)?;
+        }
+        SignerSetup::Awskms {
+            key_id,
+            region,
+            operator_address,
+            access_key_id,
+            secret_access_key,
+            ..
+        } => {
+            crate::signer::awskms::validate_key_id(key_id)?;
+            // A panel bot reads no AWS_REGION or instance metadata, so the
+            // region has to be in the config: from the ARN, or given.
+            crate::signer::awskms::key_region(key_id, region.as_deref())?
+                .context("paste the key ARN, or give the key's region")?;
+            parse_address(operator_address)
+                .context("operator address is not a valid EVM address")?;
+            crate::signer::awskms::credentials_ini(access_key_id, secret_access_key)?;
         }
     }
     Ok(())
@@ -1341,6 +1448,142 @@ mod tests {
             secret.ends_with("-----END PRIVATE KEY-----\n"),
             "the PEM keeps exactly one trailing newline"
         );
+    }
+
+    const GCP_KEY_VERSION: &str =
+        "projects/acme/locations/us-east1/keyRings/stitch/cryptoKeys/operator/cryptoKeyVersions/1";
+
+    fn gcpkms(credentials_json: &str) -> SignerSetup {
+        SignerSetup::Gcpkms {
+            key_version: GCP_KEY_VERSION.into(),
+            operator_address: OPERATOR.into(),
+            api_base_url: None,
+            credentials_json: credentials_json.into(),
+        }
+    }
+
+    fn service_account_json() -> String {
+        serde_json::json!({
+            "type": "service_account",
+            "private_key_id": "kid",
+            "private_key": TEST_RSA_PEM,
+            "client_email": "stitch@acme.iam.gserviceaccount.com",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn gcpkms_config_keeps_the_service_account_key_out_of_toml_and_env() {
+        let dir = unique_dir("gcpkms-write");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let paths = write_config_signer(&dir, corridor, &gcpkms(&service_account_json())).unwrap();
+
+        let toml = std::fs::read_to_string(&paths.toml).unwrap();
+        assert!(toml.contains("provider = \"gcpkms\""), "{toml}");
+        assert!(toml.contains(GCP_KEY_VERSION), "{toml}");
+        assert!(!toml.contains("BEGIN PRIVATE KEY"));
+        Config::from_toml(&toml).unwrap();
+
+        let env = std::fs::read_to_string(&paths.env).unwrap();
+        assert!(env.contains("GCP_KMS_CREDENTIALS_FILE="), "{env}");
+        assert!(!env.contains("BEGIN PRIVATE KEY"));
+
+        let secret = std::fs::read_to_string(dir.join("gcpkms-credentials.json")).unwrap();
+        assert!(secret.contains("\"service_account\""));
+        assert_eq!(
+            signer_files(&dir, &gcpkms("{}")),
+            vec!["stitch.toml", "stitch.env", "gcpkms-credentials.json"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const AWS_KEY_ARN: &str =
+        "arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+
+    fn awskms(key_id: &str, region: Option<&str>, secret: &str) -> SignerSetup {
+        SignerSetup::Awskms {
+            key_id: key_id.into(),
+            region: region.map(str::to_string),
+            operator_address: OPERATOR.into(),
+            api_base_url: None,
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_access_key: secret.into(),
+        }
+    }
+
+    #[test]
+    fn awskms_config_keeps_the_access_key_out_of_toml_and_env() {
+        let dir = unique_dir("awskms-write");
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let paths =
+            write_config_signer(&dir, corridor, &awskms(AWS_KEY_ARN, None, secret)).unwrap();
+
+        let toml = std::fs::read_to_string(&paths.toml).unwrap();
+        assert!(toml.contains("provider = \"awskms\""), "{toml}");
+        assert!(toml.contains(AWS_KEY_ARN), "{toml}");
+        assert!(!toml.contains(secret));
+        Config::from_toml(&toml).unwrap();
+
+        let env = std::fs::read_to_string(&paths.env).unwrap();
+        assert!(env.contains("AWS_KMS_CREDENTIALS_FILE="), "{env}");
+        assert!(!env.contains(secret));
+
+        let file = std::fs::read_to_string(dir.join("awskms-credentials.ini")).unwrap();
+        assert!(file.starts_with("[default]\n"), "{file}");
+        assert!(file.contains(secret));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn awskms_rejects_bad_input_before_writing() {
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        for (name, signer) in [
+            // No ARN and no region: nothing in a panel bot's world names one.
+            ("awskms-no-region", awskms("alias/stitch", None, secret)),
+            ("awskms-bad-secret", awskms(AWS_KEY_ARN, None, "x\n[evil]")),
+            (
+                "awskms-wrong-region",
+                awskms(AWS_KEY_ARN, Some("eu-west-1"), secret),
+            ),
+        ] {
+            let dir = unique_dir(name);
+            assert!(
+                write_config_signer(&dir, corridor, &signer).is_err(),
+                "{name}"
+            );
+            assert!(!config_paths(&dir).toml.exists(), "{name}: nothing written");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn gcpkms_rejects_bad_input_before_writing() {
+        let corridor = find_corridor("cngn-usdt-bsc").unwrap();
+        let workload_identity = serde_json::json!({ "type": "external_account" }).to_string();
+        let key_without_version = SignerSetup::Gcpkms {
+            key_version: GCP_KEY_VERSION
+                .trim_end_matches("/cryptoKeyVersions/1")
+                .into(),
+            operator_address: OPERATOR.into(),
+            api_base_url: None,
+            credentials_json: service_account_json(),
+        };
+        for (name, signer) in [
+            ("gcpkms-empty", gcpkms("")),
+            ("gcpkms-wif", gcpkms(&workload_identity)),
+            ("gcpkms-no-version", key_without_version),
+        ] {
+            let dir = unique_dir(name);
+            assert!(
+                write_config_signer(&dir, corridor, &signer).is_err(),
+                "{name}"
+            );
+            assert!(!config_paths(&dir).toml.exists(), "{name}: nothing written");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]

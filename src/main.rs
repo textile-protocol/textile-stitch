@@ -224,11 +224,14 @@ async fn main() -> anyhow::Result<()> {
     // is piped (the desktop app captures it) or redirected to a file/journald,
     // colors would otherwise show up as literal escape sequences.
     let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
     tracing_subscriber::fmt()
         .with_ansi(use_ansi)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_new(stitch_bot::signer::awskms::quiet_sdk_logs(
+                &rust_log,
+            ))
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 

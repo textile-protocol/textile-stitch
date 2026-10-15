@@ -41,6 +41,16 @@ const SECRETS: &[(&str, &str, &str)] = &[
         "FIREBLOCKS_API_PRIVATE_KEY_FILE",
         "fireblocks-api.key",
     ),
+    (
+        "GCP_KMS_CREDENTIALS",
+        "GCP_KMS_CREDENTIALS_FILE",
+        "gcpkms-credentials.json",
+    ),
+    (
+        "AWS_KMS_CREDENTIALS",
+        "AWS_KMS_CREDENTIALS_FILE",
+        "awskms-credentials.ini",
+    ),
 ];
 
 fn runtime_dir(name: &str) -> PathBuf {

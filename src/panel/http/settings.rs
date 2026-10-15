@@ -1231,6 +1231,8 @@ fn signer_provider(signer: &setup::SignerView) -> &'static str {
         setup::SignerView::Turnkey { .. } => "Turnkey",
         setup::SignerView::Mpcvault { .. } => "MPCVault",
         setup::SignerView::Fireblocks { .. } => "Fireblocks",
+        setup::SignerView::Gcpkms { .. } => "Google Cloud KMS",
+        setup::SignerView::Awskms { .. } => "AWS KMS",
     }
 }
 

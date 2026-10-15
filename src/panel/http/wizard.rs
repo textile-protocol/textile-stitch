@@ -208,6 +208,63 @@ pub async fn fireblocks_verify(
     Ok(Json(verified).into_response())
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcpKmsVerifyRequest {
+    pub key_version: String,
+    pub credentials_json: String,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+}
+
+/// Read the key version's public key, sign one throwaway message with it, and
+/// report the address that signature recovers to, the key's protection level
+/// and how long the sign took.
+///
+/// Cloud KMS shows a PEM, not an Ethereum address, so this is what fills in
+/// `operator_address` on the form instead of asking the operator to derive it.
+pub async fn gcpkms_verify(Json(body): Json<GcpKmsVerifyRequest>) -> Result<Response, ApiError> {
+    let verified = crate::signer::gcpkms::verify(
+        &body.key_version,
+        &body.credentials_json,
+        body.api_base_url.as_deref(),
+    )
+    .await
+    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(verified).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AwsKmsVerifyRequest {
+    pub key_id: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Read the key's public key, sign one throwaway message with it, and report
+/// the address that signature recovers to and how long the sign took.
+///
+/// AWS KMS shows a public key, not an Ethereum address, so this is what fills
+/// in `operator_address` on the form instead of asking the operator to derive
+/// it.
+pub async fn awskms_verify(Json(body): Json<AwsKmsVerifyRequest>) -> Result<Response, ApiError> {
+    let verified = crate::signer::awskms::verify(
+        &body.key_id,
+        body.region.as_deref(),
+        body.api_base_url.as_deref(),
+        &body.access_key_id,
+        &body.secret_access_key,
+    )
+    .await
+    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(verified).into_response())
+}
+
 /// The signer half of the wizard payload.
 ///
 /// Tagged on `kind` so the shape and the backend can't disagree, and so a missing
@@ -261,6 +318,23 @@ pub enum SignerRequest {
         raw_signing: bool,
         api_key: String,
         api_private_key: String,
+    },
+    Gcpkms {
+        key_version: String,
+        operator_address: String,
+        #[serde(default)]
+        api_base_url: Option<String>,
+        credentials_json: String,
+    },
+    Awskms {
+        key_id: String,
+        operator_address: String,
+        #[serde(default)]
+        region: Option<String>,
+        #[serde(default)]
+        api_base_url: Option<String>,
+        access_key_id: String,
+        secret_access_key: String,
     },
 }
 
@@ -337,6 +411,32 @@ impl SignerRequest {
                 api_key,
                 api_private_key,
             }),
+            SignerRequest::Gcpkms {
+                key_version,
+                operator_address,
+                api_base_url,
+                credentials_json,
+            } => Ok(SignerSetup::Gcpkms {
+                key_version,
+                operator_address,
+                api_base_url: blank_to_none(api_base_url),
+                credentials_json,
+            }),
+            SignerRequest::Awskms {
+                key_id,
+                operator_address,
+                region,
+                api_base_url,
+                access_key_id,
+                secret_access_key,
+            } => Ok(SignerSetup::Awskms {
+                key_id,
+                region: blank_to_none(region),
+                operator_address,
+                api_base_url: blank_to_none(api_base_url),
+                access_key_id,
+                secret_access_key,
+            }),
         }
     }
 }
@@ -359,6 +459,12 @@ fn operator_address_of(setup: &SignerSetup) -> Result<String, ApiError> {
             operator_address, ..
         }
         | SignerSetup::Fireblocks {
+            operator_address, ..
+        }
+        | SignerSetup::Gcpkms {
+            operator_address, ..
+        }
+        | SignerSetup::Awskms {
             operator_address, ..
         } => Ok(operator_address.trim().to_lowercase()),
     }

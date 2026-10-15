@@ -924,6 +924,12 @@ fn operator_address(signer: &setup::SignerView, config_path: &Path) -> Option<St
         }
         | setup::SignerView::Fireblocks {
             operator_address, ..
+        }
+        | setup::SignerView::Gcpkms {
+            operator_address, ..
+        }
+        | setup::SignerView::Awskms {
+            operator_address, ..
         } => Some(operator_address.clone()),
     }
 }
@@ -934,6 +940,8 @@ fn signer_label(signer: &setup::SignerView) -> &'static str {
         setup::SignerView::Turnkey { .. } => "turnkey",
         setup::SignerView::Mpcvault { .. } => "mpcvault",
         setup::SignerView::Fireblocks { .. } => "fireblocks",
+        setup::SignerView::Gcpkms { .. } => "gcpkms",
+        setup::SignerView::Awskms { .. } => "awskms",
     }
 }
 

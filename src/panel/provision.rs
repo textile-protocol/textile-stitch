@@ -40,6 +40,8 @@ const LOCAL_SECRET: &str = SignerKind::Local.secret_file();
 const TURNKEY_SECRET: &str = SignerKind::Turnkey.secret_file();
 const MPCVAULT_SECRET: &str = SignerKind::Mpcvault.secret_file();
 const FIREBLOCKS_SECRET: &str = SignerKind::Fireblocks.secret_file();
+const GCPKMS_SECRET: &str = SignerKind::Gcpkms.secret_file();
+const AWSKMS_SECRET: &str = SignerKind::Awskms.secret_file();
 
 /// What the panel knows about a bot's on-disk config, as far as provisioning
 /// cares: which signer it selects and therefore which secret file to mount and
@@ -147,6 +149,22 @@ pub fn signer_runtime_for(signer: &SignerView, config: &Path) -> SignerRuntime {
                 env,
             }
         }
+        SignerView::Gcpkms { .. } => SignerRuntime {
+            secret_file: GCPKMS_SECRET.to_string(),
+            env: vec![format!(
+                "{}={}",
+                crate::signer::gcpkms::CREDENTIALS_FILE_ENV,
+                in_container(GCPKMS_SECRET)
+            )],
+        },
+        SignerView::Awskms { .. } => SignerRuntime {
+            secret_file: AWSKMS_SECRET.to_string(),
+            env: vec![format!(
+                "{}={}",
+                crate::signer::awskms::CREDENTIALS_FILE_ENV,
+                in_container(AWSKMS_SECRET)
+            )],
+        },
     }
 }
 
@@ -964,6 +982,42 @@ mod tests {
             &"TURNKEY_API_PRIVATE_KEY_FILE=/home/stitch/run/turnkey-api.key".to_string()
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gcpkms_mounts_the_credentials_file_and_points_the_bot_at_it() {
+        let rt = signer_runtime_from(
+            &SignerView::Gcpkms {
+                key_version: "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+                    .into(),
+                operator_address: "0x0".into(),
+                api_base_url: String::new(),
+            },
+            Path::new("/data/bots/bot-a"),
+        );
+        assert_eq!(rt.secret_file, "gcpkms-credentials.json");
+        assert_eq!(
+            rt.env,
+            vec!["GCP_KMS_CREDENTIALS_FILE=/home/stitch/run/gcpkms-credentials.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn awskms_mounts_the_credentials_file_and_points_the_bot_at_it() {
+        let rt = signer_runtime_from(
+            &SignerView::Awskms {
+                key_id: "arn:aws:kms:us-east-1:111122223333:key/1234abcd".into(),
+                region: String::new(),
+                operator_address: "0x0".into(),
+                api_base_url: String::new(),
+            },
+            Path::new("/data/bots/bot-a"),
+        );
+        assert_eq!(rt.secret_file, "awskms-credentials.ini");
+        assert_eq!(
+            rt.env,
+            vec!["AWS_KMS_CREDENTIALS_FILE=/home/stitch/run/awskms-credentials.ini".to_string()]
+        );
     }
 
     fn fireblocks_view() -> SignerView {

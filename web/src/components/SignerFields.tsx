@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, api } from '../api'
+import { createStaleGuard } from '../staleGuard'
+import { regionalKmsEndpoint } from '../gcpkms'
 import { Banner, Button, Field, Input, Select, TextArea } from './ui'
 
-export type SignerKind = 'local' | 'fireblocks' | 'turnkey' | 'mpcvault'
+export type SignerKind = 'local' | 'fireblocks' | 'turnkey' | 'mpcvault' | 'gcpkms' | 'awskms'
 /** How the local hot wallet is provided. Create is the default. */
 export type LocalMode = 'create' | 'import'
 export type KeyForm = 'privateKey' | 'seedPhrase'
@@ -54,6 +56,11 @@ export function SignerFields({
           onChange={(e) =>
             set({
               kind: e.target.value as SignerKind,
+              // Nothing crosses backends. An operator address one backend's
+              // Verify proved belongs to that backend's credentials, and would
+              // otherwise satisfy another backend's isSignerComplete; secrets
+              // shouldn't sit in memory for a backend nobody picked.
+              mpc: {},
               // Leaving local: drop any secret sitting in memory.
               ...(e.target.value !== 'local'
                 ? {
@@ -69,6 +76,8 @@ export function SignerFields({
           <option value="fireblocks">MPC — Fireblocks</option>
           <option value="turnkey">MPC — Turnkey</option>
           <option value="mpcvault">MPC — MPCVault · Experimental</option>
+          <option value="gcpkms">HSM — Google Cloud KMS</option>
+          <option value="awskms">HSM — AWS KMS</option>
         </Select>
       </Field>
 
@@ -111,6 +120,14 @@ export function SignerFields({
             ['apiToken', 'API token', true],
           ]}
         />
+      )}
+
+      {value.kind === 'gcpkms' && (
+        <GcpKmsFields values={value.mpc} onChange={(mpc) => set({ mpc })} />
+      )}
+
+      {value.kind === 'awskms' && (
+        <AwsKmsFields values={value.mpc} onChange={(mpc) => set({ mpc })} />
       )}
     </>
   )
@@ -495,10 +512,15 @@ function PemField({
   const [loaded, setLoaded] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const reads = useStaleGuard()
   const held = isCompletePem(value)
 
   async function accept(file: File | undefined) {
     if (!file) return
+    // A slow read (a network drive, a cloud-synced folder) can finish after
+    // the operator switched signer or pasted something else. Applying it then
+    // would switch the form back to Fireblocks with this key in it.
+    const stale = reads.begin()
     setError(null)
     // A private key is a few KB; anything far bigger is the wrong file and
     // shouldn't be read into memory to find that out.
@@ -511,10 +533,12 @@ function PemField({
     try {
       text = await file.text()
     } catch (e) {
+      if (stale()) return
       setLoaded(null)
       setError(`Couldn't read ${file.name}: ${(e as Error).message}`)
       return
     }
+    if (stale()) return
     // Catch the wrong file here rather than letting it fail server-side after
     // the operator has moved on — the public key and the CSR sit in the same
     // directory and are easy to grab by mistake.
@@ -564,6 +588,7 @@ function PemField({
                 type="button"
                 className="rounded px-2 py-0.5 text-xs font-bold text-muted hover:bg-hover hover:text-ink"
                 onClick={() => {
+                  reads.invalidate()
                   setLoaded(null)
                   setError(null)
                   onChange('')
@@ -581,7 +606,9 @@ function PemField({
               value={value}
               onChange={(e) => {
                 // Typed or pasted over: whatever file this came from no longer
-                // describes what is in the box.
+                // describes what is in the box, and a read still in flight
+                // mustn't overwrite it.
+                reads.invalidate()
                 setLoaded(null)
                 setError(null)
                 onChange(e.target.value)
@@ -850,6 +877,425 @@ function FireblocksFields({
   )
 }
 
+/**
+ * {@link createStaleGuard} bound to a component's lifetime: work begun before an
+ * unmount reads as stale after it. Used wherever async work writes back into the
+ * form (a file read, a Verify round trip), so a late result can't switch the
+ * signer back or bring back a secret the form already cleared.
+ */
+function useStaleGuard() {
+  const guard = useMemo(createStaleGuard, [])
+  useEffect(() => {
+    guard.open()
+    return () => guard.close()
+  }, [guard])
+  return guard
+}
+
+/** A service-account key is ~2.4 KB; this is slack, not a limit anyone should hit. */
+const MAX_CREDENTIALS_BYTES = 64 * 1024
+
+/** What kind of Google credentials file this is, or null if it isn't one. */
+function credentialsType(text: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (parsed && typeof parsed === 'object' && 'type' in parsed) {
+      const type = (parsed as { type: unknown }).type
+      return typeof type === 'string' ? type : null
+    }
+  } catch {
+    // Not JSON (yet): still being pasted, or the wrong file.
+  }
+  return null
+}
+
+/**
+ * The service-account JSON key, dropped, picked or pasted.
+ *
+ * Read in the browser into the same form value a paste fills, and collapsed to
+ * a summary once it parses, for the same reason the Fireblocks PEM is: it holds
+ * a private key, and nothing on screen needs it after it has loaded.
+ */
+function CredentialsJsonField({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (json: string) => void
+}) {
+  const [loaded, setLoaded] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+  const reads = useStaleGuard()
+  const type = credentialsType(value)
+
+  async function accept(file: File | undefined) {
+    if (!file) return
+    // A slow read (a network drive, a cloud-synced folder) can finish after
+    // the operator switched signer or pasted something else.
+    const stale = reads.begin()
+    setError(null)
+    if (file.size > MAX_CREDENTIALS_BYTES) {
+      setLoaded(null)
+      setError(`${file.name} is ${Math.round(file.size / 1024)} KB — too big to be a key file.`)
+      return
+    }
+    let text: string
+    try {
+      text = await file.text()
+    } catch (e) {
+      if (stale()) return
+      setLoaded(null)
+      setError(`Couldn't read ${file.name}: ${(e as Error).message}`)
+      return
+    }
+    if (stale()) return
+    if (credentialsType(text) === null) {
+      setLoaded(null)
+      setError(
+        `${file.name} isn't a Google credentials file. You want the JSON key you downloaded ` +
+          `for the service account.`,
+      )
+      return
+    }
+    setLoaded(file.name)
+    onChange(text)
+  }
+
+  return (
+    <div className="space-y-2">
+      <Field
+        label="Service account key (JSON)"
+        hint={
+          type
+            ? 'Hidden once loaded. The server checks it on Verify.'
+            : 'Paste it, or choose the file. Needs roles/cloudkms.signerVerifier on the key.'
+        }
+      >
+        {type ? (
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-line bg-canvas px-3 py-2">
+            <span className="text-sm text-ink">
+              {loaded ? `Loaded ${loaded}` : 'Key file set'} ({type})
+            </span>
+            <button
+              type="button"
+              className="rounded px-2 py-0.5 text-xs font-bold text-muted hover:bg-hover hover:text-ink"
+              onClick={() => {
+                reads.invalidate()
+                setLoaded(null)
+                setError(null)
+                onChange('')
+              }}
+            >
+              Replace
+            </button>
+          </div>
+        ) : (
+          <TextArea
+            rows={4}
+            autoComplete="off"
+            spellCheck={false}
+            placeholder='{ "type": "service_account", … }'
+            value={value}
+            onChange={(e) => {
+              reads.invalidate()
+              setLoaded(null)
+              setError(null)
+              onChange(e.target.value)
+            }}
+          />
+        )}
+      </Field>
+
+      {/* Outside the Field, so its label doesn't forward clicks to the input. */}
+      <input
+        ref={fileRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={(e) => {
+          void accept(e.target.files?.[0])
+          e.target.value = ''
+        }}
+      />
+      {!type && (
+        <Button type="button" onClick={() => fileRef.current?.click()}>
+          Choose file…
+        </Button>
+      )}
+
+      {error && <Banner tone="danger">{error}</Banner>}
+    </div>
+  )
+}
+
+/**
+ * Google Cloud KMS: a key version and a service-account key, nothing else typed.
+ *
+ * Cloud KMS shows a PEM, not an Ethereum address, so the operator address is
+ * never entered. Verify reads the public key, signs a throwaway message, and
+ * fills in the address that signature recovered to. Editing either input
+ * clears it, and a response for inputs that have since changed is dropped, so
+ * the address on the form always belongs to the key in the form.
+ */
+function GcpKmsFields({
+  values,
+  onChange,
+}: {
+  values: Record<string, string>
+  onChange: (v: Record<string, string>) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [proof, setProof] = useState<{ protectionLevel: string; latencyMs: number } | null>(
+    null,
+  )
+  const verifies = useStaleGuard()
+
+  const keyVersion = (values.keyVersion ?? '').trim()
+  const credentialsJson = values.credentialsJson ?? ''
+  const apiBaseUrl = (values.apiBaseUrl ?? '').trim()
+  const regional = regionalKmsEndpoint(keyVersion)
+
+  /** Patch an input and retire whatever the old inputs proved. */
+  const edit = (patch: Record<string, string>) => {
+    verifies.invalidate()
+    setBusy(false)
+    setProof(null)
+    onChange({ ...values, ...patch, operatorAddress: '' })
+  }
+
+  async function verify() {
+    const stale = verifies.begin()
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await api.gcpkmsVerify({
+        keyVersion,
+        credentialsJson,
+        apiBaseUrl: apiBaseUrl || undefined,
+      })
+      if (stale()) return
+      setProof({ protectionLevel: res.protectionLevel, latencyMs: res.latencyMs })
+      onChange({ ...values, operatorAddress: res.address })
+    } catch (e) {
+      if (stale()) return
+      setProof(null)
+      onChange({ ...values, operatorAddress: '' })
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      if (!stale()) setBusy(false)
+    }
+  }
+
+  const slow = proof !== null && proof.latencyMs > SLOW_SIGN_MS
+  const hsm = proof?.protectionLevel.startsWith('HSM') ?? false
+
+  return (
+    <div className="space-y-3">
+      <Field
+        label="Key version"
+        hint="The full resource name, version included. The key must be EC_SIGN_SECP256K1_SHA256."
+      >
+        <Input
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          className="font-mono text-xs"
+          placeholder="projects/…/locations/…/keyRings/…/cryptoKeys/…/cryptoKeyVersions/1"
+          value={values.keyVersion ?? ''}
+          onChange={(e) => edit({ keyVersion: e.target.value })}
+        />
+      </Field>
+
+      <CredentialsJsonField
+        value={credentialsJson}
+        onChange={(json) => edit({ credentialsJson: json })}
+      />
+
+      <Field
+        label="Regional endpoint (optional)"
+        hint={
+          regional
+            ? `Empty uses the global endpoint. This key's region is ${regional}.`
+            : 'Empty uses the global endpoint. A regional one only serves keys in its own location.'
+        }
+      >
+        <Input
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          className="font-mono text-xs"
+          placeholder={regional ?? 'https://cloudkms.googleapis.com'}
+          value={values.apiBaseUrl ?? ''}
+          onChange={(e) => edit({ apiBaseUrl: e.target.value })}
+        />
+      </Field>
+
+      {keyVersion.length > 0 && credentialsType(credentialsJson) !== null && (
+        <Button type="button" onClick={() => void verify()} disabled={busy}>
+          {busy ? 'Signing a test message…' : 'Verify'}
+        </Button>
+      )}
+
+      {values.operatorAddress && proof && (
+        <Banner tone={slow || !hsm ? 'warning' : 'success'}>
+          <div>
+            Signed as <code>{values.operatorAddress}</code>. Protection level:{' '}
+            {proof.protectionLevel || 'unknown'}.
+            {!hsm && ' This key is not in Cloud HSM.'}
+          </div>
+          <div>
+            One signature took {proof.latencyMs} ms.{' '}
+            {!slow
+              ? 'That fits inside the venue reply budget.'
+              : apiBaseUrl || !regional
+                ? 'That is slow for quoting. Run the bot in the same region as the key.'
+                : 'That is slow for quoting. Run the bot in the same region as the key, or ' +
+                  `set the regional endpoint above to ${regional}.`}
+          </div>
+        </Banner>
+      )}
+
+      {error && <Banner tone="danger">{error}</Banner>}
+    </div>
+  )
+}
+
+/** `arn:aws:kms:REGION:ACCOUNT:key/…` or `…:alias/…`: the panel needs the ARN for its region. */
+const AWS_KMS_ARN = /^arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:(key|alias)\/\S+$/
+
+/**
+ * AWS KMS: a key ARN and an IAM access key, nothing else typed.
+ *
+ * AWS KMS shows a public key, not an Ethereum address, so as with Cloud KMS the
+ * operator address is never entered: Verify reads the public key, signs a
+ * throwaway message, and fills in the address that signature recovered to.
+ * Editing any input clears it, and a response for inputs that have since
+ * changed is dropped.
+ */
+function AwsKmsFields({
+  values,
+  onChange,
+}: {
+  values: Record<string, string>
+  onChange: (v: Record<string, string>) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [latencyMs, setLatencyMs] = useState<number | null>(null)
+  const verifies = useStaleGuard()
+
+  const keyId = (values.keyId ?? '').trim()
+  const accessKeyId = (values.accessKeyId ?? '').trim()
+  const secretAccessKey = (values.secretAccessKey ?? '').trim()
+  const arnOk = AWS_KMS_ARN.test(keyId)
+
+  /** Patch an input and retire whatever the old inputs proved. */
+  const edit = (patch: Record<string, string>) => {
+    verifies.invalidate()
+    setBusy(false)
+    setLatencyMs(null)
+    onChange({ ...values, ...patch, operatorAddress: '' })
+  }
+
+  async function verify() {
+    const stale = verifies.begin()
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await api.awskmsVerify({ keyId, accessKeyId, secretAccessKey })
+      if (stale()) return
+      setLatencyMs(res.latencyMs)
+      onChange({ ...values, operatorAddress: res.address })
+    } catch (e) {
+      if (stale()) return
+      setLatencyMs(null)
+      onChange({ ...values, operatorAddress: '' })
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      if (!stale()) setBusy(false)
+    }
+  }
+
+  const slow = latencyMs !== null && latencyMs > SLOW_SIGN_MS
+
+  return (
+    <div className="space-y-3">
+      <Field
+        label="Key ARN"
+        hint="An ECC_SECG_P256K1 key with SIGN_VERIFY usage. The ARN names its region."
+      >
+        <Input
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          className="font-mono text-xs"
+          placeholder="arn:aws:kms:us-east-1:111122223333:key/…"
+          value={values.keyId ?? ''}
+          onChange={(e) => edit({ keyId: e.target.value })}
+        />
+      </Field>
+
+      <Field
+        label="Access key ID"
+        hint="An IAM access key allowed kms:Sign and kms:GetPublicKey on this key."
+      >
+        <Input
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          className="font-mono text-sm"
+          placeholder="AKIA…"
+          value={values.accessKeyId ?? ''}
+          onChange={(e) => edit({ accessKeyId: e.target.value })}
+        />
+      </Field>
+
+      <Field label="Secret access key">
+        <Input
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          data-1p-ignore
+          data-lpignore="true"
+          value={values.secretAccessKey ?? ''}
+          onChange={(e) => edit({ secretAccessKey: e.target.value })}
+        />
+      </Field>
+
+      {keyId.length > 0 && !arnOk && (
+        <Banner tone="warning">
+          Paste the key's full ARN (arn:aws:kms:REGION:ACCOUNT:key/…), not its id or alias name.
+          The bot needs the region it names.
+        </Banner>
+      )}
+
+      {arnOk && accessKeyId.length > 0 && secretAccessKey.length > 0 && (
+        <Button type="button" onClick={() => void verify()} disabled={busy}>
+          {busy ? 'Signing a test message…' : 'Verify'}
+        </Button>
+      )}
+
+      {values.operatorAddress && latencyMs !== null && (
+        <Banner tone={slow ? 'warning' : 'success'}>
+          <div>
+            Signed as <code>{values.operatorAddress}</code>.
+          </div>
+          <div>
+            One signature took {latencyMs} ms.{' '}
+            {slow
+              ? 'That is slow for quoting. Run the bot in the same region as the key.'
+              : 'That fits inside the venue reply budget.'}
+          </div>
+        </Banner>
+      )}
+
+      {error && <Banner tone="danger">{error}</Banner>}
+    </div>
+  )
+}
+
 function MpcFields({
   values,
   onChange,
@@ -896,6 +1342,11 @@ export function isSignerComplete(s: SignerState): boolean {
       // advisory. A bot whose address was guessed wrong quotes orders no one
       // can fill.
       return ['apiKey', 'apiPrivateKey', 'vaultAccountId', 'operatorAddress'].every(filled)
+    case 'gcpkms':
+      // Same rule as Fireblocks: the address only ever comes from Verify.
+      return ['keyVersion', 'credentialsJson', 'operatorAddress'].every(filled)
+    case 'awskms':
+      return ['keyId', 'accessKeyId', 'secretAccessKey', 'operatorAddress'].every(filled)
   }
 }
 

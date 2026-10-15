@@ -388,7 +388,7 @@ By default Stitch signs with the local private key (the hotwallet). An optional
 handles every signature the bot makes: the EIP-712 limit orders and the on-chain
 fill/approve transactions. You pick one backend for the whole bot.
 
-Four options:
+Six options:
 
 - **Local hotwallet** (default): the bot signs with `STITCH_PRIVATE_KEY` /
   `STITCH_PRIVATE_KEY_FILE`. Omit `[signer]` entirely, or set
@@ -410,6 +410,14 @@ Four options:
   default setup they don't run here — give that bot a hot wallet rather than
   going after the entitlement. Signing is create-then-poll rather than one call,
   so measure the latency before relying on it to quote.
+- **Google Cloud KMS**: the key lives in Cloud KMS, normally at the HSM
+  protection level, and every signature is one `asymmetricSign` call from inside
+  the bot. It signs raw digests, so the on-chain legs work too. Run yourself on
+  GCP, it needs no secret at all: the bot takes tokens from the metadata server.
+  Bots the panel creates use a service-account JSON key.
+- **AWS KMS**: the same idea on AWS. The key lives in AWS KMS's HSMs, and every
+  signature is one `Sign` call through the AWS SDK. Run yourself on AWS, an IAM
+  role is all it needs. Bots the panel creates use an IAM access key.
 
 Secrets always come from the environment, never the config file (same rule as the
 existing key). Each secret has a `_FILE` variant (a path) that takes precedence
@@ -421,7 +429,7 @@ approvals (`stitch approve`) regardless of the signer.
 
 **Desktop / panel.** If you use `stitch-desktop` or the server panel, you don't
 need to edit any of this by hand. Add corridor and Settings both have a **Signer**
-dropdown (hot wallet / Turnkey / MPCVault / Fireblocks) that collects the fields below, writes
+dropdown (hot wallet / Turnkey / MPCVault / Fireblocks / Google Cloud KMS / AWS KMS) that collects the fields below, writes
 the `[signer]` section, stores each secret in an owner-only file, and points
 `stitch.env` at it. Changing the signer in Settings rewrites all three and
 restarts a running bot. The rest of this section is the reference for CLI and
@@ -507,6 +515,49 @@ policy rule and no entitlement.
 For the full walkthrough (API user and co-signer, the vault account, the Typed
 Message policy rule, and the panel's Verify step), see [Fireblocks signer
 setup](signer-fireblocks.md).
+
+Google Cloud KMS:
+
+```toml
+[signer]
+provider         = "gcpkms"
+key_version      = "projects/<project>/locations/<location>/keyRings/<ring>/cryptoKeys/<key>/cryptoKeyVersions/<n>"
+operator_address = "0x<the EVM address the key version controls>"
+api_base_url     = "https://cloudkms.googleapis.com"   # optional, default; or https://<location>-cloudkms.googleapis.com
+max_concurrent_signs = 8                                # optional
+```
+
+Credentials, first hit wins: `GCP_KMS_CREDENTIALS_FILE` or `GCP_KMS_CREDENTIALS`
+(a service-account JSON key, secret), `GOOGLE_APPLICATION_CREDENTIALS`, gcloud's
+application-default file, then the GCP metadata server. The identity needs
+`roles/cloudkms.signerVerifier` on the key. The bot checks the key's public key
+against `operator_address` at startup and won't start on a mismatch.
+
+For the full walkthrough (creating the HSM key, the service account and its IAM
+grant, the panel's Verify step, quota, and key rotation), see [Google Cloud KMS
+signer setup](signer-gcpkms.md).
+
+AWS KMS:
+
+```toml
+[signer]
+provider         = "awskms"
+key_id           = "arn:aws:kms:<region>:<account>:key/<key id>"
+operator_address = "0x<the EVM address the key controls>"
+region           = "<region>"                             # optional; only when key_id isn't an ARN
+api_base_url     = "https://kms-fips.<region>.amazonaws.com"  # optional FIPS or VPC endpoint
+max_concurrent_signs = 8                                  # optional
+```
+
+Credentials, first hit wins: `AWS_KMS_CREDENTIALS_FILE` or `AWS_KMS_CREDENTIALS`
+(an AWS credentials file, read from `[default]`, secret), then the SDK's default
+chain (env keys, profiles, web identity, the ECS task role, the EC2 instance role).
+The identity needs `kms:Sign` and `kms:GetPublicKey` on the key. The bot checks the
+key's public key against `operator_address` at startup and won't start on a
+mismatch.
+
+For the full walkthrough (creating the key, the IAM policy, the panel's Verify
+step, quota, and key rotation), see [AWS KMS signer setup](signer-awskms.md).
 
 MPCVault is a two-process setup: the bot plus the sidecar on the same host. The
 bot runs an HTTP "callback approval" server at `callback_listen_addr`; the

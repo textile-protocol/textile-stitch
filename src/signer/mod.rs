@@ -6,8 +6,9 @@
 //! through a [`Signer`]: a 32-byte digest in, a 65-byte `r ++ s ++ v` (v in
 //! {27,28}) signature out. The default backend is a raw local key
 //! ([`local::LocalSigner`], the "hotwallet"); MPC backends ([`turnkey`],
-//! [`mpcvault`], [`fireblocks`]) implement the same trait so the rest of the bot
-//! never knows which one is signing.
+//! [`mpcvault`], [`fireblocks`]) and the cloud KMS backends ([`gcpkms`] for
+//! Google Cloud KMS / Cloud HSM, [`awskms`] for AWS KMS) implement the same
+//! trait so the rest of the bot never knows which one is signing.
 //!
 //! One backend needs more than a digest. Fireblocks will not sign opaque bytes
 //! without a raw-signing entitlement its customers have to negotiate, so it
@@ -35,7 +36,9 @@ use zeroize::Zeroize;
 
 use crate::config::Config;
 
+pub mod awskms;
 pub mod fireblocks;
+pub mod gcpkms;
 pub mod local;
 pub mod mpcvault;
 pub mod turnkey;
@@ -120,6 +123,13 @@ pub struct SignerSecrets {
     /// be handed in per call rather than read from the process environment,
     /// which on a multi-bot panel holds either nothing or another bot's key.
     pub fireblocks_api_key: Option<String>,
+    /// The Cloud KMS credentials JSON (a service-account key) beside the bot's
+    /// config. `None` lets the environment decide, which for a bot on GCP is the
+    /// metadata server and no file at all.
+    pub gcpkms_credentials_file: Option<PathBuf>,
+    /// The AWS credentials file beside the bot's config. `None` lets the SDK's
+    /// default chain decide, which on AWS is the attached IAM role.
+    pub awskms_credentials_file: Option<PathBuf>,
 }
 
 /// [`build_signer`] with explicit secret paths. See [`SignerSecrets`].
@@ -135,6 +145,12 @@ pub async fn build_signer_with(cfg: &Config, secrets: &SignerSecrets) -> anyhow:
         SignerConfig::Fireblocks(c) => Ok(Arc::new(
             fireblocks::FireblocksSigner::from_config_with(&c, secrets)?,
         )),
+        SignerConfig::Gcpkms(c) => Ok(Arc::new(
+            gcpkms::GcpKmsSigner::from_config_with(&c, secrets).await?,
+        )),
+        SignerConfig::Awskms(c) => Ok(Arc::new(
+            awskms::AwsKmsSigner::from_config_with(&c, secrets).await?,
+        )),
     }
 }
 
@@ -149,6 +165,8 @@ pub enum SignerConfig {
     Turnkey(TurnkeyConfig),
     Mpcvault(MpcVaultConfig),
     Fireblocks(FireblocksConfig),
+    Gcpkms(GcpKmsConfig),
+    Awskms(AwsKmsConfig),
 }
 
 impl SignerConfig {
@@ -159,6 +177,8 @@ impl SignerConfig {
             SignerConfig::Turnkey(c) => c.max_concurrent_signs,
             SignerConfig::Mpcvault(c) => c.max_concurrent_signs,
             SignerConfig::Fireblocks(c) => c.max_concurrent_signs,
+            SignerConfig::Gcpkms(c) => c.max_concurrent_signs,
+            SignerConfig::Awskms(c) => c.max_concurrent_signs,
         }
     }
 
@@ -187,7 +207,11 @@ impl SignerConfig {
     /// the entitlement, not something we recommend anyone go and buy.
     pub fn raw_signing_unavailable(&self) -> Option<&'static str> {
         match self {
-            SignerConfig::Local | SignerConfig::Turnkey(_) | SignerConfig::Mpcvault(_) => None,
+            SignerConfig::Local
+            | SignerConfig::Turnkey(_)
+            | SignerConfig::Mpcvault(_)
+            | SignerConfig::Gcpkms(_)
+            | SignerConfig::Awskms(_) => None,
             SignerConfig::Fireblocks(c) if c.raw_signing => None,
             SignerConfig::Fireblocks(_) => Some(
                 "signs Fireblocks typed messages, which cannot sign an on-chain transaction. \
@@ -266,6 +290,52 @@ pub struct FireblocksConfig {
     pub max_concurrent_signs: usize,
 }
 
+/// Google Cloud KMS config. The credentials are not here: they come from the
+/// environment (or the metadata server on GCP), see [`gcpkms`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct GcpKmsConfig {
+    /// Full key *version* resource name:
+    /// `projects/P/locations/L/keyRings/R/cryptoKeys/K/cryptoKeyVersions/N`.
+    /// The key must be `EC_SIGN_SECP256K1_SHA256`, normally at `HSM` protection.
+    pub key_version: String,
+    /// The EVM address the key version controls. Checked against the key's
+    /// public key at startup.
+    pub operator_address: String,
+    /// `https://cloudkms.googleapis.com`, or a regional
+    /// `https://<location>-cloudkms.googleapis.com` endpoint.
+    #[serde(default = "default_gcpkms_base_url")]
+    pub api_base_url: String,
+    #[serde(default = "default_max_concurrent_signs")]
+    pub max_concurrent_signs: usize,
+}
+
+fn default_gcpkms_base_url() -> String {
+    gcpkms::DEFAULT_API_BASE_URL.to_string()
+}
+
+/// AWS KMS config. The credentials are not here: they come from a credentials
+/// file or the SDK's default chain, see [`awskms`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AwsKmsConfig {
+    /// The KMS key: its ARN (preferred, it names the region), an alias ARN, a
+    /// key id or `alias/<name>`. The key must be `ECC_SECG_P256K1` with
+    /// `SIGN_VERIFY` usage.
+    pub key_id: String,
+    /// The EVM address the key controls. Checked against the key's public key
+    /// at startup.
+    pub operator_address: String,
+    /// The key's region. Only needed when `key_id` is not an ARN; must agree
+    /// with the ARN when it is one.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// A FIPS (`https://kms-fips.<region>.amazonaws.com`) or VPC endpoint.
+    /// Defaults to the region's standard KMS endpoint.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    #[serde(default = "default_max_concurrent_signs")]
+    pub max_concurrent_signs: usize,
+}
+
 fn default_fireblocks_asset_id() -> String {
     fireblocks::DEFAULT_ASSET_ID.to_string()
 }
@@ -310,6 +380,31 @@ const FIREBLOCKS_API_HOSTS: &[&str] = &[
     "eu2-api.fireblocks.io",
     "us-east-1-api.fireblocks.io",
 ];
+/// Cloud KMS's global endpoint. The regional `<location>-cloudkms.googleapis.com`
+/// endpoints are matched by [`gcpkms::is_regional_api_host`], since the list of
+/// locations is Google's to grow.
+const GCPKMS_API_HOSTS: &[&str] = &["cloudkms.googleapis.com"];
+
+/// A host predicate, and how an error message describes the hosts it accepts.
+type HostPattern = (fn(&str) -> bool, &'static str);
+
+/// Hosts a provider accepts by shape rather than by name, and how the error
+/// message describes them. AWS KMS has an endpoint per region and per VPC, so
+/// it has no fixed list at all.
+fn host_pattern(provider: &str) -> Option<HostPattern> {
+    match provider {
+        "gcpkms" => Some((
+            gcpkms::is_regional_api_host,
+            "<location>-cloudkms.googleapis.com",
+        )),
+        "awskms" => Some((
+            awskms::is_kms_host,
+            "kms.<region>.amazonaws.com, kms-fips.<region>.amazonaws.com, \
+             vpce-….kms.<region>.vpce.amazonaws.com",
+        )),
+        _ => None,
+    }
+}
 
 /// Refuse a signer `api_base_url` that isn't on the provider allowlist.
 ///
@@ -320,8 +415,11 @@ pub fn validate_signer_api_base_url(provider: &str, raw: &str) -> anyhow::Result
         "turnkey" => TURNKEY_API_HOSTS,
         "mpcvault" => MPCVAULT_API_HOSTS,
         "fireblocks" => FIREBLOCKS_API_HOSTS,
+        "gcpkms" => GCPKMS_API_HOSTS,
+        "awskms" => &[],
         _ => return Ok(()),
     };
+    let pattern = host_pattern(provider);
     let parsed = url::Url::parse(raw.trim())
         .with_context(|| format!("[signer].api_base_url must be a valid URL, got {raw:?}"))?;
     anyhow::ensure!(
@@ -333,7 +431,9 @@ pub fn validate_signer_api_base_url(provider: &str, raw: &str) -> anyhow::Result
         .host_str()
         .filter(|h| !h.is_empty())
         .with_context(|| format!("[signer].api_base_url must include a host, got {raw:?}"))?;
-    if allowed.iter().any(|h| host.eq_ignore_ascii_case(h)) {
+    if allowed.iter().any(|h| host.eq_ignore_ascii_case(h))
+        || pattern.is_some_and(|(matches, _)| matches(host))
+    {
         return Ok(());
     }
     if custom_signer_api_allowed() {
@@ -344,12 +444,17 @@ pub fn validate_signer_api_base_url(provider: &str, raw: &str) -> anyhow::Result
         );
         return Ok(());
     }
+    let listed = allowed
+        .iter()
+        .copied()
+        .chain(pattern.map(|(_, shown)| shown))
+        .collect::<Vec<_>>()
+        .join(", ");
     anyhow::bail!(
         "[signer].api_base_url host {host:?} is not an official {provider} API host \
-         (allowed: {}). Pointing this at an attacker-controlled URL can leak signer \
+         (allowed: {listed}). Pointing this at an attacker-controlled URL can leak signer \
          credentials. Use the default, or set STITCH_ALLOW_CUSTOM_SIGNER_API=1 if you \
-         really mean to override it.",
-        allowed.join(", ")
+         really mean to override it."
     );
 }
 
@@ -590,6 +695,57 @@ pub fn finalize_signature(
     anyhow::bail!("remote signature did not recover to operator address {expected}")
 }
 
+/// Sign the throwaway [`signer_check_payload`] once, as a startup check.
+///
+/// A KMS grants reading a key's public half and signing with it separately
+/// (`viewPublicKey` / `useToSign` on Cloud KMS, `GetPublicKey` / `Sign` on AWS).
+/// Credentials with only the first pass the address check and then fail every
+/// quote, so the constructors sign once and stop startup with the backend's
+/// own error instead. The payload authorises nothing, and the signature has to
+/// recover to the operator address.
+///
+/// [`signer_check_payload`]: crate::protocol::typed_data::signer_check_payload
+pub async fn prove_signing(signer: &(impl Signer + ?Sized)) -> anyhow::Result<()> {
+    let payload =
+        crate::protocol::typed_data::signer_check_payload(B256::from(rand::random::<[u8; 32]>()));
+    signer.sign_typed(&payload).await.map(drop)
+}
+
+/// A KMS's DER ECDSA signature (RFC 3279 `SEQUENCE { r, s }`, no recovery id)
+/// as the canonical 65 bytes. Goes through [`finalize_signature`], so it is
+/// normalized to low-s and has to recover to `expected` over `digest`.
+pub fn finalize_der_signature(
+    digest: B256,
+    der: &[u8],
+    expected: Address,
+) -> anyhow::Result<[u8; 65]> {
+    let sig = Signature::from_der(der).map_err(|_| anyhow::anyhow!("malformed DER signature"))?;
+    let (r, s) = sig.split_bytes();
+    let mut r32 = [0u8; 32];
+    r32.copy_from_slice(&r);
+    let mut s32 = [0u8; 32];
+    s32.copy_from_slice(&s);
+    finalize_signature(digest, &r32, &s32, None, expected)
+}
+
+/// Ethereum address of a secp256k1 SubjectPublicKeyInfo DER blob, the form KMS
+/// public-key APIs return it in.
+pub fn address_from_spki_der(der: &[u8]) -> anyhow::Result<Address> {
+    use k256::pkcs8::DecodePublicKey;
+    let key = VerifyingKey::from_public_key_der(der)
+        .map_err(|_| anyhow::anyhow!("not a secp256k1 public key"))?;
+    Ok(address_from_verifying_key(&key))
+}
+
+/// A path from an env var, ignoring an empty value.
+pub(crate) fn env_path(var: &str) -> Option<PathBuf> {
+    std::env::var(var)
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -673,6 +829,26 @@ mod tests {
         validate_signer_api_base_url("mpcvault", "https://api.mpcvault.com").unwrap();
         validate_signer_api_base_url("mpcvault", "https://api.mpcvault.com/").unwrap();
         validate_signer_api_base_url("turnkey", "https://api.turnkey.com").unwrap();
+        validate_signer_api_base_url("gcpkms", "https://cloudkms.googleapis.com").unwrap();
+        validate_signer_api_base_url("gcpkms", "https://us-east1-cloudkms.googleapis.com").unwrap();
+    }
+
+    #[test]
+    fn cloud_kms_lookalike_hosts_are_rejected() {
+        for hostile in [
+            "https://cloudkms.googleapis.com.evil.example",
+            "https://evil.example/cloudkms.googleapis.com",
+            "https://us-east1-cloudkms.evil.example",
+            "http://cloudkms.googleapis.com",
+        ] {
+            let err = validate_signer_api_base_url("gcpkms", hostile)
+                .expect_err("lookalike must be refused");
+            assert!(
+                hostile.starts_with("http://")
+                    || format!("{err:#}").contains("<location>-cloudkms"),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]
@@ -814,6 +990,28 @@ mod tests {
         // Normalized back to the canonical low-s signature; recovers to the signer.
         assert_eq!(got, full);
         assert_eq!(recover_address(digest, &got).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_kms_der_signature_is_finalized_into_a_recoverable_one() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::pkcs8::EncodePublicKey;
+
+        let digest = b256!("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        let expected = address_from_signing_key(&key());
+        // A plain, non-recoverable DER signature, the way a KMS returns one.
+        let sig: Signature = key().sign_prehash(digest.as_slice()).unwrap();
+        let der = sig.to_der();
+        let fixed = finalize_der_signature(digest, der.as_bytes(), expected).unwrap();
+        assert_eq!(recover_address(digest, &fixed).unwrap(), expected);
+        assert!(finalize_der_signature(digest, der.as_bytes(), Address::ZERO).is_err());
+        assert!(finalize_der_signature(digest, &[0x30, 0x00], expected).is_err());
+
+        let spki = k256::PublicKey::from(*key().verifying_key())
+            .to_public_key_der()
+            .unwrap();
+        assert_eq!(address_from_spki_der(spki.as_bytes()).unwrap(), expected);
+        assert!(address_from_spki_der(&[0u8; 10]).is_err());
     }
 
     #[test]

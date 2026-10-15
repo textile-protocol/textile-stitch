@@ -65,7 +65,9 @@ pub struct Config {
     pub tick_interval_secs: u64,
     pub feed: FeedConfig,
     /// Signing backend. Omit for the local key (hotwallet) from the environment;
-    /// set `provider = "turnkey" | "mpcvault"` to sign via an MPC wallet.
+    /// set `provider = "turnkey" | "mpcvault" | "fireblocks"` to sign via an MPC
+    /// wallet, or `"gcpkms"` / `"awskms"` to sign with a Google Cloud KMS
+    /// (Cloud HSM) or AWS KMS key.
     #[serde(default)]
     pub signer: Option<crate::signer::SignerConfig>,
     /// RFQ responder. Omitted → the responder never spawns. See [`RfqConfig`].
@@ -1364,6 +1366,18 @@ impl Config {
                 }
                 crate::signer::SignerConfig::Fireblocks(c) => {
                     crate::signer::validate_signer_api_base_url("fireblocks", &c.api_base_url)?;
+                }
+                crate::signer::SignerConfig::Gcpkms(c) => {
+                    crate::signer::validate_signer_api_base_url("gcpkms", &c.api_base_url)?;
+                    crate::signer::gcpkms::validate_key_version(&c.key_version)?;
+                    crate::signer::parse_address(&c.operator_address)?;
+                }
+                crate::signer::SignerConfig::Awskms(c) => {
+                    if let Some(url) = c.api_base_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                        crate::signer::validate_signer_api_base_url("awskms", url)?;
+                    }
+                    crate::signer::awskms::validate_key_id(&c.key_id)?;
+                    crate::signer::parse_address(&c.operator_address)?;
                 }
                 crate::signer::SignerConfig::Local => {}
             }

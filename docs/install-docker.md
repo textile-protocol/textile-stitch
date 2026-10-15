@@ -28,10 +28,11 @@ Environment variables the entrypoint understands:
   `STITCH_PRIVATE_KEY_FILE` is exported automatically).
 - `STITCH_RFQ_API_KEY` — the maker credential from `stitch connect` (written to
   `rfq-api.key`, then `STITCH_RFQ_API_KEY_FILE` is exported automatically).
-- `TURNKEY_API_PRIVATE_KEY`, `MPCVAULT_API_TOKEN`, `FIREBLOCKS_API_PRIVATE_KEY` —
-  the MPC signer secret for whichever `[signer]` backend you use (written to
-  `turnkey-api.key`, `mpcvault-api.token` or `fireblocks-api.key`, and the
-  matching `*_FILE` variable is exported). The raw variable is removed before
+- `TURNKEY_API_PRIVATE_KEY`, `MPCVAULT_API_TOKEN`, `FIREBLOCKS_API_PRIVATE_KEY`,
+  `GCP_KMS_CREDENTIALS`, `AWS_KMS_CREDENTIALS` — the signer secret for whichever
+  `[signer]` backend you use (written to `turnkey-api.key`, `mpcvault-api.token`,
+  `fireblocks-api.key`, `gcpkms-credentials.json` or `awskms-credentials.ini`, and
+  the matching `*_FILE` variable is exported). The raw variable is removed before
   the bot starts. The Turnkey public key and `FIREBLOCKS_API_KEY` are
   identifiers and stay as plain variables.
 - `STITCH_CONFIG_FILE`, `STITCH_PRIVATE_KEY_FILE`, `STITCH_RUNTIME_DIR` — override

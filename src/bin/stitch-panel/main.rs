@@ -120,10 +120,15 @@ fn strip_line_ending(line: &str) -> &str {
 }
 
 fn serve() -> Result<()> {
+    // Verify and Connect build KMS signers in-process, so the panel gets the
+    // same quiet AWS SDK the bot does.
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info,stitch_bot=info".into());
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,stitch_bot=info".into()),
+            tracing_subscriber::EnvFilter::try_new(stitch_bot::signer::awskms::quiet_sdk_logs(
+                &rust_log,
+            ))
+            .unwrap_or_else(|_| "info,stitch_bot=info".into()),
         )
         .init();
 

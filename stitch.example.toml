@@ -246,3 +246,28 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # poll_interval_ms = 50                    # optional; signing is create-then-poll, so this is latency
 # poll_timeout_secs    = 30                # optional
 # max_concurrent_signs = 4                 # optional
+#
+# Google Cloud KMS (key in Cloud KMS, normally Cloud HSM; one asymmetricSign
+# call per signature, no sidecar). The key must be EC_SIGN_SECP256K1_SHA256.
+# Credentials in the env: GCP_KMS_CREDENTIALS_FILE / GCP_KMS_CREDENTIALS (a
+# service-account JSON key), or nothing on GCP with a service account attached.
+# See docs/signer-gcpkms.md.
+# [signer]
+# provider         = "gcpkms"
+# key_version      = "projects/<project>/locations/<location>/keyRings/<ring>/cryptoKeys/<key>/cryptoKeyVersions/1"
+# operator_address = "0x<the EVM address the key version controls>"
+# api_base_url     = "https://cloudkms.googleapis.com"   # optional, default; or https://<location>-cloudkms.googleapis.com
+# max_concurrent_signs = 8                                # optional
+#
+# AWS KMS (key in AWS KMS's HSMs; one Sign call per signature through the AWS
+# SDK, no sidecar). The key must be ECC_SECG_P256K1 with SIGN_VERIFY usage.
+# Credentials in the env: AWS_KMS_CREDENTIALS_FILE / AWS_KMS_CREDENTIALS (an AWS
+# credentials file), else the SDK's default chain, so an IAM role on AWS is
+# enough. See docs/signer-awskms.md.
+# [signer]
+# provider         = "awskms"
+# key_id           = "arn:aws:kms:<region>:<account>:key/<key id>"
+# operator_address = "0x<the EVM address the key controls>"
+# region           = "<region>"                                # optional; only when key_id isn't an ARN
+# api_base_url     = "https://kms-fips.<region>.amazonaws.com"  # optional FIPS or VPC endpoint
+# max_concurrent_signs = 8                                      # optional

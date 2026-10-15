@@ -461,8 +461,8 @@ fn nav_attestation_typed_data(a: &NavAttestation) -> Value {
     })
 }
 
-/// A throwaway payload for proving a signer works, used by the panel's Verify
-/// button and nothing else.
+/// A throwaway payload for proving a signer works: the panel's Verify button,
+/// and the KMS signers' startup check ([`crate::signer::prove_signing`]).
 ///
 /// It signs under its own domain (`Stitch Signer Check`) with its own struct, so
 /// the resulting signature authorises nothing: no contract verifies it and the

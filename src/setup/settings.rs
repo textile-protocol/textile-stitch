@@ -360,6 +360,17 @@ pub enum SignerView {
         api_base_url: String,
         raw_signing: bool,
     },
+    Gcpkms {
+        key_version: String,
+        operator_address: String,
+        api_base_url: String,
+    },
+    Awskms {
+        key_id: String,
+        region: String,
+        operator_address: String,
+        api_base_url: String,
+    },
 }
 
 /// Read the current signer from a `stitch.toml` body.
@@ -406,6 +417,17 @@ pub fn try_read_signer(toml_str: &str) -> Result<SignerView> {
             asset_id: c.asset_id,
             api_base_url: c.api_base_url,
             raw_signing: c.raw_signing,
+        },
+        SignerConfig::Gcpkms(c) => SignerView::Gcpkms {
+            key_version: c.key_version,
+            operator_address: c.operator_address,
+            api_base_url: c.api_base_url,
+        },
+        SignerConfig::Awskms(c) => SignerView::Awskms {
+            key_id: c.key_id,
+            region: c.region.unwrap_or_default(),
+            operator_address: c.operator_address,
+            api_base_url: c.api_base_url.unwrap_or_default(),
         },
         SignerConfig::Local => SignerView::Local,
     })
@@ -1373,6 +1395,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_gcpkms_config_reads_back_with_the_global_endpoint_by_default() {
+        let toml = "[signer]\nprovider = \"gcpkms\"\n\
+             key_version = \"projects/p/locations/us-east1/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1\"\n\
+             operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n";
+        match try_read_signer(toml).expect("gcpkms config parses") {
+            SignerView::Gcpkms {
+                key_version,
+                api_base_url,
+                ..
+            } => {
+                assert!(key_version.ends_with("/cryptoKeyVersions/1"));
+                assert_eq!(api_base_url, "https://cloudkms.googleapis.com");
+            }
+            other => panic!("expected Gcpkms, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_awskms_config_reads_back_with_optional_fields_empty() {
+        let toml = "[signer]\nprovider = \"awskms\"\n\
+             key_id = \"arn:aws:kms:us-east-1:111122223333:key/1234abcd\"\n\
+             operator_address = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n";
+        match try_read_signer(toml).expect("awskms config parses") {
+            SignerView::Awskms {
+                key_id,
+                region,
+                api_base_url,
+                ..
+            } => {
+                assert!(key_id.starts_with("arn:aws:kms:us-east-1"));
+                assert_eq!(region, "");
+                assert_eq!(api_base_url, "");
+            }
+            other => panic!("expected Awskms, got {other:?}"),
+        }
+    }
+
     const TURNKEY_SIGNER: &str = "\n[signer]\nprovider = \"turnkey\"\n\
          organization_id = \"org-1\"\n\
          sign_with = \"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\"\n\
@@ -1421,6 +1481,8 @@ mod tests {
         assert!(try_read_signer("[signer]\nprovider = \"turnkey\"\n").is_err());
         // Fireblocks needs both required fields too.
         assert!(try_read_signer("[signer]\nprovider = \"fireblocks\"\n").is_err());
+        assert!(try_read_signer("[signer]\nprovider = \"gcpkms\"\n").is_err());
+        assert!(try_read_signer("[signer]\nprovider = \"awskms\"\n").is_err());
         // The lenient wrapper is still lenient, for the desktop form.
         assert!(matches!(
             read_signer("this is not [ toml"),

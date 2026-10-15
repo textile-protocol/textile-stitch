@@ -48,5 +48,7 @@ file_secret STITCH_RFQ_API_KEY STITCH_RFQ_API_KEY_FILE "${runtime_dir}/rfq-api.k
 file_secret TURNKEY_API_PRIVATE_KEY TURNKEY_API_PRIVATE_KEY_FILE "${runtime_dir}/turnkey-api.key"
 file_secret MPCVAULT_API_TOKEN MPCVAULT_API_TOKEN_FILE "${runtime_dir}/mpcvault-api.token"
 file_secret FIREBLOCKS_API_PRIVATE_KEY FIREBLOCKS_API_PRIVATE_KEY_FILE "${runtime_dir}/fireblocks-api.key"
+file_secret GCP_KMS_CREDENTIALS GCP_KMS_CREDENTIALS_FILE "${runtime_dir}/gcpkms-credentials.json"
+file_secret AWS_KMS_CREDENTIALS AWS_KMS_CREDENTIALS_FILE "${runtime_dir}/awskms-credentials.ini"
 
 exec "$@"

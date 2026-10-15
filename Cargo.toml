@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.315"
+version = "0.1.316"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; quotes Swap via RFQ firm quotes and optionally fills resting limit orders."
 license = "AGPL-3.0-or-later"
@@ -107,6 +107,15 @@ subtle = { version = "2.6.1", default-features = false, optional = true }
 tar = { version = "0.4.46", default-features = false, optional = true }
 mime_guess = { version = "2.0.5", optional = true }
 sha2 = "0.10.9"
+# AWS KMS signer. The official SDK rather than hand-rolled SigV4, because the
+# part worth not rewriting is the credential chain: env, profile, web identity
+# (EKS), ECS task roles and EC2 instance roles. Same crates and features Warp's
+# KMS risk signer uses.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest", "default-https-client"] }
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+# Already in the graph through aws-config; named directly for EnvConfigFiles,
+# which aws-config only re-exports under a deprecated alias.
+aws-runtime = { version = "1", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

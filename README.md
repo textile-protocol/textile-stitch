@@ -188,7 +188,8 @@ Secrets always come from the environment, never the config file, and each has a
 `STITCH_PRIVATE_KEY_FILE` vs `STITCH_PRIVATE_KEY`.
 
 The desktop / panel UI writes all of this for you: Add corridor and Settings have a
-**Signer** dropdown (hot wallet / Turnkey / MPCVault) that collects the fields
+**Signer** dropdown (hot wallet / Turnkey / MPCVault / Fireblocks / Google Cloud
+KMS / AWS KMS) that collects the fields
 below, drops the secret in an owner-only file, and points `stitch.env` at it. The
 manual `[signer]` fields below are for CLI and server operators editing
 `stitch.toml` by hand.
@@ -209,6 +210,21 @@ manual `[signer]` fields below are for CLI and server operators editing
   `max_concurrent_signs`. Env var: `MPCVAULT_API_TOKEN` /
   `MPCVAULT_API_TOKEN_FILE` (secret). Full setup walkthrough (vault, API token,
   Client Signer, sidecar): [MPCVault signer setup](docs/signer-mpcvault.md).
+- **Google Cloud KMS** (`provider = "gcpkms"`): an `EC_SIGN_SECP256K1_SHA256` key
+  in Cloud KMS, normally Cloud HSM. One synchronous `asymmetricSign` call per
+  signature, no sidecar. Config fields: `key_version` (the full key version
+  resource name), `operator_address`, optional `api_base_url` and
+  `max_concurrent_signs`. Credentials: `GCP_KMS_CREDENTIALS_FILE` /
+  `GCP_KMS_CREDENTIALS` (a service-account JSON key), or none at all on GCP with
+  a service account attached. Full setup walkthrough:
+  [Google Cloud KMS signer setup](docs/signer-gcpkms.md).
+- **AWS KMS** (`provider = "awskms"`): an `ECC_SECG_P256K1` key in AWS KMS. One
+  `Sign` call per signature through the AWS SDK, no sidecar. Config fields:
+  `key_id` (the key ARN), `operator_address`, optional `region`, `api_base_url`
+  and `max_concurrent_signs`. Credentials: `AWS_KMS_CREDENTIALS_FILE` /
+  `AWS_KMS_CREDENTIALS` (an AWS credentials file), else the SDK's default chain,
+  so on AWS an attached IAM role is enough. Full setup walkthrough:
+  [AWS KMS signer setup](docs/signer-awskms.md).
 
 The operator wallet still needs a little native gas for Permit2 approvals
 (`stitch approve`) no matter which signer you use.

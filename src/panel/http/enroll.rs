@@ -83,6 +83,14 @@ pub(super) fn secrets_beside(config_path: &Path) -> SignerSecrets {
             config_path,
             crate::signer::fireblocks::API_KEY_ENV,
         ),
+        gcpkms_credentials_file: provision::find_beside(
+            config_path,
+            crate::setup::writer::SignerKind::Gcpkms.secret_file(),
+        ),
+        awskms_credentials_file: provision::find_beside(
+            config_path,
+            crate::setup::writer::SignerKind::Awskms.secret_file(),
+        ),
     }
 }
 

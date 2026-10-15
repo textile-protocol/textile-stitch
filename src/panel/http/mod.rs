@@ -295,6 +295,8 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             "/api/signer/fireblocks/verify",
             post(wizard::fireblocks_verify),
         )
+        .route("/api/signer/gcpkms/verify", post(wizard::gcpkms_verify))
+        .route("/api/signer/awskms/verify", post(wizard::awskms_verify))
         .route("/api/bots", get(bots::list).post(wizard::create))
         .route("/api/bots/{name}", get(bots::show).delete(bots::remove))
         .route("/api/bots/{name}/name", patch(bots::rename))
