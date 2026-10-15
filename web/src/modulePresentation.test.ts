@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest'
 import type { ModulesConfig, ModulesView } from './modules'
 import {
   inventoryIllustration,
+  moduleChanges,
+  moduleKeyFigures,
   moduleOverviewState,
   moduleParameterErrors,
   volatilityIllustration,
 } from './modulePresentation'
+import { applyPreset, modulePresets } from './modulePresets'
 
 const config = (): ModulesConfig => ({
   mode: 'live',
@@ -103,7 +106,7 @@ const view = (): ModulesView => ({
   config: config(),
   revision: 'one',
   running: true,
-  dataset_template: {},
+  corridor_decimals: 18,
   settlement_decimals: 18,
   status: {
     version: 1,
@@ -182,5 +185,63 @@ describe('concise overview truthfulness', () => {
     for (const key of ['inventory', 'spreads', 'rebalance'] as const)
       v.status!.config[key].enabled = false
     expect(moduleOverviewState(v, 101).title).toBe('No modules enabled')
+  })
+})
+
+describe('strategy rows and the save bar', () => {
+  it('lists nothing when the draft matches the saved settings', () => {
+    expect(moduleChanges(config(), config())).toEqual([])
+  })
+  it('surfaces preset changes to secondary settings, in form order', () => {
+    const saved = config()
+    const draft = applyPreset(saved, 'inventory', modulePresets[0]!)
+    expect(moduleChanges(saved, draft)).toEqual([
+      { label: 'Target holdings', from: '40%', to: '50%' },
+      { label: 'Pause purchases at', from: '80%', to: '75%' },
+      { label: 'Maximum price adjustment', from: '0.4%', to: '0.1%' },
+    ])
+    expect(saved).toEqual(config())
+  })
+  it('names modes and switches as the panel does', () => {
+    const draft = config()
+    draft.mode = 'shadow'
+    draft.rebalance.enabled = true
+    expect(moduleChanges(config(), draft)).toEqual([
+      { label: 'Run mode', from: 'Live', to: 'Preview' },
+      { label: 'Spot rebalancing', from: 'Off', to: 'On' },
+    ])
+  })
+  it('treats a missing inventory weighting flag as off', () => {
+    const saved = config()
+    delete saved.spreads.inventory_aware
+    const draft = config()
+    draft.spreads.inventory_aware = false
+    expect(moduleChanges(saved, draft)).toEqual([])
+  })
+  it('shows an emptied field as a dash, as one change', () => {
+    const draft = config()
+    draft.inventory.target_bps = NaN
+    expect(moduleChanges(config(), draft)).toEqual([
+      { label: 'Target holdings', from: '40%', to: '—' },
+    ])
+    expect(moduleKeyFigures(draft, 'inventory')[0]).toEqual({
+      label: 'Target',
+      value: '—',
+    })
+  })
+  it('gives each module its two defining figures', () => {
+    const c = config()
+    expect(moduleKeyFigures(c, 'inventory')).toEqual([
+      { label: 'Target', value: '40%' },
+      { label: 'Pause at', value: '80%' },
+    ])
+    expect(moduleKeyFigures(c, 'spreads')).toEqual([
+      { label: 'Max extra', value: '+1%' },
+      { label: 'Sensitivity', value: '1×' },
+    ])
+    expect(moduleKeyFigures(c, 'rebalance')).toEqual([
+      { label: 'Sell above', value: '50%' },
+      { label: 'Per sale', value: '2%' },
+    ])
   })
 })

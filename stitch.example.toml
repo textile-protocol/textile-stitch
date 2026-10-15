@@ -1,6 +1,6 @@
 # First-party FX modules (OperatorVault, one RFQ corridor). Defaults to off.
 # Enable this one root property to expose Modules; initial mode is shadow.
-# See docs/modules.md for strategies, simulation and the dealer API.
+# See docs/modules.md for strategies and the dealer API.
 modules_enabled = false
 
 # Textile Stitch — example config.

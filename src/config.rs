@@ -44,7 +44,7 @@ pub const MAX_TWAP_MAX_DEVIATION_BPS: u32 = 10_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Master gate for module runtime, recording, simulation and panel controls.
+    /// Master gate for module runtime, recording and panel controls.
     #[serde(default)]
     pub modules_enabled: bool,
     #[serde(default)]

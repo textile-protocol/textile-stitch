@@ -84,7 +84,7 @@ export interface ModulesView {
   status: ModuleStatus | null
   running: boolean
   settlement_decimals: number
-  dataset_template: Record<string, unknown>
+  corridor_decimals: number
 }
 
 /** Recorded changes, including side vetoes and caps; never recalculate from
@@ -101,88 +101,6 @@ export function dynamicSpreadAdditions(
     buy: delta(inputs.inventory_buy_bps, decision.buy_bps),
     sell: delta(inputs.inventory_sell_bps, decision.sell_bps),
   }
-}
-export interface SimulationMetrics {
-  ending_nav: string
-  pnl: string
-  return_pct: number
-  max_drawdown_bps: number
-  customer_fills: number
-  rebalance_fills: number
-  execution_costs: string
-  max_inventory_bps: number
-}
-export interface SimulationReport {
-  version: number
-  config: ModulesConfig
-  baseline: SimulationMetrics
-  candidate: SimulationMetrics
-  equity: { at: number; baseline: string; candidate: string }[]
-  assumptions: string[]
-  events: number
-  dealer_observations: number
-}
-export interface HistoryOptions {
-  from: number
-  to: number
-  cost_per_trade: string
-  dealer_scenario: null | {
-    slippage_bps: number
-    max_corridor_per_observation: string
-  }
-}
-export interface HistoricalSimulation {
-  report: SimulationReport
-  dataset: unknown
-  options: HistoryOptions
-  source: {
-    vault: string
-    chain_id: number
-    from: number
-    to: number
-    collected_at: number
-    price_source: string
-    indexed_through: number
-    config_revision: string
-    staleness_secs: number
-    snapshot: { block_number: string; block_hash: string; at: number }
-  }
-  coverage: {
-    observed_trades: number
-    replayed_trades: number
-    skipped_stale_trades: number
-    price_observations: number
-    fresh_seconds: number
-    total_seconds: number
-    max_price_gap_secs: number
-  }
-  analysis: {
-    return_delta_pp: number
-    drawdown_delta_bps: number
-    inventory_delta_bps: number
-    fill_delta: number
-    conclusion: string
-  }
-}
-
-/** Decimal user input to exact atomic units, without Number rounding. */
-export function simulationAmount(value: string, decimals: number): string {
-  if (
-    !Number.isInteger(decimals) ||
-    decimals < 0 ||
-    decimals > 18 ||
-    !/^\d+(\.\d+)?$/.test(value)
-  ) {
-    throw new Error('Enter a non-negative amount using a decimal point.')
-  }
-  const [whole, fraction = ''] = value.split('.')
-  if (fraction.length > decimals)
-    throw new Error(`Use at most ${decimals} decimal places.`)
-  const atomic =
-    BigInt(whole!) * 10n ** BigInt(decimals) +
-    BigInt(fraction.padEnd(decimals, '0') || '0')
-  if (atomic >= 2n ** 256n) throw new Error('Amount is too large.')
-  return atomic.toString()
 }
 export function moduleStatusFresh(
   status: ModuleStatus | null,
@@ -295,27 +213,6 @@ export function dynamicSpreadState(
             : 'The observed prices are unchanged within the rolling window. The module is active and adds 0 bps.'
           : 'The dynamic addition is included in quote calculations. Available inventory, vault controls and venue checks still determine whether a quote is offered.',
   }
-}
-export function equityCoordinates(
-  points: SimulationReport['equity'],
-  key: 'baseline' | 'candidate'
-): string {
-  if (!points.length) return ''
-  const values = points.flatMap((p) => [
-    BigInt(p.baseline),
-    BigInt(p.candidate),
-  ])
-  const low = values.reduce((a, b) => (a < b ? a : b))
-  const high = values.reduce((a, b) => (a > b ? a : b))
-  const span = high - low || 1n
-  const first = points[0]?.at ?? 0
-  const elapsed = (points.at(-1)?.at ?? first) - first || 1
-  return points
-    .map(
-      (p) =>
-        `${20 + ((p.at - first) * 660) / elapsed},${180 - Number(((BigInt(p[key]) - low) * 150n) / span)}`
-    )
-    .join(' ')
 }
 export function downloadJson(name: string, data: unknown) {
   const url = URL.createObjectURL(

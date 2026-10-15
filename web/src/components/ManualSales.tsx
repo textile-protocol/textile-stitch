@@ -54,7 +54,7 @@ export default function ManualSales({
   const c = view.config
   const ready =
     c.mode === 'live' && c.rebalance.enabled && c.rebalance.method !== 'dealer'
-  const decimals = Number(view.dataset_template.corridor_decimals)
+  const decimals = view.corridor_decimals
   const atomicAmount = saleAtomic(amount, decimals)
   const atomicMinimum = saleAtomic(minimum, view.settlement_decimals)
   const valid =

@@ -15,14 +15,12 @@ export default function ModulesOverview({
   now,
   currency,
   onConfigure,
-  onSimulate,
   onDecisions,
 }: {
   view: ModulesView
   now: number
   currency: string
   onConfigure: (key: ModuleKey) => void
-  onSimulate: () => void
   onDecisions: () => void
 }) {
   const state = moduleOverviewState(view, now)
@@ -182,14 +180,6 @@ export default function ModulesOverview({
           </p>
         )}
       </Card>
-      <div className="flex flex-wrap items-center justify-between gap-3 px-1">
-        <p className="text-muted text-sm">
-          See how different settings would have performed.
-        </p>
-        <Button onClick={onSimulate}>
-          Try a historical simulation <span aria-hidden>↗</span>
-        </Button>
-      </div>
       <Disclosure title="Details & recent activity">
         <div className="space-y-4">
           <DynamicSpreadsLive view={view} now={now} />

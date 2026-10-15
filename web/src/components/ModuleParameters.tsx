@@ -1,27 +1,47 @@
-import { useId, useState } from 'react'
+import { useId, useState, type ReactNode } from 'react'
 import type { ModulesConfig } from '../modules'
 import ModulePresets from './ModulePresets'
 import {
   inventoryIllustration,
+  moduleKeyFigures,
   moduleKeys,
+  moduleModes,
   moduleNames,
   moduleParameterErrors,
   percentage,
   volatilityIllustration,
   type ModuleKey,
 } from '../modulePresentation'
+import { matchingPreset } from '../modulePresets'
 import {
   AllocationBar,
+  Chevron,
   MarginBars,
   ModuleSwitch,
   NumberControl,
+  Popover,
 } from './ModuleControls'
 import {
   InventoryFields,
-  SpreadFields,
+  moduleGuides,
   RebalanceFields,
+  SpreadFields,
 } from './ModuleParameterFields'
+import { Button } from './ui'
 
+type Example = {
+  share: number
+  range: number
+  setShare: (bps: number) => void
+  setRange: (bps: number) => void
+  /** Collapsed to a narrow tab by default; shared by all modules. */
+  shown: boolean
+  toggle: () => void
+}
+
+/** The whole module config as one strategy: run mode in the header, then a
+ * row per module with its switch, two defining figures and preset. Edit opens
+ * that module's values in place; one module is open at a time. */
 export default function ModuleParameters({
   draft,
   onChange,
@@ -33,289 +53,460 @@ export default function ModuleParameters({
 }: {
   draft: ModulesConfig
   onChange: (config: ModulesConfig) => void
-  selected: ModuleKey
-  onSelect: (key: ModuleKey) => void
+  selected: ModuleKey | null
+  onSelect: (key: ModuleKey | null) => void
   currency: string
   settlement: string
   initialShare?: number | null
 }) {
-  const [exampleShare, setExampleShare] = useState(initialShare ?? 4500)
-  const [exampleRange, setExampleRange] = useState(20)
-  const [showExample, setShowExample] = useState(false)
-  const exampleId = useId()
-  const update = <K extends keyof ModulesConfig>(
-    key: K,
-    value: ModulesConfig[K]
-  ) => onChange({ ...draft, [key]: value })
-  const valid = moduleParameterErrors(draft).length === 0
-  const enabled = draft[selected].enabled
-  const ModuleFields = {
+  const [share, setShare] = useState(initialShare ?? 4500)
+  const [range, setRange] = useState(20)
+  const [shown, setShown] = useState(false)
+  const example: Example = {
+    share,
+    range,
+    shown,
+    toggle: () => setShown((value) => !value),
+    setShare: (value) =>
+      setShare(
+        Number.isFinite(value)
+          ? Math.max(0, Math.min(10000, Math.round(value)))
+          : 0
+      ),
+    setRange: (value) =>
+      setRange(
+        Number.isFinite(value)
+          ? Math.max(0, Math.min(1000, Math.round(value)))
+          : 0
+      ),
+  }
+  const titleId = useId()
+  const descriptions: Record<ModuleKey, string> = {
+    inventory: `Steer ${currency} holdings toward a target by shifting quotes.`,
+    spreads: 'Widen margins when prices move, up to a cap you set.',
+    rebalance: `Suggest selling excess ${currency} for ${settlement}.`,
+  }
+  return (
+    <section
+      aria-labelledby={titleId}
+      className="border-line-soft bg-surface rounded-xl border"
+    >
+      <header className="border-line-soft flex flex-wrap items-center justify-between gap-4 border-b px-5 py-4">
+        <div className="min-w-0">
+          <h3 id={titleId} className="font-bold">
+            Quote strategy
+          </h3>
+          <p className="text-muted mt-0.5 text-xs">
+            {moduleModes.find((m) => m.value === draft.mode)?.effect}
+          </p>
+        </div>
+        <ModeSwitch
+          value={draft.mode}
+          onChange={(mode) => onChange({ ...draft, mode })}
+        />
+      </header>
+      {moduleKeys.map((key) => (
+        <ModuleRow
+          key={key}
+          module={key}
+          draft={draft}
+          onChange={onChange}
+          description={descriptions[key]}
+          open={selected === key}
+          onToggle={() => onSelect(selected === key ? null : key)}
+        >
+          <ModuleEditor
+            module={key}
+            draft={draft}
+            onChange={onChange}
+            currency={currency}
+            settlement={settlement}
+            example={example}
+          />
+        </ModuleRow>
+      ))}
+    </section>
+  )
+}
+
+const modeDots: Record<ModulesConfig['mode'], string> = {
+  off: 'bg-faint',
+  shadow: 'bg-warning',
+  live: 'bg-success',
+}
+
+function ModeSwitch({
+  value,
+  onChange,
+}: {
+  value: ModulesConfig['mode']
+  onChange: (mode: ModulesConfig['mode']) => void
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Module mode"
+      className="bg-active inline-flex rounded-lg p-0.5"
+    >
+      {moduleModes.map((mode) => (
+        <label
+          key={mode.value}
+          title={mode.hint}
+          className={`inline-flex cursor-pointer items-center gap-2 rounded-md px-3 py-1.5 text-sm font-bold transition has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent ${value === mode.value ? 'bg-canvas text-ink ring-line-soft shadow-sm ring-1' : 'text-muted hover:text-ink'}`}
+        >
+          <input
+            type="radio"
+            name="module-mode"
+            value={mode.value}
+            checked={value === mode.value}
+            onChange={() => onChange(mode.value)}
+            className="sr-only"
+          />
+          <span
+            aria-hidden
+            className={`size-1.5 rounded-full ${modeDots[mode.value]}`}
+          />
+          {mode.label}
+          <span className="sr-only">: {mode.hint}</span>
+        </label>
+      ))}
+    </div>
+  )
+}
+
+function ModuleRow({
+  module,
+  draft,
+  onChange,
+  description,
+  open,
+  onToggle,
+  children,
+}: {
+  module: ModuleKey
+  draft: ModulesConfig
+  onChange: (config: ModulesConfig) => void
+  description: string
+  open: boolean
+  onToggle: () => void
+  children: ReactNode
+}) {
+  const id = useId()
+  const on = draft[module].enabled
+  const name = moduleNames[module]
+  const figures = moduleKeyFigures(draft, module)
+  const preset =
+    module === 'rebalance'
+      ? null
+      : (matchingPreset(draft, module)?.name ?? 'Custom')
+  const caption = 'text-faint text-[11px] font-bold uppercase tracking-wider'
+  return (
+    // The card can't clip (popovers must escape it), so the last row's
+    // example panel rounds its own bottom corners via group-last/row.
+    <div className="group/row border-line-soft border-b last:border-b-0">
+      <div
+        className={`relative grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-4 px-5 py-3.5 md:grid-cols-[auto_minmax(0,1fr)_6.5rem_6.5rem_6rem_auto] md:gap-x-5 ${open ? 'bg-hover' : ''}`}
+      >
+        {open && (
+          <span
+            aria-hidden
+            className="absolute inset-y-0 left-0 w-0.5 bg-accent"
+          />
+        )}
+        <ModuleSwitch
+          label={`Enable ${name.toLowerCase()}`}
+          checked={on}
+          showState={false}
+          onChange={(enabled) =>
+            onChange({ ...draft, [module]: { ...draft[module], enabled } })
+          }
+        />
+        <div className="min-w-0">
+          <h4 className={`text-sm font-bold ${on ? '' : 'text-muted'}`}>
+            {name}
+          </h4>
+          <p className="text-muted text-xs md:truncate">{description}</p>
+          <p className="text-muted mt-1 text-xs tabular-nums md:hidden">
+            {figures.map((f) => `${f.label} ${f.value}`).join(' · ')}
+          </p>
+        </div>
+        {figures.map((f) => (
+          <div key={f.label} className="hidden md:block">
+            <p className={caption}>{f.label}</p>
+            <p
+              className={`text-sm font-bold tabular-nums ${on ? '' : 'text-muted'}`}
+            >
+              {f.value}
+            </p>
+          </div>
+        ))}
+        <div className="hidden md:block">
+          {preset && (
+            <>
+              <p className={caption}>Preset</p>
+              <p className="text-muted text-sm">{preset}</p>
+            </>
+          )}
+        </div>
+        <Button
+          variant={open ? 'secondary' : 'ghost'}
+          aria-expanded={open}
+          aria-controls={open ? id : undefined}
+          aria-label={`${open ? 'Close' : 'Edit'} ${name.toLowerCase()}`}
+          onClick={onToggle}
+        >
+          {open ? 'Close' : 'Edit'}
+          <Chevron
+            className={`transition-transform ${open ? 'rotate-180' : ''}`}
+          />
+        </Button>
+      </div>
+      {open && (
+        <div
+          id={id}
+          role="region"
+          aria-label={`${name} settings`}
+          className="border-line-soft border-t"
+        >
+          {children}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ModuleEditor({
+  module,
+  draft,
+  onChange,
+  currency,
+  settlement,
+  example,
+}: {
+  module: ModuleKey
+  draft: ModulesConfig
+  onChange: (config: ModulesConfig) => void
+  currency: string
+  settlement: string
+  example: Example
+}) {
+  const Fields = {
     inventory: InventoryFields,
     spreads: SpreadFields,
     rebalance: RebalanceFields,
-  }[selected]
-  const explanations = {
-    inventory: `Use your quotes to bring ${currency} holdings toward a target.`,
-    spreads: 'Add a margin when prices move, within a limit you choose.',
-    rebalance: `Request a sale of excess ${currency} for ${settlement}.`,
-  }
-  const extra = valid
-    ? volatilityIllustration(draft, exampleShare, exampleRange)
-    : null
-  const margins = valid ? inventoryIllustration(draft, exampleShare) : null
-  const sale =
-    enabled && exampleShare >= draft.rebalance.trigger_bps
-      ? Math.max(
-          0,
-          Math.min(
-            draft.rebalance.max_trade_bps,
-            exampleShare - draft.inventory.target_bps
-          )
-        )
-      : 0
-
+  }[module]
+  const guide = moduleGuides[module]
   return (
-    <div className="space-y-5">
-      <div className="border-line-soft bg-surface rounded-xl border p-5">
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-          <h3 className="font-bold">How modules run</h3>
-          <span className="text-muted text-xs">
-            Applies to all enabled modules
-          </span>
-        </div>
-        <div
-          role="radiogroup"
-          aria-label="Module mode"
-          className="grid grid-cols-3 gap-2"
-        >
-          {(
-            [
-              ['off', 'Off', 'Regular quotes'],
-              ['shadow', 'Preview', 'Observe only'],
-              ['live', 'Live', 'Apply to quotes'],
-            ] as const
-          ).map(([mode, label, hint]) => (
-            <label
-              key={mode}
-              className={`relative cursor-pointer rounded-xl border p-3 text-center transition has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent ${draft.mode === mode ? 'bg-accent-tint border-accent' : 'border-line-soft hover:bg-canvas'}`}
-            >
-              <input
-                type="radio"
-                name="module-mode"
-                value={mode}
-                checked={draft.mode === mode}
-                onChange={() => update('mode', mode)}
-                className="peer sr-only"
-              />
-              <span className="block text-sm font-bold peer-focus-visible:underline">
-                {label}
-              </span>
-              <span className="text-muted mt-1 block text-xs">{hint}</span>
-            </label>
-          ))}
-        </div>
-        <p className="text-muted mt-3 text-xs">
-          {draft.mode === 'live'
-            ? 'Saving applies these settings to live quotes and restarts a running bot.'
-            : draft.mode === 'shadow'
-              ? 'Preview records proposed adjustments without changing live quotes.'
-              : 'Saving turns off new module activity. Already signed orders remain valid until they expire.'}
-        </p>
-      </div>
-
-      <div>
-        <p className="text-muted mb-3 text-xs font-bold uppercase tracking-wider">
-          Choose a module to configure
-        </p>
-        <div className="grid gap-2 sm:grid-cols-3" aria-label="Choose a module">
-          {moduleKeys.map((key, i) => (
-            <button
-              key={key}
-              aria-pressed={selected === key}
-              onClick={() => onSelect(key)}
-              className={`flex items-center gap-3 rounded-xl border p-4 text-left transition ${selected === key ? 'bg-accent-tint border-accent' : 'border-line-soft bg-surface hover:bg-canvas'}`}
-            >
-              <span
-                aria-hidden
-                className={`text-xs font-bold ${selected === key ? 'text-accent' : 'text-muted'}`}
-              >
-                0{i + 1}
-              </span>
-              <span className="flex-1 text-sm font-bold">
-                {moduleNames[key]}
-              </span>
-              <span
-                className={`size-2 rounded-full ${draft[key].enabled ? 'bg-accent' : 'bg-active'}`}
-                aria-label={draft[key].enabled ? 'Enabled' : 'Off'}
-              />
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <section
-        aria-label={`${moduleNames[selected]} settings`}
-        className="border-line-soft bg-surface overflow-hidden rounded-xl border"
-      >
-        <div className="border-line-soft flex items-start justify-between gap-4 border-b p-5">
-          <div>
-            <h3 className="text-lg font-bold">{moduleNames[selected]}</h3>
-            <p className="text-muted mt-1 text-sm">{explanations[selected]}</p>
-          </div>
-          <ModuleSwitch
-            label={`Enable ${moduleNames[selected].toLowerCase()}`}
-            checked={enabled}
-            onChange={(value) =>
-              update(selected, { ...draft[selected], enabled: value })
-            }
-          />
-        </div>
-        {!enabled && (
-          <p className="bg-hover mx-5 mt-4 rounded-lg px-3 py-2 text-sm">
-            This module is off. You can prepare its settings before enabling it.
-          </p>
-        )}
-        {selected !== 'rebalance' && (
+    <>
+      <div className="border-line-soft flex flex-wrap items-center gap-x-4 gap-y-2 border-b px-5 py-2.5">
+        {module !== 'rebalance' && (
           <ModulePresets
-            key={selected}
             draft={draft}
             onChange={onChange}
-            module={selected}
+            module={module}
             currency={currency}
             settlement={settlement}
           />
         )}
-        <div className="grid lg:grid-cols-[1.15fr_1fr]">
-          <div className="space-y-6 p-5 sm:p-6">
-            <ModuleFields
-              key={selected}
-              draft={draft}
-              onChange={onChange}
-              currency={currency}
-            />
-          </div>
-          <div className="min-w-0">
-            <button
-              aria-expanded={showExample}
-              aria-controls={exampleId}
-              onClick={() => setShowExample((value) => !value)}
-              className="border-line-soft bg-canvas flex w-full items-center justify-between gap-3 border-t p-5 text-left text-sm font-bold lg:hidden"
-            >
-              Try an interactive example{' '}
-              <span aria-hidden>{showExample ? '−' : '+'}</span>
-            </button>
-            <aside
-              id={exampleId}
-              className={`border-line-soft bg-canvas h-full border-t p-5 sm:p-6 lg:block lg:border-l lg:border-t-0 ${showExample ? 'block' : 'hidden'}`}
-              aria-label="Interactive example"
-            >
-              <p className="text-xs font-bold uppercase tracking-wider text-accent">
-                Try an example
-              </p>
-              <h4 className="mb-2 mt-2 text-lg font-bold">
-                {selected === 'inventory'
-                  ? 'See your quotes respond'
-                  : selected === 'spreads'
-                    ? 'See the extra margin'
-                    : 'See when a sale starts'}
-              </h4>
-              <p className="text-muted mb-6 text-xs leading-relaxed">
-                Illustration of this module’s settings. This is not a live quote
-                or a return forecast.
-              </p>
-              {!valid ? (
-                <p className="text-muted text-sm">
-                  Correct the settings below to update this example.
-                </p>
-              ) : (
-                <div className="space-y-6">
-                  <AllocationBar
-                    share={exampleShare}
-                    target={draft.inventory.target_bps}
-                    limit={draft.inventory.max_bps}
-                    currency={currency}
-                  />
-                  {!draft.inventory.enabled && (
-                    <p className="text-muted text-xs">
-                      Inventory balancing is off. Its target and purchase limit
-                      are shown for reference.
-                    </p>
-                  )}
-                  {selected === 'inventory' && margins && (
-                    <>
-                      <MarginBars {...margins} />
-                      <p className="text-muted text-xs leading-relaxed">
-                        Example base margins: 0.20% each. Includes inventory
-                        adjustments and the minimum margin; excludes dynamic
-                        spreads.
-                      </p>
-                    </>
-                  )}
-                  {selected === 'spreads' && extra && (
-                    <>
-                      <MarginBars {...extra} extra />
-                      <p className="text-muted text-xs leading-relaxed">
-                        Extra margin only. Added after inventory adjustments.
-                        Actual quotes also depend on available funds and side
-                        limits.
-                      </p>
-                      <NumberControl
-                        label="Example price range"
-                        value={exampleRange}
-                        sliderMax={100}
-                        max={1000}
-                        onChange={(value) =>
-                          setExampleRange(
-                            Number.isFinite(value)
-                              ? Math.max(0, Math.min(1000, Math.round(value)))
-                              : 0
-                          )
-                        }
-                      />
-                    </>
-                  )}
-                  {selected === 'rebalance' && (
-                    <div className="border-line-soft bg-surface rounded-xl border p-4">
-                      <p className="text-muted text-sm">
-                        {sale > 0 ? 'Sale size · up to' : 'No sale requested'}
-                      </p>
-                      <p className="my-2 text-3xl font-bold">
-                        {percentage(sale)}
-                      </p>
-                      <p className="text-muted text-xs leading-relaxed">
-                        {sale > 0
-                          ? `of vault value, converted from ${currency} to ${settlement}. Actual size is also limited by available funds and the vault’s order cap.`
-                          : enabled
-                            ? `Sales start at ${percentage(draft.rebalance.trigger_bps)} ${currency} holdings.`
-                            : 'Enable spot rebalancing to request sales.'}
-                      </p>
-                    </div>
-                  )}
-                  <div className="border-line-soft border-t pt-5">
-                    <NumberControl
-                      label={`Example ${currency} holdings`}
-                      value={exampleShare}
-                      max={10000}
-                      sliderMax={10000}
-                      onChange={(value) =>
-                        setExampleShare(
-                          Number.isFinite(value)
-                            ? Math.max(0, Math.min(10000, Math.round(value)))
-                            : 0
-                        )
-                      }
-                    />
-                  </div>
-                </div>
-              )}
-              <p className="text-muted mt-6 text-xs leading-relaxed">
-                Only the example changes here. Use historical simulation to test
-                your settings on past activity.
-              </p>
-            </aside>
+        {!draft[module].enabled && (
+          <p className="text-muted text-xs">
+            Off. You can prepare its settings before turning it on.
+          </p>
+        )}
+        <Popover
+          align="end"
+          className="ml-auto"
+          label={
+            <>
+              {guide.title} <span aria-hidden>›</span>
+            </>
+          }
+          buttonClassName="text-muted hover:text-ink text-xs font-bold"
+        >
+          {() => (
+            <div className="text-muted p-4 text-sm leading-relaxed">
+              {guide.body(currency)}
+            </div>
+          )}
+        </Popover>
+      </div>
+      <div className="grid lg:grid-cols-[minmax(0,1fr)_auto]">
+        <div className="p-5 sm:p-6">
+          {/* Caps line length when the example is tucked away. */}
+          <div className="max-w-3xl space-y-6">
+            <Fields draft={draft} onChange={onChange} currency={currency} />
           </div>
         </div>
-      </section>
+        <ModuleExample
+          module={module}
+          draft={draft}
+          currency={currency}
+          settlement={settlement}
+          example={example}
+        />
+      </div>
+    </>
+  )
+}
+
+function ModuleExample({
+  module,
+  draft,
+  currency,
+  settlement,
+  example,
+}: {
+  module: ModuleKey
+  draft: ModulesConfig
+  currency: string
+  settlement: string
+  example: Example
+}) {
+  const id = useId()
+  const valid = moduleParameterErrors(draft).length === 0
+  const enabled = draft[module].enabled
+  const extra = valid
+    ? volatilityIllustration(draft, example.share, example.range)
+    : null
+  const margins = valid ? inventoryIllustration(draft, example.share) : null
+  const sale =
+    enabled && example.share >= draft.rebalance.trigger_bps
+      ? Math.max(
+          0,
+          Math.min(
+            draft.rebalance.max_trade_bps,
+            example.share - draft.inventory.target_bps
+          )
+        )
+      : 0
+  const label = 'Simulate'
+  return (
+    <div className="border-line-soft bg-canvas flex min-w-0 flex-col border-t group-last/row:rounded-b-xl lg:flex-row lg:border-l lg:border-t-0 lg:group-last/row:rounded-bl-none">
+      <button
+        type="button"
+        aria-expanded={example.shown}
+        aria-controls={id}
+        onClick={example.toggle}
+        className="hover:bg-hover flex w-full items-center justify-between gap-3 p-5 text-left text-sm font-bold group-last/row:rounded-b-xl lg:hidden"
+      >
+        {label} <span aria-hidden>{example.shown ? '−' : '+'}</span>
+      </button>
+      {/* Desktop: a narrow tab that pulls the example out to its right and
+          stays in place to push it back, so focus never moves. */}
+      <button
+        type="button"
+        aria-expanded={example.shown}
+        aria-controls={id}
+        aria-label={`${example.shown ? 'Hide' : 'Show'} simulation`}
+        title={`${example.shown ? 'Hide' : 'Show'} simulation`}
+        onClick={example.toggle}
+        className={`hover:bg-hover group/tab hidden w-11 shrink-0 flex-col items-center gap-3 py-5 transition-colors lg:flex lg:group-last/row:rounded-br-xl ${example.shown ? 'border-line-soft border-r lg:group-last/row:rounded-br-none' : ''}`}
+      >
+        <Chevron
+          className={`text-muted group-hover/tab:text-ink ${example.shown ? '-rotate-90' : 'rotate-90'}`}
+        />
+        <span
+          aria-hidden
+          className={`rotate-180 text-[11px] font-bold uppercase tracking-wider [writing-mode:vertical-rl] ${example.shown ? 'text-accent' : 'text-muted group-hover/tab:text-ink'}`}
+        >
+          {label}
+        </span>
+      </button>
+      <div
+        className={`transition-[width] duration-200 ease-out motion-reduce:transition-none lg:overflow-hidden ${example.shown ? 'lg:w-[22rem]' : 'lg:w-0'}`}
+      >
+        {example.shown && (
+          <aside
+            id={id}
+            aria-label={label}
+            className="border-line-soft border-t p-5 sm:p-6 lg:w-[22rem] lg:border-t-0"
+          >
+            <h4 className="mb-6 text-lg font-bold">
+              {module === 'inventory'
+                ? 'See your quotes respond'
+                : module === 'spreads'
+                  ? 'See the extra margin'
+                  : 'See when a sale starts'}
+            </h4>
+            {!valid ? (
+              <p className="text-muted text-sm">
+                Correct the settings to update this example.
+              </p>
+            ) : (
+              <div className="space-y-6">
+                <AllocationBar
+                  share={example.share}
+                  target={draft.inventory.target_bps}
+                  limit={draft.inventory.max_bps}
+                  currency={currency}
+                />
+                {!draft.inventory.enabled && (
+                  <p className="text-muted text-xs">
+                    Inventory balancing is off. Its target and purchase limit
+                    are shown for reference.
+                  </p>
+                )}
+                {module === 'inventory' && margins && (
+                  <>
+                    <MarginBars {...margins} />
+                    <p className="text-muted text-xs leading-relaxed">
+                      Example base margins: 0.20% each. Includes inventory
+                      adjustments and the minimum margin; excludes dynamic
+                      spreads.
+                    </p>
+                  </>
+                )}
+                {module === 'spreads' && extra && (
+                  <>
+                    <MarginBars {...extra} extra />
+                    <p className="text-muted text-xs leading-relaxed">
+                      Extra margin only. Added after inventory adjustments.
+                      Actual quotes also depend on available funds and side
+                      limits.
+                    </p>
+                    <NumberControl
+                      label="Example price range"
+                      value={example.range}
+                      sliderMax={100}
+                      max={1000}
+                      onChange={example.setRange}
+                    />
+                  </>
+                )}
+                {module === 'rebalance' && (
+                  <div className="border-line-soft bg-surface rounded-xl border p-4">
+                    <p className="text-muted text-sm">
+                      {sale > 0 ? 'Sale size · up to' : 'No sale requested'}
+                    </p>
+                    <p className="my-2 text-3xl font-bold">
+                      {percentage(sale)}
+                    </p>
+                    <p className="text-muted text-xs leading-relaxed">
+                      {sale > 0
+                        ? `of vault value, converted from ${currency} to ${settlement}. Actual size is also limited by available funds and the vault’s order cap.`
+                        : enabled
+                          ? `Sales start at ${percentage(draft.rebalance.trigger_bps)} ${currency} holdings.`
+                          : 'Enable spot rebalancing to request sales.'}
+                    </p>
+                  </div>
+                )}
+                <div className="border-line-soft border-t pt-5">
+                  <NumberControl
+                    label={`Example ${currency} holdings`}
+                    value={example.share}
+                    max={10000}
+                    sliderMax={10000}
+                    onChange={example.setShare}
+                  />
+                </div>
+              </div>
+            )}
+            <p className="text-muted mt-6 text-xs leading-relaxed">
+              Illustration only, not a live quote or a return forecast.
+            </p>
+          </aside>
+        )}
+      </div>
     </div>
   )
 }

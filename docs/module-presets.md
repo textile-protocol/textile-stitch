@@ -2,7 +2,7 @@
 
 Parameters offers three starting points for each quote module: **Competitive**, **Balanced** and **Defensive**. Choose them independently. Inventory balancing controls how much corridor currency to hold; dynamic spreads controls the extra price-movement buffer. There is no dealer or spot-rebalancing preset.
 
-Selection only updates the draft. The sliders and example respond immediately; **Test on history** evaluates that draft. Save remains a separate action. No profile is automatically selected on upgrade, and none is presented as a best-performing strategy.
+Selection only updates the draft. The sliders and the **Simulate** panel respond immediately. Save remains a separate action. No profile is automatically selected on upgrade, and none is presented as a best-performing strategy.
 
 ## Settings and tradeoffs
 
@@ -50,7 +50,7 @@ For each in-period observation at availability time `at`, take only observations
 
 This cadence supports minute-scale windows and a two-minute source-history warmup, rather than a window shorter than typical source updates. Warmup still depends on actual source timestamps and may take longer when observations are missing. Caps are rounded policy choices checked against this day, not fitted quantiles: Competitive's 5 bps cap clipped 7 of 1,440 uncapped additions; Balanced's largest uncapped addition was 14 bps against its 15 bps cap; Defensive's was 21 bps against 25 bps. Caps deliberately limit the margin and can be exceeded by the underlying market movement.
 
-cNGN's recorded settlement value fell approximately 0.0646% over this sample. One relatively quiet day and five executions cannot establish a profitable preset, calibrate demand, or represent a currency shock. A five-day collection attempt could not read the initial vault snapshot, so no five-day evidence is claimed. These are shared starting profiles; **other corridors have not been calibrated by this check**. Test the actual vault across multiple periods and cost assumptions. Historical replay conditions on observed trades and cannot recover missing customer demand at different quotes.
+cNGN's recorded settlement value fell approximately 0.0646% over this sample. One relatively quiet day and five executions cannot establish a profitable preset, calibrate demand, or represent a currency shock. A five-day collection attempt could not read the initial vault snapshot, so no five-day evidence is claimed. These are shared starting profiles; **other corridors have not been calibrated by this check**.
 
 To reproduce, POST this read-only query to `https://api.textilecredit.com/graphql`, supplying the BSC vault address and the timestamps above as variables:
 

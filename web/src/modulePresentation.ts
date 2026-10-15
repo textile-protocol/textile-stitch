@@ -15,6 +15,131 @@ export const moduleKeys: ModuleKey[] = ['inventory', 'spreads', 'rebalance']
 export const percentage = (bps: number) =>
   `${(bps / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
 
+type Mode = ModulesConfig['mode']
+/** `shadow` is called Preview in the panel. `effect` says what saving does. */
+export const moduleModes: readonly {
+  value: Mode
+  label: string
+  hint: string
+  effect: string
+}[] = [
+  {
+    value: 'off',
+    label: 'Off',
+    hint: 'Regular quotes',
+    effect:
+      'Saving turns off new module activity. Already signed orders remain valid until they expire.',
+  },
+  {
+    value: 'shadow',
+    label: 'Preview',
+    hint: 'Observe only',
+    effect:
+      'Preview records proposed adjustments without changing live quotes.',
+  },
+  {
+    value: 'live',
+    label: 'Live',
+    hint: 'Apply to quotes',
+    effect:
+      'Saving applies these settings to live quotes and restarts a running bot.',
+  },
+]
+
+// A typed-over field can be NaN; show a dash rather than "NaN%".
+const shownPercent = (v: unknown) =>
+  typeof v === 'number' && Number.isFinite(v) ? percentage(v) : '—'
+const shownSeconds = (v: unknown) =>
+  typeof v === 'number' && Number.isFinite(v)
+    ? `${v.toLocaleString()} sec`
+    : '—'
+const shownSwitch = (v: unknown) => (v ? 'On' : 'Off')
+
+/** The two settings that define each module, shown on its strategy row. */
+export function moduleKeyFigures(
+  c: ModulesConfig,
+  key: ModuleKey
+): { label: string; value: string }[] {
+  const figures: Record<ModuleKey, [string, string][]> = {
+    inventory: [
+      ['Target', shownPercent(c.inventory.target_bps)],
+      ['Pause at', shownPercent(c.inventory.max_bps)],
+    ],
+    spreads: [
+      ['Max extra', `+${shownPercent(c.spreads.max_extra_bps)}`],
+      [
+        'Sensitivity',
+        Number.isFinite(c.spreads.multiplier)
+          ? `${c.spreads.multiplier}×`
+          : '—',
+      ],
+    ],
+    rebalance: [
+      ['Sell above', shownPercent(c.rebalance.trigger_bps)],
+      ['Per sale', shownPercent(c.rebalance.max_trade_bps)],
+    ],
+  }
+  return figures[key].map(([label, value]) => ({ label, value }))
+}
+
+/** Every setting the Parameters form edits, labeled as the form labels it.
+ * Dealer credentials are TOML-only and not listed. */
+const editableSettings: readonly [
+  string,
+  (c: ModulesConfig) => unknown,
+  (v: unknown) => string,
+][] = [
+  [
+    'Run mode',
+    (c) => c.mode,
+    (v) => moduleModes.find((m) => m.value === v)?.label ?? String(v),
+  ],
+  ['Inventory balancing', (c) => c.inventory.enabled, shownSwitch],
+  ['Target holdings', (c) => c.inventory.target_bps, shownPercent],
+  ['Pause purchases at', (c) => c.inventory.max_bps, shownPercent],
+  ['Maximum price adjustment', (c) => c.inventory.max_skew_bps, shownPercent],
+  ['Minimum quote margin', (c) => c.inventory.spread_floor_bps, shownPercent],
+  ['Dynamic spreads', (c) => c.spreads.enabled, shownSwitch],
+  ['Maximum extra margin', (c) => c.spreads.max_extra_bps, shownPercent],
+  [
+    'Sensitivity',
+    (c) => c.spreads.multiplier,
+    (v) => (Number.isFinite(v) ? `${v}×` : '—'),
+  ],
+  [
+    'Favor inventory reduction',
+    (c) => c.spreads.inventory_aware ?? false,
+    shownSwitch,
+  ],
+  ['Price history window', (c) => c.spreads.window_secs, shownSeconds],
+  ['Warmup time', (c) => c.spreads.warmup_secs, shownSeconds],
+  ['Spot rebalancing', (c) => c.rebalance.enabled, shownSwitch],
+  [
+    'Sale method',
+    (c) => c.rebalance.method ?? 'manual',
+    (v) => (v === 'dealer' ? 'Dealer API' : 'Manual'),
+  ],
+  ['Suggest a sale above', (c) => c.rebalance.trigger_bps, shownPercent],
+  ['Maximum per sale', (c) => c.rebalance.max_trade_bps, shownPercent],
+  ['Maximum price discount', (c) => c.rebalance.max_slippage_bps, shownPercent],
+  ['Wait between sales', (c) => c.rebalance.cooldown_secs, shownSeconds],
+  ['Order lifetime', (c) => c.rebalance.order_lifetime_secs, shownSeconds],
+]
+
+/** What saving would change, in form order. `Object.is` so an empty field
+ * (NaN) counts as one change, not a change on every render. */
+export const moduleChanges = (
+  saved: ModulesConfig,
+  draft: ModulesConfig
+): { label: string; from: string; to: string }[] =>
+  editableSettings
+    .filter(([, read]) => !Object.is(read(saved), read(draft)))
+    .map(([label, read, show]) => ({
+      label,
+      from: show(read(saved)),
+      to: show(read(draft)),
+    }))
+
 /** UI validation mirrors the numeric config constraints. The server remains
  * authoritative, including dealer URL and wallet validation. Never repair a
  * related setting silently when a slider moves. */
@@ -119,8 +244,7 @@ export function moduleOverviewState(view: ModulesView, now: number) {
   if (!view.running)
     return {
       title: 'Ready when you are',
-      message:
-        'The bot is stopped. You can edit settings or try a historical simulation.',
+      message: 'The bot is stopped. You can still edit its settings.',
       current: false,
     }
   if (
@@ -163,7 +287,7 @@ export function moduleOverviewState(view: ModulesView, now: number) {
   if (!moduleKeys.some((key) => c[key].enabled))
     return {
       title: 'No modules enabled',
-      message: 'Choose a module in Parameters to adjust the bot’s behavior.',
+      message: 'Turn on a module in Parameters to adjust the bot’s behavior.',
       current: true,
     }
   if (d && c.spreads.enabled && isWarmingUp(d))

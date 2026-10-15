@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! First-party policies. Pure decisions are shared by live RFQ and replay.
+//! First-party policies. Pure decisions, applied by the live RFQ responder.
 //! Modules never receive a signer, RPC client or authority to move funds.
 pub mod config;
 pub mod dealer;
-pub mod history;
 pub mod manual;
-pub mod replay;
 pub mod runtime;
 mod strategies;
 

@@ -1,37 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
-  equityCoordinates,
   moduleStatusFresh,
-  simulationAmount,
   dynamicSpreadState,
   dynamicSpreadAdditions,
   type ModulesView,
   type ModuleStatus,
 } from './modules'
-
-describe('simulation costs and dealer depth', () => {
-  it('preserves atomic precision above the safe integer range', () => {
-    expect(simulationAmount('100000000000000.000000000000000001', 18)).toBe(
-      '100000000000000000000000000000001'
-    )
-    expect(simulationAmount('0.25', 6)).toBe('250000')
-    expect(simulationAmount('0', 0)).toBe('0')
-  })
-  it('rejects negative, ambiguous, overflowing and over-precision inputs', () => {
-    for (const value of [
-      '-1',
-      '1,000',
-      '1e6',
-      '',
-      '.2',
-      'NaN',
-      '0.0000001',
-      '9'.repeat(80),
-    ]) {
-      expect(() => simulationAmount(value, 6)).toThrow()
-    }
-  })
-})
 
 describe('module telemetry', () => {
   const status = {
@@ -55,16 +29,6 @@ describe('module telemetry', () => {
       },
     } as ModuleStatus
     expect(moduleStatusFresh(disconnected, true, 101)).toBe(false)
-  })
-  it('plots differences above Number.MAX_SAFE_INTEGER without rounding away the result', () => {
-    const n = 10n ** 30n
-    const points = [
-      { at: 1, baseline: n.toString(), candidate: n.toString() },
-      { at: 2, baseline: n.toString(), candidate: (n + 1n).toString() },
-    ]
-    expect(equityCoordinates(points, 'candidate')).toBe('20,180 680,30')
-    expect(equityCoordinates(points, 'baseline')).toBe('20,180 680,180')
-    expect(equityCoordinates([], 'baseline')).toBe('')
   })
 })
 
@@ -100,7 +64,7 @@ describe('dynamic spread visibility', () => {
       running: true,
       revision: 'test',
       settlement_decimals: 6,
-      dataset_template: {},
+      corridor_decimals: 18,
       config,
       status: {
         version: 1,

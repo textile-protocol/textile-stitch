@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { percentage } from '../modulePresentation'
 
 /** Shared module editor vocabulary: exact inputs + sliders, accessible switches,
@@ -30,14 +30,133 @@ export function Disclosure({
   )
 }
 
+/** Second-order settings, always visible. A caption and a recessed panel set
+ * them apart from the module's main controls. */
+export function SecondarySettings({
+  title,
+  children,
+}: {
+  title: string
+  children: ReactNode
+}) {
+  const id = useId()
+  return (
+    <section aria-labelledby={id} className="space-y-2.5 pt-1">
+      <h5
+        id={id}
+        className="text-faint text-[11px] font-bold uppercase tracking-wider"
+      >
+        {title}
+      </h5>
+      <div className="border-line-soft bg-canvas divide-line-soft divide-y rounded-xl border [&>*]:p-4">
+        {children}
+      </div>
+    </section>
+  )
+}
+
+export function Chevron({ className = '' }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`size-3 shrink-0 ${className}`}
+    >
+      <path d="M3 4.5 6 7.5 9 4.5" />
+    </svg>
+  )
+}
+
+/** A button with a small anchored panel. Closes on Escape (focus returns to
+ * the button), on a press outside, and when focus tabs out. The panel follows
+ * the button in tab order, so it needs no focus trap. */
+export function Popover({
+  label,
+  buttonClassName,
+  align = 'start',
+  className = '',
+  children,
+}: {
+  label: ReactNode
+  buttonClassName: string
+  align?: 'start' | 'end'
+  className?: string
+  children: (close: () => void) => ReactNode
+}) {
+  const [open, setOpen] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
+  const button = useRef<HTMLButtonElement>(null)
+  const id = useId()
+  const close = () => {
+    setOpen(false)
+    button.current?.focus()
+  }
+  useEffect(() => {
+    if (!open) return
+    const outside = (e: PointerEvent) => {
+      if (!root.current?.contains(e.target as Node)) setOpen(false)
+    }
+    const escape = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      setOpen(false)
+      button.current?.focus()
+    }
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('keydown', escape)
+    return () => {
+      document.removeEventListener('pointerdown', outside)
+      document.removeEventListener('keydown', escape)
+    }
+  }, [open])
+  return (
+    <div
+      ref={root}
+      className={`relative ${className}`}
+      onBlur={(e) => {
+        // A click on panel text blurs with no related target; only a focus
+        // move outside closes.
+        if (e.relatedTarget && !root.current?.contains(e.relatedTarget))
+          setOpen(false)
+      }}
+    >
+      <button
+        ref={button}
+        type="button"
+        aria-expanded={open}
+        aria-controls={open ? id : undefined}
+        onClick={() => setOpen((value) => !value)}
+        className={buttonClassName}
+      >
+        {label}
+      </button>
+      {open && (
+        <div
+          id={id}
+          className={`border-line bg-surface absolute top-full z-30 mt-1.5 max-h-[min(34rem,70vh)] w-[min(23rem,calc(100vw-3rem))] overflow-y-auto rounded-xl border shadow-xl ${align === 'end' ? 'right-0' : 'left-0'}`}
+        >
+          {children(close)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function ModuleSwitch({
   label,
   checked,
   onChange,
+  showState = true,
 }: {
   label: string
   checked: boolean
   onChange: (value: boolean) => void
+  /** Off where the row already says whether the module is on. */
+  showState?: boolean
 }) {
   return (
     <label className="relative inline-flex cursor-pointer items-center gap-2 text-sm">
@@ -53,7 +172,7 @@ export function ModuleSwitch({
         aria-hidden
         className="bg-active after:bg-muted peer-checked:after:bg-on-accent relative h-6 w-10 rounded-full transition-colors after:absolute after:left-1 after:top-1 after:size-4 after:rounded-full after:transition-transform peer-checked:bg-accent peer-checked:after:translate-x-4 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-accent"
       />
-      <span aria-hidden>{checked ? 'On' : 'Off'}</span>
+      {showState && <span aria-hidden>{checked ? 'On' : 'Off'}</span>}
     </label>
   )
 }

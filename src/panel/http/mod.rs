@@ -310,7 +310,6 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             "/api/bots/{name}/modules",
             get(modules::show).put(modules::update),
         )
-        .route("/api/bots/{name}/modules/simulate", post(modules::simulate))
         .route(
             "/api/bots/{name}/modules/manual-sales",
             get(manual_sales::list).post(manual_sales::create),
@@ -318,10 +317,6 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route(
             "/api/bots/{name}/modules/manual-sales/{id}/close",
             post(manual_sales::close),
-        )
-        .route(
-            "/api/bots/{name}/modules/simulate-history",
-            post(modules::simulate_history),
         )
         .route("/api/bots/{name}/settings", get(settings::show))
         .route("/api/bots/{name}/settings", patch(settings::update))

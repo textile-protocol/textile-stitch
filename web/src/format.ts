@@ -1,47 +1,7 @@
 // Formatting helpers.
 //
 // Everything here goes through `Intl` with no explicit locale, so the operator's
-// own locale decides separators and date order. Amounts are atomic-unit integers
-// arriving as strings; they are formatted with BigInt arithmetic rather than
-// `Number`, because a large inventory would lose its low digits to a float.
-
-/** The literal the config accepts for "quote everything funded". */
-export const MAX_LIQUIDITY = 'max'
-
-/**
- * Render an atomic-unit integer string as a decimal amount.
- *
- * Returns the input unchanged for the `max` sentinel and for anything that isn't
- * a plain integer, so a hand-edited config renders as what it actually says
- * instead of as `NaN`.
- */
-export function formatAtomic(raw: string, decimals: number): string {
-  const value = raw.trim()
-  if (value === '' || value === MAX_LIQUIDITY) return value
-  if (!/^\d+$/.test(value)) return value
-
-  const big = BigInt(value)
-  const scale = 10n ** BigInt(decimals)
-  const whole = big / scale
-  const frac = big % scale
-
-  const wholeText = new Intl.NumberFormat().format(whole)
-  if (frac === 0n) return wholeText
-
-  // Keep at most 6 fractional digits, trimmed: a wei-exact tail is noise in a UI.
-  const fracText = frac.toString().padStart(decimals, '0').slice(0, 6).replace(/0+$/, '')
-  if (fracText === '') return wholeText
-  const separator = decimalSeparator()
-  return `${wholeText}${separator}${fracText}`
-}
-
-function decimalSeparator(): string {
-  return (
-    new Intl.NumberFormat()
-      .formatToParts(1.1)
-      .find((p) => p.type === 'decimal')?.value ?? '.'
-  )
-}
+// own locale decides separators and date order.
 
 /**
  * An RFC 3339 timestamp as a locale date, or a dash.

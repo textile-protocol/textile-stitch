@@ -3,7 +3,7 @@
 use alloy_primitives::{address, U256};
 use stitch_bot::{
     config::RfqCapacity,
-    modules::{config::DealerConfig, dealer, replay::*, *},
+    modules::{config::DealerConfig, dealer, *},
     pricing::quote::Spread,
     rfq::responder::CorridorBook,
 };
@@ -472,138 +472,6 @@ fn dealer_cannot_change_counterparty_size_price_or_deadline() {
     ] {
         assert!(dealer::validate_quote(&cfg, &req, &changed, 100).is_err());
     }
-}
-fn data() -> Dataset {
-    let b = book();
-    Dataset {
-        version: 1,
-        chain_id: 1,
-        corridor_token: b.collateral.to_string(),
-        settlement_token: b.debt.to_string(),
-        corridor_decimals: 6,
-        settlement_decimals: 6,
-        initial_settlement: u(40_000_000),
-        initial_corridor: u(60_000_000),
-        max_order_settlement: u(100_000_000),
-        max_order_corridor: u(100_000_000),
-        reserve_settlement: U256::ZERO,
-        reserve_corridor: U256::ZERO,
-        cost_per_trade: U256::ZERO,
-        events: vec![
-            Event {
-                at: 100,
-                price_at: 100,
-                price: 1.0,
-                trade: None,
-                dealer: Some(Liquidity {
-                    max_corridor: u(100_000_000),
-                    net_price: 1.0,
-                }),
-            },
-            Event {
-                at: 500,
-                price_at: 500,
-                price: 0.5,
-                trade: None,
-                dealer: None,
-            },
-        ],
-    }
-}
-#[test]
-fn replay_protects_against_a_drop_only_when_executable_liquidity_exists() {
-    let mut cfg = config();
-    cfg.rebalance.enabled = true;
-    let d = data();
-    let report = run(&d, &cfg, &book()).unwrap();
-    assert_eq!(report.baseline.ending_nav, u(70_000_000));
-    assert_eq!(report.candidate.ending_nav, u(71_000_000));
-    assert_eq!(report.candidate.rebalance_fills, 1);
-    let mut d = d;
-    d.events[0].dealer = None;
-    let report = run(&d, &cfg, &book()).unwrap();
-    assert_eq!(report.candidate.ending_nav, report.baseline.ending_nav);
-    assert_eq!(report.candidate.rebalance_fills, 0);
-}
-#[test]
-fn replay_costs_can_erase_the_benefit_and_portfolios_do_not_share_balances() {
-    let mut cfg = config();
-    cfg.rebalance.enabled = true;
-    let mut d = data();
-    d.cost_per_trade = u(1_500_000);
-    let report = run(&d, &cfg, &book()).unwrap();
-    assert_eq!(report.baseline.ending_nav, u(70_000_000));
-    assert!(report.candidate.ending_nav < report.baseline.ending_nav);
-    assert_eq!(report.candidate.execution_costs, u(1_500_000));
-}
-#[test]
-fn customer_acceptance_and_operator_side_switches_control_simulated_fills() {
-    let mut d = data();
-    d.events[0].dealer = None;
-    d.events[0].trade = Some(Trade {
-        vault_buys: true,
-        corridor_amount: u(1_000_000),
-        limit_price: 0.998,
-    });
-    let report = run(&d, &config(), &book()).unwrap();
-    assert_eq!(report.baseline.customer_fills, 1);
-    assert_eq!(report.candidate.customer_fills, 0);
-    let mut b = book();
-    b.buy_capacity_debt = None;
-    let report = run(&d, &config(), &b).unwrap();
-    assert_eq!(report.baseline.customer_fills, 0);
-}
-
-#[test]
-fn replay_uses_inventory_weighting_to_price_a_sale_and_charges_its_execution_cost() {
-    let mut cfg = inventory_aware_config();
-    let mut d = data();
-    d.cost_per_trade = u(100);
-    d.events = spread_history()
-        .iter()
-        .map(|p| Event {
-            at: p.timestamp,
-            price_at: p.timestamp,
-            price: p.price,
-            trade: None,
-            dealer: None,
-        })
-        .collect();
-    d.events[1].trade = Some(Trade {
-        vault_buys: false,
-        corridor_amount: u(1_000_000),
-        limit_price: 1.0012,
-    });
-    // The same live decision offers a 10 bps sale; a 12 bps customer limit
-    // accepts it. The symmetric buffer instead asks 15 bps and misses it.
-    assert_eq!(
-        evaluate(&cfg, &inventory_context(6000), &spread_history()).sell_bps,
-        Some(10)
-    );
-    let aware = run(&d, &cfg, &book()).unwrap();
-    assert_eq!(aware.candidate.customer_fills, 1);
-    assert_eq!(aware.candidate.execution_costs, u(100));
-    assert!(aware.config.spreads.inventory_aware);
-    cfg.spreads.inventory_aware = false;
-    let symmetric = run(&d, &cfg, &book()).unwrap();
-    assert_eq!(symmetric.candidate.customer_fills, 0);
-    assert_eq!(aware.baseline.ending_nav, symmetric.baseline.ending_nav);
-    assert_eq!(aware.candidate.rebalance_fills, 0);
-}
-#[test]
-fn replay_refuses_future_prices_wrong_tokens_unsorted_events_and_wrong_versions() {
-    let mut d = data();
-    d.events[0].price_at = 101;
-    assert!(run(&d, &config(), &book()).is_err());
-    let mut d = data();
-    d.events.reverse();
-    assert!(run(&d, &config(), &book()).is_err());
-    let mut d = data();
-    d.corridor_token = d.settlement_token.clone();
-    assert!(run(&d, &config(), &book()).is_err());
-    let mut d = data();
-    d.version = 2;
-    assert!(run(&d, &config(), &book()).is_err());
 }
 #[tokio::test]
 async fn dealer_pacing_survives_restart_and_corrupt_pacing_blocks_start() {
