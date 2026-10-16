@@ -8,8 +8,11 @@ import {
   moduleNames,
   moduleParameterErrors,
   percentage,
+  liveRow,
   quoteBreakdown,
   quoteModeNote,
+  warmupNote,
+  type LiveReading,
   type ModuleKey,
   type QuoteSides,
 } from '../modulePresentation'
@@ -32,9 +35,15 @@ import { Button } from './ui'
 
 type Example = {
   share: number
+  /** Price range in bps. Fractional: a live reading keeps the bot's own float. */
   range: number
   setShare: (bps: number) => void
   setRange: (bps: number) => void
+  /** The bot's current reading, when it has a fresh one. */
+  live: LiveReading | null
+  /** Holdings and range are the live reading's, so the table is "now". */
+  atLive: boolean
+  useLive: () => void
   /** Collapsed to a narrow tab by default; shared by all modules. */
   shown: boolean
   toggle: () => void
@@ -51,7 +60,7 @@ export default function ModuleParameters({
   currency,
   settlement,
   corridor,
-  initialShare,
+  live,
 }: {
   draft: ModulesConfig
   onChange: (config: ModulesConfig) => void
@@ -61,15 +70,28 @@ export default function ModuleParameters({
   settlement: string
   /** The corridor's saved spreads in bps; null until they can be read. */
   corridor: QuoteSides | null
-  initialShare?: number | null
+  /** The bot's current reading. The example starts from it when there is one. */
+  live: LiveReading | null
 }) {
-  const [share, setShare] = useState(initialShare ?? 4500)
-  const [range, setRange] = useState(20)
+  // A warming-up window has no range to start from; 0.2% is a plain example.
+  const [share, setShare] = useState(live?.share ?? 4500)
+  const [range, setRange] = useState(live?.rangeBps ?? 20)
   const [shown, setShown] = useState(false)
   const example: Example = {
     share,
     range,
     shown,
+    live,
+    atLive:
+      live !== null &&
+      live.rangeBps !== null &&
+      share === live.share &&
+      range === live.rangeBps,
+    useLive: () => {
+      if (!live) return
+      setShare(live.share)
+      if (live.rangeBps !== null) setRange(live.rangeBps)
+    },
     toggle: () => setShown((value) => !value),
     setShare: (value) =>
       setShare(
@@ -79,9 +101,7 @@ export default function ModuleParameters({
       ),
     setRange: (value) =>
       setRange(
-        Number.isFinite(value)
-          ? Math.max(0, Math.min(1000, Math.round(value)))
-          : 0
+        Number.isFinite(value) ? Math.max(0, Math.min(10000, value)) : 0
       ),
   }
   const titleId = useId()
@@ -379,7 +399,12 @@ function ModuleExample({
     valid && corridor
       ? quoteBreakdown(draft, corridor, example.share, example.range)
       : null
-  const modeNote = quoteModeNote(draft.mode)
+  const notes = [
+    quoteModeNote(draft.mode),
+    valid && corridor
+      ? warmupNote(draft, corridor, example.share, example.range)
+      : null,
+  ].filter((note): note is string => note !== null)
   const sale =
     enabled && example.share >= draft.rebalance.trigger_bps
       ? Math.max(
@@ -479,12 +504,24 @@ function ModuleExample({
                     <QuoteBreakdown
                       rows={breakdown}
                       highlight={module === 'rebalance' ? null : module}
+                      current={
+                        example.atLive && example.live
+                          ? liveRow(example.live)
+                          : null
+                      }
                     />
-                    {modeNote && (
-                      <p className="text-muted text-xs leading-relaxed">
-                        {modeNote}
+                    <p className="text-muted text-xs leading-relaxed">
+                      Modules start from your corridor spread and adjust it;
+                      they don't replace it.
+                    </p>
+                    {notes.map((note) => (
+                      <p
+                        key={note}
+                        className="text-muted text-xs leading-relaxed"
+                      >
+                        {note}
                       </p>
-                    )}
+                    ))}
                   </div>
                 ) : (
                   <p className="text-muted text-xs leading-relaxed">
@@ -493,12 +530,29 @@ function ModuleExample({
                     shown here.
                   </p>
                 )}
+                {example.live &&
+                  (example.atLive ? (
+                    <p className="text-muted text-xs leading-relaxed">
+                      Holdings and price range below are the bot's current
+                      readings.
+                    </p>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={example.useLive}
+                      className="text-left text-xs font-bold text-accent hover:underline"
+                    >
+                      Use the bot's current {currency} holdings
+                      {example.live.rangeBps === null ? '' : ' and price range'}
+                    </button>
+                  ))}
                 {(module === 'spreads' || draft.spreads.enabled) && (
                   <NumberControl
                     label="Example price range"
                     value={example.range}
                     sliderMax={100}
-                    max={1000}
+                    max={10000}
+                    fractionDigits={4}
                     onChange={example.setRange}
                   />
                 )}

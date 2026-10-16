@@ -4,6 +4,8 @@ import {
   corridorSpreadBps,
   corridorSpreads,
   inventoryIllustration,
+  liveReading,
+  liveRow,
   moduleChanges,
   moduleKeyFigures,
   moduleOverviewState,
@@ -12,6 +14,8 @@ import {
   quoteIllustration,
   quoteModeNote,
   volatilityIllustration,
+  warmupNote,
+  windowRangeBps,
 } from './modulePresentation'
 import { applyPreset, modulePresets } from './modulePresets'
 
@@ -236,6 +240,36 @@ describe('the simulated spread starts from the corridor spread', () => {
       sell: 10040,
     })
   })
+  it('names the capped start dynamic spreads quotes before it has price history', () => {
+    const c = config()
+    const base = { buy: 20, sell: 20 }
+    // The full 100 bps, weighted at 60% held: buys +100, sells +50.
+    expect(quoteIllustration(c, base, 6000, null).quoted).toEqual({
+      buy: 140,
+      sell: 55,
+    })
+    expect(warmupNote(c, base, 6000, 20)).toBe(
+      'Until the bot has 30 sec of price history, dynamic spreads add their full maximum: buys 1.4%, sells 0.55%. Expect that right after switching from Off, or after a stop longer than the 300 sec window.'
+    )
+    // At the purchase limit weighting drops the sell buffer too, so the
+    // start matches the table; equal buffers keep the full cap on sells.
+    expect(warmupNote(c, base, 8000, 20)).toBeNull()
+    expect(
+      warmupNote(
+        { ...c, spreads: { ...c.spreads, inventory_aware: false } },
+        base,
+        8000,
+        20
+      )
+    ).toMatch(/buys paused, sells 1.05%/)
+    // Already at the cap, or nothing live to warm up.
+    expect(warmupNote(c, base, 6000, 1000)).toBeNull()
+    c.mode = 'shadow'
+    expect(warmupNote(c, base, 6000, 20)).toBeNull()
+    c.mode = 'live'
+    c.spreads.enabled = false
+    expect(warmupNote(c, base, 6000, 20)).toBeNull()
+  })
   it('says when the bot will not quote the simulated spread', () => {
     expect(quoteModeNote('live')).toBeNull()
     expect(quoteModeNote('shadow')).toMatch(
@@ -284,6 +318,145 @@ const view = (): ModulesView => ({
     ],
   },
 })
+// The cNGN vault from the Oct 16 report: a 1/1 bps corridor, target 0.01%,
+// purchases paused at 75%, 0.1% maximum adjustment, 0.01% floor, and dynamic
+// spreads at 0.5× up to 0.05% with inventory weighting. Holding 0%, it quoted
+// 0.01% / 0.02% while the Simulate default (45% held, 0.2% range) said
+// 0.11% / 0.04%.
+const cngnVault = (): ModulesView => {
+  const c = config()
+  c.inventory = {
+    enabled: true,
+    target_bps: 1,
+    max_bps: 7500,
+    max_skew_bps: 10,
+    spread_floor_bps: 1,
+  }
+  c.spreads = {
+    enabled: true,
+    inventory_aware: true,
+    multiplier: 0.5,
+    max_extra_bps: 5,
+    window_secs: 300,
+    warmup_secs: 120,
+  }
+  return {
+    ...view(),
+    config: c,
+    corridor_spreads: {
+      buy: { kind: 'bps', value: 1 },
+      sell: { kind: 'bps', value: 1 },
+    },
+    status: {
+      version: 1,
+      config: c,
+      at: 100,
+      rebalance_status: 'Disabled',
+      next_attempt_at: 0,
+      decisions: [
+        {
+          price: 0.00073,
+          corridor: '0',
+          settlement: '1000',
+          decision: {
+            version: 1,
+            at: 100,
+            inventory_bps: 0,
+            buy_bps: 1,
+            sell_bps: 2,
+            buy_limit: '1',
+            rebalance_sell: '0',
+            volatility_bps: 1,
+            reasons: [],
+            blocked: false,
+          },
+          inputs: {
+            price_at: 100,
+            balances_at: 100,
+            base_buy_bps: 1,
+            base_sell_bps: 1,
+            inventory_buy_bps: 1,
+            inventory_sell_bps: 1,
+            // A 1.81 bps range: × 0.5 rounds up to 1 bps.
+            spread_window: {
+              samples: 40,
+              history_secs: 290,
+              low: 0.0011209,
+              high: 0.0011211025823673593,
+              extra_bps: 1,
+            },
+          },
+        },
+      ],
+    },
+  }
+}
+
+describe('the Simulate table starts from what the bot sees now', () => {
+  it('reads the range the way the bot measures it, null while warming up', () => {
+    expect(windowRangeBps({ low: 1, high: 1.001953125, extra_bps: 20 })).toBe(
+      19.53125
+    )
+    expect(windowRangeBps({ low: 1, high: 1.5, extra_bps: null })).toBeNull()
+  })
+  it('reproduces the quote the bot is making from its own reading', () => {
+    const v = cngnVault()
+    const now = liveReading(v, 101)!
+    expect(now).toEqual({
+      share: 0,
+      rangeBps: (0.0011211025823673593 / 0.0011209 - 1) * 10000,
+      quoted: { buy: 1, sell: 2 },
+      base: { buy: 1, sell: 1 },
+      mode: 'live',
+    })
+    const base = corridorSpreads(
+      v.corridor_spreads,
+      v.status!.decisions[0]!.price
+    )!
+    expect(
+      quoteIllustration(v.config, base, now.share, now.rangeBps).quoted
+    ).toEqual(now.quoted)
+    expect(liveRow(now)).toEqual({
+      label: 'Quoting now',
+      buy: '0.01%',
+      sell: '0.02%',
+    })
+    // The old fixed example inputs are what showed the higher spread.
+    expect(quoteIllustration(v.config, base, 4500, 20).quoted).toEqual({
+      buy: 11,
+      sell: 4,
+    })
+    expect(quoteIllustration(v.config, base, 0, 20).quoted).toEqual({
+      buy: 1,
+      sell: 6,
+    })
+  })
+  it('has no reading for a stale, blocked, off or input-less evaluation', () => {
+    expect(liveReading(cngnVault(), 111)).toBeNull()
+    const blocked = cngnVault()
+    blocked.status!.decisions[0]!.decision.blocked = true
+    expect(liveReading(blocked, 101)).toBeNull()
+    const off = cngnVault()
+    off.status!.config = { ...off.status!.config, mode: 'off' }
+    expect(liveReading(off, 101)).toBeNull()
+    expect(liveReading(view(), 101)).toBeNull()
+  })
+  it('names a paused or off side and a preview', () => {
+    const v = cngnVault()
+    v.status!.config = { ...v.status!.config, mode: 'shadow' }
+    v.status!.decisions[0]!.decision.buy_bps = null
+    v.status!.decisions[0]!.inputs!.base_sell_bps = null
+    v.status!.decisions[0]!.decision.sell_bps = null
+    expect(liveRow(liveReading(v, 101)!)).toEqual({
+      label: 'Proposed now',
+      buy: 'Paused',
+      sell: 'Off',
+    })
+    v.status!.decisions[0]!.inputs!.spread_window.extra_bps = null
+    expect(liveReading(v, 101)!.rangeBps).toBeNull()
+  })
+})
+
 describe('concise overview truthfulness', () => {
   it('withholds stale, future, disconnected and stopped readings', () => {
     for (const now of [99, 111])

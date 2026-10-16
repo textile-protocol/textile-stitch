@@ -16,6 +16,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
 pub(super) fn read(bot: &Bot) -> Result<(std::path::PathBuf, String, Config), ApiError> {
@@ -61,7 +62,11 @@ pub struct CorridorSpreads {
 pub struct View {
     pub config: ModulesConfig,
     pub revision: String,
-    pub status: Option<Status>,
+    /// The bot's status file as written, after checking it parses as a
+    /// [`Status`]. Passed through rather than re-serialized: serde_json's
+    /// default float parsing is best effort, and the Simulate panel recomputes
+    /// the bot's price range from the window's high and low.
+    pub status: Option<Box<RawValue>>,
     pub running: bool,
     pub settlement_decimals: u8,
     pub corridor_decimals: u8,
@@ -81,13 +86,10 @@ pub async fn show(
         if size > 2_000_000 {
             return Err(ApiError::conflict("Module status file exceeds its limit"));
         }
-        Some(
-            serde_json::from_str(
-                &std::fs::read_to_string(status_path)
-                    .map_err(|e| ApiError::bad_request(e.to_string()))?,
-            )
-            .map_err(ApiError::bad_request)?,
-        )
+        let file = std::fs::read_to_string(status_path)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        serde_json::from_str::<Status>(&file).map_err(ApiError::bad_request)?;
+        Some(RawValue::from_string(file).map_err(ApiError::bad_request)?)
     } else {
         None
     };
@@ -442,6 +444,29 @@ mod tests {
                 "buy": {"kind": "bps", "value": 30},
                 "sell": {"kind": "abs", "value": 2.5},
             })
+        );
+    }
+    #[tokio::test]
+    async fn the_view_passes_the_bots_status_floats_through_exactly() {
+        let h = harness("module-status-floats");
+        seed(&h, true);
+        // serde_json's default parser reads this as 0.001121102582367359, one
+        // bit off. The panel recomputes the bot's price range from it.
+        let high = "0.0011211025823673593";
+        let status = format!(
+            r#"{{"version":1,"config":{config},"at":100,"decisions":[{{"decision":{{"version":1,"at":100,"inventory_bps":0,"buy_bps":1,"sell_bps":2,"buy_limit":"0","rebalance_sell":"0","volatility_bps":1,"reasons":[],"blocked":false}},"price":{high},"settlement":"1","corridor":"0","inputs":{{"price_at":100,"balances_at":100,"base_buy_bps":1,"base_sell_bps":1,"inventory_buy_bps":1,"inventory_sell_bps":1,"spread_window":{{"samples":2,"history_secs":60,"low":0.0011209,"high":{high},"extra_bps":1}}}}}}],"rebalance_status":"Disabled","next_attempt_at":0}}"#,
+            config = serde_json::to_string(&ModulesConfig::default()).unwrap(),
+        );
+        std::fs::write(h.root.join("bot-a").join(STATUS_FILE), &status).unwrap();
+        let (code, body) = h.get("/api/bots/bot-a/modules").await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert!(body.contains(&format!(r#""high":{high}"#)), "{body}");
+        assert!(body.contains(&format!(r#""price":{high}"#)), "{body}");
+        // A file that isn't a status is still refused, not passed along.
+        std::fs::write(h.root.join("bot-a").join(STATUS_FILE), r#"{"version":1}"#).unwrap();
+        assert_eq!(
+            h.get("/api/bots/bot-a/modules").await.0,
+            StatusCode::BAD_REQUEST
         );
     }
     #[tokio::test]

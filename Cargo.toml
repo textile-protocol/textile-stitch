@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.319"
+version = "0.1.320"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; quotes Swap via RFQ firm quotes and optionally fills resting limit orders."
 license = "AGPL-3.0-or-later"
@@ -68,7 +68,7 @@ axum = "0.8"
 base64 = "0.22"
 k256 = { version = "0.13", features = ["ecdsa"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 semver = "1"
 toml = "0.8"
 toml_edit = "0.22"

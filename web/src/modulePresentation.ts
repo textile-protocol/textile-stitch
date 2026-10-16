@@ -2,6 +2,7 @@ import {
   isWarmingUp,
   moduleStatusFresh,
   type CorridorSpread,
+  type ModuleStatus,
   type ModulesConfig,
   type ModulesView,
 } from './modules'
@@ -250,17 +251,27 @@ export function inventoryIllustration(
         sell: base.sell === null ? null : floored(base.sell + skew),
       }
 }
+/** The dynamic-spreads addition before inventory weighting, as
+ * `modules::evaluate` takes it: the price range in bps × sensitivity, rounded
+ * up and capped. A null range is a window still warming up, which quotes at
+ * the cap. Zero when the module is off. */
+function dynamicExtra(c: ModulesConfig, rangeBps: number | null): number {
+  if (!c.spreads.enabled) return 0
+  if (rangeBps === null) return c.spreads.max_extra_bps
+  return Math.min(
+    c.spreads.max_extra_bps,
+    Math.ceil(rangeBps * c.spreads.multiplier)
+  )
+}
+
+/** Each side's dynamic addition at `share`, as `strategies::spread_additions`
+ * splits it, with buys paused at the purchase limit. */
 export function volatilityIllustration(
   c: ModulesConfig,
   share: number,
-  rangeBps: number
+  rangeBps: number | null
 ) {
-  const extra = c.spreads.enabled
-    ? Math.min(
-        c.spreads.max_extra_bps,
-        Math.ceil(rangeBps * c.spreads.multiplier)
-      )
-    : 0
+  const extra = dynamicExtra(c, rangeBps)
   const buyPaused = c.inventory.enabled && share >= c.inventory.max_bps
   if (!c.spreads.inventory_aware || !c.inventory.enabled)
     return { buy: buyPaused ? null : extra, sell: extra }
@@ -277,15 +288,17 @@ export function volatilityIllustration(
   }
 }
 
-/** What the bot would quote at `share` and a `rangeBps` price range: the
- * corridor spread, then inventory balancing, then dynamic spreads, composed as
- * `modules::evaluate` composes them, buy capped at 9,999 bps. Leaves out what
- * only a running bot knows: open quotes, funds, vault limits and freshness. */
+/** What the bot would quote at `share` and a `rangeBps` price range (null:
+ * dynamic spreads still warming up): the corridor spread, then inventory
+ * balancing, then dynamic spreads, composed as `modules::evaluate` composes
+ * them, buy capped at 9,999 bps. In Live this is the spread `modules::apply`
+ * puts on the RFQ book. Leaves out what only a running bot knows: open quotes,
+ * funds, vault limits and freshness. */
 export function quoteIllustration(
   c: ModulesConfig,
   base: QuoteSides,
   share: number,
-  rangeBps: number
+  rangeBps: number | null
 ): { base: QuoteSides; inventory: QuoteSides; quoted: QuoteSides } {
   const inventory = inventoryIllustration(c, share, base)
   const extra = volatilityIllustration(c, share, rangeBps)
@@ -366,6 +379,96 @@ export function quoteBreakdown(
     buy: buy[key],
     sell: sell[key],
   }))
+}
+
+const quotedSide = (bps: number | null, corridor: number | null) =>
+  bps !== null ? percentage(bps) : corridor === null ? 'off' : 'paused'
+
+/** What Live quotes start at while dynamic spreads has too little price
+ * history: the full maximum on top of inventory balancing. The bot keeps its
+ * window across restarts, but Off mode records none, and a stop longer than
+ * the window lets it expire. Null when that start matches the table. */
+export function warmupNote(
+  c: ModulesConfig,
+  base: QuoteSides,
+  share: number,
+  rangeBps: number
+): string | null {
+  if (c.mode !== 'live' || !c.spreads.enabled) return null
+  const warm = quoteIllustration(c, base, share, null).quoted
+  const now = quoteIllustration(c, base, share, rangeBps).quoted
+  if (warm.buy === now.buy && warm.sell === now.sell) return null
+  return `Until the bot has ${c.spreads.warmup_secs.toLocaleString()} sec of price history, dynamic spreads add their full maximum: buys ${quotedSide(warm.buy, base.buy)}, sells ${quotedSide(warm.sell, base.sell)}. Expect that right after switching from Off, or after a stop longer than the ${c.spreads.window_secs.toLocaleString()} sec window.`
+}
+
+type SpreadWindow = NonNullable<
+  ModuleStatus['decisions'][number]['inputs']
+>['spread_window']
+
+/** The window's price range in bps, `(high / low − 1) × 10,000`, the same
+ * float steps as `strategies::spread_window`. Null while the window is
+ * warming up, when dynamic spreads quotes at its cap. */
+export function windowRangeBps(
+  w: Pick<SpreadWindow, 'low' | 'high' | 'extra_bps'>
+): number | null {
+  return w.extra_bps === null || w.low === null || w.high === null
+    ? null
+    : (w.high / w.low - 1) * 10000
+}
+
+/** What the bot is working from right now, from its latest evaluation. */
+export type LiveReading = {
+  share: number
+  /** Null while dynamic spreads is warming up. */
+  rangeBps: number | null
+  /** What that evaluation put on the book (Live) or proposed (Preview). */
+  quoted: QuoteSides
+  /** The corridor spread it started from, to tell an off side from a pause. */
+  base: QuoteSides
+  mode: 'live' | 'shadow'
+}
+
+/** The bot's current holdings, price range and spreads. Null unless its
+ * latest evaluation is current, unblocked and recorded its inputs. */
+export function liveReading(
+  view: ModulesView,
+  now: number
+): LiveReading | null {
+  const status = view.status
+  const last = status?.decisions.at(-1)
+  if (
+    !status ||
+    !last?.inputs ||
+    last.decision.blocked ||
+    last.decision.inventory_bps === null ||
+    status.config.mode === 'off' ||
+    !moduleStatusFresh(status, view.running, now)
+  )
+    return null
+  return {
+    share: last.decision.inventory_bps,
+    rangeBps: windowRangeBps(last.inputs.spread_window),
+    quoted: { buy: last.decision.buy_bps, sell: last.decision.sell_bps },
+    base: { buy: last.inputs.base_buy_bps, sell: last.inputs.base_sell_bps },
+    mode: status.config.mode,
+  }
+}
+
+/** The table's comparison row: what the bot quotes (or proposes) right now. */
+export function liveRow(reading: LiveReading): {
+  label: string
+  buy: string
+  sell: string
+} {
+  const side = (key: 'buy' | 'sell') => {
+    const shown = quotedSide(reading.quoted[key], reading.base[key])
+    return shown.charAt(0).toUpperCase() + shown.slice(1)
+  }
+  return {
+    label: reading.mode === 'live' ? 'Quoting now' : 'Proposed now',
+    buy: side('buy'),
+    sell: side('sell'),
+  }
 }
 
 /** Why the spread table isn't what the bot quotes today, when it isn't. The

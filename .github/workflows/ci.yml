@@ -70,6 +70,12 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
+      # Includes the Simulate parity check against the Rust module evaluator
+      # (src/moduleSpreadParity.test.ts).
+      - name: Test the frontend
+        working-directory: web
+        run: npm test
+
       - name: Run panel tests
         run: cargo test --features panel
 

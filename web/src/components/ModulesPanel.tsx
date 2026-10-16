@@ -9,6 +9,7 @@ import { pairSymbols } from './SpreadExample'
 import ScrollTabs from './ScrollTabs'
 import {
   corridorSpreads,
+  liveReading,
   moduleParameterErrors,
   type ModuleKey,
 } from '../modulePresentation'
@@ -189,6 +190,7 @@ export default function ModulesPanel({
               currency={currency}
               settlement={settlement}
               corridor={corridor}
+              live={liveReading(view, now)}
             />
           </fieldset>
           {!valid && (

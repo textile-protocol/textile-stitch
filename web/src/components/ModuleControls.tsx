@@ -188,6 +188,7 @@ export function NumberControl({
   step = 1,
   sliderMax,
   hint,
+  fractionDigits,
 }: {
   label: string
   value: number
@@ -199,6 +200,9 @@ export function NumberControl({
   step?: number
   sliderMax?: number
   hint?: string
+  /** Accept any value, shown to this many decimals of the displayed unit.
+   * The exact value is kept until the input is edited. */
+  fractionDigits?: number
 }) {
   const id = useId()
   const finite = Number.isFinite(value)
@@ -206,12 +210,16 @@ export function NumberControl({
     finite &&
     value >= min &&
     value <= max &&
-    (step !== 1 || Number.isInteger(value))
+    (fractionDigits !== undefined || step !== 1 || Number.isInteger(value))
   const end = Math.min(max, Math.max(sliderMax ?? max, finite ? value : min))
   const fill = valid
     ? Math.min(100, Math.max(0, ((value - min) / (end - min)) * 100))
     : 0
   const shown = (n: number) => n / scale
+  const typed = (n: number) =>
+    fractionDigits === undefined
+      ? shown(n)
+      : Number(shown(n).toFixed(fractionDigits))
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-3">
@@ -222,10 +230,12 @@ export function NumberControl({
           <input
             id={id}
             type="number"
-            value={finite ? shown(value) : ''}
+            value={finite ? typed(value) : ''}
             min={min / scale}
             max={max / scale}
-            step={step === 1 ? step / scale : 'any'}
+            step={
+              step === 1 && fractionDigits === undefined ? step / scale : 'any'
+            }
             aria-invalid={!valid}
             aria-describedby={`${id}-unit${hint ? ` ${id}-hint` : ''}`}
             onChange={(e) =>
@@ -249,7 +259,7 @@ export function NumberControl({
           <input
             type="range"
             aria-label={`${label} slider`}
-            aria-valuetext={valid ? `${shown(value)}${unit}` : 'Choose a value'}
+            aria-valuetext={valid ? `${typed(value)}${unit}` : 'Choose a value'}
             min={min}
             max={end}
             step={step}
@@ -326,10 +336,13 @@ export function AllocationBar({
 export function QuoteBreakdown({
   rows,
   highlight,
+  current,
 }: {
   rows: QuoteBreakdownRow[]
   /** The open module's row; null when that module moves no spread. */
   highlight: QuoteBreakdownRow['key'] | null
+  /** What the bot quotes right now, for comparison under the total. */
+  current?: { label: string; buy: string; sell: string } | null
 }) {
   return (
     <table className="w-full text-sm tabular-nums" aria-live="polite">
@@ -364,6 +377,19 @@ export function QuoteBreakdown({
             </tr>
           )
         })}
+        {current && (
+          <tr className="text-muted">
+            <th scope="row" className="py-1.5 pl-2 pr-2 text-left font-normal">
+              {current.label}
+            </th>
+            <td className="whitespace-nowrap py-1.5 text-right">
+              {current.buy}
+            </td>
+            <td className="whitespace-nowrap py-1.5 pl-3 text-right">
+              {current.sell}
+            </td>
+          </tr>
+        )}
       </tbody>
     </table>
   )
