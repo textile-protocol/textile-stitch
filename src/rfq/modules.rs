@@ -73,6 +73,7 @@ impl Engine {
             now,
             price: quote.price,
             price_at: quote.timestamp,
+            price_degraded: quote.degraded,
             balances_at: balances.at,
             staleness_secs: book.staleness_secs,
             settlement: balances.settlement,

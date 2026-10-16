@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Feed timestamps through the real HTTP, RFQ and NAV adapters. All I/O is local.
+//! Feed timestamps and the `degraded` flag through the real HTTP, RFQ and NAV
+//! adapters. All I/O is local.
 use super::*;
+use crate::pricing::tick::is_stale;
 use axum::{http::StatusCode, routing::get, Json, Router};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,6 +45,7 @@ async fn invalid_http_timestamps_clear_the_cache_and_cannot_fall_back() {
             Quote {
                 price: 1.0,
                 timestamp: now,
+                degraded: false,
             },
         );
         assert!(!engine.level_frames(&prices, unix_now_ms()).is_empty());
@@ -81,7 +84,8 @@ async fn fresh_http_seconds_preserve_price_and_timestamp_and_failure_clears_them
         fetched,
         Quote {
             price: 1.23456789,
-            timestamp: now
+            timestamp: now,
+            degraded: false,
         }
     );
     assert!(!is_stale(fetched.timestamp, now, 0));
@@ -154,6 +158,7 @@ async fn rfq_rechecks_held_timestamps_with_modules_off_shadow_live_and_rebalance
                 Quote {
                     price: 1.0,
                     timestamp,
+                    degraded: false,
                 },
             );
             assert!(
@@ -202,6 +207,7 @@ fn rfq_levels_obey_exact_age_and_future_boundaries_after_clock_changes() {
             Quote {
                 price: 1.0,
                 timestamp,
+                degraded: false,
             },
         );
         assert_eq!(
@@ -214,6 +220,7 @@ fn rfq_levels_obey_exact_age_and_future_boundaries_after_clock_changes() {
         Quote {
             price: 1.0,
             timestamp: now,
+            degraded: false,
         },
     );
     assert!(!engine.level_frames(&prices, now * 1_000).is_empty());
@@ -254,6 +261,140 @@ async fn valid_cached_http_sample_can_resume_after_clock_recovers() {
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
+}
+
+fn print(degraded: bool) -> PriceCache {
+    let prices = PriceCache::default();
+    prices.set(
+        "http://feed".into(),
+        Quote {
+            price: 1.0,
+            timestamp: unix_now(),
+            degraded,
+        },
+    );
+    prices
+}
+
+fn rejected_with(reply: &MakerFrame) -> Option<RejectReason> {
+    match reply {
+        MakerFrame::QuoteReject(QuoteRejectFrame { reason, .. }) => Some(*reason),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_degraded_print_rejects_firm_quotes_and_publishes_no_levels() {
+    let mut engine = test_engine();
+    let held = print(true);
+    assert!(engine.level_frames(&held, unix_now_ms()).is_empty());
+    let reply = engine.respond(exact_input_request("held"), &held).await;
+    assert_eq!(rejected_with(&reply), Some(RejectReason::DegradedFeed));
+    assert!(engine.reservations.is_empty(), "a refusal reserves nothing");
+
+    // The same price, live, quotes and publishes.
+    let live = print(false);
+    assert!(!engine.level_frames(&live, unix_now_ms()).is_empty());
+    assert!(matches!(
+        engine.respond(exact_input_request("live"), &live).await,
+        MakerFrame::QuoteResponse(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_degraded_print_older_than_the_window_reports_stale() {
+    let mut engine = test_engine();
+    let prices = PriceCache::default();
+    prices.set(
+        "http://feed".into(),
+        Quote {
+            price: 1.0,
+            timestamp: unix_now() - 241,
+            degraded: true,
+        },
+    );
+    let reply = engine
+        .respond(exact_input_request("old-hold"), &prices)
+        .await;
+    assert_eq!(rejected_with(&reply), Some(RejectReason::StaleFeed));
+}
+
+#[tokio::test]
+async fn a_degraded_print_pauses_module_quoting_with_its_own_message() {
+    use crate::modules::{runtime::QuoteState, Mode};
+    for mode in [Mode::Shadow, Mode::Live] {
+        let mut engine = test_engine();
+        let dir = enable_modules(&mut engine, mode, 7_000_000_000, 3_000_000_000);
+        let held = print(true);
+        assert!(engine.level_frames(&held, unix_now_ms()).is_empty());
+        let status = engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .current_quote_status()
+            .unwrap();
+        assert!(status.state == QuoteState::StalePrice, "{mode:?}");
+        assert!(status.message.contains("degraded"), "{}", status.message);
+        let reply = engine.respond(exact_input_request("held"), &held).await;
+        assert_eq!(rejected_with(&reply), Some(RejectReason::DegradedFeed));
+        assert!(engine.reservations.is_empty());
+
+        let live = print(false);
+        assert!(!engine.level_frames(&live, unix_now_ms()).is_empty());
+        let status = engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .current_quote_status()
+            .unwrap();
+        assert!(status.state == QuoteState::Evaluating, "{mode:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_http_flag_reaches_the_rfq_gate_and_clears_when_the_feed_recovers() {
+    let now = unix_now();
+    let body = Arc::new(RwLock::new(
+        json!({"price": 1.0, "timestamp": now, "degraded": true}),
+    ));
+    let served = body.clone();
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            let served = served.clone();
+            async move { Json(served.read().unwrap().clone()) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let feed = HttpFeed::new(&url);
+    let mut engine = test_engine();
+    engine.books[0].feed_url = url.clone();
+    let prices = PriceCache::default();
+
+    on_feed_fetch(&prices, &url, feed.fetch().await);
+    assert!(prices.get(&url).unwrap().degraded);
+    assert!(engine.level_frames(&prices, unix_now_ms()).is_empty());
+    let reply = engine.respond(exact_input_request("held"), &prices).await;
+    assert_eq!(rejected_with(&reply), Some(RejectReason::DegradedFeed));
+
+    // `/price` clears the flag, and a market-rate feed never sends it.
+    for live in [
+        json!({"price": 1.0, "timestamp": unix_now(), "degraded": false}),
+        json!({"price": 1.0, "timestamp": unix_now()}),
+    ] {
+        *body.write().unwrap() = live;
+        on_feed_fetch(&prices, &url, feed.fetch().await);
+        assert!(!prices.get(&url).unwrap().degraded);
+        assert!(!engine.level_frames(&prices, unix_now_ms()).is_empty());
+    }
+    assert!(matches!(
+        engine.respond(exact_input_request("live"), &prices).await,
+        MakerFrame::QuoteResponse(_)
+    ));
+    server.abort();
 }
 
 async fn nav_rpc() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -319,6 +460,7 @@ async fn nav_cosign_rejects_invalid_feed_before_rpc_and_signs_valid_seconds() {
             Quote {
                 price: 1.5,
                 timestamp,
+                degraded: false,
             },
         );
         let reply = engine.cosign(req.clone(), &prices).await;
@@ -339,6 +481,7 @@ async fn nav_cosign_rejects_invalid_feed_before_rpc_and_signs_valid_seconds() {
         Quote {
             price: 1.5,
             timestamp: unix_now(),
+            degraded: false,
         },
     );
     let reply = engine.cosign(req.clone(), &prices).await;
@@ -423,4 +566,46 @@ async fn invalid_http_fetch_cannot_reuse_fresh_cache_for_nav_and_recovers_on_val
     assert_eq!(reads.load(Ordering::SeqCst), 12);
     feed_server.abort();
     rpc_server.abort();
+}
+
+#[tokio::test]
+async fn nav_cosign_refuses_a_degraded_print_before_any_rpc_read() {
+    let (mut engine, req) = nav_engine_and_request();
+    let (url, reads, server) = nav_rpc().await;
+    engine.rpc = Rpc::new(&url);
+    let prices = PriceCache::default();
+    prices.set(
+        "http://feed".into(),
+        Quote {
+            price: 1.5,
+            timestamp: unix_now(),
+            degraded: true,
+        },
+    );
+    let reply = engine.cosign(req.clone(), &prices).await;
+    assert!(
+        matches!(
+            reply,
+            MakerFrame::AttestReject(AttestRejectFrame {
+                reason: AttestRejectReason::DegradedFeed,
+                ..
+            })
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+    prices.set(
+        "http://feed".into(),
+        Quote {
+            price: 1.5,
+            timestamp: unix_now(),
+            degraded: false,
+        },
+    );
+    assert!(matches!(
+        engine.cosign(req, &prices).await,
+        MakerFrame::AttestResponse(_)
+    ));
+    server.abort();
 }

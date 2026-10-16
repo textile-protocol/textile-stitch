@@ -30,9 +30,10 @@ url = "https://your-feed.example/cngn-usdt"
 # The cNGN feed serves a Bybit-corrected center that re-samples every 3 min, and
 # its `timestamp` is the sample's observation time (not request time), so it ages
 # between ticks. Keep this above the sample cadence or the bot rejects fresh
-# quotes as stale. 900s matches the feed's own 15-min freshness bound (past which
-# /api/price falls back to a fresh Monierate mid), so the feed, not the bot,
-# enforces staleness.
+# quotes as stale. A held center keeps the timestamp of the sample it holds, so
+# it ages out here like any old print. Before that, /api/price flags a frozen
+# or clamped center, and its raw-Monierate fallback, `"degraded": true`, and the
+# bot stops quoting on those whatever their age.
 staleness_secs = 900
 
 # One block per corridor you serve. Add more [[pools]] for other pairs/chains.

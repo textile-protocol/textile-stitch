@@ -250,7 +250,10 @@ impl Runtime {
     pub fn decide(&self, context: &Context) -> Decision {
         let mut state = self.state.lock().expect("module state poisoned");
         let history = &mut state.history;
+        // A degraded print (held, clamped or fallback) isn't the market the
+        // window measures, so it never becomes a sample.
         let sampled = context.price_at <= context.now
+            && !context.price_degraded
             && context.price.is_finite()
             && context.price > 0.0
             && history
@@ -329,6 +332,11 @@ impl Runtime {
         });
         s.status.at = now;
         let _ = self.writer.send_replace(s.status.clone());
+    }
+    #[cfg(test)]
+    pub(crate) fn current_quote_status(&self) -> Option<QuoteStatus> {
+        let s = self.state.lock().expect("module state poisoned");
+        s.status.quote_status.clone()
     }
     pub fn status(&self, message: impl Into<String>) {
         let mut s = self.state.lock().expect("module state poisoned");

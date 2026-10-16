@@ -63,7 +63,7 @@ use crate::chain::snapshot::{record, Publisher, RecordedRead};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
-use crate::pricing::tick::{is_price_usable, is_stale};
+use crate::pricing::tick::{usable, Unusable};
 use crate::protocol::attest::{
     check_attestation, check_window, price_wad, LiveVault, NavAttestation,
 };
@@ -1394,9 +1394,10 @@ impl Engine {
             .reserved_paying(&format!("{token:#x}"), slugs, bid, now_secs)
     }
 
-    /// Levels for every corridor with a fresh feed. A stale/missing feed
-    /// publishes nothing — the venue's >5 s gap rule takes the corridor dark,
-    /// which is exactly the stale-feed behavior we want.
+    /// Levels for every corridor whose feed print passes [`usable`]. A
+    /// stale, degraded or missing print publishes nothing — the venue's >5 s
+    /// gap rule takes the corridor dark, so it stops routing RFQs that
+    /// [`Self::respond`] would refuse anyway.
     fn level_frames(&mut self, prices: &PriceCache, now_ms: u64) -> Vec<MakerFrame> {
         use crate::modules::runtime::QuoteState;
         self.sync_vault_epoch();
@@ -1448,11 +1449,9 @@ impl Engine {
                     }
                     return None;
                 };
-                if is_stale(quote.timestamp, now_secs, book.staleness_secs)
-                    || !is_price_usable(quote.price)
-                {
+                if let Err(why) = usable(&quote, now_secs, book.staleness_secs) {
                     if let Some(modules) = &self.modules {
-                        modules.quote_status(QuoteState::StalePrice, "Reference price is stale, future-dated or invalid. Check the price feed.", now_secs);
+                        modules.quote_status(QuoteState::StalePrice, unusable_price_status(why), now_secs);
                     }
                     return None;
                 }
@@ -1595,9 +1594,10 @@ impl Engine {
         };
         // The book's own window, not the runtime's: this is the firm-quote
         // gate, so it must match the one the levels were published under.
-        if is_stale(quote.timestamp, now_secs, book.staleness_secs) || !is_price_usable(quote.price)
-        {
-            return reject(RejectReason::StaleFeed);
+        match usable(&quote, now_secs, book.staleness_secs) {
+            Ok(()) => {}
+            Err(Unusable::Degraded) => return reject(RejectReason::DegradedFeed),
+            Err(Unusable::Stale | Unusable::BadPrice) => return reject(RejectReason::StaleFeed),
         }
 
         // Deadline first: a request whose maxExpiresAt is unreadable or
@@ -2127,10 +2127,14 @@ impl Engine {
         let Some(quote) = prices.get(&book.feed_url) else {
             return reject(AttestRejectReason::StaleFeed);
         };
-        if is_stale(quote.timestamp, unix_now(), book.staleness_secs)
-            || !is_price_usable(quote.price)
-        {
-            return reject(AttestRejectReason::StaleFeed);
+        // A degraded print is one the source itself doesn't stand behind.
+        // Warp won't attest off one, and the second key won't vouch with one.
+        match usable(&quote, unix_now(), book.staleness_secs) {
+            Ok(()) => {}
+            Err(Unusable::Degraded) => return reject(AttestRejectReason::DegradedFeed),
+            Err(Unusable::Stale | Unusable::BadPrice) => {
+                return reject(AttestRejectReason::StaleFeed)
+            }
         }
 
         let calls = [
@@ -2231,6 +2235,21 @@ impl Engine {
             signature: alloy_primitives::hex::encode_prefixed(signature),
             signer: self.signer.address().to_string(),
         })
+    }
+}
+
+/// Panel text for a print the levels loop won't publish off. A degraded print
+/// keeps the `StalePrice` state: the panel reads the status file into a closed
+/// enum, so a new state would break the Modules page on a panel older than
+/// the bot. The message is what tells the two apart.
+fn unusable_price_status(why: Unusable) -> &'static str {
+    match why {
+        Unusable::Stale | Unusable::BadPrice => {
+            "Reference price is stale, future-dated or invalid. Check the price feed."
+        }
+        Unusable::Degraded => {
+            "The price feed flagged its price as degraded (a held, clamped or fallback value). Quoting is paused until it serves a live price again."
+        }
     }
 }
 
@@ -3972,6 +3991,7 @@ mod tests {
             Quote {
                 price: 1.0,
                 timestamp: unix_now(),
+                degraded: false,
             },
         );
         prices
@@ -4257,6 +4277,7 @@ mod tests {
             Quote {
                 price: 1.0,
                 timestamp: unix_now(),
+                degraded: false,
             },
         );
         assert!(cache.get("http://feed").is_some());
@@ -4277,6 +4298,7 @@ mod tests {
             Ok(Quote {
                 price: 2.0,
                 timestamp: unix_now(),
+                degraded: false,
             }),
         );
         assert_eq!(cache.get("http://feed").unwrap().price, 2.0);
@@ -4922,6 +4944,7 @@ mod tests {
             Quote {
                 price: 1.0,
                 timestamp: unix_now().saturating_sub(3_600),
+                degraded: false,
             },
         );
         let reply = engine.respond(exact_input_request("rfq_2"), &stale).await;

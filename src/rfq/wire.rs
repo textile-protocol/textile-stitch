@@ -243,6 +243,10 @@ pub enum RejectReason {
     Inventory,
     ToxicTaker,
     StaleFeed,
+    /// The feed's print is fresh, but the feed flagged it `degraded`: a held,
+    /// clamped or fallback value. The venue stores reject reasons as free
+    /// text, so it takes this one without a venue change.
+    DegradedFeed,
     Size,
     Busy,
 }
@@ -357,6 +361,10 @@ pub enum AttestRejectReason {
     WrongVault,
     /// No usable price of our own to check the attested one against.
     StaleFeed,
+    /// Our own price is fresh, but the feed flagged it `degraded`, so it
+    /// can't vouch for the attested one. Free text to the venue, like
+    /// [`RejectReason::DegradedFeed`].
+    DegradedFeed,
     /// The attested corridor price is too far from our own.
     Price,
     /// The attested figures do not match what the chain shows.
@@ -454,6 +462,7 @@ mod tests {
         for (reason, wire) in [
             (RejectReason::Inventory, "inventory"),
             (RejectReason::StaleFeed, "stale_feed"),
+            (RejectReason::DegradedFeed, "degraded_feed"),
             (RejectReason::Size, "size"),
             (RejectReason::Busy, "busy"),
         ] {
@@ -583,6 +592,10 @@ mod tests {
         assert_eq!(out["type"], "attestReject");
         assert_eq!(out["requestId"], "att_1");
         assert_eq!(out["reason"], "wrong_vault");
+        assert_eq!(
+            serde_json::to_value(AttestRejectReason::DegradedFeed).unwrap(),
+            "degraded_feed"
+        );
 
         let ok = MakerFrame::AttestResponse(AttestResponseFrame {
             request_id: "att_1".into(),

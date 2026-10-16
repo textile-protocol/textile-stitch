@@ -23,6 +23,7 @@ fn context() -> Context {
         now: 100,
         price: 1.0,
         price_at: 100,
+        price_degraded: false,
         balances_at: 100,
         staleness_secs: 10,
         settlement: u(40_000_000),
@@ -128,6 +129,81 @@ fn stale_future_and_missing_value_fail_closed() {
         assert!(d.rebalance_sell.is_zero());
     }
 }
+#[test]
+fn a_degraded_price_blocks_quotes_and_rebalancing() {
+    // A config that would otherwise quote a side and sell down the overweight
+    // corridor (60% held against the default target).
+    let mut cfg = config();
+    cfg.rebalance.enabled = true;
+    let live = evaluate(&cfg, &context(), &[]);
+    assert!(!live.blocked);
+    assert!(live.sell_bps.is_some());
+    assert!(!live.rebalance_sell.is_zero());
+
+    let held = Context {
+        price_degraded: true,
+        ..context()
+    };
+    let d = evaluate(&cfg, &held, &[]);
+    assert!(d.blocked);
+    assert!(d.buy_bps.is_none());
+    assert!(d.sell_bps.is_none());
+    assert!(d.rebalance_sell.is_zero());
+    assert!(d.reasons.iter().any(|r| r.contains("degraded")));
+
+    // Stale and degraded at once reads as stale, like the feed gate.
+    let d = evaluate(
+        &cfg,
+        &Context {
+            price_at: 89,
+            ..held
+        },
+        &[],
+    );
+    assert_eq!(d.reasons, vec!["Fresh prices and vault balances required"]);
+}
+
+#[tokio::test]
+async fn a_degraded_print_never_enters_the_spread_window() {
+    let mut cfg = config();
+    cfg.spreads.enabled = true;
+    cfg.spreads.warmup_secs = 60;
+    let now = stitch_bot::time::unix_now();
+    let at = |t: u64, price: f64, price_degraded: bool| Context {
+        now: t,
+        price_at: t,
+        balances_at: t,
+        price,
+        price_degraded,
+        ..context()
+    };
+    // Same three prints twice: a live 1.0, a 1.5 print, a live 1.0. Only the
+    // flag on the middle one differs.
+    let run = |middle_degraded: bool| {
+        let dir =
+            std::env::temp_dir().join(format!("stitch-module-degraded-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = runtime::Runtime::new(cfg.clone(), &dir, FEED).unwrap();
+        rt.decide(&at(now - 120, 1.0, false));
+        let middle = rt.decide(&at(now - 60, 1.5, middle_degraded));
+        let last = rt.decide(&at(now, 1.0, false));
+        (middle, last, dir)
+    };
+
+    let (_, last, dir) = run(false);
+    assert!(
+        last.volatility_bps > 0,
+        "a live 1.5 print widens the window"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+
+    let (middle, last, dir) = run(true);
+    assert!(middle.blocked);
+    assert_eq!(last.volatility_bps, 0, "the degraded print was sampled");
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn warmup_then_bounded_volatility_never_uses_a_future_point() {
     let mut cfg = config();

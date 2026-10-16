@@ -41,7 +41,7 @@ use stitch_bot::pricing::feed::{HttpFeed, PriceFeed};
 use stitch_bot::pricing::lean::{LeanDecision, LeanMode, LeanParams, LeanState};
 use stitch_bot::pricing::quote::oracle_rate_ray;
 use stitch_bot::pricing::quote::{ask_price, bid_price, SpotDeviationGuard};
-use stitch_bot::pricing::tick::{is_price_usable, is_stale};
+use stitch_bot::pricing::tick::{usable, Unusable};
 use stitch_bot::pricing::twap::Twap;
 use stitch_bot::setup;
 use stitch_bot::signer::{address_from_signing_key, build_signer};
@@ -821,17 +821,26 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             // understate that gap, defeat the TWAP's bot-observation-gap
             // reset, and place the averaging window in the pre-stall past.
             let now = unix_now();
-            if is_stale(quote.timestamp, now, cfg.feed.staleness_secs) {
-                warn!(feed = %feed_url, feed_ts = quote.timestamp, now, "stale or invalid feed timestamp; skipping pool");
-                continue;
-            }
-            // A fresh timestamp with a garbage price (zero, negative, NaN) is
-            // as untradeable as a stale one: go dark for the pool instead of
-            // letting the maker, taker, closer — or a TWAP carrying an old
-            // valid sample — keep quoting through the malfunction.
-            if !is_price_usable(quote.price) {
-                warn!(feed = %feed_url, price = quote.price, "unusable feed price; skipping pool");
-                continue;
+            // A fresh timestamp with a garbage price (zero, negative, NaN), or
+            // a print the feed flags degraded, is as untradeable as a stale
+            // one: go dark for the pool instead of letting the maker, taker,
+            // closer — or a TWAP carrying an old valid sample — keep quoting
+            // through it. Skipping before `observe` also keeps the print out
+            // of the TWAP.
+            match usable(&quote, now, cfg.feed.staleness_secs) {
+                Ok(()) => {}
+                Err(Unusable::Stale) => {
+                    warn!(feed = %feed_url, feed_ts = quote.timestamp, now, "stale or invalid feed timestamp; skipping pool");
+                    continue;
+                }
+                Err(Unusable::BadPrice) => {
+                    warn!(feed = %feed_url, price = quote.price, "unusable feed price; skipping pool");
+                    continue;
+                }
+                Err(Unusable::Degraded) => {
+                    warn!(feed = %feed_url, price = quote.price, "feed flagged the price degraded (held, clamped or fallback); skipping pool");
+                    continue;
+                }
             }
 
             let (debt, collateral): (Address, Address) =

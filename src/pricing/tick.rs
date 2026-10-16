@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Pure tick-loop decisions: when the feed is too stale to quote, and when the
+//! Pure tick-loop decisions: when a feed print is unfit to quote, and when the
 //! bid has moved enough to be worth re-signing.
+
+use crate::pricing::feed::Quote;
 
 /// Age of a nonzero Unix-seconds timestamp, or `None` for an invalid timestamp.
 /// Future skew is deliberately zero, matching the live module price policy.
@@ -28,6 +30,37 @@ pub fn is_stale(feed_ts: u64, now: u64, staleness_secs: u64) -> bool {
 /// letting them reach the maker or the TWAP.
 pub fn is_price_usable(price: f64) -> bool {
     price.is_finite() && price > 0.0
+}
+
+/// Why a print can't be quoted, signed or co-signed off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unusable {
+    /// Invalid, future-dated, or older than the consumer's window.
+    Stale,
+    /// Zero, negative, NaN or infinite.
+    BadPrice,
+    /// Fresh and well-formed, but the feed flagged it `degraded`.
+    Degraded,
+}
+
+/// The one gate every consumer puts a print through before trading on it:
+/// the ladder, taker and closer legs, RFQ levels and firm quotes, and NAV
+/// co-signing. `staleness_secs` is the consumer's own window.
+///
+/// Age is checked first, so a held print that has also aged out reports
+/// `Stale`, the same order Warp uses. `Degraded` is left for a current print
+/// the source itself doesn't stand behind.
+pub fn usable(quote: &Quote, now: u64, staleness_secs: u64) -> Result<(), Unusable> {
+    if is_stale(quote.timestamp, now, staleness_secs) {
+        return Err(Unusable::Stale);
+    }
+    if !is_price_usable(quote.price) {
+        return Err(Unusable::BadPrice);
+    }
+    if quote.degraded {
+        return Err(Unusable::Degraded);
+    }
+    Ok(())
 }
 
 /// True if we should sign a fresh order: no prior bid, or the bid moved at
@@ -134,6 +167,52 @@ mod tests {
         assert!(!is_price_usable(f64::NAN));
         assert!(!is_price_usable(f64::INFINITY));
         assert!(!is_price_usable(f64::NEG_INFINITY));
+    }
+
+    fn print(price: f64, timestamp: u64, degraded: bool) -> Quote {
+        Quote {
+            price,
+            timestamp,
+            degraded,
+        }
+    }
+
+    #[test]
+    fn a_fresh_live_print_is_usable_and_a_degraded_one_is_not() {
+        let now = 1_800_000_000;
+        assert_eq!(usable(&print(0.00065, now - 10, false), now, 30), Ok(()));
+        assert_eq!(
+            usable(&print(0.00065, now - 10, true), now, 30),
+            Err(Unusable::Degraded)
+        );
+        // At the window edge the print is still fresh, so the flag decides.
+        assert_eq!(
+            usable(&print(0.00065, now - 30, true), now, 30),
+            Err(Unusable::Degraded)
+        );
+    }
+
+    #[test]
+    fn age_and_price_are_reported_before_the_degraded_flag() {
+        let now = 1_800_000_000;
+        // /price stamps a frozen hold with the anchor's time, so a long hold
+        // ages out: report it stale, the reason that clears by waiting.
+        assert_eq!(
+            usable(&print(0.00065, now - 31, true), now, 30),
+            Err(Unusable::Stale)
+        );
+        assert_eq!(
+            usable(&print(0.00065, now + 1, true), now, 30),
+            Err(Unusable::Stale)
+        );
+        assert_eq!(
+            usable(&print(0.0, now, true), now, 30),
+            Err(Unusable::BadPrice)
+        );
+        assert_eq!(
+            usable(&print(f64::NAN, now, false), now, 30),
+            Err(Unusable::BadPrice)
+        );
     }
 
     #[test]

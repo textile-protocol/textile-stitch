@@ -49,6 +49,8 @@ pub struct Context {
     pub now: u64,
     pub price: f64,
     pub price_at: u64,
+    /// The feed flagged `price` degraded: a held, clamped or fallback value.
+    pub price_degraded: bool,
     pub balances_at: u64,
     pub staleness_secs: u64,
     pub settlement: U256,
@@ -103,6 +105,12 @@ pub fn evaluate(config: &ModulesConfig, ctx: &Context, history: &[PricePoint]) -
         && ctx.settlement_decimals <= 18;
     if !valid {
         return blocked(d, "Fresh prices and vault balances required");
+    }
+    if ctx.price_degraded {
+        return blocked(
+            d,
+            "Reference price is degraded (held, clamped or fallback); waiting for a live price",
+        );
     }
     let c_value = math::debt_for_collateral(
         ctx.price,

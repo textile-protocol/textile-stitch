@@ -222,6 +222,7 @@ mod tests {
             now: 1000,
             price: 1.0,
             price_at: 1000,
+            price_degraded: false,
             balances_at: 1000,
             staleness_secs: 10,
             settlement: U256::from(400),
@@ -262,6 +263,10 @@ mod tests {
             },
             Context {
                 price_at: 900,
+                ..ctx
+            },
+            Context {
+                price_degraded: true,
                 ..ctx
             },
             Context {

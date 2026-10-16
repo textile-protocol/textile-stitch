@@ -39,8 +39,24 @@ Check:
   pool's feed in the desktop app or Stitch and, on a multi-pool config,
   you get a `feed_url` override on that pool instead of a new `[feed].url`.
 
-If the feed is stale, Stitch skips quoting that pool rather than posting orders
-at an old price.
+A feed can also send `"degraded": true` to say the price is protected rather
+than live. Textile's `/price` does this on the cNGN corridors when it serves a
+frozen or move-clamped center, or falls back to raw Monierate because it has no
+sample at all:
+
+```json
+{ "price": 0.000724, "timestamp": 1760000000, "degraded": true }
+```
+
+The field is optional. Leave it out, as the market-rate corridors on `/price`
+do, and nothing changes. A value other than `true` or `false` fails the fetch.
+
+If the feed is stale or degraded, Stitch stops trading that pool rather than
+pricing off an old or held number. The ladder, limit-order taker and closer
+skip the pool for the tick. RFQ publishes no levels and rejects quote requests
+(`stale_feed` or `degraded_feed`), NAV co-signing refuses, and modules block
+their decisions. Quoting resumes on the first live print. A print that is both
+degraded and older than the window is reported as stale.
 
 ### Spreads
 

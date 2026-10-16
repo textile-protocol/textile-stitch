@@ -281,7 +281,9 @@ You need:
 - an operator wallet private key;
 - RPC access for the target chain;
 - Textile indexer URL;
-- a price feed endpoint returning fresh `{ "price": ..., "timestamp": ... }`;
+- a price feed endpoint returning fresh `{ "price": ..., "timestamp": ... }`,
+  optionally with `"degraded": true` to pause quoting (see
+  [Price Feed](docs/ADVANCED.md#price-feed));
 - the Permit2 and reactor addresses for the target chain;
 - funded token balances for the sides you enable;
 - Permit2 approvals for the tokens Stitch will spend (set up with
@@ -340,7 +342,8 @@ recovers, provided it is still within the age limit. Each quote/level/NAV decisi
 also checks held samples: age equal to its configured staleness limit is accepted,
 and age above it is rejected. The ladder uses `staleness_secs`; RFQ and NAV
 retain their existing per-pool RFQ age limits. This rule applies with modules
-off, shadow or live, and before any TWAP fallback.
+off, shadow or live, and before any TWAP fallback. The same decisions refuse a
+fresh print the feed flags `"degraded": true`.
 
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
 `50000000000`). The default `*_total_liquidity_*` value is `"max"`, which quotes
