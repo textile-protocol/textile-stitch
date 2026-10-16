@@ -3,6 +3,9 @@ import { ApiError, api } from '../api'
 import { createStaleGuard } from '../staleGuard'
 import { regionalKmsEndpoint } from '../gcpkms'
 import { Banner, Button, Field, Input, Select, TextArea } from './ui'
+import { GuideLink } from './GuideSheet'
+import AwsKmsGuide from './AwsKmsGuide'
+import GcpKmsGuide from './GcpKmsGuide'
 
 export type SignerKind = 'local' | 'fireblocks' | 'turnkey' | 'mpcvault' | 'gcpkms' | 'awskms'
 /** How the local hot wallet is provided. Create is the default. */
@@ -1093,6 +1096,10 @@ function GcpKmsFields({
 
   return (
     <div className="space-y-3">
+      <GuideLink label="Set up Google Cloud KMS step by step" title="Set up a Google Cloud KMS signer">
+        <GcpKmsGuide keyVersion={keyVersion} />
+      </GuideLink>
+
       <Field
         label="Key version"
         hint="The full resource name, version included. The key must be EC_SIGN_SECP256K1_SHA256."
@@ -1222,6 +1229,10 @@ function AwsKmsFields({
 
   return (
     <div className="space-y-3">
+      <GuideLink label="Set up AWS KMS step by step" title="Set up an AWS KMS signer">
+        <AwsKmsGuide keyId={keyId} />
+      </GuideLink>
+
       <Field
         label="Key ARN"
         hint="An ECC_SECG_P256K1 key with SIGN_VERIFY usage. The ARN names its region."
