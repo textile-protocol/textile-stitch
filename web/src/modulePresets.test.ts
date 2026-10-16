@@ -124,14 +124,15 @@ describe('module preset boundaries', () => {
 })
 
 describe('preset strategy behavior', () => {
+  const base = { buy: 20, sell: 20 }
   it('makes Defensive pause purchases sooner but still buy toward target when underweight', () => {
     const original = config()
     original.inventory.enabled = true
     const next = applyPreset(original, 'inventory', defensive)
-    expect(inventoryIllustration(next, 4000).buy).toBeNull()
-    expect(inventoryIllustration(next, 4000).sell).toBe(8)
-    expect(inventoryIllustration(next, 0).buy).toBe(8)
-    expect(inventoryIllustration(next, 0).sell).toBeGreaterThan(20)
+    expect(inventoryIllustration(next, 4000, base).buy).toBeNull()
+    expect(inventoryIllustration(next, 4000, base).sell).toBe(8)
+    expect(inventoryIllustration(next, 0, base).buy).toBe(8)
+    expect(inventoryIllustration(next, 0, base).sell).toBeGreaterThan(20)
   })
 
   it('caps buffers and favors inventory reduction without enabling inventory implicitly', () => {

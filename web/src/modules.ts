@@ -78,6 +78,12 @@ export interface ModuleStatus {
     message: string
   } | null
 }
+/** One side of the corridor's configured spread. `abs` is an offset in
+ * collateral per debt, so it only reads as bps at a price. */
+export interface CorridorSpread {
+  kind: 'bps' | 'abs'
+  value: number
+}
 export interface ModulesView {
   config: ModulesConfig
   revision: string
@@ -85,6 +91,8 @@ export interface ModulesView {
   running: boolean
   settlement_decimals: number
   corridor_decimals: number
+  /** What the modules start from. Null is a side the corridor leaves off. */
+  corridor_spreads: { buy: CorridorSpread | null; sell: CorridorSpread | null }
 }
 
 /** Recorded changes, including side vetoes and caps; never recalculate from

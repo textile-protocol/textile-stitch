@@ -8,6 +8,7 @@ use crate::{
         ModulesConfig,
     },
     panel::inventory::Bot,
+    pricing::quote::Spread,
 };
 use axum::{
     extract::{Path, State},
@@ -32,6 +33,30 @@ pub(super) fn read(bot: &Bot) -> Result<(std::path::PathBuf, String, Config), Ap
 fn revision(raw: &str) -> String {
     alloy_primitives::hex::encode(Sha256::digest(raw.as_bytes()))
 }
+/// One side of the corridor's spread as configured, before any module adjusts
+/// it. Bps as written; an absolute offset is in collateral per debt, which the
+/// panel can only turn into bps at a price.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
+pub enum CorridorSpread {
+    Bps(u32),
+    Abs(f64),
+}
+impl From<Spread> for CorridorSpread {
+    fn from(s: Spread) -> Self {
+        match s {
+            Spread::Bps(b) => Self::Bps(b),
+            Spread::Abs(d) => Self::Abs(d),
+        }
+    }
+}
+/// The spreads the modules start from. `None` is a side the corridor leaves off,
+/// which no module turns back on.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct CorridorSpreads {
+    pub buy: Option<CorridorSpread>,
+    pub sell: Option<CorridorSpread>,
+}
 #[derive(Serialize)]
 pub struct View {
     pub config: ModulesConfig,
@@ -40,6 +65,7 @@ pub struct View {
     pub running: bool,
     pub settlement_decimals: u8,
     pub corridor_decimals: u8,
+    pub corridor_spreads: CorridorSpreads,
 }
 pub async fn show(
     State(state): State<AppState>,
@@ -71,6 +97,11 @@ pub async fn show(
         running: bot.state.is_running(),
         settlement_decimals: cfg.pools[0].debt_decimals,
         corridor_decimals: cfg.pools[0].collateral_decimals,
+        // Modules require exactly one pool, so this is the corridor they adjust.
+        corridor_spreads: CorridorSpreads {
+            buy: cfg.pools[0].buy_spread().map(Into::into),
+            sell: cfg.pools[0].sell_spread().map(Into::into),
+        },
         config: cfg.modules,
     }))
 }
@@ -385,6 +416,32 @@ mod tests {
             status,
             StatusCode::CONFLICT,
             "stale edits must not overwrite newer settings"
+        );
+    }
+    #[tokio::test]
+    async fn the_view_carries_the_corridor_spreads_modules_start_from() {
+        let h = harness("module-corridor-spreads");
+        seed(&h, true);
+        let path = h.root.join("bot-a/stitch.toml");
+        let mut doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["pools"][0]["buy_offset_bps"] = toml_edit::value(30);
+        doc["pools"][0]
+            .as_table_like_mut()
+            .unwrap()
+            .remove("sell_offset_bps");
+        doc["pools"][0]["sell_offset_abs"] = toml_edit::value(2.5);
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let (status, body) = h.get("/api/bots/bot-a/modules").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            Harness::parse(&body)["corridor_spreads"],
+            serde_json::json!({
+                "buy": {"kind": "bps", "value": 30},
+                "sell": {"kind": "abs", "value": 2.5},
+            })
         );
     }
     #[tokio::test]

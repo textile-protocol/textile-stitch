@@ -479,6 +479,51 @@ fn offsets_are_exact_and_operator_disabled_sides_stay_disabled() {
     assert!(apply(&b, &d).buy_capacity_debt.is_none());
 }
 #[test]
+fn absolute_offsets_read_as_bps_rounded_up() {
+    // The panel's corridorSpreadBps mirrors this conversion.
+    let mut b = book();
+    b.buy_spread = Some(Spread::Abs(10.0));
+    b.sell_spread = Some(Spread::Abs(10.0));
+    assert_eq!(base_spreads(&b, 0.001), (Some(100), Some(102)));
+}
+#[test]
+fn quotes_stack_inventory_and_dynamic_spreads_on_the_corridor_spread() {
+    // The panel's Simulate table composes the same case: a 10/60 bps corridor,
+    // 60% held, a 20 bps price range.
+    let mut cfg = config();
+    cfg.inventory.enabled = true;
+    cfg.inventory.target_bps = 4000;
+    cfg.inventory.max_bps = 8000;
+    cfg.inventory.max_skew_bps = 40;
+    cfg.inventory.spread_floor_bps = 5;
+    cfg.spreads.enabled = true;
+    cfg.spreads.inventory_aware = true;
+    cfg.spreads.multiplier = 1.0;
+    cfg.spreads.max_extra_bps = 100;
+    cfg.spreads.window_secs = 300;
+    cfg.spreads.warmup_secs = 30;
+    let ctx = Context {
+        base_buy_bps: Some(10),
+        base_sell_bps: Some(60),
+        ..context()
+    };
+    // 1 + 2^-9 is exact in f64: a 19.53 bps range, rounded up to 20.
+    let history = [
+        PricePoint {
+            timestamp: 40,
+            price: 1.0,
+        },
+        PricePoint {
+            timestamp: 100,
+            price: 1.001953125,
+        },
+    ];
+    let d = evaluate(&cfg, &ctx, &history);
+    assert_eq!(d.inventory_bps, Some(6000));
+    assert_eq!(d.volatility_bps, 20);
+    assert_eq!((d.buy_bps, d.sell_bps), (Some(50), Some(50)));
+}
+#[test]
 fn strict_configs_reject_bad_limits_and_unknown_keys() {
     let mut c = config();
     c.inventory.target_bps = c.inventory.max_bps;

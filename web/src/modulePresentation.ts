@@ -1,6 +1,7 @@
 import {
   isWarmingUp,
   moduleStatusFresh,
+  type CorridorSpread,
   type ModulesConfig,
   type ModulesView,
 } from './modules'
@@ -181,15 +182,51 @@ export function moduleParameterErrors(c: ModulesConfig): string[] {
   ].filter((message): message is string => typeof message === 'string')
 }
 
+/** A buy and a sell spread in whole bps. Null is a side that doesn't quote. */
+export type QuoteSides = { buy: number | null; sell: number | null }
+
+/** One corridor side in whole bps, read the way `modules::base_spreads` reads
+ * it: bps as set, an absolute offset converted at `price` (settlement per
+ * corridor token) and rounded up. Null for a side the corridor leaves off;
+ * undefined for an absolute offset with no usable price. */
+export function corridorSpreadBps(
+  spread: CorridorSpread | null,
+  side: 'buy' | 'sell',
+  price: number | undefined
+): number | null | undefined {
+  if (spread === null) return null
+  if (spread.kind === 'bps') return spread.value
+  if (price === undefined || !Number.isFinite(price) || price <= 0)
+    return undefined
+  // The offset moves collateral per debt away from the mid on each side.
+  const perDebt =
+    side === 'buy' ? 1 / price + spread.value : 1 / price - spread.value
+  const quoted = perDebt > 0 ? 1 / perDebt : 0
+  const bps =
+    side === 'buy' ? (1 - quoted / price) * 10000 : (quoted / price - 1) * 10000
+  return Math.ceil(Math.max(0, bps))
+}
+
+/** Both corridor sides, or null when either can't be read in bps yet. */
+export function corridorSpreads(
+  spreads: ModulesView['corridor_spreads'],
+  price: number | undefined
+): QuoteSides | null {
+  const buy = corridorSpreadBps(spreads.buy, 'buy', price)
+  const sell = corridorSpreadBps(spreads.sell, 'sell', price)
+  return buy === undefined || sell === undefined ? null : { buy, sell }
+}
+
 /** Illustrations only: the same integer rounding as the Rust strategies, with
- * explicit example inputs. Excludes reservations, data freshness and execution. */
+ * explicit example inputs. Excludes reservations, data freshness and execution.
+ * Inventory balancing moves the corridor's `base` spreads; off returns them. */
 export function inventoryIllustration(
   c: ModulesConfig,
   share: number,
-  base = 20
-) {
+  base: QuoteSides
+): QuoteSides {
   const i = c.inventory
-  if (!i.enabled) return { buy: base, sell: base }
+  if (!i.enabled) return base
   const skew = Math.min(
     i.max_skew_bps,
     Math.floor(
@@ -197,17 +234,20 @@ export function inventoryIllustration(
         (i.max_bps - i.target_bps)
     )
   )
+  const floored = (bps: number) => Math.max(i.spread_floor_bps, bps)
+  const tighter = (bps: number | null) =>
+    bps === null ? null : floored(Math.max(0, bps - skew))
   return share >= i.target_bps
     ? {
         buy:
-          share >= i.max_bps
+          share >= i.max_bps || base.buy === null
             ? null
-            : Math.min(9999, Math.max(i.spread_floor_bps, base + skew)),
-        sell: Math.max(i.spread_floor_bps, base - skew),
+            : Math.min(9999, floored(base.buy + skew)),
+        sell: tighter(base.sell),
       }
     : {
-        buy: Math.max(i.spread_floor_bps, base - skew),
-        sell: Math.max(i.spread_floor_bps, base + skew),
+        buy: tighter(base.buy),
+        sell: base.sell === null ? null : floored(base.sell + skew),
       }
 }
 export function volatilityIllustration(
@@ -235,6 +275,107 @@ export function volatilityIllustration(
     buy: share >= c.inventory.max_bps ? null : above ? extra : extra - discount,
     sell: above ? extra - discount : extra,
   }
+}
+
+/** What the bot would quote at `share` and a `rangeBps` price range: the
+ * corridor spread, then inventory balancing, then dynamic spreads, composed as
+ * `modules::evaluate` composes them, buy capped at 9,999 bps. Leaves out what
+ * only a running bot knows: open quotes, funds, vault limits and freshness. */
+export function quoteIllustration(
+  c: ModulesConfig,
+  base: QuoteSides,
+  share: number,
+  rangeBps: number
+): { base: QuoteSides; inventory: QuoteSides; quoted: QuoteSides } {
+  const inventory = inventoryIllustration(c, share, base)
+  const extra = volatilityIllustration(c, share, rangeBps)
+  return {
+    base,
+    inventory,
+    quoted: {
+      buy:
+        inventory.buy === null || extra.buy === null
+          ? null
+          : Math.min(9999, inventory.buy + extra.buy),
+      sell:
+        inventory.sell === null || extra.sell === null
+          ? null
+          : inventory.sell + extra.sell,
+    },
+  }
+}
+
+type BreakdownKey = 'corridor' | 'inventory' | 'spreads' | 'quoted'
+export type QuoteBreakdownRow = {
+  key: BreakdownKey
+  label: string
+  /** False for a module that is switched off. */
+  on: boolean
+  buy: string
+  sell: string
+}
+
+const signedPercentage = (bps: number) =>
+  bps > 0 ? `+${percentage(bps)}` : bps < 0 ? `−${percentage(-bps)}` : '0%'
+
+/** The Simulate panel's spread table: each step's change per side, and the
+ * spread that results. Rebalancing sells inventory but never moves a quote, so
+ * it has no row. */
+export function quoteBreakdown(
+  c: ModulesConfig,
+  base: QuoteSides,
+  share: number,
+  rangeBps: number
+): QuoteBreakdownRow[] {
+  const { inventory, quoted } = quoteIllustration(c, base, share, rangeBps)
+  const change = (
+    on: boolean,
+    before: number | null,
+    after: number | null
+  ): string =>
+    !on
+      ? 'Off'
+      : before === null
+        ? '—'
+        : after === null
+          ? 'Paused'
+          : signedPercentage(after - before)
+  const side = (key: 'buy' | 'sell'): Record<BreakdownKey, string> => ({
+    corridor: base[key] === null ? 'Off' : percentage(base[key]),
+    inventory: change(c.inventory.enabled, base[key], inventory[key]),
+    spreads: change(c.spreads.enabled, inventory[key], quoted[key]),
+    quoted:
+      quoted[key] !== null
+        ? percentage(quoted[key])
+        : base[key] === null
+          ? 'Off'
+          : 'Paused',
+  })
+  const buy = side('buy')
+  const sell = side('sell')
+  const rows: [BreakdownKey, string, boolean][] = [
+    ['corridor', 'Corridor spread', true],
+    ['inventory', moduleNames.inventory, c.inventory.enabled],
+    ['spreads', moduleNames.spreads, c.spreads.enabled],
+    ['quoted', c.mode === 'live' ? 'Quoted spread' : 'Proposed spread', true],
+  ]
+  return rows.map(([key, label, on]) => ({
+    key,
+    label,
+    on,
+    buy: buy[key],
+    sell: sell[key],
+  }))
+}
+
+/** Why the spread table isn't what the bot quotes today, when it isn't. The
+ * bot only applies modules in Live mode. */
+export function quoteModeNote(mode: ModulesConfig['mode']): string | null {
+  return mode === 'off'
+    ? 'Modules are off, so live quotes stay at the corridor spread.'
+    : mode === 'shadow'
+      ? 'Preview records this proposed spread. Live quotes stay at the corridor spread until you switch to Live.'
+      : null
 }
 
 export function moduleOverviewState(view: ModulesView, now: number) {

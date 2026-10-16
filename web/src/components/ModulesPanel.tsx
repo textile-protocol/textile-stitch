@@ -7,7 +7,11 @@ import ModuleParameters from './ModuleParameters'
 import ModuleSaveBar from './ModuleSaveBar'
 import { pairSymbols } from './SpreadExample'
 import ScrollTabs from './ScrollTabs'
-import { moduleParameterErrors, type ModuleKey } from '../modulePresentation'
+import {
+  corridorSpreads,
+  moduleParameterErrors,
+  type ModuleKey,
+} from '../modulePresentation'
 import {
   downloadJson,
   isWarmingUp,
@@ -81,6 +85,11 @@ export default function ModulesPanel({
   const symbols = pairSymbols(pair)
   const currency = symbols?.base ?? 'Corridor currency'
   const settlement = symbols?.quote ?? 'Settlement currency'
+  // An absolute corridor offset reads as bps at the bot's last price.
+  const corridor = corridorSpreads(
+    view.corridor_spreads,
+    status?.decisions.at(-1)?.price
+  )
 
   async function save() {
     if (!view || !draft || !editable || !valid || busy) return
@@ -179,6 +188,7 @@ export default function ModulesPanel({
               onSelect={setSelectedModule}
               currency={currency}
               settlement={settlement}
+              corridor={corridor}
             />
           </fieldset>
           {!valid && (

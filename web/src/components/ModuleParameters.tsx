@@ -2,24 +2,25 @@ import { useId, useState, type ReactNode } from 'react'
 import type { ModulesConfig } from '../modules'
 import ModulePresets from './ModulePresets'
 import {
-  inventoryIllustration,
   moduleKeyFigures,
   moduleKeys,
   moduleModes,
   moduleNames,
   moduleParameterErrors,
   percentage,
-  volatilityIllustration,
+  quoteBreakdown,
+  quoteModeNote,
   type ModuleKey,
+  type QuoteSides,
 } from '../modulePresentation'
 import { matchingPreset } from '../modulePresets'
 import {
   AllocationBar,
   Chevron,
-  MarginBars,
   ModuleSwitch,
   NumberControl,
   Popover,
+  QuoteBreakdown,
 } from './ModuleControls'
 import {
   InventoryFields,
@@ -49,6 +50,7 @@ export default function ModuleParameters({
   onSelect,
   currency,
   settlement,
+  corridor,
   initialShare,
 }: {
   draft: ModulesConfig
@@ -57,6 +59,8 @@ export default function ModuleParameters({
   onSelect: (key: ModuleKey | null) => void
   currency: string
   settlement: string
+  /** The corridor's saved spreads in bps; null until they can be read. */
+  corridor: QuoteSides | null
   initialShare?: number | null
 }) {
   const [share, setShare] = useState(initialShare ?? 4500)
@@ -121,6 +125,7 @@ export default function ModuleParameters({
             onChange={onChange}
             currency={currency}
             settlement={settlement}
+            corridor={corridor}
             example={example}
           />
         </ModuleRow>
@@ -281,6 +286,7 @@ function ModuleEditor({
   onChange,
   currency,
   settlement,
+  corridor,
   example,
 }: {
   module: ModuleKey
@@ -288,6 +294,7 @@ function ModuleEditor({
   onChange: (config: ModulesConfig) => void
   currency: string
   settlement: string
+  corridor: QuoteSides | null
   example: Example
 }) {
   const Fields = {
@@ -342,6 +349,7 @@ function ModuleEditor({
           draft={draft}
           currency={currency}
           settlement={settlement}
+          corridor={corridor}
           example={example}
         />
       </div>
@@ -354,21 +362,24 @@ function ModuleExample({
   draft,
   currency,
   settlement,
+  corridor,
   example,
 }: {
   module: ModuleKey
   draft: ModulesConfig
   currency: string
   settlement: string
+  corridor: QuoteSides | null
   example: Example
 }) {
   const id = useId()
   const valid = moduleParameterErrors(draft).length === 0
   const enabled = draft[module].enabled
-  const extra = valid
-    ? volatilityIllustration(draft, example.share, example.range)
-    : null
-  const margins = valid ? inventoryIllustration(draft, example.share) : null
+  const breakdown =
+    valid && corridor
+      ? quoteBreakdown(draft, corridor, example.share, example.range)
+      : null
+  const modeNote = quoteModeNote(draft.mode)
   const sale =
     enabled && example.share >= draft.rebalance.trigger_bps
       ? Math.max(
@@ -446,33 +457,6 @@ function ModuleExample({
                     are shown for reference.
                   </p>
                 )}
-                {module === 'inventory' && margins && (
-                  <>
-                    <MarginBars {...margins} />
-                    <p className="text-muted text-xs leading-relaxed">
-                      Example base margins: 0.20% each. Includes inventory
-                      adjustments and the minimum margin; excludes dynamic
-                      spreads.
-                    </p>
-                  </>
-                )}
-                {module === 'spreads' && extra && (
-                  <>
-                    <MarginBars {...extra} extra />
-                    <p className="text-muted text-xs leading-relaxed">
-                      Extra margin only. Added after inventory adjustments.
-                      Actual quotes also depend on available funds and side
-                      limits.
-                    </p>
-                    <NumberControl
-                      label="Example price range"
-                      value={example.range}
-                      sliderMax={100}
-                      max={1000}
-                      onChange={example.setRange}
-                    />
-                  </>
-                )}
                 {module === 'rebalance' && (
                   <div className="border-line-soft bg-surface rounded-xl border p-4">
                     <p className="text-muted text-sm">
@@ -490,6 +474,34 @@ function ModuleExample({
                     </p>
                   </div>
                 )}
+                {breakdown ? (
+                  <div className="space-y-3">
+                    <QuoteBreakdown
+                      rows={breakdown}
+                      highlight={module === 'rebalance' ? null : module}
+                    />
+                    {modeNote && (
+                      <p className="text-muted text-xs leading-relaxed">
+                        {modeNote}
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-muted text-xs leading-relaxed">
+                    Your corridor spread is an absolute offset, so it needs a
+                    price from the running bot before the full spread can be
+                    shown here.
+                  </p>
+                )}
+                {(module === 'spreads' || draft.spreads.enabled) && (
+                  <NumberControl
+                    label="Example price range"
+                    value={example.range}
+                    sliderMax={100}
+                    max={1000}
+                    onChange={example.setRange}
+                  />
+                )}
                 <div className="border-line-soft border-t pt-5">
                   <NumberControl
                     label={`Example ${currency} holdings`}
@@ -502,7 +514,9 @@ function ModuleExample({
               </div>
             )}
             <p className="text-muted mt-6 text-xs leading-relaxed">
-              Illustration only, not a live quote or a return forecast.
+              Illustration only, not a live quote or a return forecast. Open
+              quotes, available funds and vault limits can still hold a side
+              back.
             </p>
           </aside>
         )}

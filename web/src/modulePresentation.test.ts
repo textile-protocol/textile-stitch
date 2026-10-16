@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import type { ModulesConfig, ModulesView } from './modules'
 import {
+  corridorSpreadBps,
+  corridorSpreads,
   inventoryIllustration,
   moduleChanges,
   moduleKeyFigures,
   moduleOverviewState,
   moduleParameterErrors,
+  quoteBreakdown,
+  quoteIllustration,
+  quoteModeNote,
   volatilityIllustration,
 } from './modulePresentation'
 import { applyPreset, modulePresets } from './modulePresets'
@@ -67,8 +72,9 @@ describe('module parameter validation', () => {
 })
 
 describe('interactive illustrations match strategy rounding', () => {
-  // Matching the Rust evaluator's fixed-share regression cases. The UI shows
-  // one module at a time; adding their effects must reproduce its spreads.
+  const base = { buy: 20, sell: 20 }
+  // Matching the Rust evaluator's fixed-share regression cases, which start
+  // from a 20 bps corridor spread on both sides.
   it.each([
     [0, 5, 70],
     [2000, 10, 50],
@@ -78,15 +84,10 @@ describe('interactive illustrations match strategy rounding', () => {
     [9945, null, 5],
     [10000, null, 5],
   ])('prices the %i bps inventory example correctly', (share, buy, sell) => {
-    const c = config()
-    const inventory = inventoryIllustration(c, share!)
-    const extra = volatilityIllustration(c, share!, 10)
-    expect(
-      inventory.buy === null || extra.buy === null
-        ? null
-        : inventory.buy + extra.buy
-    ).toBe(buy)
-    expect(inventory.sell + extra.sell).toBe(sell)
+    expect(quoteIllustration(config(), base, share!, 10).quoted).toEqual({
+      buy,
+      sell,
+    })
   })
   it('keeps purchase vetoes even with symmetric buffers, and applies caps before weighting', () => {
     const c = config()
@@ -97,8 +98,152 @@ describe('interactive illustrations match strategy rounding', () => {
     expect(volatilityIllustration(c, 6000, 20)).toEqual({ buy: 6, sell: 3 })
     expect(volatilityIllustration(c, 6000, 0.1)).toEqual({ buy: 1, sell: 1 })
     c.inventory.enabled = false
-    expect(inventoryIllustration(c, 9945)).toEqual({ buy: 20, sell: 20 })
+    expect(inventoryIllustration(c, 9945, base)).toEqual({ buy: 20, sell: 20 })
     expect(volatilityIllustration(c, 9945, 20)).toEqual({ buy: 6, sell: 6 })
+  })
+})
+
+describe('the simulated spread starts from the corridor spread', () => {
+  it('reads bps as set and converts an absolute offset at the price, rounding up', () => {
+    expect(
+      corridorSpreadBps({ kind: 'bps', value: 35 }, 'buy', undefined)
+    ).toBe(35)
+    expect(corridorSpreadBps(null, 'sell', 1)).toBeNull()
+    expect(
+      corridorSpreadBps({ kind: 'abs', value: 10 }, 'buy', undefined)
+    ).toBeUndefined()
+    // 1,000 corridor per settlement token, 10 more or fewer on each side.
+    expect(corridorSpreadBps({ kind: 'abs', value: 10 }, 'buy', 0.001)).toBe(
+      100
+    )
+    expect(corridorSpreadBps({ kind: 'abs', value: 10 }, 'sell', 0.001)).toBe(
+      102
+    )
+    expect(
+      corridorSpreads(
+        { buy: { kind: 'bps', value: 5 }, sell: { kind: 'abs', value: 10 } },
+        undefined
+      )
+    ).toBeNull()
+    expect(
+      corridorSpreads(
+        { buy: null, sell: { kind: 'bps', value: 40 } },
+        undefined
+      )
+    ).toEqual({ buy: null, sell: 40 })
+  })
+  it('stacks inventory balancing and dynamic spreads on an asymmetric corridor', () => {
+    // 60% held, 20 bps range: inventory moves both sides 20 bps, dynamic
+    // spreads add 20 to buys and 10 to sells after inventory weighting.
+    const c = config()
+    const base = { buy: 10, sell: 60 }
+    expect(quoteIllustration(c, base, 6000, 20)).toEqual({
+      base,
+      inventory: { buy: 30, sell: 40 },
+      quoted: { buy: 50, sell: 50 },
+    })
+    expect(quoteBreakdown(c, base, 6000, 20)).toEqual([
+      {
+        key: 'corridor',
+        label: 'Corridor spread',
+        on: true,
+        buy: '0.1%',
+        sell: '0.6%',
+      },
+      {
+        key: 'inventory',
+        label: 'Inventory balancing',
+        on: true,
+        buy: '+0.2%',
+        sell: '−0.2%',
+      },
+      {
+        key: 'spreads',
+        label: 'Dynamic spreads',
+        on: true,
+        buy: '+0.2%',
+        sell: '+0.1%',
+      },
+      {
+        key: 'quoted',
+        label: 'Quoted spread',
+        on: true,
+        buy: '0.5%',
+        sell: '0.5%',
+      },
+    ])
+  })
+  it('applies the minimum margin to the corridor spread, not to a fixed example', () => {
+    const c = config()
+    c.spreads.enabled = false
+    c.inventory.spread_floor_bps = 15
+    expect(quoteIllustration(c, { buy: 50, sell: 12 }, 6000, 0).quoted).toEqual(
+      {
+        buy: 70,
+        sell: 15,
+      }
+    )
+  })
+  it('keeps a side the corridor leaves off and pauses buys at the purchase limit', () => {
+    const c = config()
+    expect(
+      quoteBreakdown(c, { buy: null, sell: 30 }, 4000, 0).map((r) => r.buy)
+    ).toEqual(['Off', '—', '—', 'Off'])
+    expect(
+      quoteBreakdown(c, { buy: 30, sell: 30 }, 8000, 0).map((r) => r.buy)
+    ).toEqual(['0.3%', 'Paused', '—', 'Paused'])
+  })
+  it('passes the corridor spread through modules that are off, and caps buys', () => {
+    const c = config()
+    c.inventory.enabled = false
+    c.spreads.enabled = false
+    c.mode = 'shadow'
+    expect(quoteBreakdown(c, { buy: 25, sell: 30 }, 6000, 50)).toEqual([
+      {
+        key: 'corridor',
+        label: 'Corridor spread',
+        on: true,
+        buy: '0.25%',
+        sell: '0.3%',
+      },
+      {
+        key: 'inventory',
+        label: 'Inventory balancing',
+        on: false,
+        buy: 'Off',
+        sell: 'Off',
+      },
+      {
+        key: 'spreads',
+        label: 'Dynamic spreads',
+        on: false,
+        buy: 'Off',
+        sell: 'Off',
+      },
+      {
+        key: 'quoted',
+        label: 'Proposed spread',
+        on: true,
+        buy: '0.25%',
+        sell: '0.3%',
+      },
+    ])
+    c.spreads.enabled = true
+    expect(
+      quoteIllustration(c, { buy: 9990, sell: 9990 }, 6000, 50).quoted
+    ).toEqual({
+      buy: 9999,
+      sell: 10040,
+    })
+  })
+  it('says when the bot will not quote the simulated spread', () => {
+    expect(quoteModeNote('live')).toBeNull()
+    expect(quoteModeNote('shadow')).toMatch(
+      /Live quotes stay at the corridor spread/
+    )
+    expect(quoteModeNote('off')).toMatch(
+      /live quotes stay at the corridor spread/
+    )
   })
 })
 
@@ -108,6 +253,10 @@ const view = (): ModulesView => ({
   running: true,
   corridor_decimals: 18,
   settlement_decimals: 18,
+  corridor_spreads: {
+    buy: { kind: 'bps', value: 20 },
+    sell: { kind: 'bps', value: 20 },
+  },
   status: {
     version: 1,
     config: config(),

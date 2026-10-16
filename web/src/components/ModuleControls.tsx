@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
-import { percentage } from '../modulePresentation'
+import { percentage, type QuoteBreakdownRow } from '../modulePresentation'
 
 /** Shared module editor vocabulary: exact inputs + sliders, accessible switches,
  * and keyboard/touch disclosures. Values stay in the API's native units. */
@@ -320,41 +320,51 @@ export function AllocationBar({
   )
 }
 
-export function MarginBars({
-  buy,
-  sell,
-  extra = false,
+/** The spread each side ends up at, built up row by row from the corridor
+ * spread. The open module's row is marked so its share of the total stands
+ * out. */
+export function QuoteBreakdown({
+  rows,
+  highlight,
 }: {
-  buy: number | null
-  sell: number | null
-  extra?: boolean
+  rows: QuoteBreakdownRow[]
+  /** The open module's row; null when that module moves no spread. */
+  highlight: QuoteBreakdownRow['key'] | null
 }) {
-  const max = Math.max(1, buy ?? 0, sell ?? 0)
   return (
-    <div className="space-y-4" aria-live="polite">
-      {(
-        [
-          ['Vault buys', buy],
-          ['Vault sells', sell],
-        ] as const
-      ).map(([label, value], i) => (
-        <div key={label}>
-          <div className="mb-2 flex justify-between gap-3 text-sm">
-            <span>{label}</span>
-            <strong className="tabular-nums">
-              {value === null
-                ? 'Paused'
-                : `${extra ? '+' : ''}${percentage(value)}`}
-            </strong>
-          </div>
-          <div className="bg-active h-2 rounded-full">
-            <div
-              className={`h-full rounded-full transition-[width] motion-reduce:transition-none ${i === 0 ? 'bg-accent' : 'bg-muted'}`}
-              style={{ width: `${((value ?? 0) / max) * 100}%` }}
-            />
-          </div>
-        </div>
-      ))}
-    </div>
+    <table className="w-full text-sm tabular-nums" aria-live="polite">
+      <thead>
+        <tr className="text-muted whitespace-nowrap text-xs">
+          <th className="pb-2 text-left font-normal">
+            <span className="sr-only">Step</span>
+          </th>
+          <th className="pb-2 text-right font-normal">Vault buys</th>
+          <th className="pb-2 pl-3 text-right font-normal">Vault sells</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => {
+          const total = row.key === 'quoted'
+          const marked = row.key === highlight
+          return (
+            <tr
+              key={row.key}
+              className={`${total ? 'border-line-soft border-t font-bold' : ''} ${row.on ? '' : 'text-muted'}`}
+            >
+              <th
+                scope="row"
+                className={`border-l-2 py-1.5 pl-2 pr-2 text-left ${marked ? 'border-accent' : 'border-transparent'} ${total || marked ? 'font-bold' : 'font-normal'}`}
+              >
+                {row.label}
+              </th>
+              <td className="whitespace-nowrap py-1.5 text-right">{row.buy}</td>
+              <td className="whitespace-nowrap py-1.5 pl-3 text-right">
+                {row.sell}
+              </td>
+            </tr>
+          )
+        })}
+      </tbody>
+    </table>
   )
 }

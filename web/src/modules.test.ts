@@ -65,6 +65,10 @@ describe('dynamic spread visibility', () => {
       revision: 'test',
       settlement_decimals: 6,
       corridor_decimals: 18,
+      corridor_spreads: {
+        buy: { kind: 'bps', value: 20 },
+        sell: { kind: 'bps', value: 20 },
+      },
       config,
       status: {
         version: 1,
