@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
 //! First-party policies. Pure decisions, applied by the live RFQ responder.
-//! Modules never receive a signer, RPC client or authority to move funds.
+//! Modules never receive a signer, RPC client or authority to move funds; the
+//! RFQ adapters (`rfq::modules`, `rfq::liquidity`) act on their decisions.
 pub mod config;
 pub mod dealer;
+pub mod liquidity;
 pub mod manual;
 pub mod runtime;
 mod strategies;
@@ -16,13 +18,17 @@ pub use config::{Mode, ModulesConfig};
 use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 1;
+/// How old a vault balance read may be before modules stop trusting it.
+/// The inventory loop refreshes it every couple of seconds.
+pub const BALANCES_MAX_AGE_SECS: u64 = 3;
 /// Leads the decision reason while dynamic spreads quote at their cap because
 /// the price window has not spanned `warmup_secs` yet. The panel matches on it.
 pub const WARMUP_REASON: &str = "Warming up dynamic spreads";
-pub const REGISTRY: [(&str, &str); 3] = [
+pub const REGISTRY: [(&str, &str); 4] = [
     ("inventory", "Inventory balancing"),
     ("spreads", "Dynamic spreads"),
     ("rebalance", "Spot rebalancing"),
+    ("liquidity", "Liquidity schedule"),
 ];
 
 pub mod atomic {
@@ -100,7 +106,7 @@ pub fn evaluate(config: &ModulesConfig, ctx: &Context, history: &[PricePoint]) -
         && ctx.price > 0.0
         && !is_stale(ctx.price_at, ctx.now, ctx.staleness_secs)
         && ctx.balances_at <= ctx.now
-        && ctx.now - ctx.balances_at <= 3
+        && ctx.now - ctx.balances_at <= BALANCES_MAX_AGE_SECS
         && ctx.corridor_decimals <= 18
         && ctx.settlement_decimals <= 18;
     if !valid {

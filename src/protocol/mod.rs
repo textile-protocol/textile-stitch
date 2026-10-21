@@ -13,6 +13,7 @@
 
 pub mod attest;
 pub mod eip712;
+pub mod roles;
 pub mod typed_data;
 pub mod types;
 pub mod vault;

@@ -351,6 +351,36 @@ impl Reservations {
         })
     }
 
+    /// Every live claim paying `token`, on whichever side of whichever pool it
+    /// was signed: tagged entries by token, untagged ones on a bid of a
+    /// `bid_slugs` pool or an ask of an `ask_slugs` pool (the pools that pay
+    /// `token` on that side). [`Self::reserved_paying`] answers for one side
+    /// only, which misses untagged claims where `token` is the other leg.
+    pub fn reserved_paying_token<'a, B, A>(
+        &self,
+        token: &str,
+        bid_slugs: B,
+        ask_slugs: A,
+        now_secs: u64,
+    ) -> U256
+    where
+        B: IntoIterator<Item = &'a str>,
+        A: IntoIterator<Item = &'a str>,
+    {
+        let token = normalize_token(token);
+        let bids: std::collections::HashSet<&str> = bid_slugs.into_iter().collect();
+        let asks: std::collections::HashSet<&str> = ask_slugs.into_iter().collect();
+        self.by_rfq
+            .values()
+            .filter(|r| r.release_at > now_secs)
+            .filter(|r| match &r.input_token {
+                Some(t) => !token.is_empty() && t == &token,
+                None if r.bid => bids.contains(r.corridor.as_str()),
+                None => asks.contains(r.corridor.as_str()),
+            })
+            .fold(U256::ZERO, |sum, r| sum.saturating_add(r.input))
+    }
+
     /// Whether any live untagged claim belongs to no book we can see.
     ///
     /// [`Self::reserved_paying`] counts an untagged row only against a slug it
@@ -507,6 +537,32 @@ fn normalize_token_opt(raw: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settlement as debt in one pool and as collateral in another: one
+    /// total covers tagged claims and untagged ones on either side, where a
+    /// one-sided query misses the other orientation's untagged claims.
+    #[test]
+    fn a_token_total_counts_both_pool_orientations() {
+        let usdt = "0x00000000000000000000000000000000000000aa";
+        let mut r = Reservations::new();
+        r.reserve("bid", "a", true, U256::from(10u8), 1_000);
+        r.reserve("ask", "b", false, U256::from(20u8), 1_000);
+        r.reserve_paying("tagged", "c", true, U256::from(30u8), 1_000, Some(usdt));
+        r.reserve("other side of a", "a", false, U256::from(40u8), 1_000);
+        assert_eq!(
+            r.reserved_paying_token(usdt, ["a"], ["b"], 0),
+            U256::from(60u8)
+        );
+        assert_eq!(
+            r.reserved_paying(usdt, ["a"], true, 0),
+            U256::from(40u8),
+            "one side alone misses pool b's ask"
+        );
+        assert_eq!(
+            r.reserved_paying_token(usdt, ["a"], ["b"], 1_000_000),
+            U256::ZERO
+        );
+    }
 
     #[test]
     fn exclusive_claim_requires_its_own_live_reservation_and_no_other_live_claims() {

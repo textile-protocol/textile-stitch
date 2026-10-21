@@ -168,6 +168,7 @@ export default function ModulesPanel({
           view={view}
           now={now}
           currency={currency}
+          settlement={settlement}
           onConfigure={(key) => {
             if (key === 'rebalance') {
               setSection('sales')
@@ -191,6 +192,7 @@ export default function ModulesPanel({
               settlement={settlement}
               corridor={corridor}
               live={liveReading(view, now)}
+              liquidityRefusal={view.liquidity_refusal ?? null}
             />
           </fieldset>
           {!valid && (

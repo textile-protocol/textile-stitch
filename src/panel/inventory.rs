@@ -243,7 +243,9 @@ pub struct ConfigSummary {
     ///
     /// The maker leg signs Permit2 orders and posts them to the book, which costs
     /// no nonce. The taker (`limit_taker_enabled`) and closer legs call the reactor
-    /// on chain, and each transaction consumes an account nonce. That's what makes
+    /// on chain, and a live liquidity schedule moves the vault floor; each of
+    /// those transactions consumes an account nonce. See
+    /// [`crate::config::Config::sends_transactions`]. That's what makes
     /// a second process holding the same key unsafe to run concurrently, so the
     /// panel needs to know before it offers one.
     pub sends_transactions: bool,
@@ -839,10 +841,7 @@ pub fn summarise(
             .as_ref()
             .and_then(|v| v.address.parse::<alloy_primitives::Address>().ok())
             .map(|a| format!("{a:?}")),
-        sends_transactions: parsed
-            .pools
-            .iter()
-            .any(|p| p.limit_taker_enabled() || p.closer_enabled()),
+        sends_transactions: parsed.sends_transactions(),
         cannot_sign_transactions: parsed
             .signer
             .as_ref()

@@ -3,6 +3,7 @@ import {
   dynamicSpreadState,
   type ModulesView,
 } from '../modules'
+import { runningConfigDiffers } from '../modulePresentation'
 import { Banner, Card } from './ui'
 
 const bps = (v: number | null | undefined) =>
@@ -82,8 +83,7 @@ export default function DynamicSpreadsLive({
     })
     .slice(-5)
     .reverse()
-  const modeDiffers =
-    status && JSON.stringify(view.config) !== JSON.stringify(status.config)
+  const modeDiffers = runningConfigDiffers(view)
   if (!last)
     return (
       <Card title="Spread readings">

@@ -27,10 +27,13 @@ pub(super) async fn balance_loop(
     vault: Address,
     modules: crate::modules::runtime::Runtime,
 ) {
+    // Alone here, so liquid is read with them rather than from quote views.
     let calls = [
-        Call::new(vault, encode_free_settlement()),
-        Call::new(vault, encode_free_corridor()),
-    ];
+        super::module_balance_calls(vault),
+        vec![Call::new(vault, encode_liquid_settlement())],
+    ]
+    .concat();
+    let views = calls.len() - 1;
     let mut batcher = None;
     loop {
         if batcher.is_none() {
@@ -38,11 +41,16 @@ pub(super) async fn balance_loop(
         }
         let reader = batcher.unwrap_or_else(Batcher::sequential);
         if let Ok(values) = reader.read(&rpc, &calls).await {
-            if let (Some(Some(s)), Some(Some(c))) = (values.first(), values.get(1)) {
+            let (tail, liquid) = values.split_at(views.min(values.len()));
+            let liquid = liquid.first().and_then(Option::as_ref);
+            if let Some((settlement, corridor, liquid)) =
+                super::decode_module_balances(tail, liquid)
+            {
                 if let Ok(mut slot) = modules.balances.write() {
                     *slot = Some(crate::modules::runtime::Balances {
-                        settlement: decode_uint(s),
-                        corridor: decode_uint(c),
+                        settlement,
+                        corridor,
+                        liquid,
                         at: unix_now(),
                     });
                 }
@@ -98,6 +106,80 @@ impl Engine {
         let Some(modules) = &self.modules else {
             return Some(book.clone());
         };
+        self.policy_book(modules, book, quote, now)
+            .map(|b| self.liquidity_capped(modules, b, now))
+    }
+    /// While a liquidity cap is in force, no quote may promise settlement
+    /// beyond it. Applies in every module mode that has a cap set,
+    /// independent of quote policy.
+    fn liquidity_capped(
+        &self,
+        modules: &crate::modules::runtime::Runtime,
+        book: CorridorBook,
+        now: u64,
+    ) -> CorridorBook {
+        match self.settlement_allowance(modules, &book, now) {
+            Some((settlement, allowance)) => {
+                super::liquidity::cap_settlement_side(&book, settlement, allowance)
+            }
+            None => book,
+        }
+    }
+    /// The settlement token and what `book` may promise in it in total under
+    /// the liquidity cap, its own live claims included. The cap is one budget
+    /// for the token: each book gets what its siblings have not already
+    /// promised ([`super::liquidity::book_allowance`]). `None` while no cap
+    /// is in force or the vault pair isn't loaded.
+    fn settlement_allowance(
+        &self,
+        modules: &crate::modules::runtime::Runtime,
+        book: &CorridorBook,
+        now: u64,
+    ) -> Option<(Address, U256)> {
+        let cap = modules.liquidity_quote_cap(now)?;
+        let settlement = self
+            .vault_policy
+            .read()
+            .ok()
+            .and_then(|p| p.map(|p| p.settlement))?;
+        let pays_bid = book.debt == settlement;
+        let allowance = super::liquidity::book_allowance(
+            cap,
+            self.reserved_token(settlement, now),
+            self.reservations.reserved(&book.slug, pays_bid, now),
+        );
+        Some((settlement, allowance))
+    }
+    /// Whether a quote sized before signing still fits the liquidity cap. A
+    /// remote signer can take seconds, and meanwhile a fill can drain liquid
+    /// or the loop can cap for a lower; a signature released past the cap
+    /// promises settlement a bundled fill can't be paid from.
+    pub(super) fn fits_liquidity_cap(
+        &self,
+        book: &CorridorBook,
+        plan: &super::responder::QuotePlan,
+        now: u64,
+    ) -> bool {
+        let Some(modules) = &self.modules else {
+            return true;
+        };
+        match self.settlement_allowance(modules, book, now) {
+            Some((settlement, allowance)) if plan.input_token == settlement => {
+                self.reservations
+                    .reserved(&book.slug, plan.bid, now)
+                    .saturating_add(plan.input)
+                    <= allowance
+            }
+            _ => true,
+        }
+    }
+    fn policy_book(
+        &self,
+        modules: &crate::modules::runtime::Runtime,
+        book: &CorridorBook,
+        quote: &Quote,
+        now: u64,
+    ) -> Option<CorridorBook> {
         let changes_quotes = modules.config.mode == Mode::Live
             && (modules.config.inventory.enabled || modules.config.spreads.enabled);
         let Some(context) = self.module_context(book, quote, now) else {

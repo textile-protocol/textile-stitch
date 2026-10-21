@@ -38,6 +38,26 @@ fn mul_div_floor_nowrap(x: U256, n: U256, d: U256) -> U256 {
         .map_or_else(|| (x / d) * n + (x % d) * n / d, |product| product / d)
 }
 
+/// Whole tokens as text, exactly, with trailing zeros trimmed: `"25"`, `"0.5"`.
+/// Display only.
+pub fn format_units(atomic: U256, decimals: u8) -> String {
+    if decimals == 0 {
+        return atomic.to_string();
+    }
+    let scale = ten_pow(decimals);
+    let whole = atomic / scale;
+    let frac = atomic % scale;
+    if frac.is_zero() {
+        return whole.to_string();
+    }
+    let frac = format!(
+        "{:0>width$}",
+        frac.to_string(),
+        width = usize::from(decimals)
+    );
+    format!("{whole}.{}", frac.trim_end_matches('0'))
+}
+
 /// The venue fee the controller injects on top of an output:
 /// `floor(output × fee_bps / 10000)`.
 pub fn fee_on(output: U256, fee_bps: u32) -> U256 {

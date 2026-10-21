@@ -34,6 +34,7 @@
 
 mod guard;
 pub mod iso8601;
+mod liquidity;
 pub mod math;
 mod modules;
 pub mod nonce;
@@ -78,11 +79,11 @@ use crate::protocol::vault::{
     encode_close_redeem_epoch, encode_closed_redeem_epoch_id, encode_corridor_asset,
     encode_corridor_decimals, encode_epochs, encode_free_corridor, encode_free_settlement,
     encode_last_settled_nav, encode_liquid_settlement, encode_max_order_input_corridor,
-    encode_max_order_input_settlement, encode_max_order_lifetime, encode_paused,
-    encode_quotable_corridor, encode_quotable_settlement, encode_redemption_epoch_duration,
-    encode_settlement_asset, encode_settlement_decimals, encode_trading_epoch,
-    quotable_settlement_for_route, trading_nonce, vault_nonce_low, RedeemEpochView,
-    VaultQuotePolicy,
+    encode_max_order_input_settlement, encode_max_order_lifetime, encode_min_liquid_settlement,
+    encode_paused, encode_quotable_corridor, encode_quotable_settlement,
+    encode_redemption_epoch_duration, encode_settlement_asset, encode_settlement_decimals,
+    encode_trading_epoch, quotable_settlement_for_route, trading_nonce, vault_nonce_low,
+    RedeemEpochView, VaultQuotePolicy,
 };
 use crate::time::unix_now_ms;
 use iso8601::{format_iso_ms, parse_iso_ms};
@@ -428,17 +429,51 @@ fn build_runtime(
         trading_epoch: Arc::new(RwLock::new(0)),
         vault_policy: Arc::new(RwLock::new(None)),
         closing: Arc::new(Mutex::new(HashMap::new())),
-        modules: if cfg.modules_enabled && cfg.modules.mode != crate::modules::Mode::Off {
-            Some(crate::modules::runtime::Runtime::new(
-                cfg.modules.clone(),
-                config_dir.context("modules need a persistent config directory")?,
-                &module_price_source,
-            )?)
-        } else {
-            None
-        },
+        modules: modules_runtime(cfg, config_dir, &module_price_source)?,
         price_guard: cfg.price_guard,
     })
+}
+
+/// The modules runtime, when modules run. With modules off, a floor change
+/// an earlier run sent can still land, so a saved one starts a settling-only
+/// runtime ([`crate::modules::runtime::settling_only_config`]): a lower's
+/// quote cap holds until the liquidity loop settles it.
+///
+/// A saved change for another chain or vault refuses to start: its nonce and
+/// floor can only be settled there, and reading them here could release the
+/// cap while it can still land.
+fn modules_runtime(
+    cfg: &Config,
+    config_dir: Option<&std::path::Path>,
+    price_source: &str,
+) -> anyhow::Result<Option<crate::modules::runtime::Runtime>> {
+    use crate::modules::runtime::{pending_floor_saved, settling_only_config, Runtime};
+    let modules_on = cfg.modules_enabled && cfg.modules.mode != crate::modules::Mode::Off;
+    let dir = match config_dir {
+        Some(dir) => dir,
+        None if modules_on => anyhow::bail!("modules need a persistent config directory"),
+        None => return Ok(None),
+    };
+    let config = if modules_on {
+        cfg.modules.clone()
+    } else if pending_floor_saved(dir) {
+        warn!("modules are off, but a liquidity floor change may still land; settling it first");
+        settling_only_config(&cfg.modules)
+    } else {
+        return Ok(None);
+    };
+    let runtime = Runtime::new(config, dir, price_source)?;
+    let vault = cfg
+        .vault
+        .as_ref()
+        .and_then(|v| v.address.parse::<Address>().ok());
+    if let Some(why) = runtime
+        .saved_pending_floor()
+        .and_then(|saved| saved.foreign_to(cfg.chain_id, vault))
+    {
+        anyhow::bail!("not starting RFQ: {why}");
+    }
+    Ok(Some(runtime))
 }
 
 fn same_addr(value: &str, addr: Address) -> bool {
@@ -615,6 +650,25 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
                 .as_deref()
                 .map(|dir| Publisher::spawn(dir, rt.chain_id)),
         ));
+    }
+    // The liquidity schedule sends from the bot's wallet, off the quote path.
+    // Display decimals come from the corridor: modules require its debt to be
+    // the vault's settlement asset.
+    if let (Some(vault), Some(modules), Some(book)) =
+        (rt.vault, rt.modules.clone(), rt.books.first())
+    {
+        // A lower an earlier run sent keeps the loop alive to settle it, even
+        // with the schedule, or modules, since turned off.
+        if modules.config.liquidity.enabled || modules.saved_pending_floor().is_some() {
+            let wallet =
+                Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id).with_gas_caps(rt.gas_caps);
+            tokio::spawn(liquidity::liquidity_loop(
+                wallet,
+                vault,
+                modules,
+                book.debt_decimals,
+            ));
+        }
     }
 
     // The reservation ledger outlives sessions AND process restarts: every
@@ -1364,6 +1418,27 @@ impl Engine {
         );
     }
 
+    /// Every live claim paying `token`, across both sides of every book that
+    /// trades it. `U256::MAX` while a claim can't be attributed, as in
+    /// [`Self::reserved_on`].
+    pub(super) fn reserved_token(&self, token: Address, now_secs: u64) -> U256 {
+        if self
+            .reservations
+            .has_unattributable_claim(self.known_slugs(), now_secs)
+        {
+            return U256::MAX;
+        }
+        let books = || self.books.iter().chain(&self.configured);
+        self.reservations.reserved_paying_token(
+            &format!("{token:#x}"),
+            books().filter(|b| b.debt == token).map(|b| b.slug.as_str()),
+            books()
+                .filter(|b| b.collateral == token)
+                .map(|b| b.slug.as_str()),
+            now_secs,
+        )
+    }
+
     /// Every slug that names a pool we can attribute a claim to.
     fn known_slugs(&self) -> impl Iterator<Item = &str> {
         self.books
@@ -1432,6 +1507,7 @@ impl Engine {
             }
         }
         self.module_tick(prices, now_secs);
+        self.publish_liquidity_commitments(now_secs);
         let order_caps: Vec<(Address, U256)> = policy
             .map(|policy| {
                 vec![
@@ -1873,6 +1949,10 @@ impl Engine {
         ) {
             warn!(rfq_id = %req.rfq_id, ?reason, "the reference price changed while signing; signature withheld");
             return reject(reason);
+        }
+        if !self.fits_liquidity_cap(&book, &plan, unix_now()) {
+            warn!(rfq_id = %req.rfq_id, "the liquidity cap tightened while signing; signature withheld");
+            return reject(RejectReason::Inventory);
         }
 
         // The reservation starts the moment the signed order exists — even if
@@ -2518,13 +2598,14 @@ async fn inventory_loop(
                     if let Some(snapshot) = &snapshot {
                         snapshot.publish(now, recorded);
                     }
-                    if let (Some(modules), Some((free_settlement, free_corridor))) =
+                    if let (Some(modules), Some((free_settlement, free_corridor, liquid))) =
                         (module_balances, free)
                     {
                         if let Ok(mut slot) = modules.balances.write() {
                             *slot = Some(crate::modules::runtime::Balances {
                                 settlement: free_settlement,
                                 corridor: free_corridor,
+                                liquid,
                                 at: now,
                             });
                         }
@@ -2707,24 +2788,36 @@ fn decode_vault_inventory(
     ))
 }
 
-/// The vault's free balances for modules, appended after the ten quote views.
+/// The vault's free balances and liquid floor for modules, appended after the
+/// ten quote views. `liquidSettlement()` is already one of those.
 fn module_balance_calls(vault: Address) -> Vec<Call> {
     vec![
         Call::new(vault, encode_free_settlement()),
         Call::new(vault, encode_free_corridor()),
+        Call::new(vault, encode_min_liquid_settlement()),
     ]
 }
 
-/// `(freeSettlement, freeCorridor)` off the tail of the batch, or `None` when
-/// either view failed. Never an error: modules wait on a missing reading, and
-/// quote inventory must not.
-fn decode_module_balances(tail: &[Option<Bytes>]) -> Option<(U256, U256)> {
-    match tail {
-        [Some(settlement), Some(corridor)] => {
-            Some((decode_uint(settlement), decode_uint(corridor)))
-        }
+/// `(freeSettlement, freeCorridor, liquid reading)` off the tail of the
+/// batch, with `liquid` read alongside it, or `None` when either free balance
+/// failed. The liquid reading is `None` on its own when one of its views
+/// failed. Never an error: modules wait on a missing reading, and quote
+/// inventory must not.
+fn decode_module_balances(
+    tail: &[Option<Bytes>],
+    liquid: Option<&Bytes>,
+) -> Option<(U256, U256, Option<crate::modules::runtime::LiquidReading>)> {
+    let [Some(settlement), Some(corridor), floor] = tail else {
+        return None;
+    };
+    let liquid = match (liquid, floor) {
+        (Some(liquid), Some(floor)) => Some(crate::modules::runtime::LiquidReading {
+            liquid: decode_uint(liquid),
+            floor: decode_uint(floor),
+        }),
         _ => None,
-    }
+    };
+    Some((decode_uint(settlement), decode_uint(corridor), liquid))
 }
 
 /// Reads that only the panel uses, riding the batch the bot sends anyway: the
@@ -2756,7 +2849,7 @@ fn snapshot_calls(
 /// every read that answered, for the panel.
 struct VaultReading {
     inventory: (U256, U256, u64, U256, U256),
-    free: Option<(U256, U256)>,
+    free: Option<(U256, U256, Option<crate::modules::runtime::LiquidReading>)>,
     recorded: Vec<RecordedRead>,
 }
 
@@ -2785,8 +2878,10 @@ async fn read_vault_inventory(
     let results = reader.read(rpc, &calls).await?;
     let (quote, tail) = results.split_at(quote_views.min(results.len()));
     let inventory = decode_vault_inventory(quote, order_executor.is_some())?;
+    // The quote views' own `liquidSettlement()`, which decoded above.
+    let liquid = quote.get(1).and_then(Option::as_ref);
     let free = with_module_balances
-        .then(|| decode_module_balances(&tail[..module_views.min(tail.len())]))
+        .then(|| decode_module_balances(&tail[..module_views.min(tail.len())], liquid))
         .flatten();
     Ok(VaultReading {
         inventory,
@@ -2803,6 +2898,92 @@ mod tests {
     use super::wire::{QuoteExpiredFrame, QuoteResultFrame};
     use super::*;
 
+    /// Turning modules off while a floor lower may still land must not drop
+    /// its quote cap: a saved lower starts a settling-only runtime.
+    #[tokio::test]
+    async fn modules_off_still_cap_quotes_for_a_saved_lower() {
+        let cfg = crate::config::Config::from_toml(
+            r#"
+            chain_id = 8453
+            rpc_url = "http://x"
+            indexer_url = "http://x"
+            permit2 = "0x0000000000000000000000000000000000000000"
+            reactor = "0x0000000000000000000000000000000000000000"
+            tick_interval_secs = 5
+            [feed]
+            url = "https://feed"
+            staleness_secs = 30
+            [[pools]]
+            collateral = "0x0000000000000000000000000000000000000001"
+            collateral_decimals = 6
+            debt = "0x0000000000000000000000000000000000000002"
+            debt_decimals = 6
+            buy_offset_bps = 200
+            buy_order_size_debt = "5000000000"
+            ttl_secs = 60
+            refresh_threshold_bps = 0
+            [vault]
+            address = "0x00000000000000000000000000000000000000aa"
+        "#,
+        )
+        .unwrap();
+        assert!(!cfg.modules_enabled);
+        let dir =
+            std::env::temp_dir().join(format!("stitch-modules-off-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(modules_runtime(&cfg, Some(&dir), "http://feed")
+            .unwrap()
+            .is_none());
+
+        let vault: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let saved = crate::modules::runtime::PendingFloorRecord {
+            version: crate::modules::VERSION,
+            target: U256::from(100u64),
+            lowers: true,
+            chain_id: 8453,
+            vault,
+            sender: Address::repeat_byte(0xbb),
+            nonce: 5,
+            signed_tx: None,
+        };
+        let mut saving = cfg.modules.clone();
+        saving.liquidity.enabled = true;
+        crate::modules::runtime::Runtime::new(saving, &dir, "http://feed")
+            .unwrap()
+            .save_pending_floor(Some(saved))
+            .unwrap();
+        let settling = modules_runtime(&cfg, Some(&dir), "http://feed")
+            .unwrap()
+            .expect("a settling-only runtime");
+        assert_eq!(settling.config.mode, crate::modules::Mode::Shadow);
+        let c = &settling.config;
+        assert!(
+            !(c.inventory.enabled
+                || c.spreads.enabled
+                || c.rebalance.enabled
+                || c.liquidity.enabled),
+            "nothing but the cap"
+        );
+        assert_eq!(
+            settling.liquidity_quote_cap(u64::MAX - 1),
+            Some(U256::from(100u64))
+        );
+        assert!(settling.saved_pending_floor().is_some());
+
+        // Pointed at another vault, or another chain, the bot refuses to
+        // start rather than settle the change against the wrong one.
+        for (chain_id, other) in [(8453, Address::repeat_byte(0xcc)), (1, vault)] {
+            let mut moved = cfg.clone();
+            moved.chain_id = chain_id;
+            moved.vault.as_mut().unwrap().address = other.to_string();
+            let err = modules_runtime(&moved, Some(&dir), "http://feed")
+                .err()
+                .expect("refused");
+            assert!(err.to_string().contains("may still land"), "{err:#}");
+        }
+    }
     use crate::config::RfqCapacity;
     use crate::pricing::quote::Spread;
     use crate::signer::{recover_address, LocalSigner};
@@ -2956,6 +3137,8 @@ mod tests {
                 module_views.and_then(|(s, _)| word(s))
             } else if data == encode_free_corridor() {
                 module_views.and_then(|(_, c)| word(c))
+            } else if data == encode_min_liquid_settlement() {
+                module_views.and_then(|_| word(400))
             } else {
                 // The two Permit2 allowances.
                 word(u64::MAX)
@@ -2978,12 +3161,12 @@ mod tests {
                                 <(Vec<Call3>,)>::abi_decode_params_validate(&data[4..]).unwrap();
                             match calls.len() {
                                 3 => {}
-                                10 | 12 => {
+                                10 | 13 => {
                                     quote_count.fetch_add(1, Ordering::SeqCst);
                                 }
                                 count => panic!("unexpected inventory batch of {count} calls"),
                             }
-                            if calls.len() == 12 {
+                            if calls.len() == 13 {
                                 module_count.fetch_add(1, Ordering::SeqCst);
                             }
                             let results: Vec<Result3> = calls
@@ -3155,8 +3338,16 @@ mod tests {
             .expect("module balances published from the inventory batch");
         assert_eq!(balances.settlement, U256::from(700));
         assert_eq!(balances.corridor, U256::from(800));
-        // No 2-call module batch: `vault_rpc` panics on any batch size other
-        // than assets (3) and inventory (10 or 12).
+        assert_eq!(
+            balances.liquid,
+            Some(crate::modules::runtime::LiquidReading {
+                // `liquidSettlement()` is also a quote view; the mock answers 10.
+                liquid: U256::from(10),
+                floor: U256::from(400),
+            })
+        );
+        // No separate module batch: `vault_rpc` panics on any batch size
+        // other than assets (3) and inventory (10, or 14 with module views).
         assert_eq!(
             quote_reads.load(Ordering::SeqCst),
             module_reads.load(Ordering::SeqCst),
@@ -5383,6 +5574,7 @@ mod tests {
         *runtime.balances.write().unwrap() = Some(Balances {
             settlement: U256::from(settlement),
             corridor: U256::from(corridor),
+            liquid: None,
             at: unix_now(),
         });
         engine.modules = Some(runtime);
@@ -5402,6 +5594,115 @@ mod tests {
         });
         dir
     }
+    /// While the liquidity schedule lowers the floor, quotes that pay the
+    /// vault's settlement stay inside the cap, and the engine reports what is
+    /// committed under it so the loop knows when the lower is safe.
+    #[tokio::test]
+    async fn a_liquidity_cap_bounds_settlement_quotes_and_is_reported_with_commitments() {
+        use crate::modules::Mode;
+        let mut engine = test_engine();
+        let _dir = enable_modules(&mut engine, Mode::Live, 4_000_000_000, 6_000_000_000);
+        engine.configured = engine.books.clone();
+        {
+            let modules = engine.modules.as_mut().unwrap();
+            modules.config.inventory.enabled = false;
+            modules.config.liquidity.enabled = true;
+        }
+        let prices = fresh_prices();
+        let now = unix_now();
+        let modules = engine.modules.clone().unwrap();
+        // A fresh read with liquid covering the floor: no shortfall cap.
+        modules.balances.write().unwrap().as_mut().unwrap().liquid =
+            Some(crate::modules::runtime::LiquidReading {
+                liquid: U256::ZERO,
+                floor: U256::ZERO,
+            });
+
+        // No cap: the vault quotes, and the reservation pays settlement.
+        let reply = engine
+            .respond(exact_input_request("rfq_uncapped"), &prices)
+            .await;
+        let MakerFrame::QuoteResponse(first) = reply else {
+            panic!("expected a firm quote, got {reply:?}");
+        };
+        let paid: U256 = first.buy_amount.parse::<U256>().unwrap();
+        engine.publish_liquidity_commitments(now);
+        let measured = modules.liquidity_commitments(now, 10).unwrap();
+        assert!(measured.committed >= paid);
+        assert_eq!(measured.cap_in_effect, None);
+
+        // A cap at what is already promised leaves nothing for a new quote.
+        modules.set_liquidity_cap(Some(measured.committed), now + 60);
+        let reply = engine
+            .respond(exact_input_request("rfq_capped"), &prices)
+            .await;
+        let MakerFrame::QuoteReject(rejected) = reply else {
+            panic!("expected the cap to refuse settlement, got {reply:?}");
+        };
+        assert_eq!(rejected.reason, RejectReason::Inventory);
+        engine.publish_liquidity_commitments(now);
+        assert_eq!(
+            modules
+                .liquidity_commitments(now, 10)
+                .unwrap()
+                .cap_in_effect,
+            Some(measured.committed)
+        );
+
+        // A lapsed cap stops applying.
+        modules.set_liquidity_cap(Some(U256::ZERO), now.saturating_sub(1));
+        let reply = engine
+            .respond(exact_input_request("rfq_lapsed"), &prices)
+            .await;
+        assert!(matches!(reply, MakerFrame::QuoteResponse(_)), "{reply:?}");
+    }
+
+    /// A cap that tightens while a remote signer works (a fill drained
+    /// liquid, or the loop capped for a lower) withholds the signature.
+    #[tokio::test]
+    async fn a_cap_that_tightens_while_signing_withholds_the_quote() {
+        use crate::modules::Mode;
+        let mut engine = test_engine();
+        let _dir = enable_modules(&mut engine, Mode::Live, 4_000_000_000, 6_000_000_000);
+        engine.configured = engine.books.clone();
+        {
+            let modules = engine.modules.as_mut().unwrap();
+            modules.config.inventory.enabled = false;
+            modules.config.liquidity.enabled = true;
+        }
+        let modules = engine.modules.clone().unwrap();
+        modules.balances.write().unwrap().as_mut().unwrap().liquid =
+            Some(crate::modules::runtime::LiquidReading {
+                liquid: U256::ZERO,
+                floor: U256::ZERO,
+            });
+        let prices = fresh_prices();
+        let custody = Arc::new(GatedSigner {
+            inner: engine.signer.clone(),
+            started: tokio::sync::Notify::new(),
+            resume: tokio::sync::Semaphore::new(0),
+        });
+        engine.signer = custody.clone();
+        let tighten = async {
+            custody.started.notified().await;
+            modules.set_liquidity_cap(Some(U256::ZERO), unix_now() + 60);
+            custody.resume.add_permits(1);
+        };
+        let (reply, ()) = tokio::join!(
+            engine.respond(exact_input_request("rfq_tightened"), &prices),
+            tighten
+        );
+        let MakerFrame::QuoteReject(rejected) = reply else {
+            panic!("expected the tightened cap to withhold the quote, got {reply:?}");
+        };
+        assert_eq!(rejected.reason, RejectReason::Inventory);
+        assert_eq!(
+            engine.reservations.len(),
+            0,
+            "a withheld signature reserves nothing"
+        );
+    }
+
     #[tokio::test]
     async fn manual_sale_requires_local_authorization_and_survives_restart() {
         use crate::modules::{manual, Mode};

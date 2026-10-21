@@ -61,6 +61,59 @@ order_lifetime_secs = 60
 
 Numbers are starter configuration, not recommendations for a particular currency. Measure feed quality, market depth and trading costs before selecting live parameters.
 
+## Liquidity schedule
+
+A vault with a yield adapter stakes all liquid settlement above its floor (`minLiquidSettlement`) in Aave. The venue only lets a vault order into a multi-maker bundle when it fits under that floor, because anything above it can be staked again between admission and broadcast. Settlement in Aave is still quotable, but only for single-order fills through the VaultOrderExecutor, which pulls it back first. So the floor decides how much of the vault can take part in bundles and how much earns yield.
+
+The liquidity schedule moves the floor on a UTC clock. During market hours it keeps one share of free settlement liquid, outside them another. Free settlement is liquid plus the staked position, net of anything reserved for emergency redeemers.
+
+```toml
+[modules.liquidity]
+enabled = true
+open_utc = "08:00"        # UTC. A close before the open runs past midnight.
+close_utc = "17:00"
+days = ["mon", "tue", "wed", "thu", "fri"]   # UTC day each window opens on
+market_floor_bps = 5000   # keep 50% of free settlement liquid in market hours
+off_hours_floor_bps = 0   # stake everything outside them
+tolerance_bps = 500       # leave gaps under 5% of free settlement alone
+
+[modules.liquidity.authority]
+roles_modifier = "0xYourRolesModifier"
+role_key = "0x…"          # bytes32
+```
+
+Every 15 seconds the bot reads the vault and takes one step:
+
+- **Raise.** The scheduled floor is above the current one: call `setMinLiquidSettlement` with the new value.
+- **Recall.** The floor is right but fills have spent liquid below it: call `prepareSettlement` so the vault pulls the gap back from Aave. Anyone may call it.
+
+The venue admits bundled orders up to the floor, but only liquid settlement can pay them. So whenever liquid sits short of the floor by any amount, after fills or right after a raise at the open, the bot caps its settlement-paying quotes at what is actually liquid. The check runs on every quote against the vault balances the bot reads every couple of seconds, so a fill that drains liquid caps the next quote without waiting for the 15-second schedule tick. A balance read older than three seconds, or none yet, caps them at zero, since it can't show that a fill hasn't just drained liquid. The tolerance only decides when a shortfall is worth a recall transaction; it never lifts the cap. That briefly narrows quotes, single-order fills included. A live schedule also starts with settlement-paying quotes capped at zero, and only a successful vault read sets or lifts a cap. While reads fail, the last cap stays in force with no expiry.
+- **Lower.** The scheduled floor is below the current one. This is the risky direction: a bundled order admitted against the old floor needs that settlement liquid at broadcast, and once the floor drops, any `allocateIdle` (the executor calls one after every fill) can stake it. So the bot first caps its own quotes so live settlement commitments can never exceed the new floor, waits until what is already live fits under it, and only then lowers. The cap stays at the floor the lower was signed with, even if a deposit raises the schedule's target meanwhile, until the chain settles it. At close this can narrow settlement-paying quotes for about one order lifetime.
+
+Every floor change, raise or lower, is tracked the same way until the account nonce it was signed at gets used, whatever the floor reads in the meantime: another admin transaction could have moved it, and the change could still execute after. Until then nothing else is sent. That's what stops two changes from both landing, for example a big raise that lands late after a smaller one, which would drop the floor under quotes admitted against the higher one. The change is saved to `liquidity-pending.json` with its chain, vault, signing account and nonce once it's signed and before its first broadcast (no save, no send), so a restart comes back with the slot held, a lower's cap already in force, and settles it the same way. The save includes the signed transaction, and a restart with the schedule live and the same signer broadcasts those same bytes once, in case the run stopped between saving and broadcasting; identical bytes can complete it but can't send a second one. A restart while a custody or MPC signer is still approving leaves nothing saved: nothing was broadcast, and the signature has no one to send it, so the schedule just plans again. A raise that may still land caps settlement-paying quotes at what's liquid while that's short of its target, checked on every balance read and in any mode, because the venue admits bundles up to the target the moment it lands. A bot pointed at another vault or chain while one is pending refuses to start, because that nonce can only be settled where it was signed. Point it back, or delete the file once you've checked the nonce was used. A change from a signer the bot no longer uses waits for that account's nonce.
+
+Apart from that one broadcast of the identical bytes after a restart, the bot never resends or cancels a floor change. While it waits up to ten minutes for a receipt, the wallet re-sends it at a higher fee. After that the change stays pending, with the slot held and a lower's cap in force, until its nonce is used. One the node dropped isn't treated as gone, since peers may still hold it. If it's stuck, replace that nonce from the signing account; the Modules tab shows which nonce it waits on and the cap it holds. Turning the schedule off keeps a lower's cap and settles the change before the loop stops. Turning modules off entirely does too: a saved change starts a settling-only modules runtime (Preview, every module off) that does nothing else, and is gone after the next restart once the change settles.
+
+Gaps smaller than the tolerance are ignored, so ordinary NAV drift and small fills do not each cost a transaction. Nothing happens while the vault is paused, has a closed redemption epoch, or has no yield adapter. At most one transaction is in flight; every step is re-derived from a fresh read, so a recall that lands late costs gas and nothing else. Every transaction from the bot's key, including redeem-epoch closes, picks its nonce under one process-wide lock, so two senders never sign at the same nonce. The Textile keeper keeps staking what sits above the floor every five minutes, whoever set it, so the schedule never calls `allocateIdle` itself.
+
+### Authority
+
+`setMinLiquidSettlement` is operator-admin only. Don't make the bot key the operator admin: that role can also rotate the strategy signer, guardian and fee recipient, and transfer itself away. Instead, the operator-admin Safe enables a [Zodiac Roles Modifier](https://docs.roles.gnosisguild.org/) and creates a role that:
+
+- has this bot's signer as its only member,
+- allows exactly one call: `setMinLiquidSettlement(uint256)` on this vault, plain call, no value,
+- optionally bounds the argument, for example a minimum floor the bot can never go under.
+
+The bot calls `execTransactionWithRole` on the modifier with `shouldRevert = true`, so a refused call fails gas estimation and nothing is broadcast. The modifier's `target()` has to be the vault's operator admin; the panel shows both and the bot refuses floor changes when they differ. Recalls go straight to the vault and need no role.
+
+The bot's signer pays gas for both. It has to be able to sign transactions: local keys, Turnkey and MPCVault can; Fireblocks needs raw signing, which we don't recommend turning on just for this. Live mode with the schedule enabled refuses to start on a signer that can't. Preview works with any signer: it reads the vault and records what it would do, sends nothing and caps nothing.
+
+Operators whose operator admin is a custody account rather than a Safe can't use this yet. The bot would need to drive the custody API for a second account, and that isn't built.
+
+### Limits
+
+The quote cap and the commitments it measures are this bot's own. Keep one bot per vault when the schedule is on, the same rule as every other module. The schedule uses UTC; it does not follow daylight saving or market holidays. A missed raise (bot down at the open) only means smaller bundles until it runs; a missed lower means a night without yield. Neither moves funds.
+
 ## Live visibility
 
 Overview shows current holdings, buy/sell margins and saved module switches. Expand **Details & recent activity → Dynamic spreads · live monitor** for the running mode, dynamic addition on each enabled side, observed high/low range, number of source samples and warmup progress. The breakdown separates base spreads, inventory adjustments and the final module quote policy. Buy and sell additions are derived from the recorded policy, including side limits, rather than recalculated from today's settings. The chart and recent changes show both sides over the last 200 recorded evaluations; they are quote calculations, not executed trades. A paused side is shown as off, not as a zero addition, and old observations without a breakdown leave gaps.
@@ -131,11 +184,11 @@ After checking the response against current exposure and prices, Stitch construc
 
 The dealer must obtain the independent risk signature through its authorized Warp integration, assemble the vault envelope, and fill through the existing reactor or VaultOrderExecutor. It supplies settlement tokens, including the reactor's applicable fee, and pays execution gas. Stitch neither exposes Warp credentials nor bypasses the risk signature. An HTTP 2xx means receipt only. Any timeout or failure keeps the reservation until deadline plus clock skew; the signature may already have been delivered. Stitch does not retry submission or label receipt as a confirmed fill. Fresh on-chain balances determine later exposure.
 
-The reservation file and `modules-attempt.json` must survive restarts. An unreadable attempt file refuses module startup; unavailable reservation persistence withholds new module-enabled orders. Keep these files with the bot's config volume. Both local and custody/MPC strategy signers use the existing typed-signature interface. The dealer broadcasts, so the module does not manage operator transaction nonces or assume immediate custody approval; signatures arriving too late are withheld.
+The reservation file, `modules-attempt.json` and `liquidity-pending.json` must survive restarts. An unreadable attempt or pending-floor file refuses module startup; unavailable reservation persistence withholds new module-enabled orders. Keep these files with the bot's config volume. Both local and custody/MPC strategy signers use the existing typed-signature interface. The dealer broadcasts, so the module does not manage operator transaction nonces or assume immediate custody approval; signatures arriving too late are withheld.
 
 ## Implementation boundary
 
-`src/modules` owns versioned, plain-input strategy evaluation, configuration and observation. `src/rfq/modules.rs` translates decisions into the existing quote and reservation machinery. Strategies do not receive a signer, RPC client, file handle or network client. The host owns execution and validates permissions, inventory, pricing and expiry.
+`src/modules` owns versioned, plain-input strategy evaluation, configuration and observation. `src/rfq/modules.rs` translates decisions into the existing quote and reservation machinery. `src/rfq/liquidity.rs` runs the liquidity schedule: it reads the vault, applies the quote cap and sends the floor and recall transactions from the bot's wallet. `src/modules/liquidity.rs` only decides the step. Strategies do not receive a signer, RPC client, file handle or network client. The host owns execution and validates permissions, inventory, pricing and expiry.
 
 Economic vault balances (`freeSettlement`, `freeCorridor`) are read every 2 seconds in the same Multicall3 batch as quote inventory, so modules cost no request of their own, Shadow mode included. A reverting module view only leaves the module balances missing; quote inventory still refreshes. On a chain without Multicall3 they refresh in a separate process-scoped loop with at most one request in flight instead, so a slow module read cannot delay ordinary quote-inventory refreshes. Missing or stale economic balances block live rebalancing and enabled quote strategies. With only rebalancing enabled, customer quotes keep their existing pricing and ordinary inventory checks.
 

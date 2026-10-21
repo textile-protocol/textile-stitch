@@ -116,11 +116,15 @@ pub fn is_inflight_limit_error(err: &str) -> bool {
 #[error("{message}")]
 struct TransactionMayStillLand {
     message: String,
+    /// The account nonce every attempt was signed at. Once the chain's latest
+    /// nonce passes it, this transaction has either landed or never will.
+    nonce: u64,
 }
 
-fn may_still_land_error(err: anyhow::Error) -> anyhow::Error {
+fn may_still_land_error(err: anyhow::Error, nonce: u64) -> anyhow::Error {
     TransactionMayStillLand {
         message: format!("{err:#}"),
+        nonce,
     }
     .into()
 }
@@ -128,8 +132,15 @@ fn may_still_land_error(err: anyhow::Error) -> anyhow::Error {
 /// Whether a failed send crossed the broadcast boundary and therefore must
 /// not be retried merely because no receipt was observed.
 pub fn transaction_may_still_land(err: &anyhow::Error) -> bool {
+    unresolved_nonce(err).is_some()
+}
+
+/// The nonce of a send that may still land, for reconciling it against the
+/// chain later. `None` for a send that definitely did not land.
+pub fn unresolved_nonce(err: &anyhow::Error) -> Option<u64> {
     err.chain()
-        .any(|cause| cause.downcast_ref::<TransactionMayStillLand>().is_some())
+        .find_map(|cause| cause.downcast_ref::<TransactionMayStillLand>())
+        .map(|e| e.nonce)
 }
 
 /// The operator-facing explanation for geth's in-flight limit. `stuck_nonce` is
@@ -348,6 +359,29 @@ impl SendRawFailure {
     }
 }
 
+type NonceLock = std::sync::Arc<tokio::sync::Mutex<()>>;
+
+/// The lock every [`Wallet`] for `address` on `chain_id` takes to pick a nonce
+/// and broadcast under it, shared across the process. Without it two senders
+/// on one key (the liquidity schedule, a redeem-epoch close) can both read the
+/// same pending nonce, then sign different calldata at it, and one replaces
+/// the other. Held until the first broadcast: once a transaction is in the
+/// pool the pending count moves past it, and fee bumps reuse their own nonce.
+/// A signer that waits for approval holds it while it waits, which is right:
+/// no other transaction from that account can get a nonce until it signs.
+fn nonce_lock(chain_id: u64, address: Address) -> NonceLock {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u64, Address), NonceLock>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((chain_id, address))
+        .or_default()
+        .clone()
+}
+
 /// A signing wallet over an [`Rpc`]: turns calldata into landed transactions.
 /// The signer is shared (`Arc`) with the green-leg poster.
 pub struct Wallet {
@@ -379,6 +413,10 @@ impl Wallet {
 
     pub fn address(&self) -> Address {
         self.address
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     pub fn rpc(&self) -> &Rpc {
@@ -466,6 +504,19 @@ impl Wallet {
         value: U256,
         plan: &TxPlan,
     ) -> Result<B256, SendPlanFailure> {
+        let raw = self.sign_plan(to, data, value, plan).await?;
+        self.broadcast(&raw, plan.nonce).await
+    }
+
+    /// One signed attempt, as raw bytes. Every signer signs a digest and
+    /// hands it back, so nothing reaches the network until [`Self::broadcast`].
+    async fn sign_plan(
+        &self,
+        to: Address,
+        data: Bytes,
+        value: U256,
+        plan: &TxPlan,
+    ) -> Result<Bytes, SendPlanFailure> {
         let tx = Eip1559Tx {
             chain_id: self.chain_id,
             nonce: plan.nonce,
@@ -476,17 +527,21 @@ impl Wallet {
             value,
             data,
         };
-        let signed = sign_tx(self.signer.as_ref(), &tx)
+        sign_tx(self.signer.as_ref(), &tx)
             .await
-            .map_err(SendPlanFailure::SafeToRetry)?;
-        match self.rpc.send_raw_tracked(&signed.raw).await {
+            .map(|signed| signed.raw)
+            .map_err(SendPlanFailure::SafeToRetry)
+    }
+
+    async fn broadcast(&self, raw: &Bytes, nonce: u64) -> Result<B256, SendPlanFailure> {
+        match self.rpc.send_raw_tracked(raw).await {
             Ok(hash) => Ok(hash),
             Err(SendRawFailure::Rejected(err)) => Err(SendPlanFailure::SafeToRetry(
                 self.explain_send_error(err).await,
             )),
             // A transport failure can arrive after the node accepted the raw
             // transaction. Keep the claim until chain state reconciles it.
-            Err(SendRawFailure::Unknown(err)) => Err(SendPlanFailure::BroadcastUnknown(err)),
+            Err(SendRawFailure::Unknown(err)) => Err(SendPlanFailure::BroadcastUnknown(err, nonce)),
         }
     }
 
@@ -521,6 +576,8 @@ impl Wallet {
 
     /// Sign + broadcast a contract call; returns the transaction hash.
     pub async fn send(&self, to: Address, data: Bytes, value: U256) -> anyhow::Result<B256> {
+        let lock = nonce_lock(self.chain_id, self.address);
+        let _nonce = lock.lock().await;
         let plan = self.plan_tx(to, &data, value).await?;
         self.send_plan(to, data, value, &plan).await
     }
@@ -536,11 +593,38 @@ impl Wallet {
         value: U256,
         timeout: Duration,
     ) -> anyhow::Result<Value> {
+        self.send_and_wait_reserving(to, data, value, timeout, |_, _| Ok(()))
+            .await
+    }
+
+    /// [`Self::send_and_wait`], calling `reserve` with the nonce and the signed
+    /// transaction once it is signed and before its first broadcast: the first
+    /// moment it can reach the chain. A caller that must track it across
+    /// restarts saves them there, so a restart can broadcast the same bytes if
+    /// this run stops first; an error from `reserve` stops the send before
+    /// anything is broadcast. A restart while the signer still waits for
+    /// approval has broadcast nothing, so it leaves nothing to track.
+    pub async fn send_and_wait_reserving(
+        &self,
+        to: Address,
+        data: Bytes,
+        value: U256,
+        timeout: Duration,
+        reserve: impl FnOnce(u64, &Bytes) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Value> {
+        let lock = nonce_lock(self.chain_id, self.address);
+        let nonce_guard = lock.lock().await;
         let plan = self.plan_tx(to, &data, value).await?;
-        let hash = self
-            .send_plan_tracked(to, data.clone(), value, &plan)
+        let raw = self
+            .sign_plan(to, data.clone(), value, &plan)
             .await
             .map_err(SendPlanFailure::into_error)?;
+        reserve(plan.nonce, &raw)?;
+        let hash = self
+            .broadcast(&raw, plan.nonce)
+            .await
+            .map_err(SendPlanFailure::into_error)?;
+        drop(nonce_guard);
         // One line that answers "why is this not landing?" without a block
         // explorer: a stuck transaction is almost always a nonce or a fee.
         tracing::info!(
@@ -558,7 +642,7 @@ impl Wallet {
                     .rpc
                     .receipt(*hash)
                     .await
-                    .map_err(may_still_land_error)?
+                    .map_err(|e| may_still_land_error(e, plan.nonce))?
                 {
                     let status = r.get("status").and_then(Value::as_str).unwrap_or("0x1");
                     if status == "0x0" {
@@ -570,12 +654,15 @@ impl Wallet {
             let now = std::time::Instant::now();
             if now >= deadline {
                 let last = hashes.last().copied().unwrap_or_default();
-                return Err(may_still_land_error(anyhow::anyhow!(
-                    "tx {last} (nonce {}) not mined within timeout, after re-sending it at a \
+                return Err(may_still_land_error(
+                    anyhow::anyhow!(
+                        "tx {last} (nonce {}) not mined within timeout, after re-sending it at a \
                      higher fee. It may still land — re-run to check before sending anything \
                      else, and if it is still pending, replace that nonce from your wallet",
-                    plan.nonce
-                )));
+                        plan.nonce
+                    ),
+                    plan.nonce,
+                ));
             }
             if now >= next_bump {
                 match plan.bumped(self.gas_caps) {
@@ -614,14 +701,16 @@ impl Wallet {
 
 enum SendPlanFailure {
     SafeToRetry(anyhow::Error),
-    BroadcastUnknown(anyhow::Error),
+    /// The transport failed after the node may have accepted the send, at
+    /// this nonce.
+    BroadcastUnknown(anyhow::Error, u64),
 }
 
 impl SendPlanFailure {
     fn into_error(self) -> anyhow::Error {
         match self {
             Self::SafeToRetry(err) => err,
-            Self::BroadcastUnknown(err) => may_still_land_error(err),
+            Self::BroadcastUnknown(err, nonce) => may_still_land_error(err, nonce),
         }
     }
 }
@@ -684,17 +773,38 @@ mod tests {
         assert_eq!(parse_quantity(&json!("0x")).unwrap(), U256::ZERO);
     }
 
+    #[tokio::test]
+    async fn wallets_on_one_account_share_a_nonce_lock() {
+        let a = address!("00000000000000000000000000000000000000a1");
+        let b = address!("00000000000000000000000000000000000000b2");
+        let first = nonce_lock(8453, a);
+        assert!(Arc::ptr_eq(&first, &nonce_lock(8453, a)));
+        assert!(!Arc::ptr_eq(&first, &nonce_lock(8453, b)));
+        assert!(!Arc::ptr_eq(&first, &nonce_lock(1, a)));
+        let held = first.lock().await;
+        assert!(
+            nonce_lock(8453, a).try_lock().is_err(),
+            "a second wallet waits"
+        );
+        drop(held);
+        assert!(nonce_lock(8453, a).try_lock().is_ok());
+    }
+
     #[test]
     fn only_post_broadcast_errors_are_marked_as_may_still_land() {
         let before = SendPlanFailure::SafeToRetry(anyhow::anyhow!("signing failed"));
         assert!(!transaction_may_still_land(&before.into_error()));
 
         let uncertain =
-            SendPlanFailure::BroadcastUnknown(anyhow::anyhow!("send response was lost"));
-        assert!(transaction_may_still_land(&uncertain.into_error()));
+            SendPlanFailure::BroadcastUnknown(anyhow::anyhow!("send response was lost"), 4);
+        let uncertain = uncertain.into_error();
+        assert!(transaction_may_still_land(&uncertain));
+        assert_eq!(unresolved_nonce(&uncertain), Some(4));
 
-        let receipt_timeout = may_still_land_error(anyhow::anyhow!("receipt timed out"));
+        let receipt_timeout = may_still_land_error(anyhow::anyhow!("receipt timed out"), 9);
         assert!(transaction_may_still_land(&receipt_timeout));
+        let wrapped = receipt_timeout.context("liquidity schedule");
+        assert_eq!(unresolved_nonce(&wrapped), Some(9));
     }
 
     #[tokio::test]
@@ -946,6 +1056,84 @@ mod tests {
         assert_eq!(
             reserve,
             plan.gas_limit * plan.bumped(GasCaps::for_chain(1)).unwrap().max_fee
+        );
+    }
+
+    /// `reserve` runs after signing and before the first broadcast: a signer
+    /// that never answers (a custody approval a restart cut short) reserves
+    /// nothing, and a refused reserve broadcasts nothing.
+    #[tokio::test]
+    async fn reserve_runs_between_signing_and_the_first_broadcast() {
+        use axum::{routing::post, Json, Router};
+        struct Refusing;
+        #[async_trait::async_trait]
+        impl crate::signer::Signer for Refusing {
+            async fn sign_digest(&self, _: B256) -> anyhow::Result<[u8; 65]> {
+                anyhow::bail!("approval never came")
+            }
+            fn address(&self) -> Address {
+                address!("70997970C51812dc3A010C7d01b50e0d17dc79C8")
+            }
+        }
+        let methods = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = methods.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let method = req["method"].as_str().unwrap_or_default().to_owned();
+                    seen.lock().unwrap().push(method.clone());
+                    let result = match method.as_str() {
+                        "eth_getBlockByNumber" => json!({ "baseFeePerGas": "0x1" }),
+                        "eth_estimateGas" => json!("0x5208"),
+                        _ => json!("0x1"),
+                    };
+                    Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let send = |wallet: Wallet, refuse: bool| async move {
+            let reserved = std::sync::atomic::AtomicBool::new(false);
+            let sent = wallet
+                .send_and_wait_reserving(
+                    to(),
+                    Bytes::new(),
+                    U256::ZERO,
+                    Duration::ZERO,
+                    |_, signed| {
+                        // Handed the signed transaction itself, to save.
+                        assert_eq!(signed.first(), Some(&0x02));
+                        reserved.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if refuse {
+                            anyhow::bail!("could not save")
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+            (sent.is_err(), reserved.into_inner())
+        };
+
+        assert_eq!(
+            send(Wallet::new(url.clone(), Arc::new(Refusing), 1), false).await,
+            (true, false),
+            "nothing signed, nothing reserved"
+        );
+        assert_eq!(
+            send(Wallet::new(url, local_signer(), 1), true).await,
+            (true, true)
+        );
+        assert!(
+            !methods
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m == "eth_sendRawTransaction"),
+            "nothing broadcast"
         );
     }
 

@@ -22,6 +22,7 @@ pub struct ModulesConfig {
     pub inventory: InventoryConfig,
     pub spreads: SpreadsConfig,
     pub rebalance: RebalanceConfig,
+    pub liquidity: LiquidityConfig,
 }
 impl Default for ModulesConfig {
     fn default() -> Self {
@@ -30,6 +31,7 @@ impl Default for ModulesConfig {
             inventory: InventoryConfig::default(),
             spreads: SpreadsConfig::default(),
             rebalance: RebalanceConfig::default(),
+            liquidity: LiquidityConfig::default(),
         }
     }
 }
@@ -121,6 +123,119 @@ pub struct DealerConfig {
     /// Optional bearer credential; the secret itself is never in TOML or the panel.
     pub api_key_env: Option<String>,
 }
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Weekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+impl Weekday {
+    /// Days after Monday, the start of a schedule week.
+    pub fn index(self) -> u64 {
+        self as u64
+    }
+}
+/// Moves the vault's `minLiquidSettlement` on a UTC market-hours schedule.
+///
+/// Only settlement kept liquid up to that floor can back a bundled fill; the
+/// rest earns yield in the adapter and is reachable only by a single-order fill
+/// through the VaultOrderExecutor. Both floors are shares of free settlement.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LiquidityConfig {
+    pub enabled: bool,
+    /// Start of market hours, `HH:MM` UTC.
+    pub open_utc: String,
+    /// End of market hours, `HH:MM` UTC. Earlier than `open_utc` runs past midnight.
+    pub close_utc: String,
+    /// UTC weekdays a market-hours window opens on.
+    pub days: Vec<Weekday>,
+    pub market_floor_bps: u32,
+    pub off_hours_floor_bps: u32,
+    /// Gaps under this share of free settlement are left alone, so NAV drift
+    /// and small fills do not each cost a transaction.
+    pub tolerance_bps: u32,
+    /// How the bot gets operator-admin authority over the floor. Required for Live.
+    pub authority: Option<RolesAuthority>,
+}
+impl Default for LiquidityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            open_utc: "08:00".into(),
+            close_utc: "17:00".into(),
+            days: vec![
+                Weekday::Mon,
+                Weekday::Tue,
+                Weekday::Wed,
+                Weekday::Thu,
+                Weekday::Fri,
+            ],
+            market_floor_bps: 5000,
+            off_hours_floor_bps: 0,
+            tolerance_bps: 500,
+            authority: None,
+        }
+    }
+}
+impl LiquidityConfig {
+    /// Minutes after midnight UTC for `open_utc` and `close_utc`.
+    pub fn window_minutes(&self) -> Result<(u64, u64)> {
+        Ok((parse_hhmm(&self.open_utc)?, parse_hhmm(&self.close_utc)?))
+    }
+}
+/// A Zodiac Roles Modifier (v2) enabled on the operator-admin Safe. The bot's
+/// signer holds `role_key`, scoped by the operator to `setMinLiquidSettlement`
+/// on this vault, so the bot can move the floor and nothing else.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RolesAuthority {
+    pub roles_modifier: String,
+    /// `bytes32` role key, `0x` + 64 hex.
+    pub role_key: String,
+}
+impl RolesAuthority {
+    pub fn modifier(&self) -> Result<Address> {
+        let address = self
+            .roles_modifier
+            .starts_with("0x")
+            .then(|| self.roles_modifier.parse::<Address>().ok())
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("liquidity roles_modifier must be a 0x address"))?;
+        ensure!(
+            !address.is_zero(),
+            "liquidity roles_modifier cannot be zero"
+        );
+        Ok(address)
+    }
+    pub fn key(&self) -> Result<alloy_primitives::B256> {
+        let raw = self.role_key.strip_prefix("0x").unwrap_or_default();
+        ensure!(
+            raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()),
+            "liquidity role_key must be 0x followed by 64 hex characters"
+        );
+        let key = self
+            .role_key
+            .parse::<alloy_primitives::B256>()
+            .map_err(|_| anyhow::anyhow!("liquidity role_key is not bytes32"))?;
+        ensure!(!key.is_zero(), "liquidity role_key cannot be zero");
+        Ok(key)
+    }
+}
+fn parse_hhmm(raw: &str) -> Result<u64> {
+    let parsed = raw
+        .split_once(':')
+        .filter(|(h, m)| h.len() == 2 && m.len() == 2)
+        .and_then(|(h, m)| Some((h.parse::<u64>().ok()?, m.parse::<u64>().ok()?)))
+        .filter(|(h, m)| *h < 24 && *m < 60);
+    let (h, m) = parsed.ok_or_else(|| anyhow::anyhow!("liquidity times must be HH:MM (UTC)"))?;
+    Ok(h * 60 + m)
+}
 impl ModulesConfig {
     pub fn validate(&self) -> Result<()> {
         let i = &self.inventory;
@@ -159,6 +274,7 @@ impl ModulesConfig {
                 && r.cooldown_secs >= r.order_lifetime_secs + 30,
             "rebalance cooldown must cover order lifetime plus 30s; lifetime must be 10..300s"
         );
+        self.validate_liquidity()?;
         if let Some(d) = &r.dealer {
             crate::config::assert_feed_url(&d.url, "modules.rebalance.dealer.url")?;
             let url = url::Url::parse(&d.url)?;
@@ -181,5 +297,186 @@ impl ModulesConfig {
             }
         }
         Ok(())
+    }
+}
+impl ModulesConfig {
+    fn validate_liquidity(&self) -> Result<()> {
+        let l = &self.liquidity;
+        let (open, close) = l.window_minutes()?;
+        ensure!(
+            open != close,
+            "liquidity open_utc and close_utc must differ"
+        );
+        let mut days = l.days.clone();
+        days.sort();
+        days.dedup();
+        ensure!(
+            !l.days.is_empty() && days.len() == l.days.len(),
+            "liquidity days must list at least one weekday, each once"
+        );
+        ensure!(
+            l.market_floor_bps <= 10_000 && l.off_hours_floor_bps <= l.market_floor_bps,
+            "liquidity floors must satisfy off_hours_floor_bps <= market_floor_bps <= 10000"
+        );
+        ensure!(
+            (1..=5000).contains(&l.tolerance_bps),
+            "liquidity tolerance_bps must be 1..5000"
+        );
+        if let Some(authority) = &l.authority {
+            authority.modifier()?;
+            authority.key()?;
+        }
+        ensure!(
+            !(l.enabled && self.mode == Mode::Live && l.authority.is_none()),
+            "liquidity schedule in Live mode needs [modules.liquidity.authority]: the Roles \
+             modifier and role key that let this bot change the floor"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(liquidity: LiquidityConfig) -> ModulesConfig {
+        ModulesConfig {
+            liquidity,
+            ..ModulesConfig::default()
+        }
+    }
+
+    fn authority() -> Option<RolesAuthority> {
+        Some(RolesAuthority {
+            roles_modifier: "0x00000000000000000000000000000000000000cc".into(),
+            role_key: format!("0x{}", "11".repeat(32)),
+        })
+    }
+
+    #[test]
+    fn the_default_schedule_validates() {
+        ModulesConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn existing_configs_without_a_liquidity_table_still_parse() {
+        let parsed: ModulesConfig = toml::from_str("mode = \"live\"\n").unwrap();
+        assert_eq!(parsed.liquidity, LiquidityConfig::default());
+        assert!(!parsed.liquidity.enabled);
+    }
+
+    #[test]
+    fn the_liquidity_table_round_trips_through_toml() {
+        let config = with(LiquidityConfig {
+            enabled: true,
+            authority: authority(),
+            ..LiquidityConfig::default()
+        });
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("[liquidity]"), "{text}");
+        assert_eq!(toml::from_str::<ModulesConfig>(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn times_must_be_hh_mm_and_differ() {
+        for (open, close) in [
+            ("8:00", "17:00"),
+            ("24:00", "17:00"),
+            ("08:60", "17:00"),
+            ("08:00", "08:00"),
+        ] {
+            let c = with(LiquidityConfig {
+                open_utc: open.into(),
+                close_utc: close.into(),
+                ..LiquidityConfig::default()
+            });
+            assert!(c.validate().is_err(), "{open}-{close}");
+        }
+        with(LiquidityConfig {
+            open_utc: "22:00".into(),
+            close_utc: "06:00".into(),
+            ..LiquidityConfig::default()
+        })
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn days_floors_and_tolerance_are_bounded() {
+        let bad = [
+            LiquidityConfig {
+                days: vec![],
+                ..LiquidityConfig::default()
+            },
+            LiquidityConfig {
+                days: vec![Weekday::Mon, Weekday::Mon],
+                ..LiquidityConfig::default()
+            },
+            LiquidityConfig {
+                market_floor_bps: 10_001,
+                ..LiquidityConfig::default()
+            },
+            LiquidityConfig {
+                market_floor_bps: 1_000,
+                off_hours_floor_bps: 2_000,
+                ..LiquidityConfig::default()
+            },
+            LiquidityConfig {
+                tolerance_bps: 0,
+                ..LiquidityConfig::default()
+            },
+            LiquidityConfig {
+                tolerance_bps: 5_001,
+                ..LiquidityConfig::default()
+            },
+        ];
+        for liquidity in bad {
+            assert!(with(liquidity.clone()).validate().is_err(), "{liquidity:?}");
+        }
+    }
+
+    #[test]
+    fn live_needs_a_well_formed_authority() {
+        let enabled = LiquidityConfig {
+            enabled: true,
+            ..LiquidityConfig::default()
+        };
+        let live = |liquidity| ModulesConfig {
+            mode: Mode::Live,
+            ..with(liquidity)
+        };
+        assert!(live(enabled.clone()).validate().is_err());
+        with(enabled.clone()).validate().unwrap(); // Preview needs none.
+        live(LiquidityConfig {
+            authority: authority(),
+            ..enabled.clone()
+        })
+        .validate()
+        .unwrap();
+        for (modifier, key) in [
+            (
+                "0x0000000000000000000000000000000000000000",
+                "11".repeat(32),
+            ),
+            ("0xnot", "11".repeat(32)),
+            ("00000000000000000000000000000000000000cc", "11".repeat(32)),
+            (
+                "0x00000000000000000000000000000000000000cc",
+                "00".repeat(32),
+            ),
+            (
+                "0x00000000000000000000000000000000000000cc",
+                "11".repeat(31),
+            ),
+        ] {
+            let c = live(LiquidityConfig {
+                authority: Some(RolesAuthority {
+                    roles_modifier: modifier.into(),
+                    role_key: format!("0x{key}"),
+                }),
+                ..enabled.clone()
+            });
+            assert!(c.validate().is_err(), "{modifier} {key}");
+        }
     }
 }

@@ -26,6 +26,52 @@ export interface ModulesConfig {
     order_lifetime_secs: number
     dealer: { url: string; taker: string; api_key_env: string | null } | null
   }
+  /** Moves the vault's on-chain `minLiquidSettlement` on a UTC schedule.
+   * Floors and tolerance are shares of free settlement (liquid + staked). */
+  liquidity: LiquidityConfig
+}
+export type Weekday = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun'
+export interface LiquidityConfig {
+  enabled: boolean
+  /** "HH:MM", 24h, UTC. Start of market hours. */
+  open_utc: string
+  /** "HH:MM", UTC. Earlier than `open_utc` means the window runs past midnight. */
+  close_utc: string
+  /** UTC weekday each window opens on. */
+  days: Weekday[]
+  market_floor_bps: number
+  off_hours_floor_bps: number
+  tolerance_bps: number
+  authority: { roles_modifier: string; role_key: string } | null
+}
+export type LiquidityStep =
+  | 'hold'
+  | 'raise_floor'
+  | 'lower_floor'
+  | 'drain'
+  | 'recall'
+  | 'wait'
+/** Atomic settlement amounts are decimal strings; null means "not read". */
+export interface LiquidityStatus {
+  at: number
+  market_hours: boolean
+  next_change_at: number | null
+  /** Bot signer that sends the floor and recall transactions. */
+  sender: string
+  operator_admin: string | null
+  /** Roles modifier `target()`; should equal `operator_admin`. */
+  authority_target: string | null
+  floor: string | null
+  target: string | null
+  liquid: string | null
+  free: string | null
+  committed: string | null
+  quote_cap: string | null
+  step: LiquidityStep
+  message: string
+  in_flight: string | null
+  /** Most recent last, at most 20. */
+  actions: { at: number; action: string; ok: boolean; detail: string }[]
 }
 export interface ModuleDecision {
   version: number
@@ -78,6 +124,8 @@ export interface ModuleStatus {
       | 'evaluating'
     message: string
   } | null
+  /** Absent from bots released before the liquidity schedule. */
+  liquidity?: LiquidityStatus | null
 }
 /** One side of the corridor's configured spread. `abs` is an offset in
  * collateral per debt, so it only reads as bps at a price. */
@@ -94,6 +142,9 @@ export interface ModulesView {
   corridor_decimals: number
   /** What the modules start from. Null is a side the corridor leaves off. */
   corridor_spreads: { buy: CorridorSpread | null; sell: CorridorSpread | null }
+  /** Why the liquidity schedule can't run on this vault (no yield adapter),
+   *  or null. Absent from older panels. */
+  liquidity_refusal?: string | null
 }
 
 /** Recorded changes, including side vetoes and caps; never recalculate from

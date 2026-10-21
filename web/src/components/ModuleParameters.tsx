@@ -2,6 +2,7 @@ import { useId, useState, type ReactNode } from 'react'
 import type { ModulesConfig } from '../modules'
 import ModulePresets from './ModulePresets'
 import {
+  liquidityScheduleErrors,
   moduleKeyFigures,
   moduleKeys,
   moduleModes,
@@ -24,9 +25,11 @@ import {
   NumberControl,
   Popover,
   QuoteBreakdown,
+  ScheduleStrip,
 } from './ModuleControls'
 import {
   InventoryFields,
+  LiquidityFields,
   moduleGuides,
   RebalanceFields,
   SpreadFields,
@@ -61,6 +64,7 @@ export default function ModuleParameters({
   settlement,
   corridor,
   live,
+  liquidityRefusal,
 }: {
   draft: ModulesConfig
   onChange: (config: ModulesConfig) => void
@@ -72,6 +76,8 @@ export default function ModuleParameters({
   corridor: QuoteSides | null
   /** The bot's current reading. The example starts from it when there is one. */
   live: LiveReading | null
+  /** Why the liquidity schedule can't run on this vault, or null. */
+  liquidityRefusal: string | null
 }) {
   // A warming-up window has no range to start from; 0.2% is a plain example.
   const [share, setShare] = useState(live?.share ?? 4500)
@@ -109,6 +115,7 @@ export default function ModuleParameters({
     inventory: `Steer ${currency} holdings toward a target by shifting quotes.`,
     spreads: 'Widen margins when prices move, up to a cap you set.',
     rebalance: `Suggest selling excess ${currency} for ${settlement}.`,
+    liquidity: `Keep more ${settlement} liquid for bundled fills in market hours; let the rest earn yield in Aave.`,
   }
   return (
     <section
@@ -138,6 +145,7 @@ export default function ModuleParameters({
           description={descriptions[key]}
           open={selected === key}
           onToggle={() => onSelect(selected === key ? null : key)}
+          blocked={key === 'liquidity' && liquidityRefusal !== null}
         >
           <ModuleEditor
             module={key}
@@ -147,6 +155,7 @@ export default function ModuleParameters({
             settlement={settlement}
             corridor={corridor}
             example={example}
+            blockedReason={key === 'liquidity' ? liquidityRefusal : null}
           />
         </ModuleRow>
       ))}
@@ -206,6 +215,7 @@ function ModuleRow({
   description,
   open,
   onToggle,
+  blocked,
   children,
 }: {
   module: ModuleKey
@@ -214,6 +224,8 @@ function ModuleRow({
   description: string
   open: boolean
   onToggle: () => void
+  /** The module can't run on this bot; it can still be turned off. */
+  blocked: boolean
   children: ReactNode
 }) {
   const id = useId()
@@ -221,7 +233,7 @@ function ModuleRow({
   const name = moduleNames[module]
   const figures = moduleKeyFigures(draft, module)
   const preset =
-    module === 'rebalance'
+    module === 'rebalance' || module === 'liquidity'
       ? null
       : (matchingPreset(draft, module)?.name ?? 'Custom')
   const caption = 'text-faint text-[11px] font-bold uppercase tracking-wider'
@@ -242,6 +254,7 @@ function ModuleRow({
           label={`Enable ${name.toLowerCase()}`}
           checked={on}
           showState={false}
+          disabled={blocked && !on}
           onChange={(enabled) =>
             onChange({ ...draft, [module]: { ...draft[module], enabled } })
           }
@@ -308,6 +321,7 @@ function ModuleEditor({
   settlement,
   corridor,
   example,
+  blockedReason,
 }: {
   module: ModuleKey
   draft: ModulesConfig
@@ -316,17 +330,20 @@ function ModuleEditor({
   settlement: string
   corridor: QuoteSides | null
   example: Example
+  /** Why this module can't run on this bot, or null. */
+  blockedReason: string | null
 }) {
   const Fields = {
     inventory: InventoryFields,
     spreads: SpreadFields,
     rebalance: RebalanceFields,
+    liquidity: LiquidityFields,
   }[module]
   const guide = moduleGuides[module]
   return (
     <>
       <div className="border-line-soft flex flex-wrap items-center gap-x-4 gap-y-2 border-b px-5 py-2.5">
-        {module !== 'rebalance' && (
+        {(module === 'inventory' || module === 'spreads') && (
           <ModulePresets
             draft={draft}
             onChange={onChange}
@@ -335,10 +352,19 @@ function ModuleEditor({
             settlement={settlement}
           />
         )}
-        {!draft[module].enabled && (
-          <p className="text-muted text-xs">
-            Off. You can prepare its settings before turning it on.
+        {blockedReason !== null ? (
+          <p role="note" className="text-xs font-bold text-warning">
+            {blockedReason.trim().replace(/\.?$/, '.')}{' '}
+            {draft[module].enabled
+              ? 'Turn the schedule off; the bot will not act on this vault.'
+              : 'The schedule can only be turned on for a vault with a yield adapter.'}
           </p>
+        ) : (
+          !draft[module].enabled && (
+            <p className="text-muted text-xs">
+              Off. You can prepare its settings before turning it on.
+            </p>
+          )
         )}
         <Popover
           align="end"
@@ -352,7 +378,7 @@ function ModuleEditor({
         >
           {() => (
             <div className="text-muted p-4 text-sm leading-relaxed">
-              {guide.body(currency)}
+              {guide.body(currency, settlement)}
             </div>
           )}
         </Popover>
@@ -361,7 +387,12 @@ function ModuleEditor({
         <div className="p-5 sm:p-6">
           {/* Caps line length when the example is tucked away. */}
           <div className="max-w-3xl space-y-6">
-            <Fields draft={draft} onChange={onChange} currency={currency} />
+            <Fields
+              draft={draft}
+              onChange={onChange}
+              currency={currency}
+              settlement={settlement}
+            />
           </div>
         </div>
         <ModuleExample
@@ -462,9 +493,26 @@ function ModuleExample({
                 ? 'See your quotes respond'
                 : module === 'spreads'
                   ? 'See the extra margin'
-                  : 'See when a sale starts'}
+                  : module === 'liquidity'
+                    ? 'See the weekly schedule'
+                    : 'See when a sale starts'}
             </h4>
-            {!valid ? (
+            {module === 'liquidity' ? (
+              liquidityScheduleErrors(draft.liquidity).length === 0 ? (
+                <div className="space-y-5">
+                  <ScheduleStrip schedule={draft.liquidity} />
+                  <p className="text-muted text-xs leading-relaxed">
+                    Bundled fills can only use {settlement} kept liquid up to
+                    the floor. The rest earns yield in Aave and is still usable
+                    by single-order fills through the executor.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-muted text-sm">
+                  Correct the schedule to update this example.
+                </p>
+              )
+            ) : !valid ? (
               <p className="text-muted text-sm">
                 Correct the settings to update this example.
               </p>
@@ -568,9 +616,9 @@ function ModuleExample({
               </div>
             )}
             <p className="text-muted mt-6 text-xs leading-relaxed">
-              Illustration only, not a live quote or a return forecast. Open
-              quotes, available funds and vault limits can still hold a side
-              back.
+              {module === 'liquidity'
+                ? 'Illustration only. The floor is a share of free settlement, so the amount kept liquid moves with the vault balance.'
+                : 'Illustration only, not a live quote or a return forecast. Open quotes, available funds and vault limits can still hold a side back.'}
             </p>
           </aside>
         )}

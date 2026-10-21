@@ -6,6 +6,7 @@ import {
   type ModulesView,
   type ModuleStatus,
 } from './modules'
+import { defaultLiquidity } from './modulePresentation'
 
 describe('module telemetry', () => {
   const status = {
@@ -59,6 +60,7 @@ describe('dynamic spread visibility', () => {
         order_lifetime_secs: 60,
         dealer: null,
       },
+      liquidity: defaultLiquidity(),
     }
     return {
       running: true,

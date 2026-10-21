@@ -1180,24 +1180,7 @@ pub(super) fn units(atomic: U256, decimals: u8) -> f64 {
     raw / 10f64.powi(i32::from(decimals))
 }
 
-/// Whole tokens as text, exactly, with trailing zeros trimmed: `"25"`, `"0.5"`.
-pub(super) fn format_units(atomic: U256, decimals: u8) -> String {
-    if decimals == 0 {
-        return atomic.to_string();
-    }
-    let scale = U256::from(10u8).pow(U256::from(decimals));
-    let whole = atomic / scale;
-    let frac = atomic % scale;
-    if frac.is_zero() {
-        return whole.to_string();
-    }
-    let frac = format!(
-        "{:0>width$}",
-        frac.to_string(),
-        width = usize::from(decimals)
-    );
-    format!("{whole}.{}", frac.trim_end_matches('0'))
-}
+pub(super) use crate::rfq::math::format_units;
 
 fn now_unix() -> u64 {
     SystemTime::now()

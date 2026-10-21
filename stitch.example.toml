@@ -2,6 +2,9 @@
 # Enable this one root property to expose Modules; initial mode is shadow.
 # See docs/modules.md for strategies and the dealer API.
 modules_enabled = false
+# The liquidity schedule ([modules.liquidity]) moves the vault's liquid floor
+# on a UTC market-hours clock through a Zodiac Roles grant on the
+# operator-admin Safe. See "Liquidity schedule" in docs/modules.md.
 
 # Textile Stitch — example config.
 # The wallet key is NOT here; export STITCH_PRIVATE_KEY in the environment.

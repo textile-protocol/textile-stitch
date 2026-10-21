@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import type { ModulesConfig, ModulesView } from './modules'
+import type { LiquidityStatus, ModulesConfig, ModulesView } from './modules'
 import {
   corridorSpreadBps,
   corridorSpreads,
+  defaultLiquidity,
   inventoryIllustration,
+  liquiditySchedule,
+  liquiditySetupHint,
+  liquidityState,
   liveReading,
   liveRow,
+  marketMinutes,
   moduleChanges,
   moduleKeyFigures,
   moduleOverviewState,
@@ -13,6 +18,10 @@ import {
   quoteBreakdown,
   quoteIllustration,
   quoteModeNote,
+  runningConfigDiffers,
+  scheduleByDay,
+  shareBps,
+  shiftClock,
   volatilityIllustration,
   warmupNote,
   windowRangeBps,
@@ -45,6 +54,7 @@ const config = (): ModulesConfig => ({
     order_lifetime_secs: 60,
     dealer: null,
   },
+  liquidity: defaultLiquidity(),
 })
 
 describe('module parameter validation', () => {
@@ -565,5 +575,318 @@ describe('strategy rows and the save bar', () => {
       { label: 'Sell above', value: '50%' },
       { label: 'Per sale', value: '2%' },
     ])
+    expect(moduleKeyFigures(c, 'liquidity')).toEqual([
+      { label: 'Market hours', value: '50%' },
+      { label: 'Off-hours', value: '0%' },
+    ])
+  })
+  it('lists liquidity schedule changes with the form labels', () => {
+    const draft = config()
+    draft.liquidity.enabled = true
+    draft.liquidity.days = ['mon', 'tue']
+    expect(moduleChanges(config(), draft)).toEqual([
+      { label: 'Liquidity schedule', from: 'Off', to: 'On' },
+      {
+        label: 'Market days (UTC)',
+        from: 'Mon, Tue, Wed, Thu, Fri',
+        to: 'Mon, Tue',
+      },
+    ])
+  })
+})
+
+const ROLES = '0x' + 'ab'.repeat(20)
+const ROLE_KEY = '0x' + '01'.repeat(32)
+
+describe('liquidity schedule validation', () => {
+  it('accepts the server defaults in every mode while disabled', () => {
+    for (const mode of ['off', 'shadow', 'live'] as const)
+      expect(moduleParameterErrors({ ...config(), mode })).toEqual([])
+  })
+  it('checks clock format and rejects equal open and close times', () => {
+    for (const [open, close] of [
+      ['8:00', '17:00'],
+      ['24:00', '17:00'],
+      ['08:60', '17:00'],
+      ['08:00', '08:00'],
+      ['', '17:00'],
+    ]) {
+      const c = config()
+      c.liquidity.open_utc = open!
+      c.liquidity.close_utc = close!
+      expect(moduleParameterErrors(c)).toEqual([
+        'Liquidity schedule: enter opening and closing times as HH:MM in UTC, and make them different.',
+      ])
+    }
+    const c = config()
+    c.liquidity.open_utc = '23:59'
+    c.liquidity.close_utc = '00:00'
+    expect(moduleParameterErrors(c)).toEqual([])
+  })
+  it('needs at least one day and no duplicates', () => {
+    const c = config()
+    c.liquidity.days = []
+    expect(moduleParameterErrors(c)).toHaveLength(1)
+    c.liquidity.days = ['mon', 'mon']
+    expect(moduleParameterErrors(c)).toHaveLength(1)
+  })
+  it('bounds floors to whole bps and keeps market hours at or above off-hours', () => {
+    for (const value of [-1, 10001, 0.5, NaN]) {
+      const c = config()
+      c.liquidity.market_floor_bps = value
+      c.liquidity.off_hours_floor_bps = 0
+      expect(moduleParameterErrors(c)).toEqual([
+        'Liquidity schedule: floors must be 0–100% of free settlement, in steps of 0.01%.',
+      ])
+    }
+    const c = config()
+    c.liquidity.market_floor_bps = 10000
+    c.liquidity.off_hours_floor_bps = 10000
+    expect(moduleParameterErrors(c)).toEqual([])
+    c.liquidity.market_floor_bps = 9999
+    expect(moduleParameterErrors(c)).toEqual([
+      'Liquidity schedule: keep at least as much liquid during market hours as off-hours.',
+    ])
+  })
+  it('keeps tolerance within 1–5000 bps', () => {
+    for (const [value, errors] of [
+      [0, 1],
+      [1, 0],
+      [5000, 0],
+      [5001, 1],
+      [2.5, 1],
+    ] as const) {
+      const c = config()
+      c.liquidity.tolerance_bps = value
+      expect(moduleParameterErrors(c)).toHaveLength(errors)
+    }
+  })
+  it('checks authority format whenever one is entered, even while disabled', () => {
+    const c = config()
+    c.liquidity.authority = { roles_modifier: ROLES, role_key: ROLE_KEY }
+    expect(moduleParameterErrors(c)).toEqual([])
+    for (const roles_modifier of [
+      '',
+      ROLES.slice(0, -1),
+      ROLES.slice(2),
+      '0x' + '0'.repeat(40),
+      '0x' + 'g'.repeat(40),
+    ]) {
+      c.liquidity.authority = { roles_modifier, role_key: ROLE_KEY }
+      expect(moduleParameterErrors(c)).toHaveLength(1)
+    }
+    for (const role_key of ['', '0x' + '0'.repeat(64), ROLE_KEY + '0']) {
+      c.liquidity.authority = { roles_modifier: ROLES, role_key }
+      expect(moduleParameterErrors(c)).toHaveLength(1)
+    }
+  })
+  it('requires an authority only when enabled in Live mode', () => {
+    const c = config()
+    c.liquidity.enabled = true
+    expect(moduleParameterErrors(c)).toEqual([
+      'Liquidity schedule: Live mode needs the Roles modifier and role key that let this bot change the floor.',
+    ])
+    expect(moduleParameterErrors({ ...c, mode: 'shadow' })).toEqual([])
+    c.liquidity.authority = { roles_modifier: ROLES, role_key: ROLE_KEY }
+    expect(moduleParameterErrors(c)).toEqual([])
+  })
+})
+
+describe('liquidity schedule illustration', () => {
+  it('covers the week with market hours on each listed day', () => {
+    const segments = liquiditySchedule(defaultLiquidity())!
+    expect(segments[0]).toEqual({
+      start: 0,
+      end: 480,
+      market: false,
+      floor_bps: 0,
+    })
+    expect(segments[1]).toEqual({
+      start: 480,
+      end: 1020,
+      market: true,
+      floor_bps: 5000,
+    })
+    expect(segments.at(-1)).toEqual({
+      start: 4 * 1440 + 1020,
+      end: 7 * 1440,
+      market: false,
+      floor_bps: 0,
+    })
+    expect(marketMinutes(segments)).toBe(5 * 9 * 60)
+    segments.forEach((s, i) => expect(s.start).toBe(segments[i - 1]?.end ?? 0))
+  })
+  it('runs a window past midnight into the next day', () => {
+    const l = {
+      ...defaultLiquidity(),
+      open_utc: '22:00',
+      close_utc: '06:00',
+      days: ['fri' as const],
+    }
+    expect(liquiditySchedule(l)!.filter((s) => s.market)).toEqual([
+      {
+        start: 4 * 1440 + 1320,
+        end: 5 * 1440 + 360,
+        market: true,
+        floor_bps: 5000,
+      },
+    ])
+    const days = scheduleByDay(liquiditySchedule(l)!)
+    expect(days[4]!.segments.at(-1)).toMatchObject({
+      start: 1320,
+      end: 1440,
+      market: true,
+    })
+    expect(days[5]!.segments[0]).toMatchObject({
+      start: 0,
+      end: 360,
+      market: true,
+    })
+  })
+  it('wraps a Sunday overnight window into Monday morning', () => {
+    const l = {
+      ...defaultLiquidity(),
+      open_utc: '22:00',
+      close_utc: '06:00',
+      days: ['sun' as const],
+    }
+    const segments = liquiditySchedule(l)!
+    expect(segments[0]).toMatchObject({ start: 0, end: 360, market: true })
+    expect(segments.at(-1)).toMatchObject({
+      start: 6 * 1440 + 1320,
+      end: 7 * 1440,
+      market: true,
+    })
+    expect(marketMinutes(segments)).toBe(480)
+  })
+  it('returns nothing for invalid times', () => {
+    expect(
+      liquiditySchedule({ ...defaultLiquidity(), close_utc: '08:00' })
+    ).toBeNull()
+  })
+  it('converts UTC clock times to the operator offset with a day shift', () => {
+    expect(shiftClock('08:00', 120)).toEqual({ time: '10:00', dayShift: 0 })
+    expect(shiftClock('23:30', 60)).toEqual({ time: '00:30', dayShift: 1 })
+    expect(shiftClock('02:00', -300)).toEqual({ time: '21:00', dayShift: -1 })
+    expect(shiftClock('nope', 0)).toBeNull()
+  })
+  it('measures shares of free settlement without float rounding', () => {
+    expect(
+      shareBps('500000000000000000000000', '1000000000000000000000000')
+    ).toBe(5000)
+    expect(shareBps('1', '0')).toBeNull()
+    expect(shareBps(null, '10')).toBeNull()
+  })
+})
+
+const liquidity = (): LiquidityStatus => ({
+  at: 100,
+  market_hours: true,
+  next_change_at: 3600,
+  sender: '0xbot',
+  operator_admin: '0xSafe',
+  authority_target: '0xsafe',
+  floor: '1000000',
+  target: '5000000',
+  liquid: '1000000',
+  free: '10000000',
+  committed: '0',
+  quote_cap: null,
+  step: 'raise_floor',
+  message: 'Raising the floor for market hours.',
+  in_flight: null,
+  actions: [],
+})
+const liquidityView = (): ModulesView => {
+  const v = view()
+  v.settlement_decimals = 6
+  v.config.liquidity.enabled = true
+  v.status!.config.liquidity.enabled = true
+  v.status!.liquidity = liquidity()
+  return v
+}
+describe('liquidity overview state', () => {
+  it('shows the live step with the bot message', () => {
+    expect(liquidityState(liquidityView(), 101)).toEqual({
+      label: 'Raising the floor',
+      message: 'Raising the floor for market hours.',
+      current: true,
+    })
+  })
+  it('reads as a preview in shadow mode, with the target amount', () => {
+    const v = liquidityView()
+    v.status!.config.mode = 'shadow'
+    const state = liquidityState(v, 101)
+    expect(state.label).toBe('Preview · would raise the floor')
+    expect(state.message).toContain('Would raise the floor to 5')
+    expect(state.message).toContain('Preview sends no transactions.')
+    v.status!.liquidity!.step = 'drain'
+    v.status!.liquidity!.quote_cap = '2000000'
+    expect(liquidityState(v, 101).message).toContain(
+      'Would cap new quotes so they commit at most 2,'
+    )
+  })
+  it('withholds stopped, missing, stale and future readings', () => {
+    expect(liquidityState(liquidityView(), 145).current).toBe(true)
+    expect(liquidityState(liquidityView(), 145.5).label).toBe('Reading stale')
+    expect(liquidityState(liquidityView(), 99).label).toBe('Reading stale')
+    const v = liquidityView()
+    v.status!.liquidity = undefined
+    expect(liquidityState(v, 101).label).toBe('No liquidity data')
+    v.status = null
+    expect(liquidityState(v, 101).label).toBe('No runtime data')
+    v.running = false
+    expect(liquidityState(v, 101).label).toBe('Bot stopped')
+  })
+  it('passes on why the bot is waiting and reports a disabled running schedule', () => {
+    const v = liquidityView()
+    Object.assign(v.status!.liquidity!, {
+      step: 'wait',
+      target: null,
+      message: 'The vault is paused. Nothing is staked while it is paused',
+    })
+    expect(liquidityState(v, 101)).toEqual({
+      label: 'Waiting',
+      message: 'The vault is paused. Nothing is staked while it is paused',
+      current: true,
+    })
+    v.status!.config.mode = 'shadow'
+    expect(liquidityState(v, 101).label).toBe('Preview · waiting')
+    v.status!.config.liquidity.enabled = false
+    expect(liquidityState(v, 101).label).toBe('Schedule off')
+  })
+  it('suggests setup when the authority targets another Safe or the last action failed', () => {
+    const l = liquidity()
+    expect(liquiditySetupHint(l)).toBeNull()
+    l.actions = [
+      { at: 90, action: 'raise_floor', ok: false, detail: 'reverted' },
+    ]
+    expect(liquiditySetupHint(l)).toBe(
+      'The last transaction failed. Grant the role to 0xbot and keep it funded with gas.'
+    )
+    l.actions.push({ at: 95, action: 'raise_floor', ok: true, detail: '' })
+    expect(liquiditySetupHint(l)).toBeNull()
+    l.authority_target = '0xother'
+    expect(liquiditySetupHint(l)).toContain('Grant the role to 0xbot')
+  })
+})
+
+describe('running config comparison', () => {
+  it('ignores a missing liquidity key from older bots unless the schedule is on', () => {
+    const v = view()
+    expect(runningConfigDiffers(v)).toBe(false)
+    const { liquidity: _, ...older } = v.status!.config
+    v.status!.config = older as ModulesConfig
+    expect(runningConfigDiffers(v)).toBe(false)
+    v.config.liquidity.enabled = true
+    expect(runningConfigDiffers(v)).toBe(true)
+  })
+  it('does not crash the overview on an older running config', () => {
+    const v = view()
+    const { liquidity: _, ...older } = v.status!.config
+    v.status!.config = older as ModulesConfig
+    for (const key of ['inventory', 'spreads', 'rebalance'] as const)
+      v.status!.config[key].enabled = false
+    expect(moduleOverviewState(v, 101).title).toBe('No modules enabled')
   })
 })

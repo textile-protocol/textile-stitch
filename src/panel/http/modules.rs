@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
+use super::chain_reads::{read_cached, word, Ask};
 use super::{ApiError, AppState};
 use crate::{
     config::Config,
@@ -58,6 +59,35 @@ pub struct CorridorSpreads {
     pub buy: Option<CorridorSpread>,
     pub sell: Option<CorridorSpread>,
 }
+/// Why the liquidity schedule can't run on this bot's vault, if it can't. It
+/// moves settlement between liquid and the vault's yield adapter, so a vault
+/// without one has nothing to move. The adapter is fixed at deployment, so the
+/// read is cached for the life of the panel. A failed read refuses nothing:
+/// the bot makes the same check on its own reads before acting.
+async fn liquidity_refusal(state: &AppState, cfg: &Config) -> Option<String> {
+    let Some(vault) = cfg
+        .vault
+        .as_ref()
+        .and_then(|v| v.address.parse::<alloy_primitives::Address>().ok())
+    else {
+        return Some("This bot does not trade from a vault".into());
+    };
+    let what = format!("yieldAdapter() on {vault}");
+    let ask = Ask::call(vault, crate::protocol::vault::encode_yield_adapter(), &what).constant();
+    let answers = read_cached(
+        &cfg.rpc_url,
+        cfg.chain_id,
+        &state.chain_constants,
+        None,
+        &[ask],
+    )
+    .await;
+    let adapter = word(answers.first()?, &what).ok()?;
+    adapter
+        .is_zero()
+        .then(|| "This vault has no yield adapter, so nothing is staked".into())
+}
+
 #[derive(Serialize)]
 pub struct View {
     pub config: ModulesConfig,
@@ -71,6 +101,8 @@ pub struct View {
     pub settlement_decimals: u8,
     pub corridor_decimals: u8,
     pub corridor_spreads: CorridorSpreads,
+    /// Why the liquidity schedule can't be turned on here, or `None`.
+    pub liquidity_refusal: Option<String>,
 }
 pub async fn show(
     State(state): State<AppState>,
@@ -93,7 +125,9 @@ pub async fn show(
     } else {
         None
     };
+    let liquidity_refusal = liquidity_refusal(&state, &cfg).await;
     Ok(Json(View {
+        liquidity_refusal,
         revision: revision(&raw),
         status,
         running: bot.state.is_running(),
@@ -120,13 +154,23 @@ pub async fn update(
 ) -> Result<Response, ApiError> {
     let (_lock, bot) = super::bots::lock_config(&name, &state).await?;
     super::require_editable(&bot)?;
-    let (path, raw, _) = read(&bot)?;
+    let (path, raw, saved) = read(&bot)?;
     if revision(&raw) != body.revision {
         return Err(ApiError::conflict(
             "Config changed since you opened Modules. Reload before saving.",
         ));
     }
     body.config.validate().map_err(ApiError::bad_request)?;
+    // Turning the schedule on needs a vault with a yield adapter. A config
+    // that already has it on is not re-checked, so unrelated module edits
+    // never wait on the chain; the bot doesn't act without one either way.
+    if body.config.liquidity.enabled && !saved.modules.liquidity.enabled {
+        if let Some(why) = liquidity_refusal(&state, &saved).await {
+            return Err(ApiError::bad_request(format!(
+                "The liquidity schedule needs a vault that stakes its idle settlement. {why}."
+            )));
+        }
+    }
     let mut doc = raw
         .parse::<toml_edit::DocumentMut>()
         .map_err(ApiError::bad_request)?;
@@ -763,6 +807,7 @@ mod tests {
                 "[modules.inventory]",
                 "[modules.spreads]",
                 "[modules.rebalance]",
+                "[modules.liquidity]",
             ];
             assert_eq!(
                 &headers[..before.len()],

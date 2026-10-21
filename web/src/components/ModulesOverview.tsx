@@ -4,22 +4,26 @@ import {
   moduleNames,
   moduleOverviewState,
   percentage,
+  runningConfigDiffers,
   type ModuleKey,
 } from '../modulePresentation'
 import { AllocationBar, Disclosure } from './ModuleControls'
 import DynamicSpreadsLive from './DynamicSpreadsLive'
+import LiquidityScheduleLive from './LiquidityScheduleLive'
 import { Button, Card } from './ui'
 
 export default function ModulesOverview({
   view,
   now,
   currency,
+  settlement,
   onConfigure,
   onDecisions,
 }: {
   view: ModulesView
   now: number
   currency: string
+  settlement: string
   onConfigure: (key: ModuleKey) => void
   onDecisions: () => void
 }) {
@@ -30,13 +34,12 @@ export default function ModulesOverview({
   const share = current?.inventory_bps
   const margins = current && !current.blocked
   const shadow = config.mode === 'shadow'
-  const differs =
-    !!view.status &&
-    JSON.stringify(view.status.config) !== JSON.stringify(view.config)
+  const differs = runningConfigDiffers(view)
   const descriptions: Record<ModuleKey, string> = {
     inventory: `Keep ${currency} holdings near your target.`,
     spreads: 'Adjust quote margins as market prices move.',
     rebalance: `Sell excess ${currency} to your wallet or an invited buyer.`,
+    liquidity: `Keep more ${settlement} liquid in market hours; let more earn yield in Aave off-hours.`,
   }
   return (
     <div className="space-y-4">
@@ -180,6 +183,9 @@ export default function ModulesOverview({
           </p>
         )}
       </Card>
+      {(view.config.liquidity?.enabled || view.status?.liquidity) && (
+        <LiquidityScheduleLive view={view} now={now} settlement={settlement} />
+      )}
       <Disclosure title="Details & recent activity">
         <div className="space-y-4">
           <DynamicSpreadsLive view={view} now={now} />

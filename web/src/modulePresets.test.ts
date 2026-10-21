@@ -6,6 +6,7 @@ import {
   presetConflict,
 } from './modulePresets'
 import {
+  defaultLiquidity,
   inventoryIllustration,
   moduleParameterErrors,
   volatilityIllustration,
@@ -41,6 +42,7 @@ const config = (): ModulesConfig => ({
       api_key_env: 'DEALER_KEY',
     },
   },
+  liquidity: defaultLiquidity(),
 })
 const defensive = modulePresets.find((p) => p.id === 'defensive')!
 const balanced = modulePresets.find((p) => p.id === 'balanced')!

@@ -1,5 +1,13 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
-import { percentage, type QuoteBreakdownRow } from '../modulePresentation'
+import type { LiquidityConfig } from '../modules'
+import {
+  liquiditySchedule,
+  marketMinutes,
+  percentage,
+  scheduleByDay,
+  weekdayNames,
+  type QuoteBreakdownRow,
+} from '../modulePresentation'
 
 /** Shared module editor vocabulary: exact inputs + sliders, accessible switches,
  * and keyboard/touch disclosures. Values stay in the API's native units. */
@@ -151,22 +159,27 @@ export function ModuleSwitch({
   checked,
   onChange,
   showState = true,
+  disabled = false,
 }: {
   label: string
   checked: boolean
   onChange: (value: boolean) => void
   /** Off where the row already says whether the module is on. */
   showState?: boolean
+  disabled?: boolean
 }) {
   return (
-    <label className="relative inline-flex cursor-pointer items-center gap-2 text-sm">
+    <label
+      className={`relative inline-flex items-center gap-2 text-sm ${disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
+    >
       <input
         type="checkbox"
         role="switch"
         aria-label={label}
         checked={checked}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
-        className="peer absolute left-0 top-0 z-10 h-6 w-10 cursor-pointer opacity-0"
+        className="peer absolute left-0 top-0 z-10 h-6 w-10 cursor-pointer opacity-0 disabled:cursor-not-allowed"
       />
       <span
         aria-hidden
@@ -392,5 +405,77 @@ export function QuoteBreakdown({
         )}
       </tbody>
     </table>
+  )
+}
+
+/** A UTC week, one row per day: market hours in accent, off-hours muted.
+ * Renders nothing for an invalid schedule; callers show the error instead. */
+export function ScheduleStrip({ schedule }: { schedule: LiquidityConfig }) {
+  const segments = liquiditySchedule(schedule)
+  if (!segments) return null
+  const hours = marketMinutes(segments) / 60
+  const market = percentage(schedule.market_floor_bps)
+  const off = percentage(schedule.off_hours_floor_bps)
+  return (
+    <div className="space-y-3">
+      <div
+        role="img"
+        aria-label={`${hours.toLocaleString(undefined, { maximumFractionDigits: 2 })} market hours a week, ${schedule.open_utc} to ${schedule.close_utc} UTC. Market hours keep ${market} of free settlement liquid; off-hours keep ${off}.`}
+        className="space-y-1.5"
+      >
+        {scheduleByDay(segments).map(({ day, segments: parts }) => (
+          <div key={day} className="flex items-center gap-2">
+            <span className="text-muted w-8 shrink-0 text-xs">
+              {weekdayNames[day]}
+            </span>
+            <div className="bg-active relative h-3 flex-1 overflow-hidden rounded-full">
+              {parts
+                .filter((s) => s.market)
+                .map((s) => (
+                  <span
+                    key={s.start}
+                    className="absolute inset-y-0 bg-accent"
+                    style={{
+                      left: `${(s.start / 1440) * 100}%`,
+                      width: `${((s.end - s.start) / 1440) * 100}%`,
+                    }}
+                  />
+                ))}
+            </div>
+          </div>
+        ))}
+        <div
+          aria-hidden
+          className="text-muted flex justify-between pl-10 text-xs tabular-nums"
+        >
+          {['00', '06', '12', '18', '24'].map((h) => (
+            <span key={h}>{h}</span>
+          ))}
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3 text-sm">
+        <div className="border-line-soft bg-surface rounded-xl border p-3">
+          <p className="text-muted flex items-center gap-2 text-xs">
+            <span aria-hidden className="size-2 rounded-full bg-accent" />
+            Market hours
+          </p>
+          <p className="mt-1 text-xl font-bold tabular-nums">{market}</p>
+          <p className="text-muted text-xs">kept liquid</p>
+        </div>
+        <div className="border-line-soft bg-surface rounded-xl border p-3">
+          <p className="text-muted flex items-center gap-2 text-xs">
+            <span aria-hidden className="bg-active size-2 rounded-full" />
+            Off-hours
+          </p>
+          <p className="mt-1 text-xl font-bold tabular-nums">{off}</p>
+          <p className="text-muted text-xs">kept liquid</p>
+        </div>
+      </div>
+      <p className="text-muted text-xs">
+        Hours in UTC ·{' '}
+        {hours.toLocaleString(undefined, { maximumFractionDigits: 2 })} market
+        hours a week
+      </p>
+    </div>
   )
 }

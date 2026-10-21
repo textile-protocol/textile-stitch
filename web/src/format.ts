@@ -1,7 +1,37 @@
 // Formatting helpers.
 //
 // Everything here goes through `Intl` with no explicit locale, so the operator's
-// own locale decides separators and date order.
+// own locale decides separators and date order. Amounts are atomic-unit integers
+// arriving as strings; they are formatted with BigInt arithmetic rather than
+// `Number`, because a large balance would lose its low digits to a float.
+
+/**
+ * Render an atomic-unit integer string as a decimal amount, at most 6
+ * fractional digits, trimmed. Anything that isn't a plain integer comes back
+ * unchanged rather than as `NaN`.
+ */
+export function formatAtomic(raw: string, decimals: number): string {
+  const value = raw.trim()
+  if (!/^\d+$/.test(value)) return value
+  const big = BigInt(value)
+  const scale = 10n ** BigInt(decimals)
+  const wholeText = new Intl.NumberFormat().format(big / scale)
+  const fracText = (big % scale)
+    .toString()
+    .padStart(decimals, '0')
+    .slice(0, 6)
+    .replace(/0+$/, '')
+  return fracText === ''
+    ? wholeText
+    : `${wholeText}${decimalSeparator()}${fracText}`
+}
+
+function decimalSeparator(): string {
+  return (
+    new Intl.NumberFormat().formatToParts(1.1).find((p) => p.type === 'decimal')
+      ?.value ?? '.'
+  )
+}
 
 /**
  * An RFC 3339 timestamp as a locale date, or a dash.

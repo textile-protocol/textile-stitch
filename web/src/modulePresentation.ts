@@ -1,19 +1,30 @@
+import { formatAtomic } from './format'
 import {
   isWarmingUp,
   moduleStatusFresh,
   type CorridorSpread,
+  type LiquidityConfig,
+  type LiquidityStatus,
+  type LiquidityStep,
   type ModuleStatus,
   type ModulesConfig,
   type ModulesView,
+  type Weekday,
 } from './modules'
 
-export type ModuleKey = 'inventory' | 'spreads' | 'rebalance'
+export type ModuleKey = 'inventory' | 'spreads' | 'rebalance' | 'liquidity'
 export const moduleNames: Record<ModuleKey, string> = {
   inventory: 'Inventory balancing',
   spreads: 'Dynamic spreads',
   rebalance: 'Spot rebalancing',
+  liquidity: 'Liquidity schedule',
 }
-export const moduleKeys: ModuleKey[] = ['inventory', 'spreads', 'rebalance']
+export const moduleKeys: ModuleKey[] = [
+  'inventory',
+  'spreads',
+  'rebalance',
+  'liquidity',
+]
 export const percentage = (bps: number) =>
   `${(bps / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
 
@@ -56,6 +67,7 @@ const shownSeconds = (v: unknown) =>
     ? `${v.toLocaleString()} sec`
     : '—'
 const shownSwitch = (v: unknown) => (v ? 'On' : 'Off')
+const shownText = (v: unknown) => (typeof v === 'string' && v ? v : '—')
 
 /** The two settings that define each module, shown on its strategy row. */
 export function moduleKeyFigures(
@@ -79,6 +91,10 @@ export function moduleKeyFigures(
     rebalance: [
       ['Sell above', shownPercent(c.rebalance.trigger_bps)],
       ['Per sale', shownPercent(c.rebalance.max_trade_bps)],
+    ],
+    liquidity: [
+      ['Market hours', shownPercent(c.liquidity.market_floor_bps)],
+      ['Off-hours', shownPercent(c.liquidity.off_hours_floor_bps)],
     ],
   }
   return figures[key].map(([label, value]) => ({ label, value }))
@@ -126,6 +142,36 @@ const editableSettings: readonly [
   ['Maximum price discount', (c) => c.rebalance.max_slippage_bps, shownPercent],
   ['Wait between sales', (c) => c.rebalance.cooldown_secs, shownSeconds],
   ['Order lifetime', (c) => c.rebalance.order_lifetime_secs, shownSeconds],
+  ['Liquidity schedule', (c) => c.liquidity.enabled, shownSwitch],
+  ['Market opens (UTC)', (c) => c.liquidity.open_utc, shownText],
+  ['Market closes (UTC)', (c) => c.liquidity.close_utc, shownText],
+  [
+    'Market days (UTC)',
+    (c) => c.liquidity.days.join(','),
+    (v) =>
+      String(v)
+        .split(',')
+        .filter(Boolean)
+        .map((d) => weekdayNames[d as Weekday] ?? d)
+        .join(', ') || '—',
+  ],
+  [
+    'Keep liquid during market hours',
+    (c) => c.liquidity.market_floor_bps,
+    shownPercent,
+  ],
+  [
+    'Keep liquid off-hours',
+    (c) => c.liquidity.off_hours_floor_bps,
+    shownPercent,
+  ],
+  [
+    'Roles modifier address',
+    (c) => c.liquidity.authority?.roles_modifier ?? '',
+    shownText,
+  ],
+  ['Role key', (c) => c.liquidity.authority?.role_key ?? '', shownText],
+  ['Ignore gaps smaller than', (c) => c.liquidity.tolerance_bps, shownPercent],
 ]
 
 /** What saving would change, in form order. `Object.is` so an empty field
@@ -146,8 +192,6 @@ export const moduleChanges = (
  * authoritative, including dealer URL and wallet validation. Never repair a
  * related setting silently when a slider moves. */
 export function moduleParameterErrors(c: ModulesConfig): string[] {
-  const integer = (n: number, min: number, max: number) =>
-    Number.isInteger(n) && n >= min && n <= max
   const i = c.inventory,
     s = c.spreads,
     r = c.rebalance
@@ -180,6 +224,8 @@ export function moduleParameterErrors(c: ModulesConfig): string[] {
       !Number.isSafeInteger(r.cooldown_secs) ||
       r.cooldown_secs < r.order_lifetime_secs + 30) &&
       'Spot timing: orders last 10–300 seconds; the wait between sales must be at least 30 seconds longer.',
+    ...liquidityScheduleErrors(c.liquidity),
+    ...liquidityAuthorityErrors(c.liquidity, c.mode),
   ].filter((message): message is string => typeof message === 'string')
 }
 
@@ -216,6 +262,310 @@ export function corridorSpreads(
   const buy = corridorSpreadBps(spreads.buy, 'buy', price)
   const sell = corridorSpreadBps(spreads.sell, 'sell', price)
   return buy === undefined || sell === undefined ? null : { buy, sell }
+}
+
+const integer = (n: number, min: number, max: number) =>
+  Number.isInteger(n) && n >= min && n <= max
+
+/** Server defaults for a config saved before the liquidity schedule existed. */
+export const defaultLiquidity = (): LiquidityConfig => ({
+  enabled: false,
+  open_utc: '08:00',
+  close_utc: '17:00',
+  days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+  market_floor_bps: 5000,
+  off_hours_floor_bps: 0,
+  tolerance_bps: 500,
+  authority: null,
+})
+export const weekdays: readonly Weekday[] = [
+  'mon',
+  'tue',
+  'wed',
+  'thu',
+  'fri',
+  'sat',
+  'sun',
+]
+export const weekdayNames: Record<Weekday, string> = {
+  mon: 'Mon',
+  tue: 'Tue',
+  wed: 'Wed',
+  thu: 'Thu',
+  fri: 'Fri',
+  sat: 'Sat',
+  sun: 'Sun',
+}
+
+/** Minutes after midnight for a 24h "HH:MM" clock, or null. */
+export function clockMinutes(hhmm: string): number | null {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hhmm)
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null
+}
+
+/** A UTC clock time moved by the operator's offset (minutes east of UTC).
+ * `dayShift` is -1 or 1 when the local time falls on the previous or next day. */
+export function shiftClock(
+  hhmm: string,
+  offsetMinutes: number
+): { time: string; dayShift: number } | null {
+  const minutes = clockMinutes(hhmm)
+  if (minutes === null) return null
+  const shifted = minutes + offsetMinutes
+  const local = ((shifted % 1440) + 1440) % 1440
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return {
+    time: `${pad(Math.floor(local / 60))}:${pad(local % 60)}`,
+    dayShift: Math.floor(shifted / 1440),
+  }
+}
+
+/** Schedule rules that hold in every mode, enabled or not. */
+export function liquidityScheduleErrors(l: LiquidityConfig): string[] {
+  const open = clockMinutes(l.open_utc)
+  const close = clockMinutes(l.close_utc)
+  const floors =
+    integer(l.market_floor_bps, 0, 10000) &&
+    integer(l.off_hours_floor_bps, 0, 10000)
+  return [
+    (open === null || close === null || open === close) &&
+      'Liquidity schedule: enter opening and closing times as HH:MM in UTC, and make them different.',
+    (l.days.length === 0 ||
+      new Set(l.days).size !== l.days.length ||
+      l.days.some((day) => !weekdays.includes(day))) &&
+      'Liquidity schedule: choose at least one day, each listed once.',
+    !floors &&
+      'Liquidity schedule: floors must be 0–100% of free settlement, in steps of 0.01%.',
+    floors &&
+      l.market_floor_bps < l.off_hours_floor_bps &&
+      'Liquidity schedule: keep at least as much liquid during market hours as off-hours.',
+    !integer(l.tolerance_bps, 1, 5000) &&
+      'Liquidity schedule: tolerance must be 0.01–50%, in steps of 0.01%.',
+  ].filter((message): message is string => typeof message === 'string')
+}
+
+const nonZeroHex = (value: string, digits: number) =>
+  new RegExp(`^0x[0-9a-fA-F]{${digits}}$`).test(value) && !/^0x0+$/.test(value)
+
+/** Authority format applies whenever one is entered; Live mode with the
+ * schedule enabled needs one, because the bot must be able to send the change. */
+export function liquidityAuthorityErrors(
+  l: LiquidityConfig,
+  mode: ModulesConfig['mode']
+): string[] {
+  return [
+    l.authority &&
+      !nonZeroHex(l.authority.roles_modifier, 40) &&
+      'Liquidity schedule: the Roles modifier must be a non-zero 0x address (40 hex characters).',
+    l.authority &&
+      !nonZeroHex(l.authority.role_key, 64) &&
+      'Liquidity schedule: the role key must be a non-zero 0x value with 64 hex characters.',
+    l.enabled &&
+      mode === 'live' &&
+      !l.authority &&
+      'Liquidity schedule: Live mode needs the Roles modifier and role key that let this bot change the floor.',
+  ].filter((message): message is string => typeof message === 'string')
+}
+
+export const WEEK_MINUTES = 7 * 1440
+/** [start, end) in minutes from Monday 00:00 UTC. */
+export type ScheduleSegment = {
+  start: number
+  end: number
+  market: boolean
+  floor_bps: number
+}
+
+/** The whole UTC week as contiguous market / off-hours segments, or null when
+ * the times are invalid. Windows open on each listed day and close at the next
+ * `close_utc`, so a close earlier than the open runs past midnight; Sunday's
+ * window wraps into Monday. Each window lasts under 24h, so none overlap. */
+export function liquiditySchedule(
+  l: LiquidityConfig
+): ScheduleSegment[] | null {
+  const open = clockMinutes(l.open_utc)
+  const close = clockMinutes(l.close_utc)
+  if (open === null || close === null || open === close) return null
+  const length = (close - open + 1440) % 1440
+  const windows = [...new Set(l.days)]
+    .filter((day) => weekdays.includes(day))
+    .flatMap((day): [number, number][] => {
+      const start = weekdays.indexOf(day) * 1440 + open
+      const end = start + length
+      return end <= WEEK_MINUTES
+        ? [[start, end]]
+        : [
+            [start, WEEK_MINUTES],
+            [0, end - WEEK_MINUTES],
+          ]
+    })
+    .sort((a, b) => a[0] - b[0])
+  const segment = (start: number, end: number, market: boolean) => ({
+    start,
+    end,
+    market,
+    floor_bps: market ? l.market_floor_bps : l.off_hours_floor_bps,
+  })
+  const { segments, cursor } = windows.reduce<{
+    segments: ScheduleSegment[]
+    cursor: number
+  }>(
+    (acc, [start, end]) => ({
+      segments: [
+        ...acc.segments,
+        ...(start > acc.cursor ? [segment(acc.cursor, start, false)] : []),
+        segment(start, end, true),
+      ],
+      cursor: end,
+    }),
+    { segments: [], cursor: 0 }
+  )
+  return cursor < WEEK_MINUTES
+    ? [...segments, segment(cursor, WEEK_MINUTES, false)]
+    : segments
+}
+
+/** Week segments split per UTC day, with minutes relative to that midnight. */
+export function scheduleByDay(segments: ScheduleSegment[]) {
+  return weekdays.map((day, i) => {
+    const from = i * 1440
+    const to = from + 1440
+    return {
+      day,
+      segments: segments
+        .filter((s) => s.end > from && s.start < to)
+        .map((s) => ({
+          ...s,
+          start: Math.max(s.start, from) - from,
+          end: Math.min(s.end, to) - from,
+        })),
+    }
+  })
+}
+
+export const marketMinutes = (segments: ScheduleSegment[]) =>
+  segments
+    .filter((s) => s.market)
+    .reduce((total, s) => total + s.end - s.start, 0)
+
+/** `part / whole` in bps for atomic amounts, or null when either is unknown. */
+export function shareBps(
+  part: string | null,
+  whole: string | null
+): number | null {
+  if (!part || !whole || !/^\d+$/.test(part) || !/^\d+$/.test(whole))
+    return null
+  const total = BigInt(whole)
+  return total === 0n ? null : Number((BigInt(part) * 10000n) / total)
+}
+
+export const LIQUIDITY_STALE_SECS = 45
+
+const liquidityLabels: Record<LiquidityStep, [live: string, preview: string]> =
+  {
+    hold: ['Floor on schedule', 'Preview · no change'],
+    raise_floor: ['Raising the floor', 'Preview · would raise the floor'],
+    lower_floor: ['Lowering the floor', 'Preview · would lower the floor'],
+    drain: ['Capping new quotes', 'Preview · would cap new quotes'],
+    recall: ['Pulling settlement from Aave', 'Preview · would pull from Aave'],
+    // Missing vault reads, or a vault state the floor does not apply to.
+    wait: ['Waiting', 'Preview · waiting'],
+  }
+
+function previewMessage(l: LiquidityStatus, decimals: number): string {
+  const amount = (raw: string | null) =>
+    raw === null ? 'the scheduled level' : formatAtomic(raw, decimals)
+  const would = {
+    hold: 'The floor matches the schedule. Nothing would change.',
+    raise_floor: `Would raise the floor to ${amount(l.target)}.`,
+    lower_floor: `Would lower the floor to ${amount(l.target)}.`,
+    drain: `Would cap new quotes so they commit at most ${amount(l.quote_cap ?? l.target)}, wait for live quotes above the new floor to expire, then lower the floor to ${amount(l.target)}.`,
+    recall: `Would pull settlement back from Aave until ${amount(l.floor)} is liquid.`,
+    wait: l.message,
+  }[l.step]
+  return `${would} Preview sends no transactions.`
+}
+
+/** Overview headline for the liquidity schedule, in the style of
+ * `dynamicSpreadState`. Uses the running config, not the saved draft. */
+export function liquidityState(
+  view: ModulesView,
+  now: number
+): { label: string; message: string; current: boolean } {
+  const status = view.status
+  const l = status?.liquidity
+  // Older bots report a running config without the liquidity key.
+  const running = status?.config.liquidity
+  if (!view.running)
+    return {
+      label: 'Bot stopped',
+      message:
+        'Start the bot to run the liquidity schedule. Saving settings alone does not start it.',
+      current: false,
+    }
+  if (!status)
+    return {
+      label: 'No runtime data',
+      message:
+        'The panel has not received a module status file from this bot yet.',
+      current: false,
+    }
+  if (!l)
+    return {
+      label: 'No liquidity data',
+      message:
+        'The bot has not reported a liquidity reading. Bots released before this module never do; update the bot on its card above. Otherwise check that the schedule is enabled and saved.',
+      current: false,
+    }
+  if (l.at > now || now - l.at > LIQUIDITY_STALE_SECS)
+    return {
+      label: 'Reading stale',
+      message:
+        'No current liquidity reading. Check the vault RPC reads in the bot logs. The last values are shown below.',
+      current: false,
+    }
+  if (status.config.mode === 'off' || !running?.enabled)
+    return {
+      label: 'Schedule off',
+      message:
+        'The running configuration does not move the floor. The last readings are shown for reference.',
+      current: false,
+    }
+  const shadow = status.config.mode === 'shadow'
+  const [live, preview] = liquidityLabels[l.step]
+  return {
+    label: shadow ? preview : live,
+    message: shadow ? previewMessage(l, view.settlement_decimals) : l.message,
+    current: true,
+  }
+}
+
+/** Setup advice when the bot cannot change the floor, or null. */
+export function liquiditySetupHint(l: LiquidityStatus): string | null {
+  const grant = `Grant the role to ${l.sender} and keep it funded with gas.`
+  if (
+    l.authority_target &&
+    l.operator_admin &&
+    l.authority_target.toLowerCase() !== l.operator_admin.toLowerCase()
+  )
+    return `The Roles modifier acts for ${l.authority_target}, but this vault's operator admin is ${l.operator_admin}. Use a Roles modifier enabled on the operator-admin Safe. ${grant}`
+  if (l.actions.at(-1)?.ok === false)
+    return `The last transaction failed. ${grant}`
+  return null
+}
+
+/** Whether the bot runs different settings than the saved ones. Older bots
+ * don't report `liquidity`; that only counts when the saved schedule is on. */
+export function runningConfigDiffers(view: ModulesView): boolean {
+  const running = view.status?.config
+  if (!running) return false
+  if (running.liquidity === undefined) {
+    const { liquidity, ...saved } = view.config
+    return (
+      liquidity.enabled || JSON.stringify(saved) !== JSON.stringify(running)
+    )
+  }
+  return JSON.stringify(running) !== JSON.stringify(view.config)
 }
 
 /** Illustrations only: the same integer rounding as the Rust strategies, with
@@ -528,7 +878,8 @@ export function moduleOverviewState(view: ModulesView, now: number) {
         'These are proposed adjustments. Your live quotes stay unchanged.',
       current: true,
     }
-  if (!moduleKeys.some((key) => c[key].enabled))
+  // `?.`: an older bot's running config has no liquidity key.
+  if (!moduleKeys.some((key) => c[key]?.enabled))
     return {
       title: 'No modules enabled',
       message: 'Turn on a module in Parameters to adjust the bot’s behavior.',

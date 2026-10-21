@@ -1164,6 +1164,22 @@ impl Config {
         .collect()
     }
 
+    /// Whether the liquidity schedule will send its own floor and recall
+    /// transactions: on, in Live mode, with modules on. Preview only reads.
+    pub fn liquidity_schedule_sends(&self) -> bool {
+        self.modules_enabled
+            && self.modules.liquidity.enabled
+            && self.modules.mode == crate::modules::Mode::Live
+    }
+
+    /// Whether this config broadcasts transactions from the operator wallet at
+    /// all: an on-chain leg, or a live liquidity schedule. The panel's
+    /// `sends_transactions` reads this, so its one-process-per-key guards and
+    /// the signer checks here count the same senders.
+    pub fn sends_transactions(&self) -> bool {
+        !self.on_chain_legs().is_empty() || self.liquidity_schedule_sends()
+    }
+
     /// Why `modules_enabled = true` would be refused on this config, in the
     /// order `validate` reports them. Empty when modules can be turned on. The
     /// panel shows these before the operator tries, so they read as fixes.
@@ -1463,6 +1479,20 @@ impl Config {
             self.modules.validate()?;
             if let Some(blocker) = self.modules_blockers().first() {
                 anyhow::bail!("{blocker}");
+            }
+            // The schedule sends its own transactions in Live mode; Preview
+            // only reads, so any signer can preview it.
+            if let Some(why) = self
+                .signer
+                .as_ref()
+                .and_then(|s| s.raw_signing_unavailable())
+                .filter(|_| self.liquidity_schedule_sends())
+            {
+                anyhow::bail!(
+                    "this bot {why}, so the liquidity schedule cannot send its floor and \
+                     recall transactions in Live mode. Use Preview, or a signer that can \
+                     sign transactions."
+                );
             }
         }
         if let Some(signer) = &self.signer {
@@ -1783,6 +1813,22 @@ mod tests {
             {signer}
         "#
         )
+    }
+
+    /// A live liquidity schedule broadcasts from the operator wallet, so the
+    /// panel's one-process-per-key guards must count it; Preview only reads.
+    #[test]
+    fn a_live_liquidity_schedule_counts_as_sending_transactions() {
+        let mut cfg = Config::from_toml(&rfq_only_with_signer("")).unwrap();
+        assert!(!cfg.sends_transactions());
+        cfg.modules_enabled = true;
+        cfg.modules.liquidity.enabled = true;
+        cfg.modules.mode = crate::modules::Mode::Shadow;
+        assert!(!cfg.sends_transactions());
+        cfg.modules.mode = crate::modules::Mode::Live;
+        assert!(cfg.sends_transactions() && cfg.on_chain_legs().is_empty());
+        cfg.modules_enabled = false;
+        assert!(!cfg.sends_transactions());
     }
 
     const FIREBLOCKS_SIGNER: &str = r#"

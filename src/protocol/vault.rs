@@ -107,6 +107,30 @@ pub fn encode_closed_redeem_epoch_id() -> Vec<u8> {
     encode_view("closedRedeemEpochId()")
 }
 
+/// The liquid settlement `allocateIdle` never stakes below. Only liquid up to
+/// this floor can back a bundled fill.
+pub fn encode_min_liquid_settlement() -> Vec<u8> {
+    encode_view("minLiquidSettlement()")
+}
+
+/// `setMinLiquidSettlement(uint256)` — operator admin only, and it reverts when
+/// `next` equals the current floor or the vault has no yield adapter. Raising
+/// it recalls nothing; lowering it lets the next `allocateIdle` stake the gap.
+pub fn encode_set_min_liquid_settlement(next: U256) -> Vec<u8> {
+    let mut out = encode_view("setMinLiquidSettlement(uint256)");
+    out.extend_from_slice(&next.to_be_bytes::<32>());
+    out
+}
+
+/// `prepareSettlement(uint256)` — anyone may call. Recalls from the yield
+/// adapter until at least `needed` is liquid; reverts `InsufficientSettlement`
+/// when `needed` exceeds free settlement.
+pub fn encode_prepare_settlement(needed: U256) -> Vec<u8> {
+    let mut out = encode_view("prepareSettlement(uint256)");
+    out.extend_from_slice(&needed.to_be_bytes::<32>());
+    out
+}
+
 /// `epochs(uint256)` — the public getter on the epoch map. Every member is a
 /// value type, so the return is a flat run of 32-byte words in declaration
 /// order; see [`RedeemEpochView::decode`].
@@ -526,6 +550,21 @@ mod tests {
         assert_eq!(
             n & ((U256::from(1u8) << 128) - U256::from(1u8)),
             U256::from(42u64)
+        );
+    }
+
+    /// Pinned against the deployed OperatorVault ABI (viem `toFunctionSelector`).
+    #[test]
+    fn liquidity_calls_match_the_vault_abi() {
+        use alloy_primitives::hex;
+        assert_eq!(hex::encode(encode_min_liquid_settlement()), "1e484871");
+        assert_eq!(
+            hex::encode(encode_set_min_liquid_settlement(U256::from(100u8))),
+            "4901e73c0000000000000000000000000000000000000000000000000000000000000064"
+        );
+        assert_eq!(
+            hex::encode(encode_prepare_settlement(U256::from(100u8))),
+            "bf2179360000000000000000000000000000000000000000000000000000000000000064"
         );
     }
 }

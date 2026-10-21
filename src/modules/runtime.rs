@@ -14,6 +14,10 @@ const ATTEMPTS_FILE: &str = "modules-attempt.json";
 /// The dynamic-spreads price window, so a restart (every module save is one)
 /// resumes warm instead of quoting at the cap until the feed ticks again.
 pub const HISTORY_FILE: &str = "modules-history.json";
+/// A floor change that may still land. Kept across restarts so a pending
+/// lower's quote cap is back in force before the first quote is signed, and
+/// no second floor change goes out while the first can still execute.
+const PENDING_FLOOR_FILE: &str = "liquidity-pending.json";
 pub const MAX_DECISIONS: usize = 200;
 /// Most samples the window keeps: one per second over the longest allowed window.
 const MAX_HISTORY: usize = 3601;
@@ -38,7 +42,17 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 pub struct Balances {
     pub settlement: U256,
     pub corridor: U256,
+    /// Liquid settlement and the floor, from the same read. `None` when
+    /// either view failed.
+    pub liquid: Option<LiquidReading>,
     pub at: u64,
+}
+
+/// `liquidSettlement()` and `minLiquidSettlement()`, read with the balances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiquidReading {
+    pub liquid: U256,
+    pub floor: U256,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Observation {
@@ -90,6 +104,9 @@ pub struct Status {
     pub next_attempt_at: u64,
     #[serde(default)]
     pub quote_status: Option<QuoteStatus>,
+    /// Absent from status files written before the liquidity schedule existed.
+    #[serde(default)]
+    pub liquidity: Option<super::liquidity::LiquidityStatus>,
 }
 #[derive(Serialize, Deserialize)]
 struct Attempt {
@@ -167,6 +184,123 @@ fn spawn_history_writer(dir: &Path, source: String) -> tokio::sync::watch::Sende
     writer
 }
 
+/// A floor change (`setMinLiquidSettlement`) the liquidity loop has signed
+/// and has not seen settle. Saved after it's signed and before its first
+/// broadcast, so a change that can reach the chain is always on disk with the
+/// chain, vault, account and nonce to settle it against, and one a restart
+/// interrupts while the signer waits for approval leaves nothing behind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFloorRecord {
+    pub version: u32,
+    /// Floor it sets, in atomic settlement units.
+    #[serde(with = "atomic")]
+    pub target: U256,
+    /// A lower, which pins the quote cap at `target` until it settles. A
+    /// raise holds the slot and pins what's liquid while that's short of
+    /// `target`.
+    pub lowers: bool,
+    pub chain_id: u64,
+    #[serde(with = "super::manual::address")]
+    pub vault: alloy_primitives::Address,
+    /// The account that signs it. A rotated signer does not settle it.
+    #[serde(with = "super::manual::address")]
+    pub sender: alloy_primitives::Address,
+    pub nonce: u64,
+    /// The signed transaction, 0x-hex. A restart broadcasts it once more, in
+    /// case the run that saved it stopped before broadcasting it. The same
+    /// bytes are the same transaction, so this can complete it but never
+    /// send a second one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_tx: Option<String>,
+}
+
+impl PendingFloorRecord {
+    /// Why this bot can't settle the saved change, or `None` when it can. Its
+    /// nonce and floor only mean something on the chain and vault it was
+    /// signed for, so a bot moved elsewhere must not read them there.
+    pub fn foreign_to(
+        &self,
+        chain_id: u64,
+        vault: Option<alloy_primitives::Address>,
+    ) -> Option<String> {
+        (self.chain_id != chain_id || vault != Some(self.vault)).then(|| {
+            format!(
+                "a liquidity floor change from {} (nonce {}) to vault {} on chain {} may still \
+                 land, but this bot now runs vault {} on chain {chain_id}. Point it back until \
+                 that nonce is used on chain {}, or once you have confirmed that, delete \
+                 {PENDING_FLOOR_FILE}",
+                self.sender,
+                self.nonce,
+                self.vault,
+                self.chain_id,
+                vault.map_or("none".into(), |v| v.to_string()),
+                self.chain_id,
+            )
+        })
+    }
+}
+
+/// Whether an earlier run left a floor change that may still land in `dir`.
+pub fn pending_floor_saved(dir: &Path) -> bool {
+    dir.join(PENDING_FLOOR_FILE).exists()
+}
+
+/// The modules config a bot with modules off runs while it settles a saved
+/// floor change: Preview, every module off. Quotes are left as they are; only
+/// a lower's quote cap applies, and the liquidity loop settles it, then stops.
+pub fn settling_only_config(config: &ModulesConfig) -> ModulesConfig {
+    let mut c = config.clone();
+    c.mode = Mode::Shadow;
+    c.inventory.enabled = false;
+    c.spreads.enabled = false;
+    c.rebalance.enabled = false;
+    c.liquidity.enabled = false;
+    c
+}
+
+/// The saved floor change, if any. Unreadable is an error: starting without
+/// it could quote past a floor that is about to drop.
+fn load_pending_floor(dir: &Path) -> Result<Option<PendingFloorRecord>> {
+    let path = dir.join(PENDING_FLOOR_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let record: PendingFloorRecord = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    ensure!(
+        record.version == VERSION,
+        "unsupported pending liquidity floor change version"
+    );
+    Ok(Some(record))
+}
+
+/// How long the engine trusts a quote cap the liquidity loop has not renewed.
+/// Long enough to ride out a slow vault read; a lower in flight holds it open.
+pub const LIQUIDITY_CAP_TTL_SECS: u64 = 120;
+
+/// The liquidity loop and the RFQ engine meet here. The engine owns the
+/// reservation ledger, so it publishes what live quotes have committed; the
+/// loop owns the schedule, so it publishes the quote cap.
+#[derive(Default)]
+struct LiquidityShared {
+    /// `(committed, the loop's cap in force when the engine measured, measured at)`.
+    commitments: Option<(U256, Option<U256>, u64)>,
+    /// `(cap, valid through)`.
+    cap: Option<(U256, u64)>,
+    /// The target of a raise that may still land. The per-quote shortfall cap
+    /// measures liquid against it, since the venue admits bundles up to it
+    /// the moment it lands.
+    pending_raise: Option<U256>,
+}
+
+impl LiquidityShared {
+    /// The loop's cap, unless it has lapsed.
+    fn scheduled_cap(&self, now: u64) -> Option<U256> {
+        self.cap
+            .filter(|(_, through)| *through >= now)
+            .map(|(cap, _)| cap)
+    }
+}
+
 struct State {
     history: Vec<PricePoint>,
     status: Status,
@@ -181,6 +315,9 @@ pub struct Runtime {
     pub(crate) dir: PathBuf,
     writer: tokio::sync::watch::Sender<Status>,
     history_writer: tokio::sync::watch::Sender<Vec<PricePoint>>,
+    liquidity: Arc<Mutex<LiquidityShared>>,
+    /// The floor change saved by the previous run, as found at startup.
+    saved_floor: Option<PendingFloorRecord>,
 }
 impl Runtime {
     /// `price_source` is the feed URL the module prices come from; it keys
@@ -197,6 +334,25 @@ impl Runtime {
         } else {
             0
         };
+        // A saved lower pins the cap whether or not the schedule is still on:
+        // turning it off does not stop a sent transaction from landing. The
+        // liquidity loop runs until it settles (see `rfq::liquidity`).
+        let saved_floor = load_pending_floor(dir)?;
+        // A live schedule may restart over an unfunded floor or a raise still
+        // landing. Until its first trusted read says what is liquid, quotes
+        // promise no settlement at all (see `rfq::liquidity::publish_cap`).
+        let starting_cap =
+            (config.liquidity.enabled && config.mode == Mode::Live).then_some(U256::ZERO);
+        let liquidity = LiquidityShared {
+            cap: saved_floor
+                .as_ref()
+                .filter(|f| f.lowers)
+                .map(|f| f.target)
+                .or(starting_cap)
+                .map(|cap| (cap, u64::MAX)),
+            pending_raise: saved_floor.as_ref().filter(|f| !f.lowers).map(|f| f.target),
+            ..Default::default()
+        };
         let status = Status {
             version: VERSION,
             config: config.clone(),
@@ -204,6 +360,7 @@ impl Runtime {
             decisions: vec![],
             rebalance_status: "Waiting for fresh vault data".into(),
             next_attempt_at,
+            liquidity: None,
             quote_status: Some(QuoteStatus {
                 at: crate::time::unix_now(),
                 state: QuoteState::WaitingForSession,
@@ -247,6 +404,8 @@ impl Runtime {
             })),
             dir: dir.into(),
             writer,
+            liquidity: Arc::new(Mutex::new(liquidity)),
+            saved_floor,
         })
     }
     pub fn decide(&self, context: &Context) -> Decision {
@@ -397,11 +556,281 @@ impl Runtime {
     pub fn take_quote(&self) -> Option<(dealer::QuoteRequest, dealer::Quote)> {
         self.state.lock().ok()?.ready.take()
     }
+
+    /// The floor change the previous run saved, for the liquidity loop to settle.
+    pub fn saved_pending_floor(&self) -> Option<PendingFloorRecord> {
+        self.saved_floor.clone()
+    }
+    /// Save the pending floor change, or remove it once settled. Must succeed
+    /// before one is broadcast: a restart that lost a lower would quote past
+    /// the new floor, and one that lost a raise could send a second change.
+    pub fn save_pending_floor(&self, pending: Option<PendingFloorRecord>) -> Result<()> {
+        let path = self.dir.join(PENDING_FLOOR_FILE);
+        match pending {
+            Some(record) => write_json(&path, &record),
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// The settlement cap new quotes must respect, if one is in force: the
+    /// liquidity loop's cap, and for a live schedule the liquid shortfall
+    /// from the latest balance read, whichever is lower. The loop runs every
+    /// 15 seconds; balances refresh every couple, so a fill that drains liquid
+    /// under the floor caps the next quote without waiting for the loop.
+    /// A poisoned lock reads as a zero cap: quoting less is the safe failure.
+    pub fn liquidity_quote_cap(&self, now: u64) -> Option<U256> {
+        let Ok(shared) = self.liquidity.lock() else {
+            return Some(U256::ZERO);
+        };
+        match (
+            shared.scheduled_cap(now),
+            self.liquid_shortfall_cap(now, shared.pending_raise),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    /// [`super::liquidity::shortfall_cap`] on the latest balance read, while
+    /// the schedule runs live, and in any mode while a raise may still land.
+    /// Liquid is measured against the higher of the on-chain floor and that
+    /// raise's target. A read that is missing or older than
+    /// [`super::BALANCES_MAX_AGE_SECS`] caps at zero: it can't show that a fill
+    /// hasn't just drained liquid, and quotes should not outlive the read that
+    /// bounds them. That's the same bound the modules hold balances to, and
+    /// about when quote inventory goes dark.
+    fn liquid_shortfall_cap(&self, now: u64, pending_raise: Option<U256>) -> Option<U256> {
+        let live = self.config.liquidity.enabled && self.config.mode == Mode::Live;
+        if !live && pending_raise.is_none() {
+            return None;
+        }
+        let fresh = self
+            .balances
+            .read()
+            .ok()
+            .and_then(|b| *b)
+            .filter(|b| now.saturating_sub(b.at) <= super::BALANCES_MAX_AGE_SECS);
+        let raise = pending_raise.unwrap_or_default();
+        match fresh.and_then(|b| Some((b.liquid?, b.settlement))) {
+            Some((r, free)) => super::liquidity::shortfall_cap(r.liquid, r.floor.max(raise), free),
+            None => Some(U256::ZERO),
+        }
+    }
+    /// Hand the per-quote shortfall cap the target of a raise that may still
+    /// land, or clear it once that raise settles.
+    pub fn set_pending_raise(&self, target: Option<U256>) {
+        if let Ok(mut shared) = self.liquidity.lock() {
+            shared.pending_raise = target;
+        }
+    }
+    /// The liquidity loop's own cap, without the shortfall cap.
+    #[cfg(test)]
+    pub(crate) fn scheduled_quote_cap(&self, now: u64) -> Option<U256> {
+        self.liquidity.lock().ok()?.scheduled_cap(now)
+    }
+    /// Set or clear the cap. `through` is when it lapses unless renewed.
+    pub fn set_liquidity_cap(&self, cap: Option<U256>, through: u64) {
+        if let Ok(mut shared) = self.liquidity.lock() {
+            shared.cap = cap.map(|c| (c, through));
+        }
+    }
+    /// Move the current cap's expiry to `through` without changing the cap.
+    pub fn renew_liquidity_cap(&self, through: u64) {
+        if let Ok(mut shared) = self.liquidity.lock() {
+            if let Some((cap, _)) = shared.cap {
+                shared.cap = Some((cap, through));
+            }
+        }
+    }
+    /// Engine side: what live quotes commit now. Recorded with the loop's own
+    /// cap in force, not the shortfall cap: that one comes and goes with each
+    /// balance read, so it can't vouch that quotes stay under a new floor.
+    pub fn record_liquidity_commitments(&self, committed: U256, now: u64) {
+        if let Ok(mut shared) = self.liquidity.lock() {
+            shared.commitments = Some((committed, shared.scheduled_cap(now), now));
+        }
+    }
+    /// The engine's last measurement, if no older than `max_age` seconds.
+    pub fn liquidity_commitments(
+        &self,
+        now: u64,
+        max_age: u64,
+    ) -> Option<super::liquidity::Commitments> {
+        let shared = self.liquidity.lock().ok()?;
+        let (committed, cap_in_effect, at) = shared.commitments?;
+        (at <= now && now - at <= max_age).then_some(super::liquidity::Commitments {
+            committed,
+            cap_in_effect,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn status_snapshot(&self) -> Status {
+        self.state
+            .lock()
+            .expect("module state poisoned")
+            .status
+            .clone()
+    }
+    pub fn liquidity_status(&self, status: super::liquidity::LiquidityStatus) {
+        let mut s = self.state.lock().expect("module state poisoned");
+        s.status.at = status.at;
+        s.status.liquidity = Some(status);
+        let _ = self.writer.send_replace(s.status.clone());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fill that drains liquid under the floor caps the very next quote
+    /// from the balance read, without waiting for the liquidity loop.
+    #[tokio::test]
+    async fn a_liquid_shortfall_caps_quotes_from_the_balance_read() {
+        let runtime_for = |mode: Mode| {
+            let dir =
+                std::env::temp_dir().join(format!("stitch-shortfall-{}", rand::random::<u64>()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut config = ModulesConfig {
+                mode,
+                ..Default::default()
+            };
+            config.liquidity.enabled = true;
+            Runtime::new(config, &dir, "http://localhost/price").unwrap()
+        };
+        let read = |runtime: &Runtime, liquid: u64, floor: u64| {
+            *runtime.balances.write().unwrap() = Some(Balances {
+                settlement: U256::from(1_000u64),
+                corridor: U256::ZERO,
+                liquid: Some(LiquidReading {
+                    liquid: U256::from(liquid),
+                    floor: U256::from(floor),
+                }),
+                at: 0,
+            });
+        };
+        let live = runtime_for(Mode::Live);
+        // Drop the zero cap a live schedule starts with, as a trusted read would.
+        live.set_liquidity_cap(None, 0);
+        read(&live, 500, 500);
+        assert_eq!(live.liquidity_quote_cap(0), None, "funded");
+        read(&live, 499, 500);
+        assert_eq!(live.liquidity_quote_cap(0), Some(U256::from(499u64)));
+        // The lower of the loop's cap and the shortfall.
+        live.set_liquidity_cap(Some(U256::from(300u64)), u64::MAX);
+        assert_eq!(live.liquidity_quote_cap(0), Some(U256::from(300u64)));
+        live.set_liquidity_cap(Some(U256::from(900u64)), u64::MAX);
+        assert_eq!(live.liquidity_quote_cap(0), Some(U256::from(499u64)));
+        // A read past the age bound, or none yet, can't vouch for liquid.
+        live.set_liquidity_cap(None, 0);
+        read(&live, 500, 500);
+        let max_age = crate::modules::BALANCES_MAX_AGE_SECS;
+        assert_eq!(live.liquidity_quote_cap(max_age), None, "still fresh");
+        assert_eq!(
+            live.liquidity_quote_cap(max_age + 1),
+            Some(U256::ZERO),
+            "stale"
+        );
+        *live.balances.write().unwrap() = None;
+        assert_eq!(live.liquidity_quote_cap(0), Some(U256::ZERO), "no read yet");
+
+        let preview = runtime_for(Mode::Shadow);
+        read(&preview, 0, 500);
+        assert_eq!(preview.liquidity_quote_cap(0), None, "Preview never caps");
+    }
+
+    /// A raise that may still land measures liquid against its target in any
+    /// mode, from the moment a restart loads it.
+    #[tokio::test]
+    async fn a_pending_raise_measures_liquid_against_its_target() {
+        let dir = std::env::temp_dir().join(format!("stitch-raise-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_json(
+            &dir.join(PENDING_FLOOR_FILE),
+            &PendingFloorRecord {
+                version: VERSION,
+                target: U256::from(900u64),
+                lowers: false,
+                chain_id: 8453,
+                vault: alloy_primitives::Address::ZERO,
+                sender: alloy_primitives::Address::ZERO,
+                nonce: 5,
+                signed_tx: None,
+            },
+        )
+        .unwrap();
+        let preview = Runtime::new(
+            ModulesConfig {
+                mode: Mode::Shadow,
+                ..Default::default()
+            },
+            &dir,
+            "http://localhost/price",
+        )
+        .unwrap();
+        *preview.balances.write().unwrap() = Some(Balances {
+            settlement: U256::from(1_000u64),
+            corridor: U256::ZERO,
+            liquid: Some(LiquidReading {
+                liquid: U256::from(300u64),
+                floor: U256::ZERO,
+            }),
+            at: 0,
+        });
+        assert_eq!(preview.liquidity_quote_cap(0), Some(U256::from(300u64)));
+        preview.set_pending_raise(None);
+        assert_eq!(
+            preview.liquidity_quote_cap(0),
+            None,
+            "Preview, nothing pending"
+        );
+    }
+
+    /// A shortfall cap alone never opens the lower gate: it lifts as soon as
+    /// a deposit refills liquid, so only the loop's own cap counts.
+    #[tokio::test]
+    async fn commitments_carry_only_the_loops_own_cap() {
+        let dir =
+            std::env::temp_dir().join(format!("stitch-commitments-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = ModulesConfig {
+            mode: Mode::Live,
+            ..Default::default()
+        };
+        config.liquidity.enabled = true;
+        let live = Runtime::new(config, &dir, "http://localhost/price").unwrap();
+        live.set_liquidity_cap(None, 0);
+        *live.balances.write().unwrap() = Some(Balances {
+            settlement: U256::from(1_000u64),
+            corridor: U256::ZERO,
+            liquid: Some(LiquidReading {
+                liquid: U256::ZERO,
+                floor: U256::from(500u64),
+            }),
+            at: 0,
+        });
+        assert_eq!(live.liquidity_quote_cap(0), Some(U256::ZERO));
+        live.record_liquidity_commitments(U256::ZERO, 0);
+        assert_eq!(
+            live.liquidity_commitments(0, 10).unwrap().cap_in_effect,
+            None
+        );
+
+        live.set_liquidity_cap(Some(U256::from(300u64)), 60);
+        live.record_liquidity_commitments(U256::ZERO, 0);
+        assert_eq!(
+            live.liquidity_commitments(0, 10).unwrap().cap_in_effect,
+            Some(U256::from(300u64))
+        );
+        live.record_liquidity_commitments(U256::ZERO, 61);
+        assert_eq!(
+            live.liquidity_commitments(61, 10).unwrap().cap_in_effect,
+            None,
+            "a lapsed cap is no cap"
+        );
+    }
 
     #[test]
     fn concurrent_writes_to_one_module_file_all_land() {
