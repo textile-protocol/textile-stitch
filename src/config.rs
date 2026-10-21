@@ -44,6 +44,9 @@ pub const MAX_TWAP_MAX_DEVIATION_BPS: u32 = 10_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// Fleet opt-in. Absent or disabled performs no hedge-service requests.
+    #[serde(default)]
+    pub perps: Option<crate::perps::PerpsConfig>,
     /// Master gate for module runtime, recording and panel controls.
     #[serde(default)]
     pub modules_enabled: bool,
@@ -1317,6 +1320,15 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if let Some(perps) = &self.perps {
+            perps.validate()?;
+            if perps.enabled {
+                anyhow::ensure!(
+                    self.chain_id == 42220 && self.rfq_active(),
+                    "FX hedging currently requires a connected Celo Stitch"
+                );
+            }
+        }
         assert_feed_url(&self.feed.url, "[feed].url")?;
         if let Some(gas) = &self.gas {
             assert_gas_ceiling(gas.max_fee_per_gas_gwei, "[gas].max_fee_per_gas_gwei")?;

@@ -1,3 +1,5 @@
+import { PerpsFeature } from './PerpsFeature'
+
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { ApiError, api } from '../api'
@@ -306,6 +308,7 @@ export default function SettingsForm({
             }}
           />
         )}
+        <PerpsFeature key={bot.name} bot={bot} dirty={dirty} />
       </ExperimentalCard>
 
 

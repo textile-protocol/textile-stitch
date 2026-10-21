@@ -28,6 +28,7 @@ pub(crate) use crate::chain::mock_node as mock_chain;
 mod manual_sales;
 mod modules;
 pub mod origin;
+mod perps;
 pub mod session;
 pub mod settings;
 pub mod updates;
@@ -299,6 +300,10 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/signer/awskms/verify", post(wizard::awskms_verify))
         .route("/api/bots", get(bots::list).post(wizard::create))
         .route("/api/bots/{name}", get(bots::show).delete(bots::remove))
+        .route(
+            "/api/bots/{name}/perps",
+            get(perps::show).put(perps::update),
+        )
         .route("/api/bots/{name}/name", patch(bots::rename))
         .route("/api/bots/{name}/start", post(bots::start))
         .route("/api/bots/{name}/stop", post(bots::stop))

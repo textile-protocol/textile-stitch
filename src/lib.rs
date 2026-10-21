@@ -32,6 +32,7 @@ pub mod modules;
 pub mod net;
 #[cfg(feature = "panel")]
 pub mod panel;
+pub mod perps;
 pub mod pricing;
 pub mod protocol;
 pub mod rfq;

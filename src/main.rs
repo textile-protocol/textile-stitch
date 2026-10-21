@@ -749,6 +749,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // RFQ responder: spawned only when `[rfq].enabled`. With the config
     // off this is a no-op. The public ladder is a separate `book_enabled`
     // switch.
+    let perps_task =
+        stitch_bot::perps::maybe_spawn(&cfg, dry_run, std::path::Path::new(&config_path));
     let rfq_task = stitch_bot::rfq::maybe_spawn(
         &cfg,
         signer.clone(),
@@ -870,6 +872,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         tokio::select! {
             _ = &mut shutdown => {
                 info!("shutdown signal received; stopping after current tick");
+                if let Some(task) = &perps_task { task.abort(); }
                 if let Some(task) = &rfq_task {
                     task.abort();
                 }

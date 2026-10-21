@@ -83,7 +83,7 @@ export function notifyUnauthorized() {
 async function request<T>(
   path: string,
   init?: RequestInit,
-  readBody?: (res: Response) => Promise<T>,
+  readBody?: (res: Response) => Promise<T>
 ): Promise<T> {
   let res: Response
   try {
@@ -127,7 +127,7 @@ async function requestText(path: string): Promise<string> {
 }
 
 async function readError(
-  res: Response,
+  res: Response
 ): Promise<{ message: string; body: unknown }> {
   const body = await res.text().catch(() => '')
   try {
@@ -170,6 +170,18 @@ export interface DesktopSwitches {
 }
 
 export const api = {
+  perps: (name: string) =>
+    request<{
+      enabled: boolean
+      assignmentId: string
+      unavailable: boolean
+      remote: null | { control: null | { mode: string }; effectiveMode: string }
+    }>(`/api/bots/${encodeURIComponent(name)}/perps`),
+  setPerps: (name: string, assignmentId: string, mode: string) =>
+    request(`/api/bots/${encodeURIComponent(name)}/perps`, {
+      method: 'PUT',
+      body: JSON.stringify({ assignmentId, mode }),
+    }),
   manualSales: (name: string) =>
     request<ManualSale[]>(
       `/api/bots/${encodeURIComponent(name)}/modules/manual-sales`
@@ -187,8 +199,13 @@ export const api = {
       `/api/bots/${encodeURIComponent(name)}/modules/manual-sales/${encodeURIComponent(id)}/close`,
       json({})
     ),
-  modules: (name: string) => request<ModulesView>(`/api/bots/${encodeURIComponent(name)}/modules`),
-  saveModules: (name: string, revision: string, config: ModulesConfig) => request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/modules`, { method: 'PUT', body: JSON.stringify({ revision, config }) }),
+  modules: (name: string) =>
+    request<ModulesView>(`/api/bots/${encodeURIComponent(name)}/modules`),
+  saveModules: (name: string, revision: string, config: ModulesConfig) =>
+    request<SaveResult>(`/api/bots/${encodeURIComponent(name)}/modules`, {
+      method: 'PUT',
+      body: JSON.stringify({ revision, config }),
+    }),
   /** The desktop app's own switches, relayed through the panel. */
   desktop: () => request<DesktopSwitches>('/api/desktop'),
   setDesktop: (body: { autostart?: boolean; keepAwake?: boolean }) =>
@@ -198,7 +215,8 @@ export const api = {
     }),
 
   session: () => request<SessionInfo>('/api/session'),
-  login: (password: string) => request<SessionInfo>('/api/login', json({ password })),
+  login: (password: string) =>
+    request<SessionInfo>('/api/login', json({ password })),
   logout: () => request<unknown>('/api/logout', { method: 'POST' }),
 
   /**
@@ -226,7 +244,7 @@ export const api = {
   feedMid: (url: string, signal?: AbortSignal) =>
     request<FeedMid>(
       `/api/feed/mid?url=${encodeURIComponent(url)}`,
-      signal ? { signal } : undefined,
+      signal ? { signal } : undefined
     ),
 
   createBot: (body: unknown) =>
@@ -240,7 +258,7 @@ export const api = {
   generateWallet: () =>
     request<{ address: string; seedPhrase: string }>(
       '/api/wallets/generate',
-      json({}),
+      json({})
     ),
 
   /**
@@ -258,7 +276,7 @@ export const api = {
   }) =>
     request<{ vaults: { id: string; name: string }[] }>(
       '/api/signer/fireblocks/vaults',
-      json(body),
+      json(body)
     ),
 
   /**
@@ -279,7 +297,7 @@ export const api = {
   }) =>
     request<{ address: string; assetId: string; latencyMs: number }>(
       '/api/signer/fireblocks/verify',
-      json(body),
+      json(body)
     ),
 
   /**
@@ -295,7 +313,7 @@ export const api = {
   }) =>
     request<{ address: string; protectionLevel: string; latencyMs: number }>(
       '/api/signer/gcpkms/verify',
-      json(body),
+      json(body)
     ),
 
   /**
@@ -311,7 +329,10 @@ export const api = {
     region?: string
     apiBaseUrl?: string
   }) =>
-    request<{ address: string; latencyMs: number }>('/api/signer/awskms/verify', json(body)),
+    request<{ address: string; latencyMs: number }>(
+      '/api/signer/awskms/verify',
+      json(body)
+    ),
 
   /**
    * Dry-run: which other bots already use this signer on this chain. Used to warn
@@ -353,7 +374,7 @@ export const api = {
   rollback: (name: string, tag: string) =>
     request<ActionResult>(
       `/api/bots/${encodeURIComponent(name)}/rollback`,
-      json({ tag }),
+      json({ tag })
     ),
 
   // `acceptLedgerLoss` is for the second attempt only. The first rolls back when
@@ -362,19 +383,19 @@ export const api = {
   migrate: (name: string, acceptLedgerLoss = false) =>
     request<MigrationResult>(
       `/api/bots/${encodeURIComponent(name)}/migrate?acceptLedgerLoss=${acceptLedgerLoss}`,
-      { method: 'POST' },
+      { method: 'POST' }
     ),
 
   remove: (name: string, deleteConfig: boolean) =>
     request<{ message: string }>(
       `/api/bots/${encodeURIComponent(name)}?deleteConfig=${deleteConfig}`,
-      { method: 'DELETE' },
+      { method: 'DELETE' }
     ),
 
   settings: (name: string, pool: number, signal?: AbortSignal) =>
     request<Settings>(
       `/api/bots/${encodeURIComponent(name)}/settings?pool=${pool}`,
-      signal ? { signal } : undefined,
+      signal ? { signal } : undefined
     ),
 
   saveSettings: (name: string, patch: unknown) =>
@@ -385,9 +406,7 @@ export const api = {
 
   /** Per-token Permit2 allowance status across every corridor this bot quotes. */
   allowances: (name: string) =>
-    request<Allowances>(
-      `/api/bots/${encodeURIComponent(name)}/allowances`,
-    ),
+    request<Allowances>(`/api/bots/${encodeURIComponent(name)}/allowances`),
 
   /**
    * Wallet balances, dollar values, gas and Permit2 state in one read, plus the
@@ -403,7 +422,8 @@ export const api = {
    */
   approveUrl: (name: string) => `/api/bots/${encodeURIComponent(name)}/approve`,
   /** URL of the withdraw one-shot; same streaming shape as approve. */
-  withdrawUrl: (name: string) => `/api/bots/${encodeURIComponent(name)}/withdraw`,
+  withdrawUrl: (name: string) =>
+    `/api/bots/${encodeURIComponent(name)}/withdraw`,
 
   /**
    * Send one Permit2 approval through the bot's custodian.
@@ -415,7 +435,7 @@ export const api = {
   approveViaCustody: (name: string, token: string) =>
     request<CustodyApproval>(
       `/api/bots/${encodeURIComponent(name)}/approve/custody`,
-      { method: 'POST', body: JSON.stringify({ token }) },
+      { method: 'POST', body: JSON.stringify({ token }) }
     ),
 
   enrollRfq: (name: string) =>
@@ -428,22 +448,25 @@ export const api = {
   verifyRfqEmail: (name: string, body: { contactEmail: string }) =>
     request<RfqEmailResult>(
       `/api/bots/${encodeURIComponent(name)}/rfq/verify-email`,
-      { method: 'POST', body: JSON.stringify(body) },
+      { method: 'POST', body: JSON.stringify(body) }
     ),
 
   checkRfqStatus: (name: string) =>
     request<RfqStatusResult>(
       `/api/bots/${encodeURIComponent(name)}/rfq/status`,
-      { method: 'POST', body: JSON.stringify({}) },
+      { method: 'POST', body: JSON.stringify({}) }
     ),
 
   /** Run every vault check against this bot. Writes nothing. */
   checkVault: (name: string, address: string, signal?: AbortSignal) =>
-    request<VaultCheckResult>(`/api/bots/${encodeURIComponent(name)}/vault/check`, {
-      method: 'POST',
-      body: JSON.stringify({ address }),
-      signal,
-    }),
+    request<VaultCheckResult>(
+      `/api/bots/${encodeURIComponent(name)}/vault/check`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ address }),
+        signal,
+      }
+    ),
 
   /**
    * Move the bot onto a vault: the same checks, then a Textile re-connect with
@@ -453,7 +476,7 @@ export const api = {
   linkVault: (name: string, address: string) =>
     request<VaultLinkResult>(
       `/api/bots/${encodeURIComponent(name)}/vault`,
-      json({ address }),
+      json({ address })
     ),
 
   /**
@@ -463,7 +486,7 @@ export const api = {
   setModulesEnabled: (name: string, enabled: boolean) =>
     request<SaveResult>(
       `/api/bots/${encodeURIComponent(name)}/modules/enabled`,
-      { method: 'PUT', body: JSON.stringify({ enabled }) },
+      { method: 'PUT', body: JSON.stringify({ enabled }) }
     ),
 
   /** Back to the bot's own wallet: re-connects to Textile and restarts. */
@@ -474,7 +497,7 @@ export const api = {
 
   rawConfig: (name: string) =>
     request<{ toml: string; path: string; editable: boolean }>(
-      `/api/bots/${encodeURIComponent(name)}/config`,
+      `/api/bots/${encodeURIComponent(name)}/config`
     ),
 
   saveRawConfig: (name: string, toml: string) =>
@@ -482,8 +505,6 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ toml }),
     }),
-
-
 
   /** Append a same-chain catalog corridor as another [[pools]] entry. */
   addPool: (name: string, corridorId: string) =>
@@ -499,7 +520,7 @@ export const api = {
   removePool: (name: string, index: number, collateral: string, debt: string) =>
     request<SaveResult>(
       `/api/bots/${encodeURIComponent(name)}/pools/${index}?collateral=${encodeURIComponent(collateral)}&debt=${encodeURIComponent(debt)}`,
-      { method: 'DELETE' },
+      { method: 'DELETE' }
     ),
 
   /** Registry digest check: which bots (and the panel) are behind. */
@@ -532,7 +553,10 @@ export const api = {
 }
 
 function act(name: string, what: string): Promise<ActionResult> {
-  return request<ActionResult>(`/api/bots/${encodeURIComponent(name)}/${what}`, {
-    method: 'POST',
-  })
+  return request<ActionResult>(
+    `/api/bots/${encodeURIComponent(name)}/${what}`,
+    {
+      method: 'POST',
+    }
+  )
 }
