@@ -6,6 +6,7 @@ import { Banner, Button, Field, Input, Select, TextArea } from './ui'
 import { GuideLink } from './GuideSheet'
 import AwsKmsGuide from './AwsKmsGuide'
 import GcpKmsGuide from './GcpKmsGuide'
+import FireblocksGuide from './FireblocksGuide'
 
 export type SignerKind = 'local' | 'fireblocks' | 'turnkey' | 'mpcvault' | 'gcpkms' | 'awskms'
 /** How the local hot wallet is provided. Create is the default. */
@@ -789,6 +790,10 @@ function FireblocksFields({
 
   return (
     <div className="space-y-3">
+      <GuideLink label="Set up Fireblocks step by step" title="Set up a Fireblocks signer">
+        <FireblocksGuide />
+      </GuideLink>
+
       <Field label="Workspace region">
         <Select
           value={apiBaseUrl}

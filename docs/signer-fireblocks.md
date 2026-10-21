@@ -54,11 +54,14 @@ not work for a quoting bot.
 
 On the **Developer Sandbox** you can skip this entirely: sandboxes ship with an
 API user already created and wired to Fireblocks' Communal Test Co-signer. Look
-under **Settings → Users** for the existing one rather than adding another. See
-[Testing against the Fireblocks sandbox](#testing-against-the-fireblocks-sandbox).
+under **Developer Center → API users** for the existing one, and use it if you
+still have its private key. Otherwise add your own with the **Non-Signing
+Admin** role: a Sandbox has no Signer role, and Non-Signing Admin signs there.
+See [Testing against the Fireblocks sandbox](#testing-against-the-fireblocks-sandbox).
 
-With a co-signer in place, go to **Settings → Users → Add user** and create an
-**API user** with the **Signer** role. Two roles that look plausible and are not:
+With a co-signer in place, go to **Developer Center → API users → Add API
+user**, give it the **Signer** role, and pick the co-signer under **Co-signer
+setup**. Two roles that look plausible and are not:
 
 - **Editor** / **Viewer**: these read your vaults fine and then fail on the
   first sign. Signing is exactly what they can't do.
@@ -70,18 +73,20 @@ Fireblocks asks for a CSR. Generate the key pair locally:
 
 ```bash
 openssl req -new -newkey rsa:4096 -nodes \
-  -keyout fireblocks_secret.key -out fireblocks.csr
+  -keyout fireblocks_secret.key -out fireblocks.csr -subj "/O=stitch"
 ```
 
-`openssl req` will prompt for country, organisation and so on; Fireblocks does
-not care what you put, so press enter through them, or skip the prompts with
-`-subj "/CN=stitch"`. `-nodes` means "don't encrypt the private key", which is
-required: the bot reads it unattended and there is nobody to type a passphrase.
+`openssl req` will prompt for country, organisation and so on. Fireblocks' own
+example sets only the organisation, so skip the prompts with `-subj "/O=stitch"`.
+`-nodes` means "don't encrypt the private key", which is required: the bot
+reads it unattended and there is nobody to type a passphrase.
 
-That one command writes **both** files. Upload `fireblocks.csr`. It is the
-public half and not sensitive. Keep `fireblocks_secret.key`; that's the secret,
-Fireblocks never sees it, and it is the file you give the panel. When the user is
-approved you get the **API key** (a UUID). That plus the key file is everything.
+That one command writes **both** files. Upload `fireblocks.csr` as the **CSR
+file**. It is the public half and not sensitive. Keep `fireblocks_secret.key`;
+that's the secret, Fireblocks never sees it, and it is the file you give the
+panel. The Owner and your admin quorum approve the new user on the mobile app.
+Its **API key** (a UUID) is in the **API User (ID)** column of the API users
+list. That plus the key file is everything.
 
 ## 2. Pick (or create) the vault account
 
@@ -105,8 +110,10 @@ need it.
 This is the step people miss, and the failure is opaque without it: signing
 requests come back `BLOCKED` or `REJECTED`.
 
-In the console, go to **Policies** and add a **Typed Message** rule that allows
-your API user to sign for the operator vault account. Scope it to that vault
+In the console, go to **Policies**, open the **Typed message** policy, and use
+**Edit policy → Add rule** to allow your API user (**Initiator**) to sign for the
+operator vault account (**Source**). Then **Publish policy**; your approval group
+approves the change on the mobile app. Scope the rule to that vault
 account. A rule that allows typed-message signing for the whole workspace lets
 this key sign for vaults it has nothing to do with.
 
@@ -254,7 +261,9 @@ What you need:
    contract call is an arbitrary transaction, so an auto-approving rule lets
    anyone holding the bot's credentials move the vault however they like, which
    is the containment this whole backend exists to give you. Route it to a human
-   approver or to an allowlist of the token contracts. Approvals are rare and
+   approver or to an allowlist of the token contracts. With **Request
+   approval**, leave **Transaction initiator can approve** off: with it on and a
+   threshold of 1, the bot approves its own calls. Approvals are rare and
    you're at the panel when they happen, and the request waits 3 minutes for the
    call to mine, so there's time to approve it in the console.
 2. A little native gas in the vault on the chain you're trading. The approve is
