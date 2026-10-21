@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.321"
+version = "0.1.322"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; quotes Swap via RFQ firm quotes and optionally fills resting limit orders."
 license = "AGPL-3.0-or-later"
@@ -126,6 +126,7 @@ libc = "0.2"
 gtk = { version = "0.18", optional = true }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 bytes = "1.12.1"
 hex = "0.4"
 tower = { version = "0.5.3", features = ["util"] }

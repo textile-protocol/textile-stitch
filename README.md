@@ -368,6 +368,73 @@ recommended for volatile pairs like WETH), ladder sizing, and the limit-order
 taker, see the
 [configuration reference in ADVANCED.md](docs/ADVANCED.md#configuration-reference).
 
+### Price guard
+
+Two checks guard the feed and every order Stitch signs, for vault and EOA
+makers alike.
+They are on with no config; `[price_guard]` tunes them.
+
+The **jump guard** watches each feed. RFQ and the ladder/taker/closer tick
+loop share one live history, cached price and hold status per feed URL.
+A hold or failed read in either loop removes the quote for both; a cache
+read by another pool does not count as another confirming observation.
+Recovery and the candidate's settling clock are shared too. Admission uses
+the widest consumer window (`[feed].staleness_secs`); each consumer still
+applies its own freshness limit. Even a sample too old for RFQ must pass
+the jump guard if the ladder could use it. A print more than `max_jump_bps`
+(default 1000, 10 %) away from the last one Stitch trusted is held back: RFQ
+rejects quote requests as `stale_feed`, publishes no levels for the
+corridor, and the ladder, taker and closer skip the pool, until the feed
+comes back near the trusted price. If the feed instead holds the new level
+for `settle_secs` (default 300) by its own timestamps, Stitch takes it as a
+real move, logs a warning and quotes again. An older print from a lagging
+replica is quotable if it is in line and never moves the reference back.
+The last trusted print is saved in `price-guard/` beside `stitch.toml`, so
+a restart judges the first print against it instead of starting over:
+restarting does not make a held 10x print trusted. To take a new level at
+once rather than wait `settle_secs`, delete that folder and restart. With
+nothing saved (a first start, a dry run) the first print is not trusted
+until a fetch started at least one second after the candidate's poll agrees
+with it. Concurrent RFQ and tick fetches cannot confirm one another, even
+if a response is delayed; the later poll may return the same cached sample.
+If the feed gave two
+prices more than `max_jump_bps` apart for the same timestamp, nothing at or
+before that timestamp is trusted after a restart, and the first newer print
+waits for a second read the same way. Nearer prices for one timestamp are
+normal on live feeds (the price API reports whole seconds) and are judged
+like any other print. This catches a 10x
+print, a decimal slip and a swapped pair as they happen. It cannot catch a
+feed that is wrong from the start, drifts in small steps, or stays wrong
+past `settle_secs`; that needs a second source.
+
+The **price band** is the last check on every order Stitch signs: a firm
+quote, a ladder order, a module rebalance sale. The maker must receive at least `1 − max_loss_bps`
+(default 1500, 15 %) of what it gives is worth at the feed print, computed
+exactly on the signed amounts. Stitch's own spreads never get near it; it
+is there for amount math that came out wrong, and a level that fails it is
+not published; a ladder side with an order that fails it posts nothing that
+tick. Once every ladder signature returns, Stitch re-fetches the feed and
+checks freshness, degraded/jump status and the signed amounts again. A
+refusal withholds the whole batch and skips the rest of that pool's tick.
+Before starting the taker or closer, Stitch also checks that the tick's
+price is still current and usable in the shared cache.
+The taker and closer legs sign no order of their own (they take other
+people's at prices through Stitch's quotes), so only the jump guard applies
+to them. It judges with the pool's configured `*_decimals`, so it
+cannot see a wrong decimals setting; Warp, which reads decimals on-chain,
+can. For a vault maker keep it at or inside the vault's Warp band (also
+1500 by default): Warp runs the same rule, and a quote Warp refuses reaches
+the venue as an invalid reply.
+
+```toml
+[price_guard]
+max_loss_bps = 1500
+max_jump_bps = 1000
+settle_secs = 300
+```
+
+With modules on, the panel's module status shows why a corridor is held.
+
 ## Security Notes
 
 - Keep `STITCH_PRIVATE_KEY` out of `stitch.toml`, shell history, and process

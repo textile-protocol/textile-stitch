@@ -69,6 +69,8 @@ pub enum QuoteState {
     WaitingForVault,
     WaitingForPrice,
     StalePrice,
+    /// The jump guard is holding the latest print back.
+    SuspectPrice,
     NoCorridor,
     Evaluating,
 }
@@ -337,6 +339,11 @@ impl Runtime {
     pub(crate) fn current_quote_status(&self) -> Option<QuoteStatus> {
         let s = self.state.lock().expect("module state poisoned");
         s.status.quote_status.clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn rebalance_status_for_test(&self) -> String {
+        let s = self.state.lock().expect("module state poisoned");
+        s.status.rebalance_status.clone()
     }
     pub fn status(&self, message: impl Into<String>) {
         let mut s = self.state.lock().expect("module state poisoned");

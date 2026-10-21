@@ -6,9 +6,16 @@
 //! into a two-sided bid/ask with the operator's spread, [`lean`] tilts those
 //! spreads against live inventory so the book self-rebalances, and [`tick`]
 //! decides when the feed is too stale to quote and when a move is worth
-//! re-signing. Pure math over plain numbers — no chain, no network.
+//! re-signing. [`jump`] holds quoting when a print jumps away from the last
+//! one trusted, and [`band`] is the last check on a firm order before it is
+//! signed. Pure math over plain numbers — no chain, no network — except
+//! [`cache`], which shares live references, and [`anchor`], which keeps the jump guard's trusted print on disk.
 
+pub mod anchor;
+pub mod band;
+pub mod cache;
 pub mod feed;
+pub mod jump;
 pub mod lean;
 pub mod quote;
 pub mod tick;

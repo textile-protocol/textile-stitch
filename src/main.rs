@@ -37,7 +37,8 @@ use stitch_bot::closer::executor::encode_balance_of;
 use stitch_bot::closer::runner::{close_pool_once, CloseOutcome, CloserPool};
 use stitch_bot::closer::strategy::{PoolParams, StrategyConfig};
 use stitch_bot::config::{Config, PoolConfig};
-use stitch_bot::pricing::feed::{HttpFeed, PriceFeed};
+use stitch_bot::pricing::cache::{FeedPolicy, PriceCache};
+use stitch_bot::pricing::feed::{HttpFeed, PriceFeed, Quote};
 use stitch_bot::pricing::lean::{LeanDecision, LeanMode, LeanParams, LeanState};
 use stitch_bot::pricing::quote::oracle_rate_ray;
 use stitch_bot::pricing::quote::{ask_price, bid_price, SpotDeviationGuard};
@@ -157,6 +158,65 @@ fn log_lean(
             "lean quote"
         ),
         LeanMode::Off => {}
+    }
+}
+
+/// Fetch each URL once per tick, but always read its current shared state.
+/// A second pool never turns cache reuse into a confirming observation, and
+/// a hold seen by RFQ cannot be bypassed by a tick-local cached verdict.
+struct FeedGuards {
+    prices: PriceCache,
+    staleness_secs: u64,
+    fetched: std::collections::HashSet<String>,
+}
+
+impl FeedGuards {
+    fn new(prices: PriceCache, staleness_secs: u64) -> Self {
+        Self {
+            prices,
+            staleness_secs,
+            fetched: Default::default(),
+        }
+    }
+
+    fn begin_tick(&mut self) {
+        self.fetched.clear();
+    }
+
+    async fn fetch(&mut self, feed_url: &str, feed: &impl PriceFeed) -> Option<Quote> {
+        if self.fetched.insert(feed_url.to_string()) {
+            let started = tokio::time::Instant::now();
+            match feed.fetch().await {
+                Ok(quote) => {
+                    self.prices.admit(started, feed_url, quote, unix_now());
+                }
+                Err(e) => {
+                    warn!(feed = %feed_url, error = %e, "feed fetch failed; skipping its pools this tick");
+                    self.prices.invalidate(feed_url);
+                }
+            }
+        }
+        self.prices.get(feed_url)
+    }
+
+    /// Read again after signing. Admission uses the same live history as
+    /// RFQ; any refusal is visible to both loops before the batch can post.
+    async fn revalidate(&mut self, feed_url: &str, feed: &impl PriceFeed) -> Option<f64> {
+        self.fetched.remove(feed_url);
+        let quote = self.fetch(feed_url, feed).await?;
+        usable(&quote, unix_now(), self.staleness_secs).ok()?;
+        Some(quote.price)
+    }
+
+    /// Async work earlier in the pool may have let either loop supersede
+    /// its snapshot. Do not start another leg using that old price surface.
+    fn is_current(&self, feed_url: &str, quote: &Quote) -> bool {
+        let now = unix_now();
+        self.prices.get(feed_url).is_some_and(|current| {
+            current.price == quote.price
+                && usable(&current, now, self.staleness_secs).is_ok()
+                && usable(quote, now, self.staleness_secs).is_ok()
+        })
     }
 }
 
@@ -669,6 +729,23 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         info!("public ladder off — this bot will not rest orders on the book");
     }
 
+    // One live history/cache per feed URL for both producers. A dry run
+    // neither reads nor writes restart anchors.
+    let anchor_dir = (!dry_run)
+        .then(|| std::path::Path::new(&config_path).parent())
+        .flatten();
+    // RFQ's per-book windows are bounded by the ladder window. Admission
+    // uses that widest window regardless of which loop fetched the sample;
+    // a quote usable by any reader must always pass the jump guard.
+    let prices = PriceCache::new(
+        anchor_dir,
+        FeedPolicy {
+            jump: cfg.price_guard.jump(),
+            staleness_secs: cfg.feed.staleness_secs,
+        },
+    );
+    let mut feed_guards = FeedGuards::new(prices.clone(), cfg.feed.staleness_secs);
+
     // RFQ responder: spawned only when `[rfq].enabled`. With the config
     // off this is a no-op. The public ladder is a separate `book_enabled`
     // switch.
@@ -677,6 +754,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         signer.clone(),
         dry_run,
         std::path::Path::new(&config_path).parent(),
+        prices,
     );
 
     // Per closer pool: position id → unix time we last submitted a fill for it,
@@ -749,6 +827,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
         reader,
         state_path: &slot_nonce_state_path,
         gas_reserve,
+        max_loss_bps: cfg.price_guard.max_loss_bps,
     };
     // Sides quoting "max" liquidity target an even share of each token's funded
     // balance instead of letting the first corridor keep draining it.
@@ -799,27 +878,23 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             _ = interval.tick() => {}
         }
         let mut budgets = TickBudgets::new(max_sides_by_token.clone());
+        feed_guards.begin_tick();
 
         'pools: for (pool_idx, pool) in cfg.pools.iter().enumerate() {
             // Each pool prices off its own feed (or the bot-level default).
             let feed_url = pool.feed_url.as_deref().unwrap_or(cfg.feed.url.as_str());
-            let quote = match feeds
-                .get(feed_url)
-                .expect("feed built at startup")
-                .fetch()
-                .await
-            {
-                Ok(q) => q,
-                Err(e) => {
-                    warn!(feed = %feed_url, error = %e, "feed fetch failed; skipping pool");
-                    continue;
-                }
+            let feed = feeds.get(feed_url).expect("feed built at startup");
+            let Some(quote) = feed_guards.fetch(feed_url, feed).await else {
+                continue;
             };
             // Read the clock per pool, AFTER the awaited fetch — not once at
             // tick start. Earlier pools' signing/posting awaits (or the fetch
             // itself) can stall past the TWAP window; a tick-start `now` would
             // understate that gap, defeat the TWAP's bot-observation-gap
             // reset, and place the averaging window in the pre-stall past.
+            // A pool sharing an earlier pool's feed reuses that pool's print,
+            // so the stall ages it too: `usable` below judges its age against
+            // this `now`.
             let now = unix_now();
             // A fresh timestamp with a garbage price (zero, negative, NaN), or
             // a print the feed flags degraded, is as untradeable as a stale
@@ -842,7 +917,6 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     continue;
                 }
             }
-
             let (debt, collateral): (Address, Address) =
                 match (pool.debt.parse(), pool.collateral.parse()) {
                     (Ok(d), Ok(c)) => (d, c),
@@ -948,14 +1022,16 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         collateral,
                         side,
                         mid,
+                        spot,
                         price_override,
                         guard,
                         now,
+                        feed_guards.revalidate(feed_url, feed),
                     )
                     .await;
                     match outcome {
-                        // The nonce ledger could not be persisted; never post on a
-                        // stale ledger. Skip the rest of this pool's tick.
+                        // A ledger failure or a post-sign price refusal makes
+                        // the rest of this pool's tick unsafe too.
                         SideOutcome::AbortPool => continue 'pools,
                         SideOutcome::Done { posted, fills } => {
                             if fills > 0 {
@@ -990,6 +1066,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             // ----- Taker leg: fill users' resting limit orders that crossed our
             // own quote (a user ask at/below our bid, a user bid at/above our
             // ask). Same feed tick, same spreads — no separate strategy. -----
+            if !feed_guards.is_current(feed_url, &quote) {
+                continue 'pools;
+            }
             if let Some(fee_bps) = taker_fee_bps {
                 if pool.limit_taker_enabled() {
                     // With the lean live, the taker prices off the same lean
@@ -1073,6 +1152,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             }
 
             // ----- Blue leg: close this pool's in-the-money auction positions. -----
+            if !feed_guards.is_current(feed_url, &quote) {
+                continue 'pools;
+            }
             if let Some(discoverer) = discoverer.as_ref() {
                 if pool.closer_enabled() {
                     let closer_pool = match build_closer_pool(pool) {
@@ -1139,6 +1221,314 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn quote(price: f64, timestamp: u64) -> Quote {
+        Quote {
+            price,
+            timestamp,
+            degraded: false,
+        }
+    }
+
+    use stitch_bot::pricing::jump::Hold;
+
+    fn prices() -> PriceCache {
+        PriceCache::new(
+            None,
+            FeedPolicy {
+                jump: stitch_bot::config::PriceGuardConfig::default().jump(),
+                staleness_secs: 300,
+            },
+        )
+    }
+
+    fn guards(prices: PriceCache) -> FeedGuards {
+        FeedGuards::new(prices, 300)
+    }
+
+    struct Ticking(std::sync::atomic::AtomicU64);
+
+    impl PriceFeed for Ticking {
+        async fn fetch(&self) -> anyhow::Result<Quote> {
+            let at = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(quote(10.0, at))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_pools_on_one_feed_do_not_confirm_a_cold_start_in_one_tick() {
+        let now = unix_now();
+        let feed = Ticking(std::sync::atomic::AtomicU64::new(now - 1));
+        let mut g = guards(prices());
+        assert_eq!(g.fetch("a", &feed).await, None);
+        assert_eq!(g.fetch("a", &feed).await, None);
+        assert_eq!(g.prices.hold("a"), Some(Hold::WarmingUp));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        g.begin_tick();
+        assert_eq!(g.fetch("a", &feed).await, Some(quote(10.0, now)));
+        assert_eq!(g.fetch("a", &feed).await, Some(quote(10.0, now)));
+    }
+
+    struct Down;
+
+    impl PriceFeed for Down {
+        async fn fetch(&self) -> anyhow::Result<Quote> {
+            anyhow::bail!("connection refused")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_skips_every_pool_on_the_feed_for_the_tick() {
+        let mut g = guards(prices());
+        assert_eq!(g.fetch("a", &Down).await, None);
+        let now = unix_now();
+        let feed = Ticking(now.into());
+        assert_eq!(g.fetch("a", &feed).await, None);
+        assert_eq!(feed.0.load(std::sync::atomic::Ordering::SeqCst), now);
+        g.begin_tick();
+        assert_eq!(g.fetch("a", &feed).await, None); // first healthy read only
+        assert_eq!(g.prices.hold("a"), Some(Hold::WarmingUp));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rfq_and_tick_share_holds_recovery_and_cached_pool_reads() {
+        let now = unix_now();
+        let rfq = prices();
+        let mut tick = guards(rfq.clone());
+        let feed = MutableFeed(std::sync::RwLock::new(Some(quote(1.0, now))));
+        assert_eq!(tick.fetch("a", &feed).await, None);
+        // Its concurrent startup response cannot confirm the tick's candidate.
+        rfq.admit(tokio::time::Instant::now(), "a", quote(1.0, now), now);
+        assert_eq!(tick.fetch("a", &Down).await, None);
+        assert_eq!(rfq.hold("a"), Some(Hold::WarmingUp));
+        // RFQ's next poll confirms the same shared candidate.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        rfq.admit(tokio::time::Instant::now(), "a", quote(1.0, now), now);
+        assert_eq!(tick.fetch("a", &Down).await, Some(quote(1.0, now)));
+        // RFQ sees a conflicting replica at the same timestamp. Its hold
+        // removes the quote even for a pool reusing this tick's old fetch.
+        rfq.admit(tokio::time::Instant::now(), "a", quote(10.0, now), now);
+        assert_eq!(tick.fetch("a", &Down).await, None);
+        assert!(!tick.is_current("a", &quote(1.0, now)));
+        assert!(matches!(rfq.hold("a"), Some(Hold::Jumped { .. })));
+        // A fresh fetch back at the trusted level recovers both readers.
+        tick.begin_tick();
+        assert_eq!(tick.fetch("a", &feed).await, Some(quote(1.0, now)));
+        assert_eq!(rfq.get("a"), Some(quote(1.0, now)));
+        assert_eq!(rfq.hold("a"), None);
+        // A jump first seen by the tick loop likewise invalidates RFQ.
+        *feed.0.write().unwrap() = Some(quote(10.0, now));
+        tick.begin_tick();
+        assert_eq!(tick.fetch("a", &feed).await, None);
+        assert_eq!(rfq.get("a"), None);
+        // Repeated reads in either loop cannot warm up a separate baseline.
+        rfq.admit(tokio::time::Instant::now(), "a", quote(10.0, now), now);
+        assert_eq!(rfq.get("a"), None);
+        tick.begin_tick();
+        assert_eq!(tick.fetch("a", &feed).await, None);
+        // Histories remain isolated by URL.
+        assert_eq!(rfq.hold("b"), None);
+        rfq.admit(tokio::time::Instant::now(), "b", quote(10.0, now), now);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        rfq.admit(tokio::time::Instant::now(), "b", quote(10.0, now), now);
+        assert_eq!(rfq.get("b"), Some(quote(10.0, now)));
+        assert_eq!(rfq.get("a"), None);
+    }
+
+    struct MutableFeed(std::sync::RwLock<Option<Quote>>);
+
+    impl PriceFeed for MutableFeed {
+        async fn fetch(&self) -> anyhow::Result<Quote> {
+            self.0
+                .read()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("feed unavailable"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_startup_tick_response_cannot_confirm_the_rfq_candidate() {
+        struct DelayedFeed {
+            sample: Quote,
+            entered: tokio::sync::Notify,
+            resume: tokio::sync::Semaphore,
+        }
+        impl PriceFeed for DelayedFeed {
+            async fn fetch(&self) -> anyhow::Result<Quote> {
+                self.entered.notify_one();
+                self.resume.acquire().await.unwrap().forget();
+                Ok(self.sample.clone())
+            }
+        }
+        let now = unix_now();
+        let rfq = prices();
+        let mut tick = guards(rfq.clone());
+        let feed = DelayedFeed {
+            sample: quote(1.0, now),
+            entered: tokio::sync::Notify::new(),
+            resume: tokio::sync::Semaphore::new(0),
+        };
+        let (result, ()) = tokio::join!(tick.fetch("a", &feed), async {
+            feed.entered.notified().await;
+            rfq.admit(tokio::time::Instant::now(), "a", quote(1.0, now), now);
+            tokio::time::advance(Duration::from_secs(5)).await;
+            feed.resume.add_permits(1);
+        });
+        assert_eq!(result, None);
+        assert_eq!(rfq.get("a"), None);
+        assert_eq!(rfq.hold("a"), Some(Hold::WarmingUp));
+        // A new poll after the delayed response can confirm the same sample.
+        tick.begin_tick();
+        feed.resume.add_permits(1);
+        assert_eq!(tick.fetch("a", &feed).await, Some(quote(1.0, now)));
+    }
+
+    struct DelayedSigner {
+        inner: stitch_bot::signer::LocalSigner,
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl stitch_bot::signer::Signer for DelayedSigner {
+        async fn sign_digest(&self, digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
+            self.entered.notify_one();
+            self.resume.acquire().await.unwrap().forget();
+            self.inner.sign_digest(digest).await
+        }
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signed_ladder_is_revalidated_before_any_order_reaches_the_venue() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use stitch_bot::book::maker::drafts_within_band;
+        use stitch_bot::book::poster::OrderDraft;
+        use stitch_bot::signer::{parse_private_key, LocalSigner, Signer};
+
+        let now = unix_now();
+        let mut degraded = quote(1.0, now);
+        degraded.degraded = true;
+        for (name, next, expected) in [
+            ("healthy", Some(quote(1.001, now)), 2),
+            ("outside band", Some(quote(1.05, now)), 0),
+            ("degraded", Some(degraded), 0),
+            ("stale", Some(quote(1.0, now - 600)), 0),
+            ("bad price", Some(quote(0.0, now)), 0),
+            // Favorable to the ask, so only the jump gate should refuse it.
+            ("jump", Some(quote(0.5, now)), 0),
+            ("unavailable", None, 0),
+        ] {
+            tokio::time::pause();
+            let feed = MutableFeed(std::sync::RwLock::new(Some(quote(1.0, now))));
+            let mut guards = guards(prices());
+            assert_eq!(guards.fetch("feed", &feed).await, None);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            guards.begin_tick();
+            assert_eq!(guards.fetch("feed", &feed).await, Some(quote(1.0, now)));
+            // The loopback HTTP venue below needs a running clock.
+            tokio::time::resume();
+
+            let mut pool = Config::from_toml(include_str!("../stitch.example.toml"))
+                .unwrap()
+                .pools[0]
+                .clone();
+            pool.debt_decimals = 6;
+            pool.collateral_decimals = 6;
+            let drafts: Vec<_> = [1_050_000u64, 1_000_000]
+                .into_iter()
+                .enumerate()
+                .map(|(i, output)| OrderDraft {
+                    nonce: i as u64 + 1,
+                    slot_key: format!("ask:{i}"),
+                    client_order_id: None,
+                    input_amount: U256::from(1_000_000),
+                    output_amount: U256::from(output),
+                })
+                .collect();
+            assert!(drafts_within_band(Side::Ask, &pool, &drafts, 1.0, 100));
+            let signer = Arc::new(DelayedSigner {
+                inner: LocalSigner::new(parse_private_key(&"01".repeat(32)).unwrap()),
+                entered: tokio::sync::Notify::new(),
+                resume: tokio::sync::Semaphore::new(0),
+            });
+            let received = Arc::new(AtomicUsize::new(0));
+            let count = received.clone();
+            let app = Router::new().route(
+                "/graphql",
+                post(move |Json(body): Json<Value>| {
+                    let count = count.clone();
+                    async move {
+                        let orders = body["variables"]["input"].as_array().unwrap();
+                        assert_eq!(orders.len(), 2);
+                        assert!(orders
+                            .iter()
+                            .all(|o| o["signature"].as_str().unwrap().starts_with("0x")));
+                        count.fetch_add(orders.len(), Ordering::SeqCst);
+                        Json(
+                            json!({"data": {"submitFillerOrders": [{"id": "one"}, {"id": "two"}]}}),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let indexer =
+                Indexer::new(format!("http://{}/graphql", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let poster = Poster {
+                indexer: &indexer,
+                signer: signer.clone(),
+                maker: signer.address(),
+                permit2: Address::new([2; 20]),
+                reactor: Address::new([3; 20]),
+                chain_id: 8453,
+                dry_run: false,
+            };
+            let (result, ()) = tokio::join!(
+                poster.post_many(
+                    300,
+                    Address::new([4; 20]),
+                    Address::new([5; 20]),
+                    &drafts,
+                    "ask",
+                    1.0,
+                    async {
+                        guards.revalidate("feed", &feed).await.is_some_and(|spot| {
+                            drafts_within_band(Side::Ask, &pool, &drafts, spot, 100)
+                        })
+                    }
+                ),
+                async {
+                    tokio::time::timeout(Duration::from_secs(2), signer.entered.notified())
+                        .await
+                        .unwrap();
+                    *feed.0.write().unwrap() = next.clone();
+                    signer.resume.add_permits(drafts.len());
+                }
+            );
+            server.abort();
+            assert_eq!(result.posted, expected, "{name}");
+            assert_eq!(result.withheld, expected == 0, "{name}");
+            assert_eq!(received.load(Ordering::SeqCst), expected, "{name}");
+            // A later pool in this tick also sees the post-sign read.
+            assert_eq!(
+                guards.fetch("feed", &Ticking(1.into())).await,
+                if name == "jump" { None } else { next },
+                "{name}"
+            );
         }
     }
 }

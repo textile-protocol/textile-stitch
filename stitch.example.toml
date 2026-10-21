@@ -36,6 +36,26 @@ url = "https://your-feed.example/cngn-usdt"
 # bot stops quoting on those whatever their age.
 staleness_secs = 900
 
+# Price checks on the feed and on every order Stitch signs. On with these
+# defaults when the block is absent, for vault and EOA makers alike.
+#
+# max_jump_bps: a print further than this from the last one Stitch trusted
+# holds the corridor (RFQ rejects as stale_feed, no levels, ladder and taker
+# skip the tick) until the feed comes back, or holds the new level for
+# settle_secs by its own timestamps. The last trusted print is kept in
+# price-guard/ beside this file, so a restart does not start trusting over;
+# delete that folder to take a new level at once. With nothing kept, the
+# first print waits for a second read to agree.
+#
+# max_loss_bps: an order (firm quote, ladder order, rebalance sale) or a
+# published level that pays the maker more than this below what it gives is
+# worth at the print is not signed. For a
+# vault maker keep it at or inside the vault's Warp band (1500 by default).
+# [price_guard]
+# max_loss_bps = 1500
+# max_jump_bps = 1000
+# settle_secs = 300
+
 # One block per corridor you serve. Add more [[pools]] for other pairs/chains.
 # Pairs with different prices (cNGN, COPM, …) MUST each set `feed_url` — one
 # shared feed can't price them all.

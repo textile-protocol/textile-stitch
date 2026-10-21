@@ -195,6 +195,26 @@ impl Engine {
                 taker: dealer_config.taker.parse().expect("validated dealer taker"),
                 order_executor: self.vault_order_executor,
             });
+            // The same last check a firm quote gets. The dealer's price is
+            // already held to max_slippage_bps of the module's fair value;
+            // this holds it to the band against the print as well, so an
+            // operator's band below the slippage limit is honoured.
+            if let Some(vs_print_bps) = super::guard::order_refusal(
+                &order,
+                false,
+                &book,
+                &quote,
+                self.price_guard.max_loss_bps,
+            ) {
+                error!(
+                    request_id = %request.request_id,
+                    vs_print_bps = ?vs_print_bps,
+                    max_loss_bps = self.price_guard.max_loss_bps,
+                    "rebalance order is outside the price band; not signing it"
+                );
+                modules.status("Rebalance blocked: the dealer's price is outside the price band");
+                return;
+            }
             self.counter += 1;
             self.reservations.reserve_paying(
                 &request.request_id,
@@ -312,6 +332,40 @@ impl Engine {
             ..current
         };
         let decision = modules.decide(&current);
+        let band = self
+            .books
+            .iter()
+            .find(|b| {
+                b.collateral == pending.order.input_token && b.debt == pending.order.output_token
+            })
+            .map(|book| {
+                super::guard::recheck_after_signing(
+                    prices,
+                    &pending.order,
+                    false,
+                    book,
+                    self.price_guard.max_loss_bps,
+                )
+            });
+        match band {
+            Some(Ok(())) => {}
+            Some(Err(RejectReason::Busy)) => {
+                modules.status(
+                    "Rebalance price is outside the price band after signing; order withheld",
+                );
+                return;
+            }
+            Some(Err(RejectReason::DegradedFeed)) => {
+                modules.status(
+                    "Reference price turned degraded while signing; rebalance order withheld",
+                );
+                return;
+            }
+            _ => {
+                modules.status("Reference price unusable after signing; rebalance order withheld");
+                return;
+            }
+        }
         let epoch = self.trading_epoch.read().map(|e| *e).unwrap_or(0);
         if now.saturating_add(2) >= pending.quote.expires_at
             || epoch != pending.epoch

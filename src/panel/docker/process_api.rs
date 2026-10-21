@@ -1481,25 +1481,12 @@ mod tests {
 
         // Unique binary path so identity checks don't collide with other tests'
         // `/usr/bin/sleep` orphans under parallel cargo test.
-        let stitch_bin = root.join("stitch");
-        std::fs::copy(which_sleep(), &stitch_bin).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stitch_bin).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stitch_bin, perms).unwrap();
-        }
+        let stitch_bin = fake_stitch(&root);
 
         // Forget the Child so the OS reparents it (like a crashed panel would):
         // if we keep the handle, a SIGTERM'd process becomes our zombie and
         // kill(pid, 0) stays true until we wait().
-        let orphan = Command::new(&stitch_bin)
-            .arg("60")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let orphan = spawn_fake_bot(&stitch_bin, "60");
         let orphan_pid = orphan.id();
         // Spawn returns before execve finishes; poll until /proc identity is stable.
         let orphan_start = wait_process_starttime(orphan_pid);
@@ -1587,22 +1574,9 @@ mod tests {
         let host = bots.join("bot-a");
         std::fs::create_dir_all(&host).unwrap();
 
-        let stitch_bin = root.join("stitch");
-        std::fs::copy(which_sleep(), &stitch_bin).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stitch_bin).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stitch_bin, perms).unwrap();
-        }
+        let stitch_bin = fake_stitch(&root);
 
-        let orphan = Command::new(&stitch_bin)
-            .arg("60")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let orphan = spawn_fake_bot(&stitch_bin, "60");
         let orphan_pid = orphan.id();
         let orphan_start = wait_process_starttime(orphan_pid);
         std::mem::forget(orphan);
@@ -1812,6 +1786,77 @@ mod tests {
             .map(PathBuf::from)
             .find(|p| p.is_file())
             .expect("need a sleep binary for the process-runtime test")
+    }
+
+    /// A stand-in for the stitch binary at `<root>/stitch`, a path no other
+    /// test's processes share, that sleeps for its first argument.
+    ///
+    /// On Linux it is a script that execs `sleep`. The runtime knows a bot
+    /// there by its start time, which exec keeps, so the stand-in needn't be
+    /// a binary named `stitch`. And the system `sleep` may be a multicall
+    /// binary that picks the tool from its own file name: a copy of uutils
+    /// (Ubuntu 26.04) says "unknown program 'stitch'" and exits. Elsewhere
+    /// the runtime matches the process name, so the stand-in is a copy of
+    /// `sleep`, a standalone binary there.
+    fn fake_stitch(root: &Path) -> PathBuf {
+        let stitch_bin = root.join("stitch");
+        #[cfg(target_os = "linux")]
+        std::fs::write(
+            &stitch_bin,
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", which_sleep().display()),
+        )
+        .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        std::fs::copy(which_sleep(), &stitch_bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stitch_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stitch_bin, perms).unwrap();
+        }
+        stitch_bin
+    }
+
+    /// Spawn a binary this test just wrote. Until another thread's freshly
+    /// forked child execs, it can still hold the file open for writing from
+    /// before the write closed, and exec fails with ETXTBSY; retry past that.
+    fn spawn_written_binary(cmd: &mut Command) -> std::process::Child {
+        for _ in 0..50 {
+            match cmd.spawn() {
+                #[cfg(unix)]
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                result => return result.unwrap(),
+            }
+        }
+        cmd.spawn().unwrap()
+    }
+
+    /// Run [`fake_stitch`] as a bot sleeping `secs`, and check it stays up: a
+    /// bot that exits on its own makes a test about stopping or keeping it
+    /// pass or fail for the wrong reason.
+    fn spawn_fake_bot(stitch_bin: &Path, secs: &str) -> std::process::Child {
+        let stderr_path = stitch_bin.with_extension("stderr");
+        let mut cmd = Command::new(stitch_bin);
+        cmd.arg(secs)
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap());
+        let mut child = spawn_written_binary(&mut cmd);
+        std::thread::sleep(Duration::from_millis(100));
+        if !process_alive(child.id()) {
+            let sleep = which_sleep();
+            panic!(
+                "{} (from {}, resolving to {:?}) exited at once with {:?}; stderr: {:?}",
+                stitch_bin.display(),
+                sleep.display(),
+                std::fs::canonicalize(&sleep),
+                child.try_wait(),
+                std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+            );
+        }
+        child
     }
 
     #[test]

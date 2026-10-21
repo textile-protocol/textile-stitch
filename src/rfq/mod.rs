@@ -19,10 +19,11 @@
 //! two distribution channels. RFQ tightens staleness per feed (see
 //! [`crate::config::rfq_staleness_secs`]) so a 900s ladder template cannot
 //! keep firm quotes on a 14-minute-old print; the ladder still uses
-//! `[feed].staleness_secs` as written. Deliberately NOT shared: the tick loop
-//! (RFQ runs its own 1 s cadence and its own price cache so a slow ladder tick
-//! can't blow the reply budget), the nonce ledger (RFQ nonces live in a
-//! disjoint namespace, see [`nonce`]) and — the point of dual-run —
+//! `[feed].staleness_secs` as written. Both loops share live guard state and
+//! the price cache. Fetching stays independent: RFQ runs its own 1 s cadence
+//! so a slow ladder tick cannot stall its feed refresh. Also independent:
+//! the nonce ledger (RFQ nonces live in a disjoint namespace, see [`nonce`])
+//! and — the point of dual-run —
 //! **inventory**. RFQ quotes `min(balance, Permit2 allowance)` in full, minus
 //! its own in-flight quotes ([`reserve`]) and, when the token is the chain's
 //! gas coin, the gas reserve
@@ -31,6 +32,7 @@
 //! shrink the next ladder. Two channels pledging one balance means a fill can
 //! revert when both land at once, which beats halving the depth of both.
 
+mod guard;
 pub mod iso8601;
 pub mod math;
 mod modules;
@@ -142,6 +144,9 @@ pub struct RfqRuntime {
     /// the maker stream cannot forget a transaction task that is still alive.
     closing: Arc<Mutex<HashMap<U256, u64>>>,
     modules: Option<crate::modules::runtime::Runtime>,
+    /// `[price_guard]`: the jump guard on every fetch, the band on every
+    /// order and level.
+    price_guard: crate::config::PriceGuardConfig,
 }
 
 /// How old a wallet reading may be before a `max` side goes dark.
@@ -199,6 +204,7 @@ pub fn maybe_spawn(
     signer: DynSigner,
     dry_run: bool,
     config_dir: Option<&Path>,
+    prices: PriceCache,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.rfq_active() {
         return None;
@@ -232,7 +238,7 @@ pub fn maybe_spawn(
         corridors = ?runtime.books.iter().map(|b| b.slug.as_str()).collect::<Vec<_>>(),
         "starting RFQ responder"
     );
-    Some(tokio::spawn(run(runtime)))
+    Some(tokio::spawn(run(runtime, prices)))
 }
 
 /// True when a maker credential is configured for this bot, checking every
@@ -431,6 +437,7 @@ fn build_runtime(
         } else {
             None
         },
+        price_guard: cfg.price_guard,
     })
 }
 
@@ -571,14 +578,13 @@ fn bind_assigned_book(
 
 /// Reconnect-forever driver: one authenticated session at a time, exponential
 /// backoff 1s → 30s on any failure, reset after each successful acceptance.
-async fn run(rt: RfqRuntime) {
+async fn run(rt: RfqRuntime, prices: PriceCache) {
     // The dependency graph compiles two rustls crypto providers (ring via this
     // module, aws-lc-rs via other deps); pick ring explicitly or the TLS
     // connector refuses to guess at runtime. First install wins; harmless if
     // something else got there first.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let prices = PriceCache::default();
     let mut feed_urls: Vec<String> = rt.books.iter().map(|b| b.feed_url.clone()).collect();
     feed_urls.sort();
     feed_urls.dedup();
@@ -1118,6 +1124,7 @@ async fn session_loop_inner(
         closing: rt.closing.clone(),
         modules: rt.modules.clone(),
         pending_rebalance: None,
+        price_guard: rt.price_guard,
     };
     // Upgrade path: a ledger written before `input_token` existed loads as
     // tokenless. Stamp every bound book now, while the quoted pool is still
@@ -1306,6 +1313,7 @@ struct Engine {
     closing: Arc<Mutex<HashMap<U256, u64>>>,
     modules: Option<crate::modules::runtime::Runtime>,
     pending_rebalance: Option<modules::PendingRebalance>,
+    price_guard: crate::config::PriceGuardConfig,
 }
 
 impl Engine {
@@ -1445,7 +1453,10 @@ impl Engine {
                 }
                 let Some(quote) = prices.get(&book.feed_url) else {
                     if let Some(modules) = &self.modules {
-                        modules.quote_status(QuoteState::WaitingForPrice, "Waiting for the first reference price. Check the price feed and bot logs.", now_secs);
+                        match prices.hold(&book.feed_url) {
+                            Some(hold) => modules.quote_status(QuoteState::SuspectPrice, &hold.describe(self.price_guard.settle_secs), now_secs),
+                            None => modules.quote_status(QuoteState::WaitingForPrice, "Waiting for the first reference price. Check the price feed and bot logs.", now_secs),
+                        }
                     }
                     return None;
                 };
@@ -1456,7 +1467,7 @@ impl Engine {
                     return None;
                 }
                 let effective = self.module_book(book, &quote, now_secs)?;
-                Some(MakerFrame::Levels(levels_for(
+                let levels = levels_for(
                     &effective,
                     quote.price,
                     self.reservations.reserved(&book.slug, true, now_secs),
@@ -1466,6 +1477,11 @@ impl Engine {
                     format_iso_ms(now_ms),
                     &inventory,
                     &order_caps,
+                );
+                Some(MakerFrame::Levels(guard::levels_in_band(
+                    levels,
+                    quote.price,
+                    self.price_guard.max_loss_bps,
                 )))
             })
             .collect()
@@ -1770,6 +1786,24 @@ impl Engine {
             taker,
             order_executor: self.vault_order_executor,
         });
+        if let Some(vs_print_bps) = guard::order_refusal(
+            &order,
+            plan.bid,
+            &book,
+            &quote,
+            self.price_guard.max_loss_bps,
+        ) {
+            error!(
+                rfq_id = %req.rfq_id,
+                input = %order.input_amount,
+                output = %order.output_amount,
+                price = quote.price,
+                vs_print_bps = ?vs_print_bps,
+                max_loss_bps = self.price_guard.max_loss_bps,
+                "order is outside the price band; not signing it"
+            );
+            return reject(RejectReason::Busy);
+        }
         // Bound the signature by what is left of the reply budget.
         //
         // `replyBy` was checked on the way in, but pricing has taken time since,
@@ -1829,7 +1863,16 @@ impl Engine {
             {
                 return reject(RejectReason::Busy);
             }
-            modules.status("Manual sale quoted; awaiting buyer settlement");
+        }
+        if let Err(reason) = guard::recheck_after_signing(
+            prices,
+            &order,
+            plan.bid,
+            &book,
+            self.price_guard.max_loss_bps,
+        ) {
+            warn!(rfq_id = %req.rfq_id, ?reason, "the reference price changed while signing; signature withheld");
+            return reject(reason);
         }
 
         // The reservation starts the moment the signed order exists — even if
@@ -1846,6 +1889,10 @@ impl Engine {
         if self.modules.is_some() && self.reservations.flush().is_err() {
             error!("module-enabled quote withheld: reservation persistence failed");
             return reject(RejectReason::Busy);
+        }
+        // Only now is the quote going out; every exit above withholds it.
+        if let (Some(_), Some(modules)) = (&manual_sale, &self.modules) {
+            modules.status("Manual sale quoted; awaiting buyer settlement");
         }
         MakerFrame::QuoteResponse(QuoteResponseFrame {
             rfq_id: req.rfq_id,
@@ -2124,18 +2171,12 @@ impl Engine {
         else {
             return reject(AttestRejectReason::StaleFeed);
         };
-        let Some(quote) = prices.get(&book.feed_url) else {
-            return reject(AttestRejectReason::StaleFeed);
-        };
         // A degraded print is one the source itself doesn't stand behind.
         // Warp won't attest off one, and the second key won't vouch with one.
-        match usable(&quote, unix_now(), book.staleness_secs) {
-            Ok(()) => {}
-            Err(Unusable::Degraded) => return reject(AttestRejectReason::DegradedFeed),
-            Err(Unusable::Stale | Unusable::BadPrice) => {
-                return reject(AttestRejectReason::StaleFeed)
-            }
-        }
+        let quote = match guard::attest_print(prices, book) {
+            Ok(quote) => quote,
+            Err(reason) => return reject(reason),
+        };
 
         let calls = [
             Call::new(vault, encode_free_settlement()),
@@ -2223,6 +2264,10 @@ impl Engine {
                 return reject(AttestRejectReason::Busy);
             }
         };
+        if let Err(reason) = guard::recheck_attestation_after_signing(prices, book, &att, &live) {
+            warn!(request_id = %req.request_id, ?reason, "the reference price changed while co-signing; signature withheld");
+            return reject(reason);
+        }
         info!(
             request_id = %req.request_id,
             epoch = %req.epoch_id,
@@ -2283,35 +2328,23 @@ fn refreshed_vault_policy(
     (!close_in_flight).then_some(policy)
 }
 
-/// Latest feed quote per URL, shared between the fetch loops and the session
-/// task. `std::sync::RwLock` — nothing holds it across an await.
-#[derive(Clone, Default)]
-pub struct PriceCache(Arc<RwLock<HashMap<String, Quote>>>);
+pub use crate::pricing::cache::PriceCache;
 
-impl PriceCache {
-    pub fn get(&self, url: &str) -> Option<Quote> {
-        self.0.read().ok()?.get(url).cloned()
-    }
-
-    pub fn set(&self, url: String, quote: Quote) {
-        if let Ok(mut map) = self.0.write() {
-            map.insert(url, quote);
-        }
-    }
-
-    pub fn invalidate(&self, url: &str) {
-        if let Ok(mut map) = self.0.write() {
-            map.remove(url);
-        }
-    }
-}
-
-/// Apply one fetch to the RFQ cache. A successful quote replaces the last print;
-/// a failed fetch (including an invalid HTTP timestamp) drops it so the next
-/// `quoteRequest` is `StaleFeed`. Consumers still check the sample's age at use.
-fn on_feed_fetch(cache: &PriceCache, url: &str, result: anyhow::Result<Quote>) {
+/// Apply one fetch to the RFQ cache. A successful quote goes through the jump
+/// guard and replaces the last print only if the guard trusts it; a failed
+/// fetch (including an invalid HTTP timestamp) drops it so the next
+/// `quoteRequest` is `StaleFeed`. Consumers still check the sample's age at
+/// use. Both producers update the same history and visible reference.
+fn on_feed_fetch(
+    started: tokio::time::Instant,
+    cache: &PriceCache,
+    url: &str,
+    result: anyhow::Result<Quote>,
+) {
     match result {
-        Ok(quote) => cache.set(url.to_string(), quote),
+        Ok(quote) => {
+            cache.admit(started, url, quote, unix_now());
+        }
         Err(e) => {
             debug!(feed = %url, error = %e, "rfq feed fetch failed");
             cache.invalidate(url);
@@ -2320,11 +2353,14 @@ fn on_feed_fetch(cache: &PriceCache, url: &str, result: anyhow::Result<Quote>) {
 }
 
 /// Refresh one feed URL every second. A failed fetch invalidates the cached
-/// quote — RFQ fails closed instead of holding the last print.
+/// quote — RFQ fails closed instead of holding the last print. The jump
+/// guard starts from the print it last trusted before a restart, when the
+/// config folder has one (see [`crate::pricing::anchor`]).
 async fn price_loop(url: String, cache: PriceCache) {
     let feed = HttpFeed::new(&url);
     loop {
-        on_feed_fetch(&cache, &url, feed.fetch().await);
+        let started = tokio::time::Instant::now();
+        on_feed_fetch(started, &cache, &url, feed.fetch().await);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
@@ -2762,9 +2798,11 @@ async fn read_vault_inventory(
 #[cfg(test)]
 mod tests {
     mod feed_freshness;
+    mod price_guard;
 
     use super::wire::{QuoteExpiredFrame, QuoteResultFrame};
     use super::*;
+
     use crate::config::RfqCapacity;
     use crate::pricing::quote::Spread;
     use crate::signer::{recover_address, LocalSigner};
@@ -3653,6 +3691,7 @@ mod tests {
             closing: Arc::new(Mutex::new(HashMap::new())),
             modules: None,
             pending_rebalance: None,
+            price_guard: crate::config::PriceGuardConfig::default(),
         }
     }
 
@@ -4282,7 +4321,20 @@ mod tests {
         );
         assert!(cache.get("http://feed").is_some());
 
+        for ago in [2, 1] {
+            cache.admit(
+                tokio::time::Instant::now() - std::time::Duration::from_secs(ago),
+                "http://feed",
+                Quote {
+                    price: 2.0,
+                    timestamp: unix_now() - 1,
+                    degraded: false,
+                },
+                unix_now(),
+            );
+        }
         on_feed_fetch(
+            tokio::time::Instant::now(),
             &cache,
             "http://feed",
             Err(anyhow::anyhow!("feed host down")),
@@ -4293,6 +4345,7 @@ mod tests {
         );
 
         on_feed_fetch(
+            tokio::time::Instant::now(),
             &cache,
             "http://feed",
             Ok(Quote {
@@ -5425,6 +5478,62 @@ mod tests {
             engine.respond(req, &prices).await,
             MakerFrame::QuoteReject(_)
         ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_manual_sale_withheld_after_signing_is_not_reported_as_quoted() {
+        use crate::modules::{manual, Mode};
+        const QUOTED: &str = "Manual sale quoted; awaiting buyer settlement";
+        let mut engine = test_engine();
+        let dir = enable_modules(&mut engine, Mode::Live, 4_000_000_000, 6_000_000_000);
+        engine.modules.as_mut().unwrap().config.rebalance.enabled = true;
+        let sale = manual::Sale {
+            id: "b".repeat(64),
+            chain_id: 8453,
+            vault: engine.vault.unwrap(),
+            taker: "0x0000000000000000000000000000000000000003"
+                .parse()
+                .unwrap(),
+            corridor_token: COLLATERAL.parse().unwrap(),
+            settlement_token: DEBT.parse().unwrap(),
+            corridor_amount: U256::from(100_000_000u64),
+            min_settlement: U256::from(99_500_000u64),
+            expires_at: unix_now() + 3600,
+            closed: false,
+        };
+        manual::write(&dir, &sale).unwrap();
+        let mut req = exact_input_request(&format!("{}{}:rfq_1", manual::PREFIX, sale.id));
+        req.sell_token = DEBT.into();
+        req.buy_token = COLLATERAL.into();
+        req.sell_amount = None;
+        req.buy_amount = Some(sale.corridor_amount.to_string());
+        let custody = Arc::new(GatedSigner {
+            inner: engine.signer.clone(),
+            started: tokio::sync::Notify::new(),
+            resume: tokio::sync::Semaphore::new(0),
+        });
+        engine.signer = custody.clone();
+        let prices = fresh_prices();
+        let status = |engine: &Engine| engine.modules.as_ref().unwrap().rebalance_status_for_test();
+
+        // The reference goes away while the signer works.
+        let feed = prices.clone();
+        let (reply, ()) = tokio::join!(engine.respond(req.clone(), &prices), async {
+            custody.started.notified().await;
+            feed.invalidate("http://feed");
+            custody.resume.add_permits(1);
+        });
+        assert!(matches!(reply, MakerFrame::QuoteReject(_)), "{reply:?}");
+        assert_ne!(status(&engine), QUOTED);
+
+        // With the reference intact, the same sale is quoted and says so.
+        let prices = fresh_prices();
+        custody.resume.add_permits(1);
+        req.rfq_id = format!("{}{}:rfq_2", manual::PREFIX, sale.id);
+        let reply = engine.respond(req, &prices).await;
+        assert!(matches!(reply, MakerFrame::QuoteResponse(_)), "{reply:?}");
+        assert_eq!(status(&engine), QUOTED);
         std::fs::remove_dir_all(dir).ok();
     }
 

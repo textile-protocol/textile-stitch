@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use alloy_primitives::{Address, U256};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::book::funding::{
     funded_input_cap, parse_input_liquidity, record_funded_input_replacement, u256_to_u128,
@@ -160,6 +160,9 @@ pub struct TickCtx<'a> {
     /// Gas held out of the funded budget when a side's input is the chain's
     /// gas coin.
     pub gas_reserve: crate::chain::gas_reserve::GasReserve,
+    /// `[price_guard] max_loss_bps`: the band every ladder order must pass
+    /// against the feed print before signing and again before posting.
+    pub max_loss_bps: u32,
 }
 
 /// Quoting state that lives across ticks: last posted price per side and the
@@ -178,8 +181,8 @@ pub struct QuoteState {
 /// heartbeat; `fills` counts spent nonces observed while posting — each one is
 /// an order of ours that filled on-chain, the tick loop's fill signal (the
 /// inventory lean re-reads balances on it). `AbortPool` means the nonce ledger
-/// could not be persisted before posting — the caller must skip the rest of
-/// this pool's tick (never post an order whose nonce isn't on disk).
+/// could not be persisted, or the post-sign price guard refused. The caller
+/// must skip the rest of this pool's tick in either case.
 #[must_use]
 pub enum SideOutcome {
     Done { posted: usize, fills: usize },
@@ -202,6 +205,39 @@ impl SideOutcome {
 /// spread's price when set; sizing and everything else are unchanged. `guard`
 /// (TWAP quoting's spot-deviation bound) clamps whichever price is in effect,
 /// so the lean and the configured spread go through the same protection.
+/// `post_sign_spot` must re-read the feed and apply freshness/degraded/jump
+/// gates. It is polled after signing, immediately before posting the batch.
+/// The ladder's last check before signing: every draft that would be signed
+/// must pass the price band against the feed print (`spot`, not the TWAP
+/// centre the ladder may quote around; see [`crate::pricing::band`]). Ladder
+/// orders come from their own amount math, so this is the backstop for it,
+/// and an EOA maker has no Warp behind it. Zero-size drafts are never
+/// signed and are not judged. Pure.
+pub fn drafts_within_band(
+    side: Side,
+    pool: &PoolConfig,
+    drafts: &[OrderDraft],
+    spot: f64,
+    max_loss_bps: u32,
+) -> bool {
+    let Some(wad) = crate::pricing::band::price_wad(spot) else {
+        return false;
+    };
+    drafts
+        .iter()
+        .filter(|d| !d.input_amount.is_zero() && !d.output_amount.is_zero())
+        .all(|d| {
+            let order = crate::pricing::band::Order {
+                bid: side == Side::Bid,
+                input: d.input_amount,
+                output: d.output_amount,
+                debt_decimals: pool.debt_decimals,
+                collateral_decimals: pool.collateral_decimals,
+            };
+            crate::pricing::band::order_within(&order, wad, max_loss_bps)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn quote_side(
     ctx: &TickCtx<'_>,
@@ -213,9 +249,11 @@ pub async fn quote_side(
     collateral: Address,
     side: Side,
     mid: f64,
+    spot: f64,
     price_override: Option<f64>,
     guard: Option<SpotDeviationGuard>,
     now: u64,
+    post_sign_spot: impl std::future::Future<Output = Option<f64>>,
 ) -> SideOutcome {
     // A side without a configured spread is off, override or not — the lean
     // replaces the price of a running side, it never enables one.
@@ -267,6 +305,17 @@ pub async fn quote_side(
         // Posting an empty batch was always a no-op; skip the ledger write too.
         return SideOutcome::held();
     }
+    if !drafts_within_band(side, pool, &drafts, spot, ctx.max_loss_bps) {
+        error!(
+            pair,
+            side = label,
+            price,
+            spot,
+            max_loss_bps = ctx.max_loss_bps,
+            "ladder order is outside the price band; not posting this side"
+        );
+        return SideOutcome::held();
+    }
 
     let input_reserved = drafted_input(&drafts);
     if !persist_slot_state(
@@ -288,8 +337,18 @@ pub async fn quote_side(
             &drafts,
             label,
             price,
+            async {
+                post_sign_spot.await.is_some_and(|spot| {
+                    drafts_within_band(side, pool, &drafts, spot, ctx.max_loss_bps)
+                })
+            },
         )
         .await;
+    if result.withheld {
+        // A newly unusable print must also keep this pool's taker and
+        // closer from acting on the tick's earlier feed snapshot.
+        return SideOutcome::AbortPool;
+    }
     if !result.spent_nonces.is_empty() {
         forget_spent_slot_nonces(
             &mut state.slot_nonces,
@@ -607,6 +666,59 @@ mod tests {
 
     const DEBT: Address = Address::new([0xdd; 20]);
     const COLLATERAL: Address = Address::new([0xcc; 20]);
+
+    fn draft(amounts: (U256, U256)) -> OrderDraft {
+        OrderDraft {
+            nonce: 1,
+            slot_key: "k".into(),
+            input_amount: amounts.0,
+            output_amount: amounts.1,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn ladder_drafts_are_held_to_the_band_against_spot() {
+        let p = pool();
+        // A bid 2 % under spot and an ask 2 % over it: in the maker's favour.
+        let bid = draft(buy_amounts_at(0.98, 1_000_000_000, 6, 6));
+        assert!(drafts_within_band(Side::Bid, &p, &[bid], 1.0, 1));
+        let ask = draft(sell_amounts_at(1.02, 1_000_000_000, 6, 6));
+        assert!(drafts_within_band(Side::Ask, &p, &[ask], 1.0, 1));
+        // A TWAP-centred ask 25 bps under spot passes a wide band, not a
+        // 10 bps one: the band is measured from the print, not the centre.
+        let lagging = || draft(sell_amounts_at(0.9975, 1_000_000_000, 6, 6));
+        assert!(drafts_within_band(Side::Ask, &p, &[lagging()], 1.0, 1_500));
+        assert!(!drafts_within_band(Side::Ask, &p, &[lagging()], 1.0, 10));
+        // One draft whose output came out 1000x small refuses the side.
+        let (input, output) = buy_amounts_at(0.98, 1_000_000_000, 6, 6);
+        let broken = draft((input, output / U256::from(1_000u64)));
+        let fine = || draft(buy_amounts_at(0.98, 500_000_000, 6, 6));
+        assert!(!drafts_within_band(
+            Side::Bid,
+            &p,
+            &[fine(), broken],
+            1.0,
+            1_500
+        ));
+        // Zero-size drafts are never signed and are not judged.
+        let empty = draft((U256::ZERO, U256::ZERO));
+        assert!(drafts_within_band(
+            Side::Bid,
+            &p,
+            &[fine(), empty],
+            1.0,
+            1_500
+        ));
+        // No usable print, nothing posts.
+        assert!(!drafts_within_band(
+            Side::Bid,
+            &p,
+            &[fine()],
+            f64::NAN,
+            1_500
+        ));
+    }
 
     #[test]
     fn side_token_orientation_mirrors_bid_and_ask() {

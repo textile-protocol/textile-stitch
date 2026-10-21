@@ -99,7 +99,96 @@ pub struct Config {
     /// built-in ones ([`crate::chain::gas_caps::GasCaps::for_chain`]).
     #[serde(default)]
     pub gas: Option<GasConfig>,
+    /// Price checks on the feed and on every order Stitch signs. On with
+    /// defaults when the table is absent; see [`PriceGuardConfig`].
+    #[serde(default)]
+    pub price_guard: PriceGuardConfig,
     pub pools: Vec<PoolConfig>,
+}
+
+/// The `[price_guard]` block: two checks on the feed print and the orders
+/// built from it, for every maker — vault or EOA. Absent means the defaults.
+///
+/// `max_loss_bps` is the price band: an order Stitch signs (a firm RFQ quote,
+/// a ladder order, a module rebalance sale) or a level it publishes is
+/// refused when it would pay the maker more than this below what it gives
+/// is worth at the print ([`crate::pricing::band`]). Stitch's own spreads
+/// never come near it; it catches amount math that came out wrong. The
+/// taker and closer legs sign no order of their own: they take other
+/// people's at prices through Stitch's quotes, and only the jump guard
+/// applies to them. For a
+/// vault maker keep it at or inside Warp's `max_loss_bps` for the vault
+/// (1500 by default), so Stitch refuses before Warp does — a quote Warp
+/// refuses comes back to the venue as an invalid reply, and a strike.
+///
+/// `max_jump_bps` and `settle_secs` are the jump guard: a print further
+/// than `max_jump_bps` from the last one trusted holds quoting until the
+/// feed comes back, or holds the new level for `settle_secs`
+/// ([`crate::pricing::jump`]). RFQ, the ladder, the taker and the closer
+/// all go dark on a held print.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceGuardConfig {
+    #[serde(default = "default_guard_max_loss_bps")]
+    pub max_loss_bps: u32,
+    #[serde(default = "default_guard_max_jump_bps")]
+    pub max_jump_bps: u32,
+    #[serde(default = "default_guard_settle_secs")]
+    pub settle_secs: u64,
+}
+
+impl Default for PriceGuardConfig {
+    fn default() -> Self {
+        Self {
+            max_loss_bps: default_guard_max_loss_bps(),
+            max_jump_bps: default_guard_max_jump_bps(),
+            settle_secs: default_guard_settle_secs(),
+        }
+    }
+}
+
+impl PriceGuardConfig {
+    pub fn jump(&self) -> crate::pricing::jump::JumpGuard {
+        crate::pricing::jump::JumpGuard {
+            max_jump_bps: self.max_jump_bps,
+            settle_secs: self.settle_secs,
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        // Past half the input's value a 2x error passes; neither check
+        // would bound anything a bad print or a bad build gets wrong.
+        for (name, value) in [
+            ("max_loss_bps", self.max_loss_bps),
+            ("max_jump_bps", self.max_jump_bps),
+        ] {
+            anyhow::ensure!(
+                (1..=MAX_PRICE_GUARD_BPS).contains(&value),
+                "[price_guard].{name} must be within 1..={MAX_PRICE_GUARD_BPS}, got {value}"
+            );
+        }
+        anyhow::ensure!(
+            self.settle_secs <= MAX_PRICE_GUARD_SETTLE_SECS,
+            "[price_guard].settle_secs must be at most {MAX_PRICE_GUARD_SETTLE_SECS}, got {}",
+            self.settle_secs
+        );
+        Ok(())
+    }
+}
+
+/// Widest `[price_guard]` band or jump threshold accepted.
+pub const MAX_PRICE_GUARD_BPS: u32 = 5_000;
+/// Longest a new level may be made to hold before it is trusted.
+pub const MAX_PRICE_GUARD_SETTLE_SECS: u64 = 3_600;
+
+fn default_guard_max_loss_bps() -> u32 {
+    1_500
+}
+fn default_guard_max_jump_bps() -> u32 {
+    1_000
+}
+fn default_guard_settle_secs() -> u64 {
+    300
 }
 
 /// The `[gas]` block. Each key replaces one built-in ceiling; a missing key
@@ -1439,6 +1528,7 @@ impl Config {
                 "[vault] is set — the public ladder must stay off (book_enabled = false)."
             );
         }
+        self.price_guard.validate()?;
         self.validate_rfq()?;
         Ok(())
     }
@@ -1513,6 +1603,35 @@ mod tests {
     use super::*;
 
     const EXAMPLE: &str = include_str!("../stitch.example.toml");
+
+    #[test]
+    fn the_price_guard_is_on_by_default_and_bounded() {
+        let cfg = Config::from_toml(EXAMPLE).unwrap();
+        assert_eq!(cfg.price_guard, PriceGuardConfig::default());
+        assert_eq!(cfg.price_guard.max_loss_bps, 1_500);
+        assert_eq!(cfg.price_guard.max_jump_bps, 1_000);
+        assert_eq!(cfg.price_guard.settle_secs, 300);
+
+        let with = |body: &str| format!("{EXAMPLE}\n[price_guard]\n{body}\n");
+        let tuned = Config::from_toml(&with(
+            "max_loss_bps = 500\nmax_jump_bps = 2000\nsettle_secs = 0",
+        ))
+        .unwrap();
+        assert_eq!(tuned.price_guard.max_loss_bps, 500);
+        assert_eq!(tuned.price_guard.jump().max_jump_bps, 2_000);
+        assert_eq!(tuned.price_guard.jump().settle_secs, 0);
+        for (body, needle) in [
+            ("max_loss_bps = 0", "max_loss_bps"),
+            ("max_loss_bps = 5001", "max_loss_bps"),
+            ("max_jump_bps = 0", "max_jump_bps"),
+            ("max_jump_bps = 5001", "max_jump_bps"),
+            ("settle_secs = 3601", "settle_secs"),
+            ("enabled = false", "enabled"),
+        ] {
+            let err = format!("{:#}", Config::from_toml(&with(body)).unwrap_err());
+            assert!(err.contains(needle), "{body}: {err}");
+        }
+    }
 
     #[test]
     fn parses_the_example_config() {

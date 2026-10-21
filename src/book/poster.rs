@@ -48,12 +48,15 @@ pub struct PostResult {
     /// nothing was posted. The slot ledger records it so a replacement only
     /// reuses input the indexer still counts as live.
     pub deadline: u64,
+    /// The current price guard refused after signing; stop this pool tick.
+    pub withheld: bool,
 }
 
 impl Poster<'_> {
     /// Build, sign, and POST a side's order batch. Returns the number of orders
     /// posted (or that would be posted in dry-run). The indexer writes the batch
     /// atomically, so a ladder refresh cannot partially replace live slots.
+    #[allow(clippy::too_many_arguments)]
     pub async fn post_many(
         &self,
         ttl_secs: u64,
@@ -62,6 +65,7 @@ impl Poster<'_> {
         drafts: &[OrderDraft],
         label: &str,
         price: f64,
+        post_sign_check: impl std::future::Future<Output = bool>,
     ) -> PostResult {
         let deadline = unix_now().saturating_add(ttl_secs);
 
@@ -99,6 +103,19 @@ impl Poster<'_> {
             _ => return PostResult::default(),
         };
 
+        // Poll this future only after every signature is ready. Its caller
+        // re-reads the guarded feed and checks the amounts we just signed.
+        if !post_sign_check.await {
+            warn!(
+                label,
+                "signed ladder batch withheld by the current price guard"
+            );
+            return PostResult {
+                withheld: true,
+                ..PostResult::default()
+            };
+        }
+
         if self.dry_run {
             for submission in &submissions {
                 info!(
@@ -113,6 +130,7 @@ impl Poster<'_> {
                 posted: submissions.len(),
                 spent_nonces: Vec::new(),
                 deadline,
+                withheld: false,
             };
         }
 
@@ -123,6 +141,7 @@ impl Poster<'_> {
                     posted: ids.len(),
                     spent_nonces: Vec::new(),
                     deadline,
+                    withheld: false,
                 }
             }
             Err(e) => {
@@ -145,6 +164,7 @@ impl Poster<'_> {
                     posted: 0,
                     spent_nonces,
                     deadline,
+                    withheld: false,
                 }
             }
         }

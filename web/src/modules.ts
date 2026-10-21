@@ -73,6 +73,7 @@ export interface ModuleStatus {
       | 'waiting_for_vault'
       | 'waiting_for_price'
       | 'stale_price'
+      | 'suspect_price'
       | 'no_corridor'
       | 'evaluating'
     message: string

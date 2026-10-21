@@ -8,6 +8,23 @@ use axum::{http::StatusCode, routing::get, Json, Router};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// `on_feed_fetch` for a feed the jump guard already trusts at the fetched
+/// price. These tests are about freshness; `rfq::guard` and
+/// `pricing::jump` test the guard.
+fn ingest(prices: &PriceCache, url: &str, result: anyhow::Result<Quote>) {
+    if let Ok(q) = &result {
+        // Model an earlier poll confirming a cold-start price. Bad or stale
+        // samples still never become a baseline.
+        prices.admit(
+            tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+            url,
+            q.clone(),
+            unix_now(),
+        );
+    }
+    on_feed_fetch(tokio::time::Instant::now(), prices, url, result);
+}
+
 async fn serve_feed(body: String, status: StatusCode) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -53,7 +70,7 @@ async fn invalid_http_timestamps_clear_the_cache_and_cannot_fall_back() {
         for _ in 0..2 {
             let fetched = feed.fetch().await;
             assert!(fetched.is_err(), "timestamp {timestamp} was accepted");
-            on_feed_fetch(&prices, &url, fetched);
+            on_feed_fetch(tokio::time::Instant::now(), &prices, &url, fetched);
             assert!(prices.get(&url).is_none());
             assert!(engine.level_frames(&prices, unix_now_ms()).is_empty());
             assert!(matches!(
@@ -94,9 +111,20 @@ async fn fresh_http_seconds_preserve_price_and_timestamp_and_failure_clears_them
     let (url, server) = serve_feed("unavailable".into(), StatusCode::SERVICE_UNAVAILABLE).await;
     let prices = PriceCache::default();
     prices.set(url.clone(), fetched.clone());
-    on_feed_fetch(&prices, &url, HttpFeed::new(&url).fetch().await);
+    ingest(&prices, &url, Ok(fetched.clone()));
+    on_feed_fetch(
+        tokio::time::Instant::now(),
+        &prices,
+        &url,
+        HttpFeed::new(&url).fetch().await,
+    );
     assert!(prices.get(&url).is_none());
-    on_feed_fetch(&prices, &url, Ok(fetched.clone()));
+    on_feed_fetch(
+        tokio::time::Instant::now(),
+        &prices,
+        &url,
+        Ok(fetched.clone()),
+    );
     assert_eq!(prices.get(&url), Some(fetched));
     server.abort();
 }
@@ -115,7 +143,7 @@ async fn old_http_seconds_are_rejected_at_use_without_retimestamping() {
     let mut engine = test_engine();
     engine.books[0].feed_url = url.clone();
     let prices = PriceCache::default();
-    on_feed_fetch(&prices, &url, Ok(fetched));
+    ingest(&prices, &url, Ok(fetched));
     assert!(engine.level_frames(&prices, unix_now_ms()).is_empty());
     assert!(matches!(
         engine
@@ -242,7 +270,7 @@ async fn valid_cached_http_sample_can_resume_after_clock_recovers() {
         .await;
         engine.books[0].feed_url = url.clone();
         let prices = PriceCache::default();
-        on_feed_fetch(&prices, &url, HttpFeed::new(&url).fetch().await);
+        ingest(&prices, &url, HttpFeed::new(&url).fetch().await);
         assert!(!engine.level_frames(&prices, now * 1_000).is_empty());
         assert!(engine.level_frames(&prices, (now - 1) * 1_000).is_empty());
         // This sample passed ingestion. The wall-clock policy can use it again
@@ -374,7 +402,7 @@ async fn the_http_flag_reaches_the_rfq_gate_and_clears_when_the_feed_recovers() 
     engine.books[0].feed_url = url.clone();
     let prices = PriceCache::default();
 
-    on_feed_fetch(&prices, &url, feed.fetch().await);
+    ingest(&prices, &url, feed.fetch().await);
     assert!(prices.get(&url).unwrap().degraded);
     assert!(engine.level_frames(&prices, unix_now_ms()).is_empty());
     let reply = engine.respond(exact_input_request("held"), &prices).await;
@@ -386,7 +414,7 @@ async fn the_http_flag_reaches_the_rfq_gate_and_clears_when_the_feed_recovers() 
         json!({"price": 1.0, "timestamp": unix_now()}),
     ] {
         *body.write().unwrap() = live;
-        on_feed_fetch(&prices, &url, feed.fetch().await);
+        ingest(&prices, &url, feed.fetch().await);
         assert!(!prices.get(&url).unwrap().degraded);
         assert!(!engine.level_frames(&prices, unix_now_ms()).is_empty());
     }
@@ -397,7 +425,7 @@ async fn the_http_flag_reaches_the_rfq_gate_and_clears_when_the_feed_recovers() 
     server.abort();
 }
 
-async fn nav_rpc() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+pub(super) async fn nav_rpc() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let reads = Arc::new(AtomicUsize::new(0));
@@ -423,7 +451,7 @@ async fn nav_rpc() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     (url, reads, task)
 }
 
-fn nav_engine_and_request() -> (Engine, AttestRequestFrame) {
+pub(super) fn nav_engine_and_request() -> (Engine, AttestRequestFrame) {
     let mut engine = test_engine();
     let vault = "0x2222222222222222222222222222222222222222";
     engine.vault = Some(vault.parse().unwrap());
@@ -524,7 +552,7 @@ async fn invalid_http_fetch_cannot_reuse_fresh_cache_for_nav_and_recovers_on_val
     engine.rpc = Rpc::new(&rpc_url);
     let prices = PriceCache::default();
 
-    on_feed_fetch(&prices, &url, feed.fetch().await);
+    ingest(&prices, &url, feed.fetch().await);
     assert!(!engine.level_frames(&prices, now * 1_000).is_empty());
     // A successfully ingested sample may resume after clock recovery.
     assert!(engine.level_frames(&prices, (now - 1) * 1_000).is_empty());
@@ -537,12 +565,12 @@ async fn invalid_http_fetch_cannot_reuse_fresh_cache_for_nav_and_recovers_on_val
     for timestamp in [now + 60, now * 1_000, 0, u64::MAX] {
         // Seed a still-fresh fallback before EVERY invalid HTTP response.
         *body.write().unwrap() = json!({"price": 1.5, "timestamp": unix_now()});
-        on_feed_fetch(&prices, &url, feed.fetch().await);
+        ingest(&prices, &url, feed.fetch().await);
         assert!(prices.get(&url).is_some());
         *body.write().unwrap() = json!({"price": 1.5, "timestamp": timestamp});
         let fetched = feed.fetch().await;
         assert!(fetched.is_err());
-        on_feed_fetch(&prices, &url, fetched);
+        ingest(&prices, &url, fetched);
         assert!(prices.get(&url).is_none());
         assert!(engine.level_frames(&prices, now * 1_000).is_empty());
         // Even advancing past a rejected future timestamp cannot revive it.
@@ -558,7 +586,7 @@ async fn invalid_http_fetch_cannot_reuse_fresh_cache_for_nav_and_recovers_on_val
     }
 
     *body.write().unwrap() = json!({"price": 1.5, "timestamp": unix_now()});
-    on_feed_fetch(&prices, &url, feed.fetch().await);
+    ingest(&prices, &url, feed.fetch().await);
     assert!(matches!(
         engine.cosign(req, &prices).await,
         MakerFrame::AttestResponse(_)
