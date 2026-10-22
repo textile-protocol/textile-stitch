@@ -442,9 +442,10 @@ function ImportWalletPanel({
 }
 
 /**
- * Above this, one signature eats so much of the venue's ~750ms reply budget
- * that quoting stops being reliable. Not a hard limit — the bot still runs — but
- * the operator should see it at setup rather than infer it from missed quotes.
+ * Above this, signing is slow enough to lose quotes to faster makers, well
+ * inside the venue's ~5.5s reply budget. Not a hard limit — the bot still runs —
+ * but the operator should see it at setup rather than infer it from missed
+ * quotes.
  */
 const SLOW_SIGN_MS = 400
 
@@ -657,7 +658,7 @@ function PemField({
  *
  * Verify also reports the round-trip latency, which for this backend is the
  * thing most likely to make it unsuitable: signing is a create-then-poll cycle
- * and the venue stops listening for a quote after ~750ms.
+ * and faster makers answer long before the venue stops listening (~5.5s).
  */
 function FireblocksFields({
   values,
@@ -870,8 +871,8 @@ function FireblocksFields({
             <div>
               One signature took {latencyMs} ms.{' '}
               {latencyMs > SLOW_SIGN_MS
-                ? 'That is too slow to quote reliably — the venue stops listening about 750 ms ' +
-                  'after it asks, and this bot still has to price and respond inside that. ' +
+                ? 'That is slow enough to lose quotes to faster makers, and the venue stops ' +
+                  'listening about 5.5 s after it asks. ' +
                   'Check whether your Transaction Authorization Policy auto-approves signing ' +
                   'rather than waiting on a human.'
                 : 'That fits inside the venue reply budget.'}

@@ -5,7 +5,7 @@
 //! Answers the venue's private quote requests over a WebSocket
 //! (`/v2/maker/stream`): publish indicative levels every second, and reply to
 //! each `quoteRequest` with a firm, taker-bound, Permit2-signed `LimitOrder`
-//! within the venue's reply budget (~750 ms hard, <400 ms target). The public
+//! within the venue's reply budget (~5.5 s hard, <400 ms target). The public
 //! ladder is a separate switch (`book_enabled`); RFQ-only bots skip it.
 //!
 //! Kill switch: the whole module is spawned from `run()` only when

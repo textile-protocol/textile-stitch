@@ -201,7 +201,7 @@ impl Engine {
         })
     }
     /// Only starts bounded background work. Network and custody signing never
-    /// block the maker websocket or its subsecond reply budget.
+    /// block the maker websocket or its reply budget.
     pub(super) fn module_tick(&mut self, prices: &PriceCache, now: u64) {
         let Some(modules) = self.modules.clone() else {
             return;

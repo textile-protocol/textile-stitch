@@ -119,7 +119,7 @@ this key sign for vaults it has nothing to do with.
 
 Make sure the rule **auto-approves**. A rule that routes to a human approver is
 technically fine and practically useless: the venue stops listening for a quote
-about 750 ms after it asks.
+about 5500 ms after it asks.
 
 ## 4. Configure the bot
 
@@ -200,13 +200,13 @@ using it.
 
 Worth being blunt about: Fireblocks signing is asynchronous. The bot creates a
 transaction and polls it, where Turnkey is a single synchronous call. The venue
-gives a maker about 750 ms to answer a quote request, and makers on the live
-venue answer in ~22 ms.
+gives a maker about 5500 ms to answer a quote request, but makers on the live
+venue answer in ~22 ms. The window is rarely what you lose to; speed is.
 
 Measure yours with Verify before committing to it. Under ~400 ms per signature
-you have room; well above that and you'll quote unreliably, winning less than
-your prices deserve. If Verify reports a slow signature, the usual cause is a
-policy rule that isn't auto-approving.
+you're fine; well above that and faster makers take quotes your prices deserved
+to win. If Verify reports a slow signature, the usual cause is a policy rule
+that isn't auto-approving.
 
 Nothing about it is unsafe, since every signature is verified before use, but
 whether it's fast enough depends on your workspace, and that's yours to measure,

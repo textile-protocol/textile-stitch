@@ -62,8 +62,8 @@ pub(crate) const DEFAULT_ASSET_ID: &str = "ETH";
 /// `FIREBLOCKS_API_HOSTS` in [`super`] for the full allowlist.
 pub(crate) const DEFAULT_API_BASE_URL: &str = "https://api.fireblocks.io";
 
-/// Poll hard. A quote has a ~750ms reply budget end to end, so the difference
-/// between a 50ms and a 1s first poll is the difference between quoting and not.
+/// Poll hard. A quote has a ~5.5s reply budget end to end, but makers on the
+/// live venue answer in ~22ms, so a 1s first poll loses quotes a 50ms one wins.
 pub(crate) const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 
 /// How many polls stay at the configured interval before backing off. Covers
@@ -76,7 +76,7 @@ const MAX_POLL_INTERVAL_MS: u64 = 500;
 /// clock skew rather than sitting on the limit.
 const JWT_TTL_SECS: u64 = 25;
 
-/// A contract call is a block, not a quote. Nothing is racing a 750ms reply
+/// A contract call is a block, not a quote. Nothing is racing a quote reply
 /// budget here, and every poll costs an RSA-signed token against a workspace
 /// rate limit, so this is seconds where signing is milliseconds.
 const CONTRACT_CALL_POLL_INTERVAL: Duration = Duration::from_secs(2);

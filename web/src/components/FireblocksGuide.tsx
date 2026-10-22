@@ -104,7 +104,7 @@ export default function FireblocksGuide() {
         </p>
         <p className="text-muted">
           Allow, not Request approval: the venue stops listening for a quote
-          about 750 ms after it asks, which is no time for a person. And one
+          about 5.5 s after it asks, which is no time for a person. And one
           vault, not all of them, so this key can&apos;t sign for anything else.
         </p>
         <p>
