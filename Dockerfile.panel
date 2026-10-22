@@ -20,7 +20,7 @@ COPY web/ ./
 RUN npm run build
 
 
-FROM rust:1-bookworm AS builder
+FROM rust:1-trixie AS builder
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -30,17 +30,13 @@ COPY --from=web /web/dist ./web/dist
 RUN cargo build --locked --release --features panel --bin stitch-panel
 
 
-FROM debian:bookworm-slim
+# Distroless Debian 13: glibc, libgcc, CA roots (for outbound HTTPS to RPC and
+# price feeds during a dry run) and tzdata. No shell or package manager, which
+# the panel never uses: the Docker Engine API is reached over the mounted unix
+# socket, so there is no Docker CLI here and nothing to configure.
+FROM gcr.io/distroless/cc-debian13
 
-# ca-certificates is for outbound HTTPS (RPC and price feeds during a dry run).
-# The Docker Engine API is reached over the mounted unix socket, so there is no
-# Docker CLI here and nothing to configure.
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /src/target/release/stitch-panel /usr/local/bin/stitch-panel
-RUN chmod 0755 /usr/local/bin/stitch-panel
+COPY --from=builder --chmod=0755 /src/target/release/stitch-panel /usr/local/bin/stitch-panel
 
 # Runs as root, deliberately and not as a shrug: the panel's whole job needs the
 # Docker socket, and socket access is root-equivalent on the host regardless of

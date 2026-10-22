@@ -85,6 +85,8 @@ jobs:
           # main so the merge job can assemble the multi-arch manifest list.
           outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY_IMAGE) }}
           cache-from: type=gha,scope=bot-${{ env.PLATFORM_PAIR }}
+          # Check Debian security updates even while the base digest is unchanged.
+          no-cache-filters: production
           # Only write the shared build cache from trusted (non-PR) runs. A PR can
           # run arbitrary code during the build; letting it populate the gha cache
           # would let it poison a layer later consumed by the main publish build.

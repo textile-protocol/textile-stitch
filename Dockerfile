@@ -1,4 +1,4 @@
-FROM rust:1-bookworm AS builder
+FROM rust:1-trixie AS builder
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -6,12 +6,17 @@ COPY src ./src
 
 RUN cargo build --locked --release --bin stitch
 
-FROM debian:bookworm-slim
+# Debian 13, same release as the builder. The runtime keeps a shell because the
+# entrypoint is a script, so it can't be distroless. `apt-get upgrade` picks up
+# security fixes Debian published after the base image was built. Publishing
+# bypasses this stage's cache so those fixes are checked on every build.
+FROM debian:trixie-slim AS production
 
 # The uid is pinned, not left to useradd's next-free choice: the bot's config
 # directory is bind-mounted from the host, so whoever creates it there — an
 # operator, or Stitch — has to know which uid must own it.
 RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
   && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --uid 1000 --user-group --create-home --home-dir /home/stitch --shell /usr/sbin/nologin stitch \
