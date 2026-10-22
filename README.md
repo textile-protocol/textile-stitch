@@ -21,6 +21,8 @@ Stitch quotes Swap by default, plus an optional second job:
 
 First-party FX protection modules are available behind `modules_enabled = true` in `stitch.toml`. See [module configuration and spot rebalancing](docs/modules.md).
 
+Every change to a spread, size cap, the price guard or a feed setting is recorded in `change-log.jsonl` next to `stitch.toml`, including edits made outside the panel. Nothing leaves the machine unless `[change_log] ship = true`. See [the parameter change log](docs/parameter-change-log.md).
+
 ## Contents
 
 - [Quick Start](#quick-start)

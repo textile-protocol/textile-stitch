@@ -106,7 +106,26 @@ pub struct Config {
     /// defaults when the table is absent; see [`PriceGuardConfig`].
     #[serde(default)]
     pub price_guard: PriceGuardConfig,
+    /// Where parameter-change records go besides this host. See
+    /// [`ChangeLogConfig`] and [`crate::changelog`].
+    #[serde(default)]
+    pub change_log: ChangeLogConfig,
     pub pools: Vec<PoolConfig>,
+}
+
+/// The `[change_log]` block.
+///
+/// Every change to a tracked parameter is recorded locally under
+/// `change-log.jsonl` next to this file whatever this says. `ship` decides whether
+/// those records also go to Textile, signed in with the maker API key. Off by
+/// default: a Stitch someone else operates sends nothing unless its operator
+/// opts in. Textile-operated bots set it, and turning it off is itself shipped
+/// before shipping stops (see [`crate::changelog::ship`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeLogConfig {
+    #[serde(default)]
+    pub ship: bool,
 }
 
 /// The `[price_guard]` block: two checks on the feed print and the orders

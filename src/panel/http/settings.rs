@@ -18,12 +18,15 @@ use std::path::PathBuf;
 
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
+use super::changes;
 use super::logs::{self, WalletClaim};
 use super::{require_editable, ApiError, AppState};
+use crate::changelog::{Origin, Source};
 use crate::config::Config;
+use crate::panel::auth::Identity;
 use crate::panel::docker::{ContainerState, STOP_GRACE_SECS};
 use crate::panel::inventory::{Bot, WalletId};
 use crate::panel::naming::{LABEL_RFQ_RESERVATIONS, RFQ_RESERVATIONS_TOKEN};
@@ -628,6 +631,7 @@ fn refuse_book_off_that_kills_the_last_leg(
 pub async fn update(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
+    Extension(identity): Extension<Identity>,
     Json(body): Json<SettingsUpdate>,
 ) -> Result<Response, ApiError> {
     // Lock and re-read *under the lock* via `lock_config`. Locking a path read before the
@@ -677,6 +681,7 @@ pub async fn update(
         .map(str::trim)
         .filter(|k| !k.is_empty())
     {
+        changes::deliver_before_key_change(&path).await?;
         let dir = path.parent().ok_or_else(|| {
             ApiError::internal(&anyhow::anyhow!(
                 "{}'s config has no parent directory",
@@ -695,7 +700,8 @@ pub async fn update(
         .map_err(|e| ApiError::internal(&e))?;
     }
 
-    save_and_restart(&state, &bot, &path, &edited, pool, None).await
+    let origin = changes::origin(&identity, Source::PanelSettings, &bot.name);
+    save_and_restart(&state, &bot, &path, &edited, &origin, pool, None).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -720,6 +726,7 @@ pub(super) fn network_name(chain_id: u64) -> String {
 pub async fn add_pool(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
+    Extension(identity): Extension<Identity>,
     Json(body): Json<AddPoolBody>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
@@ -814,6 +821,7 @@ pub async fn add_pool(
         &bot,
         &path,
         &edited,
+        &changes::origin(&identity, Source::PanelPoolAdd, &bot.name),
         new_index,
         Some(serde_json::json!({ "note": note })),
     )
@@ -954,6 +962,7 @@ pub struct RemovePoolQuery {
 pub async fn remove_pool(
     State(state): State<AppState>,
     UrlPath((name, index)): UrlPath<(String, usize)>,
+    Extension(identity): Extension<Identity>,
     Query(expected): Query<RemovePoolQuery>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
@@ -1056,9 +1065,11 @@ pub async fn remove_pool(
             .map(|c| c.pools.len().saturating_sub(1))
             .unwrap_or(0),
     );
-    if let Err(e) = setup::write_toml_atomic(&path, &edited) {
-        return Err(start_back_after_failure(&state, &bot, stopped, format!("{e:#}")).await);
-    }
+    let origin = changes::origin(&identity, Source::PanelPoolRemove, &bot.name);
+    let change_log_warning = match changes::write_config(&state, &path, &edited, &origin) {
+        Ok(warning) => warning,
+        Err(e) => return Err(start_back_after_failure(&state, &bot, stopped, e.message).await),
+    };
 
     let mut restarted = false;
     let mut restart_error = None;
@@ -1083,19 +1094,22 @@ pub async fn remove_pool(
         None if restarted => format!("Removed {labelled}. Saved and restarted {}.", bot.name),
         None => format!("Removed {labelled}."),
     };
-    Ok(Json(serde_json::json!({
-        "settings": SettingsBody::from_view(
-            &view,
-            true,
-            rfq_key_is_set(&path),
-            rfq_panel,
-            rfq_default,
-            super::modules::readiness(&fresh, &path, state.cfg.runtime),
-        ),
-        "restarted": restarted,
-        "restartError": restart_error,
-        "message": message,
-    }))
+    Ok(Json(changes::with_warning(
+        serde_json::json!({
+            "settings": SettingsBody::from_view(
+                &view,
+                true,
+                rfq_key_is_set(&path),
+                rfq_panel,
+                rfq_default,
+                super::modules::readiness(&fresh, &path, state.cfg.runtime),
+            ),
+            "restarted": restarted,
+            "restartError": restart_error,
+            "message": message,
+        }),
+        change_log_warning.as_deref(),
+    ))
     .into_response())
 }
 
@@ -1233,6 +1247,7 @@ fn signer_provider(signer: &setup::SignerView) -> &'static str {
 pub async fn save_raw(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
+    Extension(identity): Extension<Identity>,
     Json(body): Json<RawUpdate>,
 ) -> Result<Response, ApiError> {
     // Same lock discipline as the structured save: `lock_config` locks and re-reads under
@@ -1279,18 +1294,23 @@ pub async fn save_raw(
         require_token_aware_image(&state, &bot).await?;
     }
 
-    save_and_restart(&state, &bot, &path, &body.toml, 0, None).await
+    let origin = changes::origin(&identity, Source::PanelRaw, &bot.name);
+    save_and_restart(&state, &bot, &path, &body.toml, &origin, 0, None).await
 }
 
 /// Write the file, then bounce the container.
 ///
 /// The write is atomic (`write_toml_atomic`), so a bot reading its config at the
 /// same moment sees either the old file or the new one, never a truncated one.
+/// It is also recorded in the bot's change log under `origin` (see
+/// [`changes::write_config`]); a log that can't record is a warning on the
+/// response, never a refused save.
 pub(super) async fn save_and_restart(
     state: &AppState,
     bot: &Bot,
     path: &std::path::Path,
     toml: &str,
+    origin: &Origin,
     pool: usize,
     extra: Option<serde_json::Value>,
 ) -> Result<Response, ApiError> {
@@ -1367,6 +1387,7 @@ pub(super) async fn save_and_restart(
                 &pre_save,
                 path,
                 toml,
+                origin,
                 would_be_wallet,
                 pool,
                 extra.as_ref(),
@@ -1398,7 +1419,7 @@ pub(super) async fn save_and_restart(
     // is nothing to guard; `None` — busy — is handled by `restart_after_save`.
     let old_claim = state.wallet_locks.try_claim_for(&pre_save);
 
-    setup::write_toml_atomic(path, toml).map_err(|e| ApiError::internal(&e))?;
+    let change_log_warning = changes::write_config(state, path, toml, origin)?;
     tracing::info!(bot = %pre_save.name, path = %path.display(), "config saved");
 
     // Re-discover again from disk before deciding anything about the restart: `pre_save`
@@ -1490,7 +1511,7 @@ pub(super) async fn save_and_restart(
     });
     merge_extra(&mut body, extra.as_ref());
 
-    Ok(Json(body).into_response())
+    Ok(Json(changes::with_warning(body, change_log_warning.as_deref())).into_response())
 }
 
 /// Fold a caller's extra fields into a save response. Keys replace the save's
@@ -1531,11 +1552,13 @@ fn merge_extra(body: &mut serde_json::Value, extra: Option<&serde_json::Value>) 
 ///
 /// `new_wallet` is the wallet the incoming config selects (`None` when it has no
 /// identifiable one). `pre_save` is the still-running bot.
+#[allow(clippy::too_many_arguments)]
 async fn apply_live_change(
     state: &AppState,
     pre_save: &Bot,
     path: &std::path::Path,
     toml: &str,
+    origin: &Origin,
     new_wallet: Option<WalletId>,
     pool: usize,
     extra: Option<&serde_json::Value>,
@@ -1585,7 +1608,7 @@ async fn apply_live_change(
 
     // Safe: commit and restart, both claims held across it.
     let old_toml = read_toml(path)?;
-    setup::write_toml_atomic(path, toml).map_err(|e| ApiError::internal(&e))?;
+    let change_log_warning = changes::write_config(state, path, toml, origin)?;
     tracing::info!(bot = %pre_save.name, "config saved (live change), restarting");
 
     let response = |restarted: bool, restart_error: serde_json::Value, message: String| {
@@ -1611,7 +1634,7 @@ async fn apply_live_change(
         if restarted {
             merge_extra(&mut body, extra);
         }
-        Ok(Json(body).into_response())
+        Ok(Json(changes::with_warning(body, change_log_warning.as_deref())).into_response())
     };
 
     let e = match state.docker.restart(container, STOP_GRACE_SECS).await {
@@ -1659,13 +1682,15 @@ async fn apply_live_change(
     // the old, guarded wallet — but if that write fails, the bot is stopped safely (nothing
     // signs) with the *new* config on disk, and the message has to say so, not claim a
     // rollback that didn't happen.
-    let message = match setup::write_toml_atomic(path, &old_toml) {
-        Ok(()) => format!(
+    let message = match changes::write_config(state, path, &old_toml, &changes::as_rollback(origin))
+    {
+        Ok(_) => format!(
             "The change wasn't applied: restarting {name} failed ({e:#}), so it was stopped and \
              reverted to its old config. Start it to resume."
         ),
         Err(re) => {
-            tracing::error!(bot = %name, "couldn't roll the config back after stopping: {re:#}");
+            let re = re.message;
+            tracing::error!(bot = %name, "couldn't roll the config back after stopping: {re}");
             format!(
                 "The change wasn't applied cleanly: restarting {name} failed ({e:#}) and its \
                  config couldn't be reverted, so {name} was stopped with the *new* config on disk. \
@@ -1812,6 +1837,16 @@ mod tests {
     use crate::setup;
     use axum::http::StatusCode;
     use serde_json::json;
+
+    /// An origin for calling `save_and_restart` directly. The handler tests
+    /// below go through the routes and get the session's own.
+    fn test_origin() -> crate::changelog::Origin {
+        super::changes::origin(
+            &crate::panel::auth::Identity::Password,
+            crate::changelog::Source::PanelRaw,
+            "bot-a",
+        )
+    }
 
     /// A running panel-native bot with a real config on disk.
     fn seed(h: &Harness, name: &str) {
@@ -2879,9 +2914,10 @@ mod tests {
         // Save starting from the stale chain-56 snapshot. The claim must land on the
         // chain-1 wallet the file now names, find it busy, and skip the restart. Deriving
         // it from the stale snapshot would claim the unheld chain-56 wallet and restart.
-        let resp = super::save_and_restart(&h.state, &stale, &path, &moved, 0, None)
-            .await
-            .unwrap();
+        let resp =
+            super::save_and_restart(&h.state, &stale, &path, &moved, &test_origin(), 0, None)
+                .await
+                .unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
@@ -2916,10 +2952,17 @@ mod tests {
         // A stale path pointing at a flat-layout file the bot is not on.
         let stale_path = h.root.join("stitch.bot-a.toml");
 
-        let err =
-            super::save_and_restart(&h.state, &bot, &stale_path, "feed_url = \"x\"\n", 0, None)
-                .await
-                .expect_err("a save against a path the config no longer sits on must be refused");
+        let err = super::save_and_restart(
+            &h.state,
+            &bot,
+            &stale_path,
+            "feed_url = \"x\"\n",
+            &test_origin(),
+            0,
+            None,
+        )
+        .await
+        .expect_err("a save against a path the config no longer sits on must be refused");
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert!(err.message.contains("moved on disk"), "{}", err.message);
         // Nothing was written: the real config is untouched and the orphan wasn't created.

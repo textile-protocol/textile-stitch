@@ -1,0 +1,24 @@
+chain_id = 8453
+rpc_url = "https://base.example"
+indexer_url = "https://api.textilecredit.com"
+permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+reactor = "0x0000000000000000000000000000000000000001"
+tick_interval_secs = 15
+
+[feed]
+url = "https://api.textilecredit.com/price?pair=zaru-usdc"
+staleness_secs = 120
+
+[[pools]]
+collateral = "0x00000000000000000000000000000000000000AA"
+collateral_decimals = 6
+debt = "0x00000000000000000000000000000000000000BB"
+debt_decimals = 6
+corridor_name = "ZARU → USDC"
+buy_offset_bps = 40
+buy_total_liquidity_debt = "250000000000"
+buy_min_slice_debt = "10000000"
+sell_offset_bps = 45
+sell_total_liquidity_collateral = "4500000000000"
+sell_min_slice_debt = "10000000"
+ttl_secs = 60

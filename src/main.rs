@@ -537,6 +537,12 @@ async fn run_connect(config_path: String, venue_url: Option<String>) -> anyhow::
     let signer = build_signer(&cfg).await?;
     println!("Operator wallet: {:?}", signer.address());
 
+    // The API files a change record under whichever maker's key ships it, so
+    // anything this bot still owes Textile goes out under the current key
+    // before registering (which can rotate it) and installing the new one.
+    stitch_bot::changelog::ship::deliver_owed(path)
+        .await
+        .context("delivering owed parameter-change records before the maker key changes")?;
     let venue = stitch_bot::venue::enroll::enroll_url_from_config(&cfg, venue_url.as_deref());
     println!("Registering with {venue} ...");
     let enrolled = stitch_bot::venue::enroll::register_maker(&cfg, &signer, &venue).await?;
@@ -597,11 +603,57 @@ async fn run_connect(config_path: String, venue_url: Option<String>) -> anyhow::
     Ok(())
 }
 
+/// Record what changed in the config since the change log last saw it,
+/// before the bot runs on it, and decide whether records ship.
+///
+/// Stitch reads its config once, here, so every change that takes effect
+/// passes this point. With `[change_log] ship` on, a config that can't be
+/// recorded doesn't run: the operator opted into an audited bot, and an
+/// unrecorded change going live is the one thing that must not happen. Off,
+/// it warns and carries on. A dry run neither records nor ships: it quotes
+/// nothing, so nothing has taken effect, and the real start records it.
+fn record_config_at_startup(
+    config_path: &str,
+    config_text: &str,
+    cfg: &Config,
+    dry_run: bool,
+) -> anyhow::Result<stitch_bot::changelog::ship::Mode> {
+    use stitch_bot::changelog::ship;
+    if dry_run {
+        return Ok(ship::Mode::Off);
+    }
+    let path = std::path::Path::new(config_path);
+    match stitch_bot::changelog::record_startup(path, config_text, stitch_bot::time::unix_now_ms())
+    {
+        Ok(recorded) => {
+            if recorded > 0 {
+                info!(
+                    records = recorded,
+                    "recorded parameter changes since the change log last saw this config"
+                );
+            }
+            Ok(ship::mode(
+                cfg.change_log.ship,
+                ship::unshipped_opt_out(path),
+            ))
+        }
+        Err(e) if cfg.change_log.ship => Err(e).context(
+            "[change_log] ship is on, so Stitch won't run a config it couldn't record. The \
+             directory next to stitch.toml has to be writable by the bot (the panel's per-bot \
+             layout and the Textile compose file both mount it read-write)",
+        ),
+        Err(e) => {
+            warn!("couldn't record parameter changes at startup: {e:#}");
+            Ok(ship::Mode::Off)
+        }
+    }
+}
+
 async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
-    let cfg = Config::from_toml(
-        &std::fs::read_to_string(&config_path)
-            .with_context(|| format!("reading config {config_path}"))?,
-    )?;
+    let config_text = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("reading config {config_path}"))?;
+    let cfg = Config::from_toml(&config_text)?;
+    let shipping = record_config_at_startup(&config_path, &config_text, &cfg, dry_run)?;
     let signer = build_signer(&cfg).await?;
     let maker = signer.address();
     let permit2: Address = cfg.permit2.parse().context("invalid permit2 address")?;
@@ -751,6 +803,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // switch.
     let perps_task =
         stitch_bot::perps::maybe_spawn(&cfg, dry_run, std::path::Path::new(&config_path));
+    let change_log_task = stitch_bot::changelog::ship::spawn(
+        &cfg,
+        std::path::Path::new(&config_path),
+        Some(maker.to_string()),
+        shipping,
+    );
     let rfq_task = stitch_bot::rfq::maybe_spawn(
         &cfg,
         signer.clone(),
@@ -873,6 +931,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             _ = &mut shutdown => {
                 info!("shutdown signal received; stopping after current tick");
                 if let Some(task) = &perps_task { task.abort(); }
+                if let Some(task) = &change_log_task { task.abort(); }
                 if let Some(task) = &rfq_task {
                     task.abort();
                 }

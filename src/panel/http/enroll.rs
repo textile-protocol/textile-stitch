@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path as UrlPath, State};
 use axum::response::Response;
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -126,6 +126,7 @@ pub(super) fn refuse_connect_on_unmigrated_flat_layout(
 pub async fn enroll(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
+    Extension(identity): Extension<crate::panel::auth::Identity>,
     Json(body): Json<EnrollBody>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
@@ -137,6 +138,9 @@ pub async fn enroll(
     let rfq_default = cfg.rfq_default_unlocked() || rfq_default_flag_in_dir(&state.cfg.bots_dir);
 
     let signer = signer_for_bot(&cfg, &path).await?;
+    // Before registering: re-registering can rotate the key the owed records
+    // would have to ship with.
+    super::changes::deliver_before_key_change(&path).await?;
     let venue = crate::venue::enroll::enroll_url_from_config(&cfg, body.venue_url.as_deref());
     let enrolled = crate::venue::enroll::register_maker(&cfg, &signer, &venue)
         .await
@@ -172,6 +176,7 @@ pub async fn enroll(
         &bot,
         &path,
         &edited,
+        &super::changes::origin(&identity, crate::changelog::Source::PanelEnroll, &bot.name),
         0,
         Some(json!({
             "message": message,

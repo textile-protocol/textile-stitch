@@ -29,7 +29,7 @@ use alloy_primitives::{Address, U256};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -953,6 +953,7 @@ pub async fn check(
 pub async fn link(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
+    Extension(identity): Extension<crate::panel::auth::Identity>,
     Json(body): Json<VaultBody>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
@@ -976,6 +977,8 @@ pub async fn link(
     let candidate = setup::link_vault(&current_toml, target.vault, target.order_executor)
         .map_err(|e| ApiError::bad_request(format!("Nothing was changed: {e:#}")))?;
     let candidate_cfg = parse_config(&candidate)?;
+    // Before enrolling the new maker: owed records ship under the old one.
+    super::changes::deliver_before_key_change(&path).await?;
     let enrolled = enroll(&candidate_cfg, &signer, body.venue_url.as_deref()).await?;
     let (edited, outcome) = apply_enrollment(
         &candidate,
@@ -992,6 +995,7 @@ pub async fn link(
         &bot,
         &path,
         &edited,
+        &super::changes::origin(&identity, crate::changelog::Source::PanelVault, &bot.name),
         &enrolled,
         current_maker(&cfg),
         json!({
@@ -1008,6 +1012,7 @@ pub async fn link(
 pub async fn unlink(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
+    Extension(identity): Extension<crate::panel::auth::Identity>,
     Query(query): Query<VenueQuery>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
@@ -1026,6 +1031,8 @@ pub async fn unlink(
     let candidate = setup::unlink_vault(&current_toml)
         .map_err(|e| ApiError::bad_request(format!("Nothing was changed: {e:#}")))?;
     let candidate_cfg = parse_config(&candidate)?;
+    // Before enrolling the new maker: owed records ship under the old one.
+    super::changes::deliver_before_key_change(&path).await?;
     let enrolled = enroll(&candidate_cfg, &signer, query.venue_url.as_deref()).await?;
     let (edited, outcome) = apply_enrollment(
         &candidate,
@@ -1041,6 +1048,7 @@ pub async fn unlink(
         &bot,
         &path,
         &edited,
+        &super::changes::origin(&identity, crate::changelog::Source::PanelVault, &bot.name),
         &enrolled,
         current_maker(&cfg),
         json!({
@@ -1106,11 +1114,13 @@ fn key_after_failed_save(previous_maker: Option<&str>, enrolled_maker: &str) -> 
 /// a key store that fails partway (the key file and its `stitch.env` pointer
 /// are written before the hand-over to the bot user, which can still fail), a
 /// save refused before writing, and a failed restart that rolled it back.
+#[allow(clippy::too_many_arguments)]
 async fn switch_maker(
     state: &AppState,
     bot: &Bot,
     path: &Path,
     edited: &str,
+    origin: &crate::changelog::Origin,
     enrolled: &EnrollResponse,
     previous_maker: Option<String>,
     extra: Value,
@@ -1130,7 +1140,7 @@ async fn switch_maker(
         undo();
         return Err(e);
     }
-    let saved = save_and_restart(state, bot, path, edited, 0, Some(extra)).await;
+    let saved = save_and_restart(state, bot, path, edited, origin, 0, Some(extra)).await;
     if read_toml(path).ok().as_deref() != Some(edited) {
         undo();
     }

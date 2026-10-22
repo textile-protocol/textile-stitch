@@ -7,7 +7,7 @@ use crate::{
 use axum::{
     extract::{Path, State},
     response::Response,
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -50,9 +50,11 @@ pub struct Update {
 pub async fn update(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    Extension(identity): Extension<crate::panel::auth::Identity>,
     Json(body): Json<Update>,
 ) -> Result<Response, ApiError> {
     let (_lock, bot) = super::bots::lock_config(&name, &state).await?;
+    let origin = super::changes::origin(&identity, crate::changelog::Source::PanelPerps, &bot.name);
     super::require_editable(&bot)?;
     if !["off", "preview", "live"].contains(&body.mode.as_str()) {
         return Err(ApiError::bad_request("Choose off, preview or live"));
@@ -104,6 +106,7 @@ pub async fn update(
             &bot,
             &path,
             &doc.to_string(),
+            &origin,
             0,
             Some(json!({"note":note})),
         )
@@ -166,7 +169,7 @@ pub async fn update(
     doc["perps"]["revision"] = toml_edit::value(revision);
     // The service requires heartbeats carrying this revision. A failed save or
     // restart cannot leave an old bot authorized to increase a position.
-    super::settings::save_and_restart(&state,&bot,&path,&doc.to_string(),0,Some(json!({"note":"FX hedge authorization saved. Off stops increases; existing positions retain exit and liquidation protection."}))).await
+    super::settings::save_and_restart(&state,&bot,&path,&doc.to_string(),&origin,0,Some(json!({"note":"FX hedge authorization saved. Off stops increases; existing positions retain exit and liquidation protection."}))).await
 }
 
 fn assignment_matches(a: &Value, name: &str, cfg: &Config, funding: &str) -> bool {

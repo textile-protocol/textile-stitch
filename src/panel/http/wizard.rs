@@ -724,6 +724,7 @@ fn apply_wizard_overrides(toml: &str, req: &CreateRequest) -> Result<String, Api
 /// not a container pointing at files that don't exist.
 pub async fn create(
     State(state): State<AppState>,
+    axum::Extension(identity): axum::Extension<crate::panel::auth::Identity>,
     Json(body): Json<CreateRequest>,
 ) -> Result<Response, ApiError> {
     let explicit_name = body
@@ -816,6 +817,19 @@ pub async fn create(
         if let Err(e) = setup::stamp_rfq_default_preset(&path) {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(ApiError::bad_request(format!("{e:#}")));
+        }
+    }
+
+    // The bot's starting values, attributed to whoever created it. Otherwise
+    // the first record would be an anonymous baseline at its first start.
+    let config_file = dir.join("stitch.toml");
+    if let Ok(written) = std::fs::read_to_string(&config_file) {
+        let origin =
+            super::changes::origin(&identity, crate::changelog::Source::PanelCreate, &name);
+        if let Some(warning) =
+            super::changes::record_written(&state, &config_file, None, &written, &origin)
+        {
+            tracing::warn!(bot = %name, "{warning}");
         }
     }
 

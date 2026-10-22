@@ -315,7 +315,10 @@ pub const INSTANCE_ID_FILE: &str = "rfq-instance-id";
 /// nothing was configured: the venue then falls back to one session per
 /// credential chain, which is the behaviour that predates instance ids. Better
 /// that than an id that changes on every restart.
-fn resolve_instance_id(configured: Option<&str>, config_dir: Option<&Path>) -> Option<String> {
+pub(crate) fn resolve_instance_id(
+    configured: Option<&str>,
+    config_dir: Option<&Path>,
+) -> Option<String> {
     if let Some(name) = configured.map(str::trim).filter(|n| !n.is_empty()) {
         return Some(name.to_string());
     }

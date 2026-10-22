@@ -17,6 +17,7 @@ pub mod allowances;
 pub mod assets;
 pub mod bots;
 pub mod chain_reads;
+pub mod changes;
 pub mod custody;
 pub mod enroll;
 pub mod funding;

@@ -26,6 +26,7 @@
 pub mod app;
 pub mod book;
 pub mod chain;
+pub mod changelog;
 pub mod closer;
 pub mod config;
 pub mod modules;

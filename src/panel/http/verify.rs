@@ -10,7 +10,7 @@
 
 use axum::extract::{Path as UrlPath, State};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -174,6 +174,7 @@ pub async fn verify_email(
 pub async fn maker_status(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
+    Extension(identity): Extension<crate::panel::auth::Identity>,
     Json(body): Json<VerifyBody>,
 ) -> Result<Response, ApiError> {
     let (_saving, bot) = super::bots::lock_config(&name, &state).await?;
@@ -299,6 +300,7 @@ pub async fn maker_status(
         &bot,
         &path,
         &edited,
+        &super::changes::origin(&identity, crate::changelog::Source::PanelVerify, &bot.name),
         0,
         Some(json!({
             "message": format!(

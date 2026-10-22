@@ -14,7 +14,7 @@ use crate::{
 use axum::{
     extract::{Path, State},
     response::Response,
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -150,6 +150,7 @@ pub struct Update {
 pub async fn update(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    Extension(identity): Extension<crate::panel::auth::Identity>,
     Json(body): Json<Update>,
 ) -> Result<Response, ApiError> {
     let (_lock, bot) = super::bots::lock_config(&name, &state).await?;
@@ -182,7 +183,9 @@ pub async fn update(
     place_last(&mut doc, "modules");
     let edited = doc.to_string();
     Config::from_toml(&edited).map_err(ApiError::bad_request)?;
-    super::settings::save_and_restart(&state, &bot, &path, &edited, 0, None).await
+    let origin =
+        super::changes::origin(&identity, crate::changelog::Source::PanelModules, &bot.name);
+    super::settings::save_and_restart(&state, &bot, &path, &edited, &origin, 0, None).await
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,6 +199,7 @@ pub struct Enabled {
 pub async fn set_enabled(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    Extension(identity): Extension<crate::panel::auth::Identity>,
     Json(body): Json<Enabled>,
 ) -> Result<Response, ApiError> {
     let (_lock, bot) = super::bots::lock_config(&name, &state).await?;
@@ -225,6 +229,11 @@ pub async fn set_enabled(
         &bot,
         &path,
         &edited,
+        &super::changes::origin(
+            &identity,
+            crate::changelog::Source::PanelModulesEnabled,
+            &bot.name,
+        ),
         0,
         Some(serde_json::json!({ "note": note })),
     )

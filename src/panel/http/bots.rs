@@ -752,6 +752,14 @@ pub async fn remove(
     Path(name): Path<String>,
     Query(query): Query<RemoveQuery>,
 ) -> Result<Response, ApiError> {
+    // Deleting the config holds the config lock from the owed-records check to
+    // the delete, so a save can't append a record nobody will ever ship in
+    // between. Saves wait out the stop's grace period; that's the price.
+    let _config = if query.delete_config {
+        lock_config(&name, &state).await?.0
+    } else {
+        None
+    };
     // Need the fleet when deleteConfig is set: another Compose service can mount
     // the same directory under a different name, and wiping it would erase that
     // sibling's key while its container is still live.
@@ -768,6 +776,7 @@ pub async fn remove(
 
     if query.delete_config {
         refuse_shared_config_delete(&bot, &fleet, &state.cfg)?;
+        refuse_unshipped_change_log_delete(&bot, &state.cfg)?;
         refuse_funded_key_delete(&state, &bot).await?;
     }
 
@@ -858,6 +867,43 @@ fn owned_config_target<'a>(
                 None
             }
         }
+    }
+}
+
+/// Refuse to delete a config whose change log holds records the bot owes
+/// Textile ([`crate::changelog::ship::owed`]): unshipped records of a bot that
+/// ships, or of one that just switched shipping off and hasn't delivered the
+/// switch-off yet. The journal lives beside the config being deleted, so this
+/// would delete the only copy. The bot ships on every start, so starting it
+/// once clears this; keeping the config also works.
+fn refuse_unshipped_change_log_delete(
+    bot: &Bot,
+    cfg: &crate::panel::PanelConfig,
+) -> Result<(), ApiError> {
+    if owned_config_target(bot, cfg).is_none() {
+        return Ok(());
+    }
+    let Some(path) = bot.config_panel_path.as_deref() else {
+        return Ok(());
+    };
+    let refused = crate::changelog::ship::refused(path);
+    if refused > 0 {
+        return Err(ApiError::conflict(format!(
+            "Textile refused {refused} of {}'s parameter-change record(s) (listed in its \
+             change-log.refused), so this host has the only copy. Deleting its config would \
+             delete them. Copy the change-log files somewhere safe, or remove the bot and keep \
+             its config.",
+            bot.name
+        )));
+    }
+    match crate::changelog::ship::owed(path) {
+        0 => Ok(()),
+        pending => Err(ApiError::conflict(format!(
+            "{} has {pending} parameter-change record(s) Textile hasn't received yet, and \
+             deleting its config would delete the only copy. Start it once so it ships them, or \
+             remove it and keep its config.",
+            bot.name
+        ))),
     }
 }
 

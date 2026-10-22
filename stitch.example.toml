@@ -59,6 +59,15 @@ staleness_secs = 900
 # max_jump_bps = 1000
 # settle_secs = 300
 
+# Every change to a spread, size cap, the price guard or a feed setting is
+# recorded in change-log.jsonl next to this file, whoever made it and however (the
+# panel, an editor, `stitch connect`). That record stays on this machine.
+# `ship = true` also sends it to Textile, signed in with this bot's maker key.
+# Leave it off unless Textile operates this bot for a client. See
+# docs/parameter-change-log.md.
+# [change_log]
+# ship = true
+
 # One block per corridor you serve. Add more [[pools]] for other pairs/chains.
 # Pairs with different prices (cNGN, COPM, …) MUST each set `feed_url` — one
 # shared feed can't price them all.
