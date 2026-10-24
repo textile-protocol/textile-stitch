@@ -234,6 +234,11 @@ fn print_help() {
          --token <address|native> --amount <number|all> --to <address>.\n    \
          connect           Register this wallet with Textile and write the maker\n                      \
          credential, then exit. Required before an RFQ bot can quote.\n    \
+         register          Optional: mint this bot's ERC-8004 agent identity on its\n                      \
+         chain and record the id under [erc8004]. Takes --name and\n                      \
+         --description (stored onchain), or --agent-id <id> to link an\n                      \
+         identity the wallet already owns. Works with --dry-run;\n                      \
+         --no-record prints the id without writing the config.\n    \
          init              Interactively create stitch.toml/.env/.key, then exit.\n\n\
          OPTIONS:\n    \
          --config <path>   Operator config (TOML). Read fresh on every start.\n    \
@@ -319,6 +324,14 @@ async fn main() -> anyhow::Result<()> {
             amount,
             to,
         } => run_withdraw(config, token, amount, to).await,
+        Command::Register {
+            config,
+            name,
+            description,
+            agent_id,
+            dry_run,
+            record,
+        } => run_register(config, name, description, agent_id, dry_run, record).await,
     }
 }
 
@@ -394,6 +407,147 @@ async fn run_withdraw(
         plan.amount, plan.symbol, plan.to
     );
     Ok(())
+}
+
+/// `stitch register`: give the bot an ERC-8004 agent identity on its own
+/// chain and record the id under `[erc8004]`. Safe to rerun: a config that
+/// already names an id sends nothing, and a wallet that already owns an
+/// identity is refused a second mint and pointed at `--agent-id`.
+///
+/// The last stdout line of a mint or a link is `agent_id=<id>`, for callers
+/// that read the result rather than the config (the panel, with `record` off).
+async fn run_register(
+    config_path: String,
+    name: Option<String>,
+    description: Option<String>,
+    agent_id: Option<u64>,
+    dry_run: bool,
+    record: bool,
+) -> anyhow::Result<()> {
+    use stitch_bot::chain::erc8004;
+
+    let cfg = Config::from_toml(
+        &std::fs::read_to_string(&config_path)
+            .with_context(|| format!("reading config {config_path}"))?,
+    )?;
+    let registry = erc8004::registry_for_chain(cfg.chain_id).ok_or_else(|| {
+        anyhow!(
+            "ERC-8004 has no Identity Registry on chain {} that Stitch knows of, so there is \
+             nothing to register with",
+            cfg.chain_id
+        )
+    })?;
+    if let (Some(id), None) = (erc8004::configured_agent_id(&cfg), agent_id) {
+        println!(
+            "already registered as agent #{id} on {}: {}\nNothing sent.",
+            registry.network,
+            erc8004::scan_url(registry, id)
+        );
+        return Ok(());
+    }
+    let signer = build_signer(&cfg).await?;
+    let wallet =
+        Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id).with_gas_caps(cfg.gas_caps());
+    let owner = wallet.address();
+
+    if let Some(id) = agent_id {
+        erc8004::ensure_owns(wallet.rpc(), registry, owner, id).await?;
+        if dry_run {
+            println!(
+                "agent #{id} on {} is owned by {owner}. Dry run: config not changed.",
+                registry.network
+            );
+            return Ok(());
+        }
+        if record {
+            record_agent_id(&config_path, id)?;
+        }
+        println!(
+            "linked agent #{id} on {}: {}",
+            registry.network,
+            erc8004::scan_url(registry, id)
+        );
+        println!("agent_id={id}");
+        return Ok(());
+    }
+
+    erc8004::ensure_no_identity_yet(wallet.rpc(), registry, owner).await?;
+    erc8004::ensure_nothing_in_flight(wallet.rpc(), owner).await?;
+    let defaults = erc8004::default_profile(
+        &default_agent_label(&config_path),
+        &erc8004::pair_labels(&cfg),
+        registry.network,
+    );
+    let profile = erc8004::profile_from_input(
+        name.as_deref().unwrap_or(&defaults.name),
+        description.as_deref().unwrap_or(&defaults.description),
+    )?;
+    let plan = erc8004::plan_register(&cfg, owner, profile)?;
+    println!(
+        "stitch register on {} (chain {})",
+        registry.network, cfg.chain_id
+    );
+    println!("  registry  {}", registry.address);
+    println!("  owner     {owner}");
+    println!(
+        "  stored    {} (data URI, {} bytes)",
+        plan.json,
+        plan.agent_uri.len()
+    );
+
+    let rpc = wallet.rpc();
+    let gas = rpc
+        .estimate_gas(owner, registry.address, &plan.calldata, U256::ZERO)
+        .await
+        .context("estimating register(agentURI)")?;
+    let price = rpc.gas_price().await.context("reading the gas price")?;
+    println!(
+        "  cost      about {} {} ({gas} gas)",
+        erc8004::format_coin(gas * price),
+        registry.gas_coin
+    );
+    if dry_run {
+        println!("Dry run: nothing sent.");
+        return Ok(());
+    }
+
+    let (id, hash) = erc8004::send_register(&wallet, &plan).await?;
+    println!(
+        "registered as agent #{id} on {} in tx {hash}",
+        registry.network
+    );
+    println!("{}", erc8004::scan_url(registry, id));
+    if record {
+        record_agent_id(&config_path, id).with_context(|| {
+            format!(
+                "agent #{id} is minted, but writing it to {config_path} failed. Run \
+                 `stitch register --agent-id {id}` to record it"
+            )
+        })?;
+    }
+    println!("agent_id={id}");
+    Ok(())
+}
+
+/// Write `[erc8004] agent_id` into the config on disk, read fresh so an edit
+/// made while the mint was in flight isn't overwritten.
+fn record_agent_id(config_path: &str, id: u64) -> anyhow::Result<()> {
+    let path = std::path::Path::new(config_path);
+    let current =
+        std::fs::read_to_string(path).with_context(|| format!("reading config {config_path}"))?;
+    let next = setup::set_erc8004_agent_id(&current, id)?;
+    setup::write_toml_atomic(path, &next)
+}
+
+/// The name the CLI starts from when `--name` isn't given: the bot the
+/// config path names, else "Stitch". Canonicalized first so a bare
+/// `stitch.toml` still has a folder to name it by.
+fn default_agent_label(config_path: &str) -> String {
+    std::path::Path::new(config_path)
+        .canonicalize()
+        .ok()
+        .and_then(|p| stitch_bot::chain::erc8004::label_from_config_path(&p))
+        .unwrap_or_else(|| "Stitch".to_string())
 }
 
 /// `stitch init`: pick a corridor, take the key without echo, write the config.

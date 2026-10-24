@@ -8,9 +8,11 @@
 //! trip instead of one per view, [`snapshot`] puts the bot's latest reads on
 //! disk so the panel doesn't ask the chain again, and [`approve`] is the
 //! one-time Permit2 allowance every quoted token needs before a filler can
-//! execute an order.
+//! execute an order. [`erc8004`] is the optional onchain agent identity
+//! `stitch register` mints.
 
 pub mod approve;
+pub mod erc8004;
 pub mod gas_caps;
 pub mod gas_reserve;
 #[cfg(test)]

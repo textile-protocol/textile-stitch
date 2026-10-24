@@ -9,6 +9,8 @@ import type { ModulesConfig, ModulesView } from './modules'
 
 import type {
   ActionResult,
+  AgentIdentity,
+  AgentProfile,
   Allowances,
   Bot,
   BotVersions,
@@ -424,6 +426,24 @@ export const api = {
   /** URL of the withdraw one-shot; same streaming shape as approve. */
   withdrawUrl: (name: string) =>
     `/api/bots/${encodeURIComponent(name)}/withdraw`,
+
+  identity: (name: string) =>
+    request<AgentIdentity>(`/api/bots/${encodeURIComponent(name)}/identity`),
+  /** URL of the `stitch register` one-shot; same streaming shape as approve. */
+  registerUrl: (name: string) =>
+    `/api/bots/${encodeURIComponent(name)}/identity/register`,
+  /** Fireblocks sends the mint; answers once it has landed and been recorded. */
+  registerViaCustody: (name: string, profile: AgentProfile) =>
+    request<AgentIdentity>(
+      `/api/bots/${encodeURIComponent(name)}/identity/register/custody`,
+      json(profile),
+    ),
+  /** Record an agent id the wallet owns. The panel checks `ownerOf` first. */
+  linkIdentity: (name: string, agentId: string) =>
+    request<AgentIdentity>(
+      `/api/bots/${encodeURIComponent(name)}/identity/link`,
+      json({ agentId }),
+    ),
 
   /**
    * Send one Permit2 approval through the bot's custodian.

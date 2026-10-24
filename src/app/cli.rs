@@ -41,6 +41,20 @@ pub enum Command {
         amount: String,
         to: String,
     },
+    /// Mint this bot's ERC-8004 agent identity on its chain's Identity
+    /// Registry, or with `agent_id` link one the wallet already owns, and
+    /// record the id under `[erc8004]`. `name` and `description` replace the
+    /// generated text that goes onchain. `dry_run` prints the file and the
+    /// cost without sending. `record` off prints the id instead of writing
+    /// it: the panel mounts the config read-only and records it itself.
+    Register {
+        config: String,
+        name: Option<String>,
+        description: Option<String>,
+        agent_id: Option<u64>,
+        dry_run: bool,
+        record: bool,
+    },
 }
 
 /// Parse a command from an argument iterator (already skipping argv[0]).
@@ -60,6 +74,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
     let mut token: Option<String> = None;
     let mut amount: Option<String> = None;
     let mut to: Option<String> = None;
+    let mut register = false;
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut agent_id: Option<u64> = None;
+    let mut no_record = false;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -91,6 +110,27 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
                 )
             }
             "--to" => to = Some(it.next().ok_or_else(|| anyhow!("--to needs an address"))?),
+            // Verb: `stitch register --config <path> [--name <text>] [--description <text>]
+            // [--agent-id <id>] [--dry-run]`.
+            "register" => register = true,
+            "--name" => name = Some(it.next().ok_or_else(|| anyhow!("--name needs text"))?),
+            "--description" => {
+                description = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--description needs text"))?,
+                )
+            }
+            "--no-record" => no_record = true,
+            "--agent-id" => {
+                let raw = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--agent-id needs a token id"))?;
+                agent_id = Some(
+                    raw.trim()
+                        .parse()
+                        .map_err(|_| anyhow!("--agent-id {raw:?} is not a token id"))?,
+                );
+            }
             other => return Err(anyhow!("unknown argument: {other}")),
         }
     }
@@ -107,6 +147,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
         (connect, "connect"),
         (approve, "approve"),
         (withdraw, "withdraw"),
+        (register, "register"),
     ]
     .into_iter()
     .filter_map(|(on, name)| on.then_some(name))
@@ -126,6 +167,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
     if (token.is_some() || amount.is_some() || to.is_some()) && !withdraw {
         return Err(anyhow!(
             "--token, --amount and --to only apply to `withdraw`"
+        ));
+    }
+    if (name.is_some() || description.is_some() || agent_id.is_some() || no_record) && !register {
+        return Err(anyhow!(
+            "--name, --description, --agent-id and --no-record only apply to `register`"
+        ));
+    }
+    if agent_id.is_some() && (name.is_some() || description.is_some()) {
+        // Linking sends nothing, so there is nowhere for new text to go.
+        return Err(anyhow!(
+            "--agent-id links an identity the wallet already owns; --name and --description \
+             only apply when registering a new one"
         ));
     }
     if dry_run && withdraw {
@@ -163,6 +216,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Command>
             token: token.ok_or_else(|| anyhow!("withdraw needs --token <address|native>"))?,
             amount: amount.ok_or_else(|| anyhow!("withdraw needs --amount <number|all>"))?,
             to: to.ok_or_else(|| anyhow!("withdraw needs --to <address>"))?,
+        });
+    }
+    if register {
+        return Ok(Command::Register {
+            config,
+            name,
+            description,
+            agent_id,
+            dry_run,
+            record: !no_record,
         });
     }
     Ok(Command::Run { config, dry_run })
@@ -463,5 +526,83 @@ mod tests {
     #[test]
     fn venue_without_value_is_an_error() {
         assert!(parse_vec(&["connect", "--config", "x.toml", "--venue"]).is_err());
+    }
+
+    #[test]
+    fn register_takes_its_text_and_a_dry_run() {
+        assert_eq!(
+            parse_vec(&[
+                "register",
+                "--config",
+                "s.toml",
+                "--name",
+                "Acme MM · cNGN/USDT",
+                "--description",
+                "Quotes cNGN",
+                "--dry-run",
+                "--no-record",
+            ])
+            .unwrap(),
+            Command::Register {
+                config: "s.toml".into(),
+                name: Some("Acme MM · cNGN/USDT".into()),
+                description: Some("Quotes cNGN".into()),
+                agent_id: None,
+                dry_run: true,
+                record: false,
+            }
+        );
+        assert_eq!(
+            parse_vec(&["register", "--config", "s.toml", "--agent-id", "0"]).unwrap(),
+            Command::Register {
+                config: "s.toml".into(),
+                name: None,
+                description: None,
+                agent_id: Some(0),
+                dry_run: false,
+                record: true,
+            }
+        );
+    }
+
+    #[test]
+    fn register_flags_stay_with_register() {
+        for (args, want) in [
+            (
+                vec!["approve", "--config", "s.toml", "--name", "x"],
+                "only apply to `register`",
+            ),
+            (
+                vec!["--config", "s.toml", "--agent-id", "3"],
+                "only apply to `register`",
+            ),
+            (
+                vec!["withdraw", "--config", "s.toml", "--no-record"],
+                "only apply to `register`",
+            ),
+            (
+                vec![
+                    "register",
+                    "--config",
+                    "s.toml",
+                    "--agent-id",
+                    "3",
+                    "--name",
+                    "x",
+                ],
+                "--agent-id links",
+            ),
+            (
+                vec!["register", "--config", "s.toml", "--agent-id", "-1"],
+                "not a token id",
+            ),
+            (
+                vec!["register", "withdraw", "--config", "s.toml"],
+                "pick one verb",
+            ),
+        ] {
+            let err = parse_vec(&args).expect_err(&format!("{args:?} must be rejected"));
+            assert!(err.to_string().contains(want), "{args:?}: {err}");
+        }
     }
 }

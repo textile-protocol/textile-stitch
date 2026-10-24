@@ -35,6 +35,8 @@ pub enum Source {
     PanelVerify,
     PanelVault,
     PanelPerps,
+    /// The panel recorded the bot's ERC-8004 agent id.
+    PanelIdentity,
     /// A failed live restart put the old config back.
     PanelRollback,
     PanelCreate,
@@ -55,6 +57,7 @@ impl Source {
             Source::PanelVerify => "panel.verify",
             Source::PanelVault => "panel.vault",
             Source::PanelPerps => "panel.perps",
+            Source::PanelIdentity => "panel.identity",
             Source::PanelRollback => "panel.rollback",
             Source::PanelCreate => "panel.create",
         }

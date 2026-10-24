@@ -275,6 +275,10 @@ pub struct ConfigSummary {
     /// files beside it alone. No venue call: asking the venue rewrites the
     /// config on a seated bot, so this is what can be known without asking.
     pub venue: VenueSeat,
+    /// The ERC-8004 agent id `[erc8004]` records, if `stitch register` (or the
+    /// panel's link) wrote one. Lets a bot on the same chain and wallet offer
+    /// its sibling's identity instead of minting a second.
+    pub erc8004_agent_id: Option<u64>,
 }
 
 /// A running process is not the same as a bot Textile sends quotes to. This
@@ -848,6 +852,7 @@ pub fn summarise(
             .and_then(|s| s.raw_signing_unavailable()),
         custody_approvals: crate::panel::http::custody::custody_approvals_available(&parsed),
         venue: venue_seat(&parsed, config_path, runtime),
+        erc8004_agent_id: crate::chain::erc8004::configured_agent_id(&parsed),
     })
 }
 

@@ -577,6 +577,11 @@ pub enum OneShot {
         amount: String,
         to: String,
     },
+    /// Mint the bot's ERC-8004 identity with this onchain text. Sends one
+    /// transaction. `--no-record` because the config is mounted read-only:
+    /// the run prints the agent id and the panel records it after checking
+    /// `ownerOf`.
+    Register { name: String, description: String },
 }
 
 impl OneShot {
@@ -602,6 +607,17 @@ impl OneShot {
                 "--to".into(),
                 to.clone(),
             ],
+            OneShot::Register { name, description } => vec![
+                "stitch".into(),
+                "register".into(),
+                "--config".into(),
+                config,
+                "--no-record".into(),
+                "--name".into(),
+                name.clone(),
+                "--description".into(),
+                description.clone(),
+            ],
         }
     }
 
@@ -612,6 +628,7 @@ impl OneShot {
             OneShot::Approve => "stitch-approve",
             OneShot::DryRun => "stitch-dryrun",
             OneShot::Withdraw { .. } => "stitch-withdraw",
+            OneShot::Register { .. } => "stitch-register",
         }
     }
 
@@ -620,6 +637,7 @@ impl OneShot {
             OneShot::Approve => "approve",
             OneShot::DryRun => "dry-run",
             OneShot::Withdraw { .. } => "withdraw",
+            OneShot::Register { .. } => "register",
         }
     }
 

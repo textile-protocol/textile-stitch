@@ -21,6 +21,7 @@ pub mod changes;
 pub mod custody;
 pub mod enroll;
 pub mod funding;
+pub mod identity;
 pub mod logs;
 // The test node moved to `chain::mock_node` so the default build's tests can
 // use it too; panel tests keep their old path through this re-export.
@@ -364,6 +365,16 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             get(crate::panel::desktop::get).patch(crate::panel::desktop::patch),
         )
         .route("/api/bots/{name}/dry-run", post(logs::dry_run))
+        .route("/api/bots/{name}/identity", get(identity::show))
+        .route(
+            "/api/bots/{name}/identity/register",
+            post(identity::register),
+        )
+        .route(
+            "/api/bots/{name}/identity/register/custody",
+            post(identity::register_via_custody),
+        )
+        .route("/api/bots/{name}/identity/link", post(identity::link))
         .route("/api/compose-export", get(bots::compose_export))
         .route("/api/updates", get(updates::status))
         .route("/api/panel/update", post(updates::update_panel))

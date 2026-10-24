@@ -84,7 +84,7 @@ const CONTRACT_CALL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// back the transaction id. Generous enough to cover a slow chain and a policy
 /// rule that asks a human, short enough that a browser request does not hang
 /// on it indefinitely.
-const CONTRACT_CALL_TIMEOUT: Duration = Duration::from_secs(180);
+pub const CONTRACT_CALL_TIMEOUT: Duration = Duration::from_secs(180);
 /// `/v1/blockchains` is a workspace-wide list, not a per-account one, so one
 /// page covers every chain any real workspace has.
 const BLOCKCHAIN_PAGE_LIMIT: usize = 200;
@@ -235,6 +235,26 @@ impl FireblocksSigner {
         path: &str,
         body: Option<&Value>,
     ) -> anyhow::Result<Value> {
+        let (status, text) = self.request(method, path, body).await?;
+        if !status.is_success() {
+            anyhow::bail!("Fireblocks {path} returned {status}: {}", text.trim());
+        }
+        serde_json::from_str(&text).with_context(|| {
+            format!(
+                "Fireblocks {path} returned a non-JSON body: {}",
+                text.trim()
+            )
+        })
+    }
+
+    /// [`Self::send`] without judging the status, for the one caller that
+    /// has to tell "not found" apart from "couldn't ask".
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> anyhow::Result<(reqwest::StatusCode, String)> {
         let raw_body = body.map(|b| b.to_string()).unwrap_or_default();
         let token = self.jwt(path, &raw_body).await?;
         let mut req = self
@@ -256,15 +276,7 @@ impl FireblocksSigner {
             .text()
             .await
             .with_context(|| format!("reading the Fireblocks response for {path}"))?;
-        if !status.is_success() {
-            anyhow::bail!("Fireblocks {path} returned {status}: {}", text.trim());
-        }
-        serde_json::from_str(&text).with_context(|| {
-            format!(
-                "Fireblocks {path} returned a non-JSON body: {}",
-                text.trim()
-            )
-        })
+        Ok((status, text))
     }
 
     /// Build the RS256 token Fireblocks expects. `bodyHash` is the hex SHA-256
@@ -515,6 +527,11 @@ impl FireblocksSigner {
     /// Waits for `COMPLETED` rather than taking `txHash` the moment it appears:
     /// the caller's next move is to re-read the allowance, and a hash from
     /// `BROADCASTING` would have it read a chain that has not applied the call.
+    ///
+    /// A caller that must not send the same call twice uses
+    /// [`Self::submit_contract_call`] with an `externalTxId` and
+    /// [`Self::wait_for_contract_call`] instead, and keeps both ids in
+    /// between: a timeout here leaves the call live in Fireblocks.
     pub async fn contract_call(
         &self,
         asset_id: &str,
@@ -522,53 +539,109 @@ impl FireblocksSigner {
         calldata: &[u8],
         note: &str,
     ) -> anyhow::Result<SentTransaction> {
-        let body = self.contract_call_body(asset_id, to, calldata, note);
         let started = Instant::now();
+        let id = self
+            .submit_contract_call(asset_id, to, calldata, note, None)
+            .await?;
+        match self
+            .wait_for_contract_call(&id, CONTRACT_CALL_TIMEOUT)
+            .await?
+        {
+            CallState::Mined(tx_hash) => Ok(SentTransaction {
+                id,
+                tx_hash,
+                elapsed: started.elapsed(),
+            }),
+            CallState::Dead(why) => anyhow::bail!("{why}"),
+            CallState::InFlight => anyhow::bail!(
+                "Fireblocks transaction {id} had not completed after {:?}. It may still be in \
+                 flight — check the Fireblocks console before sending it again. The usual cause \
+                 is a Contract Call policy rule that routes to a human approver rather than \
+                 auto-approving.",
+                CONTRACT_CALL_TIMEOUT
+            ),
+        }
+    }
+
+    /// Create one contract call and return Fireblocks' transaction id. Nothing
+    /// waits: from here the call lives in Fireblocks until it mines or dies,
+    /// whatever happens to this process.
+    ///
+    /// `external_tx_id` makes the submission idempotent. Fireblocks refuses
+    /// any later transaction carrying the same one, and
+    /// [`Self::find_by_external_id`] finds this one when the response naming
+    /// it was lost.
+    pub async fn submit_contract_call(
+        &self,
+        asset_id: &str,
+        to: Address,
+        calldata: &[u8],
+        note: &str,
+        external_tx_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let body = self.contract_call_body(asset_id, to, calldata, note, external_tx_id);
         let created = self
             .send(reqwest::Method::POST, "/v1/transactions", Some(&body))
             .await?;
-        let id = created["id"]
-            .as_str()
-            .ok_or_else(|| {
-                anyhow!(
-                    "Fireblocks did not return a transaction id for the contract call: {created}"
-                )
-            })?
-            .to_string();
-        if let Some(hash) = self.settled(&created, &id)? {
-            return Ok(SentTransaction {
-                id,
-                tx_hash: hash,
-                elapsed: started.elapsed(),
-            });
-        }
+        created["id"].as_str().map(str::to_string).ok_or_else(|| {
+            anyhow!("Fireblocks did not return a transaction id for the contract call: {created}")
+        })
+    }
 
-        let deadline = started + CONTRACT_CALL_TIMEOUT;
+    /// Fireblocks' id for the transaction submitted with `external_tx_id`.
+    /// `None` only on a 404, which means Fireblocks never created it; any
+    /// other failure is an error, because guessing "never created" wrong is
+    /// how the same call gets sent twice.
+    pub async fn find_by_external_id(
+        &self,
+        external_tx_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let path = format!("/v1/transactions/external_tx_id/{external_tx_id}");
+        let (status, text) = self.request(reqwest::Method::GET, &path, None).await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            anyhow::bail!("Fireblocks {path} returned {status}: {}", text.trim());
+        }
+        let tx: Value = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "Fireblocks {path} returned a non-JSON body: {}",
+                text.trim()
+            )
+        })?;
+        tx["id"]
+            .as_str()
+            .map(|id| Some(id.to_string()))
+            .ok_or_else(|| anyhow!("Fireblocks {path} returned a transaction with no id: {tx}"))
+    }
+
+    /// Where a submitted contract call stands now: one read.
+    pub async fn contract_call_state(&self, id: &str) -> anyhow::Result<CallState> {
+        let tx = self
+            .send(
+                reqwest::Method::GET,
+                &format!("/v1/transactions/{id}"),
+                None,
+            )
+            .await?;
+        self.call_state(&tx, id)
+    }
+
+    /// Poll a submitted contract call until it mines, dies, or `timeout`
+    /// passes. `InFlight` after the timeout means it is still live.
+    pub async fn wait_for_contract_call(
+        &self,
+        id: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<CallState> {
+        let deadline = Instant::now() + timeout;
         loop {
-            if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "Fireblocks transaction {id} had not completed after {:?}. It may still be \
-                     in flight — check the Fireblocks console before sending it again. The usual \
-                     cause is a Contract Call policy rule that routes to a human approver rather \
-                     than auto-approving.",
-                    CONTRACT_CALL_TIMEOUT
-                );
+            let state = self.contract_call_state(id).await?;
+            if state != CallState::InFlight || Instant::now() >= deadline {
+                return Ok(state);
             }
             tokio::time::sleep(CONTRACT_CALL_POLL_INTERVAL).await;
-            let tx = self
-                .send(
-                    reqwest::Method::GET,
-                    &format!("/v1/transactions/{id}"),
-                    None,
-                )
-                .await?;
-            if let Some(hash) = self.settled(&tx, &id)? {
-                return Ok(SentTransaction {
-                    id,
-                    tx_hash: hash,
-                    elapsed: started.elapsed(),
-                });
-            }
         }
     }
 
@@ -581,8 +654,9 @@ impl FireblocksSigner {
         to: Address,
         calldata: &[u8],
         note: &str,
+        external_tx_id: Option<&str>,
     ) -> Value {
-        json!({
+        let mut body = json!({
             "operation": "CONTRACT_CALL",
             "assetId": asset_id,
             "source": { "type": "VAULT_ACCOUNT", "id": self.vault_account_id },
@@ -594,31 +668,55 @@ impl FireblocksSigner {
             "amount": "0",
             "note": note,
             "extraParameters": { "contractCallData": format!("0x{}", hex::encode(calldata)) },
-        })
+        });
+        if let Some(external) = external_tx_id {
+            body["externalTxId"] = json!(external);
+        }
+        body
     }
 
-    /// `Ok(Some(hash))` once the call is mined, `Ok(None)` while in flight,
-    /// `Err` on a status that will never mine.
-    fn settled(&self, tx: &Value, id: &str) -> anyhow::Result<Option<String>> {
+    /// A transaction read as a [`CallState`]. Errors only on a `COMPLETED`
+    /// transaction with no hash, which Fireblocks should never send.
+    ///
+    /// `Dead` means final. `CANCELLING` stops a signing poll (the signature
+    /// is never coming), but Fireblocks documents it as the step before
+    /// `CANCELLED`, so for a call whose caller may send a replacement once
+    /// this one is dead, it is still in flight.
+    fn call_state(&self, tx: &Value, id: &str) -> anyhow::Result<CallState> {
         let status = tx["status"].as_str().unwrap_or_default();
+        if status == "CANCELLING" {
+            return Ok(CallState::InFlight);
+        }
         if TERMINAL_FAILURES.contains(&status) {
             let sub = tx["subStatus"].as_str().unwrap_or_default();
-            anyhow::bail!(
-                "{}",
-                self.explain_failure(status, sub, Operation::ContractCall)
-            );
+            return Ok(CallState::Dead(self.explain_failure(
+                status,
+                sub,
+                Operation::ContractCall,
+            )));
         }
         if status != "COMPLETED" {
-            return Ok(None);
+            return Ok(CallState::InFlight);
         }
         tx["txHash"]
             .as_str()
             .filter(|h| !h.is_empty())
-            .map(|h| Some(h.to_string()))
+            .map(|h| CallState::Mined(h.to_string()))
             .ok_or_else(|| {
                 anyhow!("Fireblocks reported transaction {id} COMPLETED with no txHash: {tx}")
             })
     }
+}
+
+/// Where a submitted contract call stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallState {
+    /// Waiting on policy approval, signing, or the chain.
+    InFlight,
+    /// Mined, with its onchain hash.
+    Mined(String),
+    /// A status that will never mine, explained for the operator.
+    Dead(String),
 }
 
 /// A contract call Fireblocks broadcast on the operator's behalf.
@@ -1366,6 +1464,53 @@ mod tests {
         assert_eq!(match_chain(&bare, 56), None);
     }
 
+    /// A caller that passes an external id gets it on the request, which is
+    /// what makes Fireblocks refuse a second submission with it.
+    #[test]
+    fn an_external_id_rides_on_the_contract_call() {
+        let body =
+            test_signer().contract_call_body("ETH", Address::ZERO, &[1, 2], "n", Some("ext-1"));
+        assert_eq!(body["externalTxId"], "ext-1");
+    }
+
+    /// Only `COMPLETED` with a hash is mined, a terminal status is dead, and
+    /// everything else (policy approval, signing, broadcasting) is in flight,
+    /// which is what lets a caller keep waiting rather than send it again.
+    #[test]
+    fn a_contract_call_is_in_flight_until_it_completes_or_dies() {
+        let signer = test_signer();
+        let state = |tx: Value| signer.call_state(&tx, "fb-1").unwrap();
+        for status in [
+            "SUBMITTED",
+            "PENDING_AUTHORIZATION",
+            "PENDING_SIGNATURE",
+            "BROADCASTING",
+            "CONFIRMING",
+            // Not final yet: CANCELLED is. A caller that clears its guard on
+            // Dead must not do it while the cancel can still fail.
+            "CANCELLING",
+        ] {
+            assert_eq!(
+                state(json!({ "status": status })),
+                CallState::InFlight,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            state(json!({ "status": "COMPLETED", "txHash": "0xabc" })),
+            CallState::Mined("0xabc".into())
+        );
+        for status in TERMINAL_FAILURES.iter().filter(|s| **s != "CANCELLING") {
+            assert!(
+                matches!(state(json!({ "status": status })), CallState::Dead(_)),
+                "{status}"
+            );
+        }
+        assert!(signer
+            .call_state(&json!({ "status": "COMPLETED", "txHash": "" }), "fb-1")
+            .is_err());
+    }
+
     /// The approve is a contract call, not a transfer: no value moves, the
     /// token is the destination, and the whole intent is in the calldata.
     #[test]
@@ -1378,7 +1523,8 @@ mod tests {
             .parse()
             .unwrap();
         let calldata = crate::closer::executor::encode_approve(permit2, U256::MAX);
-        let body = signer.contract_call_body("BNB_BSC", token, &calldata, "note");
+        let body = signer.contract_call_body("BNB_BSC", token, &calldata, "note", None);
+        assert!(body.get("externalTxId").is_none(), "approvals send none");
 
         assert_eq!(body["operation"], "CONTRACT_CALL");
         assert_ne!(

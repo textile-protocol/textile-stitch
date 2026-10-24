@@ -110,7 +110,21 @@ pub struct Config {
     /// [`ChangeLogConfig`] and [`crate::changelog`].
     #[serde(default)]
     pub change_log: ChangeLogConfig,
+    /// The bot's ERC-8004 agent identity, once `stitch register` has minted or
+    /// linked one. See [`crate::chain::erc8004`].
+    #[serde(default)]
+    pub erc8004: Option<Erc8004Config>,
     pub pools: Vec<PoolConfig>,
+}
+
+/// The `[erc8004]` block. Written by `stitch register`; nothing reads it to
+/// quote. It is how a rerun knows the wallet already has an identity, and how
+/// the panel knows which token to show.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Erc8004Config {
+    /// Token id on the Identity Registry of this config's chain. Ids start at 0.
+    pub agent_id: Option<u64>,
 }
 
 /// The `[change_log]` block.

@@ -338,7 +338,7 @@ pub fn withdraw_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
 /// verbs that shipped after the label are gated — `withdraw` is the first.
 fn declared_verb_needed(which: &OneShot) -> Option<&'static str> {
     match which {
-        OneShot::Withdraw { .. } => Some(which.as_str()),
+        OneShot::Withdraw { .. } | OneShot::Register { .. } => Some(which.as_str()),
         OneShot::Approve | OneShot::DryRun => None,
     }
 }
@@ -719,8 +719,25 @@ pub(super) async fn reserve_approval(
     )))
 }
 
+/// Whether `stitch register` may run for this bot now: its signer can send a
+/// transaction, and nothing else is spending the wallet's nonce.
+pub(super) fn register_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
+    register_signer_check(bot)?;
+    approve_wallet_check(bot, fleet)
+}
+
+/// The signer half of [`register_check`]: whether this bot's key can send the
+/// mint itself.
+pub(super) fn register_signer_check(bot: &Bot) -> anyhow::Result<()> {
+    signer_can_broadcast(bot, "register")
+}
+
 /// Run a throwaway container with the bot's own config and stream its output.
-async fn one_shot(state: AppState, name: &str, which: OneShot) -> Result<Response, ApiError> {
+pub(super) async fn one_shot(
+    state: AppState,
+    name: &str,
+    which: OneShot,
+) -> Result<Response, ApiError> {
     let (bot, _fleet) = state.bot_and_fleet(name).await?;
     super::require_editable(&bot)?;
     // Before the wallet claim and the config lock: a run the binary would reject
@@ -739,6 +756,10 @@ async fn one_shot(state: AppState, name: &str, which: OneShot) -> Result<Respons
         let (config_guard, bot) = super::bots::lock_config(name, &state).await?;
         let check = match which {
             OneShot::Withdraw { .. } => withdraw_check,
+            // A mint takes a nonce and nothing else, like an approval. The
+            // signer half of `approve_check` would word a refusal around
+            // Permit2, so register runs the nonce half and its own signer check.
+            OneShot::Register { .. } => register_check,
             OneShot::Approve | OneShot::DryRun => approve_check,
         };
         let (bot, claim) = reserve_approval(&state, name, bot, check).await?;

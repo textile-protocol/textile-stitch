@@ -25,6 +25,7 @@ import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import FundsTab from '../components/FundsTab'
 import DesktopSwitches from '../components/DesktopSwitches'
 import ReconnectTextile from '../components/ReconnectTextile'
+import AgentIdentity from '../components/AgentIdentity'
 import RfqOverrides from '../components/RfqOverrides'
 import RenameBot from '../components/RenameBot'
 import VersionRollback from '../components/VersionRollback'
@@ -526,6 +527,15 @@ export default function BotDetail() {
               <RfqOverrides bot={bot.name} onSaved={() => void load()} />
             </div>
           </Card>
+          {/*
+            Optional, and nothing about quoting needs it, so it sits after the
+            cards an operator comes here for and before the danger zone.
+          */}
+          <AgentIdentity
+            bot={bot.name}
+            vault={bot.config?.vaultAddress ?? null}
+            onStop={(target) => void act('stop', target)}
+          />
           <DangerZone>
             {bot.container && (
               <Card title="Recreate the container">

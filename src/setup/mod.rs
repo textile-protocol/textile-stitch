@@ -31,9 +31,9 @@ pub use process::{find_stitch_binary, terminate};
 pub use remote::{fetch_corridors, DEFAULT_CORRIDOR_API};
 pub use settings::{
     add_pool_from_template, apply_rfq_default_preset, apply_settings, link_vault, read_settings,
-    read_settings_at, read_signer, remove_pool, rfq_connect_patch, short_addr, try_read_signer,
-    turn_off_module_conflicts, unlink_vault, PoolPair, PoolSummary, SettingsPatch, SettingsView,
-    SideSizing, SignerView, SpreadEdit, SpreadKind,
+    read_settings_at, read_signer, remove_pool, rfq_connect_patch, set_erc8004_agent_id,
+    short_addr, try_read_signer, turn_off_module_conflicts, unlink_vault, PoolPair, PoolSummary,
+    SettingsPatch, SettingsView, SideSizing, SignerView, SpreadEdit, SpreadKind,
 };
 pub use writer::{
     apply_signer, read_rfq_api_key, render_env, rfq_api_key_is_set, signer_files,

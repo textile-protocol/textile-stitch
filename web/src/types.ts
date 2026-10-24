@@ -589,3 +589,53 @@ export interface CustodyApproval {
   /** True when nothing was sent because the allowance was already good. */
   alreadyApproved: boolean
 }
+
+/** The free text an ERC-8004 registration file carries. Stored onchain. */
+export interface AgentProfile {
+  name: string
+  description: string
+}
+
+/**
+ * GET /api/bots/{name}/identity — the bot's ERC-8004 agent identity on its own
+ * chain, and whether Register can run now. Mirrors `IdentityBody` in
+ * `src/panel/http/identity.rs`.
+ */
+export interface AgentIdentity {
+  chainId: number
+  networkLabel: string | null
+  /** The Identity Registry on this chain. Null where ERC-8004 isn't deployed. */
+  registry: string | null
+  /** The operator wallet: mints, owns, and is the agent's wallet. */
+  owner: string | null
+  /** Decimal string; null until registered or linked. */
+  agentId: string | null
+  /** What the registry stores for the agent, read back from its URI. */
+  stored: AgentProfile | null
+  /** Set when the token now belongs to someone other than the operator wallet. */
+  ownedBy: string | null
+  /** The generated text the form starts from. Null once registered. */
+  defaults: AgentProfile | null
+  limits: { name: number; description: number }
+  /** The wallet owns an identity the config doesn't name: link, don't mint. */
+  ownedElsewhere: boolean
+  /** A bot on the same chain and wallet that recorded an agent id. */
+  sibling: { bot: string; agentId: string } | null
+  links: { agent: string | null; registry: string | null }
+  /** The mint's cost at today's gas price, against the wallet's balance. */
+  gas: { estimate: string; balance: string; symbol: string; enough: boolean } | null
+  /** Fireblocks without raw signing: Register goes out as a Contract Call. */
+  viaCustody: boolean
+  /**
+   * A Fireblocks registration on this wallet that may have been sent and
+   * hasn't landed, from this bot or a sibling on the same wallet. The card
+   * checks on it; it never offers a second one while this is set.
+   */
+  pending: { message: string } | null
+  canRegister: boolean
+  blockedReason: string | null
+  blockedKind: 'transacting' | 'gas' | 'signer' | null
+  /** The live bot to stop first, for `transacting`. */
+  blockedBy: string | null
+  readError: string | null
+}

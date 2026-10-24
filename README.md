@@ -23,6 +23,8 @@ First-party FX protection modules are available behind `modules_enabled = true` 
 
 Every change to a spread, size cap, the price guard or a feed setting is recorded in `change-log.jsonl` next to `stitch.toml`, including edits made outside the panel. Nothing leaves the machine unless `[change_log] ship = true`. See [the parameter change log](docs/parameter-change-log.md).
 
+Optionally, a bot can register itself in the public ERC-8004 agent registry on its chain from Tools in the panel, or with `stitch register`. See [ERC-8004 agent identity](docs/erc8004.md).
+
 ## Contents
 
 - [Quick Start](#quick-start)

@@ -1095,6 +1095,28 @@ pub fn unlink_vault(toml_str: &str) -> Result<String> {
     Ok(edited)
 }
 
+/// Record the bot's ERC-8004 agent id under `[erc8004]`, leaving the rest of
+/// the file as written. Replaces an id already there: the caller decides
+/// whether that is allowed (`stitch register` checks ownership onchain first).
+pub fn set_erc8004_agent_id(toml_str: &str, agent_id: u64) -> Result<String> {
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .context("parsing stitch.toml")?;
+    let root = doc.as_table_mut();
+    if !root.contains_table("erc8004") {
+        root.insert("erc8004", Item::Table(Table::new()));
+    }
+    let table = root["erc8004"]
+        .as_table_mut()
+        .context("[erc8004] in stitch.toml is not a table")?;
+    // TOML integers are i64; a token id past that has never been minted.
+    let id = i64::try_from(agent_id).context("agent id does not fit a TOML integer")?;
+    table.insert("agent_id", toml_edit::value(id));
+    let edited = doc.to_string();
+    Config::from_toml(&edited).context("the config with its agent id is not valid")?;
+    Ok(edited)
+}
+
 /// The patch Connect/Reconnect should apply: RFQ fields only. Never rewriting
 /// ladder sizing — that is what produced "buy max orders must be at least 1"
 /// on a reconnect that had no business touching the book.
@@ -1367,6 +1389,29 @@ fn set_value(table: &mut Table, key: &str, new: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_id_is_added_then_replaced_without_touching_the_rest() {
+        let base = crate::setup::find_corridor("cngn-usdt-celo")
+            .unwrap()
+            .toml_template;
+        let once = set_erc8004_agent_id(base, 1847).unwrap();
+        // toml_edit puts the new table after the last one and before the
+        // file's trailing comments; everything else stays byte for byte.
+        assert_eq!(once.replacen("\n[erc8004]\nagent_id = 1847\n", "", 1), base);
+        let cfg = Config::from_toml(&once).unwrap();
+        assert_eq!(cfg.erc8004.and_then(|e| e.agent_id), Some(1847));
+
+        let twice = set_erc8004_agent_id(&once, 0).unwrap();
+        assert_eq!(twice.matches("[erc8004]").count(), 1);
+        assert_eq!(
+            Config::from_toml(&twice)
+                .unwrap()
+                .erc8004
+                .and_then(|e| e.agent_id),
+            Some(0)
+        );
+    }
 
     const TEMPLATE: &str = include_str!("templates/cngn-usdt-bsc.toml");
 
