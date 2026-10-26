@@ -63,6 +63,7 @@ async fn invalid_http_timestamps_clear_the_cache_and_cannot_fall_back() {
                 price: 1.0,
                 timestamp: now,
                 degraded: false,
+                reference: None,
             },
         );
         assert!(!engine.level_frames(&prices, unix_now_ms()).is_empty());
@@ -89,6 +90,41 @@ async fn invalid_http_timestamps_clear_the_cache_and_cannot_fall_back() {
 }
 
 #[tokio::test]
+async fn a_live_curve_reads_the_centre_before_manual_adjustments_over_http() {
+    use crate::pricing::feed::PriceBasis;
+    let now = unix_now();
+    let (url, server) = serve_feed(
+        json!({
+            "pair": "cngn-usdt",
+            "price": 1.0 / 1388.5,
+            "unadjustedPrice": 1.0 / 1388.0,
+            "timestamp": now,
+            "degraded": false,
+        })
+        .to_string(),
+        StatusCode::OK,
+    )
+    .await;
+    let served = HttpFeed::new(&url).fetch().await.unwrap();
+    assert_eq!(
+        served.price,
+        1.0 / 1388.5,
+        "every other bot keeps the served centre"
+    );
+    let unadjusted = HttpFeed::new(&url)
+        .with_basis(PriceBasis::Unadjusted)
+        .fetch()
+        .await
+        .unwrap();
+    assert_eq!(unadjusted.price, 1.0 / 1388.0);
+    assert_eq!(
+        unadjusted.timestamp, now,
+        "the rest of the observation is shared"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn fresh_http_seconds_preserve_price_and_timestamp_and_failure_clears_them() {
     let now = unix_now();
     let (url, server) = serve_feed(
@@ -103,6 +139,7 @@ async fn fresh_http_seconds_preserve_price_and_timestamp_and_failure_clears_them
             price: 1.23456789,
             timestamp: now,
             degraded: false,
+            reference: None,
         }
     );
     assert!(!is_stale(fetched.timestamp, now, 0));
@@ -187,6 +224,7 @@ async fn rfq_rechecks_held_timestamps_with_modules_off_shadow_live_and_rebalance
                     price: 1.0,
                     timestamp,
                     degraded: false,
+                    reference: None,
                 },
             );
             assert!(
@@ -236,6 +274,7 @@ fn rfq_levels_obey_exact_age_and_future_boundaries_after_clock_changes() {
                 price: 1.0,
                 timestamp,
                 degraded: false,
+                reference: None,
             },
         );
         assert_eq!(
@@ -249,6 +288,7 @@ fn rfq_levels_obey_exact_age_and_future_boundaries_after_clock_changes() {
             price: 1.0,
             timestamp: now,
             degraded: false,
+            reference: None,
         },
     );
     assert!(!engine.level_frames(&prices, now * 1_000).is_empty());
@@ -299,6 +339,7 @@ fn print(degraded: bool) -> PriceCache {
             price: 1.0,
             timestamp: unix_now(),
             degraded,
+            reference: None,
         },
     );
     prices
@@ -339,6 +380,7 @@ async fn a_degraded_print_older_than_the_window_reports_stale() {
             price: 1.0,
             timestamp: unix_now() - 241,
             degraded: true,
+            reference: None,
         },
     );
     let reply = engine
@@ -489,6 +531,7 @@ async fn nav_cosign_rejects_invalid_feed_before_rpc_and_signs_valid_seconds() {
                 price: 1.5,
                 timestamp,
                 degraded: false,
+                reference: None,
             },
         );
         let reply = engine.cosign(req.clone(), &prices).await;
@@ -510,6 +553,7 @@ async fn nav_cosign_rejects_invalid_feed_before_rpc_and_signs_valid_seconds() {
             price: 1.5,
             timestamp: unix_now(),
             degraded: false,
+            reference: None,
         },
     );
     let reply = engine.cosign(req.clone(), &prices).await;
@@ -608,6 +652,7 @@ async fn nav_cosign_refuses_a_degraded_print_before_any_rpc_read() {
             price: 1.5,
             timestamp: unix_now(),
             degraded: true,
+            reference: None,
         },
     );
     let reply = engine.cosign(req.clone(), &prices).await;
@@ -629,6 +674,7 @@ async fn nav_cosign_refuses_a_degraded_print_before_any_rpc_read() {
             price: 1.5,
             timestamp: unix_now(),
             degraded: false,
+            reference: None,
         },
     );
     assert!(matches!(

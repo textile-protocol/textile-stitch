@@ -32,6 +32,7 @@
 //! shrink the next ladder. Two channels pledging one balance means a fill can
 //! revert when both land at once, which beats halving the depth of both.
 
+mod fills;
 mod guard;
 pub mod iso8601;
 mod liquidity;
@@ -91,13 +92,15 @@ use nonce::rfq_nonce;
 use order::{build_order, RfqOrderSpec};
 use reserve::{Reservations, RESERVATIONS_FILE};
 use responder::{
-    book_from_pool, decide_quote, levels_for, wallet_tokens, CorridorBook, InventoryView,
+    book_from_pool, decide_quote_curved, levels_for_curved, wallet_tokens, CorridorBook, CurveNote,
+    InventoryView,
 };
 use session::AuthedSession;
 use wire::{
     AttestRejectFrame, AttestRejectReason, AttestRequestFrame, AttestResponseFrame,
     CloseRedeemAckFrame, CloseRedeemRejectFrame, CloseRedeemRejectReason, CloseRedeemRequestFrame,
-    MakerFrame, QuoteRejectFrame, QuoteRequestFrame, QuoteResponseFrame, RejectReason, VenueFrame,
+    LevelsFrame, MakerFrame, QuoteRejectFrame, QuoteRequestFrame, QuoteResponseFrame, RejectReason,
+    VenueFrame,
 };
 
 /// How long a redeem-epoch close may spend waiting for its receipt. Well past
@@ -148,6 +151,12 @@ pub struct RfqRuntime {
     /// `[price_guard]`: the jump guard on every fetch, the band on every
     /// order and level.
     price_guard: crate::config::PriceGuardConfig,
+    /// Which of the feed's prices to read: the same one the tick loop reads,
+    /// since both write the one cache (see [`crate::config::Config::price_basis`]).
+    price_basis: crate::pricing::feed::PriceBasis,
+    /// The exposed claims the balance loop reads fills for, and the fills it
+    /// saw. Process-scoped like the loop; each session's engine shares it.
+    fills: fills::FillWatch,
 }
 
 /// How old a wallet reading may be before a `max` side goes dark.
@@ -172,24 +181,33 @@ const _: () = assert!(INVENTORY_REFRESH_SECS < INVENTORY_TTL_SECS);
 /// refresh loop and the session task. Quote path only reads — never waits
 /// on RPC, so a slow node can't blow the reply budget.
 #[derive(Clone, Default)]
-struct InventoryCache(Arc<RwLock<HashMap<Address, (U256, u64)>>>);
+struct InventoryCache(Arc<RwLock<HashMap<Address, (U256, U256, u64)>>>);
 
 impl InventoryCache {
     fn view(&self, now_secs: u64) -> InventoryView {
         let Ok(map) = self.0.read() else {
             return InventoryView::default();
         };
-        InventoryView::new(
-            map.iter()
-                .filter(|(_, (_, at))| now_secs.saturating_sub(*at) <= INVENTORY_TTL_SECS)
-                .map(|(token, (amount, _))| (*token, *amount))
+        let live = map
+            .iter()
+            .filter(|(_, (_, _, at))| now_secs.saturating_sub(*at) <= INVENTORY_TTL_SECS);
+        InventoryView::with_balances(
+            live.clone()
+                .map(|(token, (funded, _, _))| (*token, *funded))
+                .collect(),
+            live.map(|(token, (_, balance, _))| (*token, *balance))
                 .collect(),
         )
     }
 
-    fn set(&self, token: Address, funded: U256, at: u64) {
+    /// `funded` is `min(balance, allowance)` minus the gas reserve — what RFQ
+    /// may pledge. `balance` is the raw wallet balance — what the quote
+    /// curve's inventory share is made of: a leg the operator never approved
+    /// to Permit2 is still held naira, and a share read off `funded` would
+    /// keep a loaded one-sided pool quoting at the aggressive empty end.
+    fn set(&self, token: Address, funded: U256, balance: U256, at: u64) {
         if let Ok(mut map) = self.0.write() {
-            map.insert(token, (funded, at));
+            map.insert(token, (funded, balance, at));
         }
     }
 }
@@ -388,6 +406,7 @@ fn build_runtime(
     signer: DynSigner,
     config_dir: Option<&Path>,
 ) -> anyhow::Result<RfqRuntime> {
+    let curve = modules::book_curve(cfg);
     let books = cfg
         .pools
         .iter()
@@ -395,6 +414,7 @@ fn build_runtime(
         .collect::<anyhow::Result<Vec<_>>>()?
         .into_iter()
         .flatten()
+        .map(|book| CorridorBook { curve, ..book })
         .collect::<Vec<_>>();
     anyhow::ensure!(!books.is_empty(), "no pools to quote over RFQ");
     // Modules price off the first corridor (see `module_tick`).
@@ -434,6 +454,8 @@ fn build_runtime(
         closing: Arc::new(Mutex::new(HashMap::new())),
         modules: modules_runtime(cfg, config_dir, &module_price_source)?,
         price_guard: cfg.price_guard,
+        price_basis: cfg.price_basis(),
+        fills: fills::FillWatch::default(),
     })
 }
 
@@ -457,8 +479,16 @@ fn modules_runtime(
         None if modules_on => anyhow::bail!("modules need a persistent config directory"),
         None => return Ok(None),
     };
+    let on_vault = cfg.vault.is_some();
     let config = if modules_on {
-        cfg.modules.clone()
+        let off = cfg.modules.vault_only_enabled();
+        if !on_vault && !off.is_empty() {
+            info!(
+                modules = %off.join(", "),
+                "modules on a wallet bot: these need a vault and stay off; the inventory curve runs"
+            );
+        }
+        cfg.modules.runnable(on_vault)
     } else if pending_floor_saved(dir) {
         warn!("modules are off, but a liquidity floor change may still land; settling it first");
         settling_only_config(&cfg.modules)
@@ -477,6 +507,64 @@ fn modules_runtime(
         anyhow::bail!("not starting RFQ: {why}");
     }
     Ok(Some(runtime))
+}
+
+/// A curve quote as the module status records it. Prices turn into soft
+/// currency per dollar, the unit the curve's knobs and the panel use; the
+/// order prices are debt per collateral, so the lean is `flat / curved`.
+fn curve_quote_status(
+    book: &CorridorBook,
+    plan: &responder::QuotePlan,
+    note: CurveNote,
+    now: u64,
+) -> crate::modules::runtime::CurveQuote {
+    let mut quote = crate::modules::runtime::CurveQuote {
+        at: now,
+        bot_buys: plan.bid,
+        live: false,
+        size: responder::plan_size(plan, book),
+        share_before: None,
+        share_after: None,
+        lean_bps: None,
+        flat_reason: None,
+    };
+    match note {
+        CurveNote::Priced {
+            live,
+            flat,
+            curved,
+            f0,
+            f1,
+            ..
+        } => {
+            quote.live = live;
+            quote.share_before = Some(f0);
+            quote.share_after = Some(f1);
+            quote.lean_bps = Some((flat / curved - 1.0) * 10_000.0);
+        }
+        CurveNote::Flat(reason) => quote.flat_reason = Some(reason.to_string()),
+    }
+    quote
+}
+
+/// The curve's inputs as the module status records them this tick, or
+/// `None` while they make no share.
+fn curve_reading_status(
+    book: &CorridorBook,
+    inputs: &responder::CurveInputs,
+    fee_bps: u32,
+    now: u64,
+) -> Option<crate::modules::runtime::CurveReading> {
+    let (share, value) = responder::holdings_share(book, inputs)?;
+    let (mid, half_range_bps) = inputs.reference?;
+    Some(crate::modules::runtime::CurveReading {
+        at: now,
+        share,
+        value,
+        reference_mid: 1.0 / mid,
+        half_range_bps,
+        fee_bps,
+    })
 }
 
 fn same_addr(value: &str, addr: Address) -> bool {
@@ -627,7 +715,7 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
     feed_urls.sort();
     feed_urls.dedup();
     for url in feed_urls {
-        tokio::spawn(price_loop(url, prices.clone()));
+        tokio::spawn(price_loop(url, rt.price_basis, prices.clone()));
     }
 
     // Every RFQ side (Exact cap or live wallet) refreshes funded amounts
@@ -652,6 +740,7 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
             rt.config_dir
                 .as_deref()
                 .map(|dir| Publisher::spawn(dir, rt.chain_id)),
+            rt.fills.clone(),
         ));
     }
     // The liquidity schedule sends from the bot's wallet, off the quote path.
@@ -1062,6 +1151,9 @@ async fn send_level_frames(
         }
         emitted.push(lvl.corridor_id.clone());
         send_session_frame(stream, &frame, outbound).await?;
+        engine
+            .published_levels
+            .insert(lvl.corridor_id.clone(), lvl.clone());
     }
     Ok(emitted)
 }
@@ -1182,7 +1274,13 @@ async fn session_loop_inner(
         modules: rt.modules.clone(),
         pending_rebalance: None,
         price_guard: rt.price_guard,
+        venue_fee_bps: 0,
+        published_levels: HashMap::new(),
+        level_slack_bps: level_slack_by_slug(&accepted),
+        fills: rt.fills.clone(),
     };
+    // Claims loaded from disk are exposed; their fills can be read at once.
+    engine.publish_fill_watch(unix_now());
     // Upgrade path: a ledger written before `input_token` existed loads as
     // tokenless. Stamp every bound book now, while the quoted pool is still
     // here, so a later remove cannot drop that claim from the shared total.
@@ -1247,6 +1345,13 @@ async fn session_loop_inner(
                                     .map(str::to_owned),
                                 _ => None,
                             };
+                            // A Live curve's levels move with every quote it
+                            // reserves, so they go out again right after the
+                            // reply rather than on the next 1 s tick.
+                            let curved_corridor = match &frame {
+                                VenueFrame::QuoteRequest(req) => engine.live_curve_slug(req),
+                                _ => None,
+                            };
                             if let Some(reply) = engine.dispatch(frame, prices).await {
                                 send_session_frame(&mut stream, &reply, &mut outbound).await?;
                             }
@@ -1254,6 +1359,23 @@ async fn session_loop_inner(
                                 trailing_after_quote_expired(&mut pending_republish, expired_corridor)
                             {
                                 trailing_at = Some(at);
+                            }
+                            // Just that corridor, inline and inside the rate
+                            // budget. Not through the trailing flush: that
+                            // stamps the expiry-flush clock and would hold back
+                            // every other corridor's 1 s tick under steady flow.
+                            if let Some(slug) = curved_corridor {
+                                if !should_skip_trailing_for_rate_budget(&outbound, 1) {
+                                    let only = HashSet::from([slug]);
+                                    send_level_frames(
+                                        &mut stream,
+                                        &mut engine,
+                                        prices,
+                                        Some(&only),
+                                        &mut outbound,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                         Message::Ping(payload) => {
@@ -1299,6 +1421,7 @@ async fn session_loop_inner(
                         "venue silent for {:?} (heartbeat timeout)", last_rx.elapsed()
                     );
                     engine.reservations.prune(unix_now_ms() / 1_000);
+                    engine.publish_fill_watch(unix_now_ms() / 1_000);
                     // The first tick is immediate. After an expiry flush,
                     // emitting every book again in the same second is
                     // 2×books and trips the 40/s cap. Ordinary interval
@@ -1371,9 +1494,67 @@ struct Engine {
     modules: Option<crate::modules::runtime::Runtime>,
     pending_rebalance: Option<modules::PendingRebalance>,
     price_guard: crate::config::PriceGuardConfig,
+    /// The venue fee on the last quote request, in bps. A Live quote curve
+    /// sizes its endpoints with it, and the levels carry no request of their
+    /// own; the fee is per chain, so the last one seen is the one in force.
+    venue_fee_bps: u32,
+    /// The last levels frame sent per corridor slug: what the venue judges a
+    /// Live curve's firm reply against (see [`responder::worse_than_levels_bps`]).
+    published_levels: HashMap<String, LevelsFrame>,
+    /// Each corridor's `levelSlackBps` from the session handshake, by slug.
+    level_slack_bps: HashMap<String, f64>,
+    /// Shared with the balance loop: which claims it reads fills for, and
+    /// the fills it saw (see [`fills`]).
+    fills: fills::FillWatch,
+}
+
+/// Each assigned corridor's `levelSlackBps`, by slug. A venue that predates the
+/// field sends none, and [`Engine::level_slack_bps`] falls back to its default.
+fn level_slack_by_slug(accepted: &wire::SessionAcceptedFrame) -> HashMap<String, f64> {
+    accepted
+        .corridor_pairs
+        .iter()
+        .filter_map(|p| Some((p.slug.clone(), f64::from(p.level_slack_bps?))))
+        .collect()
 }
 
 impl Engine {
+    /// Release the claims whose orders the balance loop saw filled, then
+    /// hand it the claims left to watch. Call before reading any balance:
+    /// the loop publishes the balances that show a fill before the fill
+    /// itself, and never goes back to an older block, so every balance read
+    /// after this already has the filled trade in it.
+    fn release_fills(&mut self, now_secs: u64) {
+        let spent = self.fills.take_spent();
+        if !spent.is_empty() {
+            for rfq_id in self.reservations.release_filled(&spent) {
+                info!(rfq_id = %rfq_id, "quote filled on-chain; its reserved inventory is released");
+            }
+        }
+        self.publish_fill_watch(now_secs);
+    }
+
+    /// The exposed claims' nonces, for the balance loop's next read.
+    fn publish_fill_watch(&self, now_secs: u64) {
+        self.fills.watch(self.reservations.watched_nonces(now_secs));
+    }
+
+    /// How far past its published levels the venue lets a firm reply on
+    /// `slug` sit before it strikes it, in bps.
+    fn level_slack_bps(&self, slug: &str) -> f64 {
+        self.level_slack_bps
+            .get(slug)
+            .copied()
+            .unwrap_or(responder::DEFAULT_LEVEL_SLACK_BPS)
+    }
+
+    /// The slug of the Live quote-curve corridor `req` is for, if it is one.
+    fn live_curve_slug(&self, req: &QuoteRequestFrame) -> Option<String> {
+        book_for_request(&self.books, req)
+            .filter(|b| b.curve.is_some_and(|c| c.live))
+            .map(|b| b.slug.clone())
+    }
+
     fn sync_vault_epoch(&mut self) {
         if self.vault.is_none() {
             return;
@@ -1488,6 +1669,7 @@ impl Engine {
         use crate::modules::runtime::QuoteState;
         self.sync_vault_epoch();
         let now_secs = now_ms / 1_000;
+        self.release_fills(now_secs);
         let inventory = self.inventory.view(now_secs);
         let policy = self.vault_policy.read().ok().and_then(|g| *g);
         if self.vault.is_some() && policy.is_none() {
@@ -1546,9 +1728,19 @@ impl Engine {
                     return None;
                 }
                 let effective = self.module_book(book, &quote, now_secs)?;
-                let levels = levels_for(
+                let inputs = self.curve_inputs(book, &quote, now_secs);
+                if let (Some(modules), Some(_)) = (&self.modules, book.curve) {
+                    if let Some(reading) =
+                        curve_reading_status(book, &inputs, self.venue_fee_bps, now_secs)
+                    {
+                        modules.curve_reading(reading);
+                    }
+                }
+                let levels = levels_for_curved(
                     &effective,
                     quote.price,
+                    &inputs,
+                    self.venue_fee_bps,
                     self.reservations.reserved(&book.slug, true, now_secs),
                     self.reservations.reserved(&book.slug, false, now_secs),
                     self.reserved_on(book, true, now_secs),
@@ -1581,6 +1773,7 @@ impl Engine {
                 match r.result.as_str() {
                     "selected" => {
                         self.reservations.mark_exposed(&r.rfq_id);
+                        self.publish_fill_watch(unix_now());
                         info!(rfq_id = %r.rfq_id, result = %r.result, "quote result");
                     }
                     "no_quote" | "lost_price" | "invalid" | "late" => {
@@ -1611,6 +1804,7 @@ impl Engine {
                 // This may precede selected during reconnect/replay. It still
                 // identifies a signature the taker can hold, not a revocation.
                 self.reservations.mark_exposed(&e.rfq_id);
+                self.publish_fill_watch(unix_now());
                 debug!(rfq_id = %e.rfq_id, "quote window closed; signed inventory remains reserved");
                 None
             }
@@ -1625,6 +1819,7 @@ impl Engine {
     /// waits out the reply deadline on our account.
     async fn respond(&mut self, req: QuoteRequestFrame, prices: &PriceCache) -> MakerFrame {
         self.sync_vault_epoch();
+        self.release_fills(unix_now());
         let reject = |reason| {
             MakerFrame::QuoteReject(QuoteRejectFrame {
                 rfq_id: req.rfq_id.clone(),
@@ -1752,19 +1947,103 @@ impl Engine {
         let Some(effective_book) = self.module_book(&book, &quote, now_secs) else {
             return reject(RejectReason::Busy);
         };
-        let plan = match decide_quote(
+        self.venue_fee_bps = req.fee_bps;
+        let (plan, curve_note) = match decide_quote_curved(
             &effective_book,
             &req,
             quote.price,
+            &self.curve_inputs(&book, &quote, now_secs),
             self.reservations.reserved(&book.slug, true, now_secs),
             self.reservations.reserved(&book.slug, false, now_secs),
             self.reserved_on(&book, true, now_secs),
             self.reserved_on(&book, false, now_secs),
             &self.inventory.view(now_secs),
         ) {
-            Ok(plan) => plan,
+            Ok(out) => out,
             Err(reason) => return reject(reason),
         };
+        match curve_note {
+            Some(CurveNote::Priced {
+                live,
+                flat,
+                curved,
+                f_wallet,
+                f0,
+                f1,
+                s0,
+                s1,
+                size_debt,
+                promised_debt,
+                cheapest_until,
+            }) => {
+                // The shadow trail the rollout reads for days before anything
+                // is decided; also the live audit line once it is. Both
+                // prices are ORDER prices (spread only, fee injected on top),
+                // so the comparison carries no fee bias.
+                tracing::info!(
+                    corridor = %book.slug,
+                    rfq = %req.rfq_id,
+                    bid = plan.bid,
+                    live,
+                    f_wallet = format!("{f_wallet:.4}"),
+                    f0 = format!("{f0:.4}"),
+                    f1 = format!("{f1:.4}"),
+                    size_debt = format!("{size_debt:.2}"),
+                    promised_debt = format!("{promised_debt:.2}"),
+                    s0 = format!("{s0:.2}"),
+                    s1 = format!("{s1:.2}"),
+                    cheapest_until = format!("{:.0}%", cheapest_until * 100.0),
+                    flat = format!("{flat:.9}"),
+                    curved = format!("{curved:.9}"),
+                    curve_bps = format!("{:+.2}", (curved / flat - 1.0) * 10_000.0),
+                    "curve quote"
+                );
+            }
+            Some(CurveNote::Flat(reason)) => {
+                // Quoting flat while loaded is the state the curve exists to
+                // defend against; a long run on this path must be visible.
+                tracing::warn!(
+                    corridor = %book.slug,
+                    rfq = %req.rfq_id,
+                    reason,
+                    "curve is on but this quote went out flat"
+                );
+            }
+            None => {}
+        }
+        if let (Some(modules), Some(note)) = (&self.modules, curve_note) {
+            modules.curve_quote(curve_quote_status(&book, &plan, note, now_secs));
+        }
+        // On a Live curve the levels and the reply can price differently:
+        // the reply starts at the far end of this side's outstanding quotes
+        // while the levels only catch up on the next publish, and a reply the
+        // curve can't price goes out flat against levels that were curved.
+        // The venue judges every reply against the levels it routed on, so
+        // every reply here is checked, flat ones included. Replying more than
+        // the corridor's slack past them is a strike; declining is not. The
+        // session loop republishes this corridor right after every request,
+        // so this only bites inside that gap.
+        if book.curve.is_some_and(|c| c.live) {
+            let slack = self.level_slack_bps(&book.slug);
+            let worse = self.published_levels.get(&book.slug).and_then(|levels| {
+                responder::worse_than_levels_bps(
+                    &plan,
+                    levels,
+                    book.debt_decimals,
+                    book.collateral_decimals,
+                )
+            });
+            if let Some(worse) = worse.filter(|w| *w > slack) {
+                warn!(
+                    corridor = %book.slug,
+                    rfq_id = %req.rfq_id,
+                    worse_bps = format!("{worse:.2}"),
+                    slack_bps = slack,
+                    "quote is past the published levels' slack; declining"
+                );
+                return reject(RejectReason::Busy);
+            }
+        }
         if let Some(modules) = &self.modules {
             if modules.config.mode == crate::modules::Mode::Live
                 && modules.config.inventory.enabled
@@ -1960,13 +2239,14 @@ impl Engine {
 
         // The reservation starts the moment the signed order exists — even if
         // the send fails, the signature may have left the process.
-        self.reservations.reserve_paying(
+        self.reservations.reserve_order(
             req.rfq_id.clone(),
             book.slug.clone(),
             plan.bid,
             plan.input,
             deadline_secs,
-            Some(format!("{:#x}", plan.input_token)),
+            format!("{:#x}", plan.input_token),
+            nonce,
         );
 
         if self.modules.is_some() && self.reservations.flush().is_err() {
@@ -2439,8 +2719,8 @@ fn on_feed_fetch(
 /// quote — RFQ fails closed instead of holding the last print. The jump
 /// guard starts from the print it last trusted before a restart, when the
 /// config folder has one (see [`crate::pricing::anchor`]).
-async fn price_loop(url: String, cache: PriceCache) {
-    let feed = HttpFeed::new(&url);
+async fn price_loop(url: String, basis: crate::pricing::feed::PriceBasis, cache: PriceCache) {
+    let feed = HttpFeed::new(&url).with_basis(basis);
     loop {
         let started = tokio::time::Instant::now();
         on_feed_fetch(started, &cache, &url, feed.fetch().await);
@@ -2470,23 +2750,29 @@ fn funded_calls(owner: Address, permit2: Address, tokens: &[Address]) -> Vec<Cal
         .collect()
 }
 
-/// `min(balance, allowance)` per token, in `tokens` order, with the gas
-/// reserve taken off the balance of the chain's gas coin (see
-/// [`GasReserve::funded`]). A token whose pair of reads did not both come back
-/// is `None`: it keeps its last reading until the TTL drops it, rather than
-/// reading as zero and taking the side dark on one reverting token.
+/// `(min(balance, allowance), raw balance)` per token, in `tokens` order,
+/// with the gas reserve taken off the funded amount of the chain's gas coin
+/// (see [`GasReserve::funded`]); the raw balance is kept unreduced for the
+/// quote curve's inventory share. A token whose pair of reads did not both
+/// come back is `None`: it keeps its last reading until the TTL drops it,
+/// rather than reading as zero and taking the side dark on one reverting
+/// token.
 fn decode_funded(
     tokens: &[Address],
     results: &[Option<Bytes>],
     gas_reserve: &GasReserve,
-) -> Vec<(Address, Option<U256>)> {
+) -> Vec<(Address, Option<(U256, U256)>)> {
     tokens
         .iter()
         .enumerate()
         .map(|(i, token)| {
             let funded = match (results.get(i * 2), results.get(i * 2 + 1)) {
                 (Some(Some(balance)), Some(Some(allowance))) => {
-                    Some(gas_reserve.funded(*token, decode_uint(balance), decode_uint(allowance)))
+                    let balance = decode_uint(balance);
+                    Some((
+                        gas_reserve.funded(*token, balance, decode_uint(allowance)),
+                        balance,
+                    ))
                 }
                 _ => None,
             };
@@ -2525,9 +2811,11 @@ async fn inventory_loop(
     closing: Arc<Mutex<HashMap<U256, u64>>>,
     modules: Option<crate::modules::runtime::Runtime>,
     snapshot: Option<Publisher>,
+    fills: fills::FillWatch,
 ) {
     let mut vault_pair: Option<(Address, Address, Address, u64)> = None;
     let mut batcher: Option<Batcher> = None;
+    let mut clock = fills::BlockClock::default();
     loop {
         if batcher.is_none() {
             match Batcher::detect(wallet.rpc()).await {
@@ -2568,12 +2856,19 @@ async fn inventory_loop(
         }
         if let Some((address, settlement, corridor, max_lifetime)) = vault_pair {
             let module_balances = modules.as_ref().filter(|_| reader.is_batched());
-            let also = snapshot_calls(
-                snapshot.as_ref(),
-                reader,
-                wallet.address(),
-                &[settlement, corridor],
-            );
+            // Orders from a vault name it as swapper, so its Permit2 nonces
+            // are the vault's.
+            let fill_reads = fills::FillReads::new(reader, permit2, address, fills.watched());
+            let also = [
+                fill_reads.calls().to_vec(),
+                snapshot_calls(
+                    snapshot.as_ref(),
+                    reader,
+                    wallet.address(),
+                    &[settlement, corridor],
+                ),
+            ]
+            .concat();
             match read_vault_inventory(
                 wallet.rpc(),
                 reader,
@@ -2591,13 +2886,26 @@ async fn inventory_loop(
                     inventory: (settlement_qty, corridor_qty, epoch, max_settlement, max_corridor),
                     free,
                     recorded,
+                    also,
                 }) => {
+                    let fill = fill_reads.decode(&also);
+                    if !clock.admits(fill.block) {
+                        debug!(block = ?fill.block, "vault reading is from an older block than one already used; dropped");
+                        tokio::time::sleep(std::time::Duration::from_secs(INVENTORY_REFRESH_SECS))
+                            .await;
+                        continue;
+                    }
                     // Stamp after the RPC batch. A pre-read clock can already
                     // exceed INVENTORY_TTL_SECS on a slow endpoint, which would
                     // keep both sides dark forever.
                     let now = unix_now();
-                    cache.set(settlement, settlement_qty, now);
-                    cache.set(corridor, corridor_qty, now);
+                    // Vault quantities are QUOTABLE amounts — allowance-capped
+                    // and policy-gated in decode_vault_inventory — not wallet
+                    // balances. Stored into both slots because capacity is
+                    // their only reader: the inventory curve's share on a
+                    // vault reads the free balances below, never these.
+                    cache.set(settlement, settlement_qty, settlement_qty, now);
+                    cache.set(corridor, corridor_qty, corridor_qty, now);
                     if let Some(snapshot) = &snapshot {
                         snapshot.publish(now, recorded);
                     }
@@ -2629,6 +2937,8 @@ async fn inventory_loop(
                             },
                         );
                     }
+                    // Last: the balances that show these fills are out first.
+                    fills.saw_spent(fill.spent);
                 }
                 Err(e) => warn!(
                     error = %format!("{e:#}"),
@@ -2638,20 +2948,32 @@ async fn inventory_loop(
         } else if vault.is_none() {
             // Only the wallet path holds gas back: a vault's capital never
             // pays for the bot's transactions, the signer wallet does.
+            let funded = funded_calls(wallet.address(), permit2, &tokens);
+            let fills_at = funded.len();
+            let fill_reads =
+                fills::FillReads::new(reader, permit2, wallet.address(), fills.watched());
             let calls = [
-                funded_calls(wallet.address(), permit2, &tokens),
+                funded,
+                fill_reads.calls().to_vec(),
                 snapshot_calls(snapshot.as_ref(), reader, wallet.address(), &[]),
             ]
             .concat();
             match reader.read(wallet.rpc(), &calls).await {
                 Ok(results) => {
+                    let fill = fill_reads.decode(results.get(fills_at..).unwrap_or_default());
+                    if !clock.admits(fill.block) {
+                        debug!(block = ?fill.block, "wallet reading is from an older block than one already used; dropped");
+                        tokio::time::sleep(std::time::Duration::from_secs(INVENTORY_REFRESH_SECS))
+                            .await;
+                        continue;
+                    }
                     let now = unix_now();
                     if let Some(snapshot) = &snapshot {
                         snapshot.publish(now, record(&calls, &results));
                     }
                     for (token, funded) in decode_funded(&tokens, &results, &gas_reserve) {
                         match funded {
-                            Some(funded) => cache.set(token, funded, now),
+                            Some((funded, balance)) => cache.set(token, funded, balance, now),
                             // One token reverting must not cost the others
                             // their refresh, which is why the batch allows
                             // failures instead of failing whole.
@@ -2661,6 +2983,8 @@ async fn inventory_loop(
                             ),
                         }
                     }
+                    // Last: the balances that show these fills are out first.
+                    fills.saw_spent(fill.spent);
                 }
                 Err(e) => warn!(
                     error = %format!("{e:#}"),
@@ -2854,6 +3178,8 @@ struct VaultReading {
     inventory: (U256, U256, u64, U256, U256),
     free: Option<(U256, U256, Option<crate::modules::runtime::LiquidReading>)>,
     recorded: Vec<RecordedRead>,
+    /// The answers to `also`, in order.
+    also: Vec<Option<Bytes>>,
 }
 
 /// The quote views, then the module balances when `with_module_balances`,
@@ -2890,6 +3216,7 @@ async fn read_vault_inventory(
         inventory,
         free,
         recorded: record(&calls, &results),
+        also: tail.get(module_views..).unwrap_or_default().to_vec(),
     })
 }
 
@@ -3032,8 +3359,8 @@ mod tests {
         assert_eq!(
             decode_funded(&tokens, &results, &GasReserve::default()),
             vec![
-                (tokens[0], Some(U256::from(40u64))),
-                (tokens[1], Some(U256::from(7u64))),
+                (tokens[0], Some((U256::from(40u64), U256::from(100u64)))),
+                (tokens[1], Some((U256::from(7u64), U256::from(7u64)))),
             ]
         );
     }
@@ -3045,7 +3372,10 @@ mod tests {
         let results = vec![word(100), None, word(7), word(900)];
         let decoded = decode_funded(&tokens, &results, &GasReserve::default());
         assert_eq!(decoded[0], (tokens[0], None), "keeps its last reading");
-        assert_eq!(decoded[1], (tokens[1], Some(U256::from(7u64))));
+        assert_eq!(
+            decoded[1],
+            (tokens[1], Some((U256::from(7u64), U256::from(7u64))))
+        );
     }
 
     #[test]
@@ -3067,13 +3397,17 @@ mod tests {
         assert_eq!(
             decode_funded(&[celo, usdt], &results, &reserve),
             vec![
-                (celo, Some(U256::from(5 * COIN))),
-                (usdt, Some(U256::from(100u64))),
+                // The reserve nets the FUNDED amount; the raw balance stays.
+                (celo, Some((U256::from(5 * COIN), U256::from(10 * COIN)))),
+                (usdt, Some((U256::from(100u64), U256::from(100u64)))),
             ]
         );
         // Under the reserve, the gas coin quotes nothing rather than wrapping.
         let drained = decode_funded(&[celo], &[word(2 * COIN), word(u64::MAX)], &reserve);
-        assert_eq!(drained, vec![(celo, Some(U256::ZERO))]);
+        assert_eq!(
+            drained,
+            vec![(celo, Some((U256::ZERO, U256::from(2 * COIN))))]
+        );
     }
 
     fn vault_inventory_results() -> Vec<Option<Bytes>> {
@@ -3162,14 +3496,17 @@ mod tests {
                         if batched {
                             let (calls,) =
                                 <(Vec<Call3>,)>::abi_decode_params_validate(&data[4..]).unwrap();
+                            // Ten quote views, three module views when
+                            // modules run, and the block number the fill
+                            // reads ride with.
                             match calls.len() {
                                 3 => {}
-                                10 | 13 => {
+                                11 | 14 => {
                                     quote_count.fetch_add(1, Ordering::SeqCst);
                                 }
                                 count => panic!("unexpected inventory batch of {count} calls"),
                             }
-                            if calls.len() == 13 {
+                            if calls.len() == 14 {
                                 module_count.fetch_add(1, Ordering::SeqCst);
                             }
                             let results: Vec<Result3> = calls
@@ -3230,6 +3567,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             engine.modules.clone(),
             None,
+            engine.fills.clone(),
         ))
     }
 
@@ -3282,6 +3620,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             None,
             Some(Publisher::spawn(&dir, engine.chain_id)),
+            engine.fills.clone(),
         ));
         let owner = engine.signer.address();
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -3316,6 +3655,157 @@ mod tests {
         );
         // The Multicall3 probe and one batch: the panel's reads cost nothing.
         assert_eq!(node.hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A selected quote that fills lets its inventory go on the next balance
+    /// read rather than at its deadline: that batch shows the order's Permit2
+    /// nonce spent at the same block as the balances that already hold the
+    /// trade. A quote still open keeps its claim.
+    #[tokio::test]
+    async fn a_filled_quote_releases_its_inventory_on_the_next_balance_read() {
+        use crate::chain::mock_node::{mock_rpc, MockChain};
+        let filled = rfq_nonce(1_754_388_000_000, 0);
+        let open = rfq_nonce(1_754_388_000_001, 0);
+        let bit = |n: U256| (n & U256::from(0xffu8)).to::<usize>();
+        // The mock answers one bitmap for every word, so the two must sit on
+        // different bits for "open" to read as unspent.
+        assert_ne!(bit(filled), bit(open));
+        let node = mock_rpc(
+            MockChain::default()
+                .balance(COLLATERAL, 5_000)
+                .balance(DEBT, 7_000)
+                .with_multicall3()
+                .at_block(100)
+                .view(
+                    "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+                    "nonceBitmap(address,uint256)",
+                    U256::from(1u8) << bit(filled),
+                ),
+        )
+        .await;
+        let mut engine = test_engine();
+        let deadline = unix_now() + 60;
+        for (id, nonce) in [("rfq_filled", filled), ("rfq_open", open)] {
+            engine.reservations.reserve_order(
+                id,
+                "cngn-usdc",
+                true,
+                U256::from(400u64),
+                deadline,
+                DEBT,
+                nonce,
+            );
+            engine.reservations.mark_exposed(id);
+        }
+        engine.publish_fill_watch(unix_now());
+        let refresh = tokio::spawn(inventory_loop(
+            Wallet::new(&node.url, engine.signer.clone(), engine.chain_id),
+            engine.permit2,
+            vec![COLLATERAL.parse().unwrap(), DEBT.parse().unwrap()],
+            GasReserve::default(),
+            engine.inventory.clone(),
+            None,
+            None,
+            engine.trading_epoch.clone(),
+            engine.vault_policy.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+            None,
+            engine.fills.clone(),
+        ));
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                engine.release_fills(unix_now());
+                if engine.reservations.reserved("cngn-usdc", true, unix_now()) == U256::from(400u64)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        refresh.abort();
+        let _ = refresh.await;
+        assert!(
+            released.is_ok(),
+            "the filled quote still holds its inventory"
+        );
+        // The balances that show the trade were published before the release.
+        assert!(engine
+            .inventory
+            .view(unix_now())
+            .funded(DEBT.parse().unwrap())
+            .is_some());
+        assert_eq!(
+            engine.fills.watched(),
+            vec![open],
+            "only the open quote is still watched"
+        );
+    }
+
+    /// Without a block number the batch can't be ordered against the
+    /// balances, so nothing is released and claims hold to their deadline.
+    #[tokio::test]
+    async fn a_batch_without_a_block_number_releases_nothing() {
+        use crate::chain::mock_node::{mock_rpc, MockChain};
+        let filled = rfq_nonce(1_754_388_000_000, 0);
+        let node = mock_rpc(
+            MockChain::default()
+                .balance(DEBT, 7_000)
+                .with_multicall3()
+                .view(
+                    "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+                    "nonceBitmap(address,uint256)",
+                    U256::MAX,
+                ),
+        )
+        .await;
+        let mut engine = test_engine();
+        engine.reservations.reserve_order(
+            "rfq_filled",
+            "cngn-usdc",
+            true,
+            U256::from(400u64),
+            unix_now() + 60,
+            DEBT,
+            filled,
+        );
+        engine.reservations.mark_exposed("rfq_filled");
+        engine.publish_fill_watch(unix_now());
+        let refresh = tokio::spawn(inventory_loop(
+            Wallet::new(&node.url, engine.signer.clone(), engine.chain_id),
+            engine.permit2,
+            vec![DEBT.parse().unwrap()],
+            GasReserve::default(),
+            engine.inventory.clone(),
+            None,
+            None,
+            engine.trading_epoch.clone(),
+            engine.vault_policy.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+            None,
+            engine.fills.clone(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while engine
+                .inventory
+                .view(unix_now())
+                .funded(DEBT.parse().unwrap())
+                .is_none()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("balances published");
+        refresh.abort();
+        let _ = refresh.await;
+        engine.release_fills(unix_now());
+        assert_eq!(
+            engine.reservations.reserved("cngn-usdc", true, unix_now()),
+            U256::from(400u64)
+        );
     }
 
     #[tokio::test]
@@ -3848,18 +4338,16 @@ mod tests {
                 sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(1_500_000_000u64))),
                 feed_url: "http://feed".into(),
                 staleness_secs: 240,
+                curve: None,
             }],
             configured: Vec::new(),
             reservations: Reservations::new(),
             inventory: {
                 let cache = InventoryCache::default();
                 let now = unix_now();
-                cache.set(DEBT.parse().unwrap(), U256::from(10_000_000_000u64), now);
-                cache.set(
-                    COLLATERAL.parse().unwrap(),
-                    U256::from(10_000_000_000u64),
-                    now,
-                );
+                let ten_k = U256::from(10_000_000_000u64);
+                cache.set(DEBT.parse().unwrap(), ten_k, ten_k, now);
+                cache.set(COLLATERAL.parse().unwrap(), ten_k, ten_k, now);
                 cache
             },
             counter: 0,
@@ -3886,6 +4374,10 @@ mod tests {
             modules: None,
             pending_rebalance: None,
             price_guard: crate::config::PriceGuardConfig::default(),
+            venue_fee_bps: 0,
+            published_levels: HashMap::new(),
+            level_slack_bps: HashMap::new(),
+            fills: fills::FillWatch::default(),
         }
     }
 
@@ -4225,6 +4717,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now(),
                 degraded: false,
+                reference: None,
             },
         );
         prices
@@ -4246,6 +4739,294 @@ mod tests {
             max_expires_at: format_iso_ms(deadline),
             fee_bps: 1,
         }
+    }
+
+    /// `fresh_prices`, but the feed also publishes the reference book the
+    /// quote curve anchors on, as the cNGN `/price` endpoint now serves it.
+    fn fresh_prices_with_reference() -> PriceCache {
+        let prices = PriceCache::default();
+        prices.set(
+            "http://feed".into(),
+            Quote {
+                price: 1.0,
+                timestamp: unix_now(),
+                degraded: false,
+                reference: Some(crate::pricing::feed::ReferenceBook {
+                    mid: 1.0,
+                    half_range_bps: 9.4,
+                }),
+            },
+        );
+        prices
+    }
+
+    fn curve_engine(mode: crate::modules::Mode) -> Engine {
+        let mut engine = test_engine();
+        engine.books[0].curve =
+            (mode != crate::modules::Mode::Off).then_some(responder::BookCurve {
+                live: mode == crate::modules::Mode::Live,
+                params: crate::pricing::curve::CurveParams::default(),
+            });
+        engine
+    }
+
+    /// End to end through `respond`: feed parse -> reference book -> curve ->
+    /// amounts -> signature -> reservation. Shadow must be invisible in the
+    /// wire frame — byte-identical amounts to a curve-off engine — because
+    /// shadow is what runs against production flow for days before anything
+    /// is decided.
+    #[tokio::test]
+    async fn shadow_is_invisible_on_the_wire_end_to_end() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let MakerFrame::QuoteResponse(off) = curve_engine(Mode::Off)
+            .respond(exact_input_request("rfq_off"), &prices)
+            .await
+        else {
+            panic!("off engine must quote");
+        };
+        let MakerFrame::QuoteResponse(shadow) = curve_engine(Mode::Shadow)
+            .respond(exact_input_request("rfq_shadow"), &prices)
+            .await
+        else {
+            panic!("shadow engine must quote");
+        };
+        assert_eq!(off.sell_amount, shadow.sell_amount);
+        assert_eq!(off.buy_amount, shadow.buy_amount);
+        assert_eq!(off.fee_amount, shadow.fee_amount);
+    }
+
+    /// Live mode must actually change the wire frame, still sign, and still
+    /// reserve — the whole path, not just `decide_quote_curved` in isolation.
+    #[tokio::test]
+    async fn live_curve_reprices_the_wire_frame_and_still_reserves() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let MakerFrame::QuoteResponse(flat) = curve_engine(Mode::Off)
+            .respond(exact_input_request("rfq_flat"), &prices)
+            .await
+        else {
+            panic!("off engine must quote");
+        };
+        let mut engine = curve_engine(Mode::Live);
+        let MakerFrame::QuoteResponse(live) = engine
+            .respond(exact_input_request("rfq_live"), &prices)
+            .await
+        else {
+            panic!("live engine must quote");
+        };
+        // Exact-input: the taker's gross is echoed either way; the maker's
+        // own leg is where the curve shows up.
+        assert_eq!(flat.sell_amount, live.sell_amount);
+        assert_ne!(
+            flat.buy_amount, live.buy_amount,
+            "live curve must reprice the maker leg"
+        );
+        assert!(!live.signature.is_empty());
+        assert!(
+            !engine.reservations.is_empty(),
+            "a live curve quote must still reserve its claim"
+        );
+        // And with no reference on the feed, live falls back to the flat
+        // answer rather than going dark.
+        let MakerFrame::QuoteResponse(fallback) = curve_engine(Mode::Live)
+            .respond(exact_input_request("rfq_fb"), &fresh_prices())
+            .await
+        else {
+            panic!("live engine without a reference must still quote");
+        };
+        assert_eq!(flat.buy_amount, fallback.buy_amount);
+    }
+
+    /// The levels a Live curve publishes come off the same curve as its firm
+    /// quotes, through `level_frames`, with the venue fee the last request
+    /// carried. Off and Shadow keep the one flat row per side.
+    #[tokio::test]
+    async fn a_live_curve_publishes_its_levels_off_the_curve() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let levels = |engine: &mut Engine| {
+            let frames = engine.level_frames(&prices, unix_now_ms());
+            let MakerFrame::Levels(frame) = frames[0].clone() else {
+                panic!("expected levels, got {frames:?}");
+            };
+            frame
+        };
+        for mode in [Mode::Off, Mode::Shadow] {
+            let frame = levels(&mut curve_engine(mode));
+            assert_eq!((frame.bids.len(), frame.asks.len()), (1, 1), "{mode:?}");
+        }
+        let mut live = curve_engine(Mode::Live);
+        let frame = levels(&mut live);
+        let rows = usize::try_from(responder::CURVE_LEVEL_ROWS).unwrap();
+        assert_eq!((frame.bids.len(), frame.asks.len()), (rows, rows));
+        // The fee the levels are sized with follows the requests.
+        assert_eq!(live.venue_fee_bps, 0);
+        let mut req = exact_input_request("rfq_fee");
+        req.fee_bps = 3;
+        let _ = live.respond(req, &prices).await;
+        assert_eq!(live.venue_fee_bps, 3);
+    }
+
+    /// A large same-side quote between two level publishes moves the next
+    /// curved quote past the levels the venue routed it on. Replying would be
+    /// a `level_slack` strike, so the bot declines until its levels catch up.
+    #[tokio::test]
+    async fn a_live_curve_declines_rather_than_reply_past_its_levels() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let mut engine = curve_engine(Mode::Live);
+        engine.books[0].buy_spread = Some(Spread::Bps(1));
+        engine.books[0].sell_spread = Some(Spread::Bps(1));
+        engine.books[0].buy_capacity_debt = Some(RfqCapacity::Exact(U256::from(12_000_000_000u64)));
+        let publish = |engine: &mut Engine| {
+            let frames = engine.level_frames(&prices, unix_now_ms());
+            let MakerFrame::Levels(frame) = frames[0].clone() else {
+                panic!("expected levels, got {frames:?}");
+            };
+            engine
+                .published_levels
+                .insert(frame.corridor_id.clone(), frame);
+        };
+        publish(&mut engine);
+        let MakerFrame::QuoteResponse(_) =
+            engine.respond(exact_input_request("rfq_a"), &prices).await
+        else {
+            panic!("a quote in line with its levels goes out");
+        };
+        // 7k of a 20k wallet promised on the bid before the next publish: the
+        // next bid starts at f = 0.9 against levels published at f = 0.5.
+        engine.reservations.reserve(
+            "rfq_big",
+            "cngn-usdc",
+            true,
+            U256::from(7_000_000_000u64),
+            unix_now() + 60,
+        );
+        let MakerFrame::QuoteReject(rej) =
+            engine.respond(exact_input_request("rfq_b"), &prices).await
+        else {
+            panic!("must decline, not reply into a strike");
+        };
+        assert_eq!(rej.reason, RejectReason::Busy);
+        publish(&mut engine);
+        let MakerFrame::QuoteResponse(_) =
+            engine.respond(exact_input_request("rfq_c"), &prices).await
+        else {
+            panic!("quotes again once its levels caught up");
+        };
+    }
+
+    /// The venue judges a reply against the levels it routed on, whatever
+    /// priced the reply. Levels published off the curve and a request the
+    /// curve can't price (here the reference book has dropped off the feed)
+    /// make a flat reply tens of bps worse than those levels: declined, then
+    /// answered once the flat levels are out.
+    #[tokio::test]
+    async fn a_live_curve_declines_a_flat_fallback_past_its_curved_levels() {
+        use crate::modules::Mode;
+        let mut engine = curve_engine(Mode::Live);
+        // A wide spread opens the gap: half way through its holdings the
+        // curve answers near the mid, flat answers a full spread off it.
+        engine.books[0].buy_spread = Some(Spread::Bps(50));
+        engine.books[0].sell_spread = Some(Spread::Bps(50));
+        let publish = |engine: &mut Engine, prices: &PriceCache| {
+            let frames = engine.level_frames(prices, unix_now_ms());
+            let MakerFrame::Levels(frame) = frames[0].clone() else {
+                panic!("expected levels, got {frames:?}");
+            };
+            engine
+                .published_levels
+                .insert(frame.corridor_id.clone(), frame);
+        };
+        publish(&mut engine, &fresh_prices_with_reference());
+
+        let without_reference = fresh_prices();
+        let MakerFrame::QuoteReject(rej) = engine
+            .respond(exact_input_request("rfq_flat"), &without_reference)
+            .await
+        else {
+            panic!("a flat reply past the curved levels must be declined");
+        };
+        assert_eq!(rej.reason, RejectReason::Busy);
+
+        publish(&mut engine, &without_reference);
+        let MakerFrame::QuoteResponse(_) = engine
+            .respond(exact_input_request("rfq_flat_again"), &without_reference)
+            .await
+        else {
+            panic!("answers flat once the levels are flat too");
+        };
+    }
+
+    #[tokio::test]
+    async fn a_live_curve_judges_its_reply_by_the_corridors_own_slack() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let mut engine = curve_engine(Mode::Live);
+        engine.books[0].buy_spread = Some(Spread::Bps(1));
+        engine.books[0].sell_spread = Some(Spread::Bps(1));
+        engine.books[0].buy_capacity_debt = Some(RfqCapacity::Exact(U256::from(12_000_000_000u64)));
+        let frames = engine.level_frames(&prices, unix_now_ms());
+        let MakerFrame::Levels(frame) = frames[0].clone() else {
+            panic!("expected levels, got {frames:?}");
+        };
+        engine
+            .published_levels
+            .insert(frame.corridor_id.clone(), frame);
+        engine.reservations.reserve(
+            "rfq_big",
+            "cngn-usdc",
+            true,
+            U256::from(7_000_000_000u64),
+            unix_now() + 60,
+        );
+        // The same reply the default slack declines in the test above goes
+        // out on a corridor whose handshake allows that much room.
+        let accepted = accepted(
+            &[],
+            vec![wire::CorridorPairFrame {
+                slug: engine.books[0].slug.clone(),
+                level_slack_bps: Some(500),
+                ..Default::default()
+            }],
+        );
+        engine.level_slack_bps = level_slack_by_slug(&accepted);
+        let MakerFrame::QuoteResponse(_) =
+            engine.respond(exact_input_request("rfq_b"), &prices).await
+        else {
+            panic!("inside the corridor's slack, so it replies");
+        };
+    }
+
+    #[test]
+    fn level_slack_comes_from_the_handshake_and_defaults_without_it() {
+        let accepted = accepted(
+            &[],
+            vec![
+                wire::CorridorPairFrame {
+                    slug: "tight".into(),
+                    level_slack_bps: Some(2),
+                    ..Default::default()
+                },
+                wire::CorridorPairFrame {
+                    slug: "older-venue".into(),
+                    level_slack_bps: None,
+                    ..Default::default()
+                },
+            ],
+        );
+        let mut engine = test_engine();
+        engine.level_slack_bps = level_slack_by_slug(&accepted);
+        assert_eq!(engine.level_slack_bps("tight"), 2.0);
+        assert_eq!(
+            engine.level_slack_bps("older-venue"),
+            responder::DEFAULT_LEVEL_SLACK_BPS
+        );
+        assert_eq!(
+            engine.level_slack_bps("unassigned"),
+            responder::DEFAULT_LEVEL_SLACK_BPS
+        );
     }
 
     #[tokio::test]
@@ -4437,6 +5218,7 @@ mod tests {
             sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(1_500_000_000u64))),
             feed_url: "http://feed".into(),
             staleness_secs: 240,
+            curve: None,
         }
     }
 
@@ -4489,6 +5271,7 @@ mod tests {
         engine.inventory.set(
             OTHER.parse().unwrap(),
             U256::from(10_000_000_000u64),
+            U256::from(10_000_000_000u64),
             unix_now(),
         );
         let mut req = exact_input_request("rfq_off");
@@ -4511,6 +5294,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now(),
                 degraded: false,
+                reference: None,
             },
         );
         assert!(cache.get("http://feed").is_some());
@@ -4523,6 +5307,7 @@ mod tests {
                     price: 2.0,
                     timestamp: unix_now() - 1,
                     degraded: false,
+                    reference: None,
                 },
                 unix_now(),
             );
@@ -4546,6 +5331,7 @@ mod tests {
                 price: 2.0,
                 timestamp: unix_now(),
                 degraded: false,
+                reference: None,
             }),
         );
         assert_eq!(cache.get("http://feed").unwrap().price, 2.0);
@@ -4564,6 +5350,7 @@ mod tests {
             sell_capacity_collateral: Some(RfqCapacity::Exact(U256::from(1u64))),
             feed_url: "http://feed".into(),
             staleness_secs: 240,
+            curve: None,
         }
     }
 
@@ -4708,6 +5495,7 @@ mod tests {
                 chain_id: 4663,
                 collateral_token: "0x0000000000000000000000000000000000000099".into(),
                 debt_token: "0x0000000000000000000000000000000000000098".into(),
+                level_slack_bps: None,
             }],
         );
         assert!(
@@ -4722,6 +5510,7 @@ mod tests {
                 chain_id: 56,
                 collateral_token: COLLATERAL.into(),
                 debt_token: DEBT.into(),
+                level_slack_bps: None,
             }],
         );
         assert!(bind_assigned_book(&book, &tokens_wrong_chain, 8453).is_none());
@@ -4733,6 +5522,7 @@ mod tests {
                 chain_id: 8453,
                 collateral_token: COLLATERAL.into(),
                 debt_token: DEBT.into(),
+                level_slack_bps: None,
             }],
         );
         let bound = bind_assigned_book(&book, &tokens_ok, 8453).unwrap();
@@ -5192,6 +5982,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now().saturating_sub(3_600),
                 degraded: false,
+                reference: None,
             },
         );
         let reply = engine.respond(exact_input_request("rfq_2"), &stale).await;
@@ -5317,7 +6108,7 @@ mod tests {
         let token: Address = "0x0000000000000000000000000000000000000001"
             .parse()
             .unwrap();
-        cache.set(token, U256::from(100u64), 1_000);
+        cache.set(token, U256::from(100u64), U256::from(100u64), 1_000);
 
         assert_eq!(
             cache.view(1_000 + INVENTORY_TTL_SECS).funded(token),
@@ -5597,6 +6388,111 @@ mod tests {
         });
         dir
     }
+    /// On a vault the curve's share is the vault's free balances, the
+    /// reading inventory balancing uses, and only while it is fresh and the
+    /// book is the vault's pair the right way round. The bot wallet's own
+    /// balances never stand in for it.
+    #[tokio::test]
+    async fn a_vault_curve_reads_the_vaults_free_balances() {
+        use crate::modules::Mode;
+        use responder::Holdings;
+        let mut engine = test_engine();
+        let _dir = enable_modules(&mut engine, Mode::Shadow, 2_000_000_000, 8_000_000_000);
+        let book = engine.books[0].clone();
+        let quote = fresh_prices_with_reference().get("http://feed").unwrap();
+        let now = unix_now();
+        assert_eq!(
+            engine.curve_inputs(&book, &quote, now).holdings,
+            Some(Holdings {
+                collateral: U256::from(8_000_000_000u64),
+                debt: U256::from(2_000_000_000u64),
+            })
+        );
+        let modules = engine.modules.clone().unwrap();
+        modules.balances.write().unwrap().as_mut().unwrap().at =
+            now - crate::modules::BALANCES_MAX_AGE_SECS - 1;
+        assert_eq!(
+            engine.curve_inputs(&book, &quote, now).holdings,
+            None,
+            "stale"
+        );
+        modules.balances.write().unwrap().as_mut().unwrap().at = now;
+        let mut reversed = book.clone();
+        std::mem::swap(&mut reversed.collateral, &mut reversed.debt);
+        assert_eq!(
+            engine.curve_inputs(&reversed, &quote, now).holdings,
+            None,
+            "reversed"
+        );
+    }
+
+    /// A wallet bot runs the module runtime for the curve alone: its
+    /// vault-only modules are off (`runnable`), so nothing waits on a vault,
+    /// quotes go out curved in Live, and the status records them.
+    #[tokio::test]
+    async fn a_wallet_bot_runs_the_curve_through_the_module_runtime() {
+        use crate::modules::{runtime::Runtime, Mode, ModulesConfig};
+        let mut engine = curve_engine(Mode::Live);
+        let dir =
+            std::env::temp_dir().join(format!("stitch-curve-wallet-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = ModulesConfig {
+            mode: Mode::Live,
+            ..Default::default()
+        };
+        cfg.curve.enabled = true;
+        engine.modules = Some(Runtime::new(cfg.runnable(false), &dir, "http://feed").unwrap());
+        engine.reservations = Reservations::with_persist_path(dir.join(RESERVATIONS_FILE));
+        let prices = fresh_prices_with_reference();
+        let reply = engine
+            .respond(exact_input_request("rfq_wallet"), &prices)
+            .await;
+        let MakerFrame::QuoteResponse(_) = reply else {
+            panic!("vault-only modules must not hold a wallet bot's quotes: {reply:?}");
+        };
+        let _ = engine.level_frames(&prices, unix_now_ms());
+        let curve = engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .status_snapshot()
+            .curve
+            .unwrap();
+        assert_eq!(curve.quotes.len(), 1);
+        assert!(curve.quotes[0].live && curve.quotes[0].lean_bps.is_some());
+        let reading = curve.reading.expect("the level tick records a reading");
+        assert!(
+            (reading.share - 0.5).abs() < 1e-9,
+            "10k each side at a price of 1"
+        );
+        assert!((reading.reference_mid - 1.0).abs() < 1e-12);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `[modules.curve]` reaches every book only while modules run with it on
+    /// and the mode isn't Off; Preview records, Live quotes.
+    #[test]
+    fn the_curve_reaches_the_books_from_modules_config() {
+        use crate::modules::Mode;
+        let mut cfg: crate::config::Config = toml::from_str(
+            crate::setup::find_corridor("cngn-usdt-bsc")
+                .unwrap()
+                .toml_template,
+        )
+        .unwrap();
+        assert_eq!(modules::book_curve(&cfg), None, "off by default");
+        cfg.modules.curve.enabled = true;
+        assert_eq!(modules::book_curve(&cfg), None, "needs modules_enabled");
+        cfg.modules_enabled = true;
+        cfg.modules.curve.end_above_buy = 1.0;
+        let preview = modules::book_curve(&cfg).unwrap();
+        assert!(!preview.live && preview.params.end_above_buy == 1.0);
+        cfg.modules.mode = Mode::Live;
+        assert!(modules::book_curve(&cfg).unwrap().live);
+        cfg.modules.mode = Mode::Off;
+        assert_eq!(modules::book_curve(&cfg), None);
+    }
+
     /// While the liquidity schedule lowers the floor, quotes that pay the
     /// vault's settlement stay inside the cap, and the engine reports what is
     /// committed under it so the loop knows when the lower is safe.

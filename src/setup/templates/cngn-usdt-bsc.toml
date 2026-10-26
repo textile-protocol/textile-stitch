@@ -45,6 +45,11 @@ sell_max_orders = 40
 ttl_secs = 120
 refresh_threshold_bps = 10                        # re-quote when price moves >0.10%
 
+# The inventory curve (Swap quoting: quotes lean on this bot's own cNGN
+# share) is a module. Turn it on in the panel under Corridors > Experimental;
+# by hand it is `modules_enabled = true` plus [modules.curve], see
+# docs/modules.md. Off unless you turn it on.
+
 # Swap quoting. Connect in the Stitch panel writes maker id, stream URL,
 # and rfq-api.key. Leave this block commented until then.
 # [rfq]

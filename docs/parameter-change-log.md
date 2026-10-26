@@ -19,7 +19,7 @@ Per pool (scope `pool:<collateral>/<debt>`, labelled with the corridor name):
 | `feed_url` | the pool's own feed, or the bot-level `[feed].url` it rides |
 | `rfq_staleness_secs` | the RFQ freshness window the responder enforces, after clamping |
 
-Bot-wide (scope `bot`): `max_loss_bps`, `max_jump_bps`, `settle_secs`, `staleness_secs`, `rfq_enabled`, `book_enabled`, `modules_enabled`, `change_log.ship`, and every `modules.*` setting while modules are on.
+Bot-wide (scope `bot`): `max_loss_bps`, `max_jump_bps`, `settle_secs`, `staleness_secs`, `rfq_enabled`, `book_enabled`, `modules_enabled`, `change_log.ship`, and every `modules.*` setting while modules are on, the inventory curve's (`modules.curve.*`) included.
 
 Textile records the venue side the same way: a corridor's `mode`, `quoteTtlMs` and `replyBudgetMs` (scope `corridor:<slug>`), and the price source behind a feed (scope `price-source:<currency or pair>`).
 

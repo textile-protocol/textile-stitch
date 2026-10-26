@@ -1,13 +1,15 @@
 import { useId, useState, type ReactNode } from 'react'
-import type { ModulesConfig } from '../modules'
+import type { ModulesConfig, ModulesView } from '../modules'
+import { CurveExample, CurveFields } from './CurveModule'
 import ModulePresets from './ModulePresets'
 import {
+  leanConflict,
   liquidityScheduleErrors,
   moduleKeyFigures,
-  moduleKeys,
   moduleModes,
   moduleNames,
   moduleParameterErrors,
+  modulesFor,
   percentage,
   liveRow,
   quoteBreakdown,
@@ -21,6 +23,7 @@ import { matchingPreset } from '../modulePresets'
 import {
   AllocationBar,
   Chevron,
+  ModeSwitch,
   ModuleSwitch,
   NumberControl,
   Popover,
@@ -40,8 +43,11 @@ type Example = {
   share: number
   /** Price range in bps. Fractional: a live reading keeps the bot's own float. */
   range: number
+  /** The inventory curve's example trade, in settlement units. */
+  sizeUsd: number
   setShare: (bps: number) => void
   setRange: (bps: number) => void
+  setSizeUsd: (usd: number) => void
   /** The bot's current reading, when it has a fresh one. */
   live: LiveReading | null
   /** Holdings and range are the live reading's, so the table is "now". */
@@ -53,8 +59,9 @@ type Example = {
 }
 
 /** The whole module config as one strategy: run mode in the header, then a
- * row per module with its switch, two defining figures and preset. Edit opens
- * that module's values in place; one module is open at a time. */
+ * row per module that can run on this bot's funds, with its switch, two
+ * defining figures and preset. Edit opens that module's values in place; one
+ * module is open at a time. */
 export default function ModuleParameters({
   draft,
   onChange,
@@ -65,6 +72,8 @@ export default function ModuleParameters({
   corridor,
   live,
   liquidityRefusal,
+  view,
+  now,
 }: {
   draft: ModulesConfig
   onChange: (config: ModulesConfig) => void
@@ -78,14 +87,25 @@ export default function ModuleParameters({
   live: LiveReading | null
   /** Why the liquidity schedule can't run on this vault, or null. */
   liquidityRefusal: string | null
+  /** The module view: the inventory curve reads its status and checks. */
+  view: ModulesView
+  now: number
 }) {
+  const vault = view.vault ?? true
   // A warming-up window has no range to start from; 0.2% is a plain example.
-  const [share, setShare] = useState(live?.share ?? 4500)
+  const curveShare = view.status?.curve?.reading?.share
+  const [share, setShare] = useState(
+    live?.share ?? (curveShare !== undefined ? Math.round(curveShare * 10_000) : 4500)
+  )
   const [range, setRange] = useState(live?.rangeBps ?? 20)
+  const [sizeUsd, setSizeUsd] = useState(10_000)
   const [shown, setShown] = useState(false)
   const example: Example = {
     share,
     range,
+    sizeUsd,
+    setSizeUsd: (value) =>
+      setSizeUsd(Number.isFinite(value) ? Math.max(0, value) : 0),
     shown,
     live,
     atLive:
@@ -116,6 +136,7 @@ export default function ModuleParameters({
     spreads: 'Widen margins when prices move, up to a cap you set.',
     rebalance: `Suggest selling excess ${currency} for ${settlement}.`,
     liquidity: `Keep more ${settlement} liquid for bundled fills in market hours; let the rest earn yield in Aave.`,
+    curve: `Lean Swap quotes on the ${currency} share of what the bot holds, priced across each trade.`,
   }
   return (
     <section
@@ -132,79 +153,44 @@ export default function ModuleParameters({
           </p>
         </div>
         <ModeSwitch
+          modes={moduleModes}
           value={draft.mode}
           onChange={(mode) => onChange({ ...draft, mode })}
         />
       </header>
-      {moduleKeys.map((key) => (
-        <ModuleRow
-          key={key}
-          module={key}
-          draft={draft}
-          onChange={onChange}
-          description={descriptions[key]}
-          open={selected === key}
-          onToggle={() => onSelect(selected === key ? null : key)}
-          blocked={key === 'liquidity' && liquidityRefusal !== null}
-        >
-          <ModuleEditor
+      {modulesFor(vault).map((key) => {
+        const conflict = leanConflict(draft, key, vault)
+        return (
+          <ModuleRow
+            key={key}
             module={key}
             draft={draft}
             onChange={onChange}
-            currency={currency}
-            settlement={settlement}
-            corridor={corridor}
-            example={example}
-            blockedReason={key === 'liquidity' ? liquidityRefusal : null}
-          />
-        </ModuleRow>
-      ))}
+            description={descriptions[key]}
+            open={selected === key}
+            onToggle={() => onSelect(selected === key ? null : key)}
+            blocked={
+              (key === 'liquidity' && liquidityRefusal !== null) ||
+              conflict !== null
+            }
+          >
+            <ModuleEditor
+              module={key}
+              draft={draft}
+              onChange={onChange}
+              currency={currency}
+              settlement={settlement}
+              corridor={corridor}
+              example={example}
+              blockedReason={key === 'liquidity' ? liquidityRefusal : null}
+              conflict={conflict}
+              view={view}
+              now={now}
+            />
+          </ModuleRow>
+        )
+      })}
     </section>
-  )
-}
-
-const modeDots: Record<ModulesConfig['mode'], string> = {
-  off: 'bg-faint',
-  shadow: 'bg-warning',
-  live: 'bg-success',
-}
-
-function ModeSwitch({
-  value,
-  onChange,
-}: {
-  value: ModulesConfig['mode']
-  onChange: (mode: ModulesConfig['mode']) => void
-}) {
-  return (
-    <div
-      role="radiogroup"
-      aria-label="Module mode"
-      className="bg-active inline-flex rounded-lg p-0.5"
-    >
-      {moduleModes.map((mode) => (
-        <label
-          key={mode.value}
-          title={mode.hint}
-          className={`inline-flex cursor-pointer items-center gap-2 rounded-md px-3 py-1.5 text-sm font-bold transition has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent ${value === mode.value ? 'bg-canvas text-ink ring-line-soft shadow-sm ring-1' : 'text-muted hover:text-ink'}`}
-        >
-          <input
-            type="radio"
-            name="module-mode"
-            value={mode.value}
-            checked={value === mode.value}
-            onChange={() => onChange(mode.value)}
-            className="sr-only"
-          />
-          <span
-            aria-hidden
-            className={`size-1.5 rounded-full ${modeDots[mode.value]}`}
-          />
-          {mode.label}
-          <span className="sr-only">: {mode.hint}</span>
-        </label>
-      ))}
-    </div>
   )
 }
 
@@ -233,9 +219,9 @@ function ModuleRow({
   const name = moduleNames[module]
   const figures = moduleKeyFigures(draft, module)
   const preset =
-    module === 'rebalance' || module === 'liquidity'
-      ? null
-      : (matchingPreset(draft, module)?.name ?? 'Custom')
+    module === 'inventory' || module === 'spreads'
+      ? (matchingPreset(draft, module)?.name ?? 'Custom')
+      : null
   const caption = 'text-faint text-[11px] font-bold uppercase tracking-wider'
   return (
     // The card can't clip (popovers must escape it), so the last row's
@@ -322,6 +308,9 @@ function ModuleEditor({
   corridor,
   example,
   blockedReason,
+  conflict,
+  view,
+  now,
 }: {
   module: ModuleKey
   draft: ModulesConfig
@@ -332,13 +321,11 @@ function ModuleEditor({
   example: Example
   /** Why this module can't run on this bot, or null. */
   blockedReason: string | null
+  /** The other inventory module is on, so this one can't be turned on. */
+  conflict: string | null
+  view: ModulesView
+  now: number
 }) {
-  const Fields = {
-    inventory: InventoryFields,
-    spreads: SpreadFields,
-    rebalance: RebalanceFields,
-    liquidity: LiquidityFields,
-  }[module]
   const guide = moduleGuides[module]
   return (
     <>
@@ -358,6 +345,10 @@ function ModuleEditor({
             {draft[module].enabled
               ? 'Turn the schedule off; the bot will not act on this vault.'
               : 'The schedule can only be turned on for a vault with a yield adapter.'}
+          </p>
+        ) : conflict !== null && !draft[module].enabled ? (
+          <p role="note" className="text-xs font-bold text-warning">
+            {conflict}
           </p>
         ) : (
           !draft[module].enabled && (
@@ -387,12 +378,29 @@ function ModuleEditor({
         <div className="p-5 sm:p-6">
           {/* Caps line length when the example is tucked away. */}
           <div className="max-w-3xl space-y-6">
-            <Fields
-              draft={draft}
-              onChange={onChange}
-              currency={currency}
-              settlement={settlement}
-            />
+            {module === 'curve' ? (
+              <CurveFields
+                draft={draft}
+                onChange={onChange}
+                view={view}
+                now={now}
+                currency={currency}
+                settlement={settlement}
+                example={
+                  example.shown
+                    ? { share: example.share / 10_000, sizeUsd: example.sizeUsd }
+                    : null
+                }
+              />
+            ) : (
+              <ModuleFields
+                module={module}
+                draft={draft}
+                onChange={onChange}
+                currency={currency}
+                settlement={settlement}
+              />
+            )}
           </div>
         </div>
         <ModuleExample
@@ -402,10 +410,32 @@ function ModuleEditor({
           settlement={settlement}
           corridor={corridor}
           example={example}
+          view={view}
+          now={now}
         />
       </div>
     </>
   )
+}
+
+/** A vault module's own fields. The inventory curve has its own editor. */
+function ModuleFields({
+  module,
+  ...props
+}: {
+  module: Exclude<ModuleKey, 'curve'>
+  draft: ModulesConfig
+  onChange: (config: ModulesConfig) => void
+  currency: string
+  settlement: string
+}) {
+  const Fields = {
+    inventory: InventoryFields,
+    spreads: SpreadFields,
+    rebalance: RebalanceFields,
+    liquidity: LiquidityFields,
+  }[module]
+  return <Fields {...props} />
 }
 
 function ModuleExample({
@@ -415,6 +445,8 @@ function ModuleExample({
   settlement,
   corridor,
   example,
+  view,
+  now,
 }: {
   module: ModuleKey
   draft: ModulesConfig
@@ -422,9 +454,11 @@ function ModuleExample({
   settlement: string
   corridor: QuoteSides | null
   example: Example
+  view: ModulesView
+  now: number
 }) {
   const id = useId()
-  const valid = moduleParameterErrors(draft).length === 0
+  const valid = moduleParameterErrors(draft, view.vault ?? true).length === 0
   const enabled = draft[module].enabled
   const breakdown =
     valid && corridor
@@ -495,9 +529,23 @@ function ModuleExample({
                   ? 'See the extra margin'
                   : module === 'liquidity'
                     ? 'See the weekly schedule'
-                    : 'See when a sale starts'}
+                    : module === 'curve'
+                      ? 'See a quote'
+                      : 'See when a sale starts'}
             </h4>
-            {module === 'liquidity' ? (
+            {module === 'curve' ? (
+              <CurveExample
+                draft={draft}
+                view={view}
+                now={now}
+                currency={currency}
+                example={{ share: example.share / 10_000, sizeUsd: example.sizeUsd }}
+                onExample={(next) => {
+                  example.setShare(Math.round(next.share * 10_000))
+                  example.setSizeUsd(next.sizeUsd)
+                }}
+              />
+            ) : module === 'liquidity' ? (
               liquidityScheduleErrors(draft.liquidity).length === 0 ? (
                 <div className="space-y-5">
                   <ScheduleStrip schedule={draft.liquidity} />
@@ -618,7 +666,9 @@ function ModuleExample({
             <p className="text-muted mt-6 text-xs leading-relaxed">
               {module === 'liquidity'
                 ? 'Illustration only. The floor is a share of free settlement, so the amount kept liquid moves with the vault balance.'
-                : 'Illustration only, not a live quote or a return forecast. Open quotes, available funds and vault limits can still hold a side back.'}
+                : module === 'curve'
+                  ? 'Illustration only, not a live quote. Open quotes on the same side, capacity and the venue fee on the actual request still apply.'
+                  : 'Illustration only, not a live quote or a return forecast. Open quotes, available funds and vault limits can still hold a side back.'}
             </p>
           </aside>
         )}

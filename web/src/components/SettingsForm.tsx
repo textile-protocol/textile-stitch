@@ -295,9 +295,21 @@ export default function SettingsForm({
             onSaved(message)
           }}
         />
-        {/* Modules only run from a vault, so the section waits for one. */}
-        {loaded.vaultAddress && (
+        {/* A vault bot gets the vault modules, a wallet bot the inventory
+            curve: never both, since neither can run on the other's funds. */}
+        {loaded.vaultAddress ? (
           <ModulesSubsection
+            bot={bot}
+            settings={loaded}
+            dirty={dirty}
+            onChanged={(next, message) => {
+              setLoaded(next)
+              setDraft(next)
+              onSaved(message)
+            }}
+          />
+        ) : (
+          <CurveSubsection
             bot={bot}
             settings={loaded}
             dirty={dirty}
@@ -590,7 +602,7 @@ function ExperimentalCard({
 
           <ExperimentalSubsection
             title="TWAP / lean"
-            description="Center quotes on a rolling TWAP and/or lean spreads against the wallet's own inventory. These price the public ladder and the taker leg — Swap quotes (RFQ) answer off the latest feed print and your spreads. Useful on volatile pairs; leave blank unless you want them."
+            description={`Center quotes on a rolling TWAP and/or lean spreads against the wallet's own inventory. These price the public ladder and the taker leg. ${draft.modulesEnabled ? 'Swap quotes (RFQ) follow your modules instead.' : 'Swap quotes (RFQ) answer off the latest feed print and your spreads.'} Useful on volatile pairs; leave blank unless you want them.`}
           >
             <div className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
@@ -1051,7 +1063,7 @@ function ModulesSubsection({
   return (
     <ExperimentalSubsection
       title="FX protection modules"
-      description="Inventory balancing, dynamic spreads and spot rebalancing for a bot that trades from a vault. They steer corridor holdings toward a target and widen Swap margins when prices move."
+      description="Inventory balancing, dynamic spreads, spot rebalancing, the liquidity schedule and the inventory curve for a bot that trades from a vault. They steer corridor holdings, widen Swap margins when prices move, and lean quotes on what the vault holds."
     >
       <div className="space-y-3">
         <p className="text-sm">
@@ -1092,6 +1104,116 @@ function ModulesSubsection({
           onClick={() => void toggle()}
         >
           {on ? 'Turn off modules' : 'Turn on modules'}
+        </Button>
+        {error && <Banner tone="danger">{error}</Banner>}
+      </div>
+    </ExperimentalSubsection>
+  )
+}
+
+/**
+ * The inventory curve, for a bot that trades from its own wallet: the first
+ * module that doesn't need a vault. Adding it shows the Modules tab and starts
+ * it in Preview, so Swap quotes don't change until the operator switches to
+ * Live there. What stops it is listed up front in the server's words.
+ */
+function CurveSubsection({
+  bot,
+  settings,
+  dirty,
+  onChanged,
+}: {
+  bot: Bot
+  settings: Settings
+  dirty: boolean
+  onChanged: (settings: Settings, message: string) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // On a wallet bot the module flag is the curve's: it is the one module
+  // that runs there, and turning modules on turns it on.
+  const on = settings.modulesEnabled
+  const blockers = on ? [] : settings.modulesBlockers
+  const turnsOff = on ? [] : settings.modulesTurnsOff
+  const name = bot.displayName ?? bot.name
+
+  async function toggle() {
+    const restart = bot.running ? ` ${name} restarts to apply it.` : ''
+    const lines = on
+      ? [
+          `Turn off the inventory curve for ${name}?`,
+          '',
+          `Swap quotes go back to your corridor spread and the Modules tab is hidden. Its settings stay in stitch.toml, and orders already signed stay valid until they expire.${restart}`,
+        ]
+      : [
+          `Turn on the inventory curve for ${name}?`,
+          '',
+          `It starts in Preview: the bot records what the curve would quote without changing quotes. Switch to Live in the Modules tab when you're ready.${restart}`,
+          ...(turnsOff.length > 0
+            ? [
+                '',
+                `This also turns off ${andList(turnsOff)}, which modules can't run alongside. They stay off if you turn the curve off later.`,
+              ]
+            : []),
+        ]
+    const discard = dirty ? ['', 'Unsaved changes on this page are discarded.'] : []
+    if (!window.confirm([...lines, ...discard].join('\n'))) return
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await api.setModulesEnabled(bot.name, !on)
+      onChanged(res.settings, res.message)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <ExperimentalSubsection
+      title="Inventory curve"
+      description="Leans Swap quotes on this wallet's own share of the corridor currency, so a wallet filling up with it quotes to shed it. Each quote pays the average lean across the holdings it moves, so a round trip always costs the taker the spread. The one module that runs without a vault; on a vault it sits beside the other FX protection modules."
+    >
+      <div className="space-y-3">
+        <p className="text-sm">
+          {on ? (
+            <>
+              On. Configure it in the{' '}
+              <Link to={botPath(bot.name, 'modules')} className="underline">
+                Modules tab
+              </Link>
+              .
+            </>
+          ) : (
+            'Off.'
+          )}
+        </p>
+        {blockers.length > 0 && (
+          <div className="rounded-lg bg-hover p-3">
+            <p className="text-sm font-bold">Before you can turn it on</p>
+            <ul className="mt-1 list-disc space-y-1 pl-5 text-xs text-muted">
+              {blockers.map((blocker) => (
+                <li key={blocker} className="first-letter:uppercase">
+                  {blocker}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {blockers.length === 0 && turnsOff.length > 0 && (
+          <p className="text-xs text-muted">
+            Turning it on also turns off {andList(turnsOff)}, which modules
+            can&apos;t run alongside.
+          </p>
+        )}
+        <Button
+          variant={on ? 'secondary' : 'primary'}
+          busy={busy}
+          disabled={!settings.editable || busy || blockers.length > 0}
+          onClick={() => void toggle()}
+        >
+          {on ? 'Turn off inventory curve' : 'Turn on inventory curve'}
         </Button>
         {error && <Banner tone="danger">{error}</Banner>}
       </div>

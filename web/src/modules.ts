@@ -1,3 +1,4 @@
+import type { CurveStatus } from './curve'
 export interface ModulesConfig {
   mode: 'off' | 'shadow' | 'live'
   inventory: {
@@ -29,6 +30,15 @@ export interface ModulesConfig {
   /** Moves the vault's on-chain `minLiquidSettlement` on a UTC schedule.
    * Floors and tolerance are shares of free settlement (liquid + staked). */
   liquidity: LiquidityConfig
+  /** The inventory curve: the one module that also runs without a vault.
+   * Offsets are in the corridor's soft currency (NGN for cNGN). */
+  curve: CurveModuleConfig
+}
+export interface CurveModuleConfig {
+  enabled: boolean
+  start_below_mid: number
+  end_above_buy: number
+  shape: number
 }
 export type Weekday = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun'
 export interface LiquidityConfig {
@@ -126,6 +136,9 @@ export interface ModuleStatus {
   } | null
   /** Absent from bots released before the liquidity schedule. */
   liquidity?: LiquidityStatus | null
+  /** The inventory curve's last reading and recent quotes. Absent while it
+   *  has never run, and from older bots. */
+  curve?: CurveStatus | null
 }
 /** One side of the corridor's configured spread. `abs` is an offset in
  * collateral per debt, so it only reads as bps at a price. */
@@ -145,6 +158,13 @@ export interface ModulesView {
   /** Why the liquidity schedule can't run on this vault (no yield adapter),
    *  or null. Absent from older panels. */
   liquidity_refusal?: string | null
+  /** The bot trades from a vault: every module can run. Without one only
+   *  the inventory curve can. Absent from older panels, which only served
+   *  vault bots. */
+  vault?: boolean
+  /** The corridor's feed is read inverted (a reversed pool), where the
+   *  inventory curve can't run. */
+  feed_inverted?: boolean
 }
 
 /** Recorded changes, including side vetoes and caps; never recalculate from

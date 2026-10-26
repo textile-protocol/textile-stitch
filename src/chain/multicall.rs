@@ -100,6 +100,12 @@ impl Batcher {
         self.multicall3.is_some()
     }
 
+    /// Where the batch goes, when reads are batched: a call to Multicall3's
+    /// own views (`getBlockNumber`) rides the batch from here.
+    pub fn multicall3(&self) -> Option<Address> {
+        self.multicall3
+    }
+
     /// Ask the node whether Multicall3 is deployed at the canonical address.
     /// An error here is the node being unreachable, not an answer — the caller
     /// should retry rather than pin itself to the sequential path forever.

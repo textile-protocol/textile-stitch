@@ -272,6 +272,32 @@ export const moduleGuides: Record<
       </>
     ),
   },
+  curve: {
+    title: 'How the inventory curve works',
+    body: (currency, settlement) => (
+      <>
+        <p>
+          Swap prices move with the share of the bot&apos;s holdings in{' '}
+          {currency}. With none, it sells {settlement} at the reference mid.
+          Full of it, it pays the reference buy, what clearing {currency} on
+          the reference market would cost. The two offsets widen either end.
+        </p>
+        <p className="mt-3">
+          Every quote pays the average lean across the holdings it moves
+          through, not the lean where it starts, so a trade out and straight
+          back always costs the taker the spread. Quotes already given out on
+          one side count as moved, so splitting a trade buys nothing. Published
+          levels follow the same curve in Live.
+        </p>
+        <p className="mt-3">
+          On a vault it reads the vault&apos;s free balances and replaces
+          inventory balancing; dynamic spreads can stay on. It quotes flat when
+          the feed has no reference book, the book is more than 1% off the
+          price, or the balances are stale, and Details says how often.
+        </p>
+      </>
+    ),
+  },
 }
 
 /** Operator's local equivalent of a UTC clock time, using today's offset. */

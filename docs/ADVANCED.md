@@ -397,6 +397,22 @@ pulled side takes nothing. The configured `buy_offset_*` / `sell_offset_*`
 spreads still gate which sides run and are what shadow mode logs as the live
 comparison, but live lean pricing replaces them.
 
+Note the lean reaches the public ladder and the limit-order taker leg, **not**
+Swap quoting (RFQ). Swap quoting has its own inventory mechanism, the quote
+curve below.
+
+### The inventory curve (Swap quoting)
+
+A module that leans Swap quotes on the bot's own share of the corridor
+currency (cNGN first): empty of it, the bot sells dollars at the reference mid;
+full of it, it pays the reference buy. Every quote is priced at the average
+lean across the stretch of holdings that trade moves through, so a round trip
+always costs the taker the spread and never pays them. It is the one module
+that also runs on a bot that trades from its own wallet; on a vault it reads
+the vault's free balances and replaces inventory balancing. Off unless you turn
+it on. Configuration, rules and the panel are in [modules.md](modules.md#inventory-curve);
+the design and its decision log in [`cngn-quote-curve-spec.md`](cngn-quote-curve-spec.md).
+
 ### MPC Wallet Signers
 
 By default Stitch signs with the local private key (the hotwallet). An optional

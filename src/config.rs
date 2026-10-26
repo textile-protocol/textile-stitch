@@ -867,6 +867,17 @@ fn spread_from(bps: Option<u32>, abs: Option<f64>) -> Option<Spread> {
     }
 }
 
+/// Whether a `/price` feed URL asks for the reciprocal (`invert=1` or
+/// `invert=true`, as the API's `parseFlag` reads it): the reversed pools the
+/// corridor registry generates. An unparseable URL is left to the feed
+/// checks.
+pub(crate) fn feed_inverts(url: &str) -> bool {
+    url::Url::parse(url.trim()).is_ok_and(|u| {
+        u.query_pairs()
+            .any(|(k, v)| k == "invert" && matches!(v.to_ascii_lowercase().as_str(), "1" | "true"))
+    })
+}
+
 impl PoolConfig {
     /// Seconds before expiry at which this side reposts, with the default applied.
     pub fn repost_lead_secs(&self) -> u64 {
@@ -1200,6 +1211,28 @@ impl Config {
         .collect()
     }
 
+    /// Whether the inventory curve prices live quotes: modules on, the curve
+    /// switched on, and modules in Live. Preview only computes it.
+    pub fn curve_live(&self) -> bool {
+        self.modules_enabled
+            && self.modules.curve.enabled
+            && self.modules.mode == crate::modules::Mode::Live
+    }
+
+    /// The price every reader of this bot's feed quotes around: the tick
+    /// loop, RFQ and NAV co-signing share one jump guard per feed URL, so
+    /// they must all read the same series. A Live inventory curve reads the
+    /// centre before the admin's manual adjustments, so the hand-set lean
+    /// moves none of its quotes, the flat fallbacks included. Preview keeps
+    /// the served price, which is what it answers at.
+    pub fn price_basis(&self) -> crate::pricing::feed::PriceBasis {
+        if self.curve_live() {
+            crate::pricing::feed::PriceBasis::Unadjusted
+        } else {
+            crate::pricing::feed::PriceBasis::Served
+        }
+    }
+
     /// Whether the liquidity schedule will send its own floor and recall
     /// transactions: on, in Live mode, with modules on. Preview only reads.
     pub fn liquidity_schedule_sends(&self) -> bool {
@@ -1221,8 +1254,8 @@ impl Config {
     /// panel shows these before the operator tries, so they read as fixes.
     pub fn modules_blockers(&self) -> Vec<&'static str> {
         [
-            (!(self.vault.is_some() && self.pools.len() == 1 && self.rfq_active()))
-                .then_some("modules require an OperatorVault, one corridor and enabled RFQ"),
+            (!(self.pools.len() == 1 && self.rfq_active()))
+                .then_some("modules require one corridor and enabled RFQ"),
             (self.book_enabled || !self.on_chain_legs().is_empty()).then_some(
                 "modules require RFQ-only operation; disable the ladder, limit taker and closer",
             ),
@@ -1235,6 +1268,63 @@ impl Config {
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    /// What the inventory curve needs, once modules are known to quote one
+    /// corridor. On a wallet bot the curve is the only module that runs; on a
+    /// vault it runs beside the others except inventory balancing.
+    fn validate_curve(&self) -> anyhow::Result<()> {
+        let m = &self.modules;
+        if !m.curve.enabled {
+            return Ok(());
+        }
+        let pool = &self.pools[0];
+        // One curve serves both directions and sizes its endpoints in bps off
+        // the all-in cost. Unequal spreads would give the two directions two
+        // different curves, which reopens the round trip; an absolute spread
+        // has no bps at all.
+        let spreads: Vec<Spread> = [pool.buy_spread(), pool.sell_spread()]
+            .into_iter()
+            .flatten()
+            .collect();
+        anyhow::ensure!(
+            !spreads.is_empty(),
+            "the inventory curve needs at least one quoting side (a buy or sell spread)"
+        );
+        anyhow::ensure!(
+            spreads.iter().all(|sp| matches!(sp, Spread::Bps(_))),
+            "the inventory curve sizes its endpoints in bps, so it needs bps spreads, not \
+             absolute offsets"
+        );
+        anyhow::ensure!(
+            spreads.windows(2).all(|w| w[0] == w[1]),
+            "one inventory curve serves both directions, so the buy and sell spreads must be \
+             equal"
+        );
+        // The ends are not mirror images (the reference half-range sits on
+        // the full-of-collateral end), so the curve assumes collateral is the
+        // soft currency and debt the dollar. A generated reverse pool (USDT
+        // collateral) reads its feed with invert=1; on it the share would be
+        // the dollar share and the curve would lean on the wrong leg.
+        let feed = pool.feed_url.as_deref().unwrap_or(&self.feed.url);
+        anyhow::ensure!(
+            !feed_inverts(feed),
+            "the inventory curve assumes the collateral is the soft currency and the debt the \
+             dollar, but this pool's feed has invert=1 (a reversed pool), where it would lean \
+             on the wrong leg"
+        );
+        // Both lean quotes on what the vault holds: run together they would
+        // stack two inventory leans, and the inventory module's per-side
+        // skew would hand the curve's two directions different spreads.
+        // Dynamic spreads can stay: they add the same buffer to both sides
+        // (weighting it by inventory needs inventory balancing), so the curve
+        // only sees a wider all-in.
+        anyhow::ensure!(
+            self.vault.is_none() || !m.inventory.enabled,
+            "inventory balancing and the inventory curve both lean quotes on what the vault \
+             holds; turn one of them off"
+        );
+        Ok(())
     }
 
     /// What this config has switched on that modules can't run beside, as the
@@ -1525,6 +1615,7 @@ impl Config {
             if let Some(blocker) = self.modules_blockers().first() {
                 anyhow::bail!("{blocker}");
             }
+            self.validate_curve()?;
             // The schedule sends its own transactions in Live mode; Preview
             // only reads, so any signer can preview it.
             if let Some(why) = self
@@ -1858,6 +1949,120 @@ mod tests {
             {signer}
         "#
         )
+    }
+
+    /// A bot running the inventory curve: one corridor, RFQ only, equal bps
+    /// spreads, and its own wallet unless `vault` says otherwise.
+    fn curve_bot(pool_extra: &str, vault: bool, modules_extra: &str) -> String {
+        let vault = if vault {
+            "[vault]\naddress = \"0x1111111111111111111111111111111111111111\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "modules_enabled = true\n{}{pool_extra}\n{vault}\
+             [rfq]\nenabled = true\nurl = \"wss://x\"\nmaker_id = \"mk\"\n\
+             api_key_env = \"K\"\n\
+             validation_contract = \"0x2222222222222222222222222222222222222222\"\n\
+             [modules.curve]\nenabled = true\n{modules_extra}",
+            rfq_only_with_signer("")
+        )
+    }
+
+    #[test]
+    fn only_a_live_curve_reads_the_centre_before_manual_adjustments() {
+        use crate::pricing::feed::PriceBasis;
+        let basis = |toml: String| Config::from_toml(&toml).unwrap().price_basis();
+        let live = "[modules]\nmode = \"live\"\n";
+        assert_eq!(basis(curve_bot("", false, live)), PriceBasis::Unadjusted);
+        // Preview answers at the served price, so it reads that one.
+        assert_eq!(basis(curve_bot("", false, "")), PriceBasis::Served);
+        // Live modules without the curve, and a bot without modules.
+        let no_curve = curve_bot("", false, live).replace(
+            "[modules.curve]\nenabled = true",
+            "[modules.curve]\nenabled = false",
+        );
+        assert_eq!(basis(no_curve), PriceBasis::Served);
+        assert_eq!(basis(rfq_only_with_signer("")), PriceBasis::Served);
+    }
+
+    #[test]
+    fn the_curve_is_off_unless_switched_on() {
+        // Upgrading changes nothing: a config that never mentions the curve,
+        // modules on or off, runs it nowhere.
+        let cfg = Config::from_toml(&rfq_only_with_signer("")).unwrap();
+        assert!(!cfg.modules.curve.enabled);
+        assert_eq!(
+            cfg.modules.curve,
+            crate::modules::config::CurveConfig::default()
+        );
+    }
+
+    #[test]
+    fn the_curve_runs_on_a_wallet_bot_without_a_vault() {
+        // The first module that doesn't need a vault. The vault-only ones
+        // default on in the file but can't run here (`runnable`), so they
+        // don't block it.
+        let cfg = Config::from_toml(&curve_bot("", false, "start_below_mid = 0.5\n")).unwrap();
+        assert!(cfg.vault.is_none() && cfg.modules.curve.enabled);
+        assert_eq!(cfg.modules.curve.start_below_mid, 0.5);
+        let runs = cfg.modules.runnable(false);
+        assert!(runs.curve.enabled);
+        assert!(!runs.inventory.enabled && !runs.spreads.enabled);
+        assert!(!runs.rebalance.enabled && !runs.liquidity.enabled);
+        assert_eq!(
+            cfg.modules.vault_only_enabled(),
+            ["inventory balancing", "dynamic spreads"]
+        );
+    }
+
+    #[test]
+    fn the_curve_runs_on_a_vault_instead_of_inventory_balancing() {
+        // Two inventory leans on one vault would stack, so it's one or the
+        // other. Dynamic spreads add the same buffer to both sides and stay.
+        let both = Config::from_toml(&curve_bot("", true, ""))
+            .unwrap_err()
+            .to_string();
+        assert!(both.contains("turn one of them off"), "{both}");
+        let curve = curve_bot("", true, "[modules.inventory]\nenabled = false\n");
+        let cfg = Config::from_toml(&curve).unwrap();
+        assert!(cfg.modules.spreads.enabled && cfg.modules.curve.enabled);
+        assert_eq!(cfg.modules.runnable(true), cfg.modules);
+    }
+
+    #[test]
+    fn the_curve_refuses_spreads_it_cannot_price_and_a_reversed_feed() {
+        let unequal =
+            curve_bot("", false, "").replace("sell_offset_bps = 150", "sell_offset_bps = 300");
+        assert!(Config::from_toml(&unequal)
+            .unwrap_err()
+            .to_string()
+            .contains("must be equal"));
+        let absolute =
+            curve_bot("", false, "").replace("sell_offset_bps = 150", "sell_offset_abs = 2.0");
+        assert!(Config::from_toml(&absolute)
+            .unwrap_err()
+            .to_string()
+            .contains("bps spreads"));
+        let reversed = curve_bot(
+            "feed_url = \"https://api.example/price?pair=cngn-usdt&invert=TRUE\"\n",
+            false,
+            "",
+        );
+        assert!(Config::from_toml(&reversed)
+            .unwrap_err()
+            .to_string()
+            .contains("invert=1"));
+        assert!(Config::from_toml(&reversed.replace("invert=TRUE", "invert=0")).is_ok());
+        let negative = curve_bot("", false, "start_below_mid = -0.5\n");
+        assert!(Config::from_toml(&negative)
+            .unwrap_err()
+            .to_string()
+            .contains("zero or a positive"));
+        // None of it is checked while the curve stays off.
+        assert!(
+            Config::from_toml(&unequal.replace("[modules.curve]\nenabled = true\n", "")).is_ok()
+        );
     }
 
     /// A live liquidity schedule broadcasts from the operator wallet, so the

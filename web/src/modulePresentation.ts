@@ -1,8 +1,10 @@
+import { curveConfigErrors, knobLabel, shapeLabel } from './curve'
 import { formatAtomic } from './format'
 import {
   isWarmingUp,
   moduleStatusFresh,
   type CorridorSpread,
+  type CurveModuleConfig,
   type LiquidityConfig,
   type LiquidityStatus,
   type LiquidityStep,
@@ -12,19 +14,48 @@ import {
   type Weekday,
 } from './modules'
 
-export type ModuleKey = 'inventory' | 'spreads' | 'rebalance' | 'liquidity'
+export type ModuleKey =
+  | 'inventory'
+  | 'spreads'
+  | 'rebalance'
+  | 'liquidity'
+  | 'curve'
 export const moduleNames: Record<ModuleKey, string> = {
   inventory: 'Inventory balancing',
   spreads: 'Dynamic spreads',
   rebalance: 'Spot rebalancing',
   liquidity: 'Liquidity schedule',
+  curve: 'Inventory curve',
 }
 export const moduleKeys: ModuleKey[] = [
   'inventory',
   'spreads',
   'rebalance',
   'liquidity',
+  'curve',
 ]
+
+/** The modules that can run on this bot's funds, in display order. Every
+ * module runs on a vault; a bot that trades from its own wallet has nothing
+ * for the others to read or act through, so it gets the inventory curve
+ * alone. Mirrors `ModulesConfig::runnable` in the bot. */
+export const modulesFor = (vault: boolean): ModuleKey[] =>
+  vault ? moduleKeys : ['curve']
+
+/** Inventory balancing and the inventory curve both lean quotes on what the
+ * vault holds, so one stays off while the other runs. The bot refuses both. */
+export function leanConflict(
+  c: ModulesConfig,
+  key: ModuleKey,
+  vault: boolean
+): string | null {
+  if (!vault) return null
+  if (key === 'curve' && c.inventory.enabled)
+    return 'Inventory balancing is on. Both lean quotes on what the vault holds, so turn it off to run the curve.'
+  if (key === 'inventory' && c.curve.enabled)
+    return 'The inventory curve is on. Both lean quotes on what the vault holds, so turn it off to run inventory balancing.'
+  return null
+}
 export const percentage = (bps: number) =>
   `${(bps / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
 
@@ -68,6 +99,10 @@ const shownSeconds = (v: unknown) =>
     : '—'
 const shownSwitch = (v: unknown) => (v ? 'On' : 'Off')
 const shownText = (v: unknown) => (typeof v === 'string' && v ? v : '—')
+const shownNgn = (v: unknown) =>
+  typeof v === 'number' && Number.isFinite(v)
+    ? `${v.toLocaleString(undefined, { maximumFractionDigits: 2 })} NGN`
+    : '—'
 
 /** The two settings that define each module, shown on its strategy row. */
 export function moduleKeyFigures(
@@ -95,6 +130,10 @@ export function moduleKeyFigures(
     liquidity: [
       ['Market hours', shownPercent(c.liquidity.market_floor_bps)],
       ['Off-hours', shownPercent(c.liquidity.off_hours_floor_bps)],
+    ],
+    curve: [
+      ['Starts at', knobLabel('Mid', c.curve.start_below_mid)],
+      ['Ends at', knobLabel('Buy', c.curve.end_above_buy)],
     ],
   }
   return figures[key].map(([label, value]) => ({ label, value }))
@@ -172,6 +211,10 @@ const editableSettings: readonly [
   ],
   ['Role key', (c) => c.liquidity.authority?.role_key ?? '', shownText],
   ['Ignore gaps smaller than', (c) => c.liquidity.tolerance_bps, shownPercent],
+  ['Inventory curve', (c) => c.curve.enabled, shownSwitch],
+  ['Start below the mid', (c) => c.curve.start_below_mid, shownNgn],
+  ['End above the reference buy', (c) => c.curve.end_above_buy, shownNgn],
+  ['Curve shape', (c) => c.curve.shape, (v) => shapeLabel(Number(v))],
 ]
 
 /** What saving would change, in form order. `Object.is` so an empty field
@@ -191,7 +234,10 @@ export const moduleChanges = (
 /** UI validation mirrors the numeric config constraints. The server remains
  * authoritative, including dealer URL and wallet validation. Never repair a
  * related setting silently when a slider moves. */
-export function moduleParameterErrors(c: ModulesConfig): string[] {
+export function moduleParameterErrors(
+  c: ModulesConfig,
+  vault = true
+): string[] {
   const i = c.inventory,
     s = c.spreads,
     r = c.rebalance
@@ -226,6 +272,11 @@ export function moduleParameterErrors(c: ModulesConfig): string[] {
       'Spot timing: orders last 10–300 seconds; the wait between sales must be at least 30 seconds longer.',
     ...liquidityScheduleErrors(c.liquidity),
     ...liquidityAuthorityErrors(c.liquidity, c.mode),
+    ...curveConfigErrors(c.curve).map((m) => `Inventory curve: ${m}`),
+    vault &&
+      c.curve.enabled &&
+      c.inventory.enabled &&
+      'Inventory balancing and the inventory curve both lean quotes on what the vault holds; turn one of them off.',
   ].filter((message): message is string => typeof message === 'string')
 }
 
@@ -268,6 +319,13 @@ const integer = (n: number, min: number, max: number) =>
   Number.isInteger(n) && n >= min && n <= max
 
 /** Server defaults for a config saved before the liquidity schedule existed. */
+/** Server defaults for a config saved before the inventory curve existed. */
+export const defaultCurve = (): CurveModuleConfig => ({
+  enabled: false,
+  start_below_mid: 0,
+  end_above_buy: 0,
+  shape: 2,
+})
 export const defaultLiquidity = (): LiquidityConfig => ({
   enabled: false,
   open_utc: '08:00',

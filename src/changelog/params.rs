@@ -454,6 +454,30 @@ mod tests {
     }
 
     #[test]
+    fn the_inventory_curve_is_logged_with_the_other_modules() {
+        // Its settings live under [modules], so they are recorded the way
+        // every module setting is: while modules run.
+        let on = params_of(&format!(
+            "modules_enabled = true\n{ZARU}\n[modules.curve]\nenabled = true\nend_above_buy = 1.5\n"
+        ))
+        .expect("the fixture with modules parses");
+        assert_eq!(
+            value(&on, BOT_SCOPE, "modules.curve.enabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            value(&on, BOT_SCOPE, "modules.curve.end_above_buy").as_deref(),
+            Some("1.5")
+        );
+        assert_eq!(
+            value(&on, BOT_SCOPE, "modules.curve.shape").as_deref(),
+            Some("2.0")
+        );
+        let off = params_of(ZARU).unwrap();
+        assert!(!off.keys().any(|k| k.name.starts_with("modules.curve")));
+    }
+
+    #[test]
     fn an_unchanged_config_diffs_to_nothing() {
         let a = params_of(ZARU).unwrap();
         assert!(diff(&a, &a).is_empty());

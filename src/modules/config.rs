@@ -23,6 +23,7 @@ pub struct ModulesConfig {
     pub spreads: SpreadsConfig,
     pub rebalance: RebalanceConfig,
     pub liquidity: LiquidityConfig,
+    pub curve: CurveConfig,
 }
 impl Default for ModulesConfig {
     fn default() -> Self {
@@ -32,6 +33,76 @@ impl Default for ModulesConfig {
             spreads: SpreadsConfig::default(),
             rebalance: RebalanceConfig::default(),
             liquidity: LiquidityConfig::default(),
+            curve: CurveConfig::default(),
+        }
+    }
+}
+impl ModulesConfig {
+    /// What can run on this bot's funds. Inventory balancing, dynamic spreads,
+    /// spot rebalancing and the liquidity schedule read a vault's NAV and act
+    /// through it, so on a bot that trades from its own wallet they are off
+    /// whatever the file says; only the inventory curve runs there. On a vault
+    /// every module can run.
+    pub fn runnable(&self, on_vault: bool) -> Self {
+        if on_vault {
+            return self.clone();
+        }
+        let mut wallet = self.clone();
+        wallet.inventory.enabled = false;
+        wallet.spreads.enabled = false;
+        wallet.rebalance.enabled = false;
+        wallet.liquidity.enabled = false;
+        wallet
+    }
+
+    /// The vault-only modules switched on in the file, by name: what
+    /// [`Self::runnable`] turns off on a wallet bot.
+    pub fn vault_only_enabled(&self) -> Vec<&'static str> {
+        [
+            (self.inventory.enabled, "inventory balancing"),
+            (self.spreads.enabled, "dynamic spreads"),
+            (self.rebalance.enabled, "spot rebalancing"),
+            (self.liquidity.enabled, "the liquidity schedule"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
+    }
+}
+/// The inventory curve ([`crate::pricing::curve`]): Swap quotes lean on the
+/// bot's own share of the corridor currency and each quote pays the average
+/// lean across the stretch of holdings it moves. Runs on a wallet bot and on a
+/// vault; off unless switched on. The two offsets are in the corridor's soft
+/// currency (NGN for cNGN), measured from the reference book on every quote.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CurveConfig {
+    pub enabled: bool,
+    /// Soft currency below the reference mid where the curve starts, at no
+    /// corridor holdings. Zero or more.
+    pub start_below_mid: f64,
+    /// Soft currency above the reference buy where it ends, holding nothing
+    /// else. Zero or more.
+    pub end_above_buy: f64,
+    /// Exponent on the holdings share.
+    pub shape: f64,
+}
+impl Default for CurveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_below_mid: 0.0,
+            end_above_buy: 0.0,
+            shape: crate::pricing::curve::DEFAULT_SHAPE,
+        }
+    }
+}
+impl CurveConfig {
+    pub fn params(&self) -> crate::pricing::curve::CurveParams {
+        crate::pricing::curve::CurveParams {
+            start_below_mid: self.start_below_mid,
+            end_above_buy: self.end_above_buy,
+            shape: self.shape,
         }
     }
 }
@@ -275,6 +346,18 @@ impl ModulesConfig {
             "rebalance cooldown must cover order lifetime plus 30s; lifetime must be 10..300s"
         );
         self.validate_liquidity()?;
+        let c = &self.curve;
+        ensure!(
+            [c.start_below_mid, c.end_above_buy]
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0),
+            "modules curve offsets must be zero or a positive amount of the soft currency \
+             (they only ever widen the curve)"
+        );
+        ensure!(
+            c.shape.is_finite() && (0.5..=4.0).contains(&c.shape),
+            "modules curve shape must be between 0.5 and 4"
+        );
         if let Some(d) = &r.dealer {
             crate::config::assert_feed_url(&d.url, "modules.rebalance.dealer.url")?;
             let url = url::Url::parse(&d.url)?;

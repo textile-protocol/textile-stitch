@@ -60,6 +60,12 @@ pub struct CorridorPairFrame {
     pub chain_id: u64,
     pub collateral_token: String,
     pub debt_token: String,
+    /// How much worse for the taker than the levels it routed on a firm reply
+    /// may be before the venue strikes it as `level_slack`, in bps. Read at
+    /// authentication, so a change arrives with the next session. Absent from
+    /// a venue that predates the field.
+    #[serde(default)]
+    pub level_slack_bps: Option<u32>,
 }
 
 /// A wallet slot the venue holds for this maker. For a vault maker
@@ -524,6 +530,32 @@ mod tests {
         assert!(v["issuedAt"].is_u64());
         assert_eq!(v["issuedAt"], 1_754_388_000_000u64);
         assert_eq!(v["instanceId"], "bsc-cngn");
+    }
+
+    #[test]
+    fn corridor_pairs_carry_the_level_slack_when_the_venue_sends_it() {
+        let accepted: VenueFrame = serde_json::from_str(
+            r#"{
+                "type": "sessionAccepted",
+                "makerId": "mk_test",
+                "signingAddress": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+                "heartbeatIntervalMs": 15000,
+                "heartbeatTimeoutMs": 45000,
+                "corridors": ["cngn-usdt-bsc", "older"],
+                "corridorPairs": [
+                    {"slug": "cngn-usdt-bsc", "chainId": 56, "collateralToken": "0xc1",
+                     "debtToken": "0xd1", "levelSlackBps": 8},
+                    {"slug": "older", "chainId": 56, "collateralToken": "0xc2",
+                     "debtToken": "0xd2"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let VenueFrame::SessionAccepted(a) = accepted else {
+            panic!("wrong variant");
+        };
+        assert_eq!(a.corridor_pairs[0].level_slack_bps, Some(8));
+        assert_eq!(a.corridor_pairs[1].level_slack_bps, None);
     }
 
     #[test]

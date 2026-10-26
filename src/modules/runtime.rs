@@ -107,6 +107,57 @@ pub struct Status {
     /// Absent from status files written before the liquidity schedule existed.
     #[serde(default)]
     pub liquidity: Option<super::liquidity::LiquidityStatus>,
+    /// The inventory curve's last reading and recent quotes. Absent while
+    /// the curve has never run, and from older bot releases.
+    #[serde(default)]
+    pub curve: Option<CurveStatus>,
+}
+
+/// What the inventory curve has seen, for the panel. Diagnostic only, like
+/// the decisions: never read back to price anything.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct CurveStatus {
+    pub reading: Option<CurveReading>,
+    /// Up to [`MAX_DECISIONS`] quotes, oldest first.
+    pub quotes: Vec<CurveQuote>,
+}
+
+/// One level tick's view of the curve's inputs. Prices are in soft currency
+/// per dollar (NGN per USDT), the unit the curve's knobs live in.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CurveReading {
+    pub at: u64,
+    /// Corridor currency's share of what the bot holds, 0..1, before this
+    /// side's open quotes.
+    pub share: f64,
+    /// What the bot holds, valued in the settlement currency.
+    pub value: f64,
+    pub reference_mid: f64,
+    pub half_range_bps: f64,
+    /// The venue fee on the last quote request, bps.
+    pub fee_bps: u32,
+}
+
+/// One Swap request the curve priced, or answered flat.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CurveQuote {
+    pub at: u64,
+    /// The bot buying the corridor currency (paying settlement).
+    pub bot_buys: bool,
+    /// The quote went out at the curved price, not flat.
+    pub live: bool,
+    /// The quoted size, in settlement units.
+    pub size: f64,
+    /// The share this quote started from (after this side's open quotes) and
+    /// where it leaves it. Absent when the curve could not read the share.
+    pub share_before: Option<f64>,
+    pub share_after: Option<f64>,
+    /// The curved quote against the flat one, in bps of soft currency per
+    /// dollar: positive gives more of it per dollar. Absent when it went out
+    /// flat.
+    pub lean_bps: Option<f64>,
+    /// Why it went out flat, in the bot's words.
+    pub flat_reason: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Attempt {
@@ -255,6 +306,7 @@ pub fn settling_only_config(config: &ModulesConfig) -> ModulesConfig {
     c.spreads.enabled = false;
     c.rebalance.enabled = false;
     c.liquidity.enabled = false;
+    c.curve.enabled = false;
     c
 }
 
@@ -361,6 +413,7 @@ impl Runtime {
             rebalance_status: "Waiting for fresh vault data".into(),
             next_attempt_at,
             liquidity: None,
+            curve: None,
             quote_status: Some(QuoteStatus {
                 at: crate::time::unix_now(),
                 state: QuoteState::WaitingForSession,
@@ -665,6 +718,33 @@ impl Runtime {
             cap_in_effect,
         })
     }
+    /// The curve's view of its inputs this tick. Written once a second at
+    /// most: the level loop calls this on every publish.
+    pub fn curve_reading(&self, reading: CurveReading) {
+        let mut s = self.state.lock().expect("module state poisoned");
+        let status = &mut s.status;
+        let curve = status.curve.get_or_insert_with(CurveStatus::default);
+        if curve.reading.as_ref().is_some_and(|r| r.at == reading.at) {
+            return;
+        }
+        status.at = reading.at;
+        curve.reading = Some(reading);
+        let _ = self.writer.send_replace(status.clone());
+    }
+
+    /// A quote the curve priced or answered flat.
+    pub fn curve_quote(&self, quote: CurveQuote) {
+        let mut s = self.state.lock().expect("module state poisoned");
+        let status = &mut s.status;
+        status.at = quote.at;
+        let curve = status.curve.get_or_insert_with(CurveStatus::default);
+        curve.quotes.push(quote);
+        if curve.quotes.len() > MAX_DECISIONS {
+            curve.quotes.remove(0);
+        }
+        let _ = self.writer.send_replace(status.clone());
+    }
+
     #[cfg(test)]
     pub(crate) fn status_snapshot(&self) -> Status {
         self.state

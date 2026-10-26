@@ -3,6 +3,7 @@ import type { LiquidityStatus, ModulesConfig, ModulesView } from './modules'
 import {
   corridorSpreadBps,
   corridorSpreads,
+  defaultCurve,
   defaultLiquidity,
   inventoryIllustration,
   liquiditySchedule,
@@ -55,6 +56,7 @@ const config = (): ModulesConfig => ({
     dealer: null,
   },
   liquidity: defaultLiquidity(),
+  curve: defaultCurve(),
 })
 
 describe('module parameter validation', () => {

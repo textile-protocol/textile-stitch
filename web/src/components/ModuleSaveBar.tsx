@@ -1,29 +1,32 @@
-import type { ModulesConfig } from '../modules'
-import { moduleChanges } from '../modulePresentation'
 import { Button } from './ui'
 
-/** Sticky save controls for Parameters. Quiet while the draft matches the
- * saved config; once it differs, lists each change as saved → draft so a
- * preset's changes to secondary settings are visible before saving. */
+/** One setting saving would change, as the bar lists it. */
+export type SettingChange = { label: string; from: string; to: string }
+
+/** Sticky save controls for a module's Parameters. Quiet while the draft
+ * matches the saved config; once it differs, lists each change as saved →
+ * draft so a preset's changes to secondary settings are visible before
+ * saving. The caller works out what changed; the bar only shows it. */
 export default function ModuleSaveBar({
-  saved,
-  draft,
+  dirty,
+  changes,
+  live,
   valid,
   editable,
   busy,
   onDiscard,
   onSave,
 }: {
-  saved: ModulesConfig
-  draft: ModulesConfig
+  dirty: boolean
+  changes: SettingChange[]
+  /** The draft runs live, so saving changes quotes. */
+  live: boolean
   valid: boolean
   editable: boolean
   busy: boolean
   onDiscard: () => void
   onSave: () => void
 }) {
-  const dirty = JSON.stringify(draft) !== JSON.stringify(saved)
-  const changes = dirty ? moduleChanges(saved, draft) : []
   const consequence = editable
     ? 'Saving restarts a running bot. A stopped bot stays stopped.'
     : 'Read-only access. You can explore a draft and simulate it, but cannot save.'
@@ -75,7 +78,7 @@ export default function ModuleSaveBar({
           disabled={!editable || !dirty || !valid}
           onClick={onSave}
         >
-          {draft.mode === 'live' ? 'Save & apply live' : 'Save settings'}
+          {live ? 'Save & apply live' : 'Save settings'}
         </Button>
       </div>
     </div>

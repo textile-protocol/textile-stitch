@@ -832,7 +832,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             .unwrap_or_else(|| cfg.feed.url.clone());
         feeds
             .entry(url.clone())
-            .or_insert_with(|| HttpFeed::new(&url));
+            .or_insert_with(|| HttpFeed::new(&url).with_basis(cfg.price_basis()));
+    }
+    if cfg.curve_live() {
+        info!(
+            "inventory curve is live: quoting around the feed's centre before manual adjustments"
+        );
     }
     let indexer = Indexer::from_base_url(&cfg.indexer_url);
 
@@ -1451,6 +1456,7 @@ mod tests {
             price,
             timestamp,
             degraded: false,
+            reference: None,
         }
     }
 

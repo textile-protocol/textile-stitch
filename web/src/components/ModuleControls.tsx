@@ -154,6 +154,55 @@ export function Popover({
   )
 }
 
+const modeDots = {
+  off: 'bg-faint',
+  shadow: 'bg-warning',
+  live: 'bg-success',
+} as const
+
+/** Off / Preview / Live, the run mode every module card carries in its
+ * header. `modes` supplies the labels and hover hints. */
+export function ModeSwitch<M extends keyof typeof modeDots>({
+  modes,
+  value,
+  onChange,
+}: {
+  modes: readonly { value: M; label: string; hint: string }[]
+  value: M
+  onChange: (mode: M) => void
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Module mode"
+      className="bg-active inline-flex rounded-lg p-0.5"
+    >
+      {modes.map((mode) => (
+        <label
+          key={mode.value}
+          title={mode.hint}
+          className={`inline-flex cursor-pointer items-center gap-2 rounded-md px-3 py-1.5 text-sm font-bold transition has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent ${value === mode.value ? 'bg-canvas text-ink ring-line-soft shadow-sm ring-1' : 'text-muted hover:text-ink'}`}
+        >
+          <input
+            type="radio"
+            name="module-mode"
+            value={mode.value}
+            checked={value === mode.value}
+            onChange={() => onChange(mode.value)}
+            className="sr-only"
+          />
+          <span
+            aria-hidden
+            className={`size-1.5 rounded-full ${modeDots[mode.value]}`}
+          />
+          {mode.label}
+          <span className="sr-only">: {mode.hint}</span>
+        </label>
+      ))}
+    </div>
+  )
+}
+
 export function ModuleSwitch({
   label,
   checked,
@@ -229,6 +278,8 @@ export function NumberControl({
     ? Math.min(100, Math.max(0, ((value - min) / (end - min)) * 100))
     : 0
   const shown = (n: number) => n / scale
+  // "30%" and "2×" hug the number; a word unit gets a space: "5 NGN".
+  const suffix = /^[%×]$/.test(unit) ? unit : ` ${unit}`
   const typed = (n: number) =>
     fractionDigits === undefined
       ? shown(n)
@@ -272,7 +323,7 @@ export function NumberControl({
           <input
             type="range"
             aria-label={`${label} slider`}
-            aria-valuetext={valid ? `${typed(value)}${unit}` : 'Choose a value'}
+            aria-valuetext={valid ? `${typed(value)}${suffix}` : 'Choose a value'}
             min={min}
             max={end}
             step={step}
@@ -286,11 +337,11 @@ export function NumberControl({
           <div className="text-muted flex justify-between text-xs">
             <span>
               {shown(min)}
-              {unit}
+              {suffix}
             </span>
             <span>
               {shown(end)}
-              {unit}
+              {suffix}
             </span>
           </div>
         </>

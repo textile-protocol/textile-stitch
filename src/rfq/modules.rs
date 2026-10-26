@@ -7,6 +7,21 @@ use crate::modules::{self as policy, dealer, Context, Mode};
 use crate::protocol::types::OrderParams;
 use tokio::sync::oneshot;
 
+/// The inventory curve every book carries, from `[modules.curve]`: on while
+/// modules run with the curve switched on and the mode isn't Off. Modules
+/// quote one corridor, so it is that corridor's. Funding doesn't matter here:
+/// the curve runs on a wallet bot and on a vault, and the share it reads is
+/// picked per bot by [`Engine::curve_inputs`].
+pub(super) fn book_curve(cfg: &Config) -> Option<super::responder::BookCurve> {
+    let m = &cfg.modules;
+    (cfg.modules_enabled && m.curve.enabled && m.mode != Mode::Off).then(|| {
+        super::responder::BookCurve {
+            live: cfg.curve_live(),
+            params: m.curve.params(),
+        }
+    })
+}
+
 /// Signing has no execution authority. Only the engine that owns the current
 /// reservation ledger may release the result; disconnecting drops this receiver.
 pub(super) struct PendingRebalance {
@@ -61,6 +76,45 @@ pub(super) async fn balance_loop(
 }
 
 impl Engine {
+    /// What the inventory curve reads for `book` besides the request: the
+    /// feed's reference book and the holdings the share is made of.
+    pub(super) fn curve_inputs(
+        &self,
+        book: &CorridorBook,
+        quote: &Quote,
+        now: u64,
+    ) -> super::responder::CurveInputs {
+        super::responder::CurveInputs {
+            reference: quote.reference_book(),
+            holdings: self.curve_holdings(book, now),
+        }
+    }
+
+    /// A wallet bot's share is its raw wallet balances. A vault's is its free
+    /// balances (`freeCorridor`, `freeSettlement`): NAV with staked settlement
+    /// counted, pending deposits and reserved redemption payouts left out,
+    /// the reading inventory balancing uses. Only while that reading is
+    /// fresh and the book is the vault's pair the right way round; otherwise
+    /// `None`, and the curve answers flat.
+    fn curve_holdings(&self, book: &CorridorBook, now: u64) -> Option<super::responder::Holdings> {
+        if self.vault.is_none() {
+            let wallet = self.inventory.view(now);
+            return Some(super::responder::Holdings {
+                collateral: wallet.balance(book.collateral)?,
+                debt: wallet.balance(book.debt)?,
+            });
+        }
+        let balances = (*self.modules.as_ref()?.balances.read().ok()?)?;
+        let policy = (*self.vault_policy.read().ok()?)?;
+        let fresh = balances.at <= now && now - balances.at <= policy::BALANCES_MAX_AGE_SECS;
+        (fresh && book.collateral == policy.corridor && book.debt == policy.settlement).then_some(
+            super::responder::Holdings {
+                collateral: balances.corridor,
+                debt: balances.settlement,
+            },
+        )
+    }
+
     pub(super) fn module_context(
         &self,
         book: &CorridorBook,
@@ -180,6 +234,12 @@ impl Engine {
         quote: &Quote,
         now: u64,
     ) -> Option<CorridorBook> {
+        // The policies here read a vault's NAV. On a wallet bot the runtime
+        // carries them switched off (`ModulesConfig::runnable`), and there is
+        // nothing to wait for or report.
+        if self.vault.is_none() {
+            return Some(book.clone());
+        }
         let changes_quotes = modules.config.mode == Mode::Live
             && (modules.config.inventory.enabled || modules.config.spreads.enabled);
         let Some(context) = self.module_context(book, quote, now) else {

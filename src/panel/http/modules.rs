@@ -103,6 +103,12 @@ pub struct View {
     pub corridor_spreads: CorridorSpreads,
     /// Why the liquidity schedule can't be turned on here, or `None`.
     pub liquidity_refusal: Option<String>,
+    /// The bot trades from a vault. Every module can run there; on a bot
+    /// that trades from its own wallet only the inventory curve can.
+    pub vault: bool,
+    /// The corridor's feed is read inverted (`invert=1`, a reversed pool),
+    /// where the inventory curve can't run.
+    pub feed_inverted: bool,
 }
 pub async fn show(
     State(state): State<AppState>,
@@ -128,6 +134,10 @@ pub async fn show(
     let liquidity_refusal = liquidity_refusal(&state, &cfg).await;
     Ok(Json(View {
         liquidity_refusal,
+        vault: cfg.vault.is_some(),
+        feed_inverted: crate::config::feed_inverts(
+            cfg.pools[0].feed_url.as_deref().unwrap_or(&cfg.feed.url),
+        ),
         revision: revision(&raw),
         status,
         running: bot.state.is_running(),
@@ -280,10 +290,23 @@ pub(super) fn readiness(
         return Readiness::default();
     };
     let candidate =
-        with_modules_flag(raw, true).and_then(|toml| Ok(toml::from_str::<Config>(&toml)?));
+        with_modules_flag(raw, true).and_then(|toml| Ok((toml::from_str::<Config>(&toml)?, toml)));
     Readiness {
         blockers: match candidate {
-            Ok(candidate) => blockers(&candidate, path, runtime),
+            // The structural blockers first, in their order; once those
+            // clear, whatever else the loader would refuse (the inventory
+            // curve's requirements on a wallet bot, say).
+            Ok((candidate, toml)) => {
+                let listed = blockers(&candidate, path, runtime);
+                if listed.is_empty() {
+                    Config::from_toml(&toml)
+                        .err()
+                        .map(|e| vec![format!("{e:#}")])
+                        .unwrap_or_default()
+                } else {
+                    listed
+                }
+            }
             Err(e) => vec![format!("{e:#}")],
         },
         turns_off: current
@@ -310,6 +333,11 @@ fn and_list(items: &[&str]) -> String {
 /// saved `[modules].mode` back to `shadow`: turning modules off keeps that
 /// table, so a bot last run in Live would otherwise restart straight into Live
 /// and change quotes. An absent mode already defaults to `shadow`.
+///
+/// On a bot that trades from its own wallet the inventory curve is the one
+/// module that can run, so turning modules on there turns it on too. A vault
+/// bot's modules come on as they were saved: its curve stays off until the
+/// operator picks it over inventory balancing.
 pub fn with_modules_flag(raw: &str, enabled: bool) -> anyhow::Result<String> {
     let raw = if enabled {
         crate::setup::turn_off_module_conflicts(raw)?
@@ -324,6 +352,10 @@ pub fn with_modules_flag(raw: &str, enabled: bool) -> anyhow::Result<String> {
             .and_then(toml_edit::Item::as_table_like_mut)
         {
             modules.insert("mode", toml_edit::value("shadow"));
+        }
+        if doc.get("vault").is_none() {
+            doc["modules"]["curve"]["enabled"] = toml_edit::value(true);
+            place_last(&mut doc, "modules");
         }
     }
     Ok(doc.to_string())
@@ -630,10 +662,9 @@ mod tests {
             config["inventory"]["target_bps"]
         );
     }
-    #[tokio::test]
-    async fn a_bot_modules_cannot_run_on_says_why_and_keeps_its_config() {
-        let h = harness("module-enable-blocked");
-        seed(&h, false);
+    /// The bot without a vault, as the panel creates it.
+    fn seed_wallet_bot(h: &Harness) -> std::path::PathBuf {
+        seed(h, false);
         let path = h.root.join("bot-a/stitch.toml");
         let mut doc = std::fs::read_to_string(&path)
             .unwrap()
@@ -641,12 +672,48 @@ mod tests {
             .unwrap();
         doc.remove("vault");
         std::fs::write(&path, doc.to_string()).unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
-
+        path
+    }
+    #[tokio::test]
+    async fn a_wallet_bot_turns_on_the_inventory_curve() {
+        let h = harness("module-enable-wallet");
+        let path = seed_wallet_bot(&h);
         let (_, body) = h.get("/api/bots/bot-a/settings").await;
         assert_eq!(
             Harness::parse(&body)["modulesBlockers"],
-            serde_json::json!(["modules require an OperatorVault, one corridor and enabled RFQ"])
+            serde_json::json!([])
+        );
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules/enabled",
+                serde_json::json!({"enabled": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved = Config::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.modules_enabled && saved.vault.is_none());
+        assert!(saved.modules.curve.enabled);
+        assert_eq!(saved.modules.mode, crate::modules::Mode::Shadow);
+        // The vault modules keep their file values but don't run here.
+        assert!(!saved.modules.runnable(false).inventory.enabled);
+    }
+    #[tokio::test]
+    async fn a_wallet_bot_the_curve_cannot_price_says_why_and_keeps_its_config() {
+        let h = harness("module-enable-blocked");
+        let path = seed_wallet_bot(&h);
+        let mut doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["pools"][0]["sell_offset_bps"] = toml_edit::value(3);
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let (_, body) = h.get("/api/bots/bot-a/settings").await;
+        let blockers = Harness::parse(&body)["modulesBlockers"].clone();
+        assert!(
+            blockers[0].as_str().unwrap().contains("must be equal"),
+            "{blockers}"
         );
         let (status, body) = h
             .put_json(
@@ -655,7 +722,7 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("OperatorVault"), "{body}");
+        assert!(body.contains("must be equal"), "{body}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
     #[tokio::test]
@@ -817,6 +884,7 @@ mod tests {
                 "[modules.spreads]",
                 "[modules.rebalance]",
                 "[modules.liquidity]",
+                "[modules.curve]",
             ];
             assert_eq!(
                 &headers[..before.len()],

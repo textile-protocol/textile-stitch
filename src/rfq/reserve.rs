@@ -34,6 +34,10 @@ struct Reservation {
     input_token: Option<String>,
     /// Selected/window-closed quotes cannot be released by a stale loser frame.
     exposed: bool,
+    /// The signed order's Permit2 nonce, which a fill spends. `None` for
+    /// claims that aren't one RFQ order (a rebalance) and on ledgers written
+    /// before we stored it; those hold to `release_at`.
+    nonce: Option<U256>,
 }
 
 /// On-disk shape. `input` is a decimal string so a U256 never goes through JSON
@@ -58,6 +62,10 @@ struct StoredEntry {
     /// Absent on v1 files written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     input_token: Option<String>,
+    /// Decimal string, like `input`. Absent on files written before fills
+    /// were read, and on claims without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce: Option<String>,
 }
 
 /// The reservation ledger. Owned by the responder task; no interior locking.
@@ -121,6 +129,9 @@ impl Reservations {
                         // Selection could have happened while disconnected. Loaded
                         // claims are conservatively exposed, including legacy files.
                         exposed: true,
+                        // An unreadable nonce only means the claim can't be
+                        // released early; it still holds to its deadline.
+                        nonce: entry.nonce.and_then(|n| n.parse().ok()),
                     },
                 );
             }
@@ -156,6 +167,53 @@ impl Reservations {
         deadline_secs: u64,
         input_token: Option<impl AsRef<str>>,
     ) {
+        self.insert(
+            rfq_id,
+            corridor,
+            bid,
+            input,
+            deadline_secs,
+            input_token,
+            None,
+        );
+    }
+
+    /// Same as [`Self::reserve_paying`] for one signed RFQ order, which also
+    /// records the order's Permit2 `nonce`: a fill spends it, and
+    /// [`Self::release_filled`] then lets the claim go before its deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_order(
+        &mut self,
+        rfq_id: impl Into<String>,
+        corridor: impl Into<String>,
+        bid: bool,
+        input: U256,
+        deadline_secs: u64,
+        input_token: impl AsRef<str>,
+        nonce: U256,
+    ) {
+        self.insert(
+            rfq_id,
+            corridor,
+            bid,
+            input,
+            deadline_secs,
+            Some(input_token),
+            Some(nonce),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &mut self,
+        rfq_id: impl Into<String>,
+        corridor: impl Into<String>,
+        bid: bool,
+        input: U256,
+        deadline_secs: u64,
+        input_token: Option<impl AsRef<str>>,
+        nonce: Option<U256>,
+    ) {
         self.by_rfq.insert(
             rfq_id.into(),
             Reservation {
@@ -165,6 +223,7 @@ impl Reservations {
                 release_at: deadline_secs.saturating_add(RELEASE_SKEW_SECS),
                 input_token: normalize_token_opt(input_token.map(|t| t.as_ref().to_string())),
                 exposed: false,
+                nonce,
             },
         );
         self.persist();
@@ -432,6 +491,41 @@ impl Reservations {
         false
     }
 
+    /// The nonces of the live, exposed claims a fill could spend, newest
+    /// deadline first: what the balance loop reads (see [`super::fills`]).
+    /// A claim not yet exposed is still waiting on its result, and a losing
+    /// one releases on that.
+    pub fn watched_nonces(&self, now_secs: u64) -> Vec<U256> {
+        let mut live: Vec<(u64, U256)> = self
+            .by_rfq
+            .values()
+            .filter(|r| r.exposed && r.release_at > now_secs)
+            .filter_map(|r| Some((r.release_at, r.nonce?)))
+            .collect();
+        live.sort_by_key(|claim| std::cmp::Reverse(claim.0));
+        live.into_iter().map(|(_, nonce)| nonce).collect()
+    }
+
+    /// Release every claim whose order's nonce is in `spent`: the order
+    /// filled, so its input left the balance and the signature can't execute
+    /// again. The caller must read balances no older than the block that
+    /// showed it spent (see [`super::fills`]). Returns the released ids.
+    pub fn release_filled(&mut self, spent: &[U256]) -> Vec<String> {
+        let filled: Vec<String> = self
+            .by_rfq
+            .iter()
+            .filter(|(_, r)| r.nonce.is_some_and(|n| spent.contains(&n)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &filled {
+            self.by_rfq.remove(id);
+        }
+        if !filled.is_empty() {
+            self.persist();
+        }
+        filled
+    }
+
     /// Drop a claim only when the caller has proven it cannot execute.
     /// Venue cancellation is not such proof. Duplicate releases are no-ops.
     pub fn release(&mut self, rfq_id: &str) -> bool {
@@ -511,6 +605,7 @@ impl Reservations {
                     input: r.input.to_string(),
                     release_at: r.release_at,
                     input_token: r.input_token.clone(),
+                    nonce: r.nonce.map(|n| n.to_string()),
                 })
                 .collect(),
         };
@@ -537,6 +632,121 @@ fn normalize_token_opt(raw: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_filled_order_releases_its_claim_and_nothing_else() {
+        let mut r = Reservations::new();
+        r.reserve_order(
+            "filled",
+            "c",
+            true,
+            U256::from(10u8),
+            1_000,
+            "0xusdt",
+            U256::from(1u8),
+        );
+        r.reserve_order(
+            "open",
+            "c",
+            true,
+            U256::from(20u8),
+            1_000,
+            "0xusdt",
+            U256::from(2u8),
+        );
+        // A rebalance claim carries no RFQ nonce and holds to its deadline.
+        r.reserve_paying(
+            "rebalance",
+            "c",
+            true,
+            U256::from(40u8),
+            1_000,
+            Some("0xusdt"),
+        );
+        assert_eq!(
+            r.release_filled(&[U256::from(1u8), U256::from(9u8)]),
+            vec!["filled"]
+        );
+        assert_eq!(r.reserved("c", true, 0), U256::from(60u8));
+        assert!(
+            r.release_filled(&[U256::from(1u8)]).is_empty(),
+            "a repeat is a no-op"
+        );
+    }
+
+    #[test]
+    fn only_live_exposed_claims_with_a_nonce_are_watched() {
+        let mut r = Reservations::new();
+        r.reserve_order(
+            "selected",
+            "c",
+            true,
+            U256::from(1u8),
+            2_000,
+            "0xusdt",
+            U256::from(1u8),
+        );
+        r.reserve_order(
+            "pending",
+            "c",
+            true,
+            U256::from(1u8),
+            2_000,
+            "0xusdt",
+            U256::from(2u8),
+        );
+        r.reserve_order(
+            "lapsed",
+            "c",
+            true,
+            U256::from(1u8),
+            10,
+            "0xusdt",
+            U256::from(3u8),
+        );
+        r.reserve_order(
+            "later",
+            "c",
+            false,
+            U256::from(1u8),
+            3_000,
+            "0xcngn",
+            U256::from(4u8),
+        );
+        r.reserve("legacy", "c", true, U256::from(1u8), 2_000);
+        for id in ["selected", "lapsed", "later", "legacy"] {
+            r.mark_exposed(id);
+        }
+        // Newest deadline first; a pending result, a lapsed claim and one
+        // without a nonce aren't read.
+        assert_eq!(
+            r.watched_nonces(100),
+            vec![U256::from(4u8), U256::from(1u8)]
+        );
+    }
+
+    #[test]
+    fn a_claims_nonce_survives_a_restart_and_older_files_still_load() {
+        let dir = std::env::temp_dir().join(format!("stitch-fill-nonce-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RESERVATIONS_FILE);
+        let nonce = (U256::from(1u8) << 200) | U256::from(77u8);
+        let mut r = Reservations::with_persist_path(&path);
+        r.reserve_order("q", "c", true, U256::from(5u8), 1_000, "0xusdt", nonce);
+        let restored = Reservations::load(&path, 10).unwrap();
+        // Loaded claims are exposed, so the fill is read straight away.
+        assert_eq!(restored.watched_nonces(10), vec![nonce]);
+
+        let legacy = r#"{"version":1,"entries":[{"rfq_id":"old","corridor":"c","bid":true,"input":"5","release_at":1000}]}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let restored = Reservations::load(&path, 10).unwrap();
+        assert_eq!(restored.reserved("c", true, 10), U256::from(5u8));
+        assert!(
+            restored.watched_nonces(10).is_empty(),
+            "no nonce: held to its deadline"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Settlement as debt in one pool and as collateral in another: one
     /// total covers tagged claims and untagged ones on either side, where a

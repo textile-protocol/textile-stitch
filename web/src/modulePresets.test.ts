@@ -6,6 +6,7 @@ import {
   presetConflict,
 } from './modulePresets'
 import {
+  defaultCurve,
   defaultLiquidity,
   inventoryIllustration,
   moduleParameterErrors,
@@ -43,6 +44,7 @@ const config = (): ModulesConfig => ({
     },
   },
   liquidity: defaultLiquidity(),
+  curve: defaultCurve(),
 })
 const defensive = modulePresets.find((p) => p.id === 'defensive')!
 const balanced = modulePresets.find((p) => p.id === 'balanced')!

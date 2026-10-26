@@ -988,7 +988,24 @@ fn apply_vault(doc: &mut DocumentMut, address: Option<&str>) -> Result<()> {
         "address",
         Value::from(format!("{parsed:?}")),
     );
+    keep_the_curve_on_a_vault(doc);
     Ok(())
+}
+
+/// A wallet bot running the inventory curve keeps it when it moves onto a
+/// vault, with inventory balancing written off. Both lean quotes on what the
+/// vault holds and `Config` refuses the pair; inventory balancing defaults on
+/// and never ran on the wallet, so the curve is the lean the operator chose.
+fn keep_the_curve_on_a_vault(doc: &mut DocumentMut) {
+    let curve_on = doc
+        .get("modules")
+        .and_then(|m| m.get("curve"))
+        .and_then(|c| c.get("enabled"))
+        .and_then(Item::as_bool)
+        .unwrap_or(false);
+    if curve_on {
+        doc["modules"]["inventory"]["enabled"] = toml_edit::value(false);
+    }
 }
 
 fn vault_table_mut(doc: &mut DocumentMut) -> &mut Table {
@@ -1014,6 +1031,8 @@ fn vault_table_mut(doc: &mut DocumentMut) -> &mut Table {
 /// - The taker leg is off on every pool. It fills from the signer wallet's own
 ///   funds and approvals, not the vault's, so leaving it on would trade money
 ///   the operator just moved out of the picture.
+/// - With the inventory curve on, inventory balancing is off (see
+///   [`keep_the_curve_on_a_vault`]).
 ///
 /// Validated through `Config::from_toml`, so a caller never holds a candidate
 /// the bot would refuse to load.
@@ -1046,6 +1065,7 @@ pub fn link_vault(
     for index in 0..pools {
         apply_taker(pool_mut(&mut doc, index)?, false);
     }
+    keep_the_curve_on_a_vault(&mut doc);
     let edited = doc.to_string();
     Config::from_toml(&edited).context("the config with this vault is not valid")?;
     Ok(edited)
@@ -1891,6 +1911,37 @@ mod tests {
         let err = link_vault(TEMPLATE, vault, Some(vault)).unwrap_err();
         assert!(format!("{err:#}").contains("vault itself"), "{err:#}");
         assert!(link_vault(TEMPLATE, alloy_primitives::Address::ZERO, None).is_err());
+    }
+
+    #[test]
+    fn a_wallet_bot_keeps_its_inventory_curve_when_it_links_a_vault() {
+        let vault: alloy_primitives::Address = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+            .parse()
+            .unwrap();
+        let wallet = format!(
+            "modules_enabled = true\n{TEMPLATE}\n\
+             [rfq]\nenabled = true\nurl = \"wss://x\"\nmaker_id = \"mk\"\napi_key_env = \"K\"\n\
+             validation_contract = \"0x2222222222222222222222222222222222222222\"\n\
+             [modules]\nmode = \"shadow\"\n\n[modules.curve]\nenabled = true\n"
+        );
+        let cfg = Config::from_toml(&wallet).unwrap();
+        assert!(cfg.modules.curve.enabled && cfg.modules.inventory.enabled);
+
+        let linked = link_vault(&wallet, vault, None).unwrap();
+        let cfg = Config::from_toml(&linked).unwrap();
+        assert!(cfg.modules.curve.enabled, "{linked}");
+        assert!(!cfg.modules.inventory.enabled, "{linked}");
+
+        // The Settings form's vault field takes the same path.
+        let mut doc = wallet.parse::<DocumentMut>().unwrap();
+        apply_vault(&mut doc, Some(&vault.to_string())).unwrap();
+        let cfg = Config::from_toml(&doc.to_string()).unwrap();
+        assert!(cfg.modules.curve.enabled && !cfg.modules.inventory.enabled);
+
+        // Without the curve, inventory balancing keeps its default.
+        let plain = link_vault(TEMPLATE, vault, None).unwrap();
+        let doc = plain.parse::<DocumentMut>().unwrap();
+        assert!(doc.get("modules").is_none(), "{plain}");
     }
 
     #[test]

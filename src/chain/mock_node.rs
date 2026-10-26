@@ -51,6 +51,9 @@ pub struct MockChain {
     pub code: HashMap<String, Vec<u8>>,
     /// Sleep this long before every answer — a hung node.
     pub delay: Option<Duration>,
+    /// What Multicall3's `getBlockNumber()` answers. Zero answers no data,
+    /// as a node without the view would.
+    pub block_number: u64,
 }
 
 /// Multicall3's canonical address, lowercase — where [`MockChain::with_multicall3`]
@@ -112,6 +115,12 @@ impl MockChain {
     /// answers `eth_getCode` empty there, which is a chain that has none.
     pub fn with_multicall3(self) -> Self {
         self.with_code(MULTICALL3, vec![0x60, 0x80, 0x60, 0x40])
+    }
+
+    /// The block every batch reports running at.
+    pub fn at_block(mut self, block: u64) -> Self {
+        self.block_number = block;
+        self
     }
 
     pub fn hung_for(mut self, delay: Duration) -> Self {
@@ -197,6 +206,12 @@ fn eth_call(chain: &MockChain, to: &str, data: &str) -> Vec<u8> {
     // Only where Multicall3 is deployed: anywhere else that address is empty,
     // and an empty address answers every call with no data.
     if to == MULTICALL3 && chain.code.contains_key(MULTICALL3) {
+        if selector == hex::encode(&keccak256(b"getBlockNumber()")[..4]) {
+            return match chain.block_number {
+                0 => Vec::new(),
+                block => U256::from(block).to_be_bytes::<32>().to_vec(),
+            };
+        }
         return match selector {
             AGGREGATE3 => aggregate3(chain, data),
             // getEthBalance(address)

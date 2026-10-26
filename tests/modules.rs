@@ -52,6 +52,7 @@ fn book() -> CorridorBook {
         sell_capacity_collateral: Some(RfqCapacity::Wallet),
         feed_url: "http://localhost/price".into(),
         staleness_secs: 10,
+        curve: None,
     }
 }
 #[test]

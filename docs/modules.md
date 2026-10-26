@@ -1,18 +1,18 @@
 # FX protection modules
 
-Modules are first-party Stitch policies for an OperatorVault. Enable the feature with one **root property**, before any TOML table:
+Modules are first-party Stitch policies. Most of them are for an OperatorVault; the inventory curve also runs on a bot that trades from its own wallet. Enable the feature with one **root property**, before any TOML table:
 
 ```toml
 modules_enabled = true
 ```
 
-In the panel, a bot that trades from a vault has **Corridors → Experimental → Turn on modules**. It sets the flag for you, always in Preview, even if modules were last saved in Live. It also turns off what they can't run alongside: the public ladder, the taker leg, the closer, lean and TWAP (TWAP has no switch, so its window and deviation are removed). Those stay off if you turn modules off later. What it can't fix for you (a second corridor, RFQ off, or no Textile connection) is listed before you try, and **Turn off modules** sets the flag back.
+In the panel, a bot that trades from a vault has **Corridors → Experimental → Turn on modules**; a bot that trades from its own wallet has **Turn on inventory curve** in the same place, which sets the same flag and switches the curve on. It sets the flag for you, always in Preview, even if modules were last saved in Live. It also turns off what they can't run alongside: the public ladder, the taker leg, the closer, lean and TWAP (TWAP has no switch, so its window and deviation are removed). Those stay off if you turn modules off later. What it can't fix for you (a second corridor, RFQ off, or no Textile connection) is listed before you try, and **Turn off modules** sets the flag back.
 
 It defaults to false. With the flag absent or false, there is no module runtime, decision recorder, dealer traffic, Modules tab or module API access. Existing quotes use their existing prices and sizing.
 
 Enabling the flag opens the Modules panel and starts in **shadow** mode. Shadow records proposals while preserving existing quoting. Choose Live and save to apply enabled policies. Saving uses the normal validated config/restart flow; a stopped bot stays stopped. Off stops new module actions. Previously signed orders remain reserved and executable until expiry, including after the master flag is disabled.
 
-This first release supports one RFQ corridor per bot, funded by an OperatorVault. The pool's collateral must be the vault's corridor asset and its debt the settlement asset. Disable legacy lean, TWAP, ladder, limit-taker and closer settings. Use one module decision owner per vault: exposure limits are local strategy policy, not a new on-chain invariant across independently operated bots.
+Modules quote one RFQ corridor per bot. On a vault, the pool's collateral must be the vault's corridor asset and its debt the settlement asset. Without a vault only the inventory curve runs: inventory balancing, dynamic spreads, spot rebalancing and the liquidity schedule read the vault's NAV and act through it, so on a wallet bot they stay off whatever the file says (the bot logs which at startup) and the panel doesn't show them. Disable legacy lean, TWAP, ladder, limit-taker and closer settings. Use one module decision owner per vault: exposure limits are local strategy policy, not a new on-chain invariant across independently operated bots.
 
 ## Strategies
 
@@ -60,6 +60,28 @@ order_lifetime_secs = 60
 ```
 
 Numbers are starter configuration, not recommendations for a particular currency. Measure feed quality, market depth and trading costs before selecting live parameters.
+
+## Inventory curve
+
+The inventory curve leans Swap quotes on the bot's own share of the corridor currency (cNGN first), the share it holds of everything it holds, valued at the feed's reference mid. With none, the bot sells dollars at the reference mid; full of it, it pays the reference buy, what clearing the currency on the reference market would cost. In between, the lean grows with the share raised to `shape` (2 by default: it stays near the mid through normal holdings and leans hardest near full). The two offsets widen either end, in the soft currency (NGN for cNGN), and are measured from the reference book on every quote.
+
+Each quote pays the average lean across the stretch of holdings that trade moves the bot through, not the lean where it starts, so a trade out and straight back always costs the taker the spread, at any size. Quotes already given out on one side count as moved for the next quote on that side (never the other side), so splitting a trade buys nothing. In Live the levels the venue routes on are priced off the same curve, eight rows a side, so firm replies stay inside the corridor's level slack (the venue sends each corridor's `levelSlackBps` when the session opens); a reply that would still land past it, after a large same-side quote or answered flat against curved levels, is declined rather than sent. A quote that fills stops counting as given out on the next balance read, not at its deadline: the bot reads the order's Permit2 nonce in the same Multicall3 batch as the balances, so the release and the balance that shows the trade come from one block. The full design, the attacks it closes and its decision log are in [the curve spec](cngn-quote-curve-spec.md).
+
+```toml
+[modules.curve]
+enabled = false        # on in Preview from the panel; Live with [modules].mode
+start_below_mid = 0.0  # NGN below the reference mid, holding none
+end_above_buy = 0.0    # NGN above the reference buy, holding nothing else
+shape = 2.0            # 0.5 to 4
+```
+
+**What it reads.** On a wallet bot, the wallet's raw balances (not what Permit2 lets it promise: an unapproved leg is still held). On a vault, the vault's free balances (`freeCorridor`, `freeSettlement`): NAV with staked settlement counted, pending deposits and reserved redemption payouts left out, the same reading inventory balancing uses, and only while it is under three seconds old. The reference book comes from the feed's `reference` field (`mid`, `halfRangeBps`): the raw reference mid before Textile's manual centre adjustments, and half the book's width as the median of the last 15 minutes of uncrossed books, so a crossed tick doesn't move it.
+
+**What it needs.** Equal bps spreads on both sides (one curve serves both directions; unequal or absolute spreads would reopen the round trip), a feed the right way round (collateral is the soft currency; a reversed pool's `invert=1` feed is refused), and on a vault, inventory balancing off: both lean quotes on what the vault holds, so it's one or the other. Dynamic spreads can stay on, since they add the same buffer to both sides and the curve only sees a wider all-in. Spot rebalancing and the liquidity schedule don't touch prices and run alongside. A wallet bot running the curve that connects a vault keeps the curve: the connect writes inventory balancing off, since it defaults on and never ran on the wallet.
+
+**When it answers flat.** With no reference book on the feed, a reference more than 1% from the jump-guarded print, no fresh balance reading, or nothing held, the quote goes out at the corridor spread and the bot logs why. The Overview shows how many recent quotes went out flat and Decisions lists each one with its reason.
+
+**Going Live on a Textile corridor.** Textile's served `price` carries the admin's manual centre adjustments, the hand-made version of this lean. In Live the bot reads `unadjustedPrice` instead, the same observation before those adjustments, for everything it quotes (flat fallbacks and the jump guard included), so the knobs never reach a curve bot and going Live is one switch. Preview keeps the served price, since that's what it answers at. The knobs keep moving every other consumer of the centre.
 
 ## Liquidity schedule
 
@@ -188,7 +210,7 @@ The reservation file, `modules-attempt.json` and `liquidity-pending.json` must s
 
 ## Implementation boundary
 
-`src/modules` owns versioned, plain-input strategy evaluation, configuration and observation. `src/rfq/modules.rs` translates decisions into the existing quote and reservation machinery. `src/rfq/liquidity.rs` runs the liquidity schedule: it reads the vault, applies the quote cap and sends the floor and recall transactions from the bot's wallet. `src/modules/liquidity.rs` only decides the step. Strategies do not receive a signer, RPC client, file handle or network client. The host owns execution and validates permissions, inventory, pricing and expiry.
+`src/modules` owns versioned, plain-input strategy evaluation, configuration and observation. The inventory curve's maths is `src/pricing/curve.rs` and its quote path is `decide_quote_curved` and `levels_for_curved` in `src/rfq/responder.rs`; the module host (`src/rfq/modules.rs`) measures what it reads (`curve_inputs`) and records its readings and quotes in the module status. `src/rfq/modules.rs` translates decisions into the existing quote and reservation machinery. `src/rfq/liquidity.rs` runs the liquidity schedule: it reads the vault, applies the quote cap and sends the floor and recall transactions from the bot's wallet. `src/modules/liquidity.rs` only decides the step. Strategies do not receive a signer, RPC client, file handle or network client. The host owns execution and validates permissions, inventory, pricing and expiry.
 
 Economic vault balances (`freeSettlement`, `freeCorridor`) are read every 2 seconds in the same Multicall3 batch as quote inventory, so modules cost no request of their own, Shadow mode included. A reverting module view only leaves the module balances missing; quote inventory still refreshes. On a chain without Multicall3 they refresh in a separate process-scoped loop with at most one request in flight instead, so a slow module read cannot delay ordinary quote-inventory refreshes. Missing or stale economic balances block live rebalancing and enabled quote strategies. With only rebalancing enabled, customer quotes keep their existing pricing and ordinary inventory checks.
 

@@ -174,6 +174,7 @@ mod tests {
             price,
             timestamp,
             degraded,
+            reference: None,
         }
     }
 

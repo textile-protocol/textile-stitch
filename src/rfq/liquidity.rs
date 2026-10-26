@@ -1748,6 +1748,7 @@ mod tests {
             sell_capacity_collateral: Some(RfqCapacity::Wallet),
             feed_url: String::new(),
             staleness_secs: 10,
+            curve: None,
         };
         let capped = cap_settlement_side(&book, settlement, U256::from(9u8));
         assert_eq!(

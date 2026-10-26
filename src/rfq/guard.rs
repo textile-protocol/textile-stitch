@@ -151,6 +151,7 @@ mod tests {
             price,
             timestamp,
             degraded: false,
+            reference: None,
         }
     }
 
@@ -272,6 +273,7 @@ mod tests {
             sell_capacity_collateral: None,
             feed_url: URL.into(),
             staleness_secs: 60,
+            curve: None,
         }
     }
 

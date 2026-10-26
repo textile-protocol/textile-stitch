@@ -1,3 +1,4 @@
+import { CurveQuotes } from './CurveModule'
 import ManualSales from './ManualSales'
 import { useEffect, useState } from 'react'
 import { api } from '../api'
@@ -10,7 +11,9 @@ import ScrollTabs from './ScrollTabs'
 import {
   corridorSpreads,
   liveReading,
+  moduleChanges,
   moduleParameterErrors,
+  modulesFor,
   type ModuleKey,
 } from '../modulePresentation'
 import {
@@ -78,9 +81,17 @@ export default function ModulesPanel({
 
   if (!view || !draft)
     return error ? <ErrorState error={error} /> : <Loading what="modules" />
+  // Older panels only served vault bots.
+  const vault = view.vault ?? true
   const changed = JSON.stringify(draft) !== JSON.stringify(view.config)
   const status = view.status
-  const parameterErrors = moduleParameterErrors(draft)
+  const parameterErrors = moduleParameterErrors(draft, vault)
+  // The editor opens on inventory balancing; a wallet bot has only the curve.
+  const available = modulesFor(vault)
+  const openModule =
+    selectedModule && !available.includes(selectedModule)
+      ? available[0]!
+      : selectedModule
   const valid = parameterErrors.length === 0
   // Corridor names use " / ", "→" or "↔" depending on where they were listed.
   const symbols = pairSymbols(pair)
@@ -120,7 +131,9 @@ export default function ModulesPanel({
         <div>
           <h2 className="text-xl font-bold">Modules</h2>
           <p className="text-muted text-sm">
-            Manage your holdings and quote margins.
+            {vault
+              ? 'Manage your holdings and quote margins.'
+              : 'Lean your Swap quotes on what this wallet holds.'}
           </p>
         </div>
       </div>
@@ -131,7 +144,8 @@ export default function ModulesPanel({
         items={[
           { value: 'overview', label: 'Overview' },
           { value: 'parameters', label: 'Parameters' },
-          { value: 'sales', label: 'Manual sale' },
+          // Sales move a vault's corridor currency; a wallet has none to run.
+          ...(vault ? [{ value: 'sales' as const, label: 'Manual sale' }] : []),
           { value: 'decisions', label: 'Decisions' },
         ]}
       />
@@ -170,7 +184,7 @@ export default function ModulesPanel({
           currency={currency}
           settlement={settlement}
           onConfigure={(key) => {
-            if (key === 'rebalance') {
+            if (key === 'rebalance' && vault) {
               setSection('sales')
               return
             }
@@ -186,13 +200,15 @@ export default function ModulesPanel({
             <ModuleParameters
               draft={draft}
               onChange={setDraft}
-              selected={selectedModule}
+              selected={openModule}
               onSelect={setSelectedModule}
               currency={currency}
               settlement={settlement}
               corridor={corridor}
               live={liveReading(view, now)}
               liquidityRefusal={view.liquidity_refusal ?? null}
+              view={view}
+              now={now}
             />
           </fieldset>
           {!valid && (
@@ -208,8 +224,9 @@ export default function ModulesPanel({
             </Banner>
           )}
           <ModuleSaveBar
-            saved={view.config}
-            draft={draft}
+            dirty={changed}
+            changes={changed ? moduleChanges(view.config, draft) : []}
+            live={draft.mode === 'live'}
             valid={valid}
             editable={editable}
             busy={busy}
@@ -221,7 +238,14 @@ export default function ModulesPanel({
           />
         </>
       )}
-      {section === 'decisions' && (
+      {section === 'decisions' && (draft.curve.enabled || status?.curve) && (
+        <CurveQuotes
+          quotes={status?.curve?.quotes ?? []}
+          currency={currency}
+          settlement={settlement}
+        />
+      )}
+      {section === 'decisions' && vault && (
         <Card
           title="Recent decisions"
           action={

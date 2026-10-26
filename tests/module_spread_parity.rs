@@ -140,6 +140,7 @@ fn book(buy: Option<Spread>, sell: Option<Spread>) -> CorridorBook {
         sell_capacity_collateral: Some(RfqCapacity::Wallet),
         feed_url: "http://localhost/price".into(),
         staleness_secs: 10,
+        curve: None,
     }
 }
 
