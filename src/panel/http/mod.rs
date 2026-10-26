@@ -30,6 +30,8 @@ pub(crate) use crate::chain::mock_node as mock_chain;
 mod manual_sales;
 mod modules;
 pub mod origin;
+#[cfg(test)]
+mod password_migration_tests;
 mod perps;
 pub mod session;
 pub mod settings;
@@ -64,6 +66,9 @@ pub struct AppState {
     /// do it should still serve every other route.
     pub files: Option<Arc<dyn ContainerFiles>>,
     pub sessions: Arc<Sessions>,
+    /// UI migration takes effect immediately; the mounted file restores it on boot.
+    pub migrated_password: Arc<std::sync::RwLock<Option<String>>>,
+    pub password_setup_lock: Arc<tokio::sync::Mutex<()>>,
     /// Exclusive claims on operator wallets, held across any action that puts a
     /// signer on one — an approval run, a bot launch, a settings restart. One lock
     /// per wallet, so the paths can't slip past each other's checks. See
@@ -99,6 +104,8 @@ impl AppState {
             docker,
             files: None,
             sessions: Arc::new(Sessions::new()),
+            migrated_password: Arc::new(std::sync::RwLock::new(None)),
+            password_setup_lock: Arc::new(tokio::sync::Mutex::new(())),
             wallet_locks: Arc::new(logs::WalletLocks::new()),
             login_permits: Arc::new(tokio::sync::Semaphore::new(
                 auth::MAX_CONCURRENT_VERIFICATIONS,
@@ -106,6 +113,19 @@ impl AppState {
             config_locks: Arc::new(settings::ConfigLocks::new()),
             chain_constants: Arc::new(chain_reads::ChainConstants::default()),
         }
+    }
+
+    pub fn auth_config(&self) -> PanelConfig {
+        let mut cfg = (*self.cfg).clone();
+        if let Some(hash) = &*self
+            .migrated_password
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            cfg.auth = super::AuthMode::Password { hash: hash.clone() };
+            cfg.trust_identity_header = false;
+        }
+        cfg
     }
 
     pub fn with_container_files(mut self, files: Arc<dyn ContainerFiles>) -> Self {
@@ -286,6 +306,7 @@ fn public_routes() -> Router<AppState> {
 
 fn protected_routes(state: &AppState) -> Router<AppState> {
     Router::new()
+        .route("/api/panel/password", post(session::set_password))
         .route("/api/corridors", get(wizard::corridors))
         .route("/api/feed/mid", get(wizard::feed_mid))
         .route("/api/wallets/generate", post(wizard::generate_wallet))
@@ -420,7 +441,7 @@ pub fn identify(state: &AppState, req: &Request) -> Result<Identity, AuthError> 
     let token =
         header(header::COOKIE.as_str()).and_then(|c| auth::cookie_value(&c, SESSION_COOKIE));
     auth::authorize(
-        &state.cfg,
+        &state.auth_config(),
         &state.sessions,
         header(IDENTITY_HEADER).as_deref(),
         token.as_deref(),

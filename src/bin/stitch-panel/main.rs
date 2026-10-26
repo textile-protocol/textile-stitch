@@ -49,7 +49,11 @@ USAGE:
                                  argon2 hash, for STITCH_PANEL_PASSWORD_HASH.
                                  Reads stdin instead when piped, for scripts.
 
-The panel is configured entirely from the environment:
+The panel is configured from the environment. Legacy operators can set a password
+in the UI. That saved password in STITCH_PANEL_BOTS_DIR takes precedence over
+environment authentication and disables identity-header login on every startup.
+
+Environment options:
 
     STITCH_PANEL_RUNTIME            docker (default) or process (desktop, no Docker)
     STITCH_PANEL_BIND               listen address        (default 127.0.0.1:8420)
@@ -67,8 +71,8 @@ The panel is configured entirely from the environment:
     STITCH_PANEL_IDENTITY_PROXY_ONLY=1   attest that an authenticated reverse proxy
                                          is the sole peer on the listener (sets and
                                          strips the identity header). Required with
-                                         TRUST_IDENTITY_HEADER; set by the shipped
-                                         Tailscale sidecar compose file.
+                                         TRUST_IDENTITY_HEADER. Only opt in for
+                                         a legacy or custom proxy deployment.
 ";
 
 /// Print an argon2 hash for a password typed at the terminal.

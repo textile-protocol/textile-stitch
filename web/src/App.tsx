@@ -4,7 +4,8 @@ import { ApiError, api, setUnauthorizedHandler } from './api'
 import OverflowMenu from './components/OverflowMenu'
 import PanelUpdateStatus, { usePanelUpdate } from './components/PanelUpdateStatus'
 import TextileIcon from './components/TextileIcon'
-import { Button, Loading } from './components/ui'
+import PanelPasswordSetup from './components/PanelPasswordSetup'
+import { Banner, Button, Loading } from './components/ui'
 import Login from './pages/Login'
 import Fleet from './pages/Fleet'
 import AddBot from './pages/AddBot'
@@ -26,6 +27,7 @@ const UPDATES_POLL_MS = 5 * 60 * 1000
 export default function App() {
   const [session, setSession] = useState<SessionInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [passwordSaved, setPasswordSaved] = useState(false)
   // Owned here, not in the header, so the login screen is themed too and there is
   // only ever one source of truth for `data-theme`.
   const [theme, setTheme] = useTheme()
@@ -79,6 +81,20 @@ export default function App() {
         onSignedOut={() => void refresh()}
       />
       <main className="mx-auto max-w-5xl px-6 py-8">
+        {session.passwordSetupRequired && (
+          <PanelPasswordSetup onSecured={(secured) => {
+            setSession(secured)
+            setPasswordSaved(true)
+          }} />
+        )}
+        {passwordSaved && (
+          <div className="mb-6" role="status">
+            <Banner tone="success" onDismiss={() => setPasswordSaved(false)}>
+              Panel password saved. Password sign-in is now required for all operators.
+              Your bots are still running.
+            </Banner>
+          </div>
+        )}
         <Routes>
           <Route path="/" element={<Fleet />} />
           <Route path="/add" element={<AddBot rfqDefault={session.rfqDefault} />} />

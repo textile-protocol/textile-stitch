@@ -217,6 +217,8 @@ export const api = {
     }),
 
   session: () => request<SessionInfo>('/api/session'),
+  setPanelPassword: (password: string, confirmation: string) =>
+    request<SessionInfo>('/api/panel/password', json({ password, confirmation })),
   login: (password: string) =>
     request<SessionInfo>('/api/login', json({ password })),
   logout: () => request<unknown>('/api/logout', { method: 'POST' }),

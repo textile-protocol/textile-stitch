@@ -12,7 +12,7 @@
 #   curl -fsSL "https://github.com/textile-protocol/textile-stitch/releases/download/${TAG}/install-panel.sh.sha256" -o install-panel.sh.sha256
 #   sha256sum -c install-panel.sh.sha256
 #   STITCH_REF="$TAG" PANEL_IMAGE="ghcr.io/textile-protocol/textile-stitch-panel:sha-<commit>" \
-#     STITCH_REQUIRE_PINNED=1 PANEL_MODE=server TS_AUTHKEY=… PANEL_USERS=… \
+#     STITCH_REQUIRE_PINNED=1 PANEL_MODE=server TS_AUTHKEY=… PANEL_PASSWORD=… \
 #     sh install-panel.sh
 #
 # Quick path:
@@ -24,7 +24,7 @@
 #   - server         → Tailscale sidecar, no host port published
 #
 # Non-interactive: set PANEL_MODE=local|server plus the mode's credentials
-# (local: PANEL_PASSWORD; server: TS_AUTHKEY and PANEL_USERS). Optionally set
+# (both: PANEL_PASSWORD; server also needs TS_AUTHKEY). Optionally set
 # PANEL_BOTS_DIR, PANEL_DIR, PANEL_IMAGE, STITCH_REF, STITCH_COMPOSE_SHA256,
 # STITCH_REQUIRE_PINNED.
 
@@ -404,7 +404,7 @@ env_file="$PANEL_DIR/.env"
 compose_mode=''
 if [ -f "$env_file" ]; then
   step 'Existing install found'
-  say "$env_file already exists, so its settings are kept as they are."
+  say "$env_file already exists; its settings are reused."
   say 'Delete it first if you want to be asked again.'
   reuse_env=yes
   # Prefer PANEL_MODE from .env; fall back to inferring from TS_AUTHKEY.
@@ -491,25 +491,13 @@ if [ "$reuse_env" = no ] && [ "$compose_mode" = server ]; then
     say 'this host, because reaching the panel means reaching the Docker socket.'
     say ''
     say 'Mint a key at https://login.tailscale.com/admin/settings/keys —'
-    say 'reusable, and NOT ephemeral, so the panel keeps its identity across restarts.'
+    say 'non-ephemeral, with a short expiration. The state volume keeps the node identity.'
   fi
   TS_AUTHKEY="$(need "${TS_AUTHKEY:-}" 'Tailscale auth key (not shown)' TS_AUTHKEY secret)"
   [ -n "$TS_AUTHKEY" ] || die 'a Tailscale auth key is required'
   case "$TS_AUTHKEY" in
     tskey-*) ;;
     *) warn "that does not look like a Tailscale auth key (they start with 'tskey-'). Continuing anyway." ;;
-  esac
-
-  if [ -z "${PANEL_USERS:-}" ]; then
-    say ''
-    say 'Who may drive the panel: the tailnet login(s) from the Users page of your'
-    say 'Tailscale console. Comma-separate for a team. Use the login, not a nickname.'
-  fi
-  PANEL_USERS="$(need "${PANEL_USERS:-}" 'Tailnet login(s), comma-separated' PANEL_USERS)"
-  [ -n "$PANEL_USERS" ] || die 'at least one tailnet login is required'
-  case "$PANEL_USERS" in
-    *@*) ;;
-    *) warn "'$PANEL_USERS' has no @ in it, so it may be a nickname rather than a login. The panel will reject anything else." ;;
   esac
 fi
 
@@ -597,7 +585,9 @@ trap - EXIT
 if [ "$compose_mode" = server ]; then
   mkdir -p "$PANEL_DIR/deploy"
   fetch "$REPO_RAW/$REF/deploy/panel-serve.json" "$PANEL_DIR/deploy/panel-serve.json"
-  say 'Compose file and tailscale serve config in place.'
+  fetch "$REPO_RAW/$REF/deploy/panel-tailscale.sh" "$PANEL_DIR/deploy/panel-tailscale.sh"
+  chmod 755 "$PANEL_DIR/deploy/panel-tailscale.sh"
+  say 'Compose file, Tailscale CLI shim and serve config in place.'
 else
   say 'Local compose file in place.'
 fi
@@ -627,7 +617,6 @@ if [ "$reuse_env" = no ]; then
     printf 'STITCH_REF=%s\n' "$REF"
     if [ "$compose_mode" = server ]; then
       printf 'TS_AUTHKEY=%s\n' "$TS_AUTHKEY"
-      printf 'PANEL_USERS=%s\n' "$PANEL_USERS"
     fi
   } >"$tmp_env"
   mv "$tmp_env" "$env_file"
@@ -685,51 +674,40 @@ if ! docker pull "$PANEL_IMAGE" >/dev/null; then
 fi
 say 'Pulled.'
 
-if [ "$compose_mode" = local ]; then
-  # Password is required: it's the only way in.
-  if ! grep -q '^PANEL_PASSWORD_HASH=' "$env_file" 2>/dev/null; then
-    step 'Panel password'
-    if [ -z "${PANEL_PASSWORD:-}" ]; then
-      say 'This install is loopback-only. You log in with a password you choose now.'
-    fi
-    PANEL_PASSWORD="$(need_password "${PANEL_PASSWORD:-}" 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
-    add_password "$PANEL_PASSWORD" 'panel password'
-  elif [ -n "${PANEL_PASSWORD:-}" ]; then
-    step 'Updating the panel password'
-    add_password "$PANEL_PASSWORD" 'panel password'
+# Fresh installs require a password. Existing identity-only server installs keep
+# access and migrate in the UI; do not turn an image/config upgrade into a lockout.
+_saved_hash="$(env_file_get "$env_file" PANEL_PASSWORD_HASH)"
+_saved_users="$(env_file_get "$env_file" PANEL_USERS)"
+_legacy_auth="$(env_file_get "$env_file" PANEL_LEGACY_IDENTITY_AUTH)"
+_saved_bots_dir="$(env_file_get "$env_file" PANEL_BOTS_DIR)"
+_credential_root="${_saved_bots_dir:-$PANEL_BOTS_DIR}"
+if [ -n "${PANEL_PASSWORD:-}" ]; then
+  if [ -e "$_credential_root/.stitch-panel-password.json" ]; then
+    die 'this panel has a UI password; PANEL_PASSWORD cannot replace it. See the password recovery steps in docs/install-panel.md.'
   fi
-else
-  # Optional fallback for tagged Tailscale nodes / Funnel edge cases.
-  if [ -n "${PANEL_PASSWORD:-}" ]; then
-    step 'Adding the password fallback'
-    add_password "$PANEL_PASSWORD" 'password fallback'
-  elif [ "$reuse_env" = no ] && have_tty; then
-    # Retry on short / mismatched passwords. .env is already written by here, so
-    # dying would leave reuse_env=yes on the next run and skip this prompt forever.
-    step 'Password fallback (optional)'
-    say 'Useful if you browse from a tagged Tailscale node, which gets no identity'
-    say 'header. Press Enter to skip.'
-    while :; do
-      _pw="$(ask_secret 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
-      if [ -z "$_pw" ]; then
-        say 'Skipped.'
-        break
-      fi
-      _len="$(password_chars "$_pw")"
-      if [ "$_len" -lt 12 ]; then
-        warn "need at least 12 characters (got $_len). Try again."
-        continue
-      fi
-      _again="$(ask_secret 'Again' PANEL_PASSWORD)"
-      if [ "$_pw" != "$_again" ]; then
-        warn "those didn't match. Try again."
-        continue
-      fi
-      add_password "$_pw" 'password fallback'
-      break
-    done
+  step 'Setting the panel password'
+  add_password "$PANEL_PASSWORD" 'panel password'
+elif [ "$reuse_env" = yes ] && [ -e "$_credential_root/.stitch-panel-password.json" ]; then
+  say 'Keeping the password saved in the panel UI.'
+elif [ "$reuse_env" = yes ] && [ "$compose_mode" = server ] && [ -n "$_saved_users" ] && { [ -z "$_legacy_auth" ] || [ "$_legacy_auth" = 1 ]; }; then
+  if ! grep -q '^PANEL_LEGACY_IDENTITY_AUTH=' "$env_file"; then
+    printf 'PANEL_LEGACY_IDENTITY_AUTH=1\n' >>"$env_file"
   fi
+  say 'Existing Tailscale login is preserved. Open the panel and choose Set panel password.'
+elif [ -z "$_saved_hash" ]; then
+  step 'Panel password'
+  PANEL_PASSWORD="$(need_password "${PANEL_PASSWORD:-}" 'Panel password (12+ characters, not shown)' PANEL_PASSWORD)"
+  add_password "$PANEL_PASSWORD" 'panel password'
 fi
+# Explicitly choosing an env password also disables the legacy proxy bypass.
+# A password already saved in the panel UI takes precedence over env settings.
+if [ -n "${PANEL_PASSWORD:-}" ] && grep -q '^PANEL_LEGACY_IDENTITY_AUTH=' "$env_file"; then
+  tmp_env="$PANEL_DIR/.env.tmp.$$"
+  sed 's/^PANEL_LEGACY_IDENTITY_AUTH=.*/PANEL_LEGACY_IDENTITY_AUTH=0/' "$env_file" >"$tmp_env"
+  mv "$tmp_env" "$env_file"
+  chmod 600 "$env_file"
+fi
+unset PANEL_PASSWORD
 
 # ---------------------------------------------------------------------- up ----
 step 'Starting the panel'
@@ -754,6 +732,7 @@ else
     say 'Open https://stitch-panel.<your-tailnet>.ts.net'
     say '(run `tailscale status` on any tailnet device if you are not sure of the name)'
   fi
+  say 'Open the panel to sign in or set a password. Restrict tailnet TCP 443 access to your operators.'
 fi
 say ''
 say 'In the web UI: Add corridor, pick one, paste your operator wallet key,'

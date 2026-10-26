@@ -22,6 +22,7 @@ pub mod auth;
 pub mod compose;
 pub mod config;
 pub mod corridors;
+pub mod credentials;
 pub mod desktop;
 pub mod docker;
 pub mod http;

@@ -121,10 +121,15 @@ Install procedure:
 
      PANEL_MODE=server sh "$INSTALLER_PATH"
 
-   The installer prompts for a Tailscale auth key (reusable, not ephemeral) and
-   the tailnet login(s) allowed in. Mint keys at
-   https://login.tailscale.com/admin/settings/keys. Use the login from the
-   Tailscale Users page, not a nickname.
+   The installer prompts for a non-ephemeral Tailscale auth key and a panel
+   password (12+ characters). Mint keys at
+   https://login.tailscale.com/admin/settings/keys. Collect secrets through a
+   local hidden prompt, never in chat. Restrict the panel node’s TCP 443 to
+   operators in the tailnet policy. Fresh installs require a password even over
+   Tailscale. Existing server installs with a saved PANEL_USERS allowlist keep
+   their identity login during migration. Open their panel and guide them to
+   Set panel password in the persistent warning; no terminal password step is
+   needed. Saving it disables identity-only login without restarting bots.
 
 4. Remove the temp installer file when finished (`rm -f "$INSTALLER_PATH"` or
    `Remove-Item $InstallerPath`).
@@ -133,7 +138,7 @@ Install procedure:
    - Local: http://127.0.0.1:8420 (log in with the panel password).
    - Server: the HTTPS URL the installer printed
      (https://stitch-panel.<tailnet>.ts.net), or discover it from the installer
-     output / `tailscale status`.
+     output / `tailscale status`. Log in with the panel password.
    Prefer opening my browser for me when you have a tool for that
    (`open`, `xdg-open`, or equivalent).
 

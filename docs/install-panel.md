@@ -85,7 +85,7 @@ sha256sum -c install-panel.sh.sha256 2>/dev/null || shasum -a 256 -c install-pan
 STITCH_REF="$TAG" \
   PANEL_IMAGE="ghcr.io/textile-protocol/textile-stitch-panel:sha-<commit>" \
   STITCH_REQUIRE_PINNED=1 \
-  PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
+  PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_PASSWORD='choose-a-long-password' \
   sh install-panel.sh
 ```
 
@@ -130,7 +130,7 @@ PANEL_MODE=local PANEL_PASSWORD='choose-a-long-password' \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
 
 # Linux server — Tailscale (not the usual path on a Mac or Windows PC)
-PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_USERS=you@example.com \
+PANEL_MODE=server TS_AUTHKEY=tskey-auth-… PANEL_PASSWORD='choose-a-long-password' \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
 ```
 
@@ -144,9 +144,8 @@ irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/insta
 | Variable | Default | What |
 |----------|---------|------|
 | `PANEL_MODE` | asked | `local` (password) or `server` (Tailscale). |
-| `PANEL_PASSWORD` | asked on local | Required for local; optional fallback on server. |
-| `TS_AUTHKEY` | asked on server | Tailscale auth key. Reusable, not ephemeral. |
-| `PANEL_USERS` | asked on server | Comma-separated tailnet logins allowed in. |
+| `PANEL_PASSWORD` | asked | Required for fresh installs. Existing identity-login servers can set it in the UI. |
+| `TS_AUTHKEY` | asked on server | Non-ephemeral Tailscale enrollment key; use a short expiration. |
 | `PANEL_BOTS_DIR` | `~/stitch-bots` / `/srv/stitch/bots` | Where bot configs live on the host. |
 | `PANEL_DIR` | `~/stitch-panel` | Where the compose file and `.env` go. |
 | `PANEL_IMAGE` | published `:latest` | Pin a `sha-*` tag or digest in production. |
@@ -154,120 +153,157 @@ irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/insta
 | `STITCH_COMPOSE_SHA256` | unset | Expected SHA-256 of `docker-compose.panel.yml` (server/`install-panel.sh` only; skipped for local compose). |
 | `STITCH_REQUIRE_PINNED` | off | Require explicit immutable `STITCH_REF` (`vX.Y.Z` / 40-char SHA) and `PANEL_IMAGE` (`sha-*` / `@sha256:…`). |
 
-Re-running it is safe: an existing `.env` is left alone, so it doubles as
-"pull the current image and bring Stitch back up".
+Re-running it keeps existing settings and reuses the password hash. An older
+server install with a saved `PANEL_USERS` allowlist keeps its existing login and
+shows **Set panel password** in the UI after the upgrade. No terminal password
+step is required. See the [migration path](#upgrading-an-older-server-install).
+`PANEL_PASSWORD` can replace an environment hash; a password saved in the UI
+takes precedence. See recovery below if that password is lost.
 
 **The rest of this page is the manual route.** You only need it to change
 something the installer doesn't ask about — your own reverse proxy, building
 from source, or wiring the compose file into an existing stack.
 
-## Manual: Tailscale-only
+## Manual: Tailscale and password
 
-What the installer sets up, by hand. Two containers: a Tailscale sidecar that
-joins your tailnet and terminates TLS, and the panel sharing that sidecar's
-network namespace. The panel listens on `127.0.0.1:8420` inside the namespace,
-and `tailscale serve` proxies to it. No port is published on the host at all.
+Two containers: a Tailscale sidecar joins your tailnet and terminates TLS, and the
+panel shares its network namespace. The panel listens on `127.0.0.1:8420` inside
+that namespace. No host port is published. Tailscale SSH is explicitly disabled;
+this sidecar only needs to serve HTTPS.
 
-Everything below runs from a checkout of this repo (or the `textile-stitch`
-mirror) on the Docker host.
+Everything below runs from a checkout on the Docker host.
 
-1. **Mint an auth key.** Tailscale admin console → Settings → Keys → Generate
-   auth key. Reusable, not ephemeral (the panel should keep its identity across
-   restarts).
+1. **Restrict tailnet access.** Limit the panel node's TCP 443 to your operator
+   group in the Tailscale policy. Remove any broader rule that also allows access:
+   Tailscale grants are additive. Do not enable Funnel, subnet routing or SSH on
+   this node. Assign a tag through the admin console or the enrollment key after
+   defining its owners in your tailnet policy.
 
-2. **Write `.env`** next to `docker-compose.panel.yml`:
+2. **Generate a password hash.** Build the panel image and run its hashing command
+   before starting a fresh stack:
+
+   ```bash
+   docker build -f Dockerfile.panel -t stitch-panel .
+   docker run --rm -it stitch-panel hash-password
+   ```
+
+   It prompts twice with no echo and prints an argon2id hash. The password must
+   have at least 12 characters. Keep it in your password manager.
+
+3. **Write `.env`** next to `docker-compose.panel.yml` and keep it owner-only:
 
    ```bash
    TS_AUTHKEY=tskey-auth-...
-   PANEL_USERS=you@example.com
+   PANEL_PASSWORD_HASH='$argon2id$v=19$m=19456,t=2,p=1$...'
    PANEL_BOTS_DIR=/srv/stitch/bots
    ```
 
-   `PANEL_USERS` is the allowlist of tailnet logins. Comma-separate for a team.
-   Use the login you see in the Tailscale console under Users, not a nickname.
+   Mint the non-ephemeral auth key in the Tailscale admin console. Use a short
+   expiration for enrollment credentials. Quote the hash: it contains `$`.
+   Run `chmod 600 .env`.
 
-3. **Create the bots root and start it.**
+4. **Start it and sign in.**
 
    ```bash
    sudo mkdir -p /srv/stitch/bots
    docker compose -f docker-compose.panel.yml up -d --build
    ```
 
-   First build takes a few minutes: it compiles the Rust binary and the frontend.
-
-4. **Open it** at `https://stitch-panel.<your-tailnet>.ts.net` from any device on
-   your tailnet. The Tailscale MagicDNS cert means no browser warning.
-
-`docker compose -f docker-compose.panel.yml logs panel` shows what it decided at
-startup: the bind address, how many bots it found, and which auth methods are
-live.
+   Open `https://stitch-panel.<your-tailnet>.ts.net` from an allowed device and
+   log in with the panel password.
 
 ### How the login works
 
-`tailscale serve` authenticates the request at the tailnet level and adds a
-`Tailscale-User-Login` header. The panel checks that header against
-`PANEL_USERS`. There is no password to manage and no session to expire.
+Tailscale policy controls who can connect. Fresh installs and migrated panels
+separately require a password session and ignore `Tailscale-User-Login`, even
+when Serve supplies it.
+A forged proxy identity alone cannot grant control of Docker. Tagged client
+nodes also use the password login, subject to the same network policy.
 
-That header is only an identity because `tailscale serve` is the one thing that
-can reach the listener: the panel shares the sidecar's network namespace, so its
-`127.0.0.1` is the sidecar's, not the host's. `docker-compose.panel.yml` sets both
-`STITCH_PANEL_TRUST_IDENTITY_HEADER=1` and `STITCH_PANEL_IDENTITY_PROXY_ONLY=1`,
-and the panel believes the header only when both are set.
+Sessions live in memory for 12 hours; restarting the panel signs everyone out.
+State-changing requests and followed log streams from another site are refused.
 
-It won't work it out from the bind address, because the address can't tell the two
-deployments apart. Run the same binary directly on the host and `127.0.0.1` is the
-*host's* loopback — every local user, and every container on the host network, can
-dial it and send `Tailscale-User-Login: you@example.com`. That's the Docker socket
-handed to an account that had nothing. Binding straight to your tailnet address is
-the same problem one layer out: peers reach that listener directly, with no proxy
-in between to overwrite what they sent.
+Custom deployments can still opt into identity-header authentication with
+`STITCH_PANEL_TAILNET_USERS` and both trust flags. That makes the proxy part of
+the authentication boundary. Adding a password to that mode is an **alternative**
+credential, not a second required check. Keep both trust flags off to require a
+password independently of the proxy.
 
-So set both variables only where an authenticated proxy is genuinely the only
-route in. TRUST alone is refused at startup — the second flag is your attestation
-that the proxy-only property holds. Everywhere else, use the password fallback.
-(A routable bind is separately refused unless you also set
-`STITCH_PANEL_ALLOW_INSECURE_BIND=1`.)
+### Upgrading an older server install
 
-Two cases where the header doesn't arrive:
+Existing operators can migrate entirely in the browser:
 
-- **You browse from a tagged node** (a CI box, a tagged server). Tailscale
-  deliberately omits identity headers for tagged devices.
-- **Funnel.** Public internet traffic gets no identity headers. Don't put this
-  behind Funnel.
+1. Click **Update panel** in the existing panel. Image updates preserve the
+   current login settings and mounted fleet directory. Existing operators retain
+   access; bot containers keep running.
+2. The updated panel shows a persistent **Secure your panel with a password**
+   warning above the fleet and bot pages. Click **Set panel password** and enter
+   a password twice (at least 12 characters). **Not now** closes the form but
+   leaves the warning visible. There is no automatic migration deadline.
+3. Click **Save password**. A success message confirms password sign-in is now
+   required. The submitting operator stays signed in. Other sessions are revoked,
+   and all operators need the shared password on their next sign-in. Save it in
+   your team's password manager.
 
-For either, add the password fallback below.
+Only an already authenticated operator can set the password. There is no
+anonymous setup page. Merely having a fallback password alongside identity login
+still shows the warning, because the header remains sufficient until migration.
 
-### Password fallback
+The panel stores only an Argon2id hash in
+`PANEL_BOTS_DIR/.stitch-panel-password.json`, with owner-only permissions. This
+file overrides old environment authentication immediately and on subsequent
+starts, including image updates. Keep it when backing up or moving the fleet
+root. Invalid or unreadable saved credentials stop startup; they do not restore
+identity login. Bot wallets and running containers are unchanged.
 
-Useful as a backup, and required if you're not fronting the panel with
-`tailscale serve`.
+Re-running the updated installer is another upgrade path. It recognizes an
+existing server `.env` with `PANEL_USERS`, preserves that allowlist, and sets
+`PANEL_LEGACY_IDENTITY_AUTH=1` so the UI can offer the same migration. This marker
+has no effect once a UI password is saved. Fresh installs still require a
+password. For a manual Compose upgrade before migration, retain `PANEL_USERS`
+and explicitly set `PANEL_LEGACY_IDENTITY_AUTH=1` in `.env`; after migration it
+can be set to `0`.
+
+**Image updates and deployment settings are separate.** The UI's Update button
+updates the panel image, not the sidecar or Compose file. Installing the updated
+Compose file keeps `TS_AUTH_ONCE=true`, so an enrolled node reuses its persisted
+identity even after the enrollment key expires. First enrollment uses
+`TS_EXTRA_ARGS=--reset --ssh=false`. On every boot, the bundled
+`deploy/panel-tailscale.sh` CLI shim adds SSH/routing restrictions to
+containerboot's `tailscale set` call before Serve is configured. This disables
+SSH, route acceptance/advertisement, exit-node use/advertisement and app-connector
+advertisement without logging in again. If that command fails, sidecar startup
+fails too. Manual upgrades must copy the shim alongside the Compose and Serve
+files; the installer downloads it automatically. Arbitrary old `TS_EXTRA_ARGS`
+values are ignored; assign tags through the admin console or enrollment key
+instead. Restrict the panel's TCP 443 to operators in tailnet policy, removing
+broader allow rules too. A revoked or expired node identity still needs a valid
+enrollment key; this is separate from expiration of the original enrollment key.
+
+**Recovery and rollback:** if the shared UI password is lost, a host administrator
+must stop the panel, configure a new `PANEL_PASSWORD_HASH`, disable both identity
+trust flags (or set `PANEL_LEGACY_IDENTITY_AUTH=0` for this Compose file), remove
+only `.stitch-panel-password.json`, then restart. Never delete the saved file
+while the panel runs. An image predating this migration ignores the saved file
+and can restore identity login from its old environment. Disable both trust flags
+and supply an environment password hash before downgrading.
+
+Verify the running configuration without printing the environment or credentials:
 
 ```bash
-docker compose -f docker-compose.panel.yml run --rm panel hash-password
+docker compose -f docker-compose.panel.yml exec tailscale tailscale version
+docker compose -f docker-compose.panel.yml exec tailscale tailscale debug prefs | python3 -c 'import json,sys; print("RunSSH:", json.load(sys.stdin).get("RunSSH"))'
+docker compose -f docker-compose.panel.yml exec tailscale tailscale serve status
+curl -sS 'https://stitch-panel.<your-tailnet>.ts.net/api/session'
 ```
 
-It prompts twice with no echo and prints an argon2id hash. If you're scripting
-this, pipe the password in instead and it reads one line from stdin without
-prompting (`... run --rm -T panel hash-password < pw.txt`) — the hash goes to
-stdout, everything else to stderr.
-
-Put it in `.env` (quote it — it contains `$`):
-
-```bash
-PANEL_PASSWORD_HASH='$argon2id$v=19$m=19456,t=2,p=1$...'
-```
-
-Then `docker compose -f docker-compose.panel.yml up -d panel`. With both set,
-either credential works. Sessions live in memory for 12 hours, and a panel
-restart signs everyone out. Either way you land back on the login screen the next
-time the tab talks to the panel — no stale UI to reload by hand.
-
-State-changing requests from another site are refused even when your credential is
-valid, which matters for the identity-header setup: a header is sent on
-cross-site requests where a cookie wouldn't be. Followed log streams get the same
-treatment — a cross-site page can't read them, but it can open them and hold a
-Docker connection forever. Browsers get this for free. `curl` and scripts are
-unaffected.
+Expect `RunSSH: False`, one HTTPS proxy to `127.0.0.1:8420`, and an unauthenticated
+session response after migration with `passwordLogin: true`, `tailnetLogin: false`
+and `passwordSetupRequired: false`. Before migration the last two are true. An
+allowlisted `Tailscale-User-Login` sent without a session after migration must get a 401 on
+`/api/bots`. Confirm an excluded device cannot connect at all using your tailnet
+policy tests and a real excluded device. Repository defaults do not prove that
+an existing deployment or its policy has changed.
 
 ## Without Tailscale
 
@@ -540,16 +576,17 @@ Everything is read from the environment at startup. Nothing is stored.
 | `STITCH_PANEL_DOCKER_SOCKET` | `/var/run/docker.sock` | Docker Engine API socket. |
 | `STITCH_PANEL_BOT_IMAGE` | `ghcr.io/…/textile-stitch:latest` | Image new bots run. Pin a `sha-*` tag in production. |
 | `STITCH_PANEL_BOT_UID` | `1000` | The uid the bot image runs as. The panel gives every bot directory it writes to this uid, because the bot's entrypoint can't lock down a directory it doesn't own and exits. Only change it for a custom image built with a different user. |
-| `STITCH_PANEL_TAILNET_USERS` | — | Comma-separated tailnet login allowlist. |
-| `STITCH_PANEL_PASSWORD_HASH` | — | argon2 hash from `stitch-panel hash-password`. |
+| `STITCH_PANEL_TAILNET_USERS` | — | Legacy or custom identity-header deployments; ignored after UI password setup. |
+| `STITCH_PANEL_PASSWORD_HASH` | — | argon2 hash from `stitch-panel hash-password`; overridden by a saved UI password. |
 | `STITCH_PANEL_ALLOW_INSECURE_BIND` | off | Permit a routable bind. You own the consequences. |
 | `STITCH_PANEL_TRUST_IDENTITY_HEADER` | off | Believe `Tailscale-User-Login`. Required for tailnet-login auth, never inferred from the bind. Also requires `STITCH_PANEL_IDENTITY_PROXY_ONLY=1`. |
-| `STITCH_PANEL_IDENTITY_PROXY_ONLY` | off | Attest that an authenticated reverse proxy is the sole peer on the listener (sets and strips the identity header). Required with `TRUST_IDENTITY_HEADER`. The sidecar layout in `docker-compose.panel.yml` sets both for you. |
+| `STITCH_PANEL_IDENTITY_PROXY_ONLY` | off | Attest that an authenticated reverse proxy is the sole peer on the listener (sets and strips the identity header). Required with `TRUST_IDENTITY_HEADER`. Off by default in Compose; retained only for explicit legacy migration. |
 | `STITCH_PANEL_CORRIDOR_API` | `https://api.textilecredit.com` | Where the Add-a-bot wizard reads the corridor list from. Set to `off` to pin the panel to the corridors compiled into the binary and never call out. |
 | `RUST_LOG` | `info` | Log verbosity. |
 
-At least one of `STITCH_PANEL_TAILNET_USERS` and `STITCH_PANEL_PASSWORD_HASH` must
-be set. There is no anonymous mode.
+Fresh Compose installs require `STITCH_PANEL_PASSWORD_HASH`. Existing panels can
+save a password through the UI instead. Legacy identity auth requires
+`STITCH_PANEL_TAILNET_USERS` and both trust flags. There is no anonymous mode.
 
 The corridor list is Textile's, not the binary's: the wizard asks
 `STITCH_PANEL_CORRIDOR_API` which corridors are listed and writes the config that
@@ -585,10 +622,9 @@ exists but read the message first.
 
 **"nothing has told it the `Tailscale-User-Login` header is trustworthy"** — you
 set `STITCH_PANEL_TAILNET_USERS` without both trust flags, so every request would
-be rejected and the panel says so at startup instead. If you're running the
-sidecar layout from `docker-compose.panel.yml` you already have both; otherwise
-decide whether an authenticated proxy really is the only way to reach the port,
-and use the password fallback if it isn't.
+be rejected and the panel says so at startup instead. Use a password hash and
+keep both trust flags off, as the shipped Compose files do. Only custom proxy
+deployments should enable identity-header authentication.
 
 **"`STITCH_PANEL_IDENTITY_PROXY_ONLY` is not"** — you set
 `STITCH_PANEL_TRUST_IDENTITY_HEADER=1` without the proxy-only attestation. TRUST
@@ -625,10 +661,10 @@ config would pull the files out from under the other. Rename or remove one with
 Set `TS_USERSPACE: "true"` in the compose file to use userspace networking
 instead; it's slower but needs no host device.
 
-**No login prompt and a 401 on everything** — the identity header isn't arriving.
-Check you're browsing the `ts.net` URL rather than an IP, that your device isn't
-tagged, and that your login is spelled exactly as it appears in the Tailscale
-console.
+**No password login prompt** — on an upgraded legacy panel, use the persistent
+**Set panel password** action. Saving it disables identity login. Afterwards,
+`/api/session` reports `passwordLogin: true`, `tailnetLogin: false` and
+`passwordSetupRequired: false`. On a fresh install, check the environment hash.
 
 ## Image updates
 
@@ -693,14 +729,17 @@ Read this before using it:
 
 ## Hardening, once it works
 
-- **Tag the panel node.** Define a tag in your tailnet policy file, then set
-  `TS_EXTRA_ARGS=--advertise-tags=tag:stitch-panel` in `.env` and recreate the
-  sidecar. Tagged nodes don't expire keys, and ACLs can restrict who reaches the
-  panel at the network level as well as at the allowlist.
-- **Pin the bot image.** `STITCH_PANEL_BOT_IMAGE` to a `sha-*` tag, so a restart
-  can't change the bot binary under you. The Update button still offers a move to
-  a newer publish when one appears.
-- **Restrict at the ACL level too.** The allowlist is the panel's own check;
-  a tailnet ACL means an unlisted device can't even open a connection.
-- **Don't use Funnel.** It strips identity headers and publishes the panel to the
-  internet. Both halves of that are bad.
+- **Restrict the tailnet policy.** Assign a panel tag in the admin console or on
+  the enrollment key and allow only operators to reach TCP 443. Broad allow rules
+  must be removed too. Keep SSH, Funnel, app-capability mounts and routing off.
+- **Complete password setup.** Existing panels retain identity login until an
+  operator saves a password in the UI. The warning stays visible until then.
+  Saved passwords disable both identity trust flags. Anyone authenticated to the
+  panel can control Docker and operator wallets.
+- **Review image updates.** Pin panel and bot images to reviewed `sha-*` tags or
+  digests. The Tailscale sidecar currently tracks `stable`; record the running
+  version and digest, review vendor bulletins and apply updates promptly. An
+  update is not proof that an unconfirmed report has been fixed.
+- **Limit credentials.** Use short-lived enrollment keys, restrict who can enroll
+  nodes, and keep signer permissions and funded inventory limited to each bot's
+  needs. If a node is compromised, revoke it and rotate exposed credentials.

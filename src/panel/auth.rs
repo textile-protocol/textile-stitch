@@ -11,8 +11,8 @@
 //!   than of anything the panel can see — so it is believed only when both
 //!   `STITCH_PANEL_TRUST_IDENTITY_HEADER` and `STITCH_PANEL_IDENTITY_PROXY_ONLY`
 //!   are set, and ignored outright otherwise. See [`PanelConfig`](super::PanelConfig).
-//! - **Password.** An argon2id hash in the environment, exchanged for a session
-//!   cookie. For operators who don't front the panel with `tailscale serve`.
+//! - **Password.** An argon2id hash from the environment or saved UI credentials,
+//!   exchanged for a session cookie. Fresh installs require it over Tailscale too.
 //!
 //! Sessions live in memory. A panel restart logs everyone out, which is the right
 //! trade for a single-process tool with no database.
@@ -202,6 +202,11 @@ impl Sessions {
         self.lock().remove(token);
     }
 
+    /// Invalidate sessions issued before the panel switches authentication modes.
+    pub fn revoke_all(&self) {
+        self.lock().clear();
+    }
+
     /// Live session count, after pruning. Used by tests and the health endpoint.
     pub fn len(&self) -> usize {
         let mut live = self.lock();
@@ -231,8 +236,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Decide who a request is, from the headers the panel can see.
 ///
-/// The identity header wins when it is trusted and allowlisted, because that is
-/// the intended deployment. Otherwise the session cookie is tried. A presented
+/// The identity header wins when it is trusted and allowlisted by the configured
+/// authentication mode. Otherwise the session cookie is tried. A presented
 /// credential that fails is [`AuthError::Rejected`]; nothing presented at all is
 /// [`AuthError::Missing`], which is what tells the UI to show a login form.
 pub fn authorize(

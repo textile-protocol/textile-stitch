@@ -30,6 +30,8 @@ pub struct SessionBody {
     /// True when the panel accepts a proxy identity header, so the UI can explain
     /// why it's waiting on `tailscale serve` instead of showing a blank page.
     tailnet_login: bool,
+    /// Legacy proxy login is still sufficient: show the persistent migration banner.
+    password_setup_required: bool,
     /// How the panel supervises bots: `"docker"` or `"process"` (desktop).
     /// The login screen uses this to show a Docker-socket warning only when it
     /// applies.
@@ -46,12 +48,14 @@ pub struct SessionBody {
 }
 
 fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
+    let cfg = state.auth_config();
+    let legacy = cfg.trust_identity_header && !cfg.auth.allowed_users().is_empty();
     SessionBody {
         authenticated: identity.is_some(),
         identity: identity.map(|i| i.label().to_string()),
-        password_login: state.cfg.auth.password_hash().is_some(),
-        tailnet_login: state.cfg.trust_identity_header
-            && !state.cfg.auth.allowed_users().is_empty(),
+        password_login: cfg.auth.password_hash().is_some(),
+        tailnet_login: legacy,
+        password_setup_required: legacy,
         runtime: state.cfg.runtime.as_str(),
         version: env!("CARGO_PKG_VERSION"),
         config_dir: state.cfg.host_bots_dir.display().to_string(),
@@ -76,7 +80,8 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    let Some(hash) = state.cfg.auth.password_hash() else {
+    let cfg = state.auth_config();
+    let Some(hash) = cfg.auth.password_hash() else {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "this panel doesn't use password login. Reach it through `tailscale serve` so it \
@@ -109,8 +114,98 @@ pub async fn login(
         }
     }
 
+    // Coordinate with migration: an old fallback-password check already in
+    // flight must not mint a valid session after identity login has been removed.
+    let migrated = state
+        .migrated_password
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let current_hash = migrated.as_deref().or(state.cfg.auth.password_hash());
+    if current_hash != Some(hash) {
+        return Err(ApiError::conflict("panel login changed; sign in again"));
+    }
     let token = state.sessions.create();
+    drop(migrated);
     tracing::info!("a password login succeeded");
+    Ok((
+        [(header::SET_COOKIE, session_cookie_header(&token))],
+        Json(session_body(&state, Some(&Identity::Password))),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct SetPasswordRequest {
+    password: String,
+    confirmation: String,
+}
+
+/// Only an already authenticated operator may migrate a legacy panel. This route
+/// is behind both the API credential guard and the browser same-origin guard.
+pub async fn set_password(
+    State(state): State<AppState>,
+    Json(body): Json<SetPasswordRequest>,
+) -> Result<Response, ApiError> {
+    let setup = state
+        .password_setup_lock
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| {
+            ApiError::conflict("a panel password is already being saved; refresh the page")
+        })?;
+    let cfg = state.auth_config();
+    if !cfg.trust_identity_header || cfg.auth.allowed_users().is_empty() {
+        return Err(ApiError::conflict(
+            "this panel already requires password login",
+        ));
+    }
+    if body.password != body.confirmation {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "the passwords do not match",
+        ));
+    }
+    if body.password.chars().count() < 12 || body.password.len() > 1024 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "use a password with at least 12 characters and at most 1024 bytes",
+        ));
+    }
+    let permit = state
+        .login_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "password checks are busy; try again in a moment",
+            )
+        })?;
+    let root = state.cfg.bots_dir.clone();
+    let active_state = state.clone();
+    let token = tokio::task::spawn_blocking(move || {
+        // Keep the write, activation and locks together even if the tab closes
+        // while the worker hashes. A completed disk write must activate in memory.
+        let (_setup, _permit) = (setup, permit);
+        let hash = auth::hash_password(&body.password)?;
+        crate::panel::credentials::save(&root, &hash)?;
+        let mut active = active_state
+            .migrated_password
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *active = Some(hash);
+        active_state.sessions.revoke_all();
+        Ok::<_, anyhow::Error>(active_state.sessions.create())
+    })
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the panel password could not be saved",
+        )
+    })?
+    .map_err(|e| ApiError::internal(&e))?;
+    tracing::info!("panel password saved; legacy identity login disabled");
     Ok((
         [(header::SET_COOKIE, session_cookie_header(&token))],
         Json(session_body(&state, Some(&Identity::Password))),
@@ -224,6 +319,59 @@ mod tests {
         let (status, body, cookie) = post(&h, "/api/login", r#"{"password":"let me in"}"#).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(cookie.is_some());
+    }
+
+    #[tokio::test]
+    async fn untrusted_proxy_headers_cannot_bypass_a_password_session() {
+        let mut h = with_password("untrusted-proxy", "a separate panel password");
+        let mut cfg = (*h.state.cfg).clone();
+        // Even a retained allowlist must not bypass the deployment's trust flag.
+        cfg.auth = AuthMode::Either {
+            allowed_users: vec!["alice@example.com".into()],
+            hash: cfg.auth.password_hash().unwrap().into(),
+        };
+        cfg.trust_identity_header = false;
+        h.state.cfg = Arc::new(cfg);
+        h.app = super::super::router(h.state.clone());
+
+        let request = |cookie: Option<&str>| {
+            let mut builder = Request::builder()
+                .uri("/api/bots")
+                .header("Tailscale-User-Login", "alice@example.com");
+            if let Some(cookie) = cookie {
+                builder = builder.header(header::COOKIE, cookie);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        let response = h.app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (status, _, cookie) = post(
+            &h,
+            "/api/login",
+            r#"{"password":"a separate panel password"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cookie = cookie.unwrap();
+        let cookie = cookie.split(';').next().unwrap();
+        let response = h.app.clone().oneshot(request(Some(cookie))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        h.app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/logout")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = h.app.clone().oneshot(request(Some(cookie))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

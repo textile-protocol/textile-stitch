@@ -25,8 +25,10 @@ For the Mac / Windows app on the machine in front of you, see
   Bump later if you run many bots on one box.
 
 Stitch drives the Docker socket. Anyone who can reach the panel owns the host
-and the operator wallets. That is why the install binds through Tailscale and
-never exposes the UI on a public address.
+and the operator wallets once authenticated. Fresh installs require a panel
+password over Tailscale and never publish the UI on a public address. Restrict
+the panel node’s TCP 443 to your operators in the tailnet policy; remove broader
+allow rules that would let other devices connect.
 
 ## 1. Prepare the host
 
@@ -65,12 +67,12 @@ sudo chown "$USER":"$USER" /srv/stitch/bots
 
 In the Tailscale admin console: **Settings → Keys → Generate auth key**.
 
-- Make it **reusable**, not ephemeral (the panel should keep its identity across
-  restarts).
+- Use a short expiration and leave **ephemeral** off. The state volume preserves
+  the node identity across restarts.
 - Copy the key (`tskey-auth-…`). You will paste it into the installer once.
 
-Note the login you use on the tailnet (the email under **Users**). That becomes
-`PANEL_USERS`.
+Choose a panel password with at least 12 characters and keep it in your password
+manager. Tailscale identity headers do not bypass this login.
 
 ## 3. Install Stitch
 
@@ -79,7 +81,7 @@ Note the login you use on the tailnet (the email under **Users**). That becomes
 ```bash
 PANEL_MODE=server \
   TS_AUTHKEY='tskey-auth-…' \
-  PANEL_USERS='you@example.com' \
+  PANEL_PASSWORD='choose-a-long-password' \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/install-panel.sh)"
 ```
 
@@ -97,22 +99,25 @@ STITCH_REF="$TAG" \
   STITCH_REQUIRE_PINNED=1 \
   PANEL_MODE=server \
   TS_AUTHKEY='tskey-auth-…' \
-  PANEL_USERS='you@example.com' \
+  PANEL_PASSWORD='choose-a-long-password' \
   sh install-panel.sh
 ```
 
 The installer writes an owner-only `.env`, starts the published panel image with
 a Tailscale sidecar, and prints the URL. No checkout, no compile.
 
-Re-running the installer is safe: an existing `.env` is left alone, so it also
-works as “pull the current image and bring Stitch back up.”
+Re-running the installer reuses existing settings and a non-empty password
+hash. Older servers with an existing identity allowlist retain access and show a
+persistent **Set panel password** action in the UI. Operators can save the new
+password there without a terminal or bot restart. See the
+[migration and upgrade checks](install-panel.md#upgrading-an-older-server-install).
 
 ## 4. Open the panel and add a corridor
 
 1. Join the same Tailscale network on your laptop or phone.
 2. Open the URL the installer printed
    (`https://stitch-panel.<your-tailnet>.ts.net`).
-3. Click **Add corridor**, pick one from the list, set the operator wallet, approve
+3. Log in with the panel password, then click **Add corridor**, pick one from the list, set the operator wallet, approve
    Permit2 allowances, **Connect** the bot to Textile on Settings, then
    **Start**. New bots quote Swap via RFQ and will not Start without that.
 
@@ -148,9 +153,9 @@ disk.
 | Symptom | Likely fix |
 |---------|------------|
 | Installer can't pull the image | Check outbound HTTPS / registry access; confirm `docker pull` works. |
-| Can't open the panel URL | Confirm Tailscale is up on both the server and your client; check `PANEL_USERS` matches your tailnet login. |
+| Can't open the panel URL | Confirm Tailscale is up on both the server and your client; check the tailnet policy allows your device to reach TCP 443. |
 | Bot won't start / ledger errors | See the layout notes in [install-panel.md](install-panel.md#the-layout-warning). |
-| Need a password instead of Tailscale | Use `PANEL_MODE=local` only on a host you sit in front of, or put an authenticated reverse proxy in front — covered in [install-panel.md](install-panel.md). |
+| No password prompt | On an upgraded legacy panel, click **Set panel password**. The warning stays until setup is complete; see the migration guide. |
 
 ## Related guides
 

@@ -29,6 +29,9 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Test panel installation and deployment controls
+        run: python3 -m unittest discover -s tests -p 'test_panel_install.py'
+
       - name: Build release binary
         run: cargo build --release --bin stitch
 

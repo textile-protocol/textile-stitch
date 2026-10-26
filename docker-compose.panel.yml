@@ -6,9 +6,10 @@
 # `tailscale serve` — there is no published port on the host at all.
 #
 # Setup, once:
-#   1. Mint a reusable, ephemeral-off auth key in the Tailscale admin console and
+#   1. Mint a non-ephemeral auth key in the Tailscale admin console and
 #      put it in .env as TS_AUTHKEY.
-#   2. Put your tailnet login in .env as PANEL_USERS (comma-separated for a team).
+#   2. Set PANEL_PASSWORD_HASH in .env (see docs/install-panel.md), and restrict
+#      tailnet access to the panel's TCP 443 to your operators.
 #   3. Create the bots root:  sudo mkdir -p /srv/stitch/bots
 #   4. docker compose -f docker-compose.panel.yml up -d --build
 #   5. Open https://stitch-panel.<your-tailnet>.ts.net
@@ -27,6 +28,11 @@ services:
     environment:
       TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in .env — mint one in the Tailscale admin console}
       TS_STATE_DIR: /var/lib/tailscale
+      # Reuse persisted identity even after the enrollment key expires.
+      TS_AUTH_ONCE: "true"
+      # containerboot runs `set` before Serve on every boot, but does not pass
+      # TS_EXTRA_ARGS to it. The CLI shim adds our SSH/routing policy to `set`.
+      PATH: /opt/stitch/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       # Declarative `tailscale serve`: TLS on 443 with a MagicDNS cert, proxied
       # to the panel on loopback. Editing this file and recreating the container
       # is the whole configuration surface.
@@ -34,14 +40,15 @@ services:
       # Kernel networking via /dev/net/tun. Userspace mode also works but is
       # slower and needs no capabilities, if your host won't give up the device.
       TS_USERSPACE: "false"
-      # Deliberately untagged. A tag has to exist in your tailnet policy file
-      # first, and `tailscale up` fails outright if it doesn't — a bad first-run
-      # experience for a hardening step. docs/install-panel.md covers tagging the
-      # panel node once you're past setup.
-      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
+      # First enrollment resets old preferences. Enrolled nodes use `set`
+      # through the shim below, without logging in again or needing the key.
+      # Arbitrary TS_EXTRA_ARGS from .env are deliberately not accepted.
+      # Assign a tag in the admin console or on the enrollment key instead.
+      TS_EXTRA_ARGS: --reset --ssh=false
     volumes:
       - tailscale-state:/var/lib/tailscale
       - ./deploy/panel-serve.json:/config/serve.json:ro
+      - ./deploy/panel-tailscale.sh:/opt/stitch/bin/tailscale:ro
     devices:
       - /dev/net/tun
     cap_add:
@@ -76,20 +83,14 @@ services:
       # tells Docker to bind-mount the second into each bot.
       STITCH_PANEL_BOTS_DIR: /data/bots
       STITCH_PANEL_HOST_BOTS_DIR: ${PANEL_BOTS_DIR:-/srv/stitch/bots}
-      # Who may drive it.
-      STITCH_PANEL_TAILNET_USERS: ${PANEL_USERS:?set PANEL_USERS in .env — your tailnet login, e.g. you@example.com}
-      # Believe the Tailscale-User-Login header. Correct *here* and only here:
-      # `network_mode: service:tailscale` above means this loopback is the
-      # sidecar's, so `tailscale serve` is the only thing that can reach the
-      # listener and it sets the header itself. Run the panel on the host instead
-      # and its loopback is the host's, shared with every local process — any of
-      # which could then send an allowlisted login and own the Docker socket. So
-      # the panel never infers this from its bind address; it has to be said.
-      # Both flags are required: TRUST alone is refused at startup.
-      STITCH_PANEL_TRUST_IDENTITY_HEADER: "1"
-      STITCH_PANEL_IDENTITY_PROXY_ONLY: "1"
-      # Optional fallback for when you're not going through `tailscale serve`.
-      # Generate with: docker compose -f docker-compose.panel.yml run --rm panel hash-password
+      # New installs require password login. Tailnet policy also controls which
+      # operators may connect in the first place.
+      # Existing identity-only installs retain access while the UI offers password
+      # setup. The installer sets this flag only for a recognized legacy install.
+      # A password saved in the UI overrides these flags on every startup.
+      STITCH_PANEL_TAILNET_USERS: ${PANEL_USERS:-}
+      STITCH_PANEL_TRUST_IDENTITY_HEADER: ${PANEL_LEGACY_IDENTITY_AUTH:-0}
+      STITCH_PANEL_IDENTITY_PROXY_ONLY: ${PANEL_LEGACY_IDENTITY_AUTH:-0}
       STITCH_PANEL_PASSWORD_HASH: ${PANEL_PASSWORD_HASH:-}
       # Image new bots run. Pin a tag in production so a restart can't change
       # the bot binary under you.

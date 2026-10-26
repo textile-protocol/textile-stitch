@@ -291,6 +291,8 @@ export interface SessionInfo {
   identity: string | null
   passwordLogin: boolean
   tailnetLogin: boolean
+  /** Legacy identity login still works until the operator migrates in the UI. */
+  passwordSetupRequired: boolean
   /** How the panel supervises bots. Desktop uses `process` (no Docker socket). */
   runtime: PanelRuntime
   /** The panel binary's version, e.g. `0.1.0`. */

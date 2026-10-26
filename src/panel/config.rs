@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! Panel configuration, read from the environment at startup.
+//! Panel configuration from the environment and saved UI credentials at startup.
 //!
 //! The panel holds market-maker keys and a Docker socket, so the defaults here
 //! are deliberately the safe ones: loopback bind, no auth bypass, and a hard
@@ -63,8 +63,8 @@ pub enum AuthMode {
     /// bound to loopback inside the tailscale namespace, which [`PanelConfig`]
     /// enforces.
     Tailnet { allowed_users: Vec<String> },
-    /// A single shared password, stored as an argon2 PHC hash. For setups that
-    /// don't front the panel with `tailscale serve`.
+    /// A single shared password, stored as an argon2 PHC hash. Used by the
+    /// shipped Compose files, independently of Tailscale's identity headers.
     Password { hash: String },
     /// Both accepted: an identity header from the proxy, or a password login.
     Either {
@@ -170,8 +170,7 @@ impl PanelConfig {
         let insecure = allow_insecure_bind();
         check_bind_address(bind.ip(), insecure)?;
 
-        let auth = auth_from_env()?;
-        let trust_identity_header = trust_identity_header()?;
+        let (auth, trust_identity_header) = startup_auth(&bots_dir)?;
         if !trust_identity_header && auth.password_hash().is_none() {
             bail!(
                 "the panel is configured to authenticate by tailnet login, but nothing has \
@@ -179,8 +178,8 @@ impl PanelConfig {
                  would be rejected. That header is only an identity if an authenticated \
                  proxy is the sole thing that can reach the listener — bind alone doesn't \
                  prove it, because a panel running on the host shares the host's loopback \
-                 with every local process. Run it the way docker-compose.panel.yml does \
-                 (in the Tailscale sidecar's network namespace) and set both \
+                 with every local process. For a custom proxy-only deployment, use \
+                 the Tailscale sidecar's network namespace and set both \
                  STITCH_PANEL_TRUST_IDENTITY_HEADER=1 and \
                  STITCH_PANEL_IDENTITY_PROXY_ONLY=1, or set STITCH_PANEL_PASSWORD_HASH \
                  and log in with a password instead."
@@ -397,8 +396,8 @@ fn allow_insecure_bind() -> bool {
 ///    authenticated reverse proxy is the *sole* peer on the listener (sets the
 ///    header itself and strips any client-supplied value).
 ///
-/// `docker-compose.panel.yml` sets both for the sidecar layout where that
-/// attestation holds. Host installs must use password auth instead.
+/// Fresh Compose installs keep both flags off and require a password. Legacy
+/// installs retain them until UI password setup overrides identity login.
 fn trust_identity_header() -> Result<bool> {
     resolve_trust_identity_header(
         flag("STITCH_PANEL_TRUST_IDENTITY_HEADER"),
@@ -440,6 +439,15 @@ fn flag(key: &str) -> bool {
 /// including `yes`, `TRUE`, or a stray space — has to fail closed.
 fn is_opt_in(raw: Option<&str>) -> bool {
     matches!(raw, Some("1") | Some("true"))
+}
+
+/// A UI-created password outranks legacy container environment, including old
+/// allowlists and trust flags preserved by the panel image updater.
+pub(crate) fn startup_auth(bots_dir: &Path) -> Result<(AuthMode, bool)> {
+    if let Some(hash) = super::credentials::load(bots_dir)? {
+        return Ok((AuthMode::Password { hash }, false));
+    }
+    Ok((auth_from_env()?, trust_identity_header()?))
 }
 
 /// Build the auth mode from the environment. At least one method is required —
