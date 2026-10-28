@@ -73,16 +73,17 @@ impl ModulesConfig {
 /// bot's own share of the corridor currency and each quote pays the average
 /// lean across the stretch of holdings it moves. Runs on a wallet bot and on a
 /// vault; off unless switched on. The two offsets are in the corridor's soft
-/// currency (NGN for cNGN), measured from the reference book on every quote.
+/// currency (NGN for cNGN), measured from the reference book on every quote;
+/// positive widens the curve, negative narrows it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CurveConfig {
     pub enabled: bool,
     /// Soft currency below the reference mid where the curve starts, at no
-    /// corridor holdings. Zero or more.
+    /// corridor holdings. Negative starts it above the mid.
     pub start_below_mid: f64,
     /// Soft currency above the reference buy where it ends, holding nothing
-    /// else. Zero or more.
+    /// else. Negative ends it below the buy.
     pub end_above_buy: f64,
     /// Exponent on the holdings share.
     pub shape: f64,
@@ -350,9 +351,9 @@ impl ModulesConfig {
         ensure!(
             [c.start_below_mid, c.end_above_buy]
                 .iter()
-                .all(|v| v.is_finite() && *v >= 0.0),
-            "modules curve offsets must be zero or a positive amount of the soft currency \
-             (they only ever widen the curve)"
+                .all(|v| v.is_finite()),
+            "modules curve offsets must be a finite amount of the soft currency (positive \
+             widens the curve, negative narrows it)"
         );
         ensure!(
             c.shape.is_finite() && (0.5..=4.0).contains(&c.shape),

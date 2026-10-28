@@ -6,6 +6,7 @@ import {
   curveRequirements,
   flatPrice,
   freshReading,
+  MAX_OFFSET,
   shareAfter,
   takerPrice,
   type Curve,
@@ -137,25 +138,29 @@ export function CurveFields({
         label="Start below the mid"
         unit="NGN"
         scale={1}
-        max={1000}
+        min={-MAX_OFFSET}
+        max={MAX_OFFSET}
+        sliderMin={-5}
         step={0.05}
         fractionDigits={2}
         sliderMax={5}
         value={c.start_below_mid}
         onChange={(start_below_mid) => set({ start_below_mid })}
-        hint={`With no ${currency}, the bot sells ${settlement} this far under the reference mid, all-in. 0 sells at the mid. More wins flow that buys ${settlement}, at a subsidy.`}
+        hint={`With no ${currency}, the bot sells ${settlement} this far under the reference mid, all-in. 0 sells at the mid. More wins flow that buys ${settlement}, at a subsidy; negative starts above the mid and narrows the curve.`}
       />
       <NumberControl
         label="End above the reference buy"
         unit="NGN"
         scale={1}
-        max={1000}
+        min={-MAX_OFFSET}
+        max={MAX_OFFSET}
+        sliderMin={-5}
         step={0.05}
         fractionDigits={2}
         sliderMax={5}
         value={c.end_above_buy}
         onChange={(end_above_buy) => set({ end_above_buy })}
-        hint={`Full of ${currency}, the bot pays this far over the reference buy for ${settlement}, all-in. 0 matches what clearing ${currency} on the reference market would cost.`}
+        hint={`Full of ${currency}, the bot pays this far over the reference buy for ${settlement}, all-in. 0 matches what clearing ${currency} on the reference market would cost; negative ends below the buy and narrows the curve. Together the two can take off the reference half-range plus the round-trip spread before the curve goes flat between them.`}
       />
       <NumberControl
         label="Shape"

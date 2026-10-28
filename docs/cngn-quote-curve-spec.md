@@ -82,9 +82,16 @@ at f = 0  (no naira)     the stitch SELLS USDT at   bybitMid - startNgn
 at f = 1  (all naira)    the stitch BUYS  USDT at   bybitBuy + endNgn
 ```
 
-Both default to 0, and both may only ever widen the curve. At 0 / 0 the stitch sells dollars at
-the Bybit mid when it holds no naira, and pays the Bybit buy price for dollars when it is full
-of naira. These are **all-in** prices, after the spread and the fee, so they are the numbers a
+Both default to 0. Positive values widen the curve; negative values narrow it, starting above the
+mid or ending below the buy (added 2026-10-28). The curve only goes flat when the de-spread
+centres of the two ends cross (`s1 <= s0` below), not the two prices above. That takes negative
+values that together remove the reference half-range plus the round-trip spread (2 x allIn), about
+1.85 NGN at a 1,380 mid, 9.4 bps half-range and 2 bps allIn. Short of that the two prices above can
+already cross (selling at f = 0 above where it buys at f = 1) while the curve still leans the right
+way, since at any one share the buy stays a round trip under the sell. Once flat it quotes one
+centre, halfway between `s0` and `s1`, with the spread either side, never backwards. At 0 / 0
+the stitch sells dollars at the Bybit mid when it holds no naira, and pays the Bybit buy price for
+dollars when it is full of naira. These are **all-in** prices, after the spread and the fee, so they are the numbers a
 taker actually sees.
 
 Everything else follows:
@@ -116,8 +123,9 @@ is wrong by one full spread across the bottom of the range.**
 **Convert the knobs to bps off the live mid on every quote**, not once at startup, so "0.5 NGN
 below mid" stays literally true as the mid moves.
 
-**Refuse the curve unless `s1 > s0`** and fall back to flat quoting (§9). That is also what
-catches a crossed Bybit reference, where the buy prints below the mid.
+**Never lean backwards.** If `s1 <= s0`, set both to their midpoint and quote that one centre
+with the spread either side. Only negative knobs get here (above); a crossed Bybit reference never
+does, because the feed omits it and a negative half-range refuses the curve (§9).
 
 **`allIn` is computed, not configured.** The venue fee arrives on the request as `fee_bps`, and
 the spread is already on the corridor, so the stitch can derive the true all-in cost per quote.
@@ -463,8 +471,8 @@ of the last 15 minutes of uncrossed books, computed by the pricing cron once a m
 on the sample (`referenceHalfRangeBps`), so it moves only as fast as the book's typical width. With
 fewer than three uncrossed books in the window it is null and the reference is omitted.
 
-**A span that is not positive.** If `s1 <= s0`, or the half-range is zero or less, there is no
-curve to walk. Fall back to flat and log.
+**A negative half-range.** There is no curve to walk. Fall back to flat and log. (`s1 <= s0` is
+not a fallback: the curve collapses to one centre, §3.)
 
 **A reference that disagrees with the price.** The jump guard only sees the served `price`. A
 reference mid or buy more than 1% (`MAX_REFERENCE_GAP_BPS`) from that guarded print is a bad

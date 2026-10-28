@@ -2054,11 +2054,16 @@ mod tests {
             .to_string()
             .contains("invert=1"));
         assert!(Config::from_toml(&reversed.replace("invert=TRUE", "invert=0")).is_ok());
-        let negative = curve_bot("", false, "start_below_mid = -0.5\n");
-        assert!(Config::from_toml(&negative)
+        // Negative offsets narrow the curve and load; a non-number does not.
+        let negative = curve_bot("", false, "start_below_mid = -0.5\nend_above_buy = -0.25\n");
+        let cfg = Config::from_toml(&negative).unwrap();
+        assert_eq!(cfg.modules.curve.start_below_mid, -0.5);
+        assert_eq!(cfg.modules.curve.end_above_buy, -0.25);
+        let not_a_number = curve_bot("", false, "start_below_mid = nan\n");
+        assert!(Config::from_toml(&not_a_number)
             .unwrap_err()
             .to_string()
-            .contains("zero or a positive"));
+            .contains("finite amount"));
         // None of it is checked while the curve stays off.
         assert!(
             Config::from_toml(&unequal.replace("[modules.curve]\nenabled = true\n", "")).is_ok()

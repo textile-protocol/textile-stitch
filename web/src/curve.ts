@@ -71,7 +71,10 @@ export interface Curve {
 
 /** The curve for this reference and cost, or null when the inputs make none
  * (the bot then quotes flat). `allInBps` is the corridor spread plus the venue
- * fee: the endpoints are the prices a taker actually pays. */
+ * fee: the endpoints are the prices a taker actually pays. Negative knobs
+ * narrow the curve; once they cross its shades (s1 <= s0, which takes more
+ * than crossing the all-in ends) it collapses flat at their midpoint, as the
+ * bot does. */
 export function curveFor(
   reference: CurveReference,
   allInBps: number,
@@ -81,12 +84,15 @@ export function curveFor(
   const { start_below_mid: start, end_above_buy: end, shape } = config
   const finite = [mid, half, allInBps, start, end, shape].every(Number.isFinite)
   if (!finite || mid <= 0 || half <= 0 || shape <= 0) return null
-  if (allInBps < 0 || allInBps >= 10_000 || start < 0 || end < 0) return null
+  if (allInBps < 0 || allInBps >= 10_000) return null
   if (mid - start <= 0) return null
   const buy = mid * (1 + half / 10_000)
+  if (buy + end <= 0) return null
   const s0 = ((mid - start) / (mid * (1 + allInBps / 10_000)) - 1) * 10_000
   const s1 = ((buy + end) / (mid * (1 - allInBps / 10_000)) - 1) * 10_000
-  return s1 > s0 ? { mid, s0, s1, shape, allInBps } : null
+  if (s1 > s0) return { mid, s0, s1, shape, allInBps }
+  const flat = (s0 + s1) / 2
+  return { mid, s0: flat, s1: flat, shape, allInBps }
 }
 
 const clamp01 = (f: number) => Math.min(1, Math.max(0, f))
@@ -145,6 +151,8 @@ export function shareAfter(
 export function cheapestUntil(curve: Curve, halfRangeBps: number): number {
   const target =
     ((1 + halfRangeBps / 10_000) / (1 + curve.allInBps / 10_000) - 1) * 10_000
+  // A collapsed curve is one flat price: cheapest everywhere or nowhere.
+  if (curve.s1 - curve.s0 <= Number.EPSILON) return target > curve.s0 ? 1 : 0
   const t = (target - curve.s0) / (curve.s1 - curve.s0)
   if (t <= 0) return 0
   if (t >= 1) return 1
@@ -154,13 +162,24 @@ export function cheapestUntil(curve: Curve, halfRangeBps: number): number {
 /** `a` against `b` in bps, signed. */
 export const bpsOver = (a: number, b: number) => (a / b - 1) * 10_000
 
+/** How far either offset may go, each way, in the soft currency. The editor's
+ * controls stop here and Save refuses past it. */
+export const MAX_OFFSET = 1000
+
+const offsetInRange = (v: number) =>
+  Number.isFinite(v) && v >= -MAX_OFFSET && v <= MAX_OFFSET
+
 /** Problems with the draft, in the words the form shows. Empty when valid. */
 export function curveConfigErrors(config: Knobs): string[] {
   const errors: string[] = []
-  if (!(Number.isFinite(config.start_below_mid) && config.start_below_mid >= 0))
-    errors.push('The start offset must be zero or more.')
-  if (!(Number.isFinite(config.end_above_buy) && config.end_above_buy >= 0))
-    errors.push('The end offset must be zero or more.')
+  if (!offsetInRange(config.start_below_mid))
+    errors.push(
+      `The start offset must be between −${MAX_OFFSET} and ${MAX_OFFSET}.`
+    )
+  if (!offsetInRange(config.end_above_buy))
+    errors.push(
+      `The end offset must be between −${MAX_OFFSET} and ${MAX_OFFSET}.`
+    )
   if (
     !(Number.isFinite(config.shape) && config.shape >= 0.5 && config.shape <= 4)
   )
@@ -175,11 +194,16 @@ export function shapeLabel(shape: number): string {
   return powers[shape] ? `f${powers[shape]}` : `f^${shape}`
 }
 
-/** "Mid", "Mid − 0.5", "Buy + 1": a knob next to the reference it offsets. */
+/** "Mid", "Mid − 0.5", "Mid + 0.5", "Buy + 1", "Buy − 0.3": a knob next to
+ * the reference it offsets. The start knob counts down from the mid, the end
+ * knob up from the buy, so a negative one flips the sign shown. */
 export function knobLabel(reference: 'Mid' | 'Buy', offset: number): string {
-  if (!(offset > 0)) return reference
-  const amount = offset.toLocaleString(undefined, { maximumFractionDigits: 2 })
-  return reference === 'Mid' ? `Mid − ${amount}` : `Buy + ${amount}`
+  if (!Number.isFinite(offset) || offset === 0) return reference
+  const amount = Math.abs(offset).toLocaleString(undefined, {
+    maximumFractionDigits: 2,
+  })
+  const up = reference === 'Mid' ? offset < 0 : offset > 0
+  return `${reference} ${up ? '+' : '−'} ${amount}`
 }
 
 /** A check the curve needs before it can price, for the module's editor. */

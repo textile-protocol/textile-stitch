@@ -28,9 +28,21 @@
 //! at f = 1  (all naira)   the stitch BUYS  USDT at  referenceBuy + end_above_buy
 //! ```
 //!
-//! Both default to zero and both only ever widen the curve. Those are
-//! *all-in* prices, after the spread and the venue fee, so they are what a
-//! taker actually sees. Everything else is derived from them.
+//! Both default to zero. Positive knobs widen the curve; negative ones narrow
+//! it, starting above the mid or ending below the buy. Those are *all-in*
+//! prices, after the spread and the venue fee, so they are what a taker
+//! actually sees. Everything else is derived from them.
+//!
+//! Negative knobs can collapse the curve. What has to cross is the two
+//! shades (`s1 <= s0`), not the two all-in prices above: the knobs must
+//! together take off the reference half-range plus the round trip (twice the
+//! all-in) in NGN. Short of that the all-in sell at f = 0 can sit above the
+//! all-in buy at f = 1 while the shade still rises, which is fine, since at
+//! any one share the buy stays a round trip under the sell. Once the shades
+//! cross the curve has no width left and quotes flat at their midpoint
+//! rather than leaning backwards. It narrows into that continuously, so a
+//! half-range that wobbles around the crossing never jumps the price, and a
+//! flat centre still nets a round trip exactly minus the spread.
 //!
 //! Note `s0` is **negative**: at zero knobs the curve starts one spread below
 //! the mid, which is exactly what lands the all-in selling price on the mid. A
@@ -42,9 +54,11 @@
 /// the shape of the curve in between. Per corridor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CurveParams {
-    /// NGN below the reference mid where the curve starts. Zero or more.
+    /// NGN below the reference mid where the curve starts. Negative starts
+    /// it above the mid.
     pub start_below_mid: f64,
-    /// NGN above the reference buy where the curve ends. Zero or more.
+    /// NGN above the reference buy where the curve ends. Negative ends it
+    /// below the buy.
     pub end_above_buy: f64,
     /// Exponent on the inventory share. [`DEFAULT_SHAPE`].
     pub shape: f64,
@@ -104,11 +118,7 @@ impl Curve {
         if !p.shape.is_finite() || p.shape <= 0.0 {
             return None;
         }
-        if !p.start_below_mid.is_finite()
-            || p.start_below_mid < 0.0
-            || !p.end_above_buy.is_finite()
-            || p.end_above_buy < 0.0
-        {
+        if !p.start_below_mid.is_finite() || !p.end_above_buy.is_finite() {
             return None;
         }
         // The one inversion. Everything below is NGN per USDT.
@@ -119,11 +129,25 @@ impl Curve {
             return None;
         }
         let s0 = ((start / (mid * (1.0 + all_in_bps / 10_000.0))) - 1.0) * 10_000.0;
-        let s1 =
-            (((buy + p.end_above_buy) / (mid * (1.0 - all_in_bps / 10_000.0))) - 1.0) * 10_000.0;
-        // A crossed reference, or knobs that leave the end below the start,
-        // is not a curve. The caller quotes flat.
-        (s0.is_finite() && s1.is_finite() && s1 > s0).then_some(Self {
+        let end = buy + p.end_above_buy;
+        if end <= 0.0 {
+            return None;
+        }
+        let s1 = ((end / (mid * (1.0 - all_in_bps / 10_000.0))) - 1.0) * 10_000.0;
+        if !(s0.is_finite() && s1.is_finite()) {
+            return None;
+        }
+        // Negative knobs that take off more than the half-range plus the
+        // round trip cross the shades. Never lean backwards: collapse to the midpoint, which the
+        // ends converge on as they meet, so the price is continuous through
+        // the crossing.
+        let (s0, s1) = if s1 > s0 {
+            (s0, s1)
+        } else {
+            let m = (s0 + s1) / 2.0;
+            (m, m)
+        };
+        Some(Self {
             mid,
             s0,
             s1,
@@ -200,6 +224,11 @@ impl Curve {
     pub fn cheapest_until(&self, half_range_bps: f64) -> f64 {
         let target = ((1.0 + half_range_bps / 10_000.0) / (1.0 + self.all_in_bps / 10_000.0) - 1.0)
             * 10_000.0;
+        if self.s1 - self.s0 <= f64::EPSILON {
+            // A collapsed curve is one flat price: cheapest everywhere or
+            // nowhere.
+            return if target > self.s0 { 1.0 } else { 0.0 };
+        }
         let t = (target - self.s0) / (self.s1 - self.s0);
         if t <= 0.0 {
             return 0.0;
@@ -291,7 +320,14 @@ mod tests {
     fn the_curve_starts_and_ends_exactly_on_the_knobs() {
         // The test that catches both likely errors: inverted units, and a
         // shade that starts at zero instead of s0.
-        for (start, end) in [(0.0, 0.0), (0.5, 1.0), (0.0, 2.0), (1.25, 0.25)] {
+        for (start, end) in [
+            (0.0, 0.0),
+            (0.5, 1.0),
+            (0.0, 2.0),
+            (1.25, 0.25),
+            (-0.5, -0.2),
+            (-0.9, 0.3),
+        ] {
             let c = curve(start, end);
             let got_start = sells_usdt(&c, 0.0);
             let got_end = buys_usdt(&c, 1.0);
@@ -341,7 +377,14 @@ mod tests {
     fn a_round_trip_costs_the_taker_the_spread_at_every_size_and_share() {
         // The whole safety argument, swept. Includes the edges a naive sweep
         // skips: f0 at 0 and 1, and trades spanning the whole book.
-        for (start, end) in [(0.0, 0.0), (0.5, 1.0), (3.0, 3.0)] {
+        // Includes a narrowed curve and one whose negative knobs cross.
+        for (start, end) in [
+            (0.0, 0.0),
+            (0.5, 1.0),
+            (3.0, 3.0),
+            (-0.5, -0.3),
+            (-1.0, -1.0),
+        ] {
             let c = curve(start, end);
             let mut worst = f64::NEG_INFINITY;
             for i in 0..=100 {
@@ -397,8 +440,7 @@ mod tests {
         // The Bybit P2P book is crossed on roughly a third of ticks. The
         // caller must quote flat rather than lean backwards.
         assert!(Curve::new(dpc(), -1.0, ALL_IN, &CurveParams::default()).is_none());
-        // The knobs only ever widen, so they cannot cross the endpoints — but
-        // a start knob that swallows the whole mid leaves no price at all.
+        // A start knob that swallows the whole mid leaves no price at all.
         let swallowed = CurveParams {
             start_below_mid: MID_NGN,
             end_above_buy: 0.0,
@@ -426,11 +468,92 @@ mod tests {
             ..CurveParams::default()
         };
         assert!(Curve::new(dpc(), HALF_RANGE, ALL_IN, &bad_shape).is_none());
-        let negative_knob = CurveParams {
-            start_below_mid: -1.0,
+        let nan_knob = CurveParams {
+            end_above_buy: f64::NAN,
             ..CurveParams::default()
         };
-        assert!(Curve::new(dpc(), HALF_RANGE, ALL_IN, &negative_knob).is_none());
+        assert!(Curve::new(dpc(), HALF_RANGE, ALL_IN, &nan_knob).is_none());
+        // An end knob that takes the whole buy away leaves no price either.
+        let swallowed_end = CurveParams {
+            end_above_buy: -2.0 * MID_NGN,
+            ..CurveParams::default()
+        };
+        assert!(Curve::new(dpc(), HALF_RANGE, ALL_IN, &swallowed_end).is_none());
+    }
+
+    #[test]
+    fn negative_knobs_narrow_the_curve() {
+        // Start above the mid, end below the buy: both ends move inward and
+        // the span shrinks by exactly what the knobs take off, in bps.
+        let wide = curve(0.0, 0.0);
+        let narrow = curve(-0.5, -0.3);
+        let (w0, w1) = wide.endpoints_bps();
+        let (n0, n1) = narrow.endpoints_bps();
+        assert!(n0 > w0 && n1 < w1, "narrow {n0}..{n1} vs wide {w0}..{w1}");
+        assert!(n1 > n0, "still a rising curve");
+        // Selling dollars with no naira now costs more than the mid.
+        assert!(sells_usdt(&narrow, 0.0) > MID_NGN);
+        // Buying them full of naira now pays less than the reference buy.
+        assert!(buys_usdt(&narrow, 1.0) < buy_ngn());
+    }
+
+    #[test]
+    fn the_all_in_ends_cross_before_the_shades_do() {
+        // -0.7 / -0.7 puts the all-in sell at no naira above the all-in buy
+        // full of it, but the de-spread shades still rise, so this is still a
+        // curve.
+        let c = curve(-0.7, -0.7);
+        assert!(sells_usdt(&c, 0.0) > buys_usdt(&c, 1.0));
+        let (s0, s1) = c.endpoints_bps();
+        assert!(s1 > s0, "{s0}..{s1}");
+        // The shades cross at about 0.925 off each end: half-range plus the
+        // round trip, split two ways.
+        let (s0, s1) = curve(-0.92, -0.92).endpoints_bps();
+        assert!(s1 > s0, "-0.92: {s0}..{s1}");
+        let (s0, s1) = curve(-0.93, -0.93).endpoints_bps();
+        assert_eq!(s0, s1, "-0.93 collapses");
+    }
+
+    #[test]
+    fn crossed_knobs_collapse_to_a_flat_centre_continuously() {
+        // HALF_RANGE puts the buy about 1.3 NGN over the mid and the round
+        // trip at ALL_IN is about 0.55 NGN, so knobs that take off more than
+        // about 1.85 between them cross the shades: the curve goes flat, never
+        // backwards.
+        let crossed = curve(-1.0, -1.0);
+        let (s0, s1) = crossed.endpoints_bps();
+        assert_eq!(s0, s1, "a crossed curve is flat");
+        assert!((crossed.shade_bps(0.0) - crossed.shade_bps(1.0)).abs() < 1e-12);
+        // Its centre is the midpoint of the two shades the knobs asked for.
+        let all_in = ALL_IN / 10_000.0;
+        let want0 = ((MID_NGN + 1.0) / (MID_NGN * (1.0 + all_in)) - 1.0) * 10_000.0;
+        let want1 = ((buy_ngn() - 1.0) / (MID_NGN * (1.0 - all_in)) - 1.0) * 10_000.0;
+        assert!((s0 - (want0 + want1) / 2.0).abs() < 1e-9);
+        // Walk the end knob down through the crossing: the price at every
+        // share moves by small steps only, with no jump where the ends meet.
+        let shares = [0.0, 0.5, 1.0];
+        let mut last: Option<[f64; 3]> = None;
+        let mut end = 0.0;
+        while end > -2.5 {
+            let c = curve(-1.0, end);
+            let now = shares.map(|f| sells_usdt(&c, f));
+            if let Some(prev) = last {
+                for i in 0..shares.len() {
+                    assert!(
+                        ((now[i] / prev[i] - 1.0) * 10_000.0).abs() < 0.5,
+                        "end {end} f {}: jumped from {} to {}",
+                        shares[i],
+                        prev[i],
+                        now[i]
+                    );
+                }
+            }
+            last = Some(now);
+            end -= 0.01;
+        }
+        // The shadow log's "cheapest until" stays a share, not NaN.
+        let until = crossed.cheapest_until(HALF_RANGE);
+        assert!((0.0..=1.0).contains(&until), "{until}");
     }
 
     #[test]
@@ -474,21 +597,27 @@ mod tests {
             let mid_ngn = 50.0 + next() * 19_950.0;
             let half = next() * 80.0;
             let all_in = 0.5 + next() * 79.5;
+            // Knobs either side of zero: wide, narrowed, and crossed.
             let p = CurveParams {
-                start_below_mid: next() * mid_ngn * 0.02,
-                end_above_buy: next() * mid_ngn * 0.02,
+                start_below_mid: (next() * 2.0 - 1.0) * mid_ngn * 0.02,
+                end_above_buy: (next() * 2.0 - 1.0) * mid_ngn * 0.02,
                 shape: 0.5 + next() * 3.5,
             };
             let Some(c) = Curve::new(1.0 / mid_ngn, half, all_in, &p) else {
                 panic!("case {case}: valid inputs must make a curve");
             };
-            // Endpoints land on the knobs, by construction, to f64 accuracy.
+            let (s0, s1) = c.endpoints_bps();
+            assert!(s1 >= s0, "case {case}: the curve leans backwards");
+            // Endpoints land on the knobs, by construction, to f64 accuracy,
+            // unless the knobs crossed and the curve collapsed flat.
             let sell0 = 1.0 / c.price(true, 0.0, 0.0, all_in).unwrap();
             let buy1 = 1.0 / c.price(false, 1.0, 1.0, all_in).unwrap();
             let want0 = mid_ngn - p.start_below_mid;
             let want1 = mid_ngn * (1.0 + half / 10_000.0) + p.end_above_buy;
-            assert!(((sell0 - want0) / want0).abs() < 1e-9, "case {case}: start");
-            assert!(((buy1 - want1) / want1).abs() < 1e-9, "case {case}: end");
+            if s1 > s0 {
+                assert!(((sell0 - want0) / want0).abs() < 1e-9, "case {case}: start");
+                assert!(((buy1 - want1) / want1).abs() < 1e-9, "case {case}: end");
+            }
             // The average is order-free, and a round trip at the realized
             // (all-in) price always costs the taker about twice the all-in.
             let f0 = next();
@@ -524,7 +653,11 @@ mod tests {
                 for bid in [true, false] {
                     let near = c.price(bid, lo, lo, all_in).unwrap();
                     let far = c.price(bid, hi, hi, all_in).unwrap();
-                    assert!(far < near, "case {case}: price must fall as f rises");
+                    if s1 > s0 {
+                        assert!(far < near, "case {case}: price must fall as f rises");
+                    } else {
+                        assert!(far == near, "case {case}: a collapsed curve is flat");
+                    }
                 }
             }
         }

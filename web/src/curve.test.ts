@@ -41,6 +41,8 @@ describe('inventory curve', () => {
       [0, 0],
       [0.5, 1],
       [1.25, 0.25],
+      [-0.5, -0.2],
+      [-0.9, 0.3],
     ]
     for (const [start, end] of settings) {
       const c = curveFor(reference, ALL_IN, knobs(start, end))!
@@ -49,16 +51,65 @@ describe('inventory curve', () => {
     }
   })
 
-  it('never pays a round trip', () => {
-    const c = curveFor(reference, ALL_IN, knobs(0.5, 1))!
-    for (let f0 = 0; f0 <= 1; f0 += 0.05) {
-      for (let t = 0.01; f0 + t <= 1; t += 0.07) {
-        // Bot buys cNGN out to f0 + t, then sells it straight back.
-        const out = takerPrice(c, true, f0, f0 + t)
-        const back = takerPrice(c, false, f0 + t, f0)
-        expect(back).toBeLessThan(out)
+  it('never pays a round trip, narrowed or crossed', () => {
+    for (const [start, end] of [
+      [0.5, 1],
+      [-0.5, -0.3],
+      [-1, -1],
+    ]) {
+      const c = curveFor(reference, ALL_IN, knobs(start!, end!))!
+      for (let f0 = 0; f0 <= 1; f0 += 0.05) {
+        for (let t = 0.01; f0 + t <= 1; t += 0.07) {
+          // Bot buys cNGN out to f0 + t, then sells it straight back.
+          const out = takerPrice(c, true, f0, f0 + t)
+          const back = takerPrice(c, false, f0 + t, f0)
+          expect(back).toBeLessThan(out)
+        }
       }
     }
+  })
+
+  it('narrows on negative knobs and goes flat, not backwards, when they cross', () => {
+    const wide = curveFor(reference, ALL_IN, knobs(0, 0))!
+    const narrow = curveFor(reference, ALL_IN, knobs(-0.5, -0.3))!
+    expect(narrow.s0).toBeGreaterThan(wide.s0)
+    expect(narrow.s1).toBeLessThan(wide.s1)
+    expect(takerPrice(narrow, true, 0, 0)).toBeGreaterThan(MID)
+    // The buy sits about 1.3 NGN over the mid and the round trip costs about
+    // 0.55: the shades cross past about 1.85 off, so 2 off goes flat.
+    const crossed = curveFor(reference, ALL_IN, knobs(-1, -1))!
+    expect(crossed.s0).toBe(crossed.s1)
+    expect(shadeAt(crossed, 0)).toBe(shadeAt(crossed, 1))
+    const until = cheapestUntil(crossed, HALF)
+    expect(until === 0 || until === 1).toBe(true)
+    // Walking the end knob through the crossing never jumps the price.
+    let last: number | null = null
+    for (let end = 0; end > -2.5; end -= 0.01) {
+      const p = takerPrice(
+        curveFor(reference, ALL_IN, knobs(-1, end))!,
+        true,
+        0.5,
+        0.5
+      )
+      if (last !== null)
+        expect(Math.abs((p / last - 1) * 10_000)).toBeLessThan(0.5)
+      last = p
+    }
+  })
+
+  it('crosses the all-in ends before the shades', () => {
+    // The all-in sell at no naira sits above the all-in buy full of it, but
+    // the shades still rise: still a curve.
+    const c = curveFor(reference, ALL_IN, knobs(-0.7, -0.7))!
+    expect(takerPrice(c, true, 0, 0)).toBeGreaterThan(
+      takerPrice(c, false, 1, 1)
+    )
+    expect(c.s1).toBeGreaterThan(c.s0)
+    // The shades cross at about 0.925 off each end.
+    const just = curveFor(reference, ALL_IN, knobs(-0.92, -0.92))!
+    expect(just.s1).toBeGreaterThan(just.s0)
+    const past = curveFor(reference, ALL_IN, knobs(-0.93, -0.93))!
+    expect(past.s1).toBe(past.s0)
   })
 
   it('stays the cheapest dollars past 80% naira at zero knobs', () => {
@@ -76,19 +127,27 @@ describe('inventory curve', () => {
       curveFor({ mid: 0, half_range_bps: HALF }, ALL_IN, knobs(0, 0))
     ).toBeNull()
     expect(curveFor(reference, ALL_IN, knobs(MID, 0))).toBeNull()
+    expect(curveFor(reference, ALL_IN, knobs(0, -2 * MID))).toBeNull()
   })
 
   it('names its knobs the way the row shows them', () => {
     expect(knobLabel('Mid', 0)).toBe('Mid')
     expect(knobLabel('Mid', 0.5)).toBe('Mid − 0.5')
     expect(knobLabel('Buy', 1)).toBe('Buy + 1')
+    expect(knobLabel('Mid', -0.5)).toBe('Mid + 0.5')
+    expect(knobLabel('Buy', -0.3)).toBe('Buy − 0.3')
     expect(shapeLabel(2)).toBe('f²')
     expect(shapeLabel(2.5)).toBe('f^2.5')
   })
 
-  it('refuses negative knobs and a shape out of range', () => {
+  it('takes negative knobs, refuses a non-number, an offset past the controls and a shape out of range', () => {
     expect(curveConfigErrors(knobs(0, 0))).toEqual([])
-    expect(curveConfigErrors(knobs(-1, 0))).toHaveLength(1)
+    expect(curveConfigErrors(knobs(-1, -0.5))).toEqual([])
+    expect(curveConfigErrors(knobs(-1000, 1000))).toEqual([])
+    expect(curveConfigErrors(knobs(NaN, 0))).toHaveLength(1)
+    expect(curveConfigErrors(knobs(-1001, 0))).toHaveLength(1)
+    expect(curveConfigErrors(knobs(0, -1001))).toHaveLength(1)
+    expect(curveConfigErrors(knobs(1001, 0))).toHaveLength(1)
     expect(
       curveConfigErrors({ start_below_mid: 0, end_above_buy: 0, shape: 9 })
     ).toHaveLength(1)

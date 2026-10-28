@@ -63,15 +63,15 @@ Numbers are starter configuration, not recommendations for a particular currency
 
 ## Inventory curve
 
-The inventory curve leans Swap quotes on the bot's own share of the corridor currency (cNGN first), the share it holds of everything it holds, valued at the feed's reference mid. With none, the bot sells dollars at the reference mid; full of it, it pays the reference buy, what clearing the currency on the reference market would cost. In between, the lean grows with the share raised to `shape` (2 by default: it stays near the mid through normal holdings and leans hardest near full). The two offsets widen either end, in the soft currency (NGN for cNGN), and are measured from the reference book on every quote.
+The inventory curve leans Swap quotes on the bot's own share of the corridor currency (cNGN first), the share it holds of everything it holds, valued at the feed's reference mid. With none, the bot sells dollars at the reference mid; full of it, it pays the reference buy, what clearing the currency on the reference market would cost. In between, the lean grows with the share raised to `shape` (2 by default: it stays near the mid through normal holdings and leans hardest near full). The two offsets move either end, in the soft currency (NGN for cNGN), and are measured from the reference book on every quote: positive widens the curve, negative narrows it (starting above the mid, ending below the buy). The curve only goes flat once negative offsets together take off the reference half-range plus the round-trip spread (twice the spread and fee), where the de-spread centres of the two ends cross. Smaller cuts can already put the empty-side sell above the full-side buy, and the curve still leans the right way: at any one share the bot's buy stays a round trip under its sell. Flat means one centre halfway between the two, never backwards; it narrows into that smoothly, so a half-range that wobbles around the crossing never jumps the price.
 
 Each quote pays the average lean across the stretch of holdings that trade moves the bot through, not the lean where it starts, so a trade out and straight back always costs the taker the spread, at any size. Quotes already given out on one side count as moved for the next quote on that side (never the other side), so splitting a trade buys nothing. In Live the levels the venue routes on are priced off the same curve, eight rows a side, so firm replies stay inside the corridor's level slack (the venue sends each corridor's `levelSlackBps` when the session opens); a reply that would still land past it, after a large same-side quote or answered flat against curved levels, is declined rather than sent. A quote that fills stops counting as given out on the next balance read, not at its deadline: the bot reads the order's Permit2 nonce in the same Multicall3 batch as the balances, so the release and the balance that shows the trade come from one block. The full design, the attacks it closes and its decision log are in [the curve spec](cngn-quote-curve-spec.md).
 
 ```toml
 [modules.curve]
 enabled = false        # on in Preview from the panel; Live with [modules].mode
-start_below_mid = 0.0  # NGN below the reference mid, holding none
-end_above_buy = 0.0    # NGN above the reference buy, holding nothing else
+start_below_mid = 0.0  # NGN below the reference mid, holding none (negative: above it)
+end_above_buy = 0.0    # NGN above the reference buy, holding nothing else (negative: below it)
 shape = 2.0            # 0.5 to 4
 ```
 

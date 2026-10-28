@@ -248,6 +248,7 @@ export function NumberControl({
   min = 0,
   max = 4999,
   step = 1,
+  sliderMin,
   sliderMax,
   hint,
   fractionDigits,
@@ -260,6 +261,8 @@ export function NumberControl({
   min?: number
   max?: number
   step?: number
+  /** Where the slider starts when `min` is far below the useful range. */
+  sliderMin?: number
   sliderMax?: number
   hint?: string
   /** Accept any value, shown to this many decimals of the displayed unit.
@@ -273,9 +276,10 @@ export function NumberControl({
     value >= min &&
     value <= max &&
     (fractionDigits !== undefined || step !== 1 || Number.isInteger(value))
+  const start = Math.max(min, Math.min(sliderMin ?? min, finite ? value : min))
   const end = Math.min(max, Math.max(sliderMax ?? max, finite ? value : min))
   const fill = valid
-    ? Math.min(100, Math.max(0, ((value - min) / (end - min)) * 100))
+    ? Math.min(100, Math.max(0, ((value - start) / (end - start)) * 100))
     : 0
   const shown = (n: number) => n / scale
   // "30%" and "2×" hug the number; a word unit gets a space: "5 NGN".
@@ -324,10 +328,10 @@ export function NumberControl({
             type="range"
             aria-label={`${label} slider`}
             aria-valuetext={valid ? `${typed(value)}${suffix}` : 'Choose a value'}
-            min={min}
+            min={start}
             max={end}
             step={step}
-            value={valid ? value : min}
+            value={valid ? value : start}
             onChange={(e) => onChange(Number(e.target.value))}
             className="module-range w-full cursor-pointer"
             style={{
@@ -336,7 +340,7 @@ export function NumberControl({
           />
           <div className="text-muted flex justify-between text-xs">
             <span>
-              {shown(min)}
+              {shown(start)}
               {suffix}
             </span>
             <span>
