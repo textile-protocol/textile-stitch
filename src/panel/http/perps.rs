@@ -37,7 +37,7 @@ pub async fn show(
     };
     let unavailable = remote.is_err();
     Ok(Json(
-        json!({"enabled":p.enabled,"assignmentId":p.assignment_id,
+        json!({"enabled":p.enabled,"recallEnabled":p.recall_enabled,"fundingTargetAtoms":p.funding_target_atoms,"assignmentId":p.assignment_id,
         "remote":remote.ok().flatten(),"unavailable":unavailable}),
     ))
 }
@@ -46,6 +46,10 @@ pub async fn show(
 pub struct Update {
     assignment_id: String,
     mode: String,
+    #[serde(default)]
+    recall_enabled: bool,
+    #[serde(default)]
+    funding_target_atoms: String,
 }
 pub async fn update(
     State(state): State<AppState>,
@@ -70,6 +74,16 @@ pub async fn update(
     {
         return Err(ApiError::bad_request(
             "Turn the existing FX hedge off before changing assignments",
+        ));
+    }
+    if dir.join("perps-funding-pending.json").exists()
+        && cfg
+            .perps
+            .as_ref()
+            .is_some_and(|p| p.assignment_id != body.assignment_id)
+    {
+        return Err(ApiError::bad_request(
+            "Reconcile pending funding before changing assignments",
         ));
     }
     // Off must be available during a venue outage. The running task also reads
@@ -143,6 +157,8 @@ pub async fn update(
     // Validate locally before requesting an authorization revision.
     let candidate = PerpsConfig {
         enabled,
+        recall_enabled: body.recall_enabled,
+        funding_target_atoms: body.funding_target_atoms.clone(),
         assignment_id: body.assignment_id.clone(),
         bot_id: name,
         revision: "0".repeat(36),
@@ -159,7 +175,7 @@ pub async fn update(
         reqwest::Method::PUT,
         &body.assignment_id,
         "",
-        Some(json!({"mode":body.mode})),
+        Some(json!({"mode":body.mode, "recallEnabled":body.recall_enabled})),
     )
     .await
     .map_err(ApiError::bad_request)?;
@@ -170,6 +186,38 @@ pub async fn update(
     // The service requires heartbeats carrying this revision. A failed save or
     // restart cannot leave an old bot authorized to increase a position.
     super::settings::save_and_restart(&state,&bot,&path,&doc.to_string(),&origin,0,Some(json!({"note":"FX hedge authorization saved. Off stops increases; existing positions retain exit and liquidation protection."}))).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resume {
+    diagnosis: String,
+}
+pub async fn resume(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<Resume>,
+) -> Result<Json<Value>, ApiError> {
+    let (_lock, bot) = super::bots::lock_config(&name, &state).await?;
+    super::require_editable(&bot)?;
+    let path = super::settings::config_path(&bot)?;
+    let cfg =
+        Config::from_toml(&super::settings::read_toml(&path)?).map_err(ApiError::bad_request)?;
+    let p = cfg
+        .perps
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("No hedge configured"))?;
+    perps::request(
+        &cfg,
+        path.parent().expect("config parent"),
+        reqwest::Method::POST,
+        &p.assignment_id,
+        "/recall/resume",
+        Some(json!({"diagnosis": body.diagnosis})),
+    )
+    .await
+    .map(Json)
+    .map_err(ApiError::bad_request)
 }
 
 fn assignment_matches(a: &Value, name: &str, cfg: &Config, funding: &str) -> bool {

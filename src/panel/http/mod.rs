@@ -327,6 +327,7 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             "/api/bots/{name}/perps",
             get(perps::show).put(perps::update),
         )
+        .route("/api/bots/{name}/perps/recall/resume", post(perps::resume))
         .route("/api/bots/{name}/name", patch(bots::rename))
         .route("/api/bots/{name}/start", post(bots::start))
         .route("/api/bots/{name}/stop", post(bots::stop))

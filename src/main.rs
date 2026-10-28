@@ -356,6 +356,14 @@ async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow:
         return Ok(());
     }
     let signer = build_signer(&cfg).await?;
+    stitch_bot::chain::rpc::register_external_journal(
+        cfg.chain_id,
+        signer.address(),
+        std::path::Path::new(&config_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("perps-funding-pending.json"),
+    );
     let permit2: Address = cfg.permit2.parse().context("invalid permit2 address")?;
     let wallet =
         Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id).with_gas_caps(cfg.gas_caps());
@@ -397,6 +405,14 @@ async fn run_withdraw(
             .with_context(|| format!("reading config {config_path}"))?,
     )?;
     let signer = build_signer(&cfg).await?;
+    stitch_bot::chain::rpc::register_external_journal(
+        cfg.chain_id,
+        signer.address(),
+        std::path::Path::new(&config_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("perps-funding-pending.json"),
+    );
     let wallet =
         Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id).with_gas_caps(cfg.gas_caps());
     let plan =
@@ -810,6 +826,16 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     let shipping = record_config_at_startup(&config_path, &config_text, &cfg, dry_run)?;
     let signer = build_signer(&cfg).await?;
     let maker = signer.address();
+    if !dry_run {
+        let dir = std::path::Path::new(&config_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        stitch_bot::chain::rpc::register_external_journal(
+            cfg.chain_id,
+            maker,
+            dir.join("perps-funding-pending.json"),
+        );
+    }
     let permit2: Address = cfg.permit2.parse().context("invalid permit2 address")?;
     let reactor: Address = cfg.reactor.parse().context("invalid reactor address")?;
 
@@ -960,8 +986,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // RFQ responder: spawned only when `[rfq].enabled`. With the config
     // off this is a no-op. The public ladder is a separate `book_enabled`
     // switch.
-    let perps_task =
-        stitch_bot::perps::maybe_spawn(&cfg, dry_run, std::path::Path::new(&config_path));
+    let perps_task = stitch_bot::perps::maybe_spawn_with_signer(
+        &cfg,
+        dry_run,
+        std::path::Path::new(&config_path),
+        signer.clone(),
+    );
     let change_log_task = stitch_bot::changelog::ship::spawn(
         &cfg,
         std::path::Path::new(&config_path),

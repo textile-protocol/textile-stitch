@@ -92,8 +92,8 @@ use nonce::rfq_nonce;
 use order::{build_order, RfqOrderSpec};
 use reserve::{Reservations, RESERVATIONS_FILE};
 use responder::{
-    book_from_pool, decide_quote_curved, levels_for_curved, wallet_tokens, CorridorBook, CurveNote,
-    InventoryView,
+    book_from_pool, decide_quote, decide_quote_curved, levels_for, levels_for_curved,
+    wallet_tokens, CorridorBook, CurveNote, InventoryView,
 };
 use session::AuthedSession;
 use wire::{
@@ -111,6 +111,7 @@ const CLOSE_REDEEM_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Everything the responder task needs, resolved once at spawn so the hot
 /// path never re-reads config or environment.
 pub struct RfqRuntime {
+    perps: Option<crate::perps::PerpsConfig>,
     url: String,
     api_key: String,
     maker_id: String,
@@ -420,6 +421,7 @@ fn build_runtime(
     // Modules price off the first corridor (see `module_tick`).
     let module_price_source = books[0].feed_url.clone();
     Ok(RfqRuntime {
+        perps: cfg.perps.clone(),
         url: rfq.url.clone(),
         api_key,
         maker_id: rfq.maker_id.clone(),
@@ -1252,6 +1254,11 @@ async fn session_loop_inner(
     }
 
     let mut engine = Engine {
+        recall: rt
+            .perps
+            .as_ref()
+            .zip(rt.config_dir.as_ref())
+            .and_then(|(p, dir)| crate::perps::recall::Runtime::load(p, dir, unix_now()).ok()),
         books,
         configured: rt.books.clone(),
         reservations,
@@ -1452,6 +1459,7 @@ async fn session_loop_inner(
 /// back to the reconnect driver when the session ends, because signed quotes
 /// outlive sockets. Everything price-shaped delegates to [`responder`].
 struct Engine {
+    recall: Option<crate::perps::recall::Runtime>,
     books: Vec<CorridorBook>,
     /// Every pool as configured, including the ones the venue did not assign.
     ///
@@ -1668,6 +1676,9 @@ impl Engine {
     fn level_frames(&mut self, prices: &PriceCache, now_ms: u64) -> Vec<MakerFrame> {
         use crate::modules::runtime::QuoteState;
         self.sync_vault_epoch();
+        if let Some(r) = &mut self.recall {
+            r.prune(now_ms / 1000);
+        }
         let now_secs = now_ms / 1_000;
         self.release_fills(now_secs);
         let inventory = self.inventory.view(now_secs);
@@ -1736,7 +1747,7 @@ impl Engine {
                         modules.curve_reading(reading);
                     }
                 }
-                let levels = levels_for_curved(
+                let mut levels = levels_for_curved(
                     &effective,
                     quote.price,
                     &inputs,
@@ -1749,6 +1760,12 @@ impl Engine {
                     &inventory,
                     &order_caps,
                 );
+                if self.vault.is_none() {
+                    if let Some(cap) = self.recall.as_ref().and_then(|r| r.capacity(self.chain_id, self.signer.address(), book.collateral, book.debt, now_ms)) {
+                        levels.recall_asks = levels_for(&effective, quote.price, U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO,
+                            format_iso_ms(now_ms), &crate::perps::recall::inventory(book.collateral, cap.atoms), &[]).asks;
+                    }
+                }
                 Some(MakerFrame::Levels(guard::levels_in_band(
                     levels,
                     quote.price,
@@ -1770,6 +1787,10 @@ impl Engine {
                 }
                 // Only never-exposed losing replies release early. A selected
                 // signature remains executable despite closing the venue window.
+                let recall_released = self
+                    .recall
+                    .as_mut()
+                    .is_some_and(|recall| recall.quote_result(&r.rfq_id, &r.result));
                 match r.result.as_str() {
                     "selected" => {
                         self.reservations.mark_exposed(&r.rfq_id);
@@ -1777,7 +1798,7 @@ impl Engine {
                         info!(rfq_id = %r.rfq_id, result = %r.result, "quote result");
                     }
                     "no_quote" | "lost_price" | "invalid" | "late" => {
-                        if self.reservations.release_unexposed(&r.rfq_id) {
+                        if self.reservations.release_unexposed(&r.rfq_id) || recall_released {
                             info!(
                                 rfq_id = %r.rfq_id,
                                 result = %r.result,
@@ -1804,6 +1825,9 @@ impl Engine {
                 // This may precede selected during reconnect/replay. It still
                 // identifies a signature the taker can hold, not a revocation.
                 self.reservations.mark_exposed(&e.rfq_id);
+                if let Some(recall) = &mut self.recall {
+                    recall.mark_exposed(&e.rfq_id);
+                }
                 self.publish_fill_watch(unix_now());
                 debug!(rfq_id = %e.rfq_id, "quote window closed; signed inventory remains reserved");
                 None
@@ -1829,7 +1853,12 @@ impl Engine {
 
         // One signature per live RFQ id. Replayed requests must not replace
         // the claim for an earlier authorization with a new nonce/amount.
-        if self.reservations.corridor(&req.rfq_id).is_some() {
+        if self.reservations.corridor(&req.rfq_id).is_some()
+            || self
+                .recall
+                .as_ref()
+                .is_some_and(|recall| recall.has_reservation(&req.rfq_id))
+        {
             return reject(RejectReason::Busy);
         }
 
@@ -1938,7 +1967,7 @@ impl Engine {
                 return reject(RejectReason::Busy);
             }
         }
-        let expires_ms = (now_ms + req.quote_ttl_ms).min(deadline_secs * 1_000);
+        let mut expires_ms = (now_ms + req.quote_ttl_ms).min(deadline_secs * 1_000);
         let Ok(taker) = req.taker.parse::<Address>() else {
             warn!(raw = %req.taker, "unparseable taker address");
             return reject(RejectReason::Busy);
@@ -1947,6 +1976,7 @@ impl Engine {
         let Some(effective_book) = self.module_book(&book, &quote, now_secs) else {
             return reject(RejectReason::Busy);
         };
+        let mut recall_offer = None;
         self.venue_fee_bps = req.fee_bps;
         let (plan, curve_note) = match decide_quote_curved(
             &effective_book,
@@ -1960,6 +1990,45 @@ impl Engine {
             &self.inventory.view(now_secs),
         ) {
             Ok(out) => out,
+            Err(RejectReason::Inventory) if self.vault.is_none() && manual_sale.is_none() => {
+                let Some(o) = req.recall.as_ref() else {
+                    return reject(RejectReason::Inventory);
+                };
+                let Some(cap) = self.recall.as_ref().and_then(|r| {
+                    r.offer(
+                        o,
+                        self.chain_id,
+                        self.signer.address(),
+                        book.collateral,
+                        book.debt,
+                        now_ms,
+                    )
+                }) else {
+                    return reject(RejectReason::Inventory);
+                };
+                if req.buy_token.parse::<Address>().ok() != Some(book.collateral) {
+                    return reject(RejectReason::Busy);
+                }
+                let plan = match decide_quote(
+                    &effective_book,
+                    &req,
+                    quote.price,
+                    U256::ZERO,
+                    U256::ZERO,
+                    U256::ZERO,
+                    U256::ZERO,
+                    &crate::perps::recall::inventory(book.collateral, cap.atoms),
+                ) {
+                    Ok(p) if !p.bid && p.input <= cap.atoms => p,
+                    _ => return reject(RejectReason::Inventory),
+                };
+                deadline_secs = o.created_at + 90; // validated, overflow-checked by Runtime::offer
+                expires_ms = (o.created_at + 60) * 1000;
+                recall_offer = Some((o.clone(), cap.executor));
+                // Recalled collateral has its own flat levels and reservation
+                // ledger; it is not part of the liquid wallet's pricing curve.
+                (plan, None)
+            }
             Err(reason) => return reject(reason),
         };
         match curve_note {
@@ -2023,7 +2092,8 @@ impl Engine {
         // the corridor's slack past them is a strike; declining is not. The
         // session loop republishes this corridor right after every request,
         // so this only bites inside that gap.
-        if book.curve.is_some_and(|c| c.live) {
+        // Recall replies use recall_asks, not the liquid curve's published levels.
+        if recall_offer.is_none() && book.curve.is_some_and(|c| c.live) {
             let slack = self.level_slack_bps(&book.slug);
             let worse = self.published_levels.get(&book.slug).and_then(|levels| {
                 responder::worse_than_levels_bps(
@@ -2131,7 +2201,7 @@ impl Engine {
             rfq_nonce(now_ms, self.counter)
         };
         self.counter += 1;
-        let order = build_order(&RfqOrderSpec {
+        let mut order = build_order(&RfqOrderSpec {
             reactor: self.reactor,
             maker,
             nonce,
@@ -2144,6 +2214,10 @@ impl Engine {
             taker,
             order_executor: self.vault_order_executor,
         });
+        if let Some((_, executor)) = &recall_offer {
+            order.additional_validation_data =
+                order::encode_preferred_filler_validation(&[*executor], deadline_secs);
+        }
         if let Some(vs_print_bps) = guard::order_refusal(
             &order,
             plan.bid,
@@ -2204,6 +2278,33 @@ impl Engine {
             }
         };
 
+        let recall_authorization = if let Some((o, executor)) = &recall_offer {
+            let payload = crate::protocol::typed_data::recall_payload(
+                self.chain_id,
+                *executor,
+                alloy_primitives::keccak256(encode_order_bytes(&order)),
+                taker,
+                plan.sell_amount,
+                o.created_at,
+                o.max_recall_price.parse().expect("validated recall price"),
+            );
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(reply_by_ms.saturating_sub(unix_now_ms())),
+                self.signer.sign_typed(&payload),
+            )
+            .await
+            {
+                Ok(Ok(sig)) => Some(wire::RecallAuthorization {
+                    route: "gmx-recall-v1".into(),
+                    authorization: alloy_primitives::hex::encode_prefixed(sig),
+                    max_debit: plan.sell_amount.to_string(),
+                }),
+                _ => return reject(RejectReason::Busy),
+            }
+        } else {
+            None
+        };
+
         if let Some(sale) = &manual_sale {
             let modules = self.modules.as_ref().expect("manual runtime");
             if crate::modules::manual::read(&modules.dir, &sale.id)
@@ -2232,23 +2333,50 @@ impl Engine {
             warn!(rfq_id = %req.rfq_id, ?reason, "the reference price changed while signing; signature withheld");
             return reject(reason);
         }
-        if !self.fits_liquidity_cap(&book, &plan, unix_now()) {
+        if recall_offer.is_none() && !self.fits_liquidity_cap(&book, &plan, unix_now()) {
             warn!(rfq_id = %req.rfq_id, "the liquidity cap tightened while signing; signature withheld");
             return reject(RejectReason::Inventory);
         }
 
         // The reservation starts the moment the signed order exists — even if
         // the send fails, the signature may have left the process.
-        self.reservations.reserve_order(
-            req.rfq_id.clone(),
-            book.slug.clone(),
-            plan.bid,
-            plan.input,
-            deadline_secs,
-            format!("{:#x}", plan.input_token),
-            nonce,
-        );
-
+        if let Some((offer, _)) = &recall_offer {
+            let Some(runtime) = self.recall.as_mut() else {
+                return reject(RejectReason::Busy);
+            };
+            if runtime
+                .offer(
+                    offer,
+                    self.chain_id,
+                    self.signer.address(),
+                    book.collateral,
+                    book.debt,
+                    unix_now_ms(),
+                )
+                .is_none()
+                || runtime
+                    .reserve(
+                        &req.rfq_id,
+                        &book.slug,
+                        plan.input_token,
+                        plan.input,
+                        deadline_secs,
+                    )
+                    .is_err()
+            {
+                return reject(RejectReason::Busy);
+            }
+        } else {
+            self.reservations.reserve_order(
+                req.rfq_id.clone(),
+                book.slug.clone(),
+                plan.bid,
+                plan.input,
+                deadline_secs,
+                format!("{:#x}", plan.input_token),
+                nonce,
+            );
+        }
         if self.modules.is_some() && self.reservations.flush().is_err() {
             error!("module-enabled quote withheld: reservation persistence failed");
             return reject(RejectReason::Busy);
@@ -2258,6 +2386,7 @@ impl Engine {
             modules.status("Manual sale quoted; awaiting buyer settlement");
         }
         MakerFrame::QuoteResponse(QuoteResponseFrame {
+            recall: recall_authorization,
             rfq_id: req.rfq_id,
             sell_amount: plan.sell_amount.to_string(),
             buy_amount: plan.buy_amount.to_string(),
@@ -4326,6 +4455,7 @@ mod tests {
         )
         .unwrap();
         Engine {
+            recall: None,
             books: vec![CorridorBook {
                 slug: "cngn-usdc".into(),
                 collateral: COLLATERAL.parse().unwrap(),
@@ -4726,6 +4856,7 @@ mod tests {
     fn exact_input_request(rfq_id: &str) -> QuoteRequestFrame {
         let deadline = unix_now_ms() + 120_000;
         QuoteRequestFrame {
+            recall: None,
             rfq_id: rfq_id.into(),
             corridor_id: "cngn-usdc".into(),
             chain_id: 8453,
@@ -5908,6 +6039,236 @@ mod tests {
             reserved_bid,
             "closing the accept window cannot restore executable inventory"
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_curve_keeps_recall_levels_and_quotes_separate_from_liquid_inventory() {
+        let mut engine = curve_engine(crate::modules::Mode::Live);
+        let dir = temp_dir("curve-recall");
+        let now = unix_now();
+        let now_ms = unix_now_ms();
+        let config = crate::perps::PerpsConfig {
+            enabled: true,
+            recall_enabled: true,
+            assignment_id: "celo-idrx".into(),
+            bot_id: "stitch-celo-2".into(),
+            revision: "one".into(),
+            ..Default::default()
+        };
+        let book = &mut engine.books[0];
+        book.slug = "idrx-usdt".into();
+        book.collateral_decimals = 2;
+        book.sell_capacity_collateral = Some(RfqCapacity::Exact(U256::from(150_000)));
+        engine.chain_id = 42220;
+        // A collateral-heavy wallet prices liquid asks below the flat recall ask.
+        engine.inventory.set(
+            book.collateral,
+            U256::from(800_000),
+            U256::from(800_000),
+            now,
+        );
+        engine.inventory.set(
+            book.debt,
+            U256::from(2_000_000_000u64),
+            U256::from(2_000_000_000u64),
+            now,
+        );
+        let book = book.clone();
+        let executor = "0x00000000000000000000000000000000000000aa";
+        let price_limit = "500500000000000000000000";
+        crate::perps::recall::cache(
+            &dir,
+            serde_json::json!({
+                "control": {"revision": config.revision}, "effectiveMode": "live",
+                "assignment": {"id": config.assignment_id, "botId": config.bot_id},
+                "recall": {
+                    "enabled": true, "reservedCollateralAtoms": "0", "operations": [],
+                    "position": {"pauseReason": null, "observedAt": format_iso_ms(now_ms),
+                        "recallableAtoms": "150000", "recallMaxPrice30": price_limit},
+                    "manifest": {"version": 2, "chainId": engine.chain_id,
+                        "assignment": {"fundingWallet": format!("{:#x}", engine.signer.address())},
+                        "assets": {"collateral": {"address": format!("{:#x}", book.collateral)},
+                            "payment": {"address": format!("{:#x}", book.debt)}},
+                        "limits": {"quoteAtoms": "150000"},
+                        "contracts": {"executor": {"address": executor}}}
+                }
+            }),
+            now_ms,
+        )
+        .unwrap();
+        engine.recall = Some(crate::perps::recall::Runtime::load(&config, &dir, now).unwrap());
+        let prices = fresh_prices_with_reference();
+        let MakerFrame::Levels(levels) = engine.level_frames(&prices, now_ms)[0].clone() else {
+            panic!("expected levels");
+        };
+        assert_eq!(levels.recall_asks.len(), 1);
+        assert_eq!(levels.asks.len(), responder::CURVE_LEVEL_ROWS as usize);
+        engine
+            .published_levels
+            .insert(book.slug.clone(), levels.clone());
+
+        // After liquid inventory leaves the wallet, only the separate recall
+        // levels remain. The last liquid curve must not price this response.
+        engine
+            .inventory
+            .set(book.collateral, U256::ZERO, U256::ZERO, now);
+        let MakerFrame::Levels(recall_only) = engine.level_frames(&prices, now_ms)[0].clone()
+        else {
+            panic!("expected recall levels");
+        };
+        assert!(recall_only.asks.is_empty());
+        assert_eq!(recall_only.recall_asks.len(), 1);
+        assert_eq!(recall_only.recall_asks[0].size, levels.recall_asks[0].size);
+        assert_eq!(
+            recall_only.recall_asks[0].rate_ray,
+            levels.recall_asks[0].rate_ray
+        );
+        let mut req = exact_input_request("curve-recall");
+        req.chain_id = engine.chain_id;
+        req.corridor_id = book.slug.clone();
+        req.sell_token = format!("{:#x}", book.debt);
+        req.buy_token = format!("{:#x}", book.collateral);
+        req.sell_amount = None;
+        req.buy_amount = Some("100000".into());
+        req.recall = Some(wire::RecallOffer {
+            route: "gmx-recall-v1".into(),
+            assignment_id: config.assignment_id.clone(),
+            executor: executor.into(),
+            created_at: now,
+            accept_by: format_iso_ms((now + 60) * 1000),
+            settle_by: format_iso_ms((now + 90) * 1000),
+            capacity_atoms: "150000".into(),
+            max_recall_price: price_limit.into(),
+            revision: 1,
+        });
+        let expected = decide_quote(
+            &book,
+            &req,
+            1.0,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            &crate::perps::recall::inventory(book.collateral, U256::from(150_000)),
+        )
+        .unwrap();
+        assert!(
+            responder::worse_than_levels_bps(
+                &expected,
+                &levels,
+                book.debt_decimals,
+                book.collateral_decimals
+            )
+            .unwrap()
+                > engine.level_slack_bps(&book.slug)
+        );
+        let reply = engine.respond(req, &prices).await;
+        let MakerFrame::QuoteResponse(reply) = reply else {
+            panic!("recall must not be rejected against liquid curve levels: {reply:?}");
+        };
+        assert_eq!(reply.sell_amount, expected.sell_amount.to_string());
+        assert_eq!(reply.buy_amount, expected.buy_amount.to_string());
+        assert_eq!(reply.expires_at, format_iso_ms((now + 60) * 1000));
+        assert!(reply.recall.is_some());
+        assert!(engine
+            .recall
+            .as_ref()
+            .unwrap()
+            .has_reservation("curve-recall"));
+        assert!(engine.reservations.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recall_results_update_the_separate_ledger_without_releasing_exposed_quotes() {
+        for result in ["lost_price", "invalid", "no_quote", "late"] {
+            for exposure in ["unselected", "selected", "expired"] {
+                let mut engine = test_engine();
+                let dir = temp_dir(&format!("recall-{result}-{exposure}"));
+                let config = crate::perps::PerpsConfig {
+                    enabled: true,
+                    recall_enabled: true,
+                    ..Default::default()
+                };
+                let mut recall =
+                    crate::perps::recall::Runtime::load(&config, &dir, unix_now()).unwrap();
+                recall
+                    .reserve(
+                        "recall",
+                        "idrx",
+                        engine.books[0].collateral,
+                        U256::from(400),
+                        unix_now() + 90,
+                    )
+                    .unwrap();
+                engine.recall = Some(recall);
+                let prices = fresh_prices();
+                // A replay cannot substitute a liquid quote for this signed recall.
+                assert!(matches!(
+                    engine.respond(exact_input_request("recall"), &prices).await,
+                    MakerFrame::QuoteReject(QuoteRejectFrame {
+                        reason: RejectReason::Busy,
+                        ..
+                    })
+                ));
+                if exposure == "selected" {
+                    engine
+                        .dispatch(
+                            VenueFrame::QuoteResult(QuoteResultFrame {
+                                rfq_id: "recall".into(),
+                                result: "selected".into(),
+                            }),
+                            &prices,
+                        )
+                        .await;
+                } else if exposure == "expired" {
+                    engine
+                        .dispatch(
+                            VenueFrame::QuoteExpired(QuoteExpiredFrame {
+                                rfq_id: "recall".into(),
+                            }),
+                            &prices,
+                        )
+                        .await;
+                }
+                // Only ordinary orders enter Permit2 fill tracking. Releasing
+                // a confirmed liquid fill must leave the recall hold intact.
+                let nonce = U256::from(7);
+                engine.reservations.reserve_order(
+                    "liquid",
+                    "idrx",
+                    false,
+                    U256::from(100),
+                    unix_now() + 90,
+                    COLLATERAL,
+                    nonce,
+                );
+                engine.reservations.mark_exposed("liquid");
+                engine.publish_fill_watch(unix_now());
+                assert_eq!(engine.fills.watched(), vec![nonce]);
+                engine.fills.saw_spent(vec![nonce]);
+                engine.release_fills(unix_now());
+                assert!(engine.reservations.is_empty());
+                assert!(engine.recall.as_ref().unwrap().has_reservation("recall"));
+                for _ in 0..2 {
+                    engine
+                        .dispatch(
+                            VenueFrame::QuoteResult(QuoteResultFrame {
+                                rfq_id: "recall".into(),
+                                result: result.into(),
+                            }),
+                            &prices,
+                        )
+                        .await;
+                }
+                assert_eq!(
+                    engine.recall.as_ref().unwrap().has_reservation("recall"),
+                    exposure != "unselected"
+                );
+                assert!(engine.reservations.is_empty());
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
     }
 
     #[tokio::test]

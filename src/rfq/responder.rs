@@ -847,6 +847,7 @@ pub fn levels_for(
         .filter(|rate| !rate.is_zero())
         .map(|rate| rate.to_string());
     LevelsFrame {
+        recall_asks: Vec::new(),
         corridor_id: book.slug.clone(),
         as_of,
         bids,
@@ -1176,6 +1177,7 @@ mod tests {
 
     fn request(sell_token: &str, buy_token: &str) -> QuoteRequestFrame {
         QuoteRequestFrame {
+            recall: None,
             rfq_id: "rfq_1".into(),
             corridor_id: "cngn-usdc".into(),
             chain_id: 8453,

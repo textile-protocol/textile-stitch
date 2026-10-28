@@ -171,18 +171,65 @@ export interface DesktopSwitches {
   pending: { autostart?: boolean | null; keepAwake?: boolean | null } | null
 }
 
+export interface RecallFleetView {
+  enabled: boolean
+  liveLimitsConfigured: boolean
+  reservedCollateralAtoms: string
+  reservedLiquidAtoms: string
+  manifest: {
+    assets: { collateral: { decimals: number } }
+    limits: { feeHeadroomAtoms: string } | null
+  }
+  position: null | {
+    liquidAtoms: string
+    collateralAtoms: string
+    recallableAtoms: string
+    shortTokens: string
+    pauseReason: string | null
+  }
+  operations: {
+    rfqId: string
+    state: string
+    outcome: string | null
+    preparationWei: string
+    failureReason: string | null
+    cancelAfter: string | null
+  }[]
+}
 export const api = {
   perps: (name: string) =>
     request<{
       enabled: boolean
+      recallEnabled: boolean
+      fundingTargetAtoms: string
       assignmentId: string
       unavailable: boolean
-      remote: null | { control: null | { mode: string }; effectiveMode: string }
+      remote: null | {
+        control: null | { mode: string }
+        effectiveMode: string
+        recall?: RecallFleetView | null
+      }
     }>(`/api/bots/${encodeURIComponent(name)}/perps`),
-  setPerps: (name: string, assignmentId: string, mode: string) =>
+  setPerps: (
+    name: string,
+    assignmentId: string,
+    mode: string,
+    recallEnabled = false,
+    fundingTargetAtoms = ''
+  ) =>
     request(`/api/bots/${encodeURIComponent(name)}/perps`, {
       method: 'PUT',
-      body: JSON.stringify({ assignmentId, mode }),
+      body: JSON.stringify({
+        assignmentId,
+        mode,
+        recallEnabled,
+        fundingTargetAtoms,
+      }),
+    }),
+  resumeRecall: (name: string, diagnosis: string) =>
+    request(`/api/bots/${encodeURIComponent(name)}/perps/recall/resume`, {
+      method: 'POST',
+      body: JSON.stringify({ diagnosis }),
     }),
   manualSales: (name: string) =>
     request<ManualSale[]>(

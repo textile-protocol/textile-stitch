@@ -61,6 +61,15 @@ pub struct Eip712Payload {
 /// if someone asks for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Body {
+    Recall {
+        chain_id: u64,
+        executor: Address,
+        order_digest: B256,
+        taker: Address,
+        max_debit: U256,
+        created_at: u64,
+        max_recall_price: U256,
+    },
     Permit2 {
         order: OrderParams,
         permit2: Address,
@@ -101,6 +110,23 @@ impl Eip712Payload {
     /// the tree back out.
     pub fn typed_data(&self) -> Value {
         match &self.body {
+            Body::Recall {
+                chain_id,
+                executor,
+                order_digest,
+                taker,
+                max_debit,
+                created_at,
+                max_recall_price,
+            } => recall_typed_data(
+                *chain_id,
+                *executor,
+                *order_digest,
+                *taker,
+                *max_debit,
+                *created_at,
+                *max_recall_price,
+            ),
             Body::Permit2 {
                 order,
                 permit2,
@@ -136,6 +162,63 @@ impl Eip712Payload {
             Body::NavAttestation { att } => nav_attestation_typed_data(att),
         }
     }
+}
+
+/// Flat terms verified by GmxRecallExecutor in addition to the Permit2 order.
+pub fn recall_payload(
+    chain_id: u64,
+    executor: Address,
+    order_digest: B256,
+    taker: Address,
+    max_debit: U256,
+    created_at: u64,
+    max_recall_price: U256,
+) -> Eip712Payload {
+    use alloy_primitives::keccak256 as k;
+    let domain = k([
+        k("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)").0,
+        k("Textile GMX Recall").0,
+        k("1").0,
+        U256::from(chain_id).to_be_bytes::<32>(),
+        executor.into_word().0,
+    ]
+    .concat());
+    let message = k([
+        k("RecallQuote(bytes32 orderDigest,address taker,uint256 maxDebit,uint256 createdAt,uint256 maxRecallPrice)").0,
+        order_digest.0,
+        taker.into_word().0,
+        max_debit.to_be_bytes::<32>(),
+        U256::from(created_at).to_be_bytes::<32>(),
+        max_recall_price.to_be_bytes::<32>(),
+    ]
+    .concat());
+    Eip712Payload {
+        digest: k([&[0x19, 0x01][..], &domain.0, &message.0].concat()),
+        body: Body::Recall {
+            chain_id,
+            executor,
+            order_digest,
+            taker,
+            max_debit,
+            created_at,
+            max_recall_price,
+        },
+    }
+}
+fn recall_typed_data(
+    chain_id: u64,
+    executor: Address,
+    order_digest: B256,
+    taker: Address,
+    max_debit: U256,
+    created_at: u64,
+    max_recall_price: U256,
+) -> Value {
+    json!({ "types": {
+        "EIP712Domain": [field("name", "string"), field("version", "string"), field("chainId", "uint256"), field("verifyingContract", "address")],
+        "RecallQuote": [field("orderDigest", "bytes32"), field("taker", "address"), field("maxDebit", "uint256"), field("createdAt", "uint256"), field("maxRecallPrice", "uint256")]
+    }, "primaryType": "RecallQuote", "domain": { "name": "Textile GMX Recall", "version": "1", "chainId": chain_id, "verifyingContract": addr(executor) },
+    "message": { "orderDigest": bytes32(order_digest), "taker": addr(taker), "maxDebit": uint(max_debit), "createdAt": created_at.to_string(), "maxRecallPrice": uint(max_recall_price) } })
 }
 
 /// `uint256` as a decimal string. JSON numbers are IEEE doubles, so a raw number
@@ -866,6 +949,36 @@ mod tests {
                 "LimitOrder"
             ],
             "field order is part of the typehash and must match Permit2's stub"
+        );
+    }
+
+    #[test]
+    fn recall_authorization_matches_generic_typed_data_hashing() {
+        let p = recall_payload(
+            42220,
+            Address::repeat_byte(1),
+            B256::repeat_byte(2),
+            Address::repeat_byte(3),
+            U256::MAX,
+            1800000000,
+            U256::from(500500),
+        );
+        assert_eq!(digest_of(&p.typed_data()), p.digest());
+        let mut tampered = p.typed_data();
+        tampered["message"]["maxRecallPrice"] = json!("500501");
+        assert_ne!(digest_of(&tampered), p.digest());
+        assert_ne!(
+            p.digest(),
+            recall_payload(
+                42220,
+                Address::repeat_byte(4),
+                B256::repeat_byte(2),
+                Address::repeat_byte(3),
+                U256::MAX,
+                1800000000,
+                U256::from(500500),
+            )
+            .digest()
         );
     }
 

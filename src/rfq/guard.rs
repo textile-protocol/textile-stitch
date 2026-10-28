@@ -107,6 +107,7 @@ pub(super) fn recheck_attestation_after_signing(
 pub(super) fn levels_in_band(frame: LevelsFrame, mid: f64, max_loss_bps: u32) -> LevelsFrame {
     let Some(wad) = price_wad(mid) else {
         return LevelsFrame {
+            recall_asks: Vec::new(),
             bids: Vec::new(),
             asks: Vec::new(),
             mid_rate_ray: None,
@@ -122,6 +123,12 @@ pub(super) fn levels_in_band(frame: LevelsFrame, mid: f64, max_loss_bps: u32) ->
         }
     };
     LevelsFrame {
+        recall_asks: frame
+            .recall_asks
+            .iter()
+            .filter(|l| keep(false)(l))
+            .cloned()
+            .collect(),
         bids: frame
             .bids
             .iter()
@@ -372,6 +379,7 @@ mod tests {
         // Mid 0.5; a 15 % band keeps a bid up to 0.5 / 0.85 = 0.588… and an
         // ask down to 0.425.
         let frame = LevelsFrame {
+            recall_asks: Vec::new(),
             corridor_id: "c".into(),
             as_of: "t".into(),
             bids: vec![

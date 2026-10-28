@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Fleet opt-in lease for the hedge executor. Disabled bots perform no perps
-//! I/O. The service owns GMX execution; this task has no new signing authority.
+//! I/O unless an already signed funding intent needs recovery. The service owns
+//! GMX execution; the owner explicitly configures any inventory funding target.
+mod funding;
+pub mod recall;
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,6 +15,10 @@ pub struct PerpsConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub recall_enabled: bool,
+    #[serde(default)]
+    pub funding_target_atoms: String,
+    #[serde(default)]
     pub assignment_id: String,
     #[serde(default)]
     pub bot_id: String,
@@ -20,6 +27,15 @@ pub struct PerpsConfig {
 }
 impl PerpsConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.funding_target_atoms.is_empty() {
+            self.funding_target_atoms
+                .parse::<alloy_primitives::U256>()
+                .map_err(|_| anyhow::anyhow!("Funding target must be unsigned token atoms"))?;
+            anyhow::ensure!(
+                self.funding_target_atoms == "0" || self.recall_enabled,
+                "Funding requires recall opt-in"
+            );
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -63,7 +79,7 @@ pub async fn request(
     );
     crate::config::assert_feed_url(&url, "FX hedge service")?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(2))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let request = client.request(method, url).bearer_auth(key);
@@ -93,16 +109,33 @@ pub fn maybe_spawn(
     dry_run: bool,
     config_path: &Path,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    spawn(cfg, dry_run, config_path, None)
+}
+pub fn maybe_spawn_with_signer(
+    cfg: &Config,
+    dry_run: bool,
+    config_path: &Path,
+    signer: crate::signer::DynSigner,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn(cfg, dry_run, config_path, Some(signer))
+}
+fn spawn(
+    cfg: &Config,
+    dry_run: bool,
+    config_path: &Path,
+    signer: Option<crate::signer::DynSigner>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let dir = config_path.parent()?.to_owned();
+    let journal = dir.join("perps-funding-pending.json");
     let perps = cfg
         .perps
         .as_ref()
-        .filter(|p| p.enabled && !dry_run)?
+        .filter(|p| !dry_run && (p.enabled || journal.exists()))?
         .clone();
     let cfg = cfg.clone();
-    let dir = config_path.parent()?.to_owned();
     let config_path = config_path.to_owned();
     Some(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
@@ -114,7 +147,42 @@ pub fn maybe_spawn(
                 .and_then(|current| current.perps)
                 .is_some_and(|current| lease_matches(&current, &perps));
             if !authorized {
-                break;
+                // Disable new risk but recover previously signed bytes. Otherwise
+                // a pause/restart after an ambiguous journal response pins the
+                // owner's nonce forever and interrupts ordinary wallet activity.
+                if !journal.exists() {
+                    break;
+                }
+                if let Some(signer) = &signer {
+                    let mut recovery = perps.clone();
+                    recovery.enabled = false;
+                    recovery.recall_enabled = false;
+                    if funding::tick(&cfg, &dir, &recovery, signer.clone())
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("Pending FX funding still requires reconciliation; no new funding authorized");
+                    }
+                }
+                continue;
+            }
+            if perps.recall_enabled {
+                if let Ok(data) = request(
+                    &cfg,
+                    &dir,
+                    reqwest::Method::GET,
+                    &perps.assignment_id,
+                    "",
+                    None,
+                )
+                .await
+                {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let _ = recall::cache(&dir, data, now);
+                }
             }
             if request(
                 &cfg,
@@ -129,6 +197,13 @@ pub fn maybe_spawn(
             {
                 tracing::warn!("FX hedge authorization unavailable; no new hedge once the 15-second lease expires");
             }
+            if let Some(signer) = &signer {
+                if let Err(_) = funding::tick(&cfg, &dir, &perps, signer.clone()).await {
+                    tracing::warn!(
+                        "FX inventory funding unavailable; existing reservations retained"
+                    );
+                }
+            }
         }
     }))
 }
@@ -138,6 +213,8 @@ fn lease_matches(saved: &PerpsConfig, running: &PerpsConfig) -> bool {
         && saved.assignment_id == running.assignment_id
         && saved.bot_id == running.bot_id
         && saved.revision == running.revision
+        && saved.recall_enabled == running.recall_enabled
+        && saved.funding_target_atoms == running.funding_target_atoms
 }
 
 #[cfg(test)]
@@ -160,6 +237,8 @@ mod tests {
     fn saved_disable_and_revision_change_stop_the_old_process() {
         let active = PerpsConfig {
             enabled: true,
+            recall_enabled: false,
+            funding_target_atoms: String::new(),
             assignment_id: "celo-idrx".into(),
             bot_id: "one".into(),
             revision: "a".into(),
@@ -187,6 +266,8 @@ mod tests {
         .is_err());
         assert!(PerpsConfig {
             enabled: true,
+            recall_enabled: false,
+            funding_target_atoms: String::new(),
             assignment_id: "../bad/id".into(),
             bot_id: "bot".into(),
             revision: "x".repeat(36)

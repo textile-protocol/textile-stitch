@@ -382,6 +382,58 @@ fn nonce_lock(chain_id: u64, address: Address) -> NonceLock {
         .clone()
 }
 
+/// Durable reservations for externally broadcast funding transactions. Loaded
+/// before run loops start; every Wallet for the account checks the same file.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ExternalIntent {
+    pub operation: String,
+    pub nonce: u64,
+    pub raw: String,
+}
+type JournalPaths = std::collections::HashMap<(u64, Address), std::path::PathBuf>;
+fn external_journals() -> &'static std::sync::Mutex<JournalPaths> {
+    static PATHS: std::sync::OnceLock<std::sync::Mutex<JournalPaths>> = std::sync::OnceLock::new();
+    PATHS.get_or_init(Default::default)
+}
+pub fn register_external_journal(chain: u64, owner: Address, path: std::path::PathBuf) {
+    external_journals()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((chain, owner), path);
+}
+fn external_path(chain: u64, owner: Address) -> Option<std::path::PathBuf> {
+    external_journals()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(chain, owner))
+        .cloned()
+}
+pub fn read_external_intent(path: &std::path::Path) -> anyhow::Result<Option<ExternalIntent>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+fn save_external_intent(path: &std::path::Path, intent: &ExternalIntent) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // A partial file after a crash fails closed. No bytes have left this process.
+    let mut file = options.open(path)?;
+    file.write_all(&serde_json::to_vec(intent)?)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// A signing wallet over an [`Rpc`]: turns calldata into landed transactions.
 /// The signer is shared (`Arc`) with the green-leg poster.
 pub struct Wallet {
@@ -456,6 +508,13 @@ impl Wallet {
     /// over [`GasCaps`] rather than clamping it: a node answering that high is
     /// broken or hostile, and a clamped bid off its numbers is still a guess.
     async fn plan_tx(&self, to: Address, data: &Bytes, value: U256) -> anyhow::Result<TxPlan> {
+        if let Some(path) = external_path(self.chain_id, self.address) {
+            if let Some(intent) = read_external_intent(&path)? {
+                anyhow::ensure!(self.rpc.latest_transaction_count(self.address).await? > intent.nonce,
+                    "A journaled inventory transfer owns the next nonce; reconcile it before sending another transaction");
+                std::fs::remove_file(path)?;
+            }
+        }
         let nonce = self.rpc.transaction_count(self.address).await?;
         let node_tip = self.rpc.max_priority_fee().await.ok();
         let node_price = self.rpc.gas_price().await.ok();
@@ -572,6 +631,44 @@ impl Wallet {
             .and_then(|code| delegation_target(&code));
         let stuck = self.rpc.latest_transaction_count(self.address).await.ok();
         anyhow::anyhow!("{err}\n\n{}", inflight_hint(delegate, stuck))
+    }
+
+    /// Sign for a durable external broadcaster. The callback must journal the
+    /// exact bytes before acknowledging; this method never broadcasts or bumps.
+    pub async fn journal_transaction<F, Fut>(
+        &self,
+        operation: &str,
+        to: Address,
+        data: Bytes,
+        value: U256,
+        journal: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(Bytes) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        anyhow::ensure!(
+            self.signer.can_sign_transactions(),
+            "This signer cannot authorize an inventory transfer"
+        );
+        let lock = nonce_lock(self.chain_id, self.address);
+        let _guard = lock.lock().await;
+        let plan = self.plan_tx(to, &data, value).await?;
+        let raw = self
+            .sign_plan(to, data, value, &plan)
+            .await
+            .map_err(SendPlanFailure::into_error)?;
+        let path = external_path(self.chain_id, self.address)
+            .ok_or_else(|| anyhow::anyhow!("Funding nonce journal not configured"))?;
+        save_external_intent(
+            &path,
+            &ExternalIntent {
+                operation: operation.to_owned(),
+                nonce: plan.nonce,
+                raw: hex::encode_prefixed(&raw),
+            },
+        )?;
+        journal(raw).await
     }
 
     /// Sign + broadcast a contract call; returns the transaction hash.
@@ -753,6 +850,45 @@ mod tests {
     use std::sync::Arc;
 
     const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    #[test]
+    fn recall_funding_journal_is_exclusive_private_and_fails_closed_after_crash() {
+        let dir = std::env::temp_dir().join(format!(
+            "funding-journal-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("pending.json");
+        assert!(read_external_intent(&path).unwrap().is_none());
+        let intent = ExternalIntent {
+            operation: "one".into(),
+            nonce: 42,
+            raw: "0x02abcdef".into(),
+        };
+        save_external_intent(&path, &intent).unwrap();
+        assert!(save_external_intent(&path, &intent).is_err());
+        let recovered = read_external_intent(&path).unwrap().unwrap();
+        assert_eq!(recovered.nonce, 42);
+        assert_eq!(recovered.raw, intent.raw);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let owner = Address::repeat_byte(0x57);
+        register_external_journal(42220, owner, path.clone());
+        assert_eq!(external_path(42220, owner), Some(path.clone()));
+        assert_eq!(external_path(1, owner), None);
+        std::fs::write(&path, "{partial").unwrap();
+        assert!(read_external_intent(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn local_signer() -> DynSigner {
         Arc::new(LocalSigner::new(parse_private_key(TEST_KEY).unwrap()))

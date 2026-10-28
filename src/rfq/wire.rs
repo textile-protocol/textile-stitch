@@ -107,6 +107,8 @@ pub struct SessionAcceptedFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteRequestFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<RecallOffer>,
     pub rfq_id: String,
     pub corridor_id: String,
     pub chain_id: u64,
@@ -192,6 +194,8 @@ pub struct SessionFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LevelsFrame {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recall_asks: Vec<Level>,
     pub corridor_id: String,
     pub as_of: String,
     /// Maker buys collateral. Sizes are collateral atomic on BOTH sides.
@@ -219,6 +223,8 @@ pub struct Level {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteResponseFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<RecallAuthorization>,
     pub rfq_id: String,
     /// Gross the taker sends. Exact-input: echoes the request's sellAmount.
     pub sell_amount: String,
@@ -432,6 +438,7 @@ mod tests {
     #[test]
     fn quote_response_serializes_with_wire_field_names() {
         let frame = MakerFrame::QuoteResponse(QuoteResponseFrame {
+            recall: None,
             rfq_id: "rfq_123".into(),
             sell_amount: "1000000000".into(),
             buy_amount: "722000000".into(),
@@ -644,4 +651,25 @@ mod tests {
         let err = serde_json::from_str::<VenueFrame>(r#"{"type":"somethingNew","x":1}"#);
         assert!(err.is_err(), "unknown tags surface as errors to skip");
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecallOffer {
+    pub route: String,
+    pub assignment_id: String,
+    pub executor: String,
+    pub created_at: u64,
+    pub accept_by: String,
+    pub settle_by: String,
+    pub capacity_atoms: String,
+    pub max_recall_price: String,
+    pub revision: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecallAuthorization {
+    pub route: String,
+    pub authorization: String,
+    pub max_debit: String,
 }
