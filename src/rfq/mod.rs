@@ -338,16 +338,10 @@ pub(crate) fn resolve_instance_id(
     configured: Option<&str>,
     config_dir: Option<&Path>,
 ) -> Option<String> {
-    if let Some(name) = configured.map(str::trim).filter(|n| !n.is_empty()) {
-        return Some(name.to_string());
+    if let Some(existing) = existing_instance_id(configured, config_dir) {
+        return Some(existing);
     }
     let path = config_dir?.join(INSTANCE_ID_FILE);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
-            return Some(existing);
-        }
-    }
     let generated = format!("stitch-{:016x}", rand::rngs::OsRng.next_u64());
     match std::fs::write(&path, format!("{generated}\n")) {
         Ok(()) => {
@@ -369,6 +363,25 @@ pub(crate) fn resolve_instance_id(
             None
         }
     }
+}
+
+/// Read the venue identity without creating or replacing it. Fleet authorization
+/// must bind the existing RFQ session, never a display name or a new identity.
+pub(crate) fn existing_instance_id(
+    configured: Option<&str>,
+    config_dir: Option<&Path>,
+) -> Option<String> {
+    if let Some(name) = configured.map(str::trim).filter(|n| !n.is_empty()) {
+        return Some(name.to_string());
+    }
+    let path = config_dir?.join(INSTANCE_ID_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Some(existing);
+        }
+    }
+    None
 }
 
 /// Resolve the maker API key without ever logging it.

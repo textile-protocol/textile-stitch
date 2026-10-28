@@ -145,7 +145,8 @@ pub async fn update(
         .as_ref()
         .or(summary.operator_address.as_ref())
         .ok_or_else(|| ApiError::bad_request("Bot wallet unavailable"))?;
-    if !assignment_matches(&remote["assignment"], &name, &cfg, funding) {
+    let bot_id = assignment_bot_id(&cfg, dir)?;
+    if !assignment_matches(&remote["assignment"], &bot_id, &cfg, funding) {
         return Err(ApiError::bad_request(
             "Hedge assignment must match this Stitch, funding wallet and corridor",
         ));
@@ -160,7 +161,7 @@ pub async fn update(
         recall_enabled: body.recall_enabled,
         funding_target_atoms: body.funding_target_atoms.clone(),
         assignment_id: body.assignment_id.clone(),
-        bot_id: name,
+        bot_id,
         revision: "0".repeat(36),
     };
     let block = toml::to_string(&candidate)
@@ -220,8 +221,20 @@ pub async fn resume(
     .map_err(ApiError::bad_request)
 }
 
-fn assignment_matches(a: &Value, name: &str, cfg: &Config, funding: &str) -> bool {
-    a["botId"].as_str() == Some(name)
+fn assignment_bot_id(cfg: &Config, dir: &std::path::Path) -> Result<String, ApiError> {
+    crate::rfq::existing_instance_id(
+        cfg.rfq.as_ref().and_then(|r| r.instance_id.as_deref()),
+        Some(dir),
+    )
+    .ok_or_else(|| {
+        ApiError::bad_request(
+            "Start RFQ before enabling FX hedging: its instance ID is unavailable",
+        )
+    })
+}
+
+fn assignment_matches(a: &Value, bot_id: &str, cfg: &Config, funding: &str) -> bool {
+    a["botId"].as_str() == Some(bot_id)
         && a["chainId"].as_u64() == Some(cfg.chain_id)
         && a["fundingWallet"]
             .as_str()
@@ -237,6 +250,69 @@ fn assignment_matches(a: &Value, name: &str, cfg: &Config, funding: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn instance_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "perps-instance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn assignment_uses_the_persisted_rfq_identity_not_the_fleet_name() {
+        let cfg: Config = toml::from_str(include_str!("../../../stitch.example.toml")).unwrap();
+        let dir = instance_dir();
+        let instance = crate::rfq::resolve_instance_id(None, Some(&dir)).unwrap();
+        let bot_id = assignment_bot_id(&cfg, &dir).unwrap();
+        assert_eq!(bot_id, instance);
+        let a = json!({"botId":instance,"chainId":cfg.chain_id,"fundingWallet":"0xabc",
+            "inventoryToken":cfg.pools[0].collateral,"inventoryDecimals":cfg.pools[0].collateral_decimals});
+        assert!(assignment_matches(&a, &bot_id, &cfg, "0xABC"));
+        assert!(!assignment_matches(&a, "stitch-celo-2", &cfg, "0xABC"));
+        assert_eq!(assignment_bot_id(&cfg, &dir).unwrap(), bot_id);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn configured_rfq_identity_takes_precedence_for_fleet_too() {
+        let mut cfg: Config = toml::from_str(include_str!("../../../stitch.example.toml")).unwrap();
+        let dir = instance_dir();
+        std::fs::write(dir.join(crate::rfq::INSTANCE_ID_FILE), "old-id\n").unwrap();
+        cfg.rfq = Some(
+            toml::from_str(
+                r#"
+            url = "wss://venue.example/v2/maker/stream"
+            maker_id = "maker-test"
+            validation_contract = "0x1111111111111111111111111111111111111111"
+            instance_id = "  configured-id  "
+        "#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(assignment_bot_id(&cfg, &dir).unwrap(), "configured-id");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(crate::rfq::INSTANCE_ID_FILE)).unwrap(),
+            "old-id\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_rfq_identity_does_not_create_a_new_one_for_fleet() {
+        let cfg: Config = toml::from_str(include_str!("../../../stitch.example.toml")).unwrap();
+        let dir = instance_dir();
+        assert!(assignment_bot_id(&cfg, &dir).is_err());
+        assert!(!dir.join(crate::rfq::INSTANCE_ID_FILE).exists());
+        std::fs::write(dir.join(crate::rfq::INSTANCE_ID_FILE), " \n").unwrap();
+        assert!(assignment_bot_id(&cfg, &dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn assignment_binds_bot_chain_funding_wallet_and_inventory_units() {
         let cfg: Config = toml::from_str(include_str!("../../../stitch.example.toml")).unwrap();
