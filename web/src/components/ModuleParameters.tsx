@@ -376,9 +376,12 @@ function ModuleExample({
         aria-expanded={example.shown}
         aria-controls={id}
         onClick={example.toggle}
-        className="hover:bg-hover @min-[52rem]:hidden flex w-full items-center justify-between gap-3 p-5 text-left text-sm font-bold group-last/row:rounded-b-xl"
+        className={`hover:bg-hover group/bar @min-[52rem]:hidden flex w-full items-center justify-between gap-3 p-5 text-left text-sm font-bold ${example.shown ? '' : 'group-last/row:rounded-b-xl'}`}
       >
-        {label} <span aria-hidden>{example.shown ? '−' : '+'}</span>
+        <span className={example.shown ? 'text-accent' : ''}>{label}</span>
+        <Chevron
+          className={`text-muted group-hover/bar:text-ink transition-transform duration-300 motion-reduce:transition-none ${example.shown ? '' : 'rotate-180'}`}
+        />
       </button>
       {/* Desktop: a narrow tab that pulls the example out to its right and
           stays in place to push it back, so focus never moves. */}
@@ -401,189 +404,195 @@ function ModuleExample({
           {label}
         </span>
       </button>
+      {/* Narrow: the example grows open under the bar and rises into place.
+          Wide: it slides out to the right of the tab. */}
       <div
-        className={`@min-[52rem]:overflow-hidden transition-[width] duration-200 ease-out motion-reduce:transition-none ${example.shown ? '@min-[52rem]:w-[22rem]' : '@min-[52rem]:w-0'}`}
+        className={`@min-[52rem]:grid-rows-[1fr] grid transition-[grid-template-rows,width] duration-300 ease-out motion-reduce:transition-none ${example.shown ? '@min-[52rem]:w-[22rem] grid-rows-[1fr]' : '@min-[52rem]:w-0 grid-rows-[0fr]'}`}
       >
-        {example.shown && (
-          <aside
-            id={id}
-            aria-label={label}
-            className="border-line-soft @min-[52rem]:w-[22rem] @min-[52rem]:border-t-0 border-t p-5 sm:p-6"
-          >
-            <h4 className="mb-6 text-lg font-bold">
-              {module === 'inventory'
-                ? 'See your quotes respond'
-                : module === 'spreads'
-                  ? 'See the extra margin'
-                  : module === 'liquidity'
-                    ? 'See the weekly schedule'
-                    : module === 'curve' || module === 'profit_unwind'
-                      ? 'See a quote'
-                      : 'See when a sale starts'}
-            </h4>
-            {module === 'curve' ? (
-              <CurveExample
-                draft={draft}
-                view={view}
-                now={now}
-                currency={currency}
-                settlement={settlement}
-                example={{
-                  share: example.share / 10_000,
-                  sizeUsd: example.sizeUsd,
-                }}
-                onExample={(next) => {
-                  example.setShare(Math.round(next.share * 10_000))
-                  example.setSizeUsd(next.sizeUsd)
-                }}
-              />
-            ) : module === 'profit_unwind' ? (
-              <UnwindExample
-                draft={draft}
-                view={view}
-                now={now}
-                currency={currency}
-                settlement={settlement}
-                example={{
-                  share: example.share / 10_000,
-                  sizeUsd: example.sizeUsd,
-                }}
-                onExample={(next) => {
-                  example.setShare(Math.round(next.share * 10_000))
-                  example.setSizeUsd(next.sizeUsd)
-                }}
-              />
-            ) : module === 'liquidity' ? (
-              liquidityScheduleErrors(draft.liquidity).length === 0 ? (
-                <div className="space-y-5">
-                  <ScheduleStrip schedule={draft.liquidity} />
-                  <p className="text-muted text-xs leading-relaxed">
-                    Bundled fills can only use {settlement} kept liquid up to
-                    the floor. The rest earns yield in Aave and is still usable
-                    by single-order fills through the executor.
-                  </p>
-                </div>
-              ) : (
-                <p className="text-muted text-sm">
-                  Correct the schedule to update this example.
-                </p>
-              )
-            ) : !valid ? (
-              <p className="text-muted text-sm">
-                Correct the settings to update this example.
-              </p>
-            ) : (
-              <div className="space-y-6">
-                <AllocationBar
-                  share={example.share}
-                  target={draft.inventory.target_bps}
-                  limit={draft.inventory.max_bps}
+        <div className="min-h-0 overflow-hidden">
+          {example.shown && (
+            <aside
+              id={id}
+              aria-label={label}
+              className="border-line-soft @min-[52rem]:w-[22rem] @min-[52rem]:border-t-0 @min-[52rem]:animate-none animate-rise-in border-t p-5 motion-reduce:animate-none sm:p-6"
+            >
+              <h4 className="mb-6 text-lg font-bold">
+                {module === 'inventory'
+                  ? 'See your quotes respond'
+                  : module === 'spreads'
+                    ? 'See the extra margin'
+                    : module === 'liquidity'
+                      ? 'See the weekly schedule'
+                      : module === 'curve' || module === 'profit_unwind'
+                        ? 'See a quote'
+                        : 'See when a sale starts'}
+              </h4>
+              {module === 'curve' ? (
+                <CurveExample
+                  draft={draft}
+                  view={view}
+                  now={now}
                   currency={currency}
+                  settlement={settlement}
+                  example={{
+                    share: example.share / 10_000,
+                    sizeUsd: example.sizeUsd,
+                  }}
+                  onExample={(next) => {
+                    example.setShare(Math.round(next.share * 10_000))
+                    example.setSizeUsd(next.sizeUsd)
+                  }}
                 />
-                {!draft.inventory.enabled && (
-                  <p className="text-muted text-xs">
-                    Inventory balancing is off. Its target and purchase limit
-                    are shown for reference.
-                  </p>
-                )}
-                {module === 'rebalance' && (
-                  <div className="border-line-soft bg-surface rounded-xl border p-4">
-                    <p className="text-muted text-sm">
-                      {sale > 0 ? 'Sale size · up to' : 'No sale requested'}
-                    </p>
-                    <p className="my-2 text-3xl font-bold">
-                      {percentage(sale)}
-                    </p>
+              ) : module === 'profit_unwind' ? (
+                <UnwindExample
+                  draft={draft}
+                  view={view}
+                  now={now}
+                  currency={currency}
+                  settlement={settlement}
+                  example={{
+                    share: example.share / 10_000,
+                    sizeUsd: example.sizeUsd,
+                  }}
+                  onExample={(next) => {
+                    example.setShare(Math.round(next.share * 10_000))
+                    example.setSizeUsd(next.sizeUsd)
+                  }}
+                />
+              ) : module === 'liquidity' ? (
+                liquidityScheduleErrors(draft.liquidity).length === 0 ? (
+                  <div className="space-y-5">
+                    <ScheduleStrip schedule={draft.liquidity} />
                     <p className="text-muted text-xs leading-relaxed">
-                      {sale > 0
-                        ? `of vault value, converted from ${currency} to ${settlement}. Actual size is also limited by available funds and the vault’s order cap.`
-                        : enabled
-                          ? `Sales start at ${percentage(draft.rebalance.trigger_bps)} ${currency} holdings.`
-                          : 'Enable spot rebalancing to request sales.'}
+                      Bundled fills can only use {settlement} kept liquid up to
+                      the floor. The rest earns yield in Aave and is still
+                      usable by single-order fills through the executor.
                     </p>
-                  </div>
-                )}
-                {breakdown ? (
-                  <div className="space-y-3">
-                    <QuoteBreakdown
-                      rows={breakdown}
-                      highlight={
-                        module === 'inventory' || module === 'spreads'
-                          ? module
-                          : null
-                      }
-                      current={
-                        example.atLive && example.live
-                          ? liveRow(example.live)
-                          : null
-                      }
-                    />
-                    <p className="text-muted text-xs leading-relaxed">
-                      Modules start from your corridor spread and adjust it;
-                      they don't replace it.
-                    </p>
-                    {notes.map((note) => (
-                      <p
-                        key={note}
-                        className="text-muted text-xs leading-relaxed"
-                      >
-                        {note}
-                      </p>
-                    ))}
                   </div>
                 ) : (
-                  <p className="text-muted text-xs leading-relaxed">
-                    Your corridor spread is an absolute offset, so it needs a
-                    price from the running bot before the full spread can be
-                    shown here.
+                  <p className="text-muted text-sm">
+                    Correct the schedule to update this example.
                   </p>
-                )}
-                {example.live &&
-                  (example.atLive ? (
-                    <p className="text-muted text-xs leading-relaxed">
-                      Holdings and price range below are the bot's current
-                      readings.
+                )
+              ) : !valid ? (
+                <p className="text-muted text-sm">
+                  Correct the settings to update this example.
+                </p>
+              ) : (
+                <div className="space-y-6">
+                  <AllocationBar
+                    share={example.share}
+                    target={draft.inventory.target_bps}
+                    limit={draft.inventory.max_bps}
+                    currency={currency}
+                  />
+                  {!draft.inventory.enabled && (
+                    <p className="text-muted text-xs">
+                      Inventory balancing is off. Its target and purchase limit
+                      are shown for reference.
                     </p>
+                  )}
+                  {module === 'rebalance' && (
+                    <div className="border-line-soft bg-surface rounded-xl border p-4">
+                      <p className="text-muted text-sm">
+                        {sale > 0 ? 'Sale size · up to' : 'No sale requested'}
+                      </p>
+                      <p className="my-2 text-3xl font-bold">
+                        {percentage(sale)}
+                      </p>
+                      <p className="text-muted text-xs leading-relaxed">
+                        {sale > 0
+                          ? `of vault value, converted from ${currency} to ${settlement}. Actual size is also limited by available funds and the vault’s order cap.`
+                          : enabled
+                            ? `Sales start at ${percentage(draft.rebalance.trigger_bps)} ${currency} holdings.`
+                            : 'Enable spot rebalancing to request sales.'}
+                      </p>
+                    </div>
+                  )}
+                  {breakdown ? (
+                    <div className="space-y-3">
+                      <QuoteBreakdown
+                        rows={breakdown}
+                        highlight={
+                          module === 'inventory' || module === 'spreads'
+                            ? module
+                            : null
+                        }
+                        current={
+                          example.atLive && example.live
+                            ? liveRow(example.live)
+                            : null
+                        }
+                      />
+                      <p className="text-muted text-xs leading-relaxed">
+                        Modules start from your corridor spread and adjust it;
+                        they don't replace it.
+                      </p>
+                      {notes.map((note) => (
+                        <p
+                          key={note}
+                          className="text-muted text-xs leading-relaxed"
+                        >
+                          {note}
+                        </p>
+                      ))}
+                    </div>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={example.useLive}
-                      className="text-left text-xs font-bold text-accent hover:underline"
-                    >
-                      Use the bot's current {currency} holdings
-                      {example.live.rangeBps === null ? '' : ' and price range'}
-                    </button>
-                  ))}
-                {(module === 'spreads' || draft.spreads.enabled) && (
-                  <NumberControl
-                    label="Example price range"
-                    value={example.range}
-                    sliderMax={100}
-                    max={10000}
-                    fractionDigits={4}
-                    onChange={example.setRange}
-                  />
-                )}
-                <div className="border-line-soft border-t pt-5">
-                  <NumberControl
-                    label={`Example ${currency} holdings`}
-                    value={example.share}
-                    max={10000}
-                    sliderMax={10000}
-                    onChange={example.setShare}
-                  />
+                    <p className="text-muted text-xs leading-relaxed">
+                      Your corridor spread is an absolute offset, so it needs a
+                      price from the running bot before the full spread can be
+                      shown here.
+                    </p>
+                  )}
+                  {example.live &&
+                    (example.atLive ? (
+                      <p className="text-muted text-xs leading-relaxed">
+                        Holdings and price range below are the bot's current
+                        readings.
+                      </p>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={example.useLive}
+                        className="text-left text-xs font-bold text-accent hover:underline"
+                      >
+                        Use the bot's current {currency} holdings
+                        {example.live.rangeBps === null
+                          ? ''
+                          : ' and price range'}
+                      </button>
+                    ))}
+                  {(module === 'spreads' || draft.spreads.enabled) && (
+                    <NumberControl
+                      label="Example price range"
+                      value={example.range}
+                      sliderMax={100}
+                      max={10000}
+                      fractionDigits={4}
+                      onChange={example.setRange}
+                    />
+                  )}
+                  <div className="border-line-soft border-t pt-5">
+                    <NumberControl
+                      label={`Example ${currency} holdings`}
+                      value={example.share}
+                      max={10000}
+                      sliderMax={10000}
+                      onChange={example.setShare}
+                    />
+                  </div>
                 </div>
-              </div>
-            )}
-            <p className="text-muted mt-6 text-xs leading-relaxed">
-              {module === 'liquidity'
-                ? 'Illustration only. The floor is a share of free settlement, so the amount kept liquid moves with the vault balance.'
-                : module === 'curve' || module === 'profit_unwind'
-                  ? 'Illustration only, not a live quote. Open quotes on the same side, capacity and the venue fee on the actual request still apply.'
-                  : 'Illustration only, not a live quote or a return forecast. Open quotes, available funds and vault limits can still hold a side back.'}
-            </p>
-          </aside>
-        )}
+              )}
+              <p className="text-muted mt-6 text-xs leading-relaxed">
+                {module === 'liquidity'
+                  ? 'Illustration only. The floor is a share of free settlement, so the amount kept liquid moves with the vault balance.'
+                  : module === 'curve' || module === 'profit_unwind'
+                    ? 'Illustration only, not a live quote. Open quotes on the same side, capacity and the venue fee on the actual request still apply.'
+                    : 'Illustration only, not a live quote or a return forecast. Open quotes, available funds and vault limits can still hold a side back.'}
+              </p>
+            </aside>
+          )}
+        </div>
       </div>
     </div>
   )

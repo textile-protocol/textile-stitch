@@ -160,3 +160,19 @@ body {
     animation: none;
   }
 }
+
+/* The Simulate panel on narrow screens: it rises into the space its row opens
+   up for it, so it reads as coming up from the bottom of the card. */
+@theme {
+  --animate-rise-in: rise-in 300ms ease-out backwards;
+  @keyframes rise-in {
+    from {
+      opacity: 0;
+      transform: translateY(1.5rem);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}

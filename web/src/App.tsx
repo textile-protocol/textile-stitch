@@ -80,7 +80,7 @@ export default function App() {
         onTheme={setTheme}
         onSignedOut={() => void refresh()}
       />
-      <main className="mx-auto max-w-5xl px-6 py-8">
+      <main className="mx-auto max-w-[96rem] px-6 py-8">
         {session.passwordSetupRequired && (
           <PanelPasswordSetup onSecured={(secured) => {
             setSession(secured)
@@ -102,7 +102,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
-      <footer className="mx-auto max-w-5xl px-6 pb-8 text-xs text-faint">
+      <footer className="mx-auto max-w-[96rem] px-6 pb-8 text-xs text-faint">
         Stitch v{session.version} · <span className="font-mono">{session.configDir}</span>
       </footer>
     </div>
@@ -153,7 +153,7 @@ function Header({
 
   return (
     <header className="border-b border-line-soft bg-surface">
-      <div className="mx-auto flex max-w-5xl items-center gap-2 px-4 py-3 sm:gap-4 sm:px-6">
+      <div className="mx-auto flex max-w-[96rem] items-center gap-2 px-4 py-3 sm:gap-4 sm:px-6">
         <Link to="/" className="flex min-w-0 items-center gap-2 font-bold">
           <TextileIcon className="h-5 w-5 shrink-0" />
           <span className="truncate">Stitch</span>

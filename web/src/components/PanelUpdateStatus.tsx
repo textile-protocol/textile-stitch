@@ -97,7 +97,7 @@ export default function PanelUpdateStatus({
       aria-live="polite"
       className={`border-t border-line-soft ${TONES[view.tone]}`}
     >
-      <div className="mx-auto flex max-w-5xl flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:gap-6 sm:px-6">
+      <div className="mx-auto flex max-w-[96rem] flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:gap-6 sm:px-6">
         <div className="flex min-w-0 flex-1 items-start gap-3">
           <StatusIcon tone={view.tone} />
           <div className="min-w-0 flex-1">
