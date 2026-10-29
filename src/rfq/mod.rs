@@ -563,9 +563,11 @@ fn curve_quote_status(
 }
 
 /// The curve's inputs as the module status records them this tick, or
-/// `None` while they make no share.
+/// `None` while they make no share. `price` is the print the flat quote is
+/// built from, debt per collateral like the reference.
 fn curve_reading_status(
     book: &CorridorBook,
+    price: f64,
     inputs: &responder::CurveInputs,
     fee_bps: u32,
     now: u64,
@@ -579,6 +581,7 @@ fn curve_reading_status(
         reference_mid: 1.0 / mid,
         half_range_bps,
         fee_bps,
+        feed_price: (price.is_finite() && price > 0.0).then(|| 1.0 / price),
     })
 }
 
@@ -1755,7 +1758,7 @@ impl Engine {
                 let inputs = self.curve_inputs(book, &quote, now_secs);
                 if let (Some(modules), Some(_)) = (&self.modules, book.curve) {
                     if let Some(reading) =
-                        curve_reading_status(book, &inputs, self.venue_fee_bps, now_secs)
+                        curve_reading_status(book, quote.price, &inputs, self.venue_fee_bps, now_secs)
                     {
                         modules.curve_reading(reading);
                     }
@@ -6841,6 +6844,82 @@ mod tests {
         );
         assert!((reading.reference_mid - 1.0).abs() < 1e-12);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The level tick records the feed price it read, apart from the
+    /// reference mid. The two differ here, so a call site that recorded the
+    /// mid instead fails.
+    #[tokio::test]
+    async fn the_level_tick_records_the_feed_price_apart_from_the_reference_mid() {
+        use crate::modules::{runtime::Runtime, Mode, ModulesConfig};
+        let mut engine = curve_engine(Mode::Live);
+        let dir = std::env::temp_dir().join(format!("stitch-curve-feed-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = ModulesConfig {
+            mode: Mode::Live,
+            ..Default::default()
+        };
+        cfg.curve.enabled = true;
+        engine.modules = Some(Runtime::new(cfg.runnable(false), &dir, "http://feed").unwrap());
+        engine.reservations = Reservations::with_persist_path(dir.join(RESERVATIONS_FILE));
+        let prices = PriceCache::default();
+        prices.set(
+            "http://feed".into(),
+            Quote {
+                price: 1.0,
+                timestamp: unix_now(),
+                degraded: false,
+                reference: Some(crate::pricing::feed::ReferenceBook {
+                    mid: 1.001,
+                    half_range_bps: 9.4,
+                }),
+            },
+        );
+        let _ = engine.level_frames(&prices, unix_now_ms());
+        let reading = engine
+            .modules
+            .as_ref()
+            .unwrap()
+            .status_snapshot()
+            .curve
+            .and_then(|curve| curve.reading)
+            .expect("the level tick records a reading");
+        assert!((reading.reference_mid - 1.0 / 1.001).abs() < 1e-12);
+        assert_eq!(reading.feed_price, Some(1.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reading carries the price the flat quote is built from, apart
+    /// from the reference mid: on cNGN the feed price sits bps above the mid,
+    /// so a panel comparing against the mid overstates the curve's lean.
+    #[test]
+    fn the_curve_reading_records_the_feed_price_apart_from_the_reference_mid() {
+        let engine = test_engine();
+        let book = &engine.books[0];
+        let inputs = responder::CurveInputs {
+            reference: Some((1.0 / 1380.78, 5.9)),
+            holdings: Some(responder::Holdings {
+                collateral: U256::from(10u64).pow(U256::from(book.collateral_decimals)),
+                debt: U256::from(10u64).pow(U256::from(book.debt_decimals)),
+            }),
+        };
+        let reading = curve_reading_status(book, 1.0 / 1381.40, &inputs, 1, 7).unwrap();
+        assert!((reading.reference_mid - 1380.78).abs() < 1e-9);
+        assert!((reading.feed_price.unwrap() - 1381.40).abs() < 1e-9);
+        for unusable in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let reading = curve_reading_status(book, unusable, &inputs, 1, 7).unwrap();
+            assert_eq!(reading.feed_price, None, "{unusable}");
+        }
+    }
+
+    /// Status written before the reading carried a feed price still loads.
+    #[test]
+    fn a_curve_reading_without_a_feed_price_still_loads() {
+        let reading: crate::modules::runtime::CurveReading = serde_json::from_str(
+            r#"{"at":1,"share":0.5,"value":100.0,"reference_mid":1380.78,"half_range_bps":5.9,"fee_bps":1}"#,
+        )
+        .unwrap();
+        assert_eq!(reading.feed_price, None);
     }
 
     /// `[modules.curve]` reaches every book only while modules run with it on

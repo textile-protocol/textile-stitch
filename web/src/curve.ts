@@ -7,7 +7,7 @@
 // unit the operator, the reference and both knobs live in. The bot's own order
 // amounts are the reciprocal; the panel never needs them.
 
-import type { CurveModuleConfig, ModulesView } from './modules'
+import type { CurveModuleConfig, ModulesConfig, ModulesView } from './modules'
 
 /** One level tick's view of the curve's inputs, as the bot records it in the
  * module status. Prices are NGN per USDT. Mirrors `CurveReading` in
@@ -23,6 +23,10 @@ export interface CurveReading {
   half_range_bps: number
   /** The venue fee on the last quote request, bps. */
   fee_bps: number
+  /** The feed price the flat quote is built from, on the bot's price basis:
+   * `price` in Preview, `unadjustedPrice` in Live where the feed serves one.
+   * Not the reference mid. Absent from older bots. */
+  feed_price?: number | null
 }
 
 /** One Swap request the curve priced, or answered flat. */
@@ -127,10 +131,48 @@ export function takerPrice(
   return botBuys ? centre * (1 + half) : centre * (1 - half)
 }
 
-/** The flat all-in price at the reference mid, for comparison. */
-export function flatPrice(curve: Curve, botBuys: boolean): number {
-  const half = curve.allInBps / 10_000
-  return botBuys ? curve.mid * (1 + half) : curve.mid * (1 - half)
+/** The feed price the bot quotes flat around, or null when the reading has
+ * no usable one. */
+export function feedPrice(reading: CurveReading): number | null {
+  const { feed_price: price } = reading
+  return price != null && Number.isFinite(price) && price > 0 ? price : null
+}
+
+/** The flat all-in price around the feed price, for comparison: what the
+ * quote would be without the curve. */
+export function flatPrice(
+  feed: number,
+  allInBps: number,
+  botBuys: boolean
+): number {
+  const half = allInBps / 10_000
+  return botBuys ? feed * (1 + half) : feed * (1 - half)
+}
+
+/** Whether a bot on this config quotes around `unadjustedPrice`, the feed
+ * price before manual adjustments: only while the curve runs Live. Otherwise
+ * it reads `price`. `Config::price_basis` in src/config.rs. */
+export function readsUnadjustedPrice(
+  config: Pick<ModulesConfig, 'mode' | 'curve'>
+): boolean {
+  return config.mode === 'live' && config.curve.enabled
+}
+
+/** How far the reference mid or buy may sit from the feed price, bps, before
+ * the bot refuses the curve and quotes flat. `MAX_REFERENCE_GAP_BPS` in
+ * src/rfq/responder.rs. */
+export const MAX_REFERENCE_GAP_BPS = 100
+
+/** Whether the bot quotes flat on this reading because its reference book is
+ * too far from the feed price. The bot measures the gap in its own units
+ * (settlement per corridor currency), which is `feed / reference` here. */
+export function referenceTooFar(reading: CurveReading, feed: number): boolean {
+  const mid = reading.reference_mid
+  const buy = mid * (1 + reading.half_range_bps / 10_000)
+  const gapBps = (reference: number) => Math.abs(feed / reference - 1) * 10_000
+  return !(
+    gapBps(mid) <= MAX_REFERENCE_GAP_BPS && gapBps(buy) <= MAX_REFERENCE_GAP_BPS
+  )
 }
 
 /** Where the share ends after a trade of `sizeUsd` on a wallet worth

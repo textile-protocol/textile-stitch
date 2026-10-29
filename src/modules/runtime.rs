@@ -136,6 +136,11 @@ pub struct CurveReading {
     pub half_range_bps: f64,
     /// The venue fee on the last quote request, bps.
     pub fee_bps: u32,
+    /// The feed price the flat quote is built from, on the bot's price basis:
+    /// `price` in Preview, `unadjustedPrice` in Live where the feed serves
+    /// one. Not the reference mid, which only the curve anchors on. Absent in
+    /// status written before the bot recorded it.
+    pub feed_price: Option<f64>,
 }
 
 /// One Swap request the curve priced, or answered flat.

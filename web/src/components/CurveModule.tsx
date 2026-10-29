@@ -4,9 +4,12 @@ import {
   cheapestUntil,
   curveFor,
   curveRequirements,
+  feedPrice,
   flatPrice,
   freshReading,
   MAX_OFFSET,
+  readsUnadjustedPrice,
+  referenceTooFar,
   shareAfter,
   takerPrice,
   type Curve,
@@ -230,6 +233,15 @@ export function CurveExample({
         Simulating needs a reference book and balances from the running bot.
       </p>
     )
+  // The reading is on the price basis of the config the bot is running,
+  // which its status carries. The saved config can differ (a save whose
+  // restart failed). A draft on another basis has no feed price to compare
+  // against until the bot runs it.
+  const running = view.status?.config ?? view.config
+  const sameBasis =
+    readsUnadjustedPrice(draft) === readsUnadjustedPrice(running)
+  const feed = sameBasis ? feedPrice(reading) : null
+  const flatOnly = feed !== null && referenceTooFar(reading, feed)
   const sides = ([true, false] as const).map((botBuys) => {
     const after = shareAfter(
       example.share,
@@ -237,14 +249,16 @@ export function CurveExample({
       reading.value,
       botBuys
     )
-    const price = takerPrice(curve, botBuys, example.share, after)
-    const flat = flatPrice(curve, botBuys)
-    return { botBuys, after, price, flat, lean: bpsOver(price, flat) }
+    const flat = feed === null ? null : flatPrice(feed, curve.allInBps, botBuys)
+    const curved = takerPrice(curve, botBuys, example.share, after)
+    const price = flatOnly && flat !== null ? flat : curved
+    const lean = flat === null || flatOnly ? null : bpsOver(price, flat)
+    return { botBuys, after, price, flat, lean }
   })
   type Side = (typeof sides)[number]
   const rows: [string, (s: Side) => string, boolean][] = [
-    ['Flat quote', (s) => priceText(s.flat), false],
-    ['Curve lean', (s) => signedBps(s.lean), true],
+    ['Flat quote', (s) => (s.flat === null ? '—' : priceText(s.flat)), false],
+    ['Curve lean', (s) => (s.lean === null ? '—' : signedBps(s.lean)), true],
     ['Quote', (s) => priceText(s.price), false],
     [`${currency} after`, (s) => share(s.after), false],
   ]
@@ -289,12 +303,23 @@ export function CurveExample({
       <p className="text-muted text-xs leading-relaxed">
         {currency} per {settlement}, all-in. Priced across the holdings this
         trade moves through, so splitting it into smaller quotes costs the same,
-        and a round trip always costs the taker the spread.
+        and a round trip always costs the taker the spread.{' '}
+        {!sameBasis
+          ? `The flat quote shows once the bot runs this: ${readsUnadjustedPrice(draft) ? 'Live quotes around the feed price before manual adjustments' : 'Preview quotes around the served feed price'}, and the running bot still reads the other one.`
+          : feed === null
+            ? 'The flat quote shows once the bot reports the price it quotes flat around; update the bot if it stays blank.'
+            : flatOnly
+              ? `The bot quotes flat right now: its reference book is more than 1% from the feed price, ${priceText(feed)}.`
+              : `Flat is the quote without the curve: spread and venue fee around the feed price the bot quotes on, ${priceText(feed)}, not the reference mid.`}
       </p>
       <p className="text-muted text-xs leading-relaxed">
         {draft.mode === 'live'
           ? 'Live quotes and published levels use this price.'
           : 'Preview records this quote. Live quotes stay flat until you switch to Live.'}
+        {/* Without the feed price the 1% check can't run, so the quote is
+            what the curve says, not necessarily what the bot sends. */}
+        {feed === null &&
+          " If the bot's reference book is more than 1% from its feed price, it quotes flat instead."}
       </p>
       {Math.abs(reading.share - example.share) > 1e-4 && (
         <button

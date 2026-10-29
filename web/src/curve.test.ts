@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import {
   averageShade,
+  bpsOver,
   cheapestUntil,
   curveConfigErrors,
   curveOverviewState,
   curveFor,
   DEFAULT_SHAPE,
+  feedPrice,
+  flatPrice,
   knobLabel,
+  MAX_REFERENCE_GAP_BPS,
+  readsUnadjustedPrice,
+  referenceTooFar,
   shadeAt,
   shapeLabel,
   takerPrice,
@@ -151,6 +157,69 @@ describe('inventory curve', () => {
     expect(
       curveConfigErrors({ start_below_mid: 0, end_above_buy: 0, shape: 9 })
     ).toHaveLength(1)
+  })
+})
+
+describe('flat quote', () => {
+  // The feed price the bot quotes flat around: on cNGN a few bps above the
+  // reference mid.
+  const FEED = 1381.4
+  const reading = {
+    at: 1,
+    share: 0.5,
+    value: 1,
+    reference_mid: MID,
+    half_range_bps: HALF,
+    fee_bps: 1,
+  }
+
+  it('sits around the feed price, not the reference mid', () => {
+    close(flatPrice(FEED, ALL_IN, true), FEED * (1 + ALL_IN / 10_000))
+    close(flatPrice(FEED, ALL_IN, false), FEED * (1 - ALL_IN / 10_000))
+  })
+
+  it('leans by the curve against the feed price, whatever the spread', () => {
+    for (const allIn of [0, ALL_IN, 25]) {
+      const c = curveFor(reference, allIn, knobs(1, 0.5))!
+      for (const botBuys of [true, false]) {
+        const lean = bpsOver(
+          takerPrice(c, botBuys, 0.5, 0.6),
+          flatPrice(FEED, allIn, botBuys)
+        )
+        const shaded = MID * (1 + averageShade(c, 0.5, 0.6) / 10_000)
+        expect(lean).toBeCloseTo(bpsOver(shaded, FEED), 9)
+      }
+    }
+  })
+
+  it('reads the feed price off the reading, and none off an older bot', () => {
+    expect(feedPrice({ ...reading, feed_price: FEED })).toBe(FEED)
+    for (const feed_price of [undefined, null, 0, -1, NaN, Infinity])
+      expect(feedPrice({ ...reading, feed_price })).toBeNull()
+  })
+
+  it('reads the unadjusted feed price only while the curve runs Live', () => {
+    const config = (mode: 'off' | 'shadow' | 'live', enabled: boolean) => ({
+      mode,
+      curve: { enabled, ...knobs(0, 0) },
+    })
+    expect(readsUnadjustedPrice(config('live', true))).toBe(true)
+    expect(readsUnadjustedPrice(config('live', false))).toBe(false)
+    expect(readsUnadjustedPrice(config('shadow', true))).toBe(false)
+    expect(readsUnadjustedPrice(config('off', true))).toBe(false)
+  })
+
+  it('goes flat, as the bot does, once the reference is 1% from the feed', () => {
+    const buy = MID * (1 + HALF / 10_000)
+    const at = (from: number, bps: number) => from * (1 + bps / 10_000)
+    const tooFar = (feed: number) => referenceTooFar(reading, feed)
+    expect(tooFar(FEED)).toBe(false)
+    // Both ends must be within 1%: below the book the buy is the far end,
+    // above it the mid is.
+    expect(tooFar(at(buy, -MAX_REFERENCE_GAP_BPS + 0.1))).toBe(false)
+    expect(tooFar(at(buy, -MAX_REFERENCE_GAP_BPS - 0.1))).toBe(true)
+    expect(tooFar(at(MID, MAX_REFERENCE_GAP_BPS - 0.1))).toBe(false)
+    expect(tooFar(at(MID, MAX_REFERENCE_GAP_BPS + 0.1))).toBe(true)
   })
 })
 
