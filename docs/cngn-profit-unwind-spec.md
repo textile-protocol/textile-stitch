@@ -1,9 +1,9 @@
 # cNGN Profit unwind: stitch pricing spec
 
-**Status: built on the quote curve, 29 Oct 2026 (`[modules.profit_unwind]`,
-`src/pricing/unwind.rs`).** It's an add-on to the quote curve (`docs/cngn-quote-curve-spec.md`);
-flat + Profit unwind is designed below and follows separately. It's off by default and opt-in per
-bot, and it previews (`live = false`) until switched to quote.
+**Status: built as its own module, on flat and on the quote curve, 29 Oct 2026
+(`[modules.profit_unwind]`, `src/pricing/unwind.rs`).** It lifts whatever price goes out: the quote
+curve's (`docs/cngn-quote-curve-spec.md`) when the curve quotes, the flat price otherwise. It's off
+by default and opt-in per bot, and it previews (`live = false`) until switched to quote.
 
 ## 0. An additional strategy, not a replacement
 
@@ -24,12 +24,16 @@ picks its own combination, per corridor.
 own feed** (the price before manual adjustments, the one a Live bot quotes off), not the P2P
 reference the curve anchors on: cNGN is always valued off our feed.
 
-**Built first on the curve only (28 Oct).** Flat bots don't read their balances today, so flat +
-Profit unwind follows as its own change.
+**On flat,** the lift moves both sides of the flat price by the same bps, so the spread is
+unchanged. The gain is measured against the price the flat bot already quotes off. The flat price
+doesn't depend on the share, but the lift does: a flat quote pays the lift's average over the stretch
+of share it walks, exactly as on the curve (§3), with the share valued at the feed. That's the
+answer to §5 for flat: out and back over the same stretch cancel, so the share needs no freezing
+here either. The round-trip limit uses the smaller of the two bps spreads, since a flat corridor's
+sides needn't match.
 
-**On flat,** the lift moves the flat centre, so both sides move together and the spread is
-unchanged. The gain is measured against the price the flat bot already quotes off. A flat price has
-no share to average over, so flat + Profit unwind needs its own answer to §5 before it ships.
+**When a Live curve can't price a request** (no reference book, one more than 1% off the print, no
+fresh balances), the flat answer goes out, and a live lift goes on it like on any flat price.
 
 `f` comes from the bot's balance reads in both cases. Flat RFQ bots already read their balances to
 cap quotes.
@@ -116,8 +120,9 @@ to `(1 - start) / 2`. So when each quote is priced, the full lift is held to
 L <= 4 * spread * mid / (1 - start)
 ```
 
-where `spread` is the corridor spread (the signed order's half-width) and `mid` is the curve's
-reference mid. That keeps `L * (1 - start) / 2` within `2 * spread`, the one cost every round trip
+where `spread` is the corridor spread (the signed order's half-width; on flat, the smaller side's)
+and `mid` is the mid the lift is turned into bps against: the curve's reference mid, or the flat
+price's centre. That keeps `L * (1 - start) / 2` within `2 * spread`, the one cost every round trip
 is sure to pay. The venue fee isn't in it: it arrives per request, and the legs of a round trip
 needn't pay the same one, so a dear first leg and cheap returns would otherwise leave room. At a
 1 bps spread and a 1,380 mid the limit is about 0.55 NGN at start 0 and 1.1 NGN at start 50, so
@@ -233,14 +238,14 @@ paid +10.6 bps at a 25 bps first leg.
 ## 6. Knobs
 
 These live in their own block, `[modules.profit_unwind]`. The lift only quotes with `live = true`
-and a Live curve (`[modules].mode`).
+in Live mode (`[modules].mode`), with or without the curve.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Off unless switched on. Needs `[modules.curve]` on |
-| `live` | `false` | Quote with the lift. Off, the bot tracks the cost, computes the lift and logs the price it would quote, and quotes the plain curve |
+| `enabled` | `false` | Off unless switched on. Runs with or without `[modules.curve]` |
+| `live` | `false` | Quote with the lift. Off, the bot tracks the cost, computes the lift and logs the price it would quote, and quotes without it |
 | `share` | `0.5` | Share of the gain passed back as a better price. Allowed range 0–1 |
-| `cap_ngn` | `2` | The most the curve ever lifts for profit unwind, in NGN. Held to the round-trip limit (§3) when quoting |
+| `cap_ngn` | `2` | The most profit unwind ever lifts the price, in NGN. Held to the round-trip limit (§3) when quoting |
 | `min_gain_ngn` | `0.7` | Ignore gains smaller than this, in NGN per USDT (about 5 bps), so feed noise doesn't move the price |
 | `start_pct` | `50` | Start profit unwind at this naira share, in %. Below it, no lift; above it the lift grows to full at 100%. Allowed range 0–99 |
 | `refresh_secs` | `900` | How often the cost is frozen again (§5). TOML only, not on the panel |
@@ -250,13 +255,20 @@ Validation, mirroring the curve:
 - the start must be within 0–99%;
 - the cap and min gain must be 0 or more;
 - refresh must be at least 60 s;
-- it needs the curve on (v1 is curve only, §0).
+- bps spreads, since the limit is a multiple of the spread;
+- a feed the right way round (the collateral is the soft currency), like the curve;
+- on a vault, inventory balancing off: it skews a side below the configured spread the limit counts
+  on. Dynamic spreads only widen the spreads and can stay.
 
 All the keys go into the parameter change log, like `modules.curve.*`.
 
-The panel's curve editor shows the current average cost, the feed, the gain, and the lift at full
-and at today's share. The curve it draws includes the lift once it quotes. Its maths is pinned to the
-bot's by `tests/unwind_parity.rs`, which writes `web/src/unwindParity.json` for the web tests.
+Profit unwind is its own module in the panel, next to the inventory curve. Its Settings draw the
+lift across the share, and show the current average cost, the feed, the gain, and the lift at full
+and at today's share. Overview shows the lift now and the cost basis, and Activity lists every quote
+it lifted or previewed. Simulate prices an example trade on the price it would lift, the curve's or
+the flat one, with the lift shown (greyed in preview) and a sell the floor holds back marked; the
+curve's Simulate shows the same row under its lean. Its maths is pinned to the bot's, on the curve and on flat, by
+`tests/unwind_parity.rs`, which writes `web/src/unwindParity.json` for the web tests.
 
 ## 7. Degraded inputs
 
@@ -305,9 +317,9 @@ bot's by `tests/unwind_parity.rs`, which writes `web/src/unwindParity.json` for 
 1. **Simulator first.** Add an average-cost input and the profit unwind knobs to the curve simulator,
    and show the lifted curve next to the plain one. Tomer checks the numbers before any code.
 2. **Preview** with `enabled = true`, `live = false`. The bot computes the lift and logs it but
-   quotes the plain curve. Each curve quote's log line carries `unwind_cost`, `unwind_full_ngn`,
-   `unwind_live` and `unwound` (the price it would have quoted) next to `curved`. Run for a few days on
-   the cNGN BSC bot that runs the curve; its curve can stay Live.
+   quotes without it. Each quote it would lift gets a `profit unwind quote` log line with `cost`,
+   `full_ngn`, `live`, `base` (the curve's or the flat price) and `unwound` (the price it would have
+   quoted). Run for a few days on the cNGN BSC bot that runs the curve; its curve can stay Live.
 3. **Live** with `live = true`, share 0.5 and cap 2 NGN.
 4. **Watch:**
    - the naira share trend;
@@ -330,6 +342,16 @@ bot's by `tests/unwind_parity.rs`, which writes `web/src/unwindParity.json` for 
 
 ## Decision log
 
+- **29 Oct 2026 (Benoit): its own module.** Profit unwind is a module of its own, not part of the
+  curve: a bot can run it on a flat price or on the curve. On flat it lifts both sides of the flat
+  signed order by the averaged lift in bps of the flat centre, with the ask floored at the cost, and
+  holds the full lift to the round-trip limit at the smaller bps spread. The share is valued at the
+  feed. A Live curve that can't price a request answers flat, and the lift goes on that. The limit
+  on flat uses the corridor's configured spreads, which dynamic spreads only widen, and profit
+  unwind is refused beside inventory balancing on a vault, which can narrow a side below them
+  between a taker's legs. The curve's own maths,
+  with or without the lift, is unchanged. The curve and profit unwind log and report separately
+  (`curve quote` and `profit unwind quote`, `status.curve` and `status.profit_unwind`).
 - **29 Oct 2026 (review of #2817, Benoit):**
   - naira in enters the basis at the feed, fills included, not at the price paid. Marking fills at
     the price paid counted the stitch's own spread and shade as gain, handed part of it back, and

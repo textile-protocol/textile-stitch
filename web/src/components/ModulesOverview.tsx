@@ -1,4 +1,5 @@
 import { curveOverviewState, freshReading } from '../curve'
+import { freshUnwindReading, unwindOverviewState } from '../unwind'
 import { type ModulesView } from '../modules'
 import {
   moduleOverviewState,
@@ -7,6 +8,7 @@ import {
   type ModuleKey,
 } from '../modulePresentation'
 import { CurveNow } from './CurveModule'
+import { ProfitUnwindNow } from './ProfitUnwindModule'
 import { AllocationBar, Disclosure } from './ModuleControls'
 import DynamicSpreadsLive from './DynamicSpreadsLive'
 import LiquidityScheduleLive from './LiquidityScheduleLive'
@@ -31,6 +33,16 @@ export default function ModulesOverview({
   if (selected === 'curve')
     return (
       <CurveOverview
+        view={view}
+        now={now}
+        currency={currency}
+        settlement={settlement}
+        onDecisions={onDecisions}
+      />
+    )
+  if (selected === 'profit_unwind')
+    return (
+      <UnwindOverview
         view={view}
         now={now}
         currency={currency}
@@ -266,6 +278,94 @@ function CurveOverview({
               : 'Holdings use this wallet’s raw balances valued at the reference mid.'}{' '}
             This side’s open quotes count as already moved. Quotes are
             calculations, not completed trades.
+          </p>
+          <Button onClick={onDecisions}>Open quote history</Button>
+        </div>
+      </Disclosure>
+    </div>
+  )
+}
+
+/** Profit unwind monitoring, on a flat price or on the curve. */
+function UnwindOverview({
+  view,
+  now,
+  currency,
+  settlement,
+  onDecisions,
+}: {
+  view: ModulesView
+  now: number
+  currency: string
+  settlement: string
+  onDecisions: () => void
+}) {
+  const vault = view.vault ?? true
+  const state = unwindOverviewState(view, now)
+  const reading = freshUnwindReading(view.status?.profit_unwind, now)
+  const quotes = view.status?.profit_unwind?.quotes ?? []
+  const u = view.config.profit_unwind
+  const onCurve = view.config.curve.enabled && view.config.mode === 'live'
+  return (
+    <div className="space-y-4">
+      <Card className="!rounded-none !border-0 !p-0">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <p className="text-muted mb-2 text-xs font-bold uppercase tracking-wider">
+              Right now
+            </p>
+            <h3 className="text-xl font-bold">{state.title}</h3>
+            <p className="text-muted mt-2 max-w-xl text-sm">{state.message}</p>
+          </div>
+          <span className="bg-hover rounded-full px-3 py-1 text-xs font-bold">
+            {state.pill}
+          </span>
+        </div>
+        <div className="border-line-soft mt-6 border-t pt-6">
+          <ProfitUnwindNow
+            view={view}
+            now={now}
+            currency={currency}
+            settlement={settlement}
+          />
+        </div>
+      </Card>
+      <Disclosure title="Details & recent activity">
+        <div className="space-y-4 text-sm">
+          <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-2">
+            {(
+              [
+                ['Lifts', onCurve ? 'The inventory curve' : 'The flat price'],
+                [
+                  vault ? 'Vault value' : 'Wallet value',
+                  reading?.value != null
+                    ? `${reading.value.toLocaleString(undefined, { maximumFractionDigits: 0 })} ${settlement}`
+                    : '—',
+                ],
+                [
+                  'Gain given back',
+                  `${Math.round(u.share * 100)}%, up to ${u.cap_ngn.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}`,
+                ],
+                [
+                  'Quotes lifted',
+                  quotes.length
+                    ? `${quotes.filter((q) => q.live).length} of the last ${quotes.length}`
+                    : '—',
+                ],
+              ] as const
+            ).map(([label, value]) => (
+              <div key={label}>
+                <dt className="text-muted text-xs">{label}</dt>
+                <dd className="font-bold tabular-nums">{value}</dd>
+              </div>
+            ))}
+          </dl>
+          <p className="text-muted text-xs">
+            {vault
+              ? 'Holdings use the vault’s free balances.'
+              : 'Holdings use this wallet’s raw balances.'}{' '}
+            The share is valued at the feed. This side’s open quotes count as
+            already moved. Quotes are calculations, not completed trades.
           </p>
           <Button onClick={onDecisions}>Open quote history</Button>
         </div>

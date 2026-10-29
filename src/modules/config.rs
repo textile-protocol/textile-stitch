@@ -43,8 +43,8 @@ impl ModulesConfig {
     /// What can run on this bot's funds. Inventory balancing, dynamic spreads,
     /// spot rebalancing and the liquidity schedule read a vault's NAV and act
     /// through it, so on a bot that trades from its own wallet they are off
-    /// whatever the file says; only the inventory curve runs there. On a vault
-    /// every module can run.
+    /// whatever the file says; only the inventory curve and profit unwind run
+    /// there. On a vault every module can run.
     pub fn runnable(&self, on_vault: bool) -> Self {
         if on_vault {
             return self.clone();
@@ -111,22 +111,22 @@ impl CurveConfig {
 }
 /// Profit unwind ([`crate::pricing::unwind`]): when the feed has moved so the
 /// corridor currency the bot holds is worth more than when it came in, the
-/// curve lifts by a slice of that gain, so takers bringing dollars clear the
-/// pile faster and the bot keeps the rest. Rides on the inventory curve; off
-/// unless switched on, and only quotes with `live` (and a Live curve). The two
-/// amounts are in the corridor's soft currency, like the curve's offsets.
+/// price lifts by a slice of that gain, so takers bringing dollars clear the
+/// pile faster and the bot keeps the rest. Its own module: it lifts whatever
+/// price goes out, the inventory curve's or the flat one. Off unless switched
+/// on, and only quotes with `live` in Live mode. The two amounts are in the
+/// corridor's soft currency, like the curve's offsets.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfitUnwindConfig {
     pub enabled: bool,
     /// Quote with the lift. Off, the bot tracks the cost, computes the lift
-    /// and logs the price it would quote, and quotes the plain curve: profit
-    /// unwind's own preview, for a bot whose curve is already Live.
+    /// and logs the price it would quote, and quotes without it: profit
+    /// unwind's own preview, for a bot already quoting Live.
     pub live: bool,
     /// Share of the gain passed back as a better price, 0 to 1.
     pub share: f64,
-    /// The most the curve ever lifts for profit unwind, soft currency per
-    /// dollar.
+    /// The most profit unwind ever lifts the price, soft currency per dollar.
     pub cap_ngn: f64,
     /// Gains smaller than this, soft currency per dollar, move nothing.
     pub min_gain_ngn: f64,
@@ -432,10 +432,6 @@ impl ModulesConfig {
         ensure!(
             u.refresh_secs >= 60,
             "modules profit_unwind refresh_secs must be at least 60"
-        );
-        ensure!(
-            !u.enabled || c.enabled,
-            "profit unwind moves the inventory curve, so it needs [modules.curve] switched on"
         );
         if let Some(d) = &r.dealer {
             crate::config::assert_feed_url(&d.url, "modules.rebalance.dealer.url")?;

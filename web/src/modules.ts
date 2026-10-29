@@ -1,4 +1,5 @@
 import type { CurveStatus } from './curve'
+import type { UnwindStatus } from './unwind'
 export interface ModulesConfig {
   mode: 'off' | 'shadow' | 'live'
   inventory: {
@@ -30,17 +31,19 @@ export interface ModulesConfig {
   /** Moves the vault's on-chain `minLiquidSettlement` on a UTC schedule.
    * Floors and tolerance are shares of free settlement (liquid + staked). */
   liquidity: LiquidityConfig
-  /** The inventory curve: the one module that also runs without a vault.
-   * Offsets are in the corridor's soft currency (NGN for cNGN). */
+  /** The inventory curve: runs with or without a vault. Offsets are in the
+   * corridor's soft currency (NGN for cNGN). */
   curve: CurveModuleConfig
-  /** Profit unwind, on top of the curve. Absent from older releases. */
-  profit_unwind?: ProfitUnwindConfig
+  /** Profit unwind: lifts whatever price goes out, the curve's or the flat
+   * one. Runs with or without a vault. A running bot's status from an older
+   * release can leave it out. */
+  profit_unwind: ProfitUnwindConfig
 }
 /** Mirrors `ProfitUnwindConfig` in src/modules/config.rs. Amounts are in the
  * corridor's soft currency per dollar, like the curve's offsets. */
 export interface ProfitUnwindConfig {
   enabled: boolean
-  /** Quote with the lift; off, the bot previews it on a Live curve. */
+  /** Quote with the lift (in Live mode); off, the bot previews it. */
   live: boolean
   /** Share of the gain passed back, 0..1. */
   share: number
@@ -155,6 +158,9 @@ export interface ModuleStatus {
   /** The inventory curve's last reading and recent quotes. Absent while it
    *  has never run, and from older bots. */
   curve?: CurveStatus | null
+  /** Profit unwind's last reading and recent quotes. Absent while it has
+   *  never run, and from older bots. */
+  profit_unwind?: UnwindStatus | null
 }
 /** One side of the corridor's configured spread. `abs` is an offset in
  * collateral per debt, so it only reads as bps at a price. */

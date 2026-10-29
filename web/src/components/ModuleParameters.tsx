@@ -1,9 +1,10 @@
 import { useId, useState } from 'react'
 import type { ModulesConfig, ModulesView } from '../modules'
 import { CurveExample, CurveFields } from './CurveModule'
+import { ProfitUnwindFields, UnwindExample } from './ProfitUnwindModule'
 import ModulePresets from './ModulePresets'
 import {
-  draftUnwindCapLimit,
+  enforcedUnwindCapLimit,
   leanConflict,
   liquidityScheduleErrors,
   moduleNames,
@@ -83,10 +84,11 @@ export default function ModuleParameters({
 }) {
   const vault = view.vault ?? true
   // A warming-up window has no range to start from; 0.2% is a plain example.
-  const curveShare = view.status?.curve?.reading?.share
+  const heldShare =
+    view.status?.curve?.reading?.share ??
+    view.status?.profit_unwind?.reading?.share
   const [share, setShare] = useState(
-    live?.share ??
-      (curveShare !== undefined ? Math.round(curveShare * 10_000) : 4500)
+    live?.share ?? (heldShare != null ? Math.round(heldShare * 10_000) : 4500)
   )
   const [range, setRange] = useState(live?.rangeBps ?? 20)
   const [sizeUsd, setSizeUsd] = useState(10_000)
@@ -263,6 +265,15 @@ function ModuleEditor({
                     : null
                 }
               />
+            ) : module === 'profit_unwind' ? (
+              <ProfitUnwindFields
+                draft={draft}
+                onChange={onChange}
+                view={view}
+                now={now}
+                currency={currency}
+                settlement={settlement}
+              />
             ) : (
               <ModuleFields
                 module={module}
@@ -289,12 +300,13 @@ function ModuleEditor({
   )
 }
 
-/** A vault module's own fields. The inventory curve has its own editor. */
+/** A vault module's own fields. The inventory curve and profit unwind have
+ * their own editors. */
 function ModuleFields({
   module,
   ...props
 }: {
-  module: Exclude<ModuleKey, 'curve'>
+  module: Exclude<ModuleKey, 'curve' | 'profit_unwind'>
   draft: ModulesConfig
   onChange: (config: ModulesConfig) => void
   currency: string
@@ -333,7 +345,7 @@ function ModuleExample({
     moduleParameterErrors(
       draft,
       view.vault ?? true,
-      draftUnwindCapLimit(view, draft, now)
+      enforcedUnwindCapLimit(view, view.config, draft, now)
     ).length === 0
   const enabled = draft[module].enabled
   const breakdown =
@@ -405,12 +417,28 @@ function ModuleExample({
                   ? 'See the extra margin'
                   : module === 'liquidity'
                     ? 'See the weekly schedule'
-                    : module === 'curve'
+                    : module === 'curve' || module === 'profit_unwind'
                       ? 'See a quote'
                       : 'See when a sale starts'}
             </h4>
             {module === 'curve' ? (
               <CurveExample
+                draft={draft}
+                view={view}
+                now={now}
+                currency={currency}
+                settlement={settlement}
+                example={{
+                  share: example.share / 10_000,
+                  sizeUsd: example.sizeUsd,
+                }}
+                onExample={(next) => {
+                  example.setShare(Math.round(next.share * 10_000))
+                  example.setSizeUsd(next.sizeUsd)
+                }}
+              />
+            ) : module === 'profit_unwind' ? (
+              <UnwindExample
                 draft={draft}
                 view={view}
                 now={now}
@@ -479,7 +507,11 @@ function ModuleExample({
                   <div className="space-y-3">
                     <QuoteBreakdown
                       rows={breakdown}
-                      highlight={module === 'rebalance' ? null : module}
+                      highlight={
+                        module === 'inventory' || module === 'spreads'
+                          ? module
+                          : null
+                      }
                       current={
                         example.atLive && example.live
                           ? liveRow(example.live)
@@ -546,7 +578,7 @@ function ModuleExample({
             <p className="text-muted mt-6 text-xs leading-relaxed">
               {module === 'liquidity'
                 ? 'Illustration only. The floor is a share of free settlement, so the amount kept liquid moves with the vault balance.'
-                : module === 'curve'
+                : module === 'curve' || module === 'profit_unwind'
                   ? 'Illustration only, not a live quote. Open quotes on the same side, capacity and the venue fee on the actual request still apply.'
                   : 'Illustration only, not a live quote or a return forecast. Open quotes, available funds and vault limits can still hold a side back.'}
             </p>

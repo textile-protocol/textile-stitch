@@ -93,7 +93,7 @@ use order::{build_order, RfqOrderSpec};
 use reserve::{Reservations, RESERVATIONS_FILE};
 use responder::{
     book_from_pool, decide_quote, decide_quote_curved, levels_for, levels_for_curved,
-    wallet_tokens, CorridorBook, CurveNote, InventoryView,
+    wallet_tokens, CorridorBook, CurveNote, InventoryView, QuoteNotes,
 };
 use session::AuthedSession;
 use wire::{
@@ -575,10 +575,9 @@ fn curve_reading_status(
     inputs: &responder::CurveInputs,
     fee_bps: u32,
     now: u64,
-    unwind: Option<crate::modules::runtime::UnwindReading>,
 ) -> Option<crate::modules::runtime::CurveReading> {
-    let (share, value) = responder::holdings_share(book, inputs)?;
     let (mid, half_range_bps) = inputs.reference?;
+    let (share, value) = responder::holdings_share(book, inputs.holdings, mid)?;
     Some(crate::modules::runtime::CurveReading {
         at: now,
         share,
@@ -587,26 +586,55 @@ fn curve_reading_status(
         half_range_bps,
         fee_bps,
         feed_price: (price.is_finite() && price > 0.0).then(|| 1.0 / price),
-        unwind,
     })
 }
 
 /// Profit unwind's reading for the module status, in soft currency per
-/// dollar, from the snapshot and the lift priced this tick.
+/// dollar, from the snapshot and the lift priced this tick. The share is
+/// valued at the feed, as on a flat price.
+#[allow(clippy::too_many_arguments)]
 fn unwind_reading_status(
+    book: &CorridorBook,
+    holdings: Option<responder::Holdings>,
     snapshot: crate::pricing::unwind::Snapshot,
     shift: crate::pricing::unwind::Shift,
     feed_price: f64,
+    fee_bps: u32,
     live: bool,
+    now: u64,
 ) -> crate::modules::runtime::UnwindReading {
     let feed_mid = 1.0 / feed_price;
+    let share = responder::holdings_share(book, holdings, feed_price);
     crate::modules::runtime::UnwindReading {
+        at: now,
+        share: share.map(|(f, _)| f),
+        value: share.map(|(_, v)| v),
+        fee_bps,
         cost: snapshot.cost_ngn,
         snapshot_at: snapshot.at,
         feed_mid,
         gain: shift.gain_ngn,
         full_shift: shift.full_ngn,
         live,
+    }
+}
+
+/// A quote profit unwind lifted or previewed, as the module status records
+/// it. The lift is in soft currency per dollar, so `base / unwound`.
+fn unwind_quote_status(
+    book: &CorridorBook,
+    plan: &responder::QuotePlan,
+    note: responder::UnwindNote,
+    now: u64,
+) -> crate::modules::runtime::UnwindQuote {
+    crate::modules::runtime::UnwindQuote {
+        at: now,
+        bot_buys: plan.bid,
+        live: note.live,
+        size: responder::plan_size(plan, book),
+        share_before: note.f0,
+        share_after: note.f1,
+        lift_bps: (note.base / note.unwound - 1.0) * 10_000.0,
     }
 }
 
@@ -764,7 +792,7 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
     // Every RFQ side (Exact cap or live wallet) refreshes funded amounts
     // off the quote path. Exact is a cap on top of the wallet, not a bypass.
     let inventory = InventoryCache::default();
-    let tokens = wallet_tokens(&rt.books);
+    let tokens = wallet_tokens(&rt.books, rt.unwind.is_some());
     if !tokens.is_empty() || rt.vault.is_some() {
         let wallet =
             Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id).with_gas_caps(rt.gas_caps);
@@ -1784,16 +1812,25 @@ impl Engine {
                 let effective = self.module_book(book, &quote, now_secs)?;
                 self.observe_unwind(book, &quote, now_secs);
                 let inputs = self.curve_inputs(book, &quote, now_secs);
-                if let (Some(modules), Some(_)) = (&self.modules, book.curve) {
-                    let unwind = self
-                        .unwind_shift(book, &quote, now_secs)
-                        .map(|(snapshot, shift)| {
-                            unwind_reading_status(snapshot, shift, quote.price, self.unwind_live())
-                        });
-                    if let Some(reading) =
-                        curve_reading_status(book, quote.price, &inputs, self.venue_fee_bps, now_secs, unwind)
-                    {
-                        modules.curve_reading(reading);
+                if let Some(modules) = &self.modules {
+                    if book.curve.is_some() {
+                        if let Some(reading) =
+                            curve_reading_status(book, quote.price, &inputs, self.venue_fee_bps, now_secs)
+                        {
+                            modules.curve_reading(reading);
+                        }
+                    }
+                    if let Some((snapshot, shift)) = self.unwind_shift(book, &quote, now_secs) {
+                        modules.unwind_reading(unwind_reading_status(
+                            book,
+                            inputs.holdings,
+                            snapshot,
+                            shift,
+                            quote.price,
+                            self.venue_fee_bps,
+                            self.unwind_live(),
+                            now_secs,
+                        ));
                     }
                 }
                 let mut levels = levels_for_curved(
@@ -2032,7 +2069,7 @@ impl Engine {
         // down. The input is kept to recheck after signing.
         self.observe_unwind(&book, &quote, now_secs);
         let curve_inputs = self.curve_inputs(&book, &quote, now_secs);
-        let (plan, curve_note) = match decide_quote_curved(
+        let (plan, notes) = match decide_quote_curved(
             &effective_book,
             &req,
             quote.price,
@@ -2081,11 +2118,11 @@ impl Engine {
                 recall_offer = Some((o.clone(), cap.executor));
                 // Recalled collateral has its own flat levels and reservation
                 // ledger; it is not part of the liquid wallet's pricing curve.
-                (plan, None)
+                (plan, QuoteNotes::default())
             }
             Err(reason) => return reject(reason),
         };
-        match curve_note {
+        match notes.curve {
             Some(CurveNote::Priced {
                 live,
                 flat,
@@ -2095,27 +2132,15 @@ impl Engine {
                 f1,
                 s0,
                 s1,
-                unwind,
-                unwound,
                 size_debt,
                 promised_debt,
                 cheapest_until,
             }) => {
-                // Profit unwind's line: the cost and full lift it sized on,
-                // whether it quoted, and the lifted price against the plain
-                // curve's. In its preview that is the price it would quote.
-                let unwind_fields = unwind.zip(unwound).map(|(u, unwound)| {
-                    (
-                        format!("{:.2}", u.lift.cost_ngn),
-                        format!("{:.2}", u.lift.full_ngn),
-                        u.live,
-                        format!("{unwound:.9}"),
-                    )
-                });
                 // The shadow trail the rollout reads for days before anything
                 // is decided; also the live audit line once it is. Both
                 // prices are ORDER prices (spread only, fee injected on top),
-                // so the comparison carries no fee bias.
+                // so the comparison carries no fee bias. `curved` is the
+                // plain curve's; profit unwind logs its lift on its own line.
                 tracing::info!(
                     corridor = %book.slug,
                     rfq = %req.rfq_id,
@@ -2128,10 +2153,6 @@ impl Engine {
                     promised_debt = format!("{promised_debt:.2}"),
                     s0 = format!("{s0:.2}"),
                     s1 = format!("{s1:.2}"),
-                    unwind_cost = unwind_fields.as_ref().map_or("-", |f| f.0.as_str()),
-                    unwind_full_ngn = unwind_fields.as_ref().map_or("-", |f| f.1.as_str()),
-                    unwind_live = unwind_fields.as_ref().is_some_and(|f| f.2),
-                    unwound = unwind_fields.as_ref().map_or("-", |f| f.3.as_str()),
                     cheapest_until = format!("{:.0}%", cheapest_until * 100.0),
                     flat = format!("{flat:.9}"),
                     curved = format!("{curved:.9}"),
@@ -2151,20 +2172,46 @@ impl Engine {
             }
             None => {}
         }
-        if let (Some(modules), Some(note)) = (&self.modules, curve_note) {
+        if let Some(u) = notes.unwind {
+            // Profit unwind's line: the cost and full lift it sized on,
+            // whether it quoted, and the lifted price against the one it
+            // lifts (the curve's or the flat one). In its preview that is the
+            // price it would have quoted.
+            tracing::info!(
+                corridor = %book.slug,
+                rfq = %req.rfq_id,
+                bid = plan.bid,
+                live = u.live,
+                f0 = format!("{:.4}", u.f0),
+                f1 = format!("{:.4}", u.f1),
+                cost = format!("{:.2}", u.lift.cost_ngn),
+                full_ngn = format!("{:.2}", u.lift.full_ngn),
+                base = format!("{:.9}", u.base),
+                unwound = format!("{:.9}", u.unwound),
+                unwind_bps = format!("{:+.2}", (u.unwound / u.base - 1.0) * 10_000.0),
+                "profit unwind quote"
+            );
+        }
+        if let (Some(modules), Some(note)) = (&self.modules, notes.curve) {
             modules.curve_quote(curve_quote_status(&book, &plan, note, now_secs));
         }
-        // On a Live curve the levels and the reply can price differently:
-        // the reply starts at the far end of this side's outstanding quotes
-        // while the levels only catch up on the next publish, and a reply the
-        // curve can't price goes out flat against levels that were curved.
+        if let (Some(modules), Some(note)) = (&self.modules, notes.unwind) {
+            modules.unwind_quote(unwind_quote_status(&book, &plan, note, now_secs));
+        }
+        // On a Live curve or a live profit unwind lift the levels and the
+        // reply can price differently: the reply starts at the far end of
+        // this side's outstanding quotes while the levels only catch up on
+        // the next publish, and a reply the curve can't price goes out flat
+        // against levels that were curved.
         // The venue judges every reply against the levels it routed on, so
         // every reply here is checked, flat ones included. Replying more than
         // the corridor's slack past them is a strike; declining is not. The
         // session loop republishes this corridor right after every request,
         // so this only bites inside that gap.
         // Recall replies use recall_asks, not the liquid curve's published levels.
-        if recall_offer.is_none() && book.curve.is_some_and(|c| c.live) {
+        let along_share =
+            book.curve.is_some_and(|c| c.live) || curve_inputs.unwind.is_some_and(|u| u.live);
+        if recall_offer.is_none() && along_share {
             let slack = self.level_slack_bps(&book.slug);
             let worse = self.published_levels.get(&book.slug).and_then(|levels| {
                 responder::worse_than_levels_bps(
@@ -5129,7 +5176,8 @@ mod tests {
         let book = engine.books[0].clone();
         let quote = prices.get("http://feed").unwrap();
         let inputs = engine.curve_inputs(&book, &quote, unix_now());
-        let (f0, total) = responder::holdings_share(&book, &inputs).unwrap();
+        let (f0, total) =
+            responder::holdings_share(&book, inputs.holdings, inputs.reference.unwrap().0).unwrap();
         let lifted = buy_amount(&mut engine, "rfq_lifted", &prices).await;
         // 1,000 cNGN at about 1 USDC walks the share up by 1,000 / total.
         let f1 = (f0 + 1_000.0 / total).min(1.0);
@@ -5148,6 +5196,35 @@ mod tests {
             unwind_tracker(&engine, 0.99),
         ));
         assert_eq!(buy_amount(&mut engine, "rfq_loss", &prices).await, plain);
+    }
+
+    /// Profit unwind on its own, with no curve: the flat quote moves by the
+    /// same lift, averaged over the stretch of share it walks (valued at the
+    /// feed).
+    #[tokio::test]
+    async fn profit_unwind_moves_a_flat_quote_by_its_lift() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let plain = buy_amount(&mut curve_engine(Mode::Off), "rfq_plain", &prices).await;
+        let mut engine = curve_engine(Mode::Off);
+        engine.unwind = Some(modules::Unwind::with_tracker(
+            unwind_params(0.002),
+            true,
+            "cngn-usdc",
+            unwind_tracker(&engine, 1.01),
+        ));
+        let book = engine.books[0].clone();
+        let quote = prices.get("http://feed").unwrap();
+        let inputs = engine.curve_inputs(&book, &quote, unix_now());
+        let (f0, total) = responder::holdings_share(&book, inputs.holdings, quote.price).unwrap();
+        let lifted = buy_amount(&mut engine, "rfq_lifted", &prices).await;
+        let f1 = (f0 + 1_000.0 * quote.price / total).min(1.0);
+        let want = 20.0 * crate::pricing::unwind::average_weight(f0, f1, 0.0);
+        let moved_bps = (plain / lifted - 1.0) * 10_000.0;
+        assert!(
+            want > 1.0 && (moved_bps - want).abs() < 0.5,
+            "moved {moved_bps} bps, want {want}"
+        );
     }
 
     /// Profit unwind's own preview on a Live curve: the same gain, computed
@@ -7185,11 +7262,11 @@ mod tests {
             }),
             unwind: None,
         };
-        let reading = curve_reading_status(book, 1.0 / 1381.40, &inputs, 1, 7, None).unwrap();
+        let reading = curve_reading_status(book, 1.0 / 1381.40, &inputs, 1, 7).unwrap();
         assert!((reading.reference_mid - 1380.78).abs() < 1e-9);
         assert!((reading.feed_price.unwrap() - 1381.40).abs() < 1e-9);
         for unusable in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let reading = curve_reading_status(book, unusable, &inputs, 1, 7, None).unwrap();
+            let reading = curve_reading_status(book, unusable, &inputs, 1, 7).unwrap();
             assert_eq!(reading.feed_price, None, "{unusable}");
         }
     }

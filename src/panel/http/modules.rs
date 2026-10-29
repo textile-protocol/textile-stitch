@@ -104,10 +104,11 @@ pub struct View {
     /// Why the liquidity schedule can't be turned on here, or `None`.
     pub liquidity_refusal: Option<String>,
     /// The bot trades from a vault. Every module can run there; on a bot
-    /// that trades from its own wallet only the inventory curve can.
+    /// that trades from its own wallet only the inventory curve and profit
+    /// unwind can.
     pub vault: bool,
     /// The corridor's feed is read inverted (`invert=1`, a reversed pool),
-    /// where the inventory curve can't run.
+    /// where the inventory curve and profit unwind can't run.
     pub feed_inverted: bool,
 }
 pub async fn show(

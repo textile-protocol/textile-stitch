@@ -115,6 +115,7 @@ const config = (): ModulesConfig => ({
   },
   liquidity: defaultLiquidity(),
   curve: defaultCurve(),
+  profit_unwind: defaultProfitUnwind(),
 })
 
 const quoteView = (vault: boolean): ModulesView => {
@@ -132,14 +133,15 @@ const quoteView = (vault: boolean): ModulesView => {
 }
 
 describe('focused module workspace', () => {
-  it('marks the curve unsaved when only its profit unwind changes', () => {
+  it('marks profit unwind unsaved on its own, not the curve', () => {
     const view = quoteView(true)
     const draft = {
       ...view.config,
       profit_unwind: { ...defaultProfitUnwind(), enabled: true },
     }
-    expect(quoteModuleUnsaved(view, view.config, 'curve')).toBe(false)
-    expect(quoteModuleUnsaved(view, draft, 'curve')).toBe(true)
+    expect(quoteModuleUnsaved(view, view.config, 'profit_unwind')).toBe(false)
+    expect(quoteModuleUnsaved(view, draft, 'profit_unwind')).toBe(true)
+    expect(quoteModuleUnsaved(view, draft, 'curve')).toBe(false)
     expect(quoteModuleUnsaved(view, draft, 'inventory')).toBe(false)
     // Shared mode has its own draft; it does not dirty individual modules.
     const other = view.config.mode === 'live' ? 'shadow' : 'live'
@@ -152,6 +154,7 @@ describe('focused module workspace', () => {
     expect(workspaceModules(['hedge', 'quotes'], quoteView(false))).toEqual([
       'hedge',
       'curve',
+      'profit_unwind',
     ])
     expect(workspaceModules(['hedge'], quoteView(true))).toEqual(['hedge'])
   })
@@ -167,6 +170,7 @@ describe('focused module workspace', () => {
       'rebalance',
       'liquidity',
       'curve',
+      'profit_unwind',
     ])
     expect(all).toContain('inventory')
   })
@@ -204,6 +208,7 @@ describe('focused module workspace', () => {
       'rebalance',
       'liquidity',
       'curve',
+      'profit_unwind',
     ])
     expect(quoteModuleStatus(view, 'inventory', now / 1000)).toBe(
       'Update pending'
@@ -223,6 +228,56 @@ describe('focused module workspace', () => {
         now / 1000
       )
     ).toBe('Off')
+  })
+  it('labels profit unwind Live only with its own switch, in Live mode, on a reading', () => {
+    const base = quoteView(false)
+    const at = now / 1000
+    const reading = {
+      at,
+      share: 0.8,
+      value: 300_000,
+      fee_bps: 1,
+      cost: 1386,
+      snapshot_at: at,
+      feed_mid: 1380,
+      gain: 6,
+      full_shift: 2,
+      live: true,
+    }
+    const view = (live: boolean, mode: 'shadow' | 'live', fresh = true) => {
+      const config = {
+        ...base.config,
+        mode,
+        curve: { ...base.config.curve, enabled: false },
+        profit_unwind: { ...defaultProfitUnwind(), enabled: true, live },
+      }
+      return {
+        ...base,
+        config,
+        status: {
+          version: 1,
+          config,
+          at,
+          decisions: [],
+          rebalance_status: 'Off',
+          next_attempt_at: 0,
+          profit_unwind: fresh ? { reading, quotes: [] } : null,
+        },
+      }
+    }
+    // No curve needed: it lifts the flat price.
+    expect(quoteModuleStatus(view(true, 'live'), 'profit_unwind', at)).toBe(
+      'Live'
+    )
+    expect(quoteModuleStatus(view(false, 'live'), 'profit_unwind', at)).toBe(
+      'Preview'
+    )
+    expect(quoteModuleStatus(view(true, 'shadow'), 'profit_unwind', at)).toBe(
+      'Preview'
+    )
+    expect(
+      quoteModuleStatus(view(true, 'live', false), 'profit_unwind', at)
+    ).toBe('Waiting')
   })
   it('uses the liquidity keeper reading independently of quote evaluations', () => {
     const view = quoteView(true)
@@ -298,17 +353,22 @@ describe('independent module saves', () => {
     })
   })
 
-  it('owns profit unwind only with the curve and preserves sibling parameters', () => {
+  it('saves profit unwind on its own and preserves sibling parameters', () => {
     const saved = config()
     const draft = {
       ...saved,
       profit_unwind: { ...defaultProfitUnwind(), enabled: true },
-      spreads: { ...saved.spreads, max_extra_bps: 75 },
+      curve: { ...saved.curve, enabled: true },
     }
-    const payload = quoteConfigForScope(saved, draft, 'curve')
+    const payload = quoteConfigForScope(saved, draft, 'profit_unwind')
     expect(payload.profit_unwind).toEqual(draft.profit_unwind)
-    expect(payload.spreads).toEqual(saved.spreads)
-    expect(remainingQuoteDraft(saved, draft, payload, 'curve')).toEqual(draft)
+    expect(payload.curve).toEqual(saved.curve)
+    expect(remainingQuoteDraft(saved, draft, payload, 'profit_unwind')).toEqual(
+      draft
+    )
+    // And the curve saves without it.
+    const curve = quoteConfigForScope(saved, draft, 'curve')
+    expect(curve.profit_unwind).toEqual(saved.profit_unwind)
   })
 
   it('discards only the selected scope, retaining sibling edits', () => {

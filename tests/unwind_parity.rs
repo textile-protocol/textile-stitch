@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
-//! The panel redraws the curve with profit unwind's lift in TypeScript
-//! (`web/src/curve.ts`). This test runs seeded cases through the bot's own
-//! `unwind::shift`, `unwind::average_weight` and `Curve::with_lift` and pins
-//! the results in `web/src/unwindParity.json`, which the web tests replay
-//! against the panel. A change on either side fails one of the two suites.
+//! The panel redraws profit unwind's lift in TypeScript (`web/src/unwind.ts`
+//! and `web/src/curve.ts`), on the inventory curve and on a flat price. This
+//! test runs seeded cases through the bot's own `unwind::shift`,
+//! `unwind::average_weight`, `Curve::with_lift` and
+//! `unwind::lifted_flat_price` and pins the results in
+//! `web/src/unwindParity.json`, which the web tests replay against the panel.
+//! A change on either side fails one of the two suites.
 //!
 //! Regenerate after an intended change with
 //! `STITCH_WRITE_PARITY=1 cargo test --test unwind_parity`.
 use serde::{Deserialize, Serialize};
-use stitch_bot::pricing::curve::{Curve, CurveParams, Lift};
-use stitch_bot::pricing::unwind::{average_weight, shift, Snapshot, UnwindParams};
+use stitch_bot::pricing::curve::{Curve, CurveParams};
+use stitch_bot::pricing::unwind::{
+    average_weight, lift_limit_ngn, lifted_flat_price, shift, Lift, Snapshot, UnwindParams,
+};
 
 const CASES: usize = 60;
 const SEED: u64 = 0x0b1d_5eed;
@@ -77,6 +81,11 @@ struct Case {
     bid: f64,
     ask: f64,
     plain_ask: f64,
+    /// The same lift on a flat price around the feed, held to the flat
+    /// round-trip limit at `spread_bps`: the signed order's price, NGN per
+    /// USDT, before the venue's fee.
+    flat_bid: f64,
+    flat_ask: f64,
 }
 
 /// A seeded case. `floored` builds one where the ask floor binds: a heavy
@@ -178,7 +187,30 @@ fn case(rng: &mut Rng, floored: bool) -> Case {
         },
         spread_bps,
     );
+    // The flat signed order around the feed, in the bot's units, and the same
+    // lift on it.
+    let flat_order = |bid: bool| {
+        let half = spread_bps / 10_000.0;
+        if bid {
+            (1.0 - half) / feed_mid
+        } else {
+            (1.0 + half) / feed_mid
+        }
+    };
+    let flat_lift = Lift {
+        full_ngn: s.full_ngn,
+        start_pct: knobs.start_pct,
+        cost_ngn: cost,
+    }
+    .held_to(lift_limit_ngn(spread_bps, feed_mid, knobs.start_pct));
+    let flat = |bid: bool| {
+        1.0 / flat_lift.map_or(flat_order(bid), |l| {
+            lifted_flat_price(flat_order(bid), bid, l, feed_mid, f0, f1)
+        })
+    };
     Case {
+        flat_bid: flat(true),
+        flat_ask: flat(false),
         full_ngn: s.full_ngn,
         gain: s.gain_ngn,
         average_weight: average_weight(f0, f1, knobs.start_pct),
@@ -236,4 +268,11 @@ fn the_panel_fixture_matches_the_bot() {
         && c.ask > c.plain_ask + 1e-6
         && (c.ask - at_floor(c)).abs() < 1e-6
         && c.ask < c.cost - 1e-3));
+    // On a flat price: lifted, and held to the flat limit.
+    let flat_bid = |c: &Case| c.feed_mid / (1.0 - c.spread_bps / 10_000.0);
+    assert!(cases.iter().any(|c| c.flat_bid > flat_bid(c) + 1e-6));
+    assert!(cases.iter().any(|c| {
+        let limit = lift_limit_ngn(c.spread_bps, c.feed_mid, c.knobs.start_pct);
+        c.full_ngn > limit && c.flat_bid > flat_bid(c) + 1e-6
+    }));
 }

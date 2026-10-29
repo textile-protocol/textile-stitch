@@ -27,7 +27,7 @@ pub(super) fn book_curve(cfg: &Config) -> Option<super::responder::BookCurve> {
 /// reservation ledger, so a reconnect keeps the basis and the snapshot.
 pub(super) struct Unwind {
     params: crate::pricing::unwind::UnwindParams,
-    /// `[modules.profit_unwind].live`: quote with the lift, or preview it.
+    /// Quote with the lift, or preview it ([`Config::profit_unwind_live`]).
     live: bool,
     /// Which feed price marks the naira, as saved with each basis.
     price: &'static str,
@@ -62,11 +62,15 @@ impl Unwind {
     }
 }
 
-/// Profit unwind when it runs: on top of a running curve, switched on.
+/// Profit unwind when it runs: while modules run, switched on, and the mode
+/// isn't Off. It lifts whatever price goes out, the inventory curve's or the
+/// flat one, so it doesn't need the curve; like the curve it runs on a wallet
+/// bot and on a vault.
 pub(super) fn unwind_runtime(cfg: &Config, config_dir: Option<&Path>) -> Option<Arc<Unwind>> {
     use crate::pricing::feed::PriceBasis;
     use crate::pricing::unwind::{load_bases, BASIS_FILE};
-    if book_curve(cfg).is_none() || !cfg.modules.profit_unwind.enabled {
+    let m = &cfg.modules;
+    if !(cfg.modules_enabled && m.profit_unwind.enabled && m.mode != Mode::Off) {
         return None;
     }
     let path = config_dir.map(|dir| dir.join(BASIS_FILE));
@@ -74,8 +78,8 @@ pub(super) fn unwind_runtime(cfg: &Config, config_dir: Option<&Path>) -> Option<
         warn!("profit unwind basis is memory-only: no config dir to persist it");
     }
     Some(Arc::new(Unwind {
-        params: cfg.modules.profit_unwind.params(),
-        live: cfg.modules.profit_unwind.live,
+        params: m.profit_unwind.params(),
+        live: cfg.profit_unwind_live(),
         price: match cfg.price_basis() {
             PriceBasis::Served => "served",
             PriceBasis::Unadjusted => "unadjusted",
@@ -140,8 +144,9 @@ pub(super) async fn balance_loop(
 }
 
 impl Engine {
-    /// What the inventory curve reads for `book` besides the request: the
-    /// feed's reference book and the holdings the share is made of.
+    /// What the pricing modules read for `book` besides the request: the
+    /// feed's reference book (the curve's), the holdings the share is made of
+    /// (both), and profit unwind's lift.
     pub(super) fn curve_inputs(
         &self,
         book: &CorridorBook,
@@ -150,7 +155,7 @@ impl Engine {
     ) -> super::responder::CurveInputs {
         super::responder::CurveInputs {
             reference: quote.reference_book(),
-            holdings: self.curve_holdings(book, now),
+            holdings: self.share_holdings(book, now),
             unwind: self.unwind_input(book, quote, now),
         }
     }
@@ -202,10 +207,10 @@ impl Engine {
         let Some(unwind) = &self.unwind else {
             return;
         };
-        if book.curve.is_none() || !(quote.price.is_finite() && quote.price > 0.0) {
+        if !(quote.price.is_finite() && quote.price > 0.0) {
             return;
         }
-        let Some(holdings) = self.curve_holdings(book, now) else {
+        let Some(holdings) = self.share_holdings(book, now) else {
             return;
         };
         let naira = super::responder::normalized(holdings.collateral, book.collateral_decimals);
@@ -258,7 +263,6 @@ impl Engine {
         crate::pricing::unwind::Shift,
     )> {
         let unwind = self.unwind.as_ref()?;
-        book.curve?;
         let snapshot = unwind.trackers.lock().ok()?.get(&book.slug)?.snapshot?;
         (quote.price > 0.0).then(|| {
             let shift =
@@ -267,8 +271,9 @@ impl Engine {
         })
     }
 
-    /// What the curve prices profit unwind with: the lift sized off the
-    /// snapshot, and whether it quotes.
+    /// What pricing lifts with: the lift sized off the snapshot, whether it
+    /// quotes, and the spread its limit is held to. `book` is the corridor
+    /// as configured, before modules move its spreads.
     fn unwind_input(
         &self,
         book: &CorridorBook,
@@ -278,12 +283,13 @@ impl Engine {
         let unwind = self.unwind.as_ref()?;
         let (snapshot, shift) = self.unwind_shift(book, quote, now)?;
         Some(super::responder::UnwindInput {
-            lift: crate::pricing::curve::Lift {
+            lift: crate::pricing::unwind::Lift {
                 full_ngn: shift.full_ngn,
                 start_pct: unwind.params.start_pct,
                 cost_ngn: snapshot.cost_ngn,
             },
             live: unwind.live,
+            limit_spread_bps: super::responder::min_bps_spread(book)?,
         })
     }
 
@@ -297,8 +303,8 @@ impl Engine {
     /// counted, pending deposits and reserved redemption payouts left out,
     /// the reading inventory balancing uses. Only while that reading is
     /// fresh and the book is the vault's pair the right way round; otherwise
-    /// `None`, and the curve answers flat.
-    fn curve_holdings(&self, book: &CorridorBook, now: u64) -> Option<super::responder::Holdings> {
+    /// `None`, and the curve and profit unwind answer flat.
+    fn share_holdings(&self, book: &CorridorBook, now: u64) -> Option<super::responder::Holdings> {
         if self.vault.is_none() {
             let wallet = self.inventory.view(now);
             return Some(super::responder::Holdings {

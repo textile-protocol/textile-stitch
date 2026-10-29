@@ -11,9 +11,10 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, U256};
 
 use crate::config::{PoolConfig, RfqCapacity};
-use crate::pricing::curve::{self, Curve, CurveParams, Lift};
+use crate::pricing::curve::{self, Curve, CurveParams};
 use crate::pricing::quote::{ask_price, bid_price, Spread};
 use crate::pricing::tick::is_price_usable;
+use crate::pricing::unwind::{self, Lift};
 
 use super::math::{
     collateral_for_debt, debt_for_collateral, fee_on, gross_of, is_quotable, max_fitting_output,
@@ -76,8 +77,29 @@ pub struct CurveInputs {
 pub struct UnwindInput {
     pub lift: Lift,
     /// False in profit unwind's own preview: the lifted price is computed
-    /// and logged, and the plain curve's goes out.
+    /// and logged, and the price without it goes out.
     pub live: bool,
+    /// The corridor's smaller bps spread as configured, before any module
+    /// widens it ([`min_bps_spread`] of the configured book). On a flat price
+    /// the lift is held to the round-trip limit at it: dynamic spreads only
+    /// ever add to it, so a return leg quoted later, at the narrowest spread
+    /// the bot uses, still pays at least this.
+    pub limit_spread_bps: f64,
+}
+
+/// The smaller of a book's spreads in bps, or `None` when a side is
+/// absolute or neither side quotes.
+pub fn min_bps_spread(book: &CorridorBook) -> Option<f64> {
+    [book.buy_spread, book.sell_spread]
+        .into_iter()
+        .flatten()
+        .map(|s| match s {
+            Spread::Bps(b) => Some(f64::from(b)),
+            Spread::Abs(_) => None,
+        })
+        .collect::<Option<Vec<f64>>>()?
+        .into_iter()
+        .reduce(f64::min)
 }
 
 /// Whether an ask priced with profit unwind's `priced` input may still go
@@ -147,17 +169,18 @@ impl InventoryView {
 
 /// Tokens a book needs live wallet reads for. Any RFQ side (Exact or Wallet)
 /// needs a reading — Exact is a cap on top of the wallet, not a bypass.
-pub fn wallet_tokens(books: &[CorridorBook]) -> Vec<Address> {
+/// `unwind` says profit unwind runs, which reads the share on every book.
+pub fn wallet_tokens(books: &[CorridorBook], unwind: bool) -> Vec<Address> {
     let mut tokens: Vec<Address> = books
         .iter()
         .flat_map(|book| {
-            // A curve corridor needs both legs read whatever its sides: the
-            // share is a ratio of the two, and a one-sided pool would
-            // otherwise never see its inactive leg and quote flat forever.
-            let curved = book.curve.is_some();
+            // The curve and profit unwind need both legs read whatever the
+            // sides: the share is a ratio of the two, and a one-sided pool
+            // would otherwise never see its inactive leg and never lean.
+            let share = unwind || book.curve.is_some();
             [
-                (curved || book.buy_capacity_debt.is_some()).then_some(book.debt),
-                (curved || book.sell_capacity_collateral.is_some()).then_some(book.collateral),
+                (share || book.buy_capacity_debt.is_some()).then_some(book.debt),
+                (share || book.sell_capacity_collateral.is_some()).then_some(book.collateral),
             ]
         })
         .flatten()
@@ -295,19 +318,30 @@ pub fn decide_quote(
     )
 }
 
-/// What the curve did (or would have done) to one quote, for the caller's
-/// log. Returned rather than logged here so the hot path stays pure and the
-/// caller keeps its own tracing context.
+/// What the pricing modules did (or would have done) to one quote, for the
+/// caller's log and the module status. Returned rather than logged here so
+/// the hot path stays pure and the caller keeps its own tracing context.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct QuoteNotes {
+    /// The inventory curve's note; `None` when the corridor has no curve.
+    pub curve: Option<CurveNote>,
+    /// Profit unwind's note; `None` while it doesn't run or had nothing to
+    /// price.
+    pub unwind: Option<UnwindNote>,
+}
+
+/// What the curve did (or would have done) to one quote.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CurveNote {
     /// The curve priced this request. In shadow (`live = false`) the answer
-    /// that actually went out is `flat`; `curved` is what the curve would
-    /// have said.
+    /// that actually went out is `flat` (with profit unwind's lift when that
+    /// quotes); `curved` is what the curve would have said.
     Priced {
         live: bool,
         /// The flat price, debt per collateral.
         flat: f64,
-        /// The curve's price for the stretch `[f0, f1]`.
+        /// The plain curve's price for the stretch `[f0, f1]`, without
+        /// profit unwind's lift ([`UnwindNote`] carries that).
         curved: f64,
         /// The wallet's naira share before the same-side advance.
         f_wallet: f64,
@@ -319,13 +353,6 @@ pub enum CurveNote {
         /// The plain curve's two endpoint shades, bps off the reference mid.
         s0: f64,
         s1: f64,
-        /// Profit unwind's lift, when it runs, held to the curve's round-trip
-        /// limit. In its preview `curved` is the plain curve's price and
-        /// `unwound` what the lift would have quoted.
-        unwind: Option<UnwindInput>,
-        /// The price with profit unwind's lift (and its ask floor) for the
-        /// same stretch, debt per collateral, live or preview.
-        unwound: Option<f64>,
         /// The quoted size and this side's already-promised size, both valued
         /// in debt units.
         size_debt: f64,
@@ -340,6 +367,22 @@ pub enum CurveNote {
     Flat(&'static str),
 }
 
+/// What profit unwind did (or would have done) to one quote: the price it
+/// lifted (`base`: the curve's when the curve quotes, the flat one
+/// otherwise) and the price with its lift and ask floor, both debt per
+/// collateral, for the stretch of share `[f0, f1]` the quote walks. In its
+/// preview (`live = false`) `base` went out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnwindNote {
+    pub live: bool,
+    pub base: f64,
+    pub unwound: f64,
+    pub f0: f64,
+    pub f1: f64,
+    /// The lift it priced with, held to the round-trip limit.
+    pub lift: Lift,
+}
+
 /// How far the reference book may sit from the jump-guarded print before the
 /// curve refuses it and the side quotes flat. A sanity bound, not a tuning
 /// knob. On Textile's cNGN feed the served price differs from the raw Bybit
@@ -349,19 +392,15 @@ pub enum CurveNote {
 /// `price` alone, and the 1,500 bps order band is the only other check.
 pub const MAX_REFERENCE_GAP_BPS: f64 = 100.0;
 
-/// Where one side's next quote starts on the curve: everything a curved
-/// price needs except the quote's own size. Shared by firm quotes and the
-/// levels they are judged against, so the two cannot drift apart.
+/// Where one side's next quote starts on the share axis: the wallet's share
+/// of the corridor currency, advanced by this side's own un-expired quotes,
+/// and the length of the axis. Shared by the curve and by profit unwind on a
+/// flat price, so both walk the same axis.
 #[derive(Debug, Clone, Copy)]
-struct CurveStart {
-    /// The curve without profit unwind.
-    plain: Curve,
-    unwind: Option<UnwindInput>,
-    /// The side's bps spread: the half-width of the signed order.
-    order_half_bps: f64,
-    half_range_bps: f64,
-    /// The raw reference mid, debt per collateral.
-    reference_mid: f64,
+struct ShareStart {
+    /// What one unit of collateral is worth in debt, for valuing the share
+    /// and the collateral a quote walks.
+    valuation_mid: f64,
     /// The wallet's naira share before the same-side advance.
     f_wallet: f64,
     /// `f_wallet` advanced by this side's own un-expired quotes.
@@ -372,7 +411,7 @@ struct CurveStart {
     promised: f64,
 }
 
-impl CurveStart {
+impl ShareStart {
     /// The share after a quote of `size_debt` (debt units) on this side. A
     /// bid takes naira in and raises the share; an ask lowers it.
     fn end(&self, bid: bool, size_debt: f64) -> f64 {
@@ -383,24 +422,194 @@ impl CurveStart {
             (self.f0 - step).clamp(0.0, 1.0)
         }
     }
+}
 
-    /// The signed order's price for the stretch `[from, to]`: lifted when
-    /// profit unwind quotes, plain otherwise.
+/// The share axis for one side, from what the bot holds valued at
+/// `valuation_mid` (debt per collateral).
+fn share_start(
+    book: &CorridorBook,
+    holdings: Option<Holdings>,
+    valuation_mid: f64,
+    bid: bool,
+    reserved_bid: U256,
+    reserved_ask: U256,
+) -> Result<ShareStart, &'static str> {
+    // The share is made of what the bot holds, never what it can promise:
+    // capacity is capped by Permit2 allowances and vault policy, and a leg
+    // that can't be promised (an unapproved one, a vault side at its order
+    // cap) is still held, so a share read off capacity would pin the curve
+    // to its most aggressive end.
+    let holdings = holdings.ok_or("no fresh balance reading for the share")?;
+    let (f_wallet, total) = curve::inventory_share(
+        saturating_u128(holdings.collateral),
+        book.collateral_decimals,
+        saturating_u128(holdings.debt),
+        book.debt_decimals,
+        valuation_mid,
+    )
+    .ok_or("it holds nothing to lean on")?;
+    // §8 of the curve spec: this side's own un-expired quotes already own
+    // their stretch, so this one starts where they end. **This side only.**
+    // A quote must never move the other side's price — otherwise requesting
+    // quotes becomes a free lever on the price (measured at 4.47 bps for a
+    // taker; same-side only is worth exactly zero to them).
+    let promised = if bid {
+        normalized(reserved_bid, book.debt_decimals)
+    } else {
+        normalized(reserved_ask, book.collateral_decimals) * valuation_mid
+    };
+    let advance = curve::share_step(promised, total);
+    let f0 = if bid {
+        (f_wallet + advance).clamp(0.0, 1.0)
+    } else {
+        (f_wallet - advance).clamp(0.0, 1.0)
+    };
+    Ok(ShareStart {
+        valuation_mid,
+        f_wallet,
+        f0,
+        total,
+        promised,
+    })
+}
+
+/// A side priced across the stretch of share a quote walks: the curve, or a
+/// flat price with profit unwind on it. Shared by firm quotes and the levels
+/// they are judged against, so the two cannot drift apart.
+trait Stretch {
+    fn share(&self) -> &ShareStart;
+
+    /// The price before profit unwind for the stretch `[from, to]`: the
+    /// curve's, or the flat one.
+    fn base_price(&self, bid: bool, from: f64, to: f64) -> Option<f64>;
+
+    /// The price with profit unwind's lift for the stretch, whether it
+    /// quotes or previews. `None` while it doesn't run.
+    fn unwound_price(&self, bid: bool, from: f64, to: f64) -> Option<f64>;
+
+    /// Profit unwind's input, its lift held to this side's round-trip limit
+    /// ([`unwind::lift_limit_ngn`]); `None` while it doesn't run.
+    fn unwind(&self) -> Option<UnwindInput>;
+
+    /// The signed order's price for the stretch: lifted when profit unwind
+    /// quotes, the base price otherwise.
     fn price(&self, bid: bool, from: f64, to: f64) -> Option<f64> {
-        match self.unwind {
+        match self.unwind() {
             Some(u) if u.live => self.unwound_price(bid, from, to),
-            _ => self.plain.price(bid, from, to, self.order_half_bps),
+            _ => self.base_price(bid, from, to),
         }
     }
+}
 
-    /// The price profit unwind's lift gives the same stretch, whether it
-    /// quotes or previews. `None` while it doesn't run.
+/// Where one side's next quote starts on the curve: everything a curved
+/// price needs except the quote's own size.
+#[derive(Debug, Clone, Copy)]
+struct CurveStart {
+    /// The curve without profit unwind.
+    plain: Curve,
+    unwind: Option<UnwindInput>,
+    /// The side's bps spread: the half-width of the signed order.
+    order_half_bps: f64,
+    half_range_bps: f64,
+    share: ShareStart,
+}
+
+impl Stretch for CurveStart {
+    fn share(&self) -> &ShareStart {
+        &self.share
+    }
+
+    fn base_price(&self, bid: bool, from: f64, to: f64) -> Option<f64> {
+        self.plain.price(bid, from, to, self.order_half_bps)
+    }
+
     fn unwound_price(&self, bid: bool, from: f64, to: f64) -> Option<f64> {
         let u = self.unwind?;
         self.plain
             .with_lift(u.lift, self.order_half_bps)
             .price(bid, from, to, self.order_half_bps)
     }
+
+    fn unwind(&self) -> Option<UnwindInput> {
+        let u = self.unwind?;
+        let limit = self
+            .plain
+            .lift_limit_ngn(u.lift.start_pct, self.order_half_bps);
+        Some(UnwindInput {
+            lift: u.lift.held_to(limit)?,
+            ..u
+        })
+    }
+}
+
+/// Where one side's next quote starts with profit unwind on a flat price:
+/// the flat price around `mid`, lifted across the stretch of share the quote
+/// walks exactly as on the curve.
+#[derive(Debug, Clone, Copy)]
+struct FlatStart {
+    /// The flat centre, debt per collateral.
+    mid: f64,
+    spread: Spread,
+    unwind: UnwindInput,
+    share: ShareStart,
+}
+
+impl Stretch for FlatStart {
+    fn share(&self) -> &ShareStart {
+        &self.share
+    }
+
+    fn base_price(&self, bid: bool, _from: f64, _to: f64) -> Option<f64> {
+        Some(if bid {
+            bid_price(self.mid, self.spread)
+        } else {
+            ask_price(self.mid, self.spread)
+        })
+    }
+
+    fn unwound_price(&self, bid: bool, from: f64, to: f64) -> Option<f64> {
+        let lift = self.unwind()?.lift;
+        let flat = self.base_price(bid, from, to)?;
+        let price = unwind::lifted_flat_price(flat, bid, lift, 1.0 / self.mid, from, to);
+        (price.is_finite() && price > 0.0).then_some(price)
+    }
+
+    fn unwind(&self) -> Option<UnwindInput> {
+        let u = self.unwind;
+        let limit = unwind::lift_limit_ngn(u.limit_spread_bps, 1.0 / self.mid, u.lift.start_pct);
+        Some(UnwindInput {
+            lift: u.lift.held_to(limit)?,
+            ..u
+        })
+    }
+}
+
+/// Profit unwind on a flat side: the flat price around the jump-guarded
+/// `mid`, valued and lifted off the same print. Needs a bps spread on the
+/// side, and balances for the share. The lift's limit comes with the input
+/// ([`UnwindInput::limit_spread_bps`]), off the configured spreads.
+fn flat_start(
+    book: &CorridorBook,
+    bid: bool,
+    spread: Spread,
+    mid: f64,
+    inputs: &CurveInputs,
+    reserved_bid: U256,
+    reserved_ask: U256,
+) -> Result<FlatStart, &'static str> {
+    let unwind = inputs.unwind.ok_or("profit unwind isn't running")?;
+    let Spread::Bps(_) = spread else {
+        return Err("profit unwind needs bps spreads");
+    };
+    if !(mid.is_finite() && mid > 0.0) {
+        return Err("no usable price to value the share");
+    }
+    Ok(FlatStart {
+        mid,
+        spread,
+        unwind,
+        share: share_start(book, inputs.holdings, mid, bid, reserved_bid, reserved_ask)?,
+    })
 }
 
 /// `|a / b - 1|` in bps.
@@ -451,38 +660,14 @@ fn curve_start(
     }
     let plain = Curve::new(reference_mid, half_range_bps, all_in_bps, params)
         .ok_or("these inputs make no curve")?;
-    // The share is made of what the bot holds, never what it can promise:
-    // capacity is capped by Permit2 allowances and vault policy, and a leg
-    // that can't be promised (an unapproved one, a vault side at its order
-    // cap) is still held, so a share read off capacity would pin the curve
-    // to its most aggressive end.
-    let holdings = inputs
-        .holdings
-        .ok_or("no fresh balance reading for the share")?;
-    let (f_wallet, total) = curve::inventory_share(
-        saturating_u128(holdings.collateral),
-        book.collateral_decimals,
-        saturating_u128(holdings.debt),
-        book.debt_decimals,
+    let share = share_start(
+        book,
+        inputs.holdings,
         reference_mid,
-    )
-    .ok_or("it holds nothing to lean on")?;
-    // §8 of the spec: this side's own un-expired quotes already own their
-    // stretch of curve, so this one starts where they end. **This side
-    // only.** A quote must never move the other side's price — otherwise
-    // requesting quotes becomes a free lever on the price (measured at
-    // 4.47 bps for a taker; same-side only is worth exactly zero to them).
-    let promised = if bid {
-        normalized(reserved_bid, book.debt_decimals)
-    } else {
-        normalized(reserved_ask, book.collateral_decimals) * reference_mid
-    };
-    let advance = curve::share_step(promised, total);
-    let f0 = if bid {
-        (f_wallet + advance).clamp(0.0, 1.0)
-    } else {
-        (f_wallet - advance).clamp(0.0, 1.0)
-    };
+        bid,
+        reserved_bid,
+        reserved_ask,
+    )?;
     Ok(CurveStart {
         plain,
         unwind: inputs.unwind,
@@ -494,25 +679,24 @@ fn curve_start(
         // (order + injected fee) lands on the knobs.
         order_half_bps: f64::from(spread_bps),
         half_range_bps,
-        reference_mid,
-        f_wallet,
-        f0,
-        total,
-        promised,
+        share,
     })
 }
 
-/// [`decide_quote`], with the corridor's inventory curve on top.
+/// [`decide_quote`], with the corridor's pricing modules on top: the
+/// inventory curve and profit unwind, each on its own.
 ///
-/// No curve on the book (the default) takes exactly the flat path with no
-/// note. Preview answers flat and reports what the curve would have said.
-/// Live answers off the curve.
+/// A Live curve that can price the request quotes; otherwise the flat price
+/// goes out. Profit unwind lifts whichever one goes out while it quotes. With
+/// neither module running this is exactly the flat path, with empty notes.
+/// Either module in preview answers as if it were off and reports what it
+/// would have said.
 ///
 /// The curve anchors on `inputs.reference`, the raw reference mid, and
 /// deliberately not on `mid`, which carries the operator's manual centre
 /// adjustments (the hand-rolled version of this curve; anchoring on it would
 /// count the shade twice). A reference more than [`MAX_REFERENCE_GAP_BPS`]
-/// from `mid` is refused and the quote goes out flat.
+/// from `mid` is refused and the curve doesn't quote.
 #[allow(clippy::too_many_arguments)]
 pub fn decide_quote_curved(
     book: &CorridorBook,
@@ -524,7 +708,7 @@ pub fn decide_quote_curved(
     token_reserved_bid: U256,
     token_reserved_ask: U256,
     inventory: &InventoryView,
-) -> Result<(QuotePlan, Option<CurveNote>), RejectReason> {
+) -> Result<(QuotePlan, QuoteNotes), RejectReason> {
     let (bid, spread) = request_side(book, req)?;
     let flat = if bid {
         bid_price(mid, spread)
@@ -544,89 +728,147 @@ pub fn decide_quote_curved(
             inventory,
         )
     };
-    let Some(book_curve) = book.curve else {
-        return Ok((at(flat)?, None));
-    };
-    let flat_because = |reason| Ok((at(flat)?, Some(CurveNote::Flat(reason))));
-    let start = match curve_start(
-        book,
-        &book_curve.params,
-        bid,
-        spread,
-        req.fee_bps,
-        mid,
-        inputs,
-        reserved_bid,
-        reserved_ask,
-    ) {
-        Ok(start) => start,
-        Err(reason) => return flat_because(reason),
-    };
-
-    // Clamp-then-price: the flat pass resolves exact-input/exact-output, the
-    // fee carve-out and the capacity clamp, and the curve prices the size
-    // that actually survived. Then one refresh at the curve's own price, for
-    // the one case where the named side is collateral and the debt leg moves
-    // with the price. That bounds the circularity far below a hundredth of a
-    // bp — the debt leg's price sensitivity is itself only bps.
-    let plan = at(flat)?;
-    let f1 = start.end(bid, debt_leg(&plan, bid, book));
-    let Some(curved) = start.price(bid, start.f0, f1) else {
-        return flat_because("the curve produced no finite price");
-    };
-    let note = |live, curved, f1, plan: &QuotePlan| {
-        let (s0, s1) = start.plain.endpoints_bps();
-        CurveNote::Priced {
-            live,
-            flat,
-            curved,
-            f_wallet: start.f_wallet,
-            f0: start.f0,
-            f1,
-            s0,
-            s1,
-            unwind: start.unwind.map(|u| UnwindInput {
-                lift: Lift {
-                    full_ngn: u.lift.full_ngn.min(
-                        start
-                            .plain
-                            .lift_limit_ngn(u.lift.start_pct, start.order_half_bps),
-                    ),
-                    ..u.lift
-                },
-                ..u
-            }),
-            unwound: start.unwound_price(bid, start.f0, f1),
-            size_debt: debt_leg(plan, bid, book),
-            promised_debt: start.promised,
-            cheapest_until: start.plain.cheapest_until(start.half_range_bps),
+    let curve = book.curve.map(|c| {
+        let start = curve_start(
+            book,
+            &c.params,
+            bid,
+            spread,
+            req.fee_bps,
+            mid,
+            inputs,
+            reserved_bid,
+            reserved_ask,
+        );
+        (c.live, start)
+    });
+    if let Some((true, Ok(start))) = &curve {
+        if let Some((plan, f1)) = walk(start, bid, flat, at, book)? {
+            let size_debt = debt_leg(&plan, bid, book);
+            let notes = QuoteNotes {
+                curve: Some(curve_note(start, true, bid, flat, f1, size_debt)),
+                unwind: unwind_note(start, bid, f1),
+            };
+            return Ok((plan, notes));
         }
-    };
-    if !book_curve.live {
-        let note = note(false, curved, f1, &plan);
-        return Ok((plan, Some(note)));
     }
-    let plan = at(curved)?;
-    let f1 = start.end(bid, debt_leg(&plan, bid, book));
-    let Some(curved) = start.price(bid, start.f0, f1) else {
-        return flat_because("the curve produced no finite price");
+    let flat_side = flat_start(book, bid, spread, mid, inputs, reserved_bid, reserved_ask).ok();
+    let walked = match &flat_side {
+        Some(start) => {
+            walk(start, bid, flat, at, book)?.map(|(plan, f1)| (plan, unwind_note(start, bid, f1)))
+        }
+        None => None,
     };
-    let note = note(true, curved, f1, &plan);
-    Ok((at(curved)?, Some(note)))
+    let (plan, unwind) = match walked {
+        Some(walked) => walked,
+        None => (at(flat)?, None),
+    };
+    let size_debt = debt_leg(&plan, bid, book);
+    let curve = curve.map(|(live, start)| match start {
+        Ok(start) if !live => {
+            let f1 = start.share.end(bid, size_debt);
+            curve_note(&start, false, bid, flat, f1, size_debt)
+        }
+        Ok(_) => CurveNote::Flat("the curve produced no finite price"),
+        Err(reason) => CurveNote::Flat(reason),
+    });
+    Ok((plan, QuoteNotes { curve, unwind }))
+}
+
+/// Clamp-then-price along the share axis: the flat pass resolves
+/// exact-input/exact-output, the fee carve-out and the capacity clamp, and
+/// `start` prices the size that actually survived. Then one refresh at its
+/// own price, for the one case where the named side is collateral and the
+/// debt leg moves with the price. That bounds the circularity far below a
+/// hundredth of a bp — the debt leg's price sensitivity is itself only bps.
+///
+/// The plan and the share it leaves, or `None` when `start` has no price for
+/// the stretch.
+fn walk(
+    start: &impl Stretch,
+    bid: bool,
+    flat: f64,
+    at: impl Fn(f64) -> Result<QuotePlan, RejectReason>,
+    book: &CorridorBook,
+) -> Result<Option<(QuotePlan, f64)>, RejectReason> {
+    let share = start.share();
+    let priced = |plan: &QuotePlan| {
+        let f1 = share.end(bid, debt_leg(plan, bid, book));
+        start.price(bid, share.f0, f1).map(|price| (price, f1))
+    };
+    let Some((price, _)) = priced(&at(flat)?) else {
+        return Ok(None);
+    };
+    let Some((price, f1)) = priced(&at(price)?) else {
+        return Ok(None);
+    };
+    Ok(Some((at(price)?, f1)))
+}
+
+/// What the curve says about a quote of `size_debt` that walks to `f1`: the
+/// plain curve's price for the stretch, against the flat one. `live` says
+/// whether it went out.
+fn curve_note(
+    start: &CurveStart,
+    live: bool,
+    bid: bool,
+    flat: f64,
+    f1: f64,
+    size_debt: f64,
+) -> CurveNote {
+    let f0 = start.share.f0;
+    let Some(curved) = start.base_price(bid, f0, f1) else {
+        return CurveNote::Flat("the curve produced no finite price");
+    };
+    let (s0, s1) = start.plain.endpoints_bps();
+    CurveNote::Priced {
+        live,
+        flat,
+        curved,
+        f_wallet: start.share.f_wallet,
+        f0,
+        f1,
+        s0,
+        s1,
+        size_debt,
+        promised_debt: start.share.promised,
+        cheapest_until: start.plain.cheapest_until(start.half_range_bps),
+    }
+}
+
+/// What profit unwind says about a quote that walked to `f1`: the price it
+/// lifts and the lifted price, whether it went out or not. `None` while it
+/// lifts nothing.
+fn unwind_note(start: &impl Stretch, bid: bool, f1: f64) -> Option<UnwindNote> {
+    let u = start.unwind()?;
+    let f0 = start.share().f0;
+    Some(UnwindNote {
+        live: u.live,
+        base: start.base_price(bid, f0, f1)?,
+        unwound: start.unwound_price(bid, f0, f1)?,
+        f0,
+        f1,
+        lift: u.lift,
+    })
 }
 
 /// The corridor currency's share of what the bot holds and the total in
-/// debt units, valued at the reference mid; `None` when the inputs make no
-/// share. For the module status: pricing reads it through [`curve_start`].
-pub fn holdings_share(book: &CorridorBook, inputs: &CurveInputs) -> Option<(f64, f64)> {
-    let (reference_mid, _) = inputs.reference?;
-    let holdings = inputs.holdings?;
+/// debt units, valued at `mid` (debt per collateral); `None` when the inputs
+/// make no share. For the module status: pricing reads it through
+/// [`share_start`]. The curve values its share at the reference mid, profit
+/// unwind on a flat price at the feed.
+pub fn holdings_share(
+    book: &CorridorBook,
+    holdings: Option<Holdings>,
+    mid: f64,
+) -> Option<(f64, f64)> {
+    let holdings = holdings?;
     curve::inventory_share(
         saturating_u128(holdings.collateral),
         book.collateral_decimals,
         saturating_u128(holdings.debt),
         book.debt_decimals,
-        reference_mid,
+        mid,
     )
 }
 
@@ -922,22 +1164,24 @@ pub fn levels_for(
     }
 }
 
-/// How many rows a Live curve publishes per side. The venue judges a firm
+/// How many rows a side priced along the share axis (a Live curve, or a
+/// live profit unwind lift) publishes. The venue judges a firm
 /// reply against the size-weighted rate of the rows the request consumes, so
 /// finer rows track the curve more closely. Eight keeps the residue of a
 /// part-consumed row under a bp on a whole-book stretch and stays well inside
 /// the venue's 20-row cap.
 pub const CURVE_LEVEL_ROWS: u64 = 8;
 
-/// [`levels_for`], with a Live inventory curve's lean on the levels.
+/// [`levels_for`], with a Live inventory curve's lean and a live profit
+/// unwind lift on the levels.
 ///
 /// The venue rejects a firm reply more than `levelSlackBps` (5 by default)
 /// worse for the taker than the levels it was routed on, so a Live curve that
 /// published flat levels would have its loaded side refused as `level_slack`
-/// exactly where it leans. A Live side publishes the curve instead (see
-/// [`curve_rows`]) from the same [`curve_start`] the firm quote uses. A book
-/// without the curve or in Preview, and a Live side that would answer flat,
-/// publishes exactly [`levels_for`].
+/// exactly where it leans. A side priced along the share axis publishes that
+/// pricing instead (see [`stretch_rows`]) from the same [`curve_start`] or
+/// [`flat_start`] the firm quote uses. A side that would answer flat with no
+/// lift publishes exactly [`levels_for`].
 ///
 /// `fee_bps` is the venue fee the curve's endpoints are sized with. Levels
 /// carry no request, so the caller passes the last one it saw; the fee is
@@ -968,9 +1212,12 @@ pub fn levels_for_curved(
         inventory,
         order_caps,
     );
-    let Some(book_curve) = book.curve.filter(|c| c.live) else {
+    let curve = book.curve.filter(|c| c.live);
+    if curve.is_none() && !inputs.unwind.is_some_and(|u| u.live) {
         return frame;
-    };
+    }
+    // Priced as the firm quote is: off the Live curve where it can, and
+    // otherwise flat with profit unwind's lift, while it lifts anything.
     let curved = |bid: bool| -> Option<Vec<Level>> {
         let (spread, reserved, token_reserved) = if bid {
             (book.buy_spread?, reserved_bid, token_reserved_bid)
@@ -978,19 +1225,28 @@ pub fn levels_for_curved(
             (book.sell_spread?, reserved_ask, token_reserved_ask)
         };
         let remaining = level_capacity(book, bid, reserved, token_reserved, inventory, order_caps)?;
-        let start = curve_start(
-            book,
-            &book_curve.params,
-            bid,
-            spread,
-            fee_bps,
-            mid,
-            inputs,
-            reserved_bid,
-            reserved_ask,
-        )
-        .ok()?;
-        curve_rows(&start, book, bid, remaining)
+        curve
+            .and_then(|c| {
+                let start = curve_start(
+                    book,
+                    &c.params,
+                    bid,
+                    spread,
+                    fee_bps,
+                    mid,
+                    inputs,
+                    reserved_bid,
+                    reserved_ask,
+                )
+                .ok()?;
+                stretch_rows(&start, book, bid, remaining)
+            })
+            .or_else(|| {
+                let start = flat_start(book, bid, spread, mid, inputs, reserved_bid, reserved_ask)
+                    .ok()
+                    .filter(|s| s.unwind().is_some_and(|u| u.live))?;
+                stretch_rows(&start, book, bid, remaining)
+            })
     };
     let bids = curved(true).unwrap_or_else(|| frame.bids.clone());
     let asks = curved(false).unwrap_or_else(|| frame.asks.clone());
@@ -1068,9 +1324,9 @@ pub fn worse_than_levels_bps(
     worse.is_finite().then_some(worse)
 }
 
-/// One side's levels off a Live curve: `remaining` (debt on the bid,
-/// collateral on the ask, as capacity counts it) cut into
-/// [`CURVE_LEVEL_ROWS`] slices, each at the curve's price for its own stretch
+/// One side's levels priced along the share axis: `remaining` (debt on the
+/// bid, collateral on the ask, as capacity counts it) cut into
+/// [`CURVE_LEVEL_ROWS`] slices, each at the side's price for its own stretch
 /// of share.
 ///
 /// The average is additive, so the size-weighted rate of the rows a request
@@ -1078,12 +1334,12 @@ pub fn worse_than_levels_bps(
 /// residue is a part-consumed last row: it is priced over its whole slice,
 /// which is further along the curve (worse for the taker) than the part the
 /// firm quote prices, so it only ever errs in the reply's favour. The shade
-/// is monotone in the share, so the rows come out best-first, the order the
-/// venue sorts them in. Sizes are collateral atomic on both sides, as in
+/// and the lift are monotone in the share, so the rows come out best-first,
+/// the order the venue sorts them in. Sizes are collateral atomic on both sides, as in
 /// [`levels_for`]. `None` when a slice has no usable price; the side then
 /// publishes flat, as its firm quote would answer.
-fn curve_rows(
-    start: &CurveStart,
+fn stretch_rows(
+    start: &impl Stretch,
     book: &CorridorBook,
     bid: bool,
     remaining: U256,
@@ -1097,14 +1353,14 @@ fn curve_rows(
         if bid {
             normalized(atomic, book.debt_decimals)
         } else {
-            normalized(atomic, book.collateral_decimals) * start.reference_mid
+            normalized(atomic, book.collateral_decimals) * start.share().valuation_mid
         }
     };
     let priced = (0..CURVE_LEVEL_ROWS)
         .map(|k| {
             let (lo, hi) = (cut(k), cut(k + 1));
-            let from = start.end(bid, walked(lo));
-            let to = start.end(bid, walked(hi));
+            let from = start.share().end(bid, walked(lo));
+            let to = start.share().end(bid, walked(hi));
             let price = start.price(bid, from, to).filter(|p| is_price_usable(*p))?;
             let size = if bid {
                 collateral_for_debt(price, hi - lo, book.debt_decimals, book.collateral_decimals)
@@ -1719,7 +1975,7 @@ mod tests {
     #[test]
     fn wallet_tokens_cover_every_rfq_side() {
         let exact = book();
-        let tokens = wallet_tokens(&[exact.clone()]);
+        let tokens = wallet_tokens(&[exact.clone()], false);
         assert_eq!(tokens.len(), 2);
         assert!(tokens.contains(&COLLATERAL.parse().unwrap()));
         assert!(tokens.contains(&DEBT.parse().unwrap()));
@@ -1727,7 +1983,7 @@ mod tests {
         let mut both = exact.clone();
         both.buy_capacity_debt = Some(RfqCapacity::Wallet);
         both.sell_capacity_collateral = Some(RfqCapacity::Wallet);
-        let tokens = wallet_tokens(&[both]);
+        let tokens = wallet_tokens(&[both], false);
         assert_eq!(tokens.len(), 2);
         assert!(tokens.contains(&COLLATERAL.parse().unwrap()));
         assert!(tokens.contains(&DEBT.parse().unwrap()));
@@ -1794,7 +2050,7 @@ mod tests {
         reserved_ask: U256,
         inv: &InventoryView,
     ) -> (QuotePlan, Option<CurveNote>) {
-        decide_quote_curved(
+        let (plan, notes) = decide_quote_curved(
             b,
             req,
             ref_mid(),
@@ -1805,7 +2061,8 @@ mod tests {
             reserved_ask,
             inv,
         )
-        .unwrap()
+        .unwrap();
+        (plan, notes.curve)
     }
     fn priced(note: Option<CurveNote>) -> (bool, f64, f64, f64, f64) {
         match note {
@@ -2127,6 +2384,8 @@ mod tests {
                 cost_ngn: snap.cost_ngn,
             },
             live,
+            // The fixture's configured 1 bps spread.
+            limit_spread_bps: 1.0,
         })
     }
 
@@ -2152,7 +2411,7 @@ mod tests {
         reference: Option<(f64, f64)>,
         held: (U256, U256),
         unwind: Option<UnwindInput>,
-    ) -> (QuotePlan, Option<CurveNote>) {
+    ) -> (QuotePlan, QuoteNotes) {
         let inv = holdings_view(held.0, held.1);
         let inputs = CurveInputs {
             unwind,
@@ -2232,10 +2491,15 @@ mod tests {
         // cost before the snapshot refreshes, the second leg after it. Gains
         // big enough that the cap binds, steep starts, a wide reference book
         // and a widened end, both directions, every size the wallet allows.
+        // Profit unwind on a Live curve, and on a flat price.
         let total = 300_000.0;
         let mut worst = f64::NEG_INFINITY;
-        for (half_range, end_above_buy) in [(HALF_RANGE, 0.0), (30.0, 2.0)] {
-            let b = curve_book(Mode::Live, 0.0, end_above_buy);
+        let books = [
+            (curve_book(Mode::Live, 0.0, 0.0), HALF_RANGE),
+            (curve_book(Mode::Live, 0.0, 2.0), 30.0),
+            (curve_book(Mode::Off, 0.0, 0.0), HALF_RANGE),
+        ];
+        for (b, half_range) in books {
             let reference = Some((ref_mid(), half_range));
             for start_pct in [0.0, 50.0, 90.0] {
                 let p = unwind_params(start_pct);
@@ -2283,81 +2547,113 @@ mod tests {
         );
     }
 
+    /// Knobs for one run of [`drain_dilute_return`].
+    #[derive(Clone, Copy)]
+    struct DrainRun {
+        cap: f64,
+        start_pct: f64,
+        gain: f64,
+        share: f64,
+        drain_to: f64,
+        back_frac: f64,
+        fee_out: u32,
+        fee_back: u32,
+        /// The configured spread the host hands profit unwind.
+        limit_spread_bps: f64,
+    }
+
+    /// Tomer's three legs (#2817), the taker's result in bps. The taker buys
+    /// most of the naira at the full lift, sells part back near empty where
+    /// the lift is small (that naira enters at the feed and pulls the cost,
+    /// so the lift, down), then sells the rest back at the lower lift. `out`
+    /// prices the first leg and `back` the returns, so their spreads can
+    /// differ the way module spreads can between quotes.
+    fn drain_dilute_return(out: &CorridorBook, back: &CorridorBook, r: DrainRun) -> f64 {
+        let total = 300_000.0;
+        let naira = |c: U256| normalized(c, out.collateral_decimals);
+        let units = |a: U256| u128::try_from(a).unwrap() as f64;
+        let p = crate::pricing::unwind::UnwindParams {
+            cap_ngn: r.cap,
+            ..unwind_params(r.start_pct)
+        };
+        let input = |tr: &crate::pricing::unwind::Tracker, now: u64| {
+            unwind_input(tr, &p, now, true).map(|u| UnwindInput {
+                limit_spread_bps: r.limit_spread_bps,
+                ..u
+            })
+        };
+        let coll = (total * r.share / ref_mid() * 1e6).round() as u128;
+        let debt = (total * (1.0 - r.share) * 1e6).round() as u128;
+        let held = (U256::from(coll), U256::from(debt));
+        let t0 = 1_000_000;
+        let tr = crate::pricing::unwind::Tracker::open(
+            None,
+            unwind_holder(),
+            naira(held.0),
+            MID_NGN + r.gain,
+            t0,
+            p.refresh_secs,
+        );
+        // Leg 1: the taker pays dollars for naira.
+        let mut l1 = request(DEBT, COLLATERAL);
+        l1.fee_bps = r.fee_out;
+        let usd_in = total * (r.share - r.drain_to);
+        l1.sell_amount = Some(((usd_in * 1e6) as u128).to_string());
+        let (p1, _) = quote_unwound(out, &l1, reference(), held, input(&tr, t0));
+        let a1 = filled(held.0, held.1, &p1);
+        let tr = tr.observe(naira(a1.0), MID_NGN, t0 + 5, p.refresh_secs);
+        // Leg 2a: part of it back, diluting the cost.
+        let got = u128::try_from(p1.buy_amount).unwrap();
+        let part = (got as f64 * r.back_frac) as u128;
+        let mut l2a = request(COLLATERAL, DEBT);
+        l2a.fee_bps = r.fee_back;
+        l2a.sell_amount = Some(part.to_string());
+        let (p2a, _) = quote_unwound(back, &l2a, reference(), a1, input(&tr, t0 + 10));
+        let a2 = filled(a1.0, a1.1, &p2a);
+        // The diluted cost lands, and the snapshot refreshes.
+        let later = t0 + p.refresh_secs + 20;
+        let tr = tr
+            .observe(naira(a2.0), MID_NGN, t0 + 15, p.refresh_secs)
+            .observe(naira(a2.0), MID_NGN, later, p.refresh_secs);
+        // Leg 2b: the rest back at the lower lift.
+        let mut l2b = request(COLLATERAL, DEBT);
+        l2b.fee_bps = r.fee_back;
+        l2b.sell_amount = Some((got - part).to_string());
+        let (p2b, _) = quote_unwound(back, &l2b, reference(), a2, input(&tr, later));
+        let returned = units(p2a.buy_amount) + units(p2b.buy_amount);
+        (returned / units(p1.sell_amount) - 1.0) * 10_000.0
+    }
+
     #[test]
     fn a_drain_dilute_return_round_trip_never_pays_the_taker() {
-        // Tomer's three legs (#2817). The taker buys most of the naira at the
-        // full lift, sells part back near empty where the lift is small (that
-        // naira enters at the feed and pulls the cost, so the lift, down),
-        // then sells the rest back at the lower lift. The curve's round-trip
-        // limit holds the lift to what that can't beat, at any cap or start,
+        // The round-trip limit holds the lift to what Tomer's three legs
+        // can't beat, at any cap or start, on a Live curve or a flat price,
         // and whatever fee each leg pays: a dear first leg and 1 bps returns
         // (the responder refuses a request with no fee) is the cheapest way
         // back.
-        let total = 300_000.0;
-        let naira = |c: U256, b: &CorridorBook| normalized(c, b.collateral_decimals);
-        let units = |a: U256| u128::try_from(a).unwrap() as f64;
         let mut worst = f64::NEG_INFINITY;
-        for (fee_out, fee_back) in [(1u32, 1u32), (10, 1), (25, 1)] {
-            for cap in [2.0, 3.0, 10.0] {
-                for start_pct in [0.0, 30.0, 50.0] {
-                    for gain in [2.0 * cap, 6.0, 20.0] {
-                        for share in [0.75, 0.9, 0.97] {
-                            for drain_to in [0.02, 0.1, 0.3] {
-                                for back_frac in [0.3, 0.6, 0.9] {
-                                    let b = curve_book(Mode::Live, 0.0, 0.0);
-                                    let p = crate::pricing::unwind::UnwindParams {
-                                        cap_ngn: cap,
-                                        ..unwind_params(start_pct)
-                                    };
-                                    let coll = (total * share / ref_mid() * 1e6).round() as u128;
-                                    let debt = (total * (1.0 - share) * 1e6).round() as u128;
-                                    let held = (U256::from(coll), U256::from(debt));
-                                    let t0 = 1_000_000;
-                                    let tr = crate::pricing::unwind::Tracker::open(
-                                        None,
-                                        unwind_holder(),
-                                        naira(held.0, &b),
-                                        MID_NGN + gain,
-                                        t0,
-                                        p.refresh_secs,
-                                    );
-                                    // Leg 1: the taker pays dollars for naira.
-                                    let mut l1 = request(DEBT, COLLATERAL);
-                                    l1.fee_bps = fee_out;
-                                    let usd_in = total * (share - drain_to);
-                                    l1.sell_amount = Some(((usd_in * 1e6) as u128).to_string());
-                                    let input = unwind_input(&tr, &p, t0, true);
-                                    let (p1, _) = quote_unwound(&b, &l1, reference(), held, input);
-                                    let a1 = filled(held.0, held.1, &p1);
-                                    let tr = tr.observe(
-                                        naira(a1.0, &b),
-                                        MID_NGN,
-                                        t0 + 5,
-                                        p.refresh_secs,
-                                    );
-                                    // Leg 2a: part of it back, diluting the cost.
-                                    let got = u128::try_from(p1.buy_amount).unwrap();
-                                    let back = (got as f64 * back_frac) as u128;
-                                    let mut l2a = request(COLLATERAL, DEBT);
-                                    l2a.fee_bps = fee_back;
-                                    l2a.sell_amount = Some(back.to_string());
-                                    let input = unwind_input(&tr, &p, t0 + 10, true);
-                                    let (p2a, _) = quote_unwound(&b, &l2a, reference(), a1, input);
-                                    let a2 = filled(a1.0, a1.1, &p2a);
-                                    // The diluted cost lands, and the snapshot refreshes.
-                                    let later = t0 + p.refresh_secs + 20;
-                                    let tr = tr
-                                        .observe(naira(a2.0, &b), MID_NGN, t0 + 15, p.refresh_secs)
-                                        .observe(naira(a2.0, &b), MID_NGN, later, p.refresh_secs);
-                                    // Leg 2b: the rest back at the lower lift.
-                                    let mut l2b = request(COLLATERAL, DEBT);
-                                    l2b.fee_bps = fee_back;
-                                    l2b.sell_amount = Some((got - back).to_string());
-                                    let input = unwind_input(&tr, &p, later, true);
-                                    let (p2b, _) = quote_unwound(&b, &l2b, reference(), a2, input);
-                                    let out = units(p2a.buy_amount) + units(p2b.buy_amount);
-                                    let bps = (out / units(p1.sell_amount) - 1.0) * 10_000.0;
-                                    worst = worst.max(bps);
+        for mode in [Mode::Live, Mode::Off] {
+            let b = curve_book(mode, 0.0, 0.0);
+            for (fee_out, fee_back) in [(1u32, 1u32), (10, 1), (25, 1)] {
+                for cap in [2.0, 3.0, 10.0] {
+                    for start_pct in [0.0, 30.0, 50.0] {
+                        for gain in [2.0 * cap, 6.0, 20.0] {
+                            for share in [0.75, 0.9, 0.97] {
+                                for drain_to in [0.02, 0.1, 0.3] {
+                                    for back_frac in [0.3, 0.6, 0.9] {
+                                        let run = DrainRun {
+                                            cap,
+                                            start_pct,
+                                            gain,
+                                            share,
+                                            drain_to,
+                                            back_frac,
+                                            fee_out,
+                                            fee_back,
+                                            limit_spread_bps: 1.0,
+                                        };
+                                        worst = worst.max(drain_dilute_return(&b, &b, run));
+                                    }
                                 }
                             }
                         }
@@ -2373,6 +2669,41 @@ mod tests {
     }
 
     #[test]
+    fn a_wider_first_leg_cannot_raise_the_flat_limit() {
+        // Dynamic spreads widen both sides by a buffer that can shrink
+        // between a taker's legs. On a flat price the limit is held to the
+        // configured spread, so a dear first leg doesn't buy the taker a
+        // bigger lift to return against at the narrow spread.
+        let narrow = curve_book(Mode::Off, 0.0, 0.0);
+        let mut wide = narrow.clone();
+        wide.buy_spread = Some(Spread::Bps(21));
+        wide.sell_spread = Some(Spread::Bps(21));
+        let run = DrainRun {
+            cap: 10.0,
+            start_pct: 0.0,
+            gain: 20.0,
+            share: 0.97,
+            drain_to: 0.02,
+            back_frac: 0.3,
+            fee_out: 1,
+            fee_back: 1,
+            limit_spread_bps: 1.0,
+        };
+        let held = drain_dilute_return(&wide, &narrow, run);
+        assert!(held < 0.0, "paid the taker {held} bps");
+        // Held to the first leg's 21 bps instead, the same legs pay.
+        let loose = drain_dilute_return(
+            &wide,
+            &narrow,
+            DrainRun {
+                limit_spread_bps: 21.0,
+                ..run
+            },
+        );
+        assert!(loose > 0.0, "the attack this closes: {loose} bps");
+    }
+
+    #[test]
     fn an_ask_priced_on_a_cost_that_fell_while_signing_is_withheld() {
         let at = |cost_ngn: f64, full_ngn: f64, live: bool| {
             Some(UnwindInput {
@@ -2382,6 +2713,7 @@ mod tests {
                     cost_ngn,
                 },
                 live,
+                limit_spread_bps: 1.0,
             })
         };
         let priced = at(1386.0, 2.0, true);
@@ -2399,24 +2731,85 @@ mod tests {
 
     #[test]
     fn profit_unwind_lifts_live_quotes_and_floors_the_ask_at_the_cost() {
-        let b = curve_book(Mode::Live, 0.0, 0.0);
+        // The same rule whether the price it lifts is a Live curve's or the
+        // flat one.
+        for mode in [Mode::Live, Mode::Off] {
+            let b = curve_book(mode, 0.0, 0.0);
+            let held = (
+                U256::from((270_000.0 / ref_mid() * 1e6) as u128),
+                U256::from(30_000_000_000u128),
+            );
+            let p = unwind_params(50.0);
+            let mut ask = request(DEBT, COLLATERAL);
+            ask.sell_amount = Some("5000000000".into());
+            let quote = |input| quote_unwound(&b, &ask, reference(), held, input);
+            let (plain_plan, none) = quote(None);
+            assert_eq!(none.unwind, None);
+            let plain = realized_ngn(&plain_plan);
+            // A 20 NGN gain: the cap binds and the ask lifts, giving the
+            // taker more naira per dollar, still well under the cost.
+            let rich = crate::pricing::unwind::Tracker::open(
+                None,
+                unwind_holder(),
+                1.0e8,
+                MID_NGN + 20.0,
+                0,
+                900,
+            );
+            let (lifted_plan, notes) = quote(unwind_input(&rich, &p, 0, true));
+            let note = notes.unwind.expect("a live lift notes itself");
+            let lifted = realized_ngn(&lifted_plan);
+            assert!(note.live && 1.0 / note.unwound > 1.0 / note.base);
+            assert!(
+                lifted > plain && lifted < MID_NGN + 20.0,
+                "{mode:?}: {lifted} vs {plain}"
+            );
+            // The curve's own note is the plain curve's, lift left out.
+            if let Some(CurveNote::Priced { curved, .. }) = notes.curve {
+                assert!((curved / note.base - 1.0).abs() < 1e-6, "{mode:?}");
+            }
+            // Preview: the same lift computed, the plain price out.
+            let (previewed, notes) = quote(unwind_input(&rich, &p, 0, false));
+            let would = notes.unwind.expect("a preview notes itself");
+            assert!(!would.live);
+            assert_eq!(previewed, plain_plan, "{mode:?}");
+            assert!(
+                (would.unwound / note.unwound - 1.0).abs() < 1e-6,
+                "{mode:?}"
+            );
+            // A cost just over the plain ask: the lift would carry the ask
+            // past it, so it stops at the cost, and the stitch never pays out
+            // more naira per dollar than the naira was worth when it came
+            // in. A flat ask sits a spread under the feed and the lift is at
+            // most the gain, so only a curve's shade brings an ask that
+            // close.
+            if mode == Mode::Off {
+                continue;
+            }
+            let cost = 1.0 / note.base + 0.2;
+            let thin =
+                crate::pricing::unwind::Tracker::open(None, unwind_holder(), 1.0e8, cost, 0, 900);
+            let (_, notes) = quote(unwind_input(&thin, &p, 0, true));
+            let floored = notes.unwind.expect("a floored lift notes itself").unwound;
+            assert!(
+                (1.0 / floored - cost).abs() < 1e-6,
+                "{mode:?}: {} vs {cost}",
+                1.0 / floored
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_curve_that_cannot_price_answers_flat_with_the_lift() {
+        // With no reference book the Live curve can't price, so the flat
+        // answer goes out, and a live lift goes on it exactly as on a book
+        // with no curve. The curve says why it went flat.
+        let live = curve_book(Mode::Live, 0.0, 0.0);
+        let flat = curve_book(Mode::Off, 0.0, 0.0);
         let held = (
             U256::from((270_000.0 / ref_mid() * 1e6) as u128),
             U256::from(30_000_000_000u128),
         );
-        let p = unwind_params(50.0);
-        let mut ask = request(DEBT, COLLATERAL);
-        ask.sell_amount = Some("5000000000".into());
-        let price = |note: Option<CurveNote>| match note {
-            Some(CurveNote::Priced {
-                curved, unwound, ..
-            }) => (curved, unwound),
-            other => panic!("expected a priced note, got {other:?}"),
-        };
-        let (plain, none) = price(quote_unwound(&b, &ask, reference(), held, None).1);
-        assert!(none.is_none());
-        // A 20 NGN gain: the cap binds and the ask lifts, giving the taker
-        // more naira per dollar, still well under the cost.
         let rich = crate::pricing::unwind::Tracker::open(
             None,
             unwind_holder(),
@@ -2425,52 +2818,16 @@ mod tests {
             0,
             900,
         );
-        let (lifted, unwound) = price(
-            quote_unwound(
-                &b,
-                &ask,
-                reference(),
-                held,
-                unwind_input(&rich, &p, 0, true),
-            )
-            .1,
-        );
-        assert_eq!(Some(lifted), unwound);
-        assert!(1.0 / lifted > 1.0 / plain && 1.0 / lifted < MID_NGN + 20.0);
-        // Preview: the same lift computed, the plain price out.
-        let (previewed, would) = price(
-            quote_unwound(
-                &b,
-                &ask,
-                reference(),
-                held,
-                unwind_input(&rich, &p, 0, false),
-            )
-            .1,
-        );
-        assert_eq!((previewed, would), (plain, unwound));
-        // A cost just over the plain ask: the lift (about 0.5 NGN here) would
-        // carry the ask past it, so it stops at the cost, and the stitch
-        // never pays out more naira per dollar than the naira was worth when
-        // it came in.
-        let cost = 1.0 / plain + 0.2;
-        let thin =
-            crate::pricing::unwind::Tracker::open(None, unwind_holder(), 1.0e8, cost, 0, 900);
-        let (floored, _) = price(
-            quote_unwound(
-                &b,
-                &ask,
-                reference(),
-                held,
-                unwind_input(&thin, &p, 0, true),
-            )
-            .1,
-        );
-        assert!(
-            (1.0 / floored - cost).abs() < 1e-6,
-            "{} vs {cost}",
-            1.0 / floored
-        );
+        let input = unwind_input(&rich, &unwind_params(50.0), 0, true);
+        let mut ask = request(DEBT, COLLATERAL);
+        ask.sell_amount = Some("5000000000".into());
+        let (on_curve, notes) = quote_unwound(&live, &ask, None, held, input);
+        let (on_flat, _) = quote_unwound(&flat, &ask, None, held, input);
+        assert_eq!(on_curve, on_flat);
+        assert!(matches!(notes.curve, Some(CurveNote::Flat(_))), "{notes:?}");
+        assert!(notes.unwind.is_some_and(|u| u.live));
+        let (plain, _) = quote_unwound(&flat, &ask, None, held, None);
+        assert_ne!(on_flat, plain, "the lift moved the flat answer");
     }
 
     #[test]
@@ -2498,18 +2855,23 @@ mod tests {
     }
 
     #[test]
-    fn a_curved_corridor_reads_both_wallet_legs() {
+    fn a_corridor_that_reads_the_share_reads_both_wallet_legs() {
         // A buy-only pool never configures sell capacity, so wallet_tokens
         // would skip its collateral — and the curve would have no share.
         let mut b = curve_book(Mode::Shadow, 0.0, 0.0);
         b.sell_capacity_collateral = None;
-        let read = wallet_tokens(&[b]);
+        let read = wallet_tokens(&[b], false);
         assert!(read.contains(&COLLATERAL.parse().unwrap()));
         assert!(read.contains(&DEBT.parse().unwrap()));
-        // While a curve-off one-sided pool keeps reading only its active leg.
-        let mut off = book();
-        off.sell_capacity_collateral = None;
-        let read = wallet_tokens(&[off]);
+        // Profit unwind reads the share too, curve or not.
+        let mut flat = book();
+        flat.sell_capacity_collateral = None;
+        let read = wallet_tokens(&[flat.clone()], true);
+        assert!(read.contains(&COLLATERAL.parse().unwrap()));
+        assert!(read.contains(&DEBT.parse().unwrap()));
+        // While a one-sided pool with neither keeps reading only its active
+        // leg.
+        let read = wallet_tokens(&[flat], false);
         assert!(!read.contains(&COLLATERAL.parse().unwrap()));
         assert!(read.contains(&DEBT.parse().unwrap()));
     }
@@ -2595,7 +2957,7 @@ mod tests {
             &inv,
         )
         .unwrap();
-        assert!(matches!(note, Some(CurveNote::Flat(_))), "{note:?}");
+        assert!(matches!(note.curve, Some(CurveNote::Flat(_))), "{note:?}");
         let flat = decide_quote(
             &b,
             &req,
@@ -2621,7 +2983,7 @@ mod tests {
             &inv,
         )
         .unwrap();
-        assert!(matches!(note, Some(CurveNote::Flat(_))), "{note:?}");
+        assert!(matches!(note.curve, Some(CurveNote::Flat(_))), "{note:?}");
     }
 
     #[test]
@@ -2657,7 +3019,7 @@ mod tests {
                 &inv,
             )
             .unwrap();
-            match note {
+            match note.curve {
                 Some(CurveNote::Flat(reason)) => {
                     assert_eq!(plan, flat, "a refused reference answers flat");
                     Some(reason)
@@ -2781,6 +3143,152 @@ mod tests {
         assert!(
             slack_used_bps(&plan, &flat) > 5.0,
             "flat levels would strike this reply"
+        );
+    }
+
+    #[test]
+    fn unwound_firm_quotes_land_inside_the_venues_level_slack() {
+        // A live profit unwind lift moves the levels exactly as it moves the
+        // firm reply, on a flat price and on a Live curve, from both ends of
+        // the share and with this side's own quotes outstanding.
+        let rich = crate::pricing::unwind::Tracker::open(
+            None,
+            unwind_holder(),
+            1.0e8,
+            MID_NGN + 20.0,
+            0,
+            900,
+        );
+        let mut checked = 0;
+        for mode in [Mode::Off, Mode::Live] {
+            let b = curve_book(mode, 0.0, 0.0);
+            for naira in [0.1, 0.5, 0.82, 0.95] {
+                let inv = wallet(300_000.0 * naira, 300_000.0 * (1.0 - naira));
+                let lifted = CurveInputs {
+                    unwind: unwind_input(&rich, &unwind_params(30.0), 0, true),
+                    ..inputs(&b, &inv, reference())
+                };
+                for held in [0u64, 20_000_000_000] {
+                    for (bid, usdt) in [
+                        (true, 1_000.0),
+                        (true, 20_000.0),
+                        (false, 1_000.0),
+                        (false, 20_000.0),
+                    ] {
+                        let has = if bid { 1.0 - naira } else { naira } * 300_000.0;
+                        if has < usdt + 25_000.0 {
+                            continue;
+                        }
+                        let reserved = if bid {
+                            (U256::from(held), U256::ZERO)
+                        } else {
+                            (U256::ZERO, U256::from((held as f64 / ref_mid()) as u128))
+                        };
+                        let mut req = if bid {
+                            request(COLLATERAL, DEBT)
+                        } else {
+                            request(DEBT, COLLATERAL)
+                        };
+                        req.sell_amount = Some(if bid {
+                            format!("{}", (usdt / ref_mid() * 1e6) as u128)
+                        } else {
+                            format!("{}", (usdt * 1e6) as u128)
+                        });
+                        let (plan, notes) = decide_quote_curved(
+                            &b,
+                            &req,
+                            ref_mid(),
+                            &lifted,
+                            reserved.0,
+                            reserved.1,
+                            reserved.0,
+                            reserved.1,
+                            &inv,
+                        )
+                        .unwrap();
+                        assert!(notes.unwind.is_some_and(|u| u.live), "{mode:?}");
+                        let levels = levels_for_curved(
+                            &b,
+                            ref_mid(),
+                            &lifted,
+                            1,
+                            reserved.0,
+                            reserved.1,
+                            reserved.0,
+                            reserved.1,
+                            "now".into(),
+                            &inv,
+                            &[],
+                        );
+                        let used = slack_used_bps(&plan, &levels);
+                        assert!(
+                            used < 0.1,
+                            "{mode:?} f {naira} held {held} bid {bid} {usdt}: firm is \
+                             {used:.3} bps worse than its levels"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 30, "only {checked} cases ran");
+        // A previewed lift leaves a flat book's levels flat, as its quotes.
+        let b = curve_book(Mode::Off, 0.0, 0.0);
+        let inv = wallet(246_000.0, 54_000.0);
+        let previewed = CurveInputs {
+            unwind: unwind_input(&rich, &unwind_params(30.0), 0, false),
+            ..inputs(&b, &inv, reference())
+        };
+        let flat = levels_for(
+            &b,
+            ref_mid(),
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            "now".into(),
+            &inv,
+            &[],
+        );
+        let levels = |inputs: &CurveInputs| {
+            levels_for_curved(
+                &b,
+                ref_mid(),
+                inputs,
+                1,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                "now".into(),
+                &inv,
+                &[],
+            )
+        };
+        assert_eq!(wire(&levels(&previewed)), wire(&flat));
+        // Live, the loaded bid would be struck against flat levels.
+        let lifted = CurveInputs {
+            unwind: unwind_input(&rich, &unwind_params(30.0), 0, true),
+            ..previewed
+        };
+        assert_ne!(wire(&levels(&lifted)), wire(&flat));
+        let mut req = request(COLLATERAL, DEBT);
+        req.sell_amount = Some(format!("{}", (5_000.0 / ref_mid() * 1e6) as u128));
+        let (plan, _) = decide_quote_curved(
+            &b,
+            &req,
+            ref_mid(),
+            &lifted,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            &inv,
+        )
+        .unwrap();
+        assert!(
+            slack_used_bps(&plan, &flat) > 1.0,
+            "the lift moves the reply"
         );
     }
 

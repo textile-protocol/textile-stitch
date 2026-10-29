@@ -6,7 +6,11 @@ import {
   type ModulesView,
   type ModuleStatus,
 } from './modules'
-import { defaultCurve, defaultLiquidity } from './modulePresentation'
+import {
+  defaultCurve,
+  defaultLiquidity,
+  defaultProfitUnwind,
+} from './modulePresentation'
 
 describe('module telemetry', () => {
   const status = {
@@ -62,6 +66,7 @@ describe('dynamic spread visibility', () => {
       },
       liquidity: defaultLiquidity(),
       curve: defaultCurve(),
+      profit_unwind: defaultProfitUnwind(),
     }
     return {
       running: true,

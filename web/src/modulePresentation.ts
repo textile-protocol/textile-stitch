@@ -1,10 +1,10 @@
+import { curveConfigErrors, shapeLabel } from './curve'
 import {
-  curveConfigErrors,
-  freshReading,
+  freshUnwindReading,
   liftLimitNgn,
+  minSpreadBps,
   profitUnwindErrors,
-  shapeLabel,
-} from './curve'
+} from './unwind'
 import { formatAtomic } from './format'
 import {
   isWarmingUp,
@@ -27,12 +27,14 @@ export type ModuleKey =
   | 'rebalance'
   | 'liquidity'
   | 'curve'
+  | 'profit_unwind'
 export const moduleNames: Record<ModuleKey, string> = {
   inventory: 'Inventory balancing',
   spreads: 'Dynamic spreads',
   rebalance: 'Spot rebalancing',
   liquidity: 'Liquidity schedule',
   curve: 'Inventory curve',
+  profit_unwind: 'Profit unwind',
 }
 export const moduleKeys: ModuleKey[] = [
   'inventory',
@@ -40,14 +42,15 @@ export const moduleKeys: ModuleKey[] = [
   'rebalance',
   'liquidity',
   'curve',
+  'profit_unwind',
 ]
 
 /** The modules that can run on this bot's funds, in display order. Every
  * module runs on a vault; a bot that trades from its own wallet has nothing
- * for the others to read or act through, so it gets the inventory curve
- * alone. Mirrors `ModulesConfig::runnable` in the bot. */
+ * for the others to read or act through, so it gets the inventory curve and
+ * profit unwind. Mirrors `ModulesConfig::runnable` in the bot. */
 export const modulesFor = (vault: boolean): ModuleKey[] =>
-  vault ? moduleKeys : ['curve']
+  vault ? moduleKeys : ['curve', 'profit_unwind']
 
 /** Inventory balancing and the inventory curve both lean quotes on what the
  * vault holds, so one stays off while the other runs. The bot refuses both. */
@@ -61,6 +64,10 @@ export function leanConflict(
     return 'Inventory balancing is on. Both lean quotes on what the vault holds, so turn it off to run the curve.'
   if (key === 'inventory' && c.curve.enabled)
     return 'The inventory curve is on. Both lean quotes on what the vault holds, so turn it off to run inventory balancing.'
+  if (key === 'profit_unwind' && c.inventory.enabled)
+    return 'Inventory balancing is on. It narrows a side below your spread, which profit unwind’s round-trip limit counts on, so turn it off to run profit unwind.'
+  if (key === 'inventory' && c.profit_unwind.enabled)
+    return 'Profit unwind is on. Inventory balancing narrows a side below the spread its round-trip limit counts on, so turn it off to run inventory balancing.'
   return null
 }
 export const percentage = (bps: number) =>
@@ -191,22 +198,22 @@ const editableSettings: readonly [
     shownPriceOffset,
   ],
   ['Curve shape', (c) => c.curve.shape, (v) => shapeLabel(Number(v))],
-  ['Profit unwind', (c) => unwind(c).enabled, shownSwitch],
+  ['Profit unwind', (c) => c.profit_unwind.enabled, shownSwitch],
   [
     'Profit unwind quotes',
-    (c) => unwind(c).live,
+    (c) => c.profit_unwind.live,
     (v) => (v ? 'Live' : 'Preview'),
   ],
   [
     'Share of gain given back',
-    (c) => unwind(c).share,
+    (c) => c.profit_unwind.share,
     (v) => (Number.isFinite(v) ? `${Math.round(Number(v) * 100)}%` : '—'),
   ],
-  ['Cap', (c) => unwind(c).cap_ngn, shownPriceOffset],
-  ['Ignore gains under', (c) => unwind(c).min_gain_ngn, shownPriceOffset],
+  ['Cap', (c) => c.profit_unwind.cap_ngn, shownPriceOffset],
+  ['Ignore gains under', (c) => c.profit_unwind.min_gain_ngn, shownPriceOffset],
   [
     'Start profit unwind at',
-    (c) => unwind(c).start_pct,
+    (c) => c.profit_unwind.start_pct,
     (v) => (Number.isFinite(v) ? `${v}% naira` : '—'),
   ],
 ]
@@ -269,13 +276,17 @@ export function moduleParameterErrors(
     ...liquidityScheduleErrors(c.liquidity),
     ...liquidityAuthorityErrors(c.liquidity, c.mode),
     ...curveConfigErrors(c.curve).map((m) => `Inventory curve: ${m}`),
-    ...profitUnwindErrors(unwind(c), c.curve.enabled, unwindCapLimitNgn).map(
+    ...profitUnwindErrors(c.profit_unwind, unwindCapLimitNgn).map(
       (m) => `Profit unwind: ${m}`
     ),
     vault &&
       c.curve.enabled &&
       c.inventory.enabled &&
       'Inventory balancing and the inventory curve both lean quotes on what the vault holds; turn one of them off.',
+    vault &&
+      c.profit_unwind.enabled &&
+      c.inventory.enabled &&
+      'Inventory balancing narrows a side below the spread profit unwind’s round-trip limit counts on; turn one of them off.',
   ].filter((message): message is string => typeof message === 'string')
 }
 
@@ -339,17 +350,37 @@ export function equalSpreadBps(view: Pick<ModulesView, 'corridor_spreads'>) {
 }
 
 /** The most the draft's profit unwind cap may be at the bot's last reading:
- * the round-trip limit at the corridor spread, its mid and the draft's start.
- * Null without a fresh reading; the bot holds the lift to it when it quotes. */
+ * the round-trip limit at the corridor's smaller spread, the feed and the
+ * draft's start. Null without a fresh reading; the bot holds the lift to it
+ * when it quotes (on the curve, at the curve's own mid, within 1% of it). */
 export function draftUnwindCapLimit(
   view: ModulesView,
   draft: ModulesConfig,
   now: number
 ): number | null {
-  const reading = freshReading(view.status?.curve, now)
-  const spread = equalSpreadBps(view)
+  const reading = freshUnwindReading(view.status?.profit_unwind, now)
+  const spread = minSpreadBps(view)
   if (!reading || spread === null) return null
-  return liftLimitNgn(spread, reading.reference_mid, unwind(draft).start_pct)
+  return liftLimitNgn(spread, reading.feed_mid, draft.profit_unwind.start_pct)
+}
+
+/** The cap limit Save enforces: only while the draft moves profit unwind's
+ * cap or start. A saved cap the feed has since moved past is held to the
+ * limit by the bot when it quotes, so it doesn't lock other saves. */
+export function enforcedUnwindCapLimit(
+  view: ModulesView,
+  saved: ModulesConfig,
+  draft: ModulesConfig,
+  now: number
+): number | null {
+  const [was, is] = [saved.profit_unwind, draft.profit_unwind]
+  if (
+    was &&
+    Object.is(was.cap_ngn, is.cap_ngn) &&
+    Object.is(was.start_pct, is.start_pct)
+  )
+    return null
+  return draftUnwindCapLimit(view, draft, now)
 }
 
 /** Server defaults for a config saved before profit unwind existed. */
@@ -362,9 +393,6 @@ export const defaultProfitUnwind = (): ProfitUnwindConfig => ({
   start_pct: 50,
   refresh_secs: 900,
 })
-/** A config's profit unwind, with the server defaults when it predates it. */
-export const unwind = (c: ModulesConfig): ProfitUnwindConfig =>
-  c.profit_unwind ?? defaultProfitUnwind()
 export const defaultLiquidity = (): LiquidityConfig => ({
   enabled: false,
   open_utc: '08:00',

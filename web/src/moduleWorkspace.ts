@@ -1,4 +1,5 @@
 import { freshReading } from './curve'
+import { freshUnwindReading } from './unwind'
 import {
   moduleNames,
   moduleKeys,
@@ -78,6 +79,12 @@ export const WORKSPACE_MODULES: Record<
     category: 'Pricing',
     description: 'Adjust quotes to the liquid inventory available to this bot.',
   },
+  profit_unwind: {
+    name: moduleNames.profit_unwind,
+    category: 'Pricing',
+    description:
+      'Give part of a holding gain back as a better price, so excess inventory clears faster. Works on flat and curve pricing.',
+  },
   inventory: {
     name: moduleNames.inventory,
     category: 'Pricing',
@@ -132,13 +139,9 @@ export function selectedWorkspaceModule(
 
 export type QuoteConfigScope = ModuleKey | 'policy'
 
-/** Profit unwind is edited with the curve. Shared mode has its own save scope. */
+/** Each module saves its own table. Shared mode has its own save scope. */
 const configKeys = (scope: QuoteConfigScope): (keyof ModulesConfig)[] =>
-  scope === 'policy'
-    ? ['mode']
-    : scope === 'curve'
-      ? ['curve', 'profit_unwind']
-      : [scope]
+  scope === 'policy' ? ['mode'] : [scope]
 
 /** Construct the full API payload from one revision's saved config and one editor. */
 export function quoteConfigForScope(
@@ -160,7 +163,7 @@ export function remainingQuoteDraft(
   scope: QuoteConfigScope
 ): ModulesConfig {
   const owned = configKeys(scope)
-  const keys: (keyof ModulesConfig)[] = ['mode', ...moduleKeys, 'profit_unwind']
+  const keys: (keyof ModulesConfig)[] = ['mode', ...moduleKeys]
   return {
     ...next,
     ...Object.fromEntries(
@@ -195,11 +198,16 @@ export function quoteModuleStatus(
   if (view.config.mode === 'off' || !view.config[key].enabled) return 'Off'
   if (key === 'curve') {
     if (!freshReading(view.status?.curve, now)) return 'Waiting'
+  } else if (key === 'profit_unwind') {
+    if (!freshUnwindReading(view.status?.profit_unwind, now)) return 'Waiting'
+    // It quotes only with its own switch on, in Live mode.
+    if (!view.config.profit_unwind.live) return 'Preview'
   } else if (key === 'liquidity') {
     if (!liquidityState(view, now).current) return 'Waiting'
   } else if (!moduleStatusFresh(view.status, view.running, now)) return 'Stale'
   if (
     key !== 'curve' &&
+    key !== 'profit_unwind' &&
     key !== 'liquidity' &&
     view.status?.decisions.at(-1)?.decision.blocked
   )

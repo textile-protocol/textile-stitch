@@ -5,6 +5,7 @@ import {
   corridorSpreads,
   defaultCurve,
   defaultLiquidity,
+  defaultProfitUnwind,
   inventoryIllustration,
   liquiditySchedule,
   liquiditySetupHint,
@@ -57,6 +58,7 @@ const config = (): ModulesConfig => ({
   },
   liquidity: defaultLiquidity(),
   curve: defaultCurve(),
+  profit_unwind: defaultProfitUnwind(),
 })
 
 describe('module parameter validation', () => {

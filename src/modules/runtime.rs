@@ -111,6 +111,10 @@ pub struct Status {
     /// the curve has never run, and from older bot releases.
     #[serde(default)]
     pub curve: Option<CurveStatus>,
+    /// Profit unwind's last reading and recent quotes. Absent while it has
+    /// never run, and from older bot releases.
+    #[serde(default)]
+    pub profit_unwind: Option<UnwindStatus>,
 }
 
 /// What the inventory curve has seen, for the panel. Diagnostic only, like
@@ -141,14 +145,30 @@ pub struct CurveReading {
     /// one. Not the reference mid, which only the curve anchors on. Absent in
     /// status written before the bot recorded it.
     pub feed_price: Option<f64>,
-    /// Profit unwind, while it runs. Absent from older bot releases.
-    #[serde(default)]
-    pub unwind: Option<UnwindReading>,
+}
+
+/// What profit unwind has seen, for the panel. Diagnostic only, like the
+/// curve's.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct UnwindStatus {
+    pub reading: Option<UnwindReading>,
+    /// Up to [`MAX_DECISIONS`] quotes it lifted or previewed, oldest first.
+    pub quotes: Vec<UnwindQuote>,
 }
 
 /// What profit unwind sees this tick, in soft currency per dollar.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UnwindReading {
+    pub at: u64,
+    /// Corridor currency's share of what the bot holds, 0..1, valued at the
+    /// feed, before this side's open quotes. Absent without a fresh balance
+    /// reading.
+    pub share: Option<f64>,
+    /// What the bot holds, valued in the settlement currency.
+    pub value: Option<f64>,
+    /// The venue fee on the last quote request, bps: what the panel's
+    /// example adds to a flat price.
+    pub fee_bps: u32,
     /// The frozen average cost the lift is sized on, and when it froze.
     pub cost: f64,
     pub snapshot_at: u64,
@@ -161,6 +181,25 @@ pub struct UnwindReading {
     pub full_shift: f64,
     /// Whether the lift quotes, or is profit unwind's preview.
     pub live: bool,
+}
+
+/// One Swap request profit unwind lifted, or would have in its preview.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UnwindQuote {
+    pub at: u64,
+    /// The bot buying the corridor currency (paying settlement).
+    pub bot_buys: bool,
+    /// The quote went out with the lift.
+    pub live: bool,
+    /// The quoted size, in settlement units.
+    pub size: f64,
+    /// The share this quote started from and where it leaves it.
+    pub share_before: f64,
+    pub share_after: f64,
+    /// The lifted price against the one it lifts (the curve's or the flat
+    /// one), in bps of soft currency per dollar: positive gives more of it
+    /// per dollar.
+    pub lift_bps: f64,
 }
 
 /// One Swap request the curve priced, or answered flat.
@@ -332,6 +371,7 @@ pub fn settling_only_config(config: &ModulesConfig) -> ModulesConfig {
     c.rebalance.enabled = false;
     c.liquidity.enabled = false;
     c.curve.enabled = false;
+    c.profit_unwind.enabled = false;
     c
 }
 
@@ -439,6 +479,7 @@ impl Runtime {
             next_attempt_at,
             liquidity: None,
             curve: None,
+            profit_unwind: None,
             quote_status: Some(QuoteStatus {
                 at: crate::time::unix_now(),
                 state: QuoteState::WaitingForSession,
@@ -754,6 +795,37 @@ impl Runtime {
         }
         status.at = reading.at;
         curve.reading = Some(reading);
+        let _ = self.writer.send_replace(status.clone());
+    }
+
+    /// Profit unwind's view of its inputs this tick. Written once a second
+    /// at most, like the curve's.
+    pub fn unwind_reading(&self, reading: UnwindReading) {
+        let mut s = self.state.lock().expect("module state poisoned");
+        let status = &mut s.status;
+        let unwind = status
+            .profit_unwind
+            .get_or_insert_with(UnwindStatus::default);
+        if unwind.reading.as_ref().is_some_and(|r| r.at == reading.at) {
+            return;
+        }
+        status.at = reading.at;
+        unwind.reading = Some(reading);
+        let _ = self.writer.send_replace(status.clone());
+    }
+
+    /// A quote profit unwind lifted, or previewed.
+    pub fn unwind_quote(&self, quote: UnwindQuote) {
+        let mut s = self.state.lock().expect("module state poisoned");
+        let status = &mut s.status;
+        status.at = quote.at;
+        let unwind = status
+            .profit_unwind
+            .get_or_insert_with(UnwindStatus::default);
+        unwind.quotes.push(quote);
+        if unwind.quotes.len() > MAX_DECISIONS {
+            unwind.quotes.remove(0);
+        }
         let _ = self.writer.send_replace(status.clone());
     }
 

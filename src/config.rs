@@ -1219,6 +1219,17 @@ impl Config {
             && self.modules.mode == crate::modules::Mode::Live
     }
 
+    /// Whether profit unwind quotes with its lift: modules on, Live mode, and
+    /// profit unwind switched on with its own `live`. Otherwise it previews
+    /// (or doesn't run). Independent of the inventory curve.
+    pub fn profit_unwind_live(&self) -> bool {
+        let u = &self.modules.profit_unwind;
+        self.modules_enabled
+            && u.enabled
+            && u.live
+            && self.modules.mode == crate::modules::Mode::Live
+    }
+
     /// The price every reader of this bot's feed quotes around: the tick
     /// loop, RFQ and NAV co-signing share one jump guard per feed URL, so
     /// they must all read the same series. A Live inventory curve reads the
@@ -1271,8 +1282,8 @@ impl Config {
     }
 
     /// What the inventory curve needs, once modules are known to quote one
-    /// corridor. On a wallet bot the curve is the only module that runs; on a
-    /// vault it runs beside the others except inventory balancing.
+    /// corridor. On a wallet bot it runs beside profit unwind only; on a
+    /// vault beside the others except inventory balancing.
     fn validate_curve(&self) -> anyhow::Result<()> {
         let m = &self.modules;
         if !m.curve.enabled {
@@ -1323,6 +1334,48 @@ impl Config {
             self.vault.is_none() || !m.inventory.enabled,
             "inventory balancing and the inventory curve both lean quotes on what the vault \
              holds; turn one of them off"
+        );
+        Ok(())
+    }
+
+    /// What profit unwind needs, once modules are known to quote one
+    /// corridor. Its round-trip limit is a multiple of the spread
+    /// ([`crate::pricing::unwind::lift_limit_ngn`]), so the spreads must be
+    /// bps; and it tracks what the collateral cost in the debt, so the
+    /// collateral must be the soft currency.
+    fn validate_profit_unwind(&self) -> anyhow::Result<()> {
+        if !self.modules.profit_unwind.enabled {
+            return Ok(());
+        }
+        let pool = &self.pools[0];
+        let spreads: Vec<Spread> = [pool.buy_spread(), pool.sell_spread()]
+            .into_iter()
+            .flatten()
+            .collect();
+        anyhow::ensure!(
+            !spreads.is_empty(),
+            "profit unwind needs at least one quoting side (a buy or sell spread)"
+        );
+        anyhow::ensure!(
+            spreads.iter().all(|sp| matches!(sp, Spread::Bps(_))),
+            "profit unwind holds its lift to a multiple of the spread, so it needs bps spreads, \
+             not absolute offsets"
+        );
+        let feed = pool.feed_url.as_deref().unwrap_or(&self.feed.url);
+        anyhow::ensure!(
+            !feed_inverts(feed),
+            "profit unwind assumes the collateral is the soft currency and the debt the dollar, \
+             but this pool's feed has invert=1 (a reversed pool), where it would track the \
+             wrong leg's cost"
+        );
+        // Its round-trip limit counts on no return leg paying less than the
+        // configured spread. Inventory balancing skews the sides below it as
+        // the vault's share moves, so between a taker's legs; dynamic spreads
+        // only add to it, so they can stay.
+        anyhow::ensure!(
+            self.vault.is_none() || !self.modules.inventory.enabled,
+            "inventory balancing narrows a side below the configured spread, which profit \
+             unwind's round-trip limit counts on; turn one of them off"
         );
         Ok(())
     }
@@ -1616,6 +1669,7 @@ impl Config {
                 anyhow::bail!("{blocker}");
             }
             self.validate_curve()?;
+            self.validate_profit_unwind()?;
             // The schedule sends its own transactions in Live mode; Preview
             // only reads, so any signer can preview it.
             if let Some(why) = self
@@ -2031,6 +2085,27 @@ mod tests {
     }
 
     #[test]
+    fn profit_unwind_runs_on_a_vault_without_inventory_balancing() {
+        // On a flat vault: inventory balancing skews a side below the
+        // configured spread its limit counts on, so it's one or the other.
+        let flat = |modules: &str| {
+            curve_bot(
+                "",
+                true,
+                &format!("[modules.profit_unwind]\nenabled = true\n{modules}"),
+            )
+            .replace("[modules.curve]\nenabled = true\n", "")
+        };
+        let both = Config::from_toml(&flat("")).unwrap_err().to_string();
+        assert!(
+            both.contains("profit unwind") && both.contains("turn one of them off"),
+            "{both}"
+        );
+        let cfg = Config::from_toml(&flat("[modules.inventory]\nenabled = false\n")).unwrap();
+        assert!(cfg.modules.profit_unwind.enabled && cfg.modules.spreads.enabled);
+    }
+
+    #[test]
     fn the_curve_refuses_spreads_it_cannot_price_and_a_reversed_feed() {
         let unequal =
             curve_bot("", false, "").replace("sell_offset_bps = 150", "sell_offset_bps = 300");
@@ -2071,19 +2146,44 @@ mod tests {
     }
 
     #[test]
-    fn profit_unwind_rides_on_the_curve_and_checks_its_knobs() {
+    fn profit_unwind_runs_with_or_without_the_curve_and_checks_its_knobs() {
         // On with the curve: loads with the panel's defaults.
         let on = curve_bot("", false, "[modules.profit_unwind]\nenabled = true\n");
         let cfg = Config::from_toml(&on).unwrap();
         let u = &cfg.modules.profit_unwind;
         assert!(u.enabled && !u.live && u.share == 0.5 && u.cap_ngn == 2.0);
         assert!(u.min_gain_ngn == 0.7 && u.start_pct == 50.0 && u.refresh_secs == 900);
-        // It moves the curve, so it needs the curve.
-        let alone = on.replace("[modules.curve]\nenabled = true\n", "");
-        assert!(Config::from_toml(&alone)
+        // On a flat price: its own module, no curve needed, and unequal bps
+        // spreads are fine (the limit takes the smaller one).
+        let alone = on
+            .replace("[modules.curve]\nenabled = true\n", "")
+            .replace("sell_offset_bps = 150", "sell_offset_bps = 300");
+        let cfg = Config::from_toml(&alone).unwrap();
+        assert!(cfg.modules.profit_unwind.enabled && !cfg.modules.curve.enabled);
+        // It quotes only with its own `live`, in Live mode.
+        assert!(!cfg.profit_unwind_live());
+        let live = alone.replace(
+            "[modules.profit_unwind]\nenabled = true\n",
+            "[modules]\nmode = \"live\"\n[modules.profit_unwind]\nenabled = true\nlive = true\n",
+        );
+        assert!(Config::from_toml(&live).unwrap().profit_unwind_live());
+        let previewing = live.replace("mode = \"live\"", "mode = \"shadow\"");
+        assert!(!Config::from_toml(&previewing).unwrap().profit_unwind_live());
+        // Its limit is a multiple of the spread, so the spreads must be bps,
+        // and the collateral must be the soft currency.
+        let absolute = alone.replace("sell_offset_bps = 300", "sell_offset_abs = 2.0");
+        assert!(Config::from_toml(&absolute)
             .unwrap_err()
             .to_string()
-            .contains("needs [modules.curve]"));
+            .contains("bps spreads"));
+        let reversed = alone.replace(
+            "[[pools]]\n",
+            "[[pools]]\nfeed_url = \"https://api.example/price?pair=cngn-usdt&invert=1\"\n",
+        );
+        assert!(Config::from_toml(&reversed)
+            .unwrap_err()
+            .to_string()
+            .contains("invert=1"));
         for (bad, says) in [
             ("share = 1.5", "share"),
             ("cap_ngn = -1.0", "cap_ngn"),

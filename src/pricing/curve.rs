@@ -50,6 +50,8 @@
 //! the range, and a round-trip test will not catch it — only the endpoints
 //! will.
 
+use crate::pricing::unwind::Lift;
+
 /// How far a quote's own size moves the share before the price is taken, and
 /// the shape of the curve in between. Per corridor.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,21 +96,6 @@ pub struct Curve {
     all_in_bps: f64,
     /// Profit unwind's lift on top, when it quotes.
     lift: Option<Lift>,
-}
-
-/// Profit unwind on top of the curve ([`crate::pricing::unwind`]): an extra
-/// shade of `full_ngn * weight(f)`, averaged over the stretch like the
-/// curve's own, with every ask it moves floored at the cost.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Lift {
-    /// The lift at 100% naira, NGN per USDT. The curve turns it into bps
-    /// against its own reference mid, the one its shades apply to.
-    pub full_ngn: f64,
-    /// Where the lift starts, percent naira share.
-    pub start_pct: f64,
-    /// The frozen average cost, NGN per USDT: no ask the lift moves goes past
-    /// it.
-    pub cost_ngn: f64,
 }
 
 impl Curve {
@@ -182,16 +169,8 @@ impl Curve {
     /// can't pay them either. A lift of zero, or one it can't trust, leaves
     /// the curve plain.
     pub fn with_lift(self, lift: Lift, spread_bps: f64) -> Self {
-        // Checked before the limit: `f64::min` would turn a NaN into the limit.
-        let trusted = lift.full_ngn.is_finite()
-            && lift.start_pct.is_finite()
-            && lift.cost_ngn.is_finite()
-            && lift.cost_ngn > 0.0;
-        let full_ngn = lift
-            .full_ngn
-            .min(self.lift_limit_ngn(lift.start_pct, spread_bps));
         Self {
-            lift: (trusted && full_ngn > 0.0).then_some(Lift { full_ngn, ..lift }),
+            lift: lift.held_to(self.lift_limit_ngn(lift.start_pct, spread_bps)),
             ..self
         }
     }

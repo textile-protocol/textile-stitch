@@ -298,6 +298,34 @@ export const moduleGuides: Record<
       </>
     ),
   },
+  profit_unwind: {
+    title: 'How profit unwind works',
+    body: (currency, settlement) => (
+      <>
+        <p>
+          The bot tracks what the {currency} it holds cost on average. When the
+          feed moves so that {currency} is worth more than it cost, both prices
+          lift by part of the gain: takers bringing {settlement} get more{' '}
+          {currency}, so the pile clears faster, and the bot keeps the rest.
+          Sells never go past the average cost.
+        </p>
+        <p className="mt-3">
+          It lifts whatever price goes out: the inventory curve&apos;s when the
+          curve quotes, the flat price otherwise. Nothing moves below the start
+          share; above it the lift grows evenly to full at 100%. Every quote
+          pays the average lift across the holdings it moves, and the lift is
+          held to a multiple of the spread, so a trade out and back never pays
+          the taker.
+        </p>
+        <p className="mt-3">
+          {currency} coming in is marked at the feed and {currency} going out
+          leaves at the average cost, so takers can only pull the gain down.
+          The cost is frozen every 15 minutes, except that new {currency}
+          lowering it applies at once.
+        </p>
+      </>
+    ),
+  },
 }
 
 /** Operator's local equivalent of a UTC clock time, using today's offset. */

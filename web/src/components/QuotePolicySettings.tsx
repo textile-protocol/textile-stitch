@@ -1,5 +1,5 @@
 import {
-  draftUnwindCapLimit,
+  enforcedUnwindCapLimit,
   moduleModes,
   moduleNames,
   moduleParameterErrors,
@@ -27,14 +27,14 @@ export default function QuotePolicySettings({
   const errors = moduleParameterErrors(
     config,
     view.vault ?? true,
-    draftUnwindCapLimit(view, config, Date.now() / 1000)
+    enforcedUnwindCapLimit(view, base.config, config, Date.now() / 1000)
   )
   return (
     <details className="border-line-soft bg-surface rounded-xl border px-4 py-3">
       <summary className="cursor-pointer text-sm font-bold">
         Shared quote policy ·{' '}
         {moduleModes.find((mode) => mode.value === view.config.mode)?.label}
-        {changed && <span className="text-warning ml-2">Unsaved</span>}
+        {changed && <span className="ml-2 text-warning">Unsaved</span>}
       </summary>
       <div className="mt-4 space-y-4">
         <p className="text-muted text-sm">

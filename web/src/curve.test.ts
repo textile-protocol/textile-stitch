@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  askFloorBinds,
   averageShade,
   bpsOver,
   cheapestUntil,
@@ -7,22 +8,20 @@ import {
   curveOverviewState,
   curveFor,
   DEFAULT_SHAPE,
+  exampleSide,
   feedPrice,
   flatPrice,
   knobLabel,
   MAX_REFERENCE_GAP_BPS,
   readsUnadjustedPrice,
   referenceTooFar,
-  liftLimitNgn,
-  profitUnwindErrors,
   shadeAt,
+  shareAfter,
   shapeLabel,
   takerPrice,
-  averageUnwindWeight,
-  unwindFullNgn,
-  unwindWeight,
   withLift,
 } from './curve'
+import { liftLimitNgn, unwindWeight } from './unwind'
 
 // The fixtures and golden values of src/pricing/curve.rs, so the Simulate
 // drawer prices exactly what the bot does.
@@ -230,43 +229,7 @@ describe('flat quote', () => {
   })
 })
 
-describe('profit unwind', () => {
-  const knobs = {
-    share: 0.5,
-    cap_ngn: 2,
-    min_gain_ngn: 0.7,
-    start_pct: 0,
-  }
-  const at = (cost: number, mid = 1380) => ({ cost, feed_mid: mid })
-
-  it('matches the spec worked example and the bot', () => {
-    // Taken in at 1386, feed 1380: the 2 NGN cap binds, and at 75% naira
-    // three quarters of it applies, about 1.5 NGN (pricing/unwind.rs pins
-    // the same).
-    const full = unwindFullNgn(knobs, at(1386))
-    expect(Math.abs(full - 2)).toBeLessThan(1e-9)
-    const lift = (start: number) => full * unwindWeight(0.75, start)
-    expect(Math.abs(lift(0) - 1.5)).toBeLessThan(1e-9)
-    expect(Math.abs(lift(50) - 1)).toBeLessThan(1e-9)
-  })
-
-  it('moves nothing on a small gain or a loss', () => {
-    expect(unwindFullNgn(knobs, at(1380.5))).toBe(0)
-    expect(unwindFullNgn(knobs, at(1374))).toBe(0)
-  })
-
-  it('starts at the start share and rises evenly', () => {
-    expect(unwindWeight(0.5, 50)).toBe(0)
-    expect(unwindWeight(0.75, 50)).toBeCloseTo(0.5, 12)
-    expect(unwindWeight(1, 50)).toBe(1)
-    // The stretch average is order-free and the point weight at zero width.
-    expect(averageUnwindWeight(0.6, 0.9, 50)).toBe(
-      averageUnwindWeight(0.9, 0.6, 50)
-    )
-    expect(averageUnwindWeight(0.8, 0.8, 50)).toBe(unwindWeight(0.8, 50))
-    expect(averageUnwindWeight(0.1, 0.4, 50)).toBe(0)
-  })
-
+describe('profit unwind on the curve', () => {
   it('lifts both sides by the weighted shade and floors the ask at the cost', () => {
     const c = curveFor(reference, ALL_IN, knobs0())!
     const up = withLift(c, { fullNgn: 1.5, startPct: 50, costNgn: MID * 2 })
@@ -322,23 +285,78 @@ describe('profit unwind', () => {
     expect(
       withLift(c, { fullNgn: NaN, startPct: 0, costNgn: MID * 2 }).lift
     ).toBe(undefined)
-    // The panel refuses a cap above the limit.
-    const base = { ...knobs, enabled: true, live: false, refresh_secs: 900 }
-    expect(profitUnwindErrors({ ...base, cap_ngn: 2 }, true, 1.1)).toHaveLength(
-      1
-    )
-    expect(profitUnwindErrors({ ...base, cap_ngn: 1 }, true, 1.1)).toEqual([])
-    expect(profitUnwindErrors({ ...base, cap_ngn: 2 }, true, null)).toEqual([])
+  })
+})
+
+describe('the Simulate example with profit unwind', () => {
+  const FEED = 1381.4
+  const plain = curveFor(reference, ALL_IN, knobs0(), ALL_IN - 1)!
+  const lifted = withLift(plain, { fullNgn: 1, startPct: 50, costNgn: 1400 })
+  const side = (over: Partial<Parameters<typeof exampleSide>[0]>) =>
+    exampleSide({
+      plain,
+      lifted,
+      unwindLive: true,
+      feed: FEED,
+      flatOnly: false,
+      share: 0.82,
+      sizeUsd: 25_000,
+      valueUsd: 300_000,
+      botBuys: false,
+      ...over,
+    })
+
+  it('splits the move off flat into the curve and profit unwind', () => {
+    for (const botBuys of [true, false]) {
+      const s = side({ botBuys })
+      expect(s.unwind!).toBeGreaterThan(0)
+      // The two rows add up to the quote's move off flat.
+      expect(s.lean! + s.unwind!).toBeCloseTo(bpsOver(s.price, s.flat!), 2)
+      // And the plain curve's lean is what the bot would quote without it.
+      const bare = side({ botBuys, lifted: null })
+      expect(bare.unwind).toBeNull()
+      expect(s.lean).toBe(bare.lean)
+      expect(s.curved).toBe(bare.price)
+    }
   })
 
-  it('needs the curve on and knobs in range', () => {
-    const base = { ...knobs, enabled: true, live: false, refresh_secs: 900 }
-    expect(profitUnwindErrors(base, true)).toEqual([])
-    expect(profitUnwindErrors(base, false)).toHaveLength(1)
-    expect(profitUnwindErrors({ ...base, share: 2 }, true)).toHaveLength(1)
-    expect(profitUnwindErrors({ ...base, start_pct: 100 }, true)).toHaveLength(
-      1
+  it('leaves a previewed lift out of the quote but still shows it', () => {
+    for (const botBuys of [true, false]) {
+      const live = side({ botBuys })
+      const preview = side({ botBuys, unwindLive: false })
+      expect(preview.price).toBe(side({ botBuys, lifted: null }).price)
+      expect(preview.unwind).toBe(live.unwind)
+    }
+  })
+
+  it('shows no curve lean while the bot quotes flat, only a flat lift', () => {
+    const s = side({ flatOnly: true })
+    expect(s.price).toBe(s.flat)
+    expect([s.lean, s.unwind]).toEqual([null, null])
+    // Quoting flat, a live lift goes on the flat price, as the bot does.
+    const lifted = side({
+      flatOnly: true,
+      flatUnwind: { unwound: 1400, price: 1400, lift: 6, atCost: false },
+    })
+    expect([lifted.price, lifted.lean, lifted.unwind]).toEqual([1400, null, 6])
+  })
+
+  it('marks a sell the cost floor holds back, and never a buy', () => {
+    // A cost just over the plain sell's order price: the lift reaches it.
+    const after = shareAfter(0.95, 25_000, 300_000, false)
+    const order = (c: typeof plain) =>
+      (takerPrice(c, false, 0.95, after) * (1 - (ALL_IN - 1) / 10_000)) /
+      (1 - ALL_IN / 10_000)
+    const costNgn = order(plain) + 0.2
+    const floored = withLift(plain, { fullNgn: 1, startPct: 0, costNgn })
+    expect(askFloorBinds(floored, 0.95, after)).toBe(true)
+    expect(side({ lifted: floored, share: 0.95 }).atCost).toBe(true)
+    expect(side({ lifted: floored, share: 0.95, botBuys: true }).atCost).toBe(
+      false
     )
+    // Far under the cost, or with no lift, nothing is held back.
+    expect(side({ share: 0.95 }).atCost).toBe(false)
+    expect(askFloorBinds(plain, 0.95, after)).toBe(false)
   })
 })
 

@@ -8,6 +8,7 @@ import {
 import {
   defaultCurve,
   defaultLiquidity,
+  defaultProfitUnwind,
   inventoryIllustration,
   moduleParameterErrors,
   volatilityIllustration,
@@ -45,6 +46,7 @@ const config = (): ModulesConfig => ({
   },
   liquidity: defaultLiquidity(),
   curve: defaultCurve(),
+  profit_unwind: defaultProfitUnwind(),
 })
 const defensive = modulePresets.find((p) => p.id === 'defensive')!
 const balanced = modulePresets.find((p) => p.id === 'balanced')!

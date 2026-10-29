@@ -539,3 +539,66 @@ export function ScheduleStrip({ schedule }: { schedule: LiquidityConfig }) {
     </div>
   )
 }
+
+/** One row of a Simulate example: a label and what each side shows. `marked`
+ * is the selected module's own row, `muted` a row that isn't in the quote
+ * (a preview), `total` the quote itself. */
+export interface ExampleRow<S> {
+  label: string
+  cell: (side: S) => string
+  marked?: boolean
+  muted?: boolean
+  total?: boolean
+}
+
+/** A Simulate example, the bot buying and selling side by side. */
+export function ExampleTable<S extends { botBuys: boolean }>({
+  sides,
+  rows,
+}: {
+  sides: S[]
+  rows: ExampleRow<S>[]
+}) {
+  return (
+    <table className="w-full text-sm tabular-nums" aria-live="polite">
+      <thead>
+        <tr className="text-muted whitespace-nowrap text-xs">
+          <th className="pb-2 text-left font-normal">
+            <span className="sr-only">Step</span>
+          </th>
+          <th className="pb-2 text-right font-normal">Bot buys</th>
+          <th className="pb-2 pl-3 text-right font-normal">Bot sells</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => (
+          <tr
+            key={row.label}
+            className={
+              row.total
+                ? 'border-line-soft border-t font-bold'
+                : row.muted
+                  ? 'text-muted'
+                  : ''
+            }
+          >
+            <th
+              scope="row"
+              className={`border-l-2 py-1.5 pl-2 pr-2 text-left ${row.marked ? 'border-accent font-bold' : 'border-transparent'} ${row.total ? 'font-bold' : 'font-normal'}`}
+            >
+              {row.label}
+            </th>
+            {sides.map((s, i) => (
+              <td
+                key={String(s.botBuys)}
+                className={`whitespace-nowrap py-1.5 text-right ${i ? 'pl-3' : ''}`}
+              >
+                {row.cell(s)}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}

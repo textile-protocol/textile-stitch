@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Textile, Inc.
 //! Profit unwind: when the feed has moved so the naira a stitch holds is worth
-//! more than it was when the stitch took it in, the inventory curve lifts by a
-//! slice of that gain. Takers bringing dollars get more naira for them, so the
-//! pile clears faster, and no ask the lift moves goes past what the naira cost.
+//! more than it was when the stitch took it in, the price lifts by a slice of
+//! that gain. Takers bringing dollars get more naira for them, so the pile
+//! clears faster, and no ask the lift moves goes past what the naira cost. It
+//! is its own module: it lifts whatever price goes out, the inventory curve's
+//! ([`crate::pricing::curve::Curve::with_lift`]) or the flat one
+//! ([`lifted_flat_price`]).
 //!
 //! # Units
 //!
@@ -20,12 +23,13 @@
 //! w(f)     = 0 at or below start, rising evenly to 1 at f = 1
 //! ```
 //!
-//! The lift stays in NGN until the curve turns it into bps against its own
-//! reference mid, the one its shades are applied to, so `cap_ngn` is the most
-//! the centre moves in NGN whatever the gap between the feed and the
-//! reference. It's a shade like the curve's own: at any one share both sides
-//! move by the same `lift(f)`, and a quote pays its mean over the stretch of
-//! share it walks ([`average_weight`]). Out and back over the same stretch integrate
+//! The lift stays in NGN until pricing turns it into bps against the mid its
+//! price is built around: the curve's reference mid, the one its shades are
+//! applied to, or the flat centre. So `cap_ngn` is the most the centre moves
+//! in NGN whatever the gap between the feed and the reference. It's a shade
+//! like the curve's own: at any one share both sides move by the same
+//! `lift(f)`, and a quote pays its mean over the stretch of share it walks
+//! ([`average_weight`]). Out and back over the same stretch integrate
 //! to the same number, so a round trip nets exactly minus the spread whatever
 //! the share does in between. The ask is then floored at the cost
 //! ([`floored_ask_ngn`]), which can only make a round trip cost more.
@@ -45,8 +49,8 @@
 //! Pulling the cost down lowers the lift, and that is a taker's one lever:
 //! drain the stitch at the full lift, sell a little back to dilute the cost,
 //! return the rest at the lower lift. [`lift_limit_ngn`] holds the full lift
-//! to what that can't beat after the round trip, and the curve applies it to
-//! every quote.
+//! to what that can't beat after the round trip, and pricing applies it to
+//! every quote, on the curve or flat.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -204,16 +208,47 @@ fn start_fraction(start_pct: f64) -> f64 {
 /// sure to cost them twice the spread: the venue's fee arrives per request,
 /// and the two legs needn't pay the same one, or any. So the full lift is held
 /// to `full * (1 - start) / 2 <= 2 * spread * mid`. `spread_bps` is the
-/// corridor spread alone, the signed order's half-width; `mid_ngn` the mid the
-/// curve applies shades to.
+/// corridor spread alone, the signed order's half-width (on flat, the smaller
+/// side's); `mid_ngn` the mid the lift is turned into bps against.
 pub fn lift_limit_ngn(spread_bps: f64, mid_ngn: f64, start_pct: f64) -> f64 {
     4.0 * (spread_bps / 10_000.0) * mid_ngn / (1.0 - start_fraction(start_pct))
+}
+
+/// Profit unwind's lift as pricing applies it: an extra shade of
+/// `full_ngn * weight(f)` on whichever price goes out (the inventory curve's,
+/// or the flat one), averaged over the stretch the quote walks, with every
+/// ask it moves floored at the cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lift {
+    /// The lift at 100% naira, NGN per USDT. Pricing turns it into bps
+    /// against the mid its price is built around.
+    pub full_ngn: f64,
+    /// Where the lift starts, percent naira share.
+    pub start_pct: f64,
+    /// The frozen average cost, NGN per USDT: no ask the lift moves goes past
+    /// it.
+    pub cost_ngn: f64,
+}
+
+impl Lift {
+    /// The lift with its full size held to `limit_ngn`
+    /// ([`lift_limit_ngn`]), or `None` when it lifts nothing: a lift of zero,
+    /// or one it can't trust.
+    pub fn held_to(self, limit_ngn: f64) -> Option<Self> {
+        // Checked before the limit: `f64::min` would turn a NaN into the limit.
+        let trusted = self.full_ngn.is_finite()
+            && self.start_pct.is_finite()
+            && self.cost_ngn.is_finite()
+            && self.cost_ngn > 0.0;
+        let full_ngn = self.full_ngn.min(limit_ngn);
+        (trusted && full_ngn > 0.0).then_some(Self { full_ngn, ..self })
+    }
 }
 
 /// The lift and what it was sized on, for pricing and the module status.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Shift {
-    /// The lift at 100% naira, NGN per USDT. At share `f` the curve lifts
+    /// The lift at 100% naira, NGN per USDT. At share `f` the price lifts
     /// by this times [`weight`].
     pub full_ngn: f64,
     /// The gain per dollar against the live feed, NGN per USDT. Negative
@@ -255,6 +290,36 @@ pub fn floored_ask_ngn(lifted: f64, plain: f64, cost_ngn: f64) -> f64 {
         return plain;
     }
     lifted.min(plain.max(cost_ngn))
+}
+
+/// A flat price with profit unwind's lift for the stretch of share
+/// `[from, to]`, debt per collateral (the bot's units), as on the curve: the
+/// full lift in bps of `mid_ngn`, the flat centre, averaged over the stretch
+/// ([`average_weight`]), raises both sides in NGN per USDT, and the ask stops
+/// at the cost ([`floored_ask_ngn`]). `flat` is the signed order's flat
+/// price for this side, and `lift` is already held to its limit
+/// ([`Lift::held_to`]). A lift of zero, or one it can't trust, leaves the
+/// flat price.
+pub fn lifted_flat_price(
+    flat: f64,
+    bid: bool,
+    lift: Lift,
+    mid_ngn: f64,
+    from: f64,
+    to: f64,
+) -> f64 {
+    let lift_bps = lift.full_ngn / mid_ngn * 10_000.0 * average_weight(from, to, lift.start_pct);
+    if !(flat.is_finite() && flat > 0.0 && lift_bps.is_finite() && lift_bps > 0.0) {
+        return flat;
+    }
+    let plain_ngn = 1.0 / flat;
+    let lifted_ngn = plain_ngn * (1.0 + lift_bps / 10_000.0);
+    let ngn = if bid {
+        lifted_ngn
+    } else {
+        floored_ask_ngn(lifted_ngn, plain_ngn, lift.cost_ngn)
+    };
+    1.0 / ngn
 }
 
 /// Whose naira a basis describes. A saved basis is picked up only by the same
@@ -534,6 +599,47 @@ mod tests {
         // No lift, no change.
         assert_eq!(floored_ask_ngn(1381.0, 1381.0, 1381.5), 1381.0);
         assert_eq!(floored_ask_ngn(1382.0, 1381.0, f64::NAN), 1381.0);
+    }
+
+    #[test]
+    fn a_flat_price_lifts_both_sides_and_its_ask_stops_at_the_cost() {
+        // Bot units: USDT per cNGN, so a lift in NGN per USDT lowers both.
+        // A 1.38 NGN full lift on a 1380 centre is 10 bps; from no start, a
+        // quote walking the top half of the share pays three quarters of it.
+        let bid = 1.0 / 1382.0;
+        let ask = 1.0 / 1379.0;
+        let lift = |cost_ngn: f64| Lift {
+            full_ngn: 1.38,
+            start_pct: 0.0,
+            cost_ngn,
+        };
+        let lifted = |p: f64, b: bool, cost: f64| {
+            1.0 / lifted_flat_price(p, b, lift(cost), 1380.0, 0.5, 1.0)
+        };
+        assert!((lifted(bid, true, 2_000.0) - 1382.0 * 1.00075).abs() < 1e-9);
+        assert!((lifted(ask, false, 2_000.0) - 1379.0 * 1.00075).abs() < 1e-9);
+        // A cost just over the ask stops it there; the bid keeps its lift.
+        assert!((lifted(ask, false, 1379.5) - 1379.5).abs() < 1e-9);
+        assert!((lifted(bid, true, 1379.5) - 1382.0 * 1.00075).abs() < 1e-9);
+        // An ask already past the cost keeps its flat price.
+        assert_eq!(
+            lifted_flat_price(ask, false, lift(1378.0), 1380.0, 0.5, 1.0),
+            ask
+        );
+        // Below the start nothing moves; no lift, or one it can't trust,
+        // leaves the flat price.
+        let start = Lift {
+            start_pct: 60.0,
+            ..lift(2_000.0)
+        };
+        assert_eq!(lifted_flat_price(ask, false, start, 1380.0, 0.2, 0.5), ask);
+        for full_ngn in [0.0, -1.0, f64::NAN] {
+            let l = Lift {
+                full_ngn,
+                ..lift(2_000.0)
+            };
+            assert_eq!(lifted_flat_price(ask, false, l, 1380.0, 0.5, 1.0), ask);
+        }
     }
 
     #[test]
