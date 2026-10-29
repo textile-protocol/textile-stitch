@@ -18,6 +18,7 @@ import {
   quoteBreakdown,
   quoteIllustration,
   quoteModeNote,
+  runnableConfig,
   runningConfigDiffers,
   scheduleByDay,
   shareBps,
@@ -867,6 +868,19 @@ describe('running config comparison', () => {
     v.status!.config = older as ModulesConfig
     expect(runningConfigDiffers(v)).toBe(false)
     v.config.liquidity.enabled = true
+    expect(runningConfigDiffers(v)).toBe(true)
+  })
+  it('expects a wallet bot to run with the vault-only modules off', () => {
+    const v = { ...view(), vault: false }
+    v.status!.config = runnableConfig(v.config, false)
+    expect(v.config.inventory.enabled).toBe(true)
+    expect(runningConfigDiffers(v)).toBe(false)
+    v.config = { ...v.config, curve: { ...v.config.curve, shape: 3 } }
+    expect(runningConfigDiffers(v)).toBe(true)
+  })
+  it('still flags a vault bot running with a module the file turns on', () => {
+    const v = view()
+    v.status!.config = runnableConfig(v.config, false)
     expect(runningConfigDiffers(v)).toBe(true)
   })
   it('does not crash the overview on an older running config', () => {

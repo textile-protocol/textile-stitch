@@ -651,18 +651,37 @@ export function liquiditySetupHint(l: LiquidityStatus): string | null {
   return null
 }
 
-/** Whether the bot runs different settings than the saved ones. Older bots
- * don't report `liquidity`; that only counts when the saved schedule is on. */
+/** The settings the bot runs from a saved config. On a wallet bot the
+ * vault-only modules stay off whatever the file says. Mirrors
+ * `ModulesConfig::runnable` in the bot. */
+export function runnableConfig(
+  c: ModulesConfig,
+  vault: boolean
+): ModulesConfig {
+  if (vault) return c
+  return {
+    ...c,
+    inventory: { ...c.inventory, enabled: false },
+    spreads: { ...c.spreads, enabled: false },
+    rebalance: { ...c.rebalance, enabled: false },
+    liquidity: { ...c.liquidity, enabled: false },
+  }
+}
+
+/** Whether the bot runs different settings than the saved ones would give it.
+ * Older bots don't report `liquidity`; that only counts when the saved
+ * schedule is on. */
 export function runningConfigDiffers(view: ModulesView): boolean {
   const running = view.status?.config
   if (!running) return false
+  const expected = runnableConfig(view.config, view.vault ?? true)
   if (running.liquidity === undefined) {
-    const { liquidity, ...saved } = view.config
+    const { liquidity, ...saved } = expected
     return (
       liquidity.enabled || JSON.stringify(saved) !== JSON.stringify(running)
     )
   }
-  return JSON.stringify(running) !== JSON.stringify(view.config)
+  return JSON.stringify(running) !== JSON.stringify(expected)
 }
 
 /** Illustrations only: the same integer rounding as the Rust strategies, with
