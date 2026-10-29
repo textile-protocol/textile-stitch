@@ -245,7 +245,7 @@ export const moduleGuides: Record<
           You decide when to sell.
         </p>
         <p className="mt-3">
-          Open Manual sale to choose an amount and minimum proceeds. Use your
+          Open this module’s Overview to choose an amount and minimum proceeds. Use your
           own wallet or invite a buyer. Each buyer reviews a fresh price and
           confirms the swap.
         </p>

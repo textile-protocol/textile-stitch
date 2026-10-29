@@ -23,7 +23,7 @@ function useWidth(fallback: number) {
   return [ref, width] as const
 }
 
-const ngn = (n: number) =>
+const priceText = (n: number) =>
   n.toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
@@ -51,6 +51,7 @@ export default function CurveChart({
   curve,
   halfRangeBps,
   currency,
+  settlement,
   holder,
   marker,
   stretches,
@@ -58,6 +59,7 @@ export default function CurveChart({
   curve: Curve
   halfRangeBps: number
   currency: string
+  settlement: string
   /** What holds the inventory: the bot's wallet, or its vault. */
   holder: 'wallet' | 'vault'
   /** The share to mark, 0..1, and what it is: the wallet now, or the example. */
@@ -144,7 +146,7 @@ export default function CurveChart({
           height={H}
           className="text-muted block overflow-visible"
           role="img"
-          aria-label={`At no ${currency} the bot buys at ${ngn(at(true, 0))} and sells at ${ngn(at(false, 0))} NGN per USDT; full of ${currency} it buys at ${ngn(at(true, 1))} and sells at ${ngn(at(false, 1))}.`}
+          aria-label={`At no ${currency} the bot buys at ${priceText(at(true, 0))} and sells at ${priceText(at(false, 0))} ${currency} per ${settlement}; full of ${currency} it buys at ${priceText(at(true, 1))} and sells at ${priceText(at(false, 1))}.`}
         >
           {ticks(lo, hi).map((t) => (
             <g key={t}>
@@ -162,7 +164,7 @@ export default function CurveChart({
                 textAnchor="end"
                 className="fill-current text-[11px] tabular-nums"
               >
-                {ngn(t)}
+                {priceText(t)}
               </text>
             </g>
           ))}
@@ -291,7 +293,7 @@ export default function CurveChart({
                 />
                 {s.label}{' '}
                 <span className="text-ink ml-auto pl-3">
-                  {ngn(at(s.botBuys, hover))}
+                  {priceText(at(s.botBuys, hover))}
                 </span>
               </p>
             ))}
@@ -299,9 +301,10 @@ export default function CurveChart({
         )}
       </div>
       <p className="text-muted text-xs leading-relaxed">
-        NGN per USDT, venue fee included. Both prices rise as the {holder} fills
-        with {currency}: the bot asks more naira for the dollars it pays and
-        gives more for the dollars it takes, so it sheds {currency}.
+        {currency} per {settlement}, venue fee included. Both prices rise as the{' '}
+        {holder} fills with {currency}: the bot asks more {currency} for the{' '}
+        {settlement} it pays and gives more for the {settlement} it takes, so it
+        sheds {currency}.
       </p>
     </figure>
   )

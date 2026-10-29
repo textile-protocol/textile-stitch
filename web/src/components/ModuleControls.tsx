@@ -15,13 +15,16 @@ export function Disclosure({
   title,
   children,
   className = '',
+  open,
 }: {
   title: string
   children: ReactNode
   className?: string
+  open?: boolean
 }) {
   return (
     <details
+      open={open}
       className={`border-line-soft bg-surface group rounded-xl border ${className}`}
     >
       <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-4 text-sm font-bold [&::-webkit-details-marker]:hidden">
@@ -327,7 +330,9 @@ export function NumberControl({
           <input
             type="range"
             aria-label={`${label} slider`}
-            aria-valuetext={valid ? `${typed(value)}${suffix}` : 'Choose a value'}
+            aria-valuetext={
+              valid ? `${typed(value)}${suffix}` : 'Choose a value'
+            }
             min={start}
             max={end}
             step={step}

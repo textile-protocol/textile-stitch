@@ -1,9 +1,7 @@
 import { curveOverviewState, freshReading } from '../curve'
 import { type ModulesView } from '../modules'
 import {
-  moduleNames,
   moduleOverviewState,
-  modulesFor,
   percentage,
   runningConfigDiffers,
   type ModuleKey,
@@ -15,29 +13,28 @@ import LiquidityScheduleLive from './LiquidityScheduleLive'
 import { Button, Card } from './ui'
 
 export default function ModulesOverview({
+  selected,
   view,
   now,
   currency,
   settlement,
-  onConfigure,
   onDecisions,
 }: {
+  selected: ModuleKey
   view: ModulesView
   now: number
   currency: string
   settlement: string
-  onConfigure: (key: ModuleKey) => void
   onDecisions: () => void
 }) {
   // Older panels only served vault bots.
-  if (!(view.vault ?? true))
+  if (selected === 'curve')
     return (
-      <WalletOverview
+      <CurveOverview
         view={view}
         now={now}
         currency={currency}
         settlement={settlement}
-        onConfigure={onConfigure}
         onDecisions={onDecisions}
       />
     )
@@ -49,16 +46,15 @@ export default function ModulesOverview({
   const margins = current && !current.blocked
   const shadow = config.mode === 'shadow'
   const differs = runningConfigDiffers(view)
-  const descriptions: Record<ModuleKey, string> = {
-    inventory: `Keep ${currency} holdings near your target.`,
-    spreads: 'Adjust quote margins as market prices move.',
-    rebalance: `Sell excess ${currency} to your wallet or an invited buyer.`,
-    liquidity: `Keep more ${settlement} liquid in market hours; let more earn yield in Aave off-hours.`,
-    curve: `Lean Swap quotes on the vault's ${currency} share, priced across each trade.`,
-  }
+  if (selected === 'spreads')
+    return <DynamicSpreadsLive view={view} now={now} />
+  if (selected === 'liquidity')
+    return (
+      <LiquidityScheduleLive view={view} now={now} settlement={settlement} />
+    )
   return (
     <div className="space-y-4">
-      <Card>
+      <Card className="!rounded-none !border-0 !p-0">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p className="text-muted mb-2 text-xs font-bold uppercase tracking-wider">
@@ -156,61 +152,6 @@ export default function ModulesOverview({
           does not add these readings.
         </p>
       )}
-      <Card
-        title="Your modules"
-        action={<span className="text-muted text-xs">Saved settings</span>}
-      >
-        <div className="divide-line-soft divide-y">
-          {modulesFor(true).map((key, i) => (
-            <button
-              key={key}
-              onClick={() => onConfigure(key)}
-              className="hover:bg-canvas flex w-full items-center gap-4 rounded-lg py-4 text-left transition first:pt-1 last:pb-1"
-            >
-              <span
-                aria-hidden
-                className="bg-accent-tint flex size-9 shrink-0 items-center justify-center rounded-lg text-sm font-bold text-accent"
-              >
-                0{i + 1}
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block text-sm font-bold">
-                  {moduleNames[key]}
-                </span>
-                <span className="text-muted mt-1 block text-xs">
-                  {descriptions[key]}
-                </span>
-              </span>
-              <span
-                className={`rounded-full px-2.5 py-1 text-xs ${view.config[key].enabled ? 'bg-accent-tint text-accent' : 'bg-hover text-muted'}`}
-              >
-                {view.config[key].enabled ? 'Enabled' : 'Off'}
-              </span>
-              <span aria-hidden className="text-muted">
-                ›
-              </span>
-            </button>
-          ))}
-        </div>
-        {config.rebalance.enabled && state.current && (
-          <p className="border-line-soft text-muted mt-4 border-t pt-3 text-sm">
-            Spot rebalancing: {view.status?.rebalance_status}
-          </p>
-        )}
-      </Card>
-      {view.config.curve.enabled && (
-        <Card title="Inventory curve">
-          <CurveNow
-            view={view}
-            now={now}
-            currency={currency}
-            settlement={settlement}
-          />
-        </Card>
-      )}
-      {(view.config.liquidity?.enabled || view.status?.liquidity) && (
-        <LiquidityScheduleLive view={view} now={now} settlement={settlement} />
-      )}
       <Disclosure title="Details & recent activity">
         <div className="space-y-4">
           <DynamicSpreadsLive view={view} now={now} />
@@ -239,38 +180,39 @@ export default function ModulesOverview({
   )
 }
 
-/** The Overview of a bot that trades from its own wallet: its one module is
- * the inventory curve, so the page is the curve's. */
-function WalletOverview({
+/** Curve monitoring for both wallet- and vault-funded bots. */
+function CurveOverview({
   view,
   now,
   currency,
   settlement,
-  onConfigure,
   onDecisions,
 }: {
   view: ModulesView
   now: number
   currency: string
   settlement: string
-  onConfigure: (key: ModuleKey) => void
   onDecisions: () => void
 }) {
+  const vault = view.vault ?? true
   const state = curveOverviewState(view, now)
   const reading = freshReading(view.status?.curve, now)
   const quotes = view.status?.curve?.quotes ?? []
   const flat = quotes.filter((q) => q.flat_reason !== null).length
-  const on = view.config.curve.enabled
   return (
     <div className="space-y-4">
-      <Card>
+      <Card className="!rounded-none !border-0 !p-0">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p className="text-muted mb-2 text-xs font-bold uppercase tracking-wider">
               Right now
             </p>
             <h3 className="text-xl font-bold">{state.title}</h3>
-            <p className="text-muted mt-2 max-w-xl text-sm">{state.message}</p>
+            <p className="text-muted mt-2 max-w-xl text-sm">
+              {vault
+                ? state.message.replace('this wallet', 'this vault')
+                : state.message}
+            </p>
           </div>
           <span className="bg-hover rounded-full px-3 py-1 text-xs font-bold">
             {state.pill}
@@ -278,43 +220,12 @@ function WalletOverview({
         </div>
         <div className="border-line-soft mt-6 border-t pt-6">
           <CurveNow
-            view={view}
+            view={{ ...view, vault }}
             now={now}
             currency={currency}
             settlement={settlement}
           />
         </div>
-      </Card>
-      <Card
-        title="Your modules"
-        action={<span className="text-muted text-xs">Saved settings</span>}
-      >
-        <button
-          onClick={() => onConfigure('curve')}
-          className="hover:bg-canvas flex w-full items-center gap-4 rounded-lg py-1 text-left transition"
-        >
-          <span
-            aria-hidden
-            className="bg-accent-tint flex size-9 shrink-0 items-center justify-center rounded-lg text-sm font-bold text-accent"
-          >
-            01
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block text-sm font-bold">{moduleNames.curve}</span>
-            <span className="text-muted mt-1 block text-xs">
-              Lean Swap quotes on this wallet&apos;s {currency} share, priced
-              across each trade.
-            </span>
-          </span>
-          <span
-            className={`rounded-full px-2.5 py-1 text-xs ${on ? 'bg-accent-tint text-accent' : 'bg-hover text-muted'}`}
-          >
-            {on ? 'Enabled' : 'Off'}
-          </span>
-          <span aria-hidden className="text-muted">
-            ›
-          </span>
-        </button>
       </Card>
       <Disclosure title="Details & recent activity">
         <div className="space-y-4 text-sm">
@@ -328,13 +239,19 @@ function WalletOverview({
                     : '—',
                 ],
                 [
-                  'Wallet value',
+                  vault ? 'Vault value' : 'Wallet value',
                   reading
                     ? `${reading.value.toLocaleString(undefined, { maximumFractionDigits: 0 })} ${settlement}`
                     : '—',
                 ],
-                ['Venue fee, last request', reading ? `${reading.fee_bps} bps` : '—'],
-                ['Answered flat', quotes.length ? `${flat} of the last ${quotes.length}` : '—'],
+                [
+                  'Venue fee, last request',
+                  reading ? `${reading.fee_bps} bps` : '—',
+                ],
+                [
+                  'Answered flat',
+                  quotes.length ? `${flat} of the last ${quotes.length}` : '—',
+                ],
               ] as const
             ).map(([label, value]) => (
               <div key={label}>
@@ -344,9 +261,11 @@ function WalletOverview({
             ))}
           </dl>
           <p className="text-muted text-xs">
-            Holdings are this wallet&apos;s raw balances valued at the reference
-            mid, with this side&apos;s open quotes counted as already moved.
-            Quotes are calculations, not completed trades.
+            {vault
+              ? 'Holdings use the vault’s free balances and existing NAV valuation.'
+              : 'Holdings use this wallet’s raw balances valued at the reference mid.'}{' '}
+            This side’s open quotes count as already moved. Quotes are
+            calculations, not completed trades.
           </p>
           <Button onClick={onDecisions}>Open quote history</Button>
         </div>

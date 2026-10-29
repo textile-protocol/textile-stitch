@@ -1,4 +1,5 @@
 import { PerpsFeature } from './PerpsFeature'
+import type { PerpsState } from '../usePerps'
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
@@ -47,9 +48,11 @@ import {
 export default function SettingsForm({
   bot,
   onSaved,
+  perps,
 }: {
   bot: Bot
   onSaved: (message: string) => void
+  perps: PerpsState
 }) {
   const [loaded, setLoaded] = useState<Settings | null>(null)
   const [draft, setDraft] = useState<Settings | null>(null)
@@ -320,7 +323,7 @@ export default function SettingsForm({
             }}
           />
         )}
-        <PerpsFeature key={bot.name} bot={bot} dirty={dirty} />
+        <PerpsFeature key={bot.name} bot={bot} dirty={dirty} perps={perps} />
       </ExperimentalCard>
 
 
@@ -1033,7 +1036,7 @@ function ModulesSubsection({
       ? [
           `Turn off modules for ${name}?`,
           '',
-          `Quotes go back to your corridor spreads and the Modules tab is hidden. Module settings stay in stitch.toml, and orders already signed stay valid until they expire.${restart}`,
+          `Quotes go back to your corridor spreads. FX hedge settings are unchanged. Quote module settings stay in stitch.toml, and orders already signed stay valid until they expire.${restart}`,
         ]
       : [
           `Turn on modules for ${name}?`,
@@ -1130,8 +1133,8 @@ function CurveSubsection({
 }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // On a wallet bot the module flag is the curve's: it is the one module
-  // that runs there, and turning modules on turns it on.
+  // On a wallet bot this quote-policy flag enables the curve. The hedge has
+  // its own independent flag and keeps the Modules tab available when needed.
   const on = settings.modulesEnabled
   const blockers = on ? [] : settings.modulesBlockers
   const turnsOff = on ? [] : settings.modulesTurnsOff
@@ -1143,7 +1146,7 @@ function CurveSubsection({
       ? [
           `Turn off the inventory curve for ${name}?`,
           '',
-          `Swap quotes go back to your corridor spread and the Modules tab is hidden. Its settings stay in stitch.toml, and orders already signed stay valid until they expire.${restart}`,
+          `Swap quotes go back to your corridor spread. FX hedge settings are unchanged. Curve settings stay in stitch.toml, and orders already signed stay valid until they expire.${restart}`,
         ]
       : [
           `Turn on the inventory curve for ${name}?`,
@@ -1173,7 +1176,7 @@ function CurveSubsection({
   return (
     <ExperimentalSubsection
       title="Inventory curve"
-      description="Leans Swap quotes on this wallet's own share of the corridor currency, so a wallet filling up with it quotes to shed it. Each quote pays the average lean across the holdings it moves, so a round trip always costs the taker the spread. The one module that runs without a vault; on a vault it sits beside the other FX protection modules."
+      description="Leans Swap quotes on this wallet's own share of the corridor currency, so a wallet filling up with it quotes to shed it. Each quote pays the average lean across the holdings it moves, so a round trip always costs the taker the spread. Works alongside FX hedging, with separate enable and mode controls."
     >
       <div className="space-y-3">
         <p className="text-sm">

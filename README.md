@@ -21,6 +21,8 @@ Stitch quotes Swap by default, plus an optional second job:
 
 First-party FX protection modules are available behind `modules_enabled = true` in `stitch.toml`. See [module configuration and spot rebalancing](docs/modules.md).
 
+Assigned bots can also opt into the [FX hedge module](docs/fx-hedge.md) from Corridors → Experimental. It shows inventory, short exposure and pending recalls, with Preview, Live and Off controls.
+
 Every change to a spread, size cap, the price guard or a feed setting is recorded in `change-log.jsonl` next to `stitch.toml`, including edits made outside the panel. Nothing leaves the machine unless `[change_log] ship = true`. See [the parameter change log](docs/parameter-change-log.md).
 
 Optionally, a bot can register itself in the public ERC-8004 agent registry on its chain from Tools in the panel, or with `stitch register`. See [ERC-8004 agent identity](docs/erc8004.md).

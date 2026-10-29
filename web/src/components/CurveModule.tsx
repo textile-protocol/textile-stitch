@@ -24,7 +24,7 @@ import { Banner, Card, Select } from './ui'
 // it shows comes from the module view the vault modules use; the curve maths
 // is `curve.ts`, pinned to the bot's.
 
-const ngn = (n: number) =>
+const priceText = (n: number) =>
   n.toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
@@ -111,6 +111,7 @@ export function CurveFields({
           curve={curve}
           halfRangeBps={reading.half_range_bps}
           currency={currency}
+          settlement={settlement}
           holder={view.vault ? 'vault' : 'wallet'}
           marker={marker}
           stretches={
@@ -136,7 +137,7 @@ export function CurveFields({
       )}
       <NumberControl
         label="Start below the mid"
-        unit="NGN"
+        unit={`${currency}/${settlement}`}
         scale={1}
         min={-MAX_OFFSET}
         max={MAX_OFFSET}
@@ -150,7 +151,7 @@ export function CurveFields({
       />
       <NumberControl
         label="End above the reference buy"
-        unit="NGN"
+        unit={`${currency}/${settlement}`}
         scale={1}
         min={-MAX_OFFSET}
         max={MAX_OFFSET}
@@ -209,6 +210,7 @@ export function CurveExample({
   view,
   now,
   currency,
+  settlement,
   example,
   onExample,
 }: {
@@ -216,6 +218,7 @@ export function CurveExample({
   view: ModulesView
   now: number
   currency: string
+  settlement: string
   example: { share: number; sizeUsd: number }
   onExample: (example: { share: number; sizeUsd: number }) => void
 }) {
@@ -240,9 +243,9 @@ export function CurveExample({
   })
   type Side = (typeof sides)[number]
   const rows: [string, (s: Side) => string, boolean][] = [
-    ['Flat quote', (s) => ngn(s.flat), false],
+    ['Flat quote', (s) => priceText(s.flat), false],
     ['Curve lean', (s) => signedBps(s.lean), true],
-    ['Quote', (s) => ngn(s.price), false],
+    ['Quote', (s) => priceText(s.price), false],
     [`${currency} after`, (s) => share(s.after), false],
   ]
   return (
@@ -284,9 +287,9 @@ export function CurveExample({
         </tbody>
       </table>
       <p className="text-muted text-xs leading-relaxed">
-        NGN per USDT, all-in. Priced across the holdings this trade moves
-        through, so splitting it into smaller quotes costs the same, and a round
-        trip always costs the taker the spread.
+        {currency} per {settlement}, all-in. Priced across the holdings this
+        trade moves through, so splitting it into smaller quotes costs the same,
+        and a round trip always costs the taker the spread.
       </p>
       <p className="text-muted text-xs leading-relaxed">
         {draft.mode === 'live'
@@ -418,7 +421,7 @@ export function CurveNow({
             <div key={q.label}>
               <p className="text-muted text-xs">{q.label}</p>
               <p className="mt-1 text-2xl font-bold tabular-nums">
-                {q.price === null ? '—' : ngn(q.price)}
+                {q.price === null ? '—' : priceText(q.price)}
               </p>
               {q.vsMid !== null && (
                 <p className="text-muted text-xs tabular-nums">
@@ -429,13 +432,13 @@ export function CurveNow({
           ))}
         </div>
         <p className="text-muted text-sm">
-          NGN per USDT, venue fee included, off the reference mid. Larger trades
-          pay the average across the holdings they move.
+          {currency} per {settlement}, venue fee included, off the reference
+          mid. Larger trades pay the average across the holdings they move.
         </p>
         {quotes_.length > 0 && flat / quotes_.length >= 0.1 && (
           <p className="bg-warning-bg mt-4 rounded-lg p-3 text-sm text-warning">
             {flat} of the last {quotes_.length} quotes went out flat. The curve
-            doesn&apos;t lean on those; Decisions says why.
+            doesn&apos;t lean on those; Activity says why.
           </p>
         )}
       </div>
@@ -462,7 +465,8 @@ export function CurveQuotes({
       <p className="text-muted mb-3 text-sm">
         Every Swap request the curve priced or answered flat, newest first. In
         Preview these are what it would have quoted. The lean is against the
-        flat quote in NGN per USDT: positive means more naira per dollar.
+        flat quote in {currency} per {settlement}: positive means more{' '}
+        {currency} per {settlement}.
       </p>
       <Select
         aria-label="Filter curve quotes"

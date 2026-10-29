@@ -99,12 +99,12 @@ const shownSeconds = (v: unknown) =>
     : '—'
 const shownSwitch = (v: unknown) => (v ? 'On' : 'Off')
 const shownText = (v: unknown) => (typeof v === 'string' && v ? v : '—')
-const shownNgn = (v: unknown) =>
+const shownPriceOffset = (v: unknown, unit: string) =>
   typeof v === 'number' && Number.isFinite(v)
-    ? `${v.toLocaleString(undefined, { maximumFractionDigits: 2 })} NGN`
+    ? `${v.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`
     : '—'
 
-/** The two settings that define each module, shown on its strategy row. */
+/** The two settings that define each module, shown in the module library. */
 export function moduleKeyFigures(
   c: ModulesConfig,
   key: ModuleKey
@@ -144,7 +144,7 @@ export function moduleKeyFigures(
 const editableSettings: readonly [
   string,
   (c: ModulesConfig) => unknown,
-  (v: unknown) => string,
+  (v: unknown, priceUnit: string) => string,
 ][] = [
   [
     'Run mode',
@@ -212,8 +212,12 @@ const editableSettings: readonly [
   ['Role key', (c) => c.liquidity.authority?.role_key ?? '', shownText],
   ['Ignore gaps smaller than', (c) => c.liquidity.tolerance_bps, shownPercent],
   ['Inventory curve', (c) => c.curve.enabled, shownSwitch],
-  ['Start below the mid', (c) => c.curve.start_below_mid, shownNgn],
-  ['End above the reference buy', (c) => c.curve.end_above_buy, shownNgn],
+  ['Start below the mid', (c) => c.curve.start_below_mid, shownPriceOffset],
+  [
+    'End above the reference buy',
+    (c) => c.curve.end_above_buy,
+    shownPriceOffset,
+  ],
   ['Curve shape', (c) => c.curve.shape, (v) => shapeLabel(Number(v))],
 ]
 
@@ -221,14 +225,15 @@ const editableSettings: readonly [
  * (NaN) counts as one change, not a change on every render. */
 export const moduleChanges = (
   saved: ModulesConfig,
-  draft: ModulesConfig
+  draft: ModulesConfig,
+  priceUnit = 'corridor units'
 ): { label: string; from: string; to: string }[] =>
   editableSettings
     .filter(([, read]) => !Object.is(read(saved), read(draft)))
     .map(([label, read, show]) => ({
       label,
-      from: show(read(saved)),
-      to: show(read(draft)),
+      from: show(read(saved), priceUnit),
+      to: show(read(draft), priceUnit),
     }))
 
 /** UI validation mirrors the numeric config constraints. The server remains
@@ -940,7 +945,7 @@ export function moduleOverviewState(view: ModulesView, now: number) {
   if (!moduleKeys.some((key) => c[key]?.enabled))
     return {
       title: 'No modules enabled',
-      message: 'Turn on a module in Parameters to adjust the bot’s behavior.',
+      message: 'Turn on a module in Settings to adjust the bot’s behavior.',
       current: true,
     }
   if (d && c.spreads.enabled && isWarmingUp(d))

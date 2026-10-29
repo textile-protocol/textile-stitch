@@ -3,7 +3,7 @@ import { Button } from './ui'
 /** One setting saving would change, as the bar lists it. */
 export type SettingChange = { label: string; from: string; to: string }
 
-/** Sticky save controls for a module's Parameters. Quiet while the draft
+/** Sticky save controls for a module's Settings. Quiet while the draft
  * matches the saved config; once it differs, lists each change as saved →
  * draft so a preset's changes to secondary settings are visible before
  * saving. The caller works out what changed; the bar only shows it. */

@@ -595,6 +595,16 @@ describe('strategy rows and the save bar', () => {
       },
     ])
   })
+  it.each(['IDRX per USDT', 'cNGN per USDT', 'wBRL per USDC'])(
+    'shows curve offset changes in %s without converting the saved value',
+    (unit) => {
+      const saved = config()
+      const draft = { ...saved, curve: { ...saved.curve, start_below_mid: 2 } }
+      expect(moduleChanges(saved, draft, unit)).toEqual([
+        { label: 'Start below the mid', from: `0 ${unit}`, to: `2 ${unit}` },
+      ])
+    }
+  )
 })
 
 const ROLES = '0x' + 'ab'.repeat(20)

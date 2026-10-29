@@ -1,4 +1,6 @@
-import ModulesPanel from '../components/ModulesPanel'
+import BotModules from '../components/BotModules'
+import { usePerps } from '../usePerps'
+import { visibleBotModules } from '../moduleWorkspace'
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { BOT_TABS, TAB_LABEL, botLabel, botPath, parseBotTab, type BotTab } from '../botRoutes'
@@ -42,7 +44,15 @@ export default function BotDetail() {
   const { name = '' } = useParams()
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
+  const perps = usePerps(name)
   const [bot, setBot] = useState<Bot | null>(null)
+  const visibleModules = visibleBotModules({
+    quoteModulesEnabled: bot?.config?.modulesEnabled ?? false,
+    hedge: perps.view,
+    hedgeUnavailable: Boolean(perps.error),
+    hedgeSetup: searchParams.get('hedge') === 'setup',
+  }, Date.now())
+  const hedgeVisible = visibleModules.includes('hedge')
   // The wallet's balances, priced. Owned here rather than by the Funds tab
   // because the header shows the total on every tab, and one poll is enough
   // for both.
@@ -66,7 +76,7 @@ export default function BotDetail() {
   // Tab lives in `?tab=` so switching bots from the title keeps the same section.
   const fallbackTab: BotTab = handoff?.needsPermit2 ? 'tools' : 'funds'
   const requestedTab = parseBotTab(searchParams.get('tab'), fallbackTab)
-  const tab = requestedTab === 'modules' && bot && !bot.config?.modulesEnabled ? fallbackTab : requestedTab
+  const tab = requestedTab === 'modules' && bot && !visibleModules.length && !perps.loading ? fallbackTab : requestedTab
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
 
   useEffect(() => {
@@ -277,7 +287,7 @@ export default function BotDetail() {
         {/* The number an operator opens this page for. Everything in the
             wallet, in dollars, large, before any button. */}
         <div className="mb-4">
-          <p className="text-xs uppercase tracking-wide text-faint">Total value</p>
+          <p className="text-xs uppercase tracking-wide text-faint">{hedgeVisible ? (vaultFunded ? 'Vault and signer value' : 'Wallet value') : 'Total value'}</p>
           <TotalValue funding={funding} />
           {/* What holds it, right under the number: the address an operator
               copies most, so it does not live in a grid cell. For a vault
@@ -417,7 +427,7 @@ export default function BotDetail() {
           className="flex flex-nowrap gap-x-0.5 overflow-x-auto overflow-y-hidden overscroll-x-contain [touch-action:pan-x_pan-y] border-b border-line-soft [scrollbar-width:none] [-ms-overflow-style:none] sm:gap-x-1 [&::-webkit-scrollbar]:hidden"
           aria-label="Bot sections"
         >
-          {BOT_TABS.filter((t) => t !== 'modules' || bot.config?.modulesEnabled).map((t) => (
+          {BOT_TABS.filter((t) => t !== 'modules' || visibleModules.length > 0).map((t) => (
             <Link
               key={t}
               to={botPath(name, t)}
@@ -439,12 +449,13 @@ export default function BotDetail() {
         />
       </div>
 
-      {tab === 'modules' && bot.config?.modulesEnabled && <ModulesPanel key={name} name={name} editable={bot.editable} pair={bot.config.pairs[0]} />}
+      <BotModules key={name} ids={visibleModules} tab={tab} bot={bot} perps={perps} funding={funding} />
 
       {tab === 'settings' &&
         (bot.editable ? (
           <SettingsForm
             bot={bot}
+            perps={perps}
             onSaved={(message) => {
               setNote(message)
               void load()

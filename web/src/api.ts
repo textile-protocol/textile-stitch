@@ -174,17 +174,25 @@ export interface DesktopSwitches {
 export interface RecallFleetView {
   enabled: boolean
   liveLimitsConfigured: boolean
+  executionEnabled?: boolean
   reservedCollateralAtoms: string
   reservedLiquidAtoms: string
   manifest: {
-    assets: { collateral: { decimals: number } }
-    limits: { feeHeadroomAtoms: string } | null
+    assets: { collateral: { address: string; decimals: number } }
+    limits: {
+      feeHeadroomAtoms: string
+      shortUsd30?: string
+      capitalAtoms?: string
+    } | null
   }
   position: null | {
     liquidAtoms: string
+    marginIdleAtoms?: string
     collateralAtoms: string
     recallableAtoms: string
     shortTokens: string
+    shortSizeUsd30?: string
+    observedAt?: string | null
     pauseReason: string | null
   }
   operations: {
@@ -194,26 +202,43 @@ export interface RecallFleetView {
     preparationWei: string
     failureReason: string | null
     cancelAfter: string | null
+    releasedAt?: string | null
   }[]
+}
+export type HedgeMode = 'off' | 'preview' | 'live'
+export interface PerpsView {
+  enabled: boolean
+  recallEnabled: boolean
+  fundingTargetAtoms: string
+  assignmentId: string
+  unavailable: boolean
+  remote: null | {
+    control: null | { mode: string }
+    effectiveMode: string
+    recall?: RecallFleetView | null
+    monitoring?: {
+      hasFunds: boolean
+      observedAt: string | null
+      pendingQuotes: number
+      pendingActions: number
+      inventoryOperations: {
+        id: string
+        kind: string
+        state: string
+        createdAt: string
+        completedAt: string | null
+        failureReason: string | null
+      }[]
+    }
+  }
 }
 export const api = {
   perps: (name: string) =>
-    request<{
-      enabled: boolean
-      recallEnabled: boolean
-      fundingTargetAtoms: string
-      assignmentId: string
-      unavailable: boolean
-      remote: null | {
-        control: null | { mode: string }
-        effectiveMode: string
-        recall?: RecallFleetView | null
-      }
-    }>(`/api/bots/${encodeURIComponent(name)}/perps`),
+    request<PerpsView>(`/api/bots/${encodeURIComponent(name)}/perps`),
   setPerps: (
     name: string,
     assignmentId: string,
-    mode: string,
+    mode: HedgeMode,
     recallEnabled = false,
     fundingTargetAtoms = ''
   ) =>
@@ -265,7 +290,10 @@ export const api = {
 
   session: () => request<SessionInfo>('/api/session'),
   setPanelPassword: (password: string, confirmation: string) =>
-    request<SessionInfo>('/api/panel/password', json({ password, confirmation })),
+    request<SessionInfo>(
+      '/api/panel/password',
+      json({ password, confirmation })
+    ),
   login: (password: string) =>
     request<SessionInfo>('/api/login', json({ password })),
   logout: () => request<unknown>('/api/logout', { method: 'POST' }),
@@ -485,13 +513,13 @@ export const api = {
   registerViaCustody: (name: string, profile: AgentProfile) =>
     request<AgentIdentity>(
       `/api/bots/${encodeURIComponent(name)}/identity/register/custody`,
-      json(profile),
+      json(profile)
     ),
   /** Record an agent id the wallet owns. The panel checks `ownerOf` first. */
   linkIdentity: (name: string, agentId: string) =>
     request<AgentIdentity>(
       `/api/bots/${encodeURIComponent(name)}/identity/link`,
-      json({ agentId }),
+      json({ agentId })
     ),
 
   /**

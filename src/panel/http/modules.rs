@@ -227,7 +227,7 @@ pub async fn set_enabled(
         }
     }
     let note = match (body.enabled, turned_off.is_empty()) {
-        (false, _) => "The Modules tab is hidden. Its settings stay in stitch.toml for when you turn modules back on.".to_string(),
+        (false, _) => "Quote modules are off. Their settings stay in stitch.toml; FX hedge settings are unchanged.".to_string(),
         (true, true) => "Modules start in Preview: they record what they would do without changing quotes. Configure them in the Modules tab.".to_string(),
         (true, false) => format!(
             "Modules start in Preview: they record what they would do without changing quotes. Configure them in the Modules tab. Turned off, since modules can't run alongside: {}.",
@@ -696,6 +696,126 @@ mod tests {
         assert_eq!(saved.modules.mode, crate::modules::Mode::Shadow);
         // The vault modules keep their file values but don't run here.
         assert!(!saved.modules.runnable(false).inventory.enabled);
+    }
+
+    fn seed_idrx_with_hedge(h: &Harness) -> std::path::PathBuf {
+        let path = seed_wallet_bot(h);
+        let mut doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["chain_id"] = toml_edit::value(42220);
+        doc["rpc_url"] = toml_edit::value("http://127.0.0.1:1");
+        doc["indexer_url"] = toml_edit::value("http://127.0.0.1:1");
+        doc["feed"]["url"] = toml_edit::value("http://127.0.0.1:1/price?pair=idrx-usdt");
+        doc["rfq"]["url"] = toml_edit::value("ws://127.0.0.1:1/v2/maker/stream");
+        let pool = doc["pools"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .get_mut(0)
+            .unwrap();
+        pool["collateral"] = toml_edit::value("0x18bc5bcc660cf2b9ce3cd51a404afe1a0cbd3c22");
+        pool["collateral_decimals"] = toml_edit::value(2);
+        pool["debt"] = toml_edit::value("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e");
+        pool["debt_decimals"] = toml_edit::value(6);
+        let raw = format!("{doc}\n[perps]\nenabled = true\nrecall_enabled = true\n\
+            assignment_id = \"idrx-fleet-production-1\"\nbot_id = \"stitch-celo-2\"\n\
+            revision = \"00000000-0000-0000-0000-000000000001\"\nfunding_target_atoms = \"25000000\"\n");
+        Config::from_toml(&raw).expect("valid Celo IDRX config with hedge authorization");
+        std::fs::write(&path, raw).unwrap();
+        path
+    }
+
+    fn saved_table(path: &std::path::Path, key: &str) -> toml::Value {
+        toml::from_str::<toml::Value>(&std::fs::read_to_string(path).unwrap()).unwrap()[key].clone()
+    }
+
+    #[tokio::test]
+    async fn idrx_curve_enable_edit_and_disable_preserve_hedge_authorization() {
+        let h = harness("idrx-curve-with-hedge");
+        let path = seed_idrx_with_hedge(&h);
+        let hedge = saved_table(&path, "perps");
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules/enabled",
+                serde_json::json!({"enabled": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(saved_table(&path, "perps"), hedge);
+        let (_, body) = h.get("/api/bots/bot-a/modules").await;
+        let view = Harness::parse(&body);
+        assert_eq!(view["corridor_decimals"], 2);
+        assert_eq!(view["settlement_decimals"], 6);
+        assert_eq!(view["config"]["curve"]["enabled"], true);
+        let mut curve = view["config"].clone();
+        curve["mode"] = serde_json::json!("live");
+        curve["curve"]["shape"] = serde_json::json!(3.0);
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules",
+                serde_json::json!({"revision": view["revision"], "config": curve}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(saved_table(&path, "perps"), hedge);
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules/enabled",
+                serde_json::json!({"enabled": false}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(saved_table(&path, "perps"), hedge);
+        assert_eq!(
+            saved_table(&path, "modules")["curve"]["shape"].as_float(),
+            Some(3.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn idrx_hedge_off_preserves_the_curve_and_refuses_stale_quote_settings() {
+        let h = harness("idrx-hedge-with-curve");
+        let path = seed_idrx_with_hedge(&h);
+        let raw = with_modules_flag(&std::fs::read_to_string(&path).unwrap(), true).unwrap();
+        let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+        doc["modules"]["mode"] = toml_edit::value("live");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let curve = saved_table(&path, "modules");
+        let (_, body) = h.get("/api/bots/bot-a/modules").await;
+        let old_view = Harness::parse(&body);
+        // The venue is unavailable; local Off still saves under the shared
+        // config lock and must not touch a different module's settings.
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/perps",
+                serde_json::json!({
+                    "assignmentId": "idrx-fleet-production-1", "mode": "off"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved = Config::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!saved.perps.unwrap().enabled);
+        assert!(saved.modules_enabled && saved.modules.curve.enabled);
+        assert_eq!(saved.modules.mode, crate::modules::Mode::Live);
+        assert_eq!(saved_table(&path, "modules"), curve);
+        let (status, _) = h
+            .put_json(
+                "/api/bots/bot-a/modules",
+                serde_json::json!({
+                    "revision": old_view["revision"], "config": old_view["config"]
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            !Config::from_toml(&std::fs::read_to_string(path).unwrap())
+                .unwrap()
+                .perps
+                .unwrap()
+                .enabled
+        );
     }
     #[tokio::test]
     async fn a_wallet_bot_the_curve_cannot_price_says_why_and_keeps_its_config() {

@@ -1,6 +1,6 @@
 # Module strategy presets
 
-Parameters offers three starting points for each quote module: **Competitive**, **Balanced** and **Defensive**. Choose them independently. Inventory balancing controls how much corridor currency to hold; dynamic spreads controls the extra price-movement buffer. There is no dealer or spot-rebalancing preset.
+Settings offers three starting points for each quote module: **Competitive**, **Balanced** and **Defensive**. Choose them independently. Inventory balancing controls how much corridor currency to hold; dynamic spreads controls the extra price-movement buffer. There is no dealer or spot-rebalancing preset.
 
 Selection only updates the draft. The sliders and the **Simulate** panel respond immediately. Save remains a separate action. No profile is automatically selected on upgrade, and none is presented as a best-performing strategy.
 
