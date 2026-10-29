@@ -2,7 +2,7 @@ import { CurveQuotes } from './CurveModule'
 import ManualSales from './ManualSales'
 import { useEffect, useState } from 'react'
 import type { QuoteModulesState } from '../useQuoteModules'
-import type { ModuleSection } from '../moduleWorkspace'
+import { quoteConfigForScope, type ModuleSection } from '../moduleWorkspace'
 import ModulesOverview from './ModulesOverview'
 import ModuleParameters from './ModuleParameters'
 import ModuleSaveBar from './ModuleSaveBar'
@@ -48,30 +48,21 @@ export default function ModulesPanel({
     const timer = setInterval(() => setNow(Date.now() / 1000), 1000)
     return () => clearInterval(timer)
   }, [])
-  const {
-    view,
-    draft,
-    setDraft,
-    changed,
-    error,
-    setError,
-    note,
-    setNote,
-    busy,
-    save,
-    discard,
-  } = state
+  const { view, draft, setDraft, base, configFor, error, busy, save, discard } =
+    state
   const [decisionFilter, setDecisionFilter] = useState('all')
 
-  if (!view || !draft)
+  const scoped = configFor(selectedModule)
+  if (!view || !draft || !base || !scoped)
     return error ? <ErrorState error={error} /> : <Loading what="modules" />
   // Older panels only served vault bots.
+  const changed = JSON.stringify(scoped) !== JSON.stringify(base.config)
   const vault = view.vault ?? true
   const status = view.status
   const parameterErrors = moduleParameterErrors(
-    draft,
+    scoped,
     vault,
-    draftUnwindCapLimit(view, draft, now)
+    draftUnwindCapLimit(view, scoped, now)
   )
   const valid = parameterErrors.length === 0
   // Corridor names use " / ", "→" or "↔" depending on where they were listed.
@@ -86,16 +77,6 @@ export default function ModulesPanel({
 
   return (
     <section aria-label="Quote module workspace" className="space-y-4">
-      {error && (
-        <Banner tone="danger" onDismiss={() => setError(null)}>
-          {error}
-        </Banner>
-      )}
-      {note && (
-        <Banner tone="info" onDismiss={() => setNote(null)}>
-          {note}
-        </Banner>
-      )}
       {changed && section !== 'settings' && (
         <Banner tone="info">
           You have unsaved changes. Live settings stay unchanged until you save.
@@ -125,8 +106,10 @@ export default function ModulesPanel({
         <>
           <fieldset disabled={busy} className="min-w-0">
             <ModuleParameters
-              draft={draft}
-              onChange={setDraft}
+              draft={scoped}
+              onChange={(next) =>
+                setDraft(quoteConfigForScope(draft, next, selectedModule))
+              }
               selected={selectedModule}
               currency={currency}
               settlement={settlement}
@@ -154,18 +137,18 @@ export default function ModulesPanel({
             changes={
               changed
                 ? moduleChanges(
-                    view.config,
-                    draft,
+                    base.config,
+                    scoped,
                     `${currency} per ${settlement}`
                   )
                 : []
             }
-            live={draft.mode === 'live'}
+            live={scoped.mode === 'live'}
             valid={valid}
             editable={editable}
             busy={busy}
-            onDiscard={discard}
-            onSave={() => void save()}
+            onDiscard={() => discard(selectedModule)}
+            onSave={() => void save(selectedModule)}
           />
         </>
       )}

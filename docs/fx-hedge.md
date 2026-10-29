@@ -58,7 +58,7 @@ stay Live while the curve is Off. Their settings and permissions are separate:
 
 The existing `modules_enabled` setting is not a master switch for hedging.
 Turning it off removes the quote controls; the Modules tab stays available
-when the hedge needs it. Turning the hedge off leaves curve settings intact.
+when the hedge has an assignment or needs monitoring. Turning the hedge off leaves curve settings intact.
 Each group keeps its own Preview/Live choice. Quote modules retain their
 existing shared policy mode and individual enable switches.
 
@@ -70,17 +70,21 @@ vault balances). GMX collateral is not added to that liquid balance. Recall
 quotes keep their separate capacity, reservations and existing price path;
 this UI change does not apply the curve to recall quotes or change hedge marks.
 
-On **Modules**, each capability is a peer in one workspace. The desktop list
-uses Capital, Pricing and Liquidity categories; mobile uses a module selector.
-One configured module opens directly. **Manage modules** opens eligible modules
-for configuration without enabling them. **Overview** shows readings,
+On **Modules**, each capability is a peer in one workspace. The always-visible list
+uses Capital, Pricing and Liquidity categories and includes disabled modules,
+even for a bot with just one module. Mobile shows the same list above the editor.
+Selecting a module does not enable it. Enabled/Disabled badges show the saved
+configuration separately from current activity. **Overview** shows readings,
 **Settings** holds the controls and **Activity** shows history. Drafts survive
 module navigation; the selected module and section survive refresh in the URL.
 Refreshing still reloads saved settings, not unsaved drafts.
 
 Quote modules retain a **Shared quote policy** mode, with every affected module
-named before saving. Its revision-checked draft is shared across quote editors;
-hedge settings have a separate draft and write path. Errors in one service leave
+named before saving. This group-wide control sits below the workspace and has
+its own Save button. Each module saves only its own settings; sibling drafts
+remain unsaved, and module toggles never change the shared mode. Hedge settings
+have a separate draft and write path. An assigned hedge stays in navigation
+when disabled, while its empty dashboard summary can still disappear. Errors in one service leave
 the other controls accessible. Search and navigation never save configuration.
 
 `moduleWorkspace.ts` lists visibility, eligibility and navigation metadata;
@@ -110,14 +114,19 @@ Selecting the curve uses the same detail pane:
 
 ![Inventory curve](images/fx-hedge-and-curve.png)
 
-One module opens directly, without a sidebar:
+A single module keeps its sidebar:
 
 ![Single FX hedge module](images/fx-hedge-preview.png)
 
-[Mobile selector](images/modules-mobile.png) ·
+[Mobile module list](images/modules-mobile.png) ·
+[Mobile simulation](images/modules-mobile-simulate.png) ·
 [Dark mobile settings](images/modules-dark-mobile.png) ·
 [Off with pending obligations](images/fx-hedge-off.png) ·
 [Experimental enable switch](images/fx-hedge-experimental.png).
+
+One enabled vault module with all its disabled siblings visible:
+
+![Single enabled vault module](images/modules-vault-single.png)
 
 A vault bot with four quote modules configured. This shows existing vault
 policies; it does not imply that this vault can also enable FX hedge. Inventory

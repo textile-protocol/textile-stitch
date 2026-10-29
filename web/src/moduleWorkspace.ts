@@ -1,6 +1,7 @@
 import { freshReading } from './curve'
 import {
   moduleNames,
+  moduleKeys,
   modulesFor,
   runningConfigDiffers,
   liquidityState,
@@ -38,7 +39,11 @@ export function visibleBotModules(
   now: number
 ): BotModuleId[] {
   const visible: Record<BotModuleId, boolean> = {
-    hedge: hedgeSetup || hedgeUnavailable || showHedgeModule(hedge, now),
+    hedge:
+      hedgeSetup ||
+      hedgeUnavailable ||
+      Boolean(hedge?.assignmentId) ||
+      showHedgeModule(hedge, now),
     quotes: quoteModulesEnabled,
   }
   return (Object.keys(MODULE_SURFACES) as BotModuleId[]).filter(
@@ -106,7 +111,7 @@ export function workspaceModules(
   ]
 }
 
-/** A single configured module opens directly, even when other modules are eligible. */
+/** Prefer the requested module, then a configured module. Navigation never writes. */
 export function selectedWorkspaceModule(
   available: WorkspaceModuleId[],
   requested: string | null,
@@ -125,39 +130,58 @@ export function selectedWorkspaceModule(
   )
 }
 
-/** Keep configured, running and drafted modules in view. Others live in Manage modules. */
-export function listedModules(
-  available: WorkspaceModuleId[],
-  selected: WorkspaceModuleId | null,
-  view: ModulesView | null,
-  draft: ModulesConfig | null
-) {
-  return available.filter(
-    (id) =>
-      id === 'hedge' ||
-      id === selected ||
-      view?.config[id].enabled ||
-      view?.status?.config[id]?.enabled ||
-      draft?.[id].enabled
-  )
+export type QuoteConfigScope = ModuleKey | 'policy'
+
+/** Profit unwind is edited with the curve. Shared mode has its own save scope. */
+const configKeys = (scope: QuoteConfigScope): (keyof ModulesConfig)[] =>
+  scope === 'policy'
+    ? ['mode']
+    : scope === 'curve'
+      ? ['curve', 'profit_unwind']
+      : [scope]
+
+/** Construct the full API payload from one revision's saved config and one editor. */
+export function quoteConfigForScope(
+  saved: ModulesConfig,
+  draft: ModulesConfig,
+  scope: QuoteConfigScope
+): ModulesConfig {
+  return {
+    ...saved,
+    ...Object.fromEntries(configKeys(scope).map((key) => [key, draft[key]])),
+  }
 }
 
-/** The config blocks a quote module owns. Profit unwind rides on the curve
- * and is edited in its section, so its block is the curve's too. */
-const configKeys = (id: ModuleKey): (keyof ModulesConfig)[] =>
-  id === 'curve' ? ['curve', 'profit_unwind'] : [id]
+/** Carry unsaved sibling drafts forward after a successful scoped save. */
+export function remainingQuoteDraft(
+  saved: ModulesConfig,
+  draft: ModulesConfig,
+  next: ModulesConfig,
+  scope: QuoteConfigScope
+): ModulesConfig {
+  const owned = configKeys(scope)
+  const keys: (keyof ModulesConfig)[] = ['mode', ...moduleKeys, 'profit_unwind']
+  return {
+    ...next,
+    ...Object.fromEntries(
+      keys
+        .filter(
+          (key) =>
+            !owned.includes(key) &&
+            JSON.stringify(saved[key]) !== JSON.stringify(draft[key])
+        )
+        .map((key) => [key, draft[key]])
+    ),
+  }
+}
 
-/** Whether the draft changes anything this module owns, or the shared mode. */
 export function quoteModuleUnsaved(
   view: ModulesView,
   draft: ModulesConfig,
   id: ModuleKey
 ): boolean {
-  return (
-    view.config.mode !== draft.mode ||
-    configKeys(id).some(
-      (key) => JSON.stringify(view.config[key]) !== JSON.stringify(draft[key])
-    )
+  return configKeys(id).some(
+    (key) => JSON.stringify(view.config[key]) !== JSON.stringify(draft[key])
   )
 }
 

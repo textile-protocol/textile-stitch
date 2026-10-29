@@ -4,7 +4,8 @@ import {
   modulesOnTab,
   visibleBotModules,
   workspaceModules,
-  listedModules,
+  quoteConfigForScope,
+  remainingQuoteDraft,
   selectedWorkspaceModule,
   quoteModuleStatus,
   quoteModuleUnsaved,
@@ -37,10 +38,11 @@ const hedge = (enabled: boolean, hasFunds = false): PerpsView => ({
 })
 
 describe('independent module composition', () => {
-  it('keeps the quote workspace when an empty hedge is turned off', () => {
+  it('keeps assigned hedge and quote navigation when an empty hedge is turned off', () => {
     const before = { quoteModulesEnabled: true, hedge: hedge(true) }
     expect(visibleBotModules(before, now)).toEqual(['hedge', 'quotes'])
     expect(visibleBotModules({ ...before, hedge: hedge(false) }, now)).toEqual([
+      'hedge',
       'quotes',
     ])
   })
@@ -139,10 +141,10 @@ describe('focused module workspace', () => {
     expect(quoteModuleUnsaved(view, view.config, 'curve')).toBe(false)
     expect(quoteModuleUnsaved(view, draft, 'curve')).toBe(true)
     expect(quoteModuleUnsaved(view, draft, 'inventory')).toBe(false)
-    // A mode change touches every quote module.
+    // Shared mode has its own draft; it does not dirty individual modules.
     const other = view.config.mode === 'live' ? 'shadow' : 'live'
     const mode = { ...view.config, mode: other } as const
-    expect(quoteModuleUnsaved(view, mode, 'inventory')).toBe(true)
+    expect(quoteModuleUnsaved(view, mode, 'inventory')).toBe(false)
   })
 
   it('does not offer vault modules to a wallet or while eligibility is unknown', () => {
@@ -154,12 +156,18 @@ describe('focused module workspace', () => {
     expect(workspaceModules(['hedge'], quoteView(true))).toEqual(['hedge'])
   })
 
-  it('opens the only configured module directly, leaving disabled modules in the library', () => {
+  it('selects the configured module while keeping every eligible module in navigation', () => {
     const view = quoteView(true)
     const all = workspaceModules(['quotes'], view)
     const selected = selectedWorkspaceModule(all, null, view)
     expect(selected).toBe('curve')
-    expect(listedModules(all, selected, view, view.config)).toEqual(['curve'])
+    expect(all).toEqual([
+      'inventory',
+      'spreads',
+      'rebalance',
+      'liquidity',
+      'curve',
+    ])
     expect(all).toContain('inventory')
   })
 
@@ -168,10 +176,6 @@ describe('focused module workspace', () => {
     const before = structuredClone(view)
     const all = workspaceModules(['quotes'], view)
     expect(selectedWorkspaceModule(all, 'spreads', view)).toBe('spreads')
-    expect(listedModules(all, 'spreads', view, view.config)).toEqual([
-      'spreads',
-      'curve',
-    ])
     expect(view).toEqual(before)
   })
 
@@ -180,7 +184,7 @@ describe('focused module workspace', () => {
     expect(selectedWorkspaceModule(['curve'], 'inventory', view)).toBe('curve')
   })
 
-  it('retains a draft-enabled module and a module still running after a saved disable', () => {
+  it('keeps all modules during a saved/running configuration mismatch', () => {
     const view = quoteView(true)
     const running = {
       ...view.config,
@@ -194,14 +198,11 @@ describe('focused module workspace', () => {
       rebalance_status: 'Off',
       next_attempt_at: 0,
     }
-    const draft = {
-      ...view.config,
-      spreads: { ...view.config.spreads, enabled: true },
-    }
-    const all = workspaceModules(['quotes'], view)
-    expect(listedModules(all, 'curve', view, draft)).toEqual([
+    expect(workspaceModules(['quotes'], view)).toEqual([
       'inventory',
       'spreads',
+      'rebalance',
+      'liquidity',
       'curve',
     ])
     expect(quoteModuleStatus(view, 'inventory', now / 1000)).toBe(
@@ -256,5 +257,82 @@ describe('focused module workspace', () => {
     expect(quoteModuleStatus(view, 'liquidity', now / 1000 + 46)).toBe(
       'Waiting'
     )
+  })
+})
+
+describe('independent module saves', () => {
+  it.each(['inventory', 'spreads', 'rebalance', 'liquidity', 'curve'] as const)(
+    'saves only %s even with unsaved sibling enable and mode changes',
+    (key) => {
+      const saved = config()
+      const draft = {
+        ...saved,
+        mode: 'off' as const,
+        ...Object.fromEntries(
+          ['inventory', 'spreads', 'rebalance', 'liquidity', 'curve'].map(
+            (id) => [id, { ...saved[id as typeof key], enabled: true }]
+          )
+        ),
+      }
+      const payload = quoteConfigForScope(saved, draft, key)
+      expect(payload).toEqual({
+        ...saved,
+        [key]: { ...saved[key], enabled: true },
+      })
+      const remaining = remainingQuoteDraft(saved, draft, payload, key)
+      expect(remaining).toEqual(draft)
+      expect(saved[key].enabled).toBe(false)
+    }
+  )
+
+  it('saves group mode without applying pending module toggles', () => {
+    const saved = config()
+    const draft = {
+      ...saved,
+      mode: 'shadow' as const,
+      spreads: { ...saved.spreads, enabled: true },
+    }
+    expect(quoteConfigForScope(saved, draft, 'policy')).toEqual({
+      ...saved,
+      mode: 'shadow',
+    })
+  })
+
+  it('owns profit unwind only with the curve and preserves sibling parameters', () => {
+    const saved = config()
+    const draft = {
+      ...saved,
+      profit_unwind: { ...defaultProfitUnwind(), enabled: true },
+      spreads: { ...saved.spreads, max_extra_bps: 75 },
+    }
+    const payload = quoteConfigForScope(saved, draft, 'curve')
+    expect(payload.profit_unwind).toEqual(draft.profit_unwind)
+    expect(payload.spreads).toEqual(saved.spreads)
+    expect(remainingQuoteDraft(saved, draft, payload, 'curve')).toEqual(draft)
+  })
+
+  it('discards only the selected scope, retaining sibling edits', () => {
+    const saved = config()
+    const draft = {
+      ...saved,
+      mode: 'shadow' as const,
+      spreads: { ...saved.spreads, enabled: true },
+      curve: { ...saved.curve, enabled: true },
+    }
+    expect(quoteConfigForScope(draft, saved, 'curve')).toEqual({
+      ...draft,
+      curve: saved.curve,
+    })
+    expect(quoteConfigForScope(draft, saved, 'policy')).toEqual({
+      ...draft,
+      mode: saved.mode,
+    })
+  })
+
+  it('takes refreshed server values for untouched scopes after saving', () => {
+    const saved = config()
+    const draft = { ...saved, curve: { ...saved.curve, shape: 3 } }
+    const next = { ...draft, spreads: { ...saved.spreads, max_extra_bps: 80 } }
+    expect(remainingQuoteDraft(saved, draft, next, 'curve')).toEqual(next)
   })
 })

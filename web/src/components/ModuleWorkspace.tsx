@@ -3,7 +3,6 @@ import { useSearchParams } from 'react-router-dom'
 import {
   MODULE_CATEGORIES,
   WORKSPACE_MODULES,
-  listedModules,
   quoteModuleStatus,
   quoteModuleUnsaved,
   workspaceModules,
@@ -12,19 +11,16 @@ import {
   type ModuleSection,
   type WorkspaceModuleId,
 } from '../moduleWorkspace'
-import {
-  leanConflict,
-  moduleModes,
-  moduleKeyFigures,
-} from '../modulePresentation'
-import { hedgeStatus } from '../perps'
+import { moduleModes } from '../modulePresentation'
+import { hedgeMode, hedgeStatus } from '../perps'
 import type { Bot, Funding } from '../types'
 import type { PerpsState } from '../usePerps'
 import { useQuoteModules } from '../useQuoteModules'
 import ModulesPanel from './ModulesPanel'
 import PerpsModule from './PerpsModule'
 import ScrollTabs from './ScrollTabs'
-import { Banner, Button, Input, Loading, Select } from './ui'
+import QuotePolicySettings from './QuotePolicySettings'
+import { Banner, Input, Loading } from './ui'
 
 /** Navigation is presentation only. Both editors stay mounted so their drafts survive. */
 export default function ModuleWorkspace({
@@ -41,7 +37,6 @@ export default function ModuleWorkspace({
   const quotes = useQuoteModules(bot.name, ids.includes('quotes'), bot.editable)
   const [params, setParams] = useSearchParams()
   const [filter, setFilter] = useState('')
-  const [library, setLibrary] = useState(false)
   const [hedgeDirty, setHedgeDirty] = useState(false)
   const [now, setNow] = useState(Date.now)
   useEffect(() => {
@@ -56,8 +51,6 @@ export default function ModuleWorkspace({
     rawSection === 'settings' || rawSection === 'activity'
       ? rawSection
       : 'overview'
-  const listed = listedModules(available, selected, quotes.view, quotes.draft)
-  const multiple = listed.length > 1
   const quoteModule =
     available.find((id) => id !== 'hedge' && id === selected) ??
     available.find((id) => id !== 'hedge')
@@ -72,7 +65,6 @@ export default function ModuleWorkspace({
       },
       { replace: true }
     )
-    setLibrary(false)
   }
   const status = (id: WorkspaceModuleId) =>
     id === 'hedge'
@@ -86,11 +78,16 @@ export default function ModuleWorkspace({
     id === 'hedge'
       ? hedgeDirty
       : quotes.view &&
+        quotes.base &&
         quotes.draft &&
-        quoteModuleUnsaved(quotes.view, quotes.draft, id)
+        quoteModuleUnsaved(
+          { ...quotes.view, config: quotes.base.config },
+          quotes.draft,
+          id
+        )
   const groups = MODULE_CATEGORIES.map((category) => ({
     category,
-    entries: listed.filter(
+    entries: available.filter(
       (id) =>
         WORKSPACE_MODULES[id].category === category &&
         `${WORKSPACE_MODULES[id].name} ${category}`
@@ -108,59 +105,7 @@ export default function ModuleWorkspace({
             Monitor and configure how this bot operates.
           </p>
         </div>
-        {available.length > 0 && (
-          <Button
-            aria-expanded={library}
-            aria-controls="module-library"
-            onClick={() => setLibrary(!library)}
-          >
-            {library ? 'Close module list' : 'Manage modules'}
-          </Button>
-        )}
       </div>
-      {library && (
-        <div
-          id="module-library"
-          className="border-line-soft bg-surface rounded-xl border p-4"
-        >
-          <p className="text-muted mb-3 text-sm">
-            Available for this bot. Open a module to review its settings;
-            opening it does not enable it.
-          </p>
-          <div className="grid gap-2 sm:grid-cols-2">
-            {available.map((id) => {
-              const conflict =
-                id !== 'hedge' && quotes.draft && quotes.view
-                  ? leanConflict(quotes.draft, id, quotes.view.vault ?? true)
-                  : null
-              const reason =
-                conflict ||
-                (id === 'liquidity' ? quotes.view?.liquidity_refusal : null)
-              return (
-                <button
-                  key={id}
-                  onClick={() => navigate(id, 'settings')}
-                  className="border-line-soft hover:bg-hover rounded-lg border p-3 text-left"
-                >
-                  <span className="block text-sm font-bold">
-                    {WORKSPACE_MODULES[id].name}
-                  </span>
-                  <span className="text-muted mt-1 block text-xs">
-                    {reason || WORKSPACE_MODULES[id].description}
-                  </span>
-                  {id !== 'hedge' && quotes.view && (
-                    <span className="text-muted mt-2 block text-xs tabular-nums">
-                      {moduleKeyFigures(quotes.view.config, id)
-                        .map((figure) => `${figure.label} ${figure.value}`)
-                        .join(' · ')}
-                    </span>
-                  )}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      )}
       {/* Errors stay independent: a missing quote service never hides hedge controls. */}
       {ids.includes('quotes') &&
         !quotes.view &&
@@ -171,89 +116,84 @@ export default function ModuleWorkspace({
         ) : (
           <Loading what="quote modules" />
         ))}
+      {quotes.view && quotes.error && (
+        <Banner tone="danger" onDismiss={() => quotes.setError(null)}>
+          {quotes.error}
+        </Banner>
+      )}
+      {quotes.note && (
+        <Banner tone="info" onDismiss={() => quotes.setNote(null)}>
+          {quotes.note}
+        </Banner>
+      )}
       {selected && (
-        <div
-          className={`border-line-soft bg-surface grid rounded-xl border ${multiple ? 'md:grid-cols-[13rem_minmax(0,1fr)]' : ''}`}
-        >
-          {multiple && (
-            <>
-              <div className="border-line-soft border-b p-4 md:hidden">
-                <label
-                  className="text-muted mb-2 block text-xs font-bold"
-                  htmlFor="module-select"
-                >
-                  Module
-                </label>
-                <Select
-                  id="module-select"
-                  aria-label="Select module"
-                  value={selected}
-                  onChange={(e) =>
-                    navigate(e.target.value as WorkspaceModuleId)
-                  }
-                >
-                  {listed.map((id) => (
-                    <option key={id} value={id}>
-                      {WORKSPACE_MODULES[id].name} · {status(id)}
-                      {unsaved(id) ? ' · Unsaved' : ''}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <nav
-                aria-label="Modules"
-                className="border-line-soft hidden min-w-0 border-r p-3 md:block"
-              >
-                <Input
-                  aria-label="Search modules"
-                  placeholder="Search modules…"
-                  value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
-                />
-                {groups.map(
-                  ({ category, entries }) =>
-                    entries.length > 0 && (
-                      <div key={category} className="mt-5">
-                        <p className="text-faint mb-2 px-2 text-[10px] font-bold uppercase tracking-widest">
-                          {category}
-                        </p>
-                        <div className="space-y-1">
-                          {entries.map((id) => (
-                            <button
-                              key={id}
-                              aria-current={
-                                selected === id ? 'page' : undefined
-                              }
-                              onClick={() => navigate(id)}
-                              className={`w-full rounded-lg px-3 py-3 text-left transition ${selected === id ? 'bg-accent-tint text-accent' : 'hover:bg-hover'}`}
-                            >
-                              <span className="block text-sm font-bold">
-                                {WORKSPACE_MODULES[id].name}
+        <div className="border-line-soft bg-surface grid rounded-xl border md:grid-cols-[14rem_minmax(0,1fr)]">
+          <nav
+            aria-label="Modules"
+            className="border-line-soft min-w-0 border-b p-3 md:border-r md:border-b-0"
+          >
+            <p className="px-2 pt-1 text-sm font-bold">All modules</p>
+            <p className="text-muted px-2 pt-1 pb-3 text-xs">
+              Saved enable state · current activity
+            </p>
+            <Input
+              aria-label="Search modules"
+              placeholder="Search modules…"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+            {groups.map(
+              ({ category, entries }) =>
+                entries.length > 0 && (
+                  <div key={category} className="mt-5">
+                    <p className="text-faint mb-2 px-2 text-[10px] font-bold uppercase tracking-widest">
+                      {category}
+                    </p>
+                    <div className="grid grid-cols-2 gap-1 md:grid-cols-1">
+                      {entries.map((id) => {
+                        const enabled =
+                          id === 'hedge'
+                            ? perps.view
+                              ? perps.view.enabled &&
+                                hedgeMode(perps.view) !== 'off'
+                              : null
+                            : (quotes.view?.config[id].enabled ?? null)
+                        return (
+                          <button
+                            key={id}
+                            aria-current={selected === id ? 'page' : undefined}
+                            onClick={() => navigate(id)}
+                            className={`min-w-0 w-full rounded-lg px-3 py-3 text-left transition ${selected === id ? 'bg-accent-tint text-accent' : 'hover:bg-hover'}`}
+                          >
+                            <span className="block text-sm font-bold">
+                              {WORKSPACE_MODULES[id].name}
+                            </span>
+                            <span className="mt-2 flex flex-wrap items-center gap-1.5 text-xs">
+                              <span
+                                className={`rounded px-1.5 py-0.5 font-bold ${enabled ? 'bg-success/10 text-success' : 'bg-canvas text-muted'}`}
+                              >
+                                {enabled === null
+                                  ? 'Loading'
+                                  : enabled
+                                    ? 'Enabled'
+                                    : 'Disabled'}
                               </span>
-                              <span className="mt-1.5 flex items-center gap-1.5 text-xs">
-                                <ModuleStatus value={status(id)} />
-                                {unsaved(id) && (
-                                  <span className="text-warning">
-                                    · Unsaved
-                                  </span>
-                                )}
-                              </span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )
-                )}
-                {groups.every((group) => !group.entries.length) && (
-                  <p className="text-muted p-3 text-xs">No matching modules.</p>
-                )}
-                <p className="text-faint mt-8 px-2 text-xs leading-relaxed">
-                  Each module keeps its settings. Quote modules share one policy
-                  mode.
-                </p>
-              </nav>
-            </>
-          )}
+                              {enabled && <ModuleStatus value={status(id)} />}
+                              {unsaved(id) && (
+                                <span className="text-warning">Unsaved</span>
+                              )}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+            )}
+            {groups.every((group) => !group.entries.length) && (
+              <p className="text-muted p-3 text-xs">No matching modules.</p>
+            )}
+          </nav>
           <div className="min-w-0 p-4 sm:p-6">
             {ids.includes('hedge') && (
               <div hidden={selected !== 'hedge'}>
@@ -312,6 +252,9 @@ export default function ModuleWorkspace({
             )}
           </div>
         </div>
+      )}
+      {quotes.view && (
+        <QuotePolicySettings state={quotes} editable={bot.editable} />
       )}
     </section>
   )

@@ -6,6 +6,11 @@ import {
 } from './modulePresentation'
 import type { ModulesConfig, ModulesView } from './modules'
 import { poll } from './poll'
+import {
+  quoteConfigForScope,
+  remainingQuoteDraft,
+  type QuoteConfigScope,
+} from './moduleWorkspace'
 
 /** One revision-checked draft for all quote modules, independent of hedge mode. */
 export function useQuoteModules(
@@ -15,7 +20,10 @@ export function useQuoteModules(
 ) {
   const [view, setView] = useState<ModulesView | null>(null)
   const [draft, setDraft] = useState<ModulesConfig | null>(null)
-  const [revision, setRevision] = useState('')
+  const [base, setBase] = useState<Pick<
+    ModulesView,
+    'config' | 'revision'
+  > | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [note, setNote] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -34,7 +42,7 @@ export function useQuoteModules(
           if (cancelled || version !== generation.current) return
           setView(next)
           setDraft((current) => current ?? next.config)
-          setRevision((current) => current || next.revision)
+          setBase((current) => current ?? next)
         } catch (e) {
           if (!cancelled && version === generation.current) setError(String(e))
         }
@@ -48,17 +56,23 @@ export function useQuoteModules(
     }
   }, [name, enabled])
 
-  async function save() {
+  const configFor = (scope: QuoteConfigScope) =>
+    base && draft ? quoteConfigForScope(base.config, draft, scope) : null
+
+  async function save(scope: QuoteConfigScope) {
+    const config = configFor(scope)
     if (
       !enabled ||
       !view ||
       !draft ||
+      !base ||
+      !config ||
       !editable ||
       saving.current ||
       moduleParameterErrors(
-        draft,
+        config,
         view.vault ?? true,
-        draftUnwindCapLimit(view, draft, Date.now() / 1000)
+        draftUnwindCapLimit(view, config, Date.now() / 1000)
       ).length
     )
       return
@@ -68,11 +82,19 @@ export function useQuoteModules(
     setError(null)
     setNote(null)
     try {
-      const result = await api.saveModules(name, revision, draft)
+      const result = await api.saveModules(name, base.revision, config)
       const next = await api.modules(name)
       setView(next)
-      setDraft(next.config)
-      setRevision(next.revision)
+      // Another writer may have changed a sibling between PUT and GET. Do not
+      // grant our retained drafts that writer's revision and overwrite it later.
+      if (JSON.stringify(next.config) !== JSON.stringify(config)) {
+        setError(
+          'Configuration changed again while saving. Reload to review saved settings; unsaved edits were kept.'
+        )
+        return
+      }
+      setDraft(remainingQuoteDraft(base.config, draft, next.config, scope))
+      setBase(next)
       setNote(result.message)
       if (result.restartError)
         setError(
@@ -88,7 +110,9 @@ export function useQuoteModules(
 
   return {
     view,
+    base,
     draft,
+    configFor,
     setDraft,
     error,
     setError,
@@ -96,13 +120,11 @@ export function useQuoteModules(
     setNote,
     busy,
     save,
-    changed: Boolean(
-      view && draft && JSON.stringify(draft) !== JSON.stringify(view.config)
-    ),
-    discard: () => {
-      if (!view) return
-      setDraft(view.config)
-      setRevision(view.revision)
+    discard: (scope: QuoteConfigScope) => {
+      if (!base) return
+      setDraft(
+        (current) => current && quoteConfigForScope(current, base.config, scope)
+      )
     },
   }
 }

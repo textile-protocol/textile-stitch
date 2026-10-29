@@ -4,6 +4,7 @@ import type { Bot, Funding } from '../types'
 import type { PerpsState } from '../usePerps'
 import ModuleWorkspace from './ModuleWorkspace'
 import PerpsModule from './PerpsModule'
+import { showHedgeModule } from '../perps'
 
 export default function BotModules({
   ids,
@@ -28,7 +29,8 @@ export default function BotModules({
         funding={funding}
       />
     )
-  return modulesOnTab(ids, tab).includes('hedge') ? (
+  return modulesOnTab(ids, tab).includes('hedge') &&
+    (perps.error || showHedgeModule(perps.view, Date.now())) ? (
     <PerpsModule bot={bot} perps={perps} funding={funding} />
   ) : null
 }

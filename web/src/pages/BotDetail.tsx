@@ -1,5 +1,6 @@
 import BotModules from '../components/BotModules'
 import { usePerps } from '../usePerps'
+import { showHedgeModule } from '../perps'
 import { visibleBotModules } from '../moduleWorkspace'
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
@@ -52,7 +53,7 @@ export default function BotDetail() {
     hedgeUnavailable: Boolean(perps.error),
     hedgeSetup: searchParams.get('hedge') === 'setup',
   }, Date.now())
-  const hedgeVisible = visibleModules.includes('hedge')
+  const hedgeVisible = Boolean(perps.error) || showHedgeModule(perps.view, Date.now())
   // The wallet's balances, priced. Owned here rather than by the Funds tab
   // because the header shows the total on every tab, and one poll is enough
   // for both.

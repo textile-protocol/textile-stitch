@@ -6,10 +6,8 @@ import {
   draftUnwindCapLimit,
   leanConflict,
   liquidityScheduleErrors,
-  moduleModes,
   moduleNames,
   moduleParameterErrors,
-  modulesFor,
   percentage,
   liveRow,
   quoteBreakdown,
@@ -22,7 +20,6 @@ import {
 import {
   AllocationBar,
   Chevron,
-  ModeSwitch,
   ModuleSwitch,
   NumberControl,
   Popover,
@@ -127,36 +124,20 @@ export default function ModuleParameters({
   const titleId = useId()
   const conflict = leanConflict(draft, selected, vault)
   const blockedReason = selected === 'liquidity' ? liquidityRefusal : null
-  const affected = modulesFor(vault).filter((key) => draft[key].enabled)
   return (
     <section
       aria-labelledby={titleId}
       className="border-line-soft bg-surface @container rounded-xl border"
     >
-      <header className="border-line-soft flex flex-wrap items-center justify-between gap-4 border-b px-5 py-4">
-        <div className="min-w-0">
-          <h3 id={titleId} className="font-bold">
-            Shared quote policy
+      <header className="border-line-soft flex items-center justify-between gap-3 border-b px-5 py-4">
+        <div>
+          <h3 id={titleId} className="text-sm font-bold">
+            {moduleNames[selected]} settings
           </h3>
-          <p className="text-muted mt-0.5 text-xs">
-            {moduleModes.find((m) => m.value === draft.mode)?.effect}
-          </p>
-          <p className="text-muted mt-2 text-xs">
-            Applies to:{' '}
-            {affected.length
-              ? affected.map((key) => moduleNames[key]).join(', ')
-              : 'no enabled quote modules'}
-            . FX hedge has its own mode. Review all changes below before saving.
+          <p className="text-muted mt-1 text-xs">
+            Changes apply only to this module.
           </p>
         </div>
-        <ModeSwitch
-          modes={moduleModes}
-          value={draft.mode}
-          onChange={(mode) => onChange({ ...draft, mode })}
-        />
-      </header>
-      <div className="flex items-center justify-between gap-3 px-5 py-4">
-        <p className="text-sm font-bold">{moduleNames[selected]} settings</p>
         <ModuleSwitch
           label={`Enable ${moduleNames[selected].toLowerCase()}`}
           checked={draft[selected].enabled}
@@ -168,7 +149,7 @@ export default function ModuleParameters({
             onChange({ ...draft, [selected]: { ...draft[selected], enabled } })
           }
         />
-      </div>
+      </header>
       <ModuleEditor
         module={selected}
         draft={draft}

@@ -13,7 +13,6 @@ import {
   liveRow,
   marketMinutes,
   moduleChanges,
-  moduleKeyFigures,
   moduleOverviewState,
   moduleParameterErrors,
   quoteBreakdown,
@@ -557,29 +556,6 @@ describe('strategy rows and the save bar', () => {
     draft.inventory.target_bps = NaN
     expect(moduleChanges(config(), draft)).toEqual([
       { label: 'Target holdings', from: '40%', to: '—' },
-    ])
-    expect(moduleKeyFigures(draft, 'inventory')[0]).toEqual({
-      label: 'Target',
-      value: '—',
-    })
-  })
-  it('gives each module its two defining figures', () => {
-    const c = config()
-    expect(moduleKeyFigures(c, 'inventory')).toEqual([
-      { label: 'Target', value: '40%' },
-      { label: 'Pause at', value: '80%' },
-    ])
-    expect(moduleKeyFigures(c, 'spreads')).toEqual([
-      { label: 'Max extra', value: '+1%' },
-      { label: 'Sensitivity', value: '1×' },
-    ])
-    expect(moduleKeyFigures(c, 'rebalance')).toEqual([
-      { label: 'Sell above', value: '50%' },
-      { label: 'Per sale', value: '2%' },
-    ])
-    expect(moduleKeyFigures(c, 'liquidity')).toEqual([
-      { label: 'Market hours', value: '50%' },
-      { label: 'Off-hours', value: '0%' },
     ])
   })
   it('lists liquidity schedule changes with the form labels', () => {

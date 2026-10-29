@@ -1,7 +1,6 @@
 import {
   curveConfigErrors,
   freshReading,
-  knobLabel,
   liftLimitNgn,
   profitUnwindErrors,
   shapeLabel,
@@ -111,41 +110,6 @@ const shownPriceOffset = (v: unknown, unit: string) =>
   typeof v === 'number' && Number.isFinite(v)
     ? `${v.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`
     : '—'
-
-/** The two settings that define each module, shown in the module library. */
-export function moduleKeyFigures(
-  c: ModulesConfig,
-  key: ModuleKey
-): { label: string; value: string }[] {
-  const figures: Record<ModuleKey, [string, string][]> = {
-    inventory: [
-      ['Target', shownPercent(c.inventory.target_bps)],
-      ['Pause at', shownPercent(c.inventory.max_bps)],
-    ],
-    spreads: [
-      ['Max extra', `+${shownPercent(c.spreads.max_extra_bps)}`],
-      [
-        'Sensitivity',
-        Number.isFinite(c.spreads.multiplier)
-          ? `${c.spreads.multiplier}×`
-          : '—',
-      ],
-    ],
-    rebalance: [
-      ['Sell above', shownPercent(c.rebalance.trigger_bps)],
-      ['Per sale', shownPercent(c.rebalance.max_trade_bps)],
-    ],
-    liquidity: [
-      ['Market hours', shownPercent(c.liquidity.market_floor_bps)],
-      ['Off-hours', shownPercent(c.liquidity.off_hours_floor_bps)],
-    ],
-    curve: [
-      ['Starts at', knobLabel('Mid', c.curve.start_below_mid)],
-      ['Ends at', knobLabel('Buy', c.curve.end_above_buy)],
-    ],
-  }
-  return figures[key].map(([label, value]) => ({ label, value }))
-}
 
 /** Every setting the Parameters form edits, labeled as the form labels it.
  * Dealer credentials are TOML-only and not listed. */
