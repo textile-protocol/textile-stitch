@@ -16,10 +16,10 @@ and the module use the same saved hedge state.
 | Live    | Allows execution within the assigned permissions and limits. Requires the deployment to permit execution, current inventory, configured limits and collateral-backed quoting permission. |
 | Off     | Stops new recall commitments, margin funding and hedge increases. Ordinary trading continues. Existing obligations, transaction reconciliation and protective exits remain active.       |
 
-The module stays visible after Off while margin funds, positions, reservations
-or pending operations remain. Missing or stale data also keeps it visible. It
-can disappear once a current snapshot confirms an empty hedge and no work is
-pending. The Experimental link always lets you reopen its configuration.
+On Funds and Dashboard, the module stays visible after Off while margin funds,
+positions, reservations or pending operations remain. Missing or stale data also
+keeps it visible. Those summaries can disappear once a current snapshot confirms
+an empty hedge and no pending work. An assigned hedge remains in the Modules list.
 
 Amounts use the collateral token’s decimals. **Authorized margin allocation**
 accepts whole-token amounts (for example `250000.00` IDRX), preserving the
@@ -100,36 +100,3 @@ move funds must use the existing reservation and execution paths; a UI card
 does not give them independent spending authority. Existing incompatibility
 checks remain, including the ban on combining two inventory leans (the curve
 and vault inventory balancing).
-
-## Screenshots
-
-These are the implemented panel rendered with example API data, not production
-balances. No setting or transaction was sent to a real bot for these captures.
-
-FX hedge and the IDRX curve as peers, with the hedge selected:
-
-![Focused module workspace](images/modules-workspace.png)
-
-Selecting the curve uses the same detail pane:
-
-![Inventory curve](images/fx-hedge-and-curve.png)
-
-A single module keeps its sidebar:
-
-![Single FX hedge module](images/fx-hedge-preview.png)
-
-[Mobile module list](images/modules-mobile.png) ·
-[Mobile simulation](images/modules-mobile-simulate.png) ·
-[Dark mobile settings](images/modules-dark-mobile.png) ·
-[Off with pending obligations](images/fx-hedge-off.png) ·
-[Experimental enable switch](images/fx-hedge-experimental.png).
-
-One enabled vault module with all its disabled siblings visible:
-
-![Single enabled vault module](images/modules-vault-single.png)
-
-A vault bot with four quote modules configured. This shows existing vault
-policies; it does not imply that this vault can also enable FX hedge. Inventory
-balancing remains off because it conflicts with the curve.
-
-![Several vault modules](images/modules-vault.png)
