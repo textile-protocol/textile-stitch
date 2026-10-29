@@ -149,6 +149,9 @@ pub struct RfqRuntime {
     /// the maker stream cannot forget a transaction task that is still alive.
     closing: Arc<Mutex<HashMap<U256, u64>>>,
     modules: Option<crate::modules::runtime::Runtime>,
+    /// Profit unwind on the curve, when it runs. Process-scoped like the
+    /// reservation ledger, so the cost basis outlives sessions.
+    unwind: Option<Arc<modules::Unwind>>,
     /// `[price_guard]`: the jump guard on every fetch, the band on every
     /// order and level.
     price_guard: crate::config::PriceGuardConfig,
@@ -468,6 +471,7 @@ fn build_runtime(
         vault_policy: Arc::new(RwLock::new(None)),
         closing: Arc::new(Mutex::new(HashMap::new())),
         modules: modules_runtime(cfg, config_dir, &module_price_source)?,
+        unwind: modules::unwind_runtime(cfg, config_dir),
         price_guard: cfg.price_guard,
         price_basis: cfg.price_basis(),
         fills: fills::FillWatch::default(),
@@ -571,6 +575,7 @@ fn curve_reading_status(
     inputs: &responder::CurveInputs,
     fee_bps: u32,
     now: u64,
+    unwind: Option<crate::modules::runtime::UnwindReading>,
 ) -> Option<crate::modules::runtime::CurveReading> {
     let (share, value) = responder::holdings_share(book, inputs)?;
     let (mid, half_range_bps) = inputs.reference?;
@@ -582,7 +587,27 @@ fn curve_reading_status(
         half_range_bps,
         fee_bps,
         feed_price: (price.is_finite() && price > 0.0).then(|| 1.0 / price),
+        unwind,
     })
+}
+
+/// Profit unwind's reading for the module status, in soft currency per
+/// dollar, from the snapshot and the lift priced this tick.
+fn unwind_reading_status(
+    snapshot: crate::pricing::unwind::Snapshot,
+    shift: crate::pricing::unwind::Shift,
+    feed_price: f64,
+    live: bool,
+) -> crate::modules::runtime::UnwindReading {
+    let feed_mid = 1.0 / feed_price;
+    crate::modules::runtime::UnwindReading {
+        cost: snapshot.cost_ngn,
+        snapshot_at: snapshot.at,
+        feed_mid,
+        gain: shift.gain_ngn,
+        full_shift: shift.full_ngn,
+        live,
+    }
 }
 
 fn same_addr(value: &str, addr: Address) -> bool {
@@ -1295,6 +1320,7 @@ async fn session_loop_inner(
         gas_caps: rt.gas_caps,
         closing: rt.closing.clone(),
         modules: rt.modules.clone(),
+        unwind: rt.unwind.clone(),
         pending_rebalance: None,
         price_guard: rt.price_guard,
         venue_fee_bps: 0,
@@ -1516,6 +1542,7 @@ struct Engine {
     /// be a second nonce spent on a revert.
     closing: Arc<Mutex<HashMap<U256, u64>>>,
     modules: Option<crate::modules::runtime::Runtime>,
+    unwind: Option<Arc<modules::Unwind>>,
     pending_rebalance: Option<modules::PendingRebalance>,
     price_guard: crate::config::PriceGuardConfig,
     /// The venue fee on the last quote request, in bps. A Live quote curve
@@ -1755,10 +1782,16 @@ impl Engine {
                     return None;
                 }
                 let effective = self.module_book(book, &quote, now_secs)?;
+                self.observe_unwind(book, &quote, now_secs);
                 let inputs = self.curve_inputs(book, &quote, now_secs);
                 if let (Some(modules), Some(_)) = (&self.modules, book.curve) {
+                    let unwind = self
+                        .unwind_shift(book, &quote, now_secs)
+                        .map(|(snapshot, shift)| {
+                            unwind_reading_status(snapshot, shift, quote.price, self.unwind_live())
+                        });
                     if let Some(reading) =
-                        curve_reading_status(book, quote.price, &inputs, self.venue_fee_bps, now_secs)
+                        curve_reading_status(book, quote.price, &inputs, self.venue_fee_bps, now_secs, unwind)
                     {
                         modules.curve_reading(reading);
                     }
@@ -1994,11 +2027,16 @@ impl Engine {
         };
         let mut recall_offer = None;
         self.venue_fee_bps = req.fee_bps;
+        // Fold in balances that landed since the last levels tick, so profit
+        // unwind never prices off a cost that new naira has already pulled
+        // down. The input is kept to recheck after signing.
+        self.observe_unwind(&book, &quote, now_secs);
+        let curve_inputs = self.curve_inputs(&book, &quote, now_secs);
         let (plan, curve_note) = match decide_quote_curved(
             &effective_book,
             &req,
             quote.price,
-            &self.curve_inputs(&book, &quote, now_secs),
+            &curve_inputs,
             self.reservations.reserved(&book.slug, true, now_secs),
             self.reservations.reserved(&book.slug, false, now_secs),
             self.reserved_on(&book, true, now_secs),
@@ -2057,10 +2095,23 @@ impl Engine {
                 f1,
                 s0,
                 s1,
+                unwind,
+                unwound,
                 size_debt,
                 promised_debt,
                 cheapest_until,
             }) => {
+                // Profit unwind's line: the cost and full lift it sized on,
+                // whether it quoted, and the lifted price against the plain
+                // curve's. In its preview that is the price it would quote.
+                let unwind_fields = unwind.zip(unwound).map(|(u, unwound)| {
+                    (
+                        format!("{:.2}", u.lift.cost_ngn),
+                        format!("{:.2}", u.lift.full_ngn),
+                        u.live,
+                        format!("{unwound:.9}"),
+                    )
+                });
                 // The shadow trail the rollout reads for days before anything
                 // is decided; also the live audit line once it is. Both
                 // prices are ORDER prices (spread only, fee injected on top),
@@ -2077,6 +2128,10 @@ impl Engine {
                     promised_debt = format!("{promised_debt:.2}"),
                     s0 = format!("{s0:.2}"),
                     s1 = format!("{s1:.2}"),
+                    unwind_cost = unwind_fields.as_ref().map_or("-", |f| f.0.as_str()),
+                    unwind_full_ngn = unwind_fields.as_ref().map_or("-", |f| f.1.as_str()),
+                    unwind_live = unwind_fields.as_ref().is_some_and(|f| f.2),
+                    unwound = unwind_fields.as_ref().map_or("-", |f| f.3.as_str()),
                     cheapest_until = format!("{:.0}%", cheapest_until * 100.0),
                     flat = format!("{flat:.9}"),
                     curved = format!("{curved:.9}"),
@@ -2352,6 +2407,10 @@ impl Engine {
         if recall_offer.is_none() && !self.fits_liquidity_cap(&book, &plan, unix_now()) {
             warn!(rfq_id = %req.rfq_id, "the liquidity cap tightened while signing; signature withheld");
             return reject(RejectReason::Inventory);
+        }
+        if !self.unwind_holds_after_signing(&book, curve_inputs.unwind, plan.bid, prices) {
+            warn!(rfq_id = %req.rfq_id, "profit unwind's cost fell while signing; signature withheld");
+            return reject(RejectReason::Busy);
         }
 
         // The reservation starts the moment the signed order exists — even if
@@ -4518,6 +4577,7 @@ mod tests {
             gas_caps: GasCaps::for_chain(8453),
             closing: Arc::new(Mutex::new(HashMap::new())),
             modules: None,
+            unwind: None,
             pending_rebalance: None,
             price_guard: crate::config::PriceGuardConfig::default(),
             venue_fee_bps: 0,
@@ -4983,6 +5043,227 @@ mod tests {
             panic!("live engine without a reference must still quote");
         };
         assert_eq!(flat.buy_amount, fallback.buy_amount);
+    }
+
+    fn unwind_params(cap_ngn: f64) -> crate::pricing::unwind::UnwindParams {
+        crate::pricing::unwind::UnwindParams {
+            share: 0.5,
+            cap_ngn,
+            min_gain_ngn: 0.0,
+            start_pct: 0.0,
+            refresh_secs: 900,
+        }
+    }
+
+    /// A tracker for someone else's naira at `cost_ngn`, frozen now.
+    fn foreign_unwind_tracker(cost_ngn: f64) -> crate::pricing::unwind::Tracker {
+        crate::pricing::unwind::Tracker {
+            holder: crate::pricing::unwind::Holder {
+                chain_id: 8453,
+                address: "0x00000000000000000000000000000000000000a1".into(),
+                collateral: "0x00000000000000000000000000000000000000c0".into(),
+                debt: "0x00000000000000000000000000000000000000d0".into(),
+                price: "unadjusted".into(),
+            },
+            basis: crate::pricing::unwind::Basis {
+                naira: cost_ngn,
+                dollars: 1.0,
+            },
+            snapshot: Some(crate::pricing::unwind::Snapshot {
+                cost_ngn,
+                at: unix_now(),
+            }),
+        }
+    }
+
+    /// The engine's own tracker: the naira its wallet holds now, carried at
+    /// `cost_ngn` and frozen now, so a firm quote's refresh keeps it.
+    fn unwind_tracker(engine: &Engine, cost_ngn: f64) -> crate::pricing::unwind::Tracker {
+        let book = &engine.books[0];
+        let held = engine
+            .inventory
+            .view(unix_now())
+            .balance(book.collateral)
+            .unwrap();
+        let naira = responder::normalized(held, book.collateral_decimals);
+        crate::pricing::unwind::Tracker {
+            holder: engine.unwind_holder(book, "unadjusted"),
+            basis: crate::pricing::unwind::Basis {
+                naira,
+                dollars: naira / cost_ngn,
+            },
+            snapshot: Some(crate::pricing::unwind::Snapshot {
+                cost_ngn,
+                at: unix_now(),
+            }),
+        }
+    }
+
+    async fn buy_amount(engine: &mut Engine, rfq: &str, prices: &PriceCache) -> f64 {
+        let MakerFrame::QuoteResponse(r) = engine.respond(exact_input_request(rfq), prices).await
+        else {
+            panic!("live engine must quote");
+        };
+        r.buy_amount.parse().unwrap()
+    }
+
+    /// Profit unwind end to end through `respond`: with a frozen gain, a Live
+    /// curve quote moves by the lift averaged over the stretch it walks,
+    /// against the same curve without it. The taker sells cNGN here, so the
+    /// bot pays more naira per dollar: fewer dollars for the same cNGN.
+    #[tokio::test]
+    async fn profit_unwind_moves_a_live_curve_quote_by_its_lift() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let plain = buy_amount(&mut curve_engine(Mode::Live), "rfq_plain", &prices).await;
+        // Feed at 1 NGN per USDT (the fixture's toy units), naira held at a
+        // 1.01 cost: a 100 bps gain. Half of it is 50 bps and the cap is 20,
+        // so the full lift is 20 bps, weighted by the share across the quote.
+        let mut engine = curve_engine(Mode::Live);
+        engine.unwind = Some(modules::Unwind::with_tracker(
+            unwind_params(0.002),
+            true,
+            "cngn-usdc",
+            unwind_tracker(&engine, 1.01),
+        ));
+        let book = engine.books[0].clone();
+        let quote = prices.get("http://feed").unwrap();
+        let inputs = engine.curve_inputs(&book, &quote, unix_now());
+        let (f0, total) = responder::holdings_share(&book, &inputs).unwrap();
+        let lifted = buy_amount(&mut engine, "rfq_lifted", &prices).await;
+        // 1,000 cNGN at about 1 USDC walks the share up by 1,000 / total.
+        let f1 = (f0 + 1_000.0 / total).min(1.0);
+        let want = 20.0 * crate::pricing::unwind::average_weight(f0, f1, 0.0);
+        let moved_bps = (plain / lifted - 1.0) * 10_000.0;
+        assert!(
+            want > 1.0 && (moved_bps - want).abs() < 0.5,
+            "moved {moved_bps} bps, want {want}"
+        );
+        // A loss gives nothing back: the quote is the plain curve's.
+        let mut engine = curve_engine(Mode::Live);
+        engine.unwind = Some(modules::Unwind::with_tracker(
+            unwind_params(0.002),
+            true,
+            "cngn-usdc",
+            unwind_tracker(&engine, 0.99),
+        ));
+        assert_eq!(buy_amount(&mut engine, "rfq_loss", &prices).await, plain);
+    }
+
+    /// Profit unwind's own preview on a Live curve: the same gain, computed
+    /// and logged, and the plain curve's price on the wire.
+    #[tokio::test]
+    async fn profit_unwind_preview_quotes_the_plain_curve() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let plain = buy_amount(&mut curve_engine(Mode::Live), "rfq_plain", &prices).await;
+        let mut engine = curve_engine(Mode::Live);
+        engine.unwind = Some(modules::Unwind::with_tracker(
+            unwind_params(0.002),
+            false,
+            "cngn-usdc",
+            unwind_tracker(&engine, 1.01),
+        ));
+        let book = engine.books[0].clone();
+        let quote = prices.get("http://feed").unwrap();
+        let input = engine
+            .curve_inputs(&book, &quote, unix_now())
+            .unwind
+            .unwrap();
+        assert!(!input.live && (input.lift.full_ngn - 0.002).abs() < 1e-12);
+        assert_eq!(buy_amount(&mut engine, "rfq_preview", &prices).await, plain);
+    }
+
+    /// A remote signer can take its time. Naira that lands in the balance
+    /// cache meanwhile pulls profit unwind's cost down, and an ask priced on
+    /// the old, higher cost is withheld; a bid, or nothing landing, holds.
+    #[test]
+    fn an_unwound_ask_is_withheld_when_naira_lands_while_signing() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let quote = prices.get("http://feed").unwrap();
+        let mut engine = curve_engine(Mode::Live);
+        let book = engine.books[0].clone();
+        let now = unix_now();
+        let naira_atomic = engine.inventory.view(now).balance(book.collateral).unwrap();
+        let naira = responder::normalized(naira_atomic, book.collateral_decimals);
+        // Naira held at a 1.01 cost against a feed of 1: the lift is on.
+        let tracker = crate::pricing::unwind::Tracker {
+            holder: engine.unwind_holder(&book, "unadjusted"),
+            basis: crate::pricing::unwind::Basis {
+                naira,
+                dollars: naira / 1.01,
+            },
+            snapshot: Some(crate::pricing::unwind::Snapshot {
+                cost_ngn: 1.01,
+                at: now,
+            }),
+        };
+        engine.unwind = Some(modules::Unwind::with_tracker(
+            unwind_params(0.002),
+            true,
+            "cngn-usdc",
+            tracker,
+        ));
+        engine.observe_unwind(&book, &quote, now);
+        let priced = engine.curve_inputs(&book, &quote, now).unwind;
+        assert!(priced.is_some_and(|u| u.live && u.lift.full_ngn > 0.0));
+        // Nothing landed: the ask holds.
+        assert!(engine.unwind_holds_after_signing(&book, priced, false, &prices));
+        // As much naira again lands at the feed while the signer works.
+        let doubled = naira_atomic * U256::from(2u8);
+        engine
+            .inventory
+            .set(book.collateral, doubled, doubled, unix_now());
+        assert!(engine.unwind_holds_after_signing(&book, priced, true, &prices));
+        assert!(!engine.unwind_holds_after_signing(&book, priced, false, &prices));
+    }
+
+    /// The tick folds the wallet into profit unwind's basis: a first read
+    /// starts at the feed, so there is no gain and nothing moves yet. A
+    /// tracker built for another holder starts over the same way.
+    #[test]
+    fn the_first_read_starts_the_basis_at_the_feed() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let quote = prices.get("http://feed").unwrap();
+        let mut engine = curve_engine(Mode::Live);
+        let book = engine.books[0].clone();
+        let now = unix_now();
+        // Someone else's tracker, at a cost far above the feed.
+        let foreign = foreign_unwind_tracker(9.0);
+        engine.unwind = Some(modules::Unwind::with_tracker(
+            unwind_params(2.0),
+            true,
+            "cngn-usdc",
+            foreign.clone(),
+        ));
+        engine.observe_unwind(&book, &quote, now);
+        let t = engine
+            .unwind
+            .as_ref()
+            .unwrap()
+            .tracker("cngn-usdc")
+            .unwrap();
+        assert_ne!(t.holder, foreign.holder);
+        assert_eq!(t.holder.chain_id, engine.chain_id);
+        let snap = t.snapshot.unwrap();
+        assert!((snap.cost_ngn - 1.0).abs() < 1e-12, "{}", snap.cost_ngn);
+        assert_eq!(
+            engine.unwind_shift(&book, &quote, now).unwrap().1.full_ngn,
+            0.0
+        );
+        // The next read, same holder, carries the basis on.
+        engine.observe_unwind(&book, &quote, now + 1);
+        assert_eq!(
+            engine
+                .unwind
+                .as_ref()
+                .unwrap()
+                .tracker("cngn-usdc")
+                .unwrap(),
+            t
+        );
     }
 
     /// The levels a Live curve publishes come off the same curve as its firm
@@ -6902,12 +7183,13 @@ mod tests {
                 collateral: U256::from(10u64).pow(U256::from(book.collateral_decimals)),
                 debt: U256::from(10u64).pow(U256::from(book.debt_decimals)),
             }),
+            unwind: None,
         };
-        let reading = curve_reading_status(book, 1.0 / 1381.40, &inputs, 1, 7).unwrap();
+        let reading = curve_reading_status(book, 1.0 / 1381.40, &inputs, 1, 7, None).unwrap();
         assert!((reading.reference_mid - 1380.78).abs() < 1e-9);
         assert!((reading.feed_price.unwrap() - 1381.40).abs() < 1e-9);
         for unusable in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let reading = curve_reading_status(book, unusable, &inputs, 1, 7).unwrap();
+            let reading = curve_reading_status(book, unusable, &inputs, 1, 7, None).unwrap();
             assert_eq!(reading.feed_price, None, "{unusable}");
         }
     }

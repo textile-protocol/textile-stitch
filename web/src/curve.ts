@@ -7,7 +7,12 @@
 // unit the operator, the reference and both knobs live in. The bot's own order
 // amounts are the reciprocal; the panel never needs them.
 
-import type { CurveModuleConfig, ModulesConfig, ModulesView } from './modules'
+import type {
+  CurveModuleConfig,
+  ModulesConfig,
+  ModulesView,
+  ProfitUnwindConfig,
+} from './modules'
 
 /** One level tick's view of the curve's inputs, as the bot records it in the
  * module status. Prices are NGN per USDT. Mirrors `CurveReading` in
@@ -27,6 +32,25 @@ export interface CurveReading {
    * `price` in Preview, `unadjustedPrice` in Live where the feed serves one.
    * Not the reference mid. Absent from older bots. */
   feed_price?: number | null
+  /** Profit unwind, while it runs. Absent from older releases. */
+  unwind?: UnwindReading | null
+}
+
+/** What profit unwind sees, in NGN per USDT. Mirrors `UnwindReading` in
+ * src/modules/runtime.rs. */
+export interface UnwindReading {
+  /** The frozen average cost the lift is sized on, and when it froze. */
+  cost: number
+  snapshot_at: number
+  /** The feed price the gain is measured against. */
+  feed_mid: number
+  /** Cost minus the feed: positive is a gain per dollar. */
+  gain: number
+  /** How far both sides lift at 100% naira; at share f, this times the
+   * weight at f. */
+  full_shift: number
+  /** Whether the lift quotes, or is profit unwind's preview. */
+  live: boolean
 }
 
 /** One Swap request the curve priced, or answered flat. */
@@ -70,65 +94,244 @@ export interface Curve {
   /** Shade at all naira, bps off the mid. */
   s1: number
   shape: number
+  /** The corridor spread plus the venue fee: what a taker pays. */
   allInBps: number
+  /** The corridor spread alone, the signed order's half-width. The venue
+   * adds its fee on top at fill time, so the bot floors profit unwind's ask
+   * on the order price, before the fee. */
+  spreadBps: number
+  /** Profit unwind's lift on top, when it quotes. */
+  lift?: CurveLift
+}
+
+/** Profit unwind on the curve: an extra shade of `fullNgn * weight(f)`,
+ * averaged over the stretch like the curve's own, with every ask it moves
+ * floored at the cost. Mirrors `Lift` in src/pricing/curve.rs. */
+export interface CurveLift {
+  /** The lift at 100% naira, NGN per USDT, turned into bps against the
+   * curve's own reference mid. */
+  fullNgn: number
+  startPct: number
+  /** The frozen average cost, NGN per USDT. */
+  costNgn: number
 }
 
 /** The curve for this reference and cost, or null when the inputs make none
  * (the bot then quotes flat). `allInBps` is the corridor spread plus the venue
- * fee: the endpoints are the prices a taker actually pays. Negative knobs
- * narrow the curve; once they cross its shades (s1 <= s0, which takes more
- * than crossing the all-in ends) it collapses flat at their midpoint, as the
- * bot does. */
+ * fee: the endpoints are the prices a taker actually pays. `spreadBps` is the
+ * spread alone (no fee when left out). Negative knobs narrow the curve; once
+ * they cross its shades (s1 <= s0, which takes more than crossing the all-in
+ * ends) it collapses flat at their midpoint, as the bot does. */
 export function curveFor(
   reference: CurveReference,
   allInBps: number,
-  config: Knobs
+  config: Knobs,
+  spreadBps: number = allInBps
 ): Curve | null {
   const { mid, half_range_bps: half } = reference
   const { start_below_mid: start, end_above_buy: end, shape } = config
-  const finite = [mid, half, allInBps, start, end, shape].every(Number.isFinite)
+  const finite = [mid, half, allInBps, spreadBps, start, end, shape].every(
+    Number.isFinite
+  )
   if (!finite || mid <= 0 || half <= 0 || shape <= 0) return null
   if (allInBps < 0 || allInBps >= 10_000) return null
+  if (spreadBps < 0 || spreadBps > allInBps) return null
   if (mid - start <= 0) return null
   const buy = mid * (1 + half / 10_000)
   if (buy + end <= 0) return null
   const s0 = ((mid - start) / (mid * (1 + allInBps / 10_000)) - 1) * 10_000
   const s1 = ((buy + end) / (mid * (1 - allInBps / 10_000)) - 1) * 10_000
-  if (s1 > s0) return { mid, s0, s1, shape, allInBps }
+  if (s1 > s0) return { mid, s0, s1, shape, allInBps, spreadBps }
   const flat = (s0 + s1) / 2
-  return { mid, s0: flat, s1: flat, shape, allInBps }
+  return { mid, s0: flat, s1: flat, shape, allInBps, spreadBps }
 }
 
 const clamp01 = (f: number) => Math.min(1, Math.max(0, f))
 
-/** Shade at one naira share, bps off the mid. */
-export function shadeAt(curve: Curve, f: number): number {
-  return curve.s0 + (curve.s1 - curve.s0) * clamp01(f) ** curve.shape
+const startFraction = (startPct: number) =>
+  Math.min(0.99, Math.max(0, startPct / 100))
+
+/** How much of the full lift applies at naira share `f`: none at or below
+ * the start, then rising evenly to all of it at 100%. Mirrors `weight` in
+ * src/pricing/unwind.rs. */
+export function unwindWeight(f: number, startPct: number): number {
+  const start = startFraction(startPct)
+  const share = clamp01(f)
+  return share <= start ? 0 : (share - start) / (1 - start)
 }
 
-/** The shade a quote pays: the mean over the stretch of share it moves
- * through, in either direction. A zero-width stretch is the point shade. */
-export function averageShade(curve: Curve, f0: number, f1: number): number {
+/** The mean of `unwindWeight` over the stretch between `f0` and `f1`, in
+ * either order: what a quote walking it pays. Mirrors `average_weight`. */
+export function averageUnwindWeight(
+  f0: number,
+  f1: number,
+  startPct: number
+): number {
   const lo = Math.min(clamp01(f0), clamp01(f1))
   const hi = Math.max(clamp01(f0), clamp01(f1))
-  if (hi - lo <= Number.EPSILON) return shadeAt(curve, lo)
+  if (hi - lo <= Number.EPSILON) return unwindWeight(lo, startPct)
+  const start = startFraction(startPct)
+  const area = (f: number) =>
+    f <= start ? 0 : (f - start) ** 2 / (2 * (1 - start))
+  return (area(hi) - area(lo)) / (hi - lo)
+}
+
+/** Profit unwind's full lift (at 100% naira) in NGN per USDT for the
+ * draft's knobs, from the bot's frozen cost and the feed it last read.
+ * Mirrors `shift` in src/pricing/unwind.rs, so the editor shows what saving
+ * would quote. */
+export function unwindFullNgn(
+  knobs: Pick<ProfitUnwindConfig, 'share' | 'cap_ngn' | 'min_gain_ngn'>,
+  reading: Pick<UnwindReading, 'cost' | 'feed_mid'>
+): number {
+  const { cost, feed_mid: mid } = reading
+  if (!(Number.isFinite(mid) && mid > 0 && Number.isFinite(cost))) return 0
+  const gain = cost - mid
+  if (gain <= 0 || gain < knobs.min_gain_ngn) return 0
+  const full = Math.min(Math.max(0, knobs.cap_ngn), clamp01(knobs.share) * gain)
+  return Number.isFinite(full) ? full : 0
+}
+
+/** The ask with the lift, NGN per USDT: raised towards the cost but never
+ * past it, and never below where the plain curve already is. Mirrors
+ * `floored_ask_ngn`. */
+export function flooredAskNgn(
+  lifted: number,
+  plain: number,
+  costNgn: number
+): number {
+  if (!(Number.isFinite(costNgn) && costNgn > 0)) return plain
+  return Math.min(lifted, Math.max(plain, costNgn))
+}
+
+/** The most the full lift may be, NGN per USDT, so a lift that falls
+ * between a taker's legs can't pay them: draining the whole book collects at
+ * most `full * (1 - start) / 2`, and a round trip is only sure to cost twice
+ * the spread (the venue fee is per request). Mirrors `lift_limit_ngn` in
+ * src/pricing/unwind.rs. */
+export function liftLimitNgn(
+  spreadBps: number,
+  midNgn: number,
+  startPct: number
+): number {
+  return (4 * (spreadBps / 10_000) * midNgn) / (1 - startFraction(startPct))
+}
+
+/** The same curve with profit unwind's lift on top, held to the round-trip
+ * limit. A lift of zero, or one it can't trust, leaves the curve plain.
+ * Mirrors `Curve::with_lift`. */
+export function withLift(curve: Curve, lift: CurveLift): Curve {
+  const plain: Curve = { ...curve, lift: undefined }
+  const trusted =
+    Number.isFinite(lift.fullNgn) &&
+    Number.isFinite(lift.startPct) &&
+    Number.isFinite(lift.costNgn) &&
+    lift.costNgn > 0
+  const fullNgn = Math.min(
+    lift.fullNgn,
+    liftLimitNgn(curve.spreadBps, curve.mid, lift.startPct)
+  )
+  return trusted && fullNgn > 0
+    ? { ...plain, lift: { ...lift, fullNgn } }
+    : plain
+}
+
+/** Problems with the profit unwind draft, in the words the form shows. */
+export function profitUnwindErrors(
+  config: ProfitUnwindConfig,
+  curveOn: boolean,
+  capLimitNgn: number | null = null
+): string[] {
+  const errors: string[] = []
+  if (
+    !(Number.isFinite(config.share) && config.share >= 0 && config.share <= 1)
+  )
+    errors.push('The share of the gain must be 0–100%.')
+  if (!(Number.isFinite(config.cap_ngn) && config.cap_ngn >= 0))
+    errors.push('The cap must be zero or more.')
+  if (!(Number.isFinite(config.min_gain_ngn) && config.min_gain_ngn >= 0))
+    errors.push('The smallest gain must be zero or more.')
+  if (
+    !(
+      Number.isFinite(config.start_pct) &&
+      config.start_pct >= 0 &&
+      config.start_pct <= 99
+    )
+  )
+    errors.push('The start must be 0–99%.')
+  if (!(Number.isSafeInteger(config.refresh_secs) && config.refresh_secs >= 60))
+    errors.push('The refresh must be at least 60 seconds.')
+  if (config.enabled && !curveOn)
+    errors.push('It moves the inventory curve, so turn the curve on first.')
+  if (config.enabled && capLimitNgn !== null && config.cap_ngn > capLimitNgn)
+    errors.push(
+      `The cap can be at most ${capLimitNgn.toFixed(2)} NGN at today's spread and start. Above that a taker could profit from the lift falling between trades.`
+    )
+  return errors
+}
+
+const plainShadeAt = (curve: Curve, f: number) =>
+  curve.s0 + (curve.s1 - curve.s0) * clamp01(f) ** curve.shape
+
+function plainAverageShade(curve: Curve, f0: number, f1: number): number {
+  const lo = Math.min(clamp01(f0), clamp01(f1))
+  const hi = Math.max(clamp01(f0), clamp01(f1))
+  if (hi - lo <= Number.EPSILON) return plainShadeAt(curve, lo)
   const p = curve.shape + 1
   return (
     curve.s0 + ((curve.s1 - curve.s0) * (hi ** p - lo ** p)) / (p * (hi - lo))
   )
 }
 
+/** The lift at 100% naira in bps off the curve's own reference mid. */
+const liftFullBps = (curve: Curve, lift: CurveLift) =>
+  (lift.fullNgn / curve.mid) * 10_000
+
+/** Shade at one naira share, bps off the mid, profit unwind's lift
+ * included. */
+export function shadeAt(curve: Curve, f: number): number {
+  const lift = curve.lift
+  return (
+    plainShadeAt(curve, f) +
+    (lift ? liftFullBps(curve, lift) * unwindWeight(f, lift.startPct) : 0)
+  )
+}
+
+/** The shade a quote pays: the mean over the stretch of share it moves
+ * through, in either direction. A zero-width stretch is the point shade.
+ * Profit unwind's lift is averaged the same way. */
+export function averageShade(curve: Curve, f0: number, f1: number): number {
+  const lift = curve.lift
+  return (
+    plainAverageShade(curve, f0, f1) +
+    (lift
+      ? liftFullBps(curve, lift) * averageUnwindWeight(f0, f1, lift.startPct)
+      : 0)
+  )
+}
+
 /** The all-in price a taker gets for the stretch, NGN per USDT: what the bot
- * pays in naira per dollar when it buys cNGN, or takes when it sells. */
+ * pays in naira per dollar when it buys cNGN, or takes when it sells. With
+ * profit unwind's lift the ask is floored at the cost as the bot does it: on
+ * the signed order (spread only), and the venue's fee comes off after. */
 export function takerPrice(
   curve: Curve,
   botBuys: boolean,
   f0: number,
   f1: number
 ): number {
-  const centre = curve.mid * (1 + averageShade(curve, f0, f1) / 10_000)
+  const centre = (shade: number) => curve.mid * (1 + shade / 10_000)
   const half = curve.allInBps / 10_000
-  return botBuys ? centre * (1 + half) : centre * (1 - half)
+  const lifted = centre(averageShade(curve, f0, f1))
+  if (botBuys) return lifted * (1 + half)
+  if (!curve.lift) return lifted * (1 - half)
+  const spread = curve.spreadBps / 10_000
+  const order = flooredAskNgn(
+    lifted * (1 - spread),
+    centre(plainAverageShade(curve, f0, f1)) * (1 - spread),
+    curve.lift.costNgn
+  )
+  return (order * (1 - half)) / (1 - spread)
 }
 
 /** The feed price the bot quotes flat around, or null when the reading has

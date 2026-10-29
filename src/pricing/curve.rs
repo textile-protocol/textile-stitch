@@ -92,6 +92,23 @@ pub struct Curve {
     s1: f64,
     shape: f64,
     all_in_bps: f64,
+    /// Profit unwind's lift on top, when it quotes.
+    lift: Option<Lift>,
+}
+
+/// Profit unwind on top of the curve ([`crate::pricing::unwind`]): an extra
+/// shade of `full_ngn * weight(f)`, averaged over the stretch like the
+/// curve's own, with every ask it moves floored at the cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lift {
+    /// The lift at 100% naira, NGN per USDT. The curve turns it into bps
+    /// against its own reference mid, the one its shades apply to.
+    pub full_ngn: f64,
+    /// Where the lift starts, percent naira share.
+    pub start_pct: f64,
+    /// The frozen average cost, NGN per USDT: no ask the lift moves goes past
+    /// it.
+    pub cost_ngn: f64,
 }
 
 impl Curve {
@@ -153,11 +170,54 @@ impl Curve {
             s1,
             shape: p.shape,
             all_in_bps,
+            lift: None,
         })
     }
 
-    /// Shade at one inventory share, bps off the reference mid.
+    /// The same curve with profit unwind's lift on top. At any one share
+    /// both sides lift by the same bps, and a quote pays the lift's mean over
+    /// its stretch, so out and back still cancel to minus the spread. The
+    /// full lift is held to [`Curve::lift_limit_ngn`] at `spread_bps`, the
+    /// signed order's half-width, so a lift that falls between a taker's legs
+    /// can't pay them either. A lift of zero, or one it can't trust, leaves
+    /// the curve plain.
+    pub fn with_lift(self, lift: Lift, spread_bps: f64) -> Self {
+        // Checked before the limit: `f64::min` would turn a NaN into the limit.
+        let trusted = lift.full_ngn.is_finite()
+            && lift.start_pct.is_finite()
+            && lift.cost_ngn.is_finite()
+            && lift.cost_ngn > 0.0;
+        let full_ngn = lift
+            .full_ngn
+            .min(self.lift_limit_ngn(lift.start_pct, spread_bps));
+        Self {
+            lift: (trusted && full_ngn > 0.0).then_some(Lift { full_ngn, ..lift }),
+            ..self
+        }
+    }
+
+    /// The most profit unwind's full lift may be on this curve, NGN per
+    /// USDT: [`crate::pricing::unwind::lift_limit_ngn`] at `spread_bps` and
+    /// this curve's reference mid. Not the all-in: the venue fee is per
+    /// request, so only the spread is a cost every round trip pays.
+    pub fn lift_limit_ngn(&self, start_pct: f64, spread_bps: f64) -> f64 {
+        crate::pricing::unwind::lift_limit_ngn(spread_bps, self.mid, start_pct)
+    }
+
+    /// Shade at one inventory share, bps off the reference mid, lift included.
     pub fn shade_bps(&self, f: f64) -> f64 {
+        self.plain_shade_bps(f)
+            + self.lift.map_or(0.0, |l| {
+                self.lift_full_bps(l) * crate::pricing::unwind::weight(f, l.start_pct)
+            })
+    }
+
+    /// The lift at 100% naira in bps off this curve's reference mid.
+    fn lift_full_bps(&self, lift: Lift) -> f64 {
+        lift.full_ngn / self.mid * 10_000.0
+    }
+
+    fn plain_shade_bps(&self, f: f64) -> f64 {
         self.s0 + (self.s1 - self.s0) * f.clamp(0.0, 1.0).powf(self.shape)
     }
 
@@ -174,13 +234,20 @@ impl Curve {
     ///
     /// Order does not matter, by construction: it is the mean value of the
     /// shade over the interval. A zero-width stretch has no mean, so it falls
-    /// back to the point shade.
+    /// back to the point shade. Profit unwind's lift is averaged the same way.
     pub fn average_shade_bps(&self, f0: f64, f1: f64) -> f64 {
+        self.plain_average_shade_bps(f0, f1)
+            + self.lift.map_or(0.0, |l| {
+                self.lift_full_bps(l) * crate::pricing::unwind::average_weight(f0, f1, l.start_pct)
+            })
+    }
+
+    fn plain_average_shade_bps(&self, f0: f64, f1: f64) -> f64 {
         let (lo, hi) = (f0.clamp(0.0, 1.0), f1.clamp(0.0, 1.0));
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
         let width = hi - lo;
         if width <= f64::EPSILON {
-            return self.shade_bps(lo);
+            return self.plain_shade_bps(lo);
         }
         let p = self.shape + 1.0;
         self.s0 + (self.s1 - self.s0) * (hi.powf(p) - lo.powf(p)) / (p * width)
@@ -203,24 +270,34 @@ impl Curve {
     /// naira in, so the share rises. In NGN per USDT that is the stitch
     /// *selling* dollars, the upper of the two prices; inverted it is the
     /// lower one, which is what a bid must be.
+    ///
+    /// With profit unwind's lift on, the ask (the stitch selling naira) is
+    /// floored at the cost: [`crate::pricing::unwind::floored_ask_ngn`] on
+    /// this order price.
     pub fn price(&self, bid: bool, f0: f64, f1: f64, order_half_bps: f64) -> Option<f64> {
         if !order_half_bps.is_finite() || !(0.0..10_000.0).contains(&order_half_bps) {
             return None;
         }
-        let centre = self.mid * (1.0 + self.average_shade_bps(f0, f1) / 10_000.0);
         let half = order_half_bps / 10_000.0;
+        let centre = |shade_bps: f64| self.mid * (1.0 + shade_bps / 10_000.0);
+        let lifted = centre(self.average_shade_bps(f0, f1));
         // NGN per USDT: selling dollars is the dearer side.
-        let ngn = if bid {
-            centre * (1.0 + half)
-        } else {
-            centre * (1.0 - half)
+        let ngn = match (bid, self.lift) {
+            (true, _) => lifted * (1.0 + half),
+            (false, None) => lifted * (1.0 - half),
+            (false, Some(lift)) => crate::pricing::unwind::floored_ask_ngn(
+                lifted * (1.0 - half),
+                centre(self.plain_average_shade_bps(f0, f1)) * (1.0 - half),
+                lift.cost_ngn,
+            ),
         };
         (ngn.is_finite() && ngn > 0.0).then(|| 1.0 / ngn)
     }
 
     /// Where the stitch stops being the cheapest dollars in the market: the
     /// share at which its all-in selling price reaches the Bybit buy. For the
-    /// shadow log and for tuning the exponent, not for pricing.
+    /// shadow log and for tuning the exponent, not for pricing. Read off the
+    /// plain curve: profit unwind's lift isn't in it.
     pub fn cheapest_until(&self, half_range_bps: f64) -> f64 {
         let target = ((1.0 + half_range_bps / 10_000.0) / (1.0 + self.all_in_bps / 10_000.0) - 1.0)
             * 10_000.0;
@@ -239,7 +316,7 @@ impl Curve {
         t.powf(1.0 / self.shape)
     }
 
-    /// Shade at the two ends, for the shadow log.
+    /// Shade at the two ends of the plain curve, for the shadow log.
     pub fn endpoints_bps(&self) -> (f64, f64) {
         (self.s0, self.s1)
     }
@@ -432,6 +509,130 @@ mod tests {
         assert!(
             ((split / whole - 1.0) * 10_000.0).abs() < 1e-6,
             "split {split} vs whole {whole}"
+        );
+    }
+
+    fn lift(full_ngn: f64, start_pct: f64, cost_ngn: f64) -> Lift {
+        Lift {
+            full_ngn,
+            start_pct,
+            cost_ngn,
+        }
+    }
+
+    #[test]
+    fn the_lift_moves_both_sides_by_the_same_weighted_shade() {
+        // Profit unwind: at every share both prices move by full * w(f).
+        // A cost far above the curve keeps the ask floor out of the way.
+        let base = curve(0.0, 0.0);
+        let up = base.with_lift(lift(1.5, 50.0, MID_NGN * 2.0), ALL_IN);
+        for f in [0.0, 0.3, 0.5, 0.75, 1.0] {
+            let w = crate::pricing::unwind::weight(f, 50.0);
+            let want_bps = 1.5 / MID_NGN * 10_000.0 * w;
+            assert!((up.shade_bps(f) - base.shade_bps(f) - want_bps).abs() < 1e-12);
+            for bid in [true, false] {
+                let a = 1.0 / base.price(bid, f, f, ALL_IN).unwrap();
+                let b = 1.0 / up.price(bid, f, f, ALL_IN).unwrap();
+                let want = 1.5 * w;
+                assert!((b - a - want).abs() < want.max(1e-9) * 1e-3, "{f} {bid}");
+            }
+        }
+        // The lift is NGN off the curve's own reference mid, so a reference
+        // 1% away from the feed still moves the centre by exactly full_ngn.
+        let wide = Curve::new(
+            1.0 / (MID_NGN * 1.01),
+            HALF_RANGE,
+            ALL_IN,
+            &CurveParams::default(),
+        )
+        .unwrap();
+        let wide_up = wide.with_lift(lift(1.0, 0.0, MID_NGN * 2.0), ALL_IN);
+        let centre = |c: &Curve| 1.0 / c.price(true, 1.0, 1.0, 0.0).unwrap();
+        assert!((centre(&wide_up) - centre(&wide) - 1.0).abs() < 1e-9);
+        // Nothing to trust, nothing lifted.
+        assert_eq!(base.with_lift(lift(f64::NAN, 50.0, MID_NGN), ALL_IN), base);
+        assert_eq!(base.with_lift(lift(0.0, 50.0, MID_NGN), ALL_IN), base);
+        assert_eq!(base.with_lift(lift(10.0, 50.0, 0.0), ALL_IN), base);
+    }
+
+    #[test]
+    fn the_lift_is_held_to_the_round_trip_limit() {
+        // 4 x spread x mid / (1 - start): about 0.55 NGN at a 1 bps spread
+        // and start 0, twice that at start 50. The fee isn't in it: it
+        // arrives per request, so only the spread is a cost every round trip
+        // pays. A bigger lift is cut to it.
+        let base = curve(0.0, 0.0);
+        let spread = ALL_IN - 1.0;
+        let limit = base.lift_limit_ngn(0.0, spread);
+        assert!((limit - 4.0 * spread / 10_000.0 * MID_NGN).abs() < 1e-9);
+        assert!((base.lift_limit_ngn(50.0, spread) - 2.0 * limit).abs() < 1e-9);
+        assert_eq!(
+            base.with_lift(lift(10.0, 0.0, MID_NGN * 2.0), spread),
+            base.with_lift(lift(limit, 0.0, MID_NGN * 2.0), spread)
+        );
+        // No spread, no room: the lift is off, whatever the fee.
+        assert_eq!(base.with_lift(lift(1.0, 0.0, MID_NGN * 2.0), 0.0), base);
+    }
+
+    #[test]
+    fn a_round_trip_with_the_lift_never_pays_the_taker() {
+        // The curve's own safety sweep with the lift on: out and back over
+        // the same stretch cancel the lift like the shade, and the ask floor
+        // only makes the return leg dearer. Steep starts included, and costs
+        // that put the floor in play across the range.
+        for (start_pct, cost) in [
+            (0.0, MID_NGN * 2.0),
+            (50.0, MID_NGN * 2.0),
+            (90.0, MID_NGN * 2.0),
+            (50.0, MID_NGN * 1.0005),
+            (90.0, MID_NGN * 1.0002),
+        ] {
+            let c = curve(0.0, 0.0).with_lift(lift(2.0, start_pct, cost), ALL_IN);
+            let mut worst = f64::NEG_INFINITY;
+            for i in 0..=50 {
+                let f0 = f64::from(i) / 50.0;
+                for j in 1..=50 {
+                    let t = f64::from(j) / 50.0;
+                    if f0 + t <= 1.0 {
+                        let f1 = f0 + t;
+                        let out = c.price(true, f0, f1, ALL_IN).unwrap();
+                        let back = c.price(false, f1, f0, ALL_IN).unwrap();
+                        worst = worst.max((out / back - 1.0) * 10_000.0);
+                    }
+                    if f0 - t >= 0.0 {
+                        let f1 = f0 - t;
+                        let out = c.price(false, f0, f1, ALL_IN).unwrap();
+                        let back = c.price(true, f1, f0, ALL_IN).unwrap();
+                        worst = worst.max((back / out - 1.0) * 10_000.0);
+                    }
+                }
+            }
+            assert!(
+                worst <= -2.0 * ALL_IN + 0.05,
+                "start {start_pct}%, cost {cost}: a round trip paid the taker {worst} bps"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lift_never_raises_an_ask_past_the_cost() {
+        // At full naira the plain ask sits about the half-range over the mid.
+        // A cost a few bps over that caps the lifted ask right at it.
+        let base = curve(0.0, 0.0);
+        let plain_ngn = 1.0 / base.price(false, 1.0, 0.98, 1.0).unwrap();
+        let cost = plain_ngn + 0.3;
+        let up = base.with_lift(lift(2.0, 0.0, cost), ALL_IN);
+        let lifted_ngn = 1.0 / up.price(false, 1.0, 0.98, 1.0).unwrap();
+        assert!((lifted_ngn - cost).abs() < 1e-9, "{lifted_ngn} vs {cost}");
+        // The bid keeps the whole lift: the gap only widens.
+        let bid_plain = 1.0 / base.price(true, 0.98, 1.0, 1.0).unwrap();
+        let bid_lifted = 1.0 / up.price(true, 0.98, 1.0, 1.0).unwrap();
+        assert!(bid_lifted - bid_plain > lifted_ngn - plain_ngn);
+        // A cost under the plain ask leaves the plain ask alone.
+        let under = base.with_lift(lift(2.0, 0.0, plain_ngn - 1.0), ALL_IN);
+        assert_eq!(
+            under.price(false, 1.0, 0.98, 1.0),
+            base.price(false, 1.0, 0.98, 1.0)
         );
     }
 

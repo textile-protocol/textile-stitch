@@ -1005,6 +1005,7 @@ mod tests {
                 "[modules.rebalance]",
                 "[modules.liquidity]",
                 "[modules.curve]",
+                "[modules.profit_unwind]",
             ];
             assert_eq!(
                 &headers[..before.len()],

@@ -141,6 +141,26 @@ pub struct CurveReading {
     /// one. Not the reference mid, which only the curve anchors on. Absent in
     /// status written before the bot recorded it.
     pub feed_price: Option<f64>,
+    /// Profit unwind, while it runs. Absent from older bot releases.
+    #[serde(default)]
+    pub unwind: Option<UnwindReading>,
+}
+
+/// What profit unwind sees this tick, in soft currency per dollar.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UnwindReading {
+    /// The frozen average cost the lift is sized on, and when it froze.
+    pub cost: f64,
+    pub snapshot_at: u64,
+    /// The feed price the gain is measured against.
+    pub feed_mid: f64,
+    /// Cost minus the feed: positive is a gain per dollar.
+    pub gain: f64,
+    /// How far both sides lift at 100% corridor currency, in soft currency
+    /// per dollar. At share `f` it's this times the weight at `f`.
+    pub full_shift: f64,
+    /// Whether the lift quotes, or is profit unwind's preview.
+    pub live: bool,
 }
 
 /// One Swap request the curve priced, or answered flat.

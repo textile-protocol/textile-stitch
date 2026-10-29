@@ -5,6 +5,7 @@ import {
   WORKSPACE_MODULES,
   listedModules,
   quoteModuleStatus,
+  quoteModuleUnsaved,
   workspaceModules,
   selectedWorkspaceModule,
   type BotModuleId,
@@ -86,9 +87,7 @@ export default function ModuleWorkspace({
       ? hedgeDirty
       : quotes.view &&
         quotes.draft &&
-        (JSON.stringify(quotes.view.config[id]) !==
-          JSON.stringify(quotes.draft[id]) ||
-          quotes.view.config.mode !== quotes.draft.mode)
+        quoteModuleUnsaved(quotes.view, quotes.draft, id)
   const groups = MODULE_CATEGORIES.map((category) => ({
     category,
     entries: listed.filter(

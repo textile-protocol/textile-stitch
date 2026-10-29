@@ -2070,6 +2070,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn profit_unwind_rides_on_the_curve_and_checks_its_knobs() {
+        // On with the curve: loads with the panel's defaults.
+        let on = curve_bot("", false, "[modules.profit_unwind]\nenabled = true\n");
+        let cfg = Config::from_toml(&on).unwrap();
+        let u = &cfg.modules.profit_unwind;
+        assert!(u.enabled && !u.live && u.share == 0.5 && u.cap_ngn == 2.0);
+        assert!(u.min_gain_ngn == 0.7 && u.start_pct == 50.0 && u.refresh_secs == 900);
+        // It moves the curve, so it needs the curve.
+        let alone = on.replace("[modules.curve]\nenabled = true\n", "");
+        assert!(Config::from_toml(&alone)
+            .unwrap_err()
+            .to_string()
+            .contains("needs [modules.curve]"));
+        for (bad, says) in [
+            ("share = 1.5", "share"),
+            ("cap_ngn = -1.0", "cap_ngn"),
+            ("start_pct = 100.0", "start_pct"),
+            ("refresh_secs = 10", "refresh_secs"),
+        ] {
+            let file = curve_bot(
+                "",
+                false,
+                &format!("[modules.profit_unwind]\nenabled = true\n{bad}\n"),
+            );
+            let err = Config::from_toml(&file).unwrap_err().to_string();
+            assert!(err.contains(says), "{bad}: {err}");
+        }
+    }
+
     /// A live liquidity schedule broadcasts from the operator wallet, so the
     /// panel's one-process-per-key guards must count it; Preview only reads.
     #[test]

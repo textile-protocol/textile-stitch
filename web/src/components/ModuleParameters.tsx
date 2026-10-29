@@ -3,6 +3,7 @@ import type { ModulesConfig, ModulesView } from '../modules'
 import { CurveExample, CurveFields } from './CurveModule'
 import ModulePresets from './ModulePresets'
 import {
+  draftUnwindCapLimit,
   leanConflict,
   liquidityScheduleErrors,
   moduleModes,
@@ -347,7 +348,12 @@ function ModuleExample({
   now: number
 }) {
   const id = useId()
-  const valid = moduleParameterErrors(draft, view.vault ?? true).length === 0
+  const valid =
+    moduleParameterErrors(
+      draft,
+      view.vault ?? true,
+      draftUnwindCapLimit(view, draft, now)
+    ).length === 0
   const enabled = draft[module].enabled
   const breakdown =
     valid && corridor

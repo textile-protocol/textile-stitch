@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
-import { moduleParameterErrors } from './modulePresentation'
+import {
+  draftUnwindCapLimit,
+  moduleParameterErrors,
+} from './modulePresentation'
 import type { ModulesConfig, ModulesView } from './modules'
 import { poll } from './poll'
 
@@ -52,7 +55,11 @@ export function useQuoteModules(
       !draft ||
       !editable ||
       saving.current ||
-      moduleParameterErrors(draft, view.vault ?? true).length
+      moduleParameterErrors(
+        draft,
+        view.vault ?? true,
+        draftUnwindCapLimit(view, draft, Date.now() / 1000)
+      ).length
     )
       return
     saving.current = true

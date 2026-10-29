@@ -24,6 +24,7 @@ pub struct ModulesConfig {
     pub rebalance: RebalanceConfig,
     pub liquidity: LiquidityConfig,
     pub curve: CurveConfig,
+    pub profit_unwind: ProfitUnwindConfig,
 }
 impl Default for ModulesConfig {
     fn default() -> Self {
@@ -34,6 +35,7 @@ impl Default for ModulesConfig {
             rebalance: RebalanceConfig::default(),
             liquidity: LiquidityConfig::default(),
             curve: CurveConfig::default(),
+            profit_unwind: ProfitUnwindConfig::default(),
         }
     }
 }
@@ -107,6 +109,59 @@ impl CurveConfig {
         }
     }
 }
+/// Profit unwind ([`crate::pricing::unwind`]): when the feed has moved so the
+/// corridor currency the bot holds is worth more than when it came in, the
+/// curve lifts by a slice of that gain, so takers bringing dollars clear the
+/// pile faster and the bot keeps the rest. Rides on the inventory curve; off
+/// unless switched on, and only quotes with `live` (and a Live curve). The two
+/// amounts are in the corridor's soft currency, like the curve's offsets.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfitUnwindConfig {
+    pub enabled: bool,
+    /// Quote with the lift. Off, the bot tracks the cost, computes the lift
+    /// and logs the price it would quote, and quotes the plain curve: profit
+    /// unwind's own preview, for a bot whose curve is already Live.
+    pub live: bool,
+    /// Share of the gain passed back as a better price, 0 to 1.
+    pub share: f64,
+    /// The most the curve ever lifts for profit unwind, soft currency per
+    /// dollar.
+    pub cap_ngn: f64,
+    /// Gains smaller than this, soft currency per dollar, move nothing.
+    pub min_gain_ngn: f64,
+    /// The corridor-currency share, in percent, where profit unwind starts.
+    /// Below it nothing moves; above it the lift grows to full at 100%.
+    pub start_pct: f64,
+    /// How often the cost the lift is sized on is frozen again. The gain
+    /// itself follows every price.
+    pub refresh_secs: u64,
+}
+impl Default for ProfitUnwindConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            live: false,
+            share: 0.5,
+            cap_ngn: 2.0,
+            min_gain_ngn: 0.7,
+            start_pct: 50.0,
+            refresh_secs: 900,
+        }
+    }
+}
+impl ProfitUnwindConfig {
+    pub fn params(&self) -> crate::pricing::unwind::UnwindParams {
+        crate::pricing::unwind::UnwindParams {
+            share: self.share,
+            cap_ngn: self.cap_ngn,
+            min_gain_ngn: self.min_gain_ngn,
+            start_pct: self.start_pct,
+            refresh_secs: self.refresh_secs,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct InventoryConfig {
@@ -358,6 +413,29 @@ impl ModulesConfig {
         ensure!(
             c.shape.is_finite() && (0.5..=4.0).contains(&c.shape),
             "modules curve shape must be between 0.5 and 4"
+        );
+        let u = &self.profit_unwind;
+        ensure!(
+            u.share.is_finite() && (0.0..=1.0).contains(&u.share),
+            "modules profit_unwind share must be between 0 and 1"
+        );
+        ensure!(
+            [u.cap_ngn, u.min_gain_ngn]
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0),
+            "modules profit_unwind cap_ngn and min_gain_ngn must be zero or more"
+        );
+        ensure!(
+            u.start_pct.is_finite() && (0.0..=99.0).contains(&u.start_pct),
+            "modules profit_unwind start_pct must be between 0 and 99"
+        );
+        ensure!(
+            u.refresh_secs >= 60,
+            "modules profit_unwind refresh_secs must be at least 60"
+        );
+        ensure!(
+            !u.enabled || c.enabled,
+            "profit unwind moves the inventory curve, so it needs [modules.curve] switched on"
         );
         if let Some(d) = &r.dealer {
             crate::config::assert_feed_url(&d.url, "modules.rebalance.dealer.url")?;

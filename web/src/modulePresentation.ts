@@ -1,4 +1,11 @@
-import { curveConfigErrors, knobLabel, shapeLabel } from './curve'
+import {
+  curveConfigErrors,
+  freshReading,
+  knobLabel,
+  liftLimitNgn,
+  profitUnwindErrors,
+  shapeLabel,
+} from './curve'
 import { formatAtomic } from './format'
 import {
   isWarmingUp,
@@ -11,6 +18,7 @@ import {
   type ModuleStatus,
   type ModulesConfig,
   type ModulesView,
+  type ProfitUnwindConfig,
   type Weekday,
 } from './modules'
 
@@ -219,6 +227,24 @@ const editableSettings: readonly [
     shownPriceOffset,
   ],
   ['Curve shape', (c) => c.curve.shape, (v) => shapeLabel(Number(v))],
+  ['Profit unwind', (c) => unwind(c).enabled, shownSwitch],
+  [
+    'Profit unwind quotes',
+    (c) => unwind(c).live,
+    (v) => (v ? 'Live' : 'Preview'),
+  ],
+  [
+    'Share of gain given back',
+    (c) => unwind(c).share,
+    (v) => (Number.isFinite(v) ? `${Math.round(Number(v) * 100)}%` : '—'),
+  ],
+  ['Cap', (c) => unwind(c).cap_ngn, shownPriceOffset],
+  ['Ignore gains under', (c) => unwind(c).min_gain_ngn, shownPriceOffset],
+  [
+    'Start profit unwind at',
+    (c) => unwind(c).start_pct,
+    (v) => (Number.isFinite(v) ? `${v}% naira` : '—'),
+  ],
 ]
 
 /** What saving would change, in form order. `Object.is` so an empty field
@@ -241,7 +267,8 @@ export const moduleChanges = (
  * related setting silently when a slider moves. */
 export function moduleParameterErrors(
   c: ModulesConfig,
-  vault = true
+  vault = true,
+  unwindCapLimitNgn: number | null = null
 ): string[] {
   const i = c.inventory,
     s = c.spreads,
@@ -278,6 +305,9 @@ export function moduleParameterErrors(
     ...liquidityScheduleErrors(c.liquidity),
     ...liquidityAuthorityErrors(c.liquidity, c.mode),
     ...curveConfigErrors(c.curve).map((m) => `Inventory curve: ${m}`),
+    ...profitUnwindErrors(unwind(c), c.curve.enabled, unwindCapLimitNgn).map(
+      (m) => `Profit unwind: ${m}`
+    ),
     vault &&
       c.curve.enabled &&
       c.inventory.enabled &&
@@ -331,6 +361,46 @@ export const defaultCurve = (): CurveModuleConfig => ({
   end_above_buy: 0,
   shape: 2,
 })
+/** The corridor's one bps spread, or null when the two sides differ or
+ * either is absolute: the curve then can't run, and says so. */
+export function equalSpreadBps(view: Pick<ModulesView, 'corridor_spreads'>) {
+  const sides = [view.corridor_spreads.buy, view.corridor_spreads.sell].filter(
+    (s) => s !== null
+  )
+  const first = sides[0]
+  return first &&
+    sides.every((s) => s.kind === 'bps' && s.value === first.value)
+    ? first.value
+    : null
+}
+
+/** The most the draft's profit unwind cap may be at the bot's last reading:
+ * the round-trip limit at the corridor spread, its mid and the draft's start.
+ * Null without a fresh reading; the bot holds the lift to it when it quotes. */
+export function draftUnwindCapLimit(
+  view: ModulesView,
+  draft: ModulesConfig,
+  now: number
+): number | null {
+  const reading = freshReading(view.status?.curve, now)
+  const spread = equalSpreadBps(view)
+  if (!reading || spread === null) return null
+  return liftLimitNgn(spread, reading.reference_mid, unwind(draft).start_pct)
+}
+
+/** Server defaults for a config saved before profit unwind existed. */
+export const defaultProfitUnwind = (): ProfitUnwindConfig => ({
+  enabled: false,
+  live: false,
+  share: 0.5,
+  cap_ngn: 2,
+  min_gain_ngn: 0.7,
+  start_pct: 50,
+  refresh_secs: 900,
+})
+/** A config's profit unwind, with the server defaults when it predates it. */
+export const unwind = (c: ModulesConfig): ProfitUnwindConfig =>
+  c.profit_unwind ?? defaultProfitUnwind()
 export const defaultLiquidity = (): LiquidityConfig => ({
   enabled: false,
   open_utc: '08:00',

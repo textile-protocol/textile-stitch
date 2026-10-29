@@ -142,6 +142,25 @@ export function listedModules(
   )
 }
 
+/** The config blocks a quote module owns. Profit unwind rides on the curve
+ * and is edited in its section, so its block is the curve's too. */
+const configKeys = (id: ModuleKey): (keyof ModulesConfig)[] =>
+  id === 'curve' ? ['curve', 'profit_unwind'] : [id]
+
+/** Whether the draft changes anything this module owns, or the shared mode. */
+export function quoteModuleUnsaved(
+  view: ModulesView,
+  draft: ModulesConfig,
+  id: ModuleKey
+): boolean {
+  return (
+    view.config.mode !== draft.mode ||
+    configKeys(id).some(
+      (key) => JSON.stringify(view.config[key]) !== JSON.stringify(draft[key])
+    )
+  )
+}
+
 export function quoteModuleStatus(
   view: ModulesView,
   key: ModuleKey,

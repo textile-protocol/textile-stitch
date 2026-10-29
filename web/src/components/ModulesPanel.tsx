@@ -9,6 +9,7 @@ import ModuleSaveBar from './ModuleSaveBar'
 import { pairSymbols } from './SpreadExample'
 import {
   corridorSpreads,
+  draftUnwindCapLimit,
   liveReading,
   moduleChanges,
   moduleParameterErrors,
@@ -67,7 +68,11 @@ export default function ModulesPanel({
   // Older panels only served vault bots.
   const vault = view.vault ?? true
   const status = view.status
-  const parameterErrors = moduleParameterErrors(draft, vault)
+  const parameterErrors = moduleParameterErrors(
+    draft,
+    vault,
+    draftUnwindCapLimit(view, draft, now)
+  )
   const valid = parameterErrors.length === 0
   // Corridor names use " / ", "→" or "↔" depending on where they were listed.
   const symbols = pairSymbols(pair)

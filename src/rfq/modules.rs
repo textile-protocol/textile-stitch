@@ -22,6 +22,70 @@ pub(super) fn book_curve(cfg: &Config) -> Option<super::responder::BookCurve> {
     })
 }
 
+/// Profit unwind's process-scoped state: the knobs, each corridor's tracker,
+/// and the bases saved by an earlier run. Outlives sessions like the
+/// reservation ledger, so a reconnect keeps the basis and the snapshot.
+pub(super) struct Unwind {
+    params: crate::pricing::unwind::UnwindParams,
+    /// `[modules.profit_unwind].live`: quote with the lift, or preview it.
+    live: bool,
+    /// Which feed price marks the naira, as saved with each basis.
+    price: &'static str,
+    path: Option<std::path::PathBuf>,
+    /// What the file held at startup. A corridor picks its entry up on its
+    /// first read, if the entry is its holder's and recent.
+    saved: std::collections::BTreeMap<String, crate::pricing::unwind::Saved>,
+    trackers: Mutex<std::collections::BTreeMap<String, crate::pricing::unwind::Tracker>>,
+}
+
+#[cfg(test)]
+impl Unwind {
+    /// A runtime holding one corridor's tracker, for end-to-end tests.
+    pub(super) fn with_tracker(
+        params: crate::pricing::unwind::UnwindParams,
+        live: bool,
+        slug: &str,
+        tracker: crate::pricing::unwind::Tracker,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            params,
+            live,
+            price: "unadjusted",
+            path: None,
+            saved: Default::default(),
+            trackers: Mutex::new([(slug.to_string(), tracker)].into_iter().collect()),
+        })
+    }
+
+    pub(super) fn tracker(&self, slug: &str) -> Option<crate::pricing::unwind::Tracker> {
+        self.trackers.lock().ok()?.get(slug).cloned()
+    }
+}
+
+/// Profit unwind when it runs: on top of a running curve, switched on.
+pub(super) fn unwind_runtime(cfg: &Config, config_dir: Option<&Path>) -> Option<Arc<Unwind>> {
+    use crate::pricing::feed::PriceBasis;
+    use crate::pricing::unwind::{load_bases, BASIS_FILE};
+    if book_curve(cfg).is_none() || !cfg.modules.profit_unwind.enabled {
+        return None;
+    }
+    let path = config_dir.map(|dir| dir.join(BASIS_FILE));
+    if path.is_none() {
+        warn!("profit unwind basis is memory-only: no config dir to persist it");
+    }
+    Some(Arc::new(Unwind {
+        params: cfg.modules.profit_unwind.params(),
+        live: cfg.modules.profit_unwind.live,
+        price: match cfg.price_basis() {
+            PriceBasis::Served => "served",
+            PriceBasis::Unadjusted => "unadjusted",
+        },
+        saved: path.as_deref().map(load_bases).unwrap_or_default(),
+        path,
+        trackers: Mutex::new(Default::default()),
+    }))
+}
+
 /// Signing has no execution authority. Only the engine that owns the current
 /// reservation ledger may release the result; disconnecting drops this receiver.
 pub(super) struct PendingRebalance {
@@ -87,7 +151,145 @@ impl Engine {
         super::responder::CurveInputs {
             reference: quote.reference_book(),
             holdings: self.curve_holdings(book, now),
+            unwind: self.unwind_input(book, quote, now),
         }
+    }
+
+    /// After signing an ask: fold in the balances that landed while the
+    /// signer worked, and say whether the unwind input it was priced with
+    /// still holds ([`super::responder::unwind_still_holds`]). Bids always
+    /// hold: a stale, higher lift there only asks the taker for more naira.
+    pub(super) fn unwind_holds_after_signing(
+        &self,
+        book: &CorridorBook,
+        priced: Option<super::responder::UnwindInput>,
+        bid: bool,
+        prices: &crate::pricing::cache::PriceCache,
+    ) -> bool {
+        if bid || self.unwind.is_none() {
+            return true;
+        }
+        let now = unix_now();
+        let current = prices.get(&book.feed_url).and_then(|quote| {
+            self.observe_unwind(book, &quote, now);
+            self.unwind_input(book, &quote, now)
+        });
+        super::responder::unwind_still_holds(priced, current)
+    }
+
+    /// Whose naira profit unwind tracks for `book`: the vault's, or the
+    /// wallet's, on this chain and pair, marked against this bot's feed price.
+    pub(super) fn unwind_holder(
+        &self,
+        book: &CorridorBook,
+        price: &str,
+    ) -> crate::pricing::unwind::Holder {
+        let holder = self.vault.unwrap_or_else(|| self.signer.address());
+        crate::pricing::unwind::Holder {
+            chain_id: self.chain_id,
+            address: format!("{holder:#x}"),
+            collateral: format!("{:#x}", book.collateral),
+            debt: format!("{:#x}", book.debt),
+            price: price.to_string(),
+        }
+    }
+
+    /// Fold this tick's naira balance into profit unwind's cost basis and
+    /// refresh its snapshot when due, saving it when it moved. The feed price,
+    /// not the reference mid, values the naira: the bot marks cNGN off its own
+    /// feed.
+    pub(super) fn observe_unwind(&self, book: &CorridorBook, quote: &Quote, now: u64) {
+        let Some(unwind) = &self.unwind else {
+            return;
+        };
+        if book.curve.is_none() || !(quote.price.is_finite() && quote.price > 0.0) {
+            return;
+        }
+        let Some(holdings) = self.curve_holdings(book, now) else {
+            return;
+        };
+        let naira = super::responder::normalized(holdings.collateral, book.collateral_decimals);
+        let holder = self.unwind_holder(book, unwind.price);
+        let Ok(mut trackers) = unwind.trackers.lock() else {
+            return;
+        };
+        let prev = trackers.get(&book.slug);
+        let next = match prev {
+            Some(t) if t.holder == holder => {
+                t.observe(naira, 1.0 / quote.price, now, unwind.params.refresh_secs)
+            }
+            // First read this run, or the holder changed under it: the saved
+            // basis only on a first read, and only if it's this holder's.
+            _ => crate::pricing::unwind::Tracker::open(
+                prev.is_none()
+                    .then(|| unwind.saved.get(&book.slug))
+                    .flatten(),
+                holder,
+                naira,
+                1.0 / quote.price,
+                now,
+                unwind.params.refresh_secs,
+            ),
+        };
+        if prev == Some(&next) {
+            return;
+        }
+        trackers.insert(book.slug.clone(), next);
+        if let Some(path) = &unwind.path {
+            let bases = trackers
+                .iter()
+                .map(|(slug, t)| (slug.clone(), t.saved(now)))
+                .collect();
+            if let Err(e) = crate::pricing::unwind::save_bases(path, bases) {
+                warn!(error = %format!("{e:#}"), path = %path.display(), "profit unwind basis not saved; a restart starts it over at the feed");
+            }
+        }
+    }
+
+    /// Profit unwind's lift for `book` at this price, with the snapshot it
+    /// was sized on; `None` while it doesn't run or has no snapshot yet.
+    pub(super) fn unwind_shift(
+        &self,
+        book: &CorridorBook,
+        quote: &Quote,
+        now: u64,
+    ) -> Option<(
+        crate::pricing::unwind::Snapshot,
+        crate::pricing::unwind::Shift,
+    )> {
+        let unwind = self.unwind.as_ref()?;
+        book.curve?;
+        let snapshot = unwind.trackers.lock().ok()?.get(&book.slug)?.snapshot?;
+        (quote.price > 0.0).then(|| {
+            let shift =
+                crate::pricing::unwind::shift(&unwind.params, &snapshot, 1.0 / quote.price, now);
+            (snapshot, shift)
+        })
+    }
+
+    /// What the curve prices profit unwind with: the lift sized off the
+    /// snapshot, and whether it quotes.
+    fn unwind_input(
+        &self,
+        book: &CorridorBook,
+        quote: &Quote,
+        now: u64,
+    ) -> Option<super::responder::UnwindInput> {
+        let unwind = self.unwind.as_ref()?;
+        let (snapshot, shift) = self.unwind_shift(book, quote, now)?;
+        Some(super::responder::UnwindInput {
+            lift: crate::pricing::curve::Lift {
+                full_ngn: shift.full_ngn,
+                start_pct: unwind.params.start_pct,
+                cost_ngn: snapshot.cost_ngn,
+            },
+            live: unwind.live,
+        })
+    }
+
+    /// Whether profit unwind's lift quotes, for the module status.
+    pub(super) fn unwind_live(&self) -> bool {
+        self.unwind.as_ref().is_some_and(|u| u.live)
     }
 
     /// A wallet bot's share is its raw wallet balances. A vault's is its free

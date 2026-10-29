@@ -87,6 +87,27 @@ shape = 2.0            # 0.5 to 4
 
 **Going Live on a Textile corridor.** Textile's served `price` carries the admin's manual centre adjustments, the hand-made version of this lean. In Live the bot reads `unadjustedPrice` instead, the same observation before those adjustments, for everything it quotes (flat fallbacks and the jump guard included), so the knobs never reach a curve bot and going Live is one switch. Preview keeps the served price, since that's what it answers at. The knobs keep moving every other consumer of the centre.
 
+## Profit unwind
+
+Profit unwind rides on the inventory curve. The bot keeps an average cost for the corridor currency it holds (NGN per USDT) from its own balance reads. Every naira that comes in, bought or deposited, enters at the feed of the read it lands in, and every naira that goes out leaves at the average cost. So the cost is what the naira was worth when it came in, the spread the bot earned on a fill is never counted as gain, and a taker's trade can only pull the cost towards the feed. When the feed then moves below that cost, the naira held is worth more than it was, and the curve lifts by a slice of the gain: takers bringing dollars get more naira for them, so the pile clears faster.
+
+The lift is a shade like the curve's own. It's `min(cap_ngn, share x gain)` NGN at 100% naira, scaled down evenly to nothing at `start_pct`, applied off the curve's reference mid, and a quote pays its average over the stretch of share it walks. Each quote also holds the full lift to `4 x spread x mid / (1 - start)` (about 0.55 NGN at a 1 bps spread and start 0, 1.1 NGN at start 50), so a taker can't profit from the lift falling between their trades. It counts the spread, not the venue fee, because the fee is per request and the legs of a round trip needn't pay the same one. The panel shows the limit next to the cap and won't save a cap above it. Out and back over the same stretch cancel, so a round trip still costs the taker the spread twice, before or after a refresh. The ask is floored at the average cost: the lift never makes the bot pay out more naira per dollar than the naira was worth when it came in. (A plain curve that already sells under cost near full is left as it is.)
+
+```toml
+[modules.profit_unwind]
+enabled = false      # needs [modules.curve] on
+live = false         # quote with it; off, the bot computes and logs the lifted price and quotes the plain curve
+share = 0.5          # share of the gain given back as a better price, 0 to 1
+cap_ngn = 2.0        # the most the curve ever lifts, NGN per USDT
+min_gain_ngn = 0.7   # gains under this move nothing
+start_pct = 50.0     # off at or below this naira share, rising evenly to full at 100%
+refresh_secs = 900   # how often the cost is frozen again
+```
+
+The lift only quotes with `live = true` on a Live curve. With `live = false` it's profit unwind's own preview: each curve quote's log line carries the cost, the full lift and the price it would have quoted (`unwound`) next to the one that went out. The gain follows the feed on every price; the cost is frozen every `refresh_secs`, except that new naira pulling it down lowers it at once, so the floor never sits above what's held.
+
+The basis is saved in `profit-unwind-basis.json` next to `stitch.toml`, with the chain, the wallet or vault, the pair and the feed price it was marked against. A restart only carries it on for the same holder, and only if it was saved within twice `refresh_secs`. Anything else (another wallet or vault, Preview vs Live, unwind switched off for a while, a missing or unreadable file) starts over at the feed, so nothing moves until a real gain builds. The Parameters page shows the frozen cost, the feed, the gain and the lift at full and at today's share, and the curve it draws includes the lift once it quotes. The full design and its decision log are in [the profit unwind spec](cngn-profit-unwind-spec.md).
+
 ## Liquidity schedule
 
 A vault with a yield adapter stakes all liquid settlement above its floor (`minLiquidSettlement`) in Aave. The venue only lets a vault order into a multi-maker bundle when it fits under that floor, because anything above it can be staked again between admission and broadcast. Settlement in Aave is still quotable, but only for single-order fills through the VaultOrderExecutor, which pulls it back first. So the floor decides how much of the vault can take part in bundles and how much earns yield.

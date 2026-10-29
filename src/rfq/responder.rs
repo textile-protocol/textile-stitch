@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, U256};
 
 use crate::config::{PoolConfig, RfqCapacity};
-use crate::pricing::curve::{self, Curve, CurveParams};
+use crate::pricing::curve::{self, Curve, CurveParams, Lift};
 use crate::pricing::quote::{ask_price, bid_price, Spread};
 use crate::pricing::tick::is_price_usable;
 
@@ -66,6 +66,36 @@ pub struct CurveInputs {
     pub reference: Option<(f64, f64)>,
     /// What the share is made of. `None` when there is no fresh reading.
     pub holdings: Option<Holdings>,
+    /// Profit unwind's lift ([`crate::pricing::unwind`]). `None` while it
+    /// doesn't run or has no cost to size on.
+    pub unwind: Option<UnwindInput>,
+}
+
+/// Profit unwind's lift for this tick, and whether it quotes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnwindInput {
+    pub lift: Lift,
+    /// False in profit unwind's own preview: the lifted price is computed
+    /// and logged, and the plain curve's goes out.
+    pub live: bool,
+}
+
+/// Whether an ask priced with profit unwind's `priced` input may still go
+/// out after signing, given the input the bot would price with `now`.
+///
+/// The lift only costs the stitch on an ask, and only by sitting on a cost
+/// that has since fallen: naira that lands while a remote signer works pulls
+/// the cost, the lift and the ask floor down. So a live lift holds while the
+/// cost it was sized on is no higher than today's, and fails if profit unwind
+/// has nothing to price off any more. A quote priced without a lift, or in the
+/// preview, holds whatever happened.
+pub fn unwind_still_holds(priced: Option<UnwindInput>, now: Option<UnwindInput>) -> bool {
+    match priced {
+        Some(p) if p.live && p.lift.full_ngn > 0.0 => {
+            now.is_some_and(|n| n.lift.cost_ngn >= p.lift.cost_ngn)
+        }
+        _ => true,
+    }
 }
 
 /// The bot's holdings of the corridor's two tokens, atomic. A wallet bot's
@@ -286,9 +316,16 @@ pub enum CurveNote {
         f0: f64,
         /// Where this quote would leave the share.
         f1: f64,
-        /// The curve's two endpoint shades, bps off the reference mid.
+        /// The plain curve's two endpoint shades, bps off the reference mid.
         s0: f64,
         s1: f64,
+        /// Profit unwind's lift, when it runs, held to the curve's round-trip
+        /// limit. In its preview `curved` is the plain curve's price and
+        /// `unwound` what the lift would have quoted.
+        unwind: Option<UnwindInput>,
+        /// The price with profit unwind's lift (and its ask floor) for the
+        /// same stretch, debt per collateral, live or preview.
+        unwound: Option<f64>,
         /// The quoted size and this side's already-promised size, both valued
         /// in debt units.
         size_debt: f64,
@@ -317,7 +354,9 @@ pub const MAX_REFERENCE_GAP_BPS: f64 = 100.0;
 /// levels they are judged against, so the two cannot drift apart.
 #[derive(Debug, Clone, Copy)]
 struct CurveStart {
-    curve: Curve,
+    /// The curve without profit unwind.
+    plain: Curve,
+    unwind: Option<UnwindInput>,
     /// The side's bps spread: the half-width of the signed order.
     order_half_bps: f64,
     half_range_bps: f64,
@@ -345,9 +384,22 @@ impl CurveStart {
         }
     }
 
-    /// The signed order's price for the stretch `[from, to]`.
+    /// The signed order's price for the stretch `[from, to]`: lifted when
+    /// profit unwind quotes, plain otherwise.
     fn price(&self, bid: bool, from: f64, to: f64) -> Option<f64> {
-        self.curve.price(bid, from, to, self.order_half_bps)
+        match self.unwind {
+            Some(u) if u.live => self.unwound_price(bid, from, to),
+            _ => self.plain.price(bid, from, to, self.order_half_bps),
+        }
+    }
+
+    /// The price profit unwind's lift gives the same stretch, whether it
+    /// quotes or previews. `None` while it doesn't run.
+    fn unwound_price(&self, bid: bool, from: f64, to: f64) -> Option<f64> {
+        let u = self.unwind?;
+        self.plain
+            .with_lift(u.lift, self.order_half_bps)
+            .price(bid, from, to, self.order_half_bps)
     }
 }
 
@@ -397,7 +449,7 @@ fn curve_start(
     {
         return Err("the reference book is more than 1% from the guarded print");
     }
-    let curve = Curve::new(reference_mid, half_range_bps, all_in_bps, params)
+    let plain = Curve::new(reference_mid, half_range_bps, all_in_bps, params)
         .ok_or("these inputs make no curve")?;
     // The share is made of what the bot holds, never what it can promise:
     // capacity is capped by Permit2 allowances and vault policy, and a leg
@@ -432,7 +484,8 @@ fn curve_start(
         (f_wallet - advance).clamp(0.0, 1.0)
     };
     Ok(CurveStart {
-        curve,
+        plain,
+        unwind: inputs.unwind,
         // The signed order carries the SPREAD alone: the venue injects
         // fee_bps on the amounts (max_fitting_output / gross_of in
         // quote_at_price), so an order priced at the all-in would charge the
@@ -522,7 +575,7 @@ pub fn decide_quote_curved(
         return flat_because("the curve produced no finite price");
     };
     let note = |live, curved, f1, plan: &QuotePlan| {
-        let (s0, s1) = start.curve.endpoints_bps();
+        let (s0, s1) = start.plain.endpoints_bps();
         CurveNote::Priced {
             live,
             flat,
@@ -532,9 +585,21 @@ pub fn decide_quote_curved(
             f1,
             s0,
             s1,
+            unwind: start.unwind.map(|u| UnwindInput {
+                lift: Lift {
+                    full_ngn: u.lift.full_ngn.min(
+                        start
+                            .plain
+                            .lift_limit_ngn(u.lift.start_pct, start.order_half_bps),
+                    ),
+                    ..u.lift
+                },
+                ..u
+            }),
+            unwound: start.unwound_price(bid, start.f0, f1),
             size_debt: debt_leg(plan, bid, book),
             promised_debt: start.promised,
-            cheapest_until: start.curve.cheapest_until(start.half_range_bps),
+            cheapest_until: start.plain.cheapest_until(start.half_range_bps),
         }
     };
     if !book_curve.live {
@@ -580,7 +645,8 @@ fn debt_leg(plan: &QuotePlan, bid: bool, book: &CorridorBook) -> f64 {
     )
 }
 
-fn normalized(amount: U256, decimals: u8) -> f64 {
+/// An atomic amount in whole token units.
+pub(super) fn normalized(amount: U256, decimals: u8) -> f64 {
     saturating_u128(amount) as f64 / 10f64.powi(i32::from(decimals))
 }
 
@@ -1718,6 +1784,7 @@ mod tests {
                 .balance(b.collateral)
                 .zip(inv.balance(b.debt))
                 .map(|(collateral, debt)| Holdings { collateral, debt }),
+            unwind: None,
         }
     }
     fn curved(
@@ -2018,6 +2085,391 @@ mod tests {
         assert!(
             (-4.4..-3.5).contains(&realized_bps),
             "realized round trip should cost about 4 bps, got {realized_bps}"
+        );
+    }
+
+    // ---- profit unwind on the curve -------------------------------------
+
+    fn unwind_params(start_pct: f64) -> crate::pricing::unwind::UnwindParams {
+        crate::pricing::unwind::UnwindParams {
+            share: 0.5,
+            cap_ngn: 2.0,
+            min_gain_ngn: 0.7,
+            start_pct,
+            refresh_secs: 900,
+        }
+    }
+
+    fn unwind_holder() -> crate::pricing::unwind::Holder {
+        crate::pricing::unwind::Holder {
+            chain_id: 8453,
+            address: "0x00000000000000000000000000000000000000a1".into(),
+            collateral: COLLATERAL.to_lowercase(),
+            debt: DEBT.to_lowercase(),
+            price: "unadjusted".into(),
+        }
+    }
+
+    /// What the host hands the curve for profit unwind off `tracker` at the
+    /// fixture's feed (the reference mid).
+    fn unwind_input(
+        tracker: &crate::pricing::unwind::Tracker,
+        p: &crate::pricing::unwind::UnwindParams,
+        now: u64,
+        live: bool,
+    ) -> Option<UnwindInput> {
+        let snap = tracker.snapshot?;
+        let shift = crate::pricing::unwind::shift(p, &snap, MID_NGN, now);
+        Some(UnwindInput {
+            lift: Lift {
+                full_ngn: shift.full_ngn,
+                start_pct: p.start_pct,
+                cost_ngn: snap.cost_ngn,
+            },
+            live,
+        })
+    }
+
+    fn holdings_view(collateral: U256, debt: U256) -> InventoryView {
+        InventoryView::new(HashMap::from([
+            (COLLATERAL.parse().unwrap(), collateral),
+            (DEBT.parse().unwrap(), debt),
+        ]))
+    }
+
+    /// The wallet after `plan` fills: the maker pays `input`, takes `output`.
+    fn filled(collateral: U256, debt: U256, plan: &QuotePlan) -> (U256, U256) {
+        if plan.bid {
+            (collateral + plan.output, debt - plan.input)
+        } else {
+            (collateral - plan.input, debt + plan.output)
+        }
+    }
+
+    fn quote_unwound(
+        b: &CorridorBook,
+        req: &QuoteRequestFrame,
+        reference: Option<(f64, f64)>,
+        held: (U256, U256),
+        unwind: Option<UnwindInput>,
+    ) -> (QuotePlan, Option<CurveNote>) {
+        let inv = holdings_view(held.0, held.1);
+        let inputs = CurveInputs {
+            unwind,
+            ..inputs(b, &inv, reference)
+        };
+        decide_quote_curved(
+            b,
+            req,
+            ref_mid(),
+            &inputs,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            &inv,
+        )
+        .unwrap()
+    }
+
+    /// The taker's realized round trip, in bps of what they started with:
+    /// sell `amount` of `first`, wait out a profit unwind refresh, sell
+    /// everything they got straight back.
+    #[allow(clippy::too_many_arguments)]
+    fn round_trip_across_a_refresh(
+        b: &CorridorBook,
+        reference: Option<(f64, f64)>,
+        p: &crate::pricing::unwind::UnwindParams,
+        held: (U256, U256),
+        entry_ngn: f64,
+        first: (&str, &str),
+        amount: U256,
+    ) -> f64 {
+        let t0 = 1_000_000;
+        let naira = |c: U256| normalized(c, b.collateral_decimals);
+        // The naira came in at `entry_ngn`; the feed has since moved to the
+        // reference mid.
+        let tracker = crate::pricing::unwind::Tracker::open(
+            None,
+            unwind_holder(),
+            naira(held.0),
+            entry_ngn,
+            t0,
+            p.refresh_secs,
+        );
+        let mut leg1 = request(first.0, first.1);
+        leg1.sell_amount = Some(amount.to_string());
+        let (plan1, _) = quote_unwound(
+            b,
+            &leg1,
+            reference,
+            held,
+            unwind_input(&tracker, p, t0, true),
+        );
+        let after = filled(held.0, held.1, &plan1);
+        // The fill lands, and the snapshot refreshes with the feed unmoved.
+        let tracker = tracker
+            .observe(naira(after.0), MID_NGN, t0 + 10, p.refresh_secs)
+            .observe(naira(after.0), MID_NGN, t0 + p.refresh_secs, p.refresh_secs);
+        let mut leg2 = request(first.1, first.0);
+        leg2.sell_amount = Some(plan1.buy_amount.to_string());
+        let (plan2, _) = quote_unwound(
+            b,
+            &leg2,
+            reference,
+            after,
+            unwind_input(&tracker, p, t0 + p.refresh_secs, true),
+        );
+        let start = u128::try_from(plan1.sell_amount).unwrap() as f64;
+        let end = u128::try_from(plan2.buy_amount).unwrap() as f64;
+        (end / start - 1.0) * 10_000.0
+    }
+
+    #[test]
+    fn a_round_trip_across_a_profit_unwind_refresh_never_pays_the_taker() {
+        // The spec's required harness (§5, §9.1): taker-realized amounts,
+        // venue fee on both legs, the first leg moving the share and the
+        // cost before the snapshot refreshes, the second leg after it. Gains
+        // big enough that the cap binds, steep starts, a wide reference book
+        // and a widened end, both directions, every size the wallet allows.
+        let total = 300_000.0;
+        let mut worst = f64::NEG_INFINITY;
+        for (half_range, end_above_buy) in [(HALF_RANGE, 0.0), (30.0, 2.0)] {
+            let b = curve_book(Mode::Live, 0.0, end_above_buy);
+            let reference = Some((ref_mid(), half_range));
+            for start_pct in [0.0, 50.0, 90.0] {
+                let p = unwind_params(start_pct);
+                for gain_ngn in [1.0, 6.0, 20.0] {
+                    for share in [0.55, 0.75, 0.9, 0.97] {
+                        let coll = (total * share / ref_mid() * 1e6).round() as u128;
+                        let debt = (total * (1.0 - share) * 1e6).round() as u128;
+                        let held = (U256::from(coll), U256::from(debt));
+                        for size_usd in [5_000.0, 30_000.0, 90_000.0] {
+                            // Taker sells naira first: bounded by our dollars.
+                            if size_usd < total * (1.0 - share) {
+                                let amount = U256::from((size_usd / ref_mid() * 1e6) as u128);
+                                worst = worst.max(round_trip_across_a_refresh(
+                                    &b,
+                                    reference,
+                                    &p,
+                                    held,
+                                    MID_NGN + gain_ngn,
+                                    (COLLATERAL, DEBT),
+                                    amount,
+                                ));
+                            }
+                            // Taker buys naira first: bounded by our naira.
+                            if size_usd < total * share {
+                                let amount = U256::from((size_usd * 1e6) as u128);
+                                worst = worst.max(round_trip_across_a_refresh(
+                                    &b,
+                                    reference,
+                                    &p,
+                                    held,
+                                    MID_NGN + gain_ngn,
+                                    (DEBT, COLLATERAL),
+                                    amount,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("worst round trip across a refresh: {worst:.3} bps");
+        assert!(
+            worst < -3.0,
+            "a round trip across a refresh paid the taker {worst} bps"
+        );
+    }
+
+    #[test]
+    fn a_drain_dilute_return_round_trip_never_pays_the_taker() {
+        // Tomer's three legs (#2817). The taker buys most of the naira at the
+        // full lift, sells part back near empty where the lift is small (that
+        // naira enters at the feed and pulls the cost, so the lift, down),
+        // then sells the rest back at the lower lift. The curve's round-trip
+        // limit holds the lift to what that can't beat, at any cap or start,
+        // and whatever fee each leg pays: a dear first leg and 1 bps returns
+        // (the responder refuses a request with no fee) is the cheapest way
+        // back.
+        let total = 300_000.0;
+        let naira = |c: U256, b: &CorridorBook| normalized(c, b.collateral_decimals);
+        let units = |a: U256| u128::try_from(a).unwrap() as f64;
+        let mut worst = f64::NEG_INFINITY;
+        for (fee_out, fee_back) in [(1u32, 1u32), (10, 1), (25, 1)] {
+            for cap in [2.0, 3.0, 10.0] {
+                for start_pct in [0.0, 30.0, 50.0] {
+                    for gain in [2.0 * cap, 6.0, 20.0] {
+                        for share in [0.75, 0.9, 0.97] {
+                            for drain_to in [0.02, 0.1, 0.3] {
+                                for back_frac in [0.3, 0.6, 0.9] {
+                                    let b = curve_book(Mode::Live, 0.0, 0.0);
+                                    let p = crate::pricing::unwind::UnwindParams {
+                                        cap_ngn: cap,
+                                        ..unwind_params(start_pct)
+                                    };
+                                    let coll = (total * share / ref_mid() * 1e6).round() as u128;
+                                    let debt = (total * (1.0 - share) * 1e6).round() as u128;
+                                    let held = (U256::from(coll), U256::from(debt));
+                                    let t0 = 1_000_000;
+                                    let tr = crate::pricing::unwind::Tracker::open(
+                                        None,
+                                        unwind_holder(),
+                                        naira(held.0, &b),
+                                        MID_NGN + gain,
+                                        t0,
+                                        p.refresh_secs,
+                                    );
+                                    // Leg 1: the taker pays dollars for naira.
+                                    let mut l1 = request(DEBT, COLLATERAL);
+                                    l1.fee_bps = fee_out;
+                                    let usd_in = total * (share - drain_to);
+                                    l1.sell_amount = Some(((usd_in * 1e6) as u128).to_string());
+                                    let input = unwind_input(&tr, &p, t0, true);
+                                    let (p1, _) = quote_unwound(&b, &l1, reference(), held, input);
+                                    let a1 = filled(held.0, held.1, &p1);
+                                    let tr = tr.observe(
+                                        naira(a1.0, &b),
+                                        MID_NGN,
+                                        t0 + 5,
+                                        p.refresh_secs,
+                                    );
+                                    // Leg 2a: part of it back, diluting the cost.
+                                    let got = u128::try_from(p1.buy_amount).unwrap();
+                                    let back = (got as f64 * back_frac) as u128;
+                                    let mut l2a = request(COLLATERAL, DEBT);
+                                    l2a.fee_bps = fee_back;
+                                    l2a.sell_amount = Some(back.to_string());
+                                    let input = unwind_input(&tr, &p, t0 + 10, true);
+                                    let (p2a, _) = quote_unwound(&b, &l2a, reference(), a1, input);
+                                    let a2 = filled(a1.0, a1.1, &p2a);
+                                    // The diluted cost lands, and the snapshot refreshes.
+                                    let later = t0 + p.refresh_secs + 20;
+                                    let tr = tr
+                                        .observe(naira(a2.0, &b), MID_NGN, t0 + 15, p.refresh_secs)
+                                        .observe(naira(a2.0, &b), MID_NGN, later, p.refresh_secs);
+                                    // Leg 2b: the rest back at the lower lift.
+                                    let mut l2b = request(COLLATERAL, DEBT);
+                                    l2b.fee_bps = fee_back;
+                                    l2b.sell_amount = Some((got - back).to_string());
+                                    let input = unwind_input(&tr, &p, later, true);
+                                    let (p2b, _) = quote_unwound(&b, &l2b, reference(), a2, input);
+                                    let out = units(p2a.buy_amount) + units(p2b.buy_amount);
+                                    let bps = (out / units(p1.sell_amount) - 1.0) * 10_000.0;
+                                    worst = worst.max(bps);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("worst drain, dilute and return: {worst:.3} bps");
+        assert!(
+            worst < 0.0,
+            "drain, dilute and return paid the taker {worst} bps"
+        );
+    }
+
+    #[test]
+    fn an_ask_priced_on_a_cost_that_fell_while_signing_is_withheld() {
+        let at = |cost_ngn: f64, full_ngn: f64, live: bool| {
+            Some(UnwindInput {
+                lift: Lift {
+                    full_ngn,
+                    start_pct: 50.0,
+                    cost_ngn,
+                },
+                live,
+            })
+        };
+        let priced = at(1386.0, 2.0, true);
+        // Same cost, or higher after a refresh: it holds.
+        assert!(unwind_still_holds(priced, at(1386.0, 2.0, true)));
+        assert!(unwind_still_holds(priced, at(1390.0, 2.0, true)));
+        // New naira pulled the cost down, or there's nothing to price off.
+        assert!(!unwind_still_holds(priced, at(1383.0, 1.0, true)));
+        assert!(!unwind_still_holds(priced, None));
+        // No lift in the price, or only previewed: nothing to recheck.
+        assert!(unwind_still_holds(None, None));
+        assert!(unwind_still_holds(at(1386.0, 2.0, false), None));
+        assert!(unwind_still_holds(at(1386.0, 0.0, true), None));
+    }
+
+    #[test]
+    fn profit_unwind_lifts_live_quotes_and_floors_the_ask_at_the_cost() {
+        let b = curve_book(Mode::Live, 0.0, 0.0);
+        let held = (
+            U256::from((270_000.0 / ref_mid() * 1e6) as u128),
+            U256::from(30_000_000_000u128),
+        );
+        let p = unwind_params(50.0);
+        let mut ask = request(DEBT, COLLATERAL);
+        ask.sell_amount = Some("5000000000".into());
+        let price = |note: Option<CurveNote>| match note {
+            Some(CurveNote::Priced {
+                curved, unwound, ..
+            }) => (curved, unwound),
+            other => panic!("expected a priced note, got {other:?}"),
+        };
+        let (plain, none) = price(quote_unwound(&b, &ask, reference(), held, None).1);
+        assert!(none.is_none());
+        // A 20 NGN gain: the cap binds and the ask lifts, giving the taker
+        // more naira per dollar, still well under the cost.
+        let rich = crate::pricing::unwind::Tracker::open(
+            None,
+            unwind_holder(),
+            1.0e8,
+            MID_NGN + 20.0,
+            0,
+            900,
+        );
+        let (lifted, unwound) = price(
+            quote_unwound(
+                &b,
+                &ask,
+                reference(),
+                held,
+                unwind_input(&rich, &p, 0, true),
+            )
+            .1,
+        );
+        assert_eq!(Some(lifted), unwound);
+        assert!(1.0 / lifted > 1.0 / plain && 1.0 / lifted < MID_NGN + 20.0);
+        // Preview: the same lift computed, the plain price out.
+        let (previewed, would) = price(
+            quote_unwound(
+                &b,
+                &ask,
+                reference(),
+                held,
+                unwind_input(&rich, &p, 0, false),
+            )
+            .1,
+        );
+        assert_eq!((previewed, would), (plain, unwound));
+        // A cost just over the plain ask: the lift (about 0.5 NGN here) would
+        // carry the ask past it, so it stops at the cost, and the stitch
+        // never pays out more naira per dollar than the naira was worth when
+        // it came in.
+        let cost = 1.0 / plain + 0.2;
+        let thin =
+            crate::pricing::unwind::Tracker::open(None, unwind_holder(), 1.0e8, cost, 0, 900);
+        let (floored, _) = price(
+            quote_unwound(
+                &b,
+                &ask,
+                reference(),
+                held,
+                unwind_input(&thin, &p, 0, true),
+            )
+            .1,
+        );
+        assert!(
+            (1.0 / floored - cost).abs() < 1e-6,
+            "{} vs {cost}",
+            1.0 / floored
         );
     }
 

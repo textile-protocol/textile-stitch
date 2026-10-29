@@ -33,6 +33,22 @@ export interface ModulesConfig {
   /** The inventory curve: the one module that also runs without a vault.
    * Offsets are in the corridor's soft currency (NGN for cNGN). */
   curve: CurveModuleConfig
+  /** Profit unwind, on top of the curve. Absent from older releases. */
+  profit_unwind?: ProfitUnwindConfig
+}
+/** Mirrors `ProfitUnwindConfig` in src/modules/config.rs. Amounts are in the
+ * corridor's soft currency per dollar, like the curve's offsets. */
+export interface ProfitUnwindConfig {
+  enabled: boolean
+  /** Quote with the lift; off, the bot previews it on a Live curve. */
+  live: boolean
+  /** Share of the gain passed back, 0..1. */
+  share: number
+  cap_ngn: number
+  min_gain_ngn: number
+  /** The naira share, percent, where it starts. */
+  start_pct: number
+  refresh_secs: number
 }
 export interface CurveModuleConfig {
   enabled: boolean

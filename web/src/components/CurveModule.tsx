@@ -12,15 +12,24 @@ import {
   referenceTooFar,
   shareAfter,
   takerPrice,
+  unwindFullNgn,
+  unwindWeight,
+  withLift,
   type Curve,
+  type CurveLift,
   type CurveQuote,
   type CurveReading,
 } from '../curve'
-import { percentage } from '../modulePresentation'
+import {
+  draftUnwindCapLimit,
+  equalSpreadBps,
+  percentage,
+  unwind,
+} from '../modulePresentation'
 import type { ModulesConfig, ModulesView } from '../modules'
 import CurveChart from './CurveChart'
 import { NumberControl, SecondarySettings } from './ModuleControls'
-import { Banner, Card, Select } from './ui'
+import { Banner, Card, Select, Toggle } from './ui'
 
 // The inventory curve's pieces of the module workspace: its editor fields,
 // its Simulate content, its Overview card and its quote history. Everything
@@ -40,33 +49,39 @@ const wholeShare = (f: number) => percentage(Math.round(f * 100) * 100)
 const money = (n: number) =>
   n.toLocaleString(undefined, { maximumFractionDigits: 0 })
 
-/** The corridor's one bps spread, or null when the two sides differ or
- * either is absolute: the curve then can't run, and says so. */
-function equalSpreadBps(view: Pick<ModulesView, 'corridor_spreads'>) {
-  const sides = [view.corridor_spreads.buy, view.corridor_spreads.sell].filter(
-    (s) => s !== null
-  )
-  const first = sides[0]
-  return first &&
-    sides.every((s) => s.kind === 'bps' && s.value === first.value)
-    ? first.value
-    : null
-}
-
 /** The curve the bot would price with now, from its last reading and the
- * draft's offsets, or null without a reading to size it. */
+ * draft's offsets, with the draft's profit unwind lift on it when that
+ * quotes, or null without a reading to size it. */
 function curveNow(
   view: ModulesView,
-  knobs: ModulesConfig['curve'],
+  draft: ModulesConfig,
   reading: CurveReading | null
 ): Curve | null {
   const spread = equalSpreadBps(view)
   if (!reading || spread === null) return null
-  return curveFor(
+  const curve = curveFor(
     { mid: reading.reference_mid, half_range_bps: reading.half_range_bps },
     spread + reading.fee_bps,
-    knobs
+    draft.curve,
+    spread
   )
+  const lift = unwind(draft).live ? draftLift(draft, reading) : null
+  return curve && lift ? withLift(curve, lift) : curve
+}
+
+/** Profit unwind's lift for the draft's knobs off the bot's frozen cost,
+ * live or preview; null while it is off or the bot hasn't reported a cost. */
+function draftLift(
+  draft: ModulesConfig,
+  reading: CurveReading | null
+): CurveLift | null {
+  const u = unwind(draft)
+  if (!u.enabled || !reading?.unwind) return null
+  return {
+    fullNgn: unwindFullNgn(u, reading.unwind),
+    startPct: u.start_pct,
+    costNgn: reading.unwind.cost,
+  }
 }
 
 /** The editor: where the bot's prices sit across its holdings, the two
@@ -92,8 +107,12 @@ export function CurveFields({
   const c = draft.curve
   const set = (curve: Partial<ModulesConfig['curve']>) =>
     onChange({ ...draft, curve: { ...c, ...curve } })
+  const u = unwind(draft)
+  const setUnwind = (patch: Partial<typeof u>) =>
+    onChange({ ...draft, profit_unwind: { ...u, ...patch } })
   const reading = freshReading(view.status?.curve, now)
-  const curve = curveNow(view, c, reading)
+  const capLimit = draftUnwindCapLimit(view, draft, now)
+  const curve = curveNow(view, draft, reading)
   const marker = example
     ? { share: example.share, label: `Example · ${share(example.share)}` }
     : reading
@@ -178,6 +197,80 @@ export function CurveFields({
         onChange={(shape) => set({ shape })}
         hint="2 keeps quotes near the mid through normal holdings and leans hardest near full. Higher leans later; 1 leans evenly."
       />
+      <SecondarySettings title="Profit unwind">
+        <div className="space-y-4">
+          <Toggle
+            checked={u.enabled}
+            disabled={!c.enabled && !u.enabled}
+            onChange={(enabled) => setUnwind({ enabled })}
+            label={`When the feed moves so the ${currency} held is worth more than it cost, lift both prices by part of the gain`}
+          />
+          <Toggle
+            checked={u.live}
+            disabled={!u.enabled}
+            onChange={(live) => setUnwind({ live })}
+            label="Quote with it. Off, the bot logs what it would quote and keeps quoting the plain curve"
+          />
+          <UnwindNow
+            reading={reading}
+            lift={draftLift(draft, reading)}
+            limitNgn={capLimit}
+            live={u.live}
+            on={u.enabled}
+            currency={currency}
+          />
+          <NumberControl
+            label="Share of gain given back"
+            unit="%"
+            scale={0.01}
+            max={1}
+            step={0.05}
+            sliderMax={1}
+            value={u.share}
+            onChange={(share) => setUnwind({ share })}
+            hint={`Of each ${currency} per ${settlement} the holdings gained, how much goes to takers as a better price. The rest is kept.`}
+          />
+          <NumberControl
+            label="Cap"
+            unit="NGN"
+            scale={1}
+            max={1000}
+            step={0.05}
+            fractionDigits={2}
+            sliderMax={5}
+            value={u.cap_ngn}
+            onChange={(cap_ngn) => setUnwind({ cap_ngn })}
+            hint={
+              capLimit === null
+                ? `The most both prices ever move, per ${settlement}.`
+                : `The most both prices ever move, per ${settlement}. At today's spread and start it can be at most ${priceText(capLimit)} NGN, so a taker can't profit from the lift falling between trades.`
+            }
+          />
+          <NumberControl
+            label="Ignore gains under"
+            unit="NGN"
+            scale={1}
+            max={1000}
+            step={0.05}
+            fractionDigits={2}
+            sliderMax={3}
+            value={u.min_gain_ngn}
+            onChange={(min_gain_ngn) => setUnwind({ min_gain_ngn })}
+            hint="Smaller gains move nothing, so feed noise doesn't move the price."
+          />
+          <NumberControl
+            label="Start profit unwind at"
+            unit="%"
+            scale={1}
+            max={99}
+            step={5}
+            sliderMax={99}
+            value={u.start_pct}
+            onChange={(start_pct) => setUnwind({ start_pct })}
+            hint={`Below this ${currency} share nothing moves. Above it the shift grows evenly to full at 100%.`}
+          />
+        </div>
+      </SecondarySettings>
       <SecondarySettings title="What the curve needs">
         {curveRequirements(
           { ...view, config: draft },
@@ -206,6 +299,68 @@ export function CurveFields({
   )
 }
 
+/** Profit unwind's numbers now: the frozen cost, the gain against the feed
+ * and the lift the draft's knobs give, at full and at today's share. */
+function UnwindNow({
+  reading,
+  lift,
+  limitNgn,
+  live,
+  on,
+  currency,
+}: {
+  reading: CurveReading | null
+  lift: CurveLift | null
+  limitNgn: number | null
+  live: boolean
+  on: boolean
+  currency: string
+}) {
+  const u = reading?.unwind
+  if (!reading || !u)
+    return (
+      <p className="text-muted text-xs">
+        {on
+          ? `The cost of the ${currency} held shows once the running bot has read its balances with profit unwind on.`
+          : `Off. The bot tracks what its ${currency} cost once profit unwind is on.`}
+      </p>
+    )
+  // The bot holds the lift to the round-trip limit when it quotes.
+  const fullNgn = Math.min(lift?.fullNgn ?? 0, limitNgn ?? Infinity)
+  const asNgn = (n: number) => `+${priceText(n)} NGN`
+  const rows: [string, string][] = [
+    ['Average cost', priceText(u.cost)],
+    ['Feed', priceText(u.feed_mid)],
+    [
+      'Gain per dollar',
+      `${u.gain >= 0 ? '+' : '−'}${priceText(Math.abs(u.gain))}`,
+    ],
+    ['Lift at 100%', asNgn(fullNgn)],
+    [
+      `Lift at ${share(reading.share)} ${currency}`,
+      asNgn(fullNgn * unwindWeight(reading.share, lift?.startPct ?? 0)),
+    ],
+  ]
+  return (
+    <div className="space-y-1">
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+        {rows.map(([label, value]) => (
+          <div key={label} className="contents">
+            <dt className="text-muted">{label}</dt>
+            <dd className="text-right font-bold tabular-nums">{value}</dd>
+          </div>
+        ))}
+      </dl>
+      {!live && (
+        <p className="text-muted text-xs">
+          Preview: the bot logs the lifted price and quotes the plain curve.
+          Asks never lift past the average cost.
+        </p>
+      )}
+    </div>
+  )
+}
+
 /** The Simulate drawer's content for the curve: one example trade, both
  * ways, flat against curved, across the holdings it moves. */
 export function CurveExample({
@@ -226,7 +381,7 @@ export function CurveExample({
   onExample: (example: { share: number; sizeUsd: number }) => void
 }) {
   const reading = freshReading(view.status?.curve, now)
-  const curve = curveNow(view, draft.curve, reading)
+  const curve = curveNow(view, draft, reading)
   if (!curve || !reading)
     return (
       <p className="text-muted text-sm">
@@ -368,7 +523,7 @@ export function CurveNow({
 }) {
   const config = view.config
   const reading = freshReading(view.status?.curve, now)
-  const curve = curveNow(view, config.curve, reading)
+  const curve = curveNow(view, config, reading)
   const f = reading?.share ?? null
   const until =
     curve && reading ? cheapestUntil(curve, reading.half_range_bps) : null

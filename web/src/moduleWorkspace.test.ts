@@ -7,8 +7,13 @@ import {
   listedModules,
   selectedWorkspaceModule,
   quoteModuleStatus,
+  quoteModuleUnsaved,
 } from './moduleWorkspace'
-import { defaultCurve, defaultLiquidity } from './modulePresentation'
+import {
+  defaultCurve,
+  defaultLiquidity,
+  defaultProfitUnwind,
+} from './modulePresentation'
 import type { ModulesConfig, ModulesView } from './modules'
 
 const now = Date.parse('2026-10-28T19:00:00Z')
@@ -125,6 +130,21 @@ const quoteView = (vault: boolean): ModulesView => {
 }
 
 describe('focused module workspace', () => {
+  it('marks the curve unsaved when only its profit unwind changes', () => {
+    const view = quoteView(true)
+    const draft = {
+      ...view.config,
+      profit_unwind: { ...defaultProfitUnwind(), enabled: true },
+    }
+    expect(quoteModuleUnsaved(view, view.config, 'curve')).toBe(false)
+    expect(quoteModuleUnsaved(view, draft, 'curve')).toBe(true)
+    expect(quoteModuleUnsaved(view, draft, 'inventory')).toBe(false)
+    // A mode change touches every quote module.
+    const other = view.config.mode === 'live' ? 'shadow' : 'live'
+    const mode = { ...view.config, mode: other } as const
+    expect(quoteModuleUnsaved(view, mode, 'inventory')).toBe(true)
+  })
+
   it('does not offer vault modules to a wallet or while eligibility is unknown', () => {
     expect(workspaceModules(['hedge', 'quotes'], null)).toEqual(['hedge'])
     expect(workspaceModules(['hedge', 'quotes'], quoteView(false))).toEqual([

@@ -13,9 +13,15 @@ import {
   MAX_REFERENCE_GAP_BPS,
   readsUnadjustedPrice,
   referenceTooFar,
+  liftLimitNgn,
+  profitUnwindErrors,
   shadeAt,
   shapeLabel,
   takerPrice,
+  averageUnwindWeight,
+  unwindFullNgn,
+  unwindWeight,
+  withLift,
 } from './curve'
 
 // The fixtures and golden values of src/pricing/curve.rs, so the Simulate
@@ -29,6 +35,7 @@ const knobs = (start: number, end: number) => ({
   end_above_buy: end,
   shape: DEFAULT_SHAPE,
 })
+const knobs0 = () => knobs(0, 0)
 const close = (got: number, want: number) =>
   expect(Math.abs((got - want) / want)).toBeLessThan(1e-9)
 
@@ -220,6 +227,118 @@ describe('flat quote', () => {
     expect(tooFar(at(buy, -MAX_REFERENCE_GAP_BPS - 0.1))).toBe(true)
     expect(tooFar(at(MID, MAX_REFERENCE_GAP_BPS - 0.1))).toBe(false)
     expect(tooFar(at(MID, MAX_REFERENCE_GAP_BPS + 0.1))).toBe(true)
+  })
+})
+
+describe('profit unwind', () => {
+  const knobs = {
+    share: 0.5,
+    cap_ngn: 2,
+    min_gain_ngn: 0.7,
+    start_pct: 0,
+  }
+  const at = (cost: number, mid = 1380) => ({ cost, feed_mid: mid })
+
+  it('matches the spec worked example and the bot', () => {
+    // Taken in at 1386, feed 1380: the 2 NGN cap binds, and at 75% naira
+    // three quarters of it applies, about 1.5 NGN (pricing/unwind.rs pins
+    // the same).
+    const full = unwindFullNgn(knobs, at(1386))
+    expect(Math.abs(full - 2)).toBeLessThan(1e-9)
+    const lift = (start: number) => full * unwindWeight(0.75, start)
+    expect(Math.abs(lift(0) - 1.5)).toBeLessThan(1e-9)
+    expect(Math.abs(lift(50) - 1)).toBeLessThan(1e-9)
+  })
+
+  it('moves nothing on a small gain or a loss', () => {
+    expect(unwindFullNgn(knobs, at(1380.5))).toBe(0)
+    expect(unwindFullNgn(knobs, at(1374))).toBe(0)
+  })
+
+  it('starts at the start share and rises evenly', () => {
+    expect(unwindWeight(0.5, 50)).toBe(0)
+    expect(unwindWeight(0.75, 50)).toBeCloseTo(0.5, 12)
+    expect(unwindWeight(1, 50)).toBe(1)
+    // The stretch average is order-free and the point weight at zero width.
+    expect(averageUnwindWeight(0.6, 0.9, 50)).toBe(
+      averageUnwindWeight(0.9, 0.6, 50)
+    )
+    expect(averageUnwindWeight(0.8, 0.8, 50)).toBe(unwindWeight(0.8, 50))
+    expect(averageUnwindWeight(0.1, 0.4, 50)).toBe(0)
+  })
+
+  it('lifts both sides by the weighted shade and floors the ask at the cost', () => {
+    const c = curveFor(reference, ALL_IN, knobs0())!
+    const up = withLift(c, { fullNgn: 1.5, startPct: 50, costNgn: MID * 2 })
+    for (const f of [0, 0.5, 0.75, 1])
+      expect(shadeAt(up, f) - shadeAt(c, f)).toBeCloseTo(
+        (1.5 / MID) * 10_000 * unwindWeight(f, 50),
+        12
+      )
+    // NGN off the curve's own mid: 1% away from the feed, still 1 NGN
+    // (before the bid's all-in, which scales it).
+    const wide = curveFor({ ...reference, mid: MID * 1.01 }, ALL_IN, knobs0())!
+    const wideUp = withLift(wide, { fullNgn: 1, startPct: 0, costNgn: MID * 2 })
+    expect(
+      takerPrice(wideUp, true, 1, 1) - takerPrice(wide, true, 1, 1)
+    ).toBeCloseTo(1 + ALL_IN / 10_000, 9)
+    // A cost just over the plain ask stops the lifted ask there.
+    const plainAsk = takerPrice(c, false, 1, 0.98)
+    const tight = withLift(c, {
+      fullNgn: 2,
+      startPct: 0,
+      costNgn: plainAsk + 0.3,
+    })
+    expect(takerPrice(tight, false, 1, 0.98)).toBeCloseTo(plainAsk + 0.3, 9)
+    expect(takerPrice(tight, true, 0.98, 1)).toBeGreaterThan(
+      takerPrice(c, true, 0.98, 1)
+    )
+    // With a venue fee the bot floors the signed order (spread only) and the
+    // fee comes off after, so the taker realizes the cost less the fee.
+    const feed = curveFor(reference, ALL_IN, knobs0(), ALL_IN - 1)!
+    const cost = takerPrice(feed, false, 1, 0.98) + 0.5
+    const fee = withLift(feed, { fullNgn: 2, startPct: 0, costNgn: cost })
+    const spread = (ALL_IN - 1) / 10_000
+    expect(takerPrice(fee, false, 1, 0.98)).toBeCloseTo(
+      (cost * (1 - ALL_IN / 10_000)) / (1 - spread),
+      9
+    )
+    // Nothing to trust, nothing lifted.
+    expect(withLift(c, { fullNgn: 0, startPct: 0, costNgn: MID }).lift).toBe(
+      undefined
+    )
+  })
+
+  it('holds the lift to the round-trip limit, as the bot does', () => {
+    // 4 x spread x mid / (1 - start): about 0.55 NGN at a 1 bps spread and
+    // start 0. The fee isn't in it: it arrives per request.
+    const limit = liftLimitNgn(ALL_IN - 1, MID, 0)
+    expect(limit).toBeCloseTo((4 * (ALL_IN - 1) * MID) / 10_000, 9)
+    expect(liftLimitNgn(ALL_IN - 1, MID, 50)).toBeCloseTo(2 * limit, 9)
+    const c = curveFor(reference, ALL_IN, knobs0(), ALL_IN - 1)!
+    const big = withLift(c, { fullNgn: 10, startPct: 0, costNgn: MID * 2 })
+    expect(big.lift?.fullNgn).toBeCloseTo(limit, 9)
+    // A NaN lift stays off rather than becoming the limit.
+    expect(
+      withLift(c, { fullNgn: NaN, startPct: 0, costNgn: MID * 2 }).lift
+    ).toBe(undefined)
+    // The panel refuses a cap above the limit.
+    const base = { ...knobs, enabled: true, live: false, refresh_secs: 900 }
+    expect(profitUnwindErrors({ ...base, cap_ngn: 2 }, true, 1.1)).toHaveLength(
+      1
+    )
+    expect(profitUnwindErrors({ ...base, cap_ngn: 1 }, true, 1.1)).toEqual([])
+    expect(profitUnwindErrors({ ...base, cap_ngn: 2 }, true, null)).toEqual([])
+  })
+
+  it('needs the curve on and knobs in range', () => {
+    const base = { ...knobs, enabled: true, live: false, refresh_secs: 900 }
+    expect(profitUnwindErrors(base, true)).toEqual([])
+    expect(profitUnwindErrors(base, false)).toHaveLength(1)
+    expect(profitUnwindErrors({ ...base, share: 2 }, true)).toHaveLength(1)
+    expect(profitUnwindErrors({ ...base, start_pct: 100 }, true)).toHaveLength(
+      1
+    )
   })
 })
 
