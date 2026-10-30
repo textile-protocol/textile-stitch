@@ -3,9 +3,12 @@ import type { ModulesConfig, ModulesView } from '../modules'
 import { CurveExample, CurveFields } from './CurveModule'
 import { ProfitUnwindFields, UnwindExample } from './ProfitUnwindModule'
 import ModulePresets from './ModulePresets'
+import { moduleMode, withModuleMode } from '../moduleModes'
 import {
   leanConflict,
   liquidityScheduleErrors,
+  moduleModeEffect,
+  moduleModes,
   moduleNames,
   moduleParameterErrors,
   percentage,
@@ -20,7 +23,8 @@ import {
 import {
   AllocationBar,
   Chevron,
-  ModuleSwitch,
+  modeDots,
+  ModeSwitch,
   NumberControl,
   Popover,
   QuoteBreakdown,
@@ -125,31 +129,37 @@ export default function ModuleParameters({
   const titleId = useId()
   const conflict = leanConflict(draft, selected, vault)
   const blockedReason = selected === 'liquidity' ? liquidityRefusal : null
+  const mode = moduleMode(draft, selected)
   return (
     <section
       aria-labelledby={titleId}
       className="border-line-soft bg-surface @container rounded-xl border"
     >
-      <header className="border-line-soft flex items-center justify-between gap-3 border-b px-5 py-4">
-        <div>
+      <header className="border-line-soft flex flex-wrap items-center justify-between gap-3 border-b px-5 py-4">
+        <div className="min-w-0">
           <h3 id={titleId} className="text-sm font-bold">
-            {moduleNames[selected]} settings
+            {moduleNames[selected]}
           </h3>
-          <p className="text-muted mt-1 text-xs">
-            Changes apply only to this module.
+          <p className="text-muted mt-1 flex items-baseline gap-1.5 text-xs">
+            <span
+              aria-hidden
+              className={`size-1.5 shrink-0 translate-y-[-1px] rounded-full ${modeDots[mode]}`}
+            />
+            {moduleModeEffect(selected, mode, draft)}
           </p>
         </div>
-        <ModuleSwitch
-          label={`Enable ${moduleNames[selected].toLowerCase()}`}
-          checked={draft[selected].enabled}
+        <fieldset
           disabled={
-            !draft[selected].enabled &&
-            (conflict !== null || blockedReason !== null)
+            mode === 'off' && (conflict !== null || blockedReason !== null)
           }
-          onChange={(enabled) =>
-            onChange({ ...draft, [selected]: { ...draft[selected], enabled } })
-          }
-        />
+        >
+          <ModeSwitch
+            label={`${moduleNames[selected]} mode`}
+            modes={moduleModes}
+            value={mode}
+            onChange={(next) => onChange(withModuleMode(draft, selected, next))}
+          />
+        </fieldset>
       </header>
       <ModuleEditor
         module={selected}
@@ -351,7 +361,7 @@ function ModuleExample({
       ? quoteBreakdown(draft, corridor, example.share, example.range)
       : null
   const notes = [
-    quoteModeNote(draft.mode),
+    quoteModeNote(draft),
     valid && corridor
       ? warmupNote(draft, corridor, example.share, example.range)
       : null,
@@ -503,7 +513,7 @@ function ModuleExample({
                           ? `of vault value, converted from ${currency} to ${settlement}. Actual size is also limited by available funds and the vault’s order cap.`
                           : enabled
                             ? `Sales start at ${percentage(draft.rebalance.trigger_bps)} ${currency} holdings.`
-                            : 'Enable spot rebalancing to request sales.'}
+                            : 'Set spot rebalancing to Preview or Live to see sales.'}
                       </p>
                     </div>
                   )}

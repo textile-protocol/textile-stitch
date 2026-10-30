@@ -8,6 +8,7 @@ import {
   remainingQuoteDraft,
   selectedWorkspaceModule,
   quoteModuleStatus,
+  hedgeBadge,
   quoteModuleUnsaved,
 } from './moduleWorkspace'
 import {
@@ -16,6 +17,12 @@ import {
   defaultProfitUnwind,
 } from './modulePresentation'
 import type { ModulesConfig, ModulesView } from './modules'
+import {
+  expandModes,
+  moduleMode,
+  normalizeModes,
+  withModuleMode,
+} from './moduleModes'
 
 const now = Date.parse('2026-10-28T19:00:00Z')
 const hedge = (enabled: boolean, hasFunds = false): PerpsView => ({
@@ -312,45 +319,90 @@ describe('focused module workspace', () => {
     expect(quoteModuleStatus(view, 'liquidity', now / 1000 + 46)).toBe(
       'Waiting'
     )
+    // The schedule's own Preview beside a shared Live.
+    const preview = withModuleMode(view.config, 'liquidity', 'shadow')
+    expect(
+      quoteModuleStatus(
+        {
+          ...view,
+          config: preview,
+          status: { ...view.status, config: preview },
+        },
+        'liquidity',
+        now / 1000
+      )
+    ).toBe('Preview')
+  })
+  it('reports a saved module mode the bot hasn’t restarted into yet', () => {
+    const view = quoteView(true)
+    view.status = {
+      version: 1,
+      config: view.config,
+      at: now / 1000,
+      decisions: [],
+      rebalance_status: 'Off',
+      next_attempt_at: 0,
+    }
+    expect(quoteModuleStatus(view, 'inventory', now / 1000)).not.toBe(
+      'Update pending'
+    )
+    view.config = withModuleMode(view.config, 'inventory', 'shadow')
+    view.config = withModuleMode(view.config, 'rebalance', 'live')
+    expect(quoteModuleStatus(view, 'inventory', now / 1000)).toBe(
+      'Update pending'
+    )
+  })
+})
+
+describe('sidebar badges', () => {
+  it('shows the hedge’s mode, and On while its remote mode is unknown', () => {
+    expect(hedgeBadge(null)).toBeNull()
+    expect(hedgeBadge(hedge(false))).toBe('off')
+    const control = (mode: string) =>
+      ({
+        ...hedge(true),
+        remote: { ...hedge(true).remote, control: { mode } },
+      }) as PerpsView
+    expect(hedgeBadge(hedge(true))).toBe('shadow')
+    expect(hedgeBadge(control('live'))).toBe('live')
+    expect(hedgeBadge(control('unreadable'))).toBe('on')
   })
 })
 
 describe('independent module saves', () => {
   it.each(['inventory', 'spreads', 'rebalance', 'liquidity', 'curve'] as const)(
-    'saves only %s even with unsaved sibling enable and mode changes',
+    'saves only %s even with unsaved sibling mode changes',
     (key) => {
       const saved = config()
-      const draft = {
-        ...saved,
-        mode: 'off' as const,
-        ...Object.fromEntries(
-          ['inventory', 'spreads', 'rebalance', 'liquidity', 'curve'].map(
-            (id) => [id, { ...saved[id as typeof key], enabled: true }]
-          )
-        ),
-      }
+      const draft = (
+        ['inventory', 'spreads', 'rebalance', 'liquidity', 'curve'] as const
+      ).reduce((c, id) => withModuleMode(c, id, 'live'), saved)
       const payload = quoteConfigForScope(saved, draft, key)
-      expect(payload).toEqual({
-        ...saved,
-        [key]: { ...saved[key], enabled: true },
-      })
+      expect(payload).toEqual({ ...saved, [key]: draft[key] })
+      expect(moduleMode(payload, key)).toBe('live')
       const remaining = remainingQuoteDraft(saved, draft, payload, key)
       expect(remaining).toEqual(draft)
       expect(saved[key].enabled).toBe(false)
     }
   )
 
-  it('saves group mode without applying pending module toggles', () => {
-    const saved = config()
-    const draft = {
-      ...saved,
-      mode: 'shadow' as const,
-      spreads: { ...saved.spreads, enabled: true },
-    }
-    expect(quoteConfigForScope(saved, draft, 'policy')).toEqual({
-      ...saved,
-      mode: 'shadow',
+  it('saves a module mode with that module and nothing else', () => {
+    const saved = expandModes({
+      ...config(),
+      mode: 'live',
+      inventory: { ...config().inventory, enabled: true },
+      spreads: { ...config().spreads, enabled: true },
     })
+    const draft = withModuleMode(
+      withModuleMode(saved, 'inventory', 'shadow'),
+      'spreads',
+      'off'
+    )
+    const payload = quoteConfigForScope(saved, draft, 'inventory')
+    expect(moduleMode(payload, 'inventory')).toBe('shadow')
+    expect(moduleMode(payload, 'spreads')).toBe('live')
+    // Saved normalized, the other module keeps its mode.
+    expect(moduleMode(normalizeModes(payload), 'spreads')).toBe('live')
   })
 
   it('saves profit unwind on its own and preserves sibling parameters', () => {
@@ -375,17 +427,12 @@ describe('independent module saves', () => {
     const saved = config()
     const draft = {
       ...saved,
-      mode: 'shadow' as const,
       spreads: { ...saved.spreads, enabled: true },
       curve: { ...saved.curve, enabled: true },
     }
     expect(quoteConfigForScope(draft, saved, 'curve')).toEqual({
       ...draft,
       curve: saved.curve,
-    })
-    expect(quoteConfigForScope(draft, saved, 'policy')).toEqual({
-      ...draft,
-      mode: saved.mode,
     })
   })
 

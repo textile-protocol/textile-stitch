@@ -10,6 +10,7 @@ import {
   withLift,
 } from '../curve'
 import { draftUnwindCapLimit, percentage } from '../modulePresentation'
+import { isLive } from '../moduleModes'
 import type { ModulesConfig, ModulesView } from '../modules'
 import {
   draftUnwindLift,
@@ -28,7 +29,6 @@ import { ticks, useWidth } from './CurveChart'
 import { curveNow } from './CurveModule'
 import {
   ExampleTable,
-  ModuleSwitch,
   NumberControl,
   SecondarySettings,
   type ExampleRow,
@@ -93,7 +93,7 @@ export function ProfitUnwindFields({
   const most = Math.max(0, u.cap_ngn)
   return (
     <>
-      {draft.mode === 'live' && u.enabled && u.live && (
+      {isLive(draft, 'profit_unwind') && (
         <Banner tone="warning">
           Live adds the lift to Swap quotes and to the levels Textile routes on:
           on top of the inventory curve when it quotes, on the flat price
@@ -108,23 +108,6 @@ export function ProfitUnwindFields({
         currency={currency}
         settlement={settlement}
       />
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <p className="text-sm font-bold">Quote with the lift</p>
-          <p className="text-muted mt-1 max-w-md text-xs">
-            {u.live
-              ? draft.mode === 'live'
-                ? 'Swap quotes and published levels carry the lift.'
-                : 'Carries the lift once the quote policy is Live. Until then the bot records what it would quote.'
-              : 'Preview: the bot tracks the cost, logs what it would quote and quotes without the lift.'}
-          </p>
-        </div>
-        <ModuleSwitch
-          label="Quote with the lift"
-          checked={u.live}
-          onChange={(live) => set({ live })}
-        />
-      </div>
       <UnwindNow
         reading={reading}
         lift={lift}
@@ -581,6 +564,7 @@ export function UnwindExample({
       </p>
     )
   const u = draft.profit_unwind
+  const unwindLive = isLive(draft, 'profit_unwind')
   const raw = draftUnwindLift(u, reading)
   // Like the curve's, the example shows what Live would quote. The curve
   // quotes when it can price: a reference book within 1% of the feed.
@@ -607,7 +591,7 @@ export function UnwindExample({
       const s = exampleSide({
         plain,
         lifted: raw ? withLift(plain, raw) : null,
-        unwindLive: u.live,
+        unwindLive: unwindLive,
         feed: null,
         flatOnly: false,
         share: example.share,
@@ -640,7 +624,7 @@ export function UnwindExample({
       base,
       order: flatOrderNgn(feed, spread.value, botBuys),
       lift: flatLift,
-      live: u.live,
+      live: unwindLive,
       midNgn: feed,
       share: example.share,
       after,
@@ -662,13 +646,13 @@ export function UnwindExample({
       cell: (s) => text(s.base),
     },
     {
-      label: u.live ? 'Profit unwind' : 'Profit unwind · preview',
+      label: unwindLive ? 'Profit unwind' : 'Profit unwind · preview',
       cell: (s) =>
         s.lift === null
           ? '—'
           : `${signedBps(s.lift)}${s.atCost ? ' · at cost' : ''}`,
       marked: true,
-      muted: !u.live,
+      muted: !unwindLive,
     },
     { label: 'Quote', cell: (s) => text(s.price), total: true },
     { label: `${currency} after`, cell: (s) => share(s.after) },
@@ -689,14 +673,12 @@ export function UnwindExample({
       <p className="text-muted text-xs leading-relaxed">
         {!raw || !held
           ? `Nothing to give back right now: the ${priceText(reading.cost)} average cost isn't far enough above the feed.`
-          : u.live
+          : unwindLive
             ? `Both prices lift by up to ${priceText(held.fullNgn)} at full ${currency}, less below that. When the bot sells ${currency} it stops at the ${priceText(reading.cost)} average cost.`
             : `Preview: the quote leaves the lift out. Quoting with it would add this row to both prices, up to ${priceText(held.fullNgn)} at full ${currency}.`}{' '}
-        {draft.mode === 'live'
-          ? u.live
-            ? 'Live quotes and published levels use this price.'
-            : ''
-          : 'Live quotes carry no lift until the quote policy is Live.'}
+        {unwindLive
+          ? 'Live quotes and published levels use this price.'
+          : 'Live quotes carry no lift until profit unwind is Live.'}
       </p>
       {Math.abs(reading.share - example.share) > 1e-4 && (
         <button

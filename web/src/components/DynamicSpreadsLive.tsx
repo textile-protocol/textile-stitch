@@ -4,6 +4,7 @@ import {
   type ModulesView,
 } from '../modules'
 import { runningConfigDiffers } from '../modulePresentation'
+import { moduleMode, quoteModesDiffer } from '../moduleModes'
 import { Banner, Card } from './ui'
 
 const bps = (v: number | null | undefined) =>
@@ -43,6 +44,11 @@ export default function DynamicSpreadsLive({
   const added = dynamicSpreadAdditions(complete ? last : undefined)
   const inventoryAware =
     config.spreads.inventory_aware && config.inventory.enabled
+  const shadow = moduleMode(config, 'spreads') === 'shadow'
+  // One of the two pricing modules Live, the other in Preview: the recorded
+  // policy is the proposal, and quotes went out at `quoted`.
+  const mixed = quoteModesDiffer(config)
+  const quoted = current ? last.quoted : undefined
   const points = (status?.decisions ?? [])
     .filter((o) => o.decision.at <= now)
     .map((o) => ({ ...o, additions: dynamicSpreadAdditions(o) }))
@@ -212,12 +218,23 @@ export default function DynamicSpreadsLive({
               ],
               ['Dynamic addition', addition(added.buy), addition(added.sell)],
               [
-                config.mode === 'shadow'
-                  ? 'Proposed spread (shadow)'
-                  : 'Final quote policy',
+                mixed
+                  ? 'Proposed spread (every running module)'
+                  : shadow
+                    ? 'Proposed spread (Preview)'
+                    : 'Final quote policy',
                 side(current ? last.decision.buy_bps : undefined),
                 side(current ? last.decision.sell_bps : undefined),
               ],
+              ...(mixed
+                ? [
+                    [
+                      'Quoted spread (Live modules only)',
+                      side(quoted ? quoted.buy_bps : undefined),
+                      side(quoted ? quoted.sell_bps : undefined),
+                    ],
+                  ]
+                : []),
             ].map(([label, buy, sell]) => (
               <tr key={label} className="border-line-soft border-t">
                 <td className="py-2 pr-3">{label}</td>
@@ -262,9 +279,7 @@ export default function DynamicSpreadsLive({
           <div className="mt-5 flex justify-between gap-2 text-sm">
             <p className="font-bold">Recent dynamic additions</p>
             <span className="text-muted">
-              {config.mode === 'shadow'
-                ? 'Shadow proposals'
-                : 'Recorded evaluations'}
+              {shadow ? 'Preview proposals' : 'Recorded evaluations'}
             </span>
           </div>
           <svg
@@ -356,8 +371,8 @@ export default function DynamicSpreadsLive({
                     <td>
                       {o.decision.blocked
                         ? 'Blocked'
-                        : config.mode === 'shadow'
-                          ? 'Shadow'
+                        : shadow
+                          ? 'Preview'
                           : 'Evaluated'}
                     </td>
                   </tr>

@@ -16,6 +16,7 @@ import {
   type ModuleKey,
 } from '../modulePresentation'
 import { downloadJson, isWarmingUp } from '../modules'
+import { isLive } from '../moduleModes'
 import { Banner, Button, Card, ErrorState, Loading, Select } from './ui'
 
 const percent = (bps: number | null) =>
@@ -142,7 +143,7 @@ export default function ModulesPanel({
                   )
                 : []
             }
-            live={scoped.mode === 'live'}
+            live={isLive(scoped, selectedModule)}
             valid={valid}
             editable={editable}
             busy={busy}

@@ -13,8 +13,31 @@ pub enum Mode {
     Live,
 }
 
+/// One policy in the quote-module group, for asking what mode it runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Module {
+    Inventory,
+    Spreads,
+    Rebalance,
+    Liquidity,
+    Curve,
+    ProfitUnwind,
+}
+impl Module {
+    pub const ALL: [Module; 6] = [
+        Module::Inventory,
+        Module::Spreads,
+        Module::Rebalance,
+        Module::Liquidity,
+        Module::Curve,
+        Module::ProfitUnwind,
+    ];
+}
+
 /// First-party policies. The root `modules_enabled` flag gates all runtime and UI access.
-/// Defaults observe only; selecting Live is an explicit operator action.
+/// Each module runs Off, Shadow (Preview) or Live on its own: its table's `mode`,
+/// or the shared `mode` here when it names none. Defaults observe only;
+/// selecting Live is an explicit operator action.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModulesConfig {
@@ -40,21 +63,147 @@ impl Default for ModulesConfig {
     }
 }
 impl ModulesConfig {
+    /// `module`'s switch and the mode its table names, if any.
+    fn switch(&self, module: Module) -> (bool, Option<Mode>) {
+        match module {
+            Module::Inventory => (self.inventory.enabled, self.inventory.mode),
+            Module::Spreads => (self.spreads.enabled, self.spreads.mode),
+            Module::Rebalance => (self.rebalance.enabled, self.rebalance.mode),
+            Module::Liquidity => (self.liquidity.enabled, self.liquidity.mode),
+            Module::Curve => (self.curve.enabled, self.curve.mode),
+            Module::ProfitUnwind => (self.profit_unwind.enabled, self.profit_unwind.mode),
+        }
+    }
+
+    fn set_switch(&mut self, module: Module, enabled: bool, mode: Option<Mode>) {
+        let (on, own) = match module {
+            Module::Inventory => (&mut self.inventory.enabled, &mut self.inventory.mode),
+            Module::Spreads => (&mut self.spreads.enabled, &mut self.spreads.mode),
+            Module::Rebalance => (&mut self.rebalance.enabled, &mut self.rebalance.mode),
+            Module::Liquidity => (&mut self.liquidity.enabled, &mut self.liquidity.mode),
+            Module::Curve => (&mut self.curve.enabled, &mut self.curve.mode),
+            Module::ProfitUnwind => (
+                &mut self.profit_unwind.enabled,
+                &mut self.profit_unwind.mode,
+            ),
+        };
+        *on = enabled;
+        *own = mode;
+    }
+
+    /// The mode `module` runs in: Off while switched off, otherwise its own
+    /// `mode`, falling back to the shared one. While profit unwind follows
+    /// the shared mode its older `live` switch still applies, so a shared
+    /// Live without it previews, as it always has.
+    pub fn mode_of(&self, module: Module) -> Mode {
+        let (enabled, own) = self.switch(module);
+        match (enabled, own, self.mode) {
+            (false, _, _) => Mode::Off,
+            (true, Some(mode), _) => mode,
+            (true, None, Mode::Live)
+                if module == Module::ProfitUnwind && !self.profit_unwind.live =>
+            {
+                Mode::Shadow
+            }
+            (true, None, shared) => shared,
+        }
+    }
+
+    /// `module` runs, in Preview or Live.
+    pub fn runs(&self, module: Module) -> bool {
+        self.mode_of(module) != Mode::Off
+    }
+
+    /// `module` acts: it changes quotes, sends transactions or allows sales.
+    pub fn is_live(&self, module: Module) -> bool {
+        self.mode_of(module) == Mode::Live
+    }
+
+    /// Whether the module runtime runs at all. A shared mode other than Off
+    /// keeps it recording even with every module off, as it always has; the
+    /// panel saves Off once nothing runs ([`Self::normalized`]).
+    pub fn runtime_on(&self) -> bool {
+        self.mode != Mode::Off || Module::ALL.into_iter().any(|m| self.runs(m))
+    }
+
+    /// The same modes, in the shape earlier releases wrote whenever that
+    /// shape can hold them, so a bot that predates per-module modes keeps
+    /// reading the file. That shape is one shared mode, with profit unwind's
+    /// `live = false` as the one way to preview beside a shared Live. Only
+    /// modes it can't express (say inventory balancing Live beside dynamic
+    /// spreads in Preview) keep Preview shared and name Live per module, and
+    /// earlier releases refuse those. With nothing running the shared mode is
+    /// Off. A switched-off module names no mode.
+    pub fn normalized(&self) -> Self {
+        let modes = Module::ALL.map(|m| (m, self.mode_of(m)));
+        let unwind = self.mode_of(Module::ProfitUnwind);
+        let running = |skip_unwind: bool| {
+            modes
+                .iter()
+                .filter(move |(m, mode)| {
+                    *mode != Mode::Off && !(skip_unwind && *m == Module::ProfitUnwind)
+                })
+                .map(|(_, mode)| *mode)
+        };
+        let all_are = |mode: Mode, skip_unwind: bool| running(skip_unwind).all(|m| m == mode);
+        let shared = match running(false).next() {
+            None => Mode::Off,
+            Some(first) if all_are(first, false) => first,
+            Some(_) if unwind == Mode::Shadow && all_are(Mode::Live, true) => Mode::Live,
+            Some(_) => Mode::Shadow,
+        };
+        let mut c = self.clone();
+        c.mode = shared;
+        c.profit_unwind.live = unwind == Mode::Live;
+        for (module, mode) in modes {
+            c.set_switch(module, mode != Mode::Off, None);
+            // What it runs in without a mode of its own.
+            let follows = c.mode_of(module);
+            if mode != Mode::Off && mode != follows {
+                c.set_switch(module, true, Some(mode));
+            }
+        }
+        c
+    }
+
+    /// The quote policies that change quotes: inventory balancing and dynamic
+    /// spreads each switched on only while Live. Quotes are decided with this
+    /// when one of the two runs Live and the other in Preview, so the Preview
+    /// one is recorded without reaching a quote.
+    pub fn live_quotes(&self) -> Self {
+        let mut c = self.clone();
+        c.inventory.enabled = self.is_live(Module::Inventory);
+        c.spreads.enabled = self.is_live(Module::Spreads);
+        c
+    }
+
+    /// One of inventory balancing and dynamic spreads runs Live and the other
+    /// in Preview, so what quotes go out at isn't the recorded decision.
+    pub fn quote_modes_differ(&self) -> bool {
+        let (inventory, spreads) = (
+            self.mode_of(Module::Inventory),
+            self.mode_of(Module::Spreads),
+        );
+        inventory != Mode::Off && spreads != Mode::Off && inventory != spreads
+    }
+
     /// What can run on this bot's funds. Inventory balancing, dynamic spreads,
     /// spot rebalancing and the liquidity schedule read a vault's NAV and act
     /// through it, so on a bot that trades from its own wallet they are off
     /// whatever the file says; only the inventory curve and profit unwind run
     /// there. On a vault every module can run.
+    ///
+    /// Normalized, so `enabled` means the module runs in Preview or Live and
+    /// the runtime asks [`Self::mode_of`] only whether it is Live.
     pub fn runnable(&self, on_vault: bool) -> Self {
-        if on_vault {
-            return self.clone();
+        let mut c = self.clone();
+        if !on_vault {
+            c.inventory.enabled = false;
+            c.spreads.enabled = false;
+            c.rebalance.enabled = false;
+            c.liquidity.enabled = false;
         }
-        let mut wallet = self.clone();
-        wallet.inventory.enabled = false;
-        wallet.spreads.enabled = false;
-        wallet.rebalance.enabled = false;
-        wallet.liquidity.enabled = false;
-        wallet
+        c.normalized()
     }
 
     /// The vault-only modules switched on in the file, by name: what
@@ -81,6 +230,10 @@ impl ModulesConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CurveConfig {
     pub enabled: bool,
+    /// This module's own run mode. Absent, it runs in the shared
+    /// `[modules].mode`. Off while `enabled` is false either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     /// Soft currency below the reference mid where the curve starts, at no
     /// corridor holdings. Negative starts it above the mid.
     pub start_below_mid: f64,
@@ -94,6 +247,7 @@ impl Default for CurveConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: None,
             start_below_mid: 0.0,
             end_above_buy: 0.0,
             shape: crate::pricing::curve::DEFAULT_SHAPE,
@@ -114,15 +268,21 @@ impl CurveConfig {
 /// price lifts by a slice of that gain, so takers bringing dollars clear the
 /// pile faster and the bot keeps the rest. Its own module: it lifts whatever
 /// price goes out, the inventory curve's or the flat one. Off unless switched
-/// on, and only quotes with `live` in Live mode. The two amounts are in the
+/// on, and only quotes in Live with `live` set. The two amounts are in the
 /// corridor's soft currency, like the curve's offsets.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfitUnwindConfig {
     pub enabled: bool,
-    /// Quote with the lift. Off, the bot tracks the cost, computes the lift
-    /// and logs the price it would quote, and quotes without it: profit
-    /// unwind's own preview, for a bot already quoting Live.
+    /// This module's own run mode. Absent, it runs in the shared
+    /// `[modules].mode`. Off while `enabled` is false either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+    /// Quote with the lift while following a shared Live mode. Off, that
+    /// previews: the bot tracks the cost, computes the lift and logs the
+    /// price it would quote, and quotes without it. From before each module
+    /// had its own mode, which wins when set; the panel keeps this in step
+    /// with it ([`ModulesConfig::normalized`]).
     pub live: bool,
     /// Share of the gain passed back as a better price, 0 to 1.
     pub share: f64,
@@ -141,6 +301,7 @@ impl Default for ProfitUnwindConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: None,
             live: false,
             share: 0.5,
             cap_ngn: 2.0,
@@ -166,6 +327,10 @@ impl ProfitUnwindConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct InventoryConfig {
     pub enabled: bool,
+    /// This module's own run mode. Absent, it runs in the shared
+    /// `[modules].mode`. Off while `enabled` is false either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     pub target_bps: u32,
     pub max_bps: u32,
     pub max_skew_bps: u32,
@@ -175,6 +340,7 @@ impl Default for InventoryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: None,
             target_bps: 3000,
             max_bps: 6000,
             max_skew_bps: 50,
@@ -186,6 +352,10 @@ impl Default for InventoryConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SpreadsConfig {
     pub enabled: bool,
+    /// This module's own run mode. Absent, it runs in the shared
+    /// `[modules].mode`. Off while `enabled` is false either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     /// Reduce the volatility buffer on inventory-reducing trades.
     /// Requires enabled inventory balancing to take effect.
     pub inventory_aware: bool,
@@ -198,6 +368,7 @@ impl Default for SpreadsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: None,
             inventory_aware: false,
             window_secs: 300,
             warmup_secs: 30,
@@ -218,6 +389,10 @@ pub enum RebalanceMethod {
 #[serde(default, deny_unknown_fields)]
 pub struct RebalanceConfig {
     pub enabled: bool,
+    /// This module's own run mode. Absent, it runs in the shared
+    /// `[modules].mode`. Off while `enabled` is false either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     pub method: RebalanceMethod,
     pub trigger_bps: u32,
     /// Maximum NAV fraction sold in a single attempt.
@@ -231,6 +406,7 @@ impl Default for RebalanceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: None,
             method: RebalanceMethod::Manual,
             trigger_bps: 5000,
             max_trade_bps: 200,
@@ -276,6 +452,10 @@ impl Weekday {
 #[serde(default, deny_unknown_fields)]
 pub struct LiquidityConfig {
     pub enabled: bool,
+    /// This module's own run mode. Absent, it runs in the shared
+    /// `[modules].mode`. Off while `enabled` is false either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     /// Start of market hours, `HH:MM` UTC.
     pub open_utc: String,
     /// End of market hours, `HH:MM` UTC. Earlier than `open_utc` runs past midnight.
@@ -294,6 +474,7 @@ impl Default for LiquidityConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: None,
             open_utc: "08:00".into(),
             close_utc: "17:00".into(),
             days: vec![
@@ -485,7 +666,7 @@ impl ModulesConfig {
             authority.key()?;
         }
         ensure!(
-            !(l.enabled && self.mode == Mode::Live && l.authority.is_none()),
+            !(self.is_live(Module::Liquidity) && l.authority.is_none()),
             "liquidity schedule in Live mode needs [modules.liquidity.authority]: the Roles \
              modifier and role key that let this bot change the floor"
         );
@@ -509,6 +690,185 @@ mod tests {
             roles_modifier: "0x00000000000000000000000000000000000000cc".into(),
             role_key: format!("0x{}", "11".repeat(32)),
         })
+    }
+
+    /// Every module set to `modes[i]`, each written as its own table's mode.
+    fn each(modes: [Mode; 6]) -> ModulesConfig {
+        let mut c = ModulesConfig {
+            inventory: InventoryConfig::default(),
+            ..ModulesConfig::default()
+        };
+        for (module, mode) in Module::ALL.into_iter().zip(modes) {
+            c.set_switch(module, mode != Mode::Off, Some(mode));
+        }
+        c
+    }
+
+    fn modes(c: &ModulesConfig) -> [Mode; 6] {
+        Module::ALL.map(|m| c.mode_of(m))
+    }
+
+    #[test]
+    fn a_file_without_module_modes_reads_as_it_always_has() {
+        let c: ModulesConfig = toml::from_str(
+            "mode = \"live\"\n[inventory]\nenabled = true\n[spreads]\nenabled = false\n\
+             [profit_unwind]\nenabled = true\nlive = false\n",
+        )
+        .unwrap();
+        assert_eq!(c.mode_of(Module::Inventory), Mode::Live);
+        assert_eq!(c.mode_of(Module::Spreads), Mode::Off);
+        // Live without its own switch has always previewed.
+        assert_eq!(c.mode_of(Module::ProfitUnwind), Mode::Shadow);
+        let off = ModulesConfig {
+            mode: Mode::Off,
+            ..c.clone()
+        };
+        assert_eq!(modes(&off), [Mode::Off; 6]);
+        assert!(!off.runtime_on());
+        // A shared mode keeps the runtime recording with every module off.
+        let mut idle = ModulesConfig::default();
+        for module in Module::ALL {
+            idle.set_switch(module, false, None);
+        }
+        assert!(idle.runtime_on());
+    }
+
+    #[test]
+    fn a_module_mode_overrides_the_shared_one_and_off_still_wins() {
+        let c: ModulesConfig = toml::from_str(
+            "mode = \"shadow\"\n[inventory]\nenabled = true\nmode = \"live\"\n\
+             [rebalance]\nenabled = false\nmode = \"live\"\n[spreads]\nenabled = true\n\
+             mode = \"off\"\n[profit_unwind]\nenabled = true\nlive = true\nmode = \"live\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.mode_of(Module::Inventory), Mode::Live);
+        assert_eq!(c.mode_of(Module::Rebalance), Mode::Off);
+        assert_eq!(c.mode_of(Module::Spreads), Mode::Off);
+        assert_eq!(c.mode_of(Module::ProfitUnwind), Mode::Live);
+        assert!(c.runtime_on());
+        let all_off = ModulesConfig {
+            mode: Mode::Off,
+            ..c
+        };
+        assert!(all_off.runtime_on(), "a Live module runs the runtime");
+    }
+
+    #[test]
+    fn normalizing_keeps_every_module_mode_and_settles_on_one_shape() {
+        let all = [Mode::Off, Mode::Shadow, Mode::Live];
+        for n in 0..3usize.pow(6) {
+            let wanted = std::array::from_fn(|i| all[n / 3usize.pow(i as u32) % 3]);
+            let c = each(wanted).normalized();
+            assert_eq!(modes(&c), wanted, "{wanted:?}");
+            assert_eq!(c.normalized(), c, "idempotent for {wanted:?}");
+            let running: Vec<_> = wanted.into_iter().filter(|m| *m != Mode::Off).collect();
+            let uniform = running.windows(2).all(|w| w[0] == w[1]);
+            let others: Vec<_> = wanted[..5].iter().filter(|m| **m != Mode::Off).collect();
+            // Everything else Live and profit unwind previewing: the older
+            // shape holds that as a shared Live with `live = false`.
+            let unwind_previews = wanted[5] == Mode::Shadow
+                && !others.is_empty()
+                && others.iter().all(|m| **m == Mode::Live);
+            let own = Module::ALL.map(|m| c.switch(m).1);
+            if uniform {
+                assert_eq!(c.mode, running.first().copied().unwrap_or(Mode::Off));
+                assert_eq!(own, [None; 6], "the shape older bots read: {wanted:?}");
+            } else if unwind_previews {
+                assert_eq!(c.mode, Mode::Live);
+                assert_eq!(own, [None; 6], "the shape older bots read: {wanted:?}");
+            } else {
+                assert_eq!(c.mode, Mode::Shadow);
+                for (mode, own) in wanted.into_iter().zip(own) {
+                    assert_eq!(own, (mode == Mode::Live).then_some(Mode::Live));
+                }
+            }
+            assert_eq!(c.profit_unwind.live, wanted[5] == Mode::Live);
+            assert_eq!(
+                toml::from_str::<ModulesConfig>(&toml::to_string(&c).unwrap()).unwrap(),
+                c
+            );
+        }
+    }
+
+    /// A Live bot with profit unwind still previewing, as earlier releases
+    /// saved it, stays in that shape: a rolled-back bot can still read it.
+    #[test]
+    fn a_live_bot_previewing_profit_unwind_keeps_the_older_shape() {
+        let file = "mode = \"live\"\n[curve]\nenabled = true\n[inventory]\nenabled = false\n\
+                    [profit_unwind]\nenabled = true\nlive = false\n";
+        let c: ModulesConfig = toml::from_str(file).unwrap();
+        let saved = c.normalized();
+        assert_eq!(modes(&saved), modes(&c));
+        let text = toml::to_string(&saved).unwrap();
+        assert_eq!(text.matches("mode =").count(), 1, "{text}");
+        assert!(text.contains("live = false"), "{text}");
+    }
+
+    #[test]
+    fn a_uniform_config_writes_no_module_modes() {
+        let mut c = ModulesConfig {
+            mode: Mode::Live,
+            ..ModulesConfig::default()
+        };
+        c.inventory.mode = Some(Mode::Live);
+        let text = toml::to_string(&c.normalized()).unwrap();
+        assert!(text.starts_with("mode = \"live\""), "{text}");
+        assert_eq!(text.matches("mode =").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_wallet_bot_runs_only_the_wallet_modules_normalized() {
+        let c = each([
+            Mode::Live,
+            Mode::Shadow,
+            Mode::Live,
+            Mode::Shadow,
+            Mode::Shadow,
+            Mode::Shadow,
+        ]);
+        let wallet = c.runnable(false);
+        assert_eq!(
+            modes(&wallet),
+            [
+                Mode::Off,
+                Mode::Off,
+                Mode::Off,
+                Mode::Off,
+                Mode::Shadow,
+                Mode::Shadow
+            ]
+        );
+        assert_eq!(wallet.mode, Mode::Shadow);
+        assert_eq!(Module::ALL.map(|m| wallet.switch(m).1), [None; 6]);
+        assert_eq!(modes(&c.runnable(true)), modes(&c));
+    }
+
+    #[test]
+    fn only_live_pricing_modules_decide_quotes() {
+        let mixed = each([
+            Mode::Live,
+            Mode::Shadow,
+            Mode::Off,
+            Mode::Off,
+            Mode::Off,
+            Mode::Off,
+        ]);
+        assert!(mixed.quote_modes_differ());
+        let quotes = mixed.live_quotes();
+        assert!(quotes.inventory.enabled && !quotes.spreads.enabled);
+        for same in [Mode::Shadow, Mode::Live] {
+            let c = each([same, same, Mode::Off, Mode::Off, Mode::Off, Mode::Off]);
+            assert!(!c.quote_modes_differ());
+        }
+        let alone = each([
+            Mode::Live,
+            Mode::Off,
+            Mode::Off,
+            Mode::Off,
+            Mode::Off,
+            Mode::Off,
+        ]);
+        assert!(!alone.quote_modes_differ());
     }
 
     #[test]
@@ -605,6 +965,17 @@ mod tests {
         };
         assert!(live(enabled.clone()).validate().is_err());
         with(enabled.clone()).validate().unwrap(); // Preview needs none.
+                                                   // Its own Live mode needs one too; another module's doesn't.
+        let own = |mode| {
+            let mut c = with(LiquidityConfig {
+                mode: Some(mode),
+                ..enabled.clone()
+            });
+            c.inventory.mode = Some(Mode::Live);
+            c
+        };
+        assert!(own(Mode::Live).validate().is_err());
+        own(Mode::Shadow).validate().unwrap();
         live(LiquidityConfig {
             authority: authority(),
             ..enabled.clone()

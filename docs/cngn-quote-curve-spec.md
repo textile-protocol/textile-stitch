@@ -422,8 +422,9 @@ hold to their deadline as before.
 
 ### On a vault
 
-**The curve is a module, and runs on a vault too.** Its settings are `[modules.curve]` under the
-shared `[modules].mode` (Off / Preview / Live), the same switch every module uses. On a wallet
+**The curve is a module, and runs on a vault too.** Its settings are `[modules.curve]`, and it runs
+in its own Off / Preview / Live mode like every module (its table's `mode`, or the shared
+`[modules].mode`). On a wallet
 bot it is the only module that runs; the vault-only ones stay off whatever the file says.
 
 On a vault the share is the vault's free balances (`freeCorridor`, `freeSettlement`): NAV with
@@ -697,7 +698,7 @@ Resolved 26 Oct 2026:
 - **Stitch pricing is the only channel this targets.** The resting book keeps its band lean
   (`pricing/lean.rs`); the curve never reaches it.
 - **Config lives in the module**: `[modules.curve]` with `enabled`, the two NGN knobs
-  (`start_below_mid`, `end_above_buy`) and `shape`, run by `[modules].mode`. `allIn` is derived
+  (`start_below_mid`, `end_above_buy`) and `shape`, run in the curve's own mode. `allIn` is derived
   per request, so it is not config. The formula has no floor term, so the band rule's
   `lean_floor_bps` has nothing to clamp here.
 - **The curve is a module for wallet bots and vaults alike** (§8): one config home, one mode

@@ -8,18 +8,20 @@ import {
   workspaceModules,
   selectedWorkspaceModule,
   type BotModuleId,
+  hedgeBadge,
+  type BadgeMode,
   type ModuleSection,
   type WorkspaceModuleId,
 } from '../moduleWorkspace'
-import { moduleModes } from '../modulePresentation'
-import { hedgeMode, hedgeStatus } from '../perps'
+import { modeLabel } from '../modulePresentation'
+import { moduleMode } from '../moduleModes'
+import { hedgeStatus } from '../perps'
 import type { Bot, Funding } from '../types'
 import type { PerpsState } from '../usePerps'
 import { useQuoteModules } from '../useQuoteModules'
 import ModulesPanel from './ModulesPanel'
 import PerpsModule from './PerpsModule'
 import ScrollTabs from './ScrollTabs'
-import QuotePolicySettings from './QuotePolicySettings'
 import { Banner, Input, Loading } from './ui'
 
 /** Navigation is presentation only. Both editors stay mounted so their drafts survive. */
@@ -134,7 +136,7 @@ export default function ModuleWorkspace({
           >
             <p className="px-2 pt-1 text-sm font-bold">All modules</p>
             <p className="text-muted px-2 pt-1 pb-3 text-xs">
-              Saved enable state · current activity
+              Saved mode · current activity
             </p>
             <Input
               aria-label="Search modules"
@@ -151,13 +153,15 @@ export default function ModuleWorkspace({
                     </p>
                     <div className="grid grid-cols-2 gap-1 md:grid-cols-1">
                       {entries.map((id) => {
-                        const enabled =
+                        const mode =
                           id === 'hedge'
-                            ? perps.view
-                              ? perps.view.enabled &&
-                                hedgeMode(perps.view) !== 'off'
+                            ? hedgeBadge(perps.view)
+                            : quotes.view
+                              ? moduleMode(quotes.view.config, id)
                               : null
-                            : (quotes.view?.config[id].enabled ?? null)
+                        // Activity beyond what the mode badge already says.
+                        const activity =
+                          mode && mode !== 'off' ? status(id) : null
                         return (
                           <button
                             key={id}
@@ -170,15 +174,18 @@ export default function ModuleWorkspace({
                             </span>
                             <span className="mt-2 flex flex-wrap items-center gap-1.5 text-xs">
                               <span
-                                className={`rounded px-1.5 py-0.5 font-bold ${enabled ? 'bg-success/10 text-success' : 'bg-canvas text-muted'}`}
+                                className={`rounded px-1.5 py-0.5 font-bold ${mode ? badgeTone[mode] : 'bg-canvas text-muted'}`}
                               >
-                                {enabled === null
+                                {mode === null
                                   ? 'Loading'
-                                  : enabled
-                                    ? 'Enabled'
-                                    : 'Disabled'}
+                                  : mode === 'on'
+                                    ? 'On'
+                                    : modeLabel(mode)}
                               </span>
-                              {enabled && <ModuleStatus value={status(id)} />}
+                              {activity &&
+                                !['Live', 'Preview'].includes(activity) && (
+                                  <ModuleStatus value={activity} />
+                                )}
                               {unsaved(id) && (
                                 <span className="text-warning">Unsaved</span>
                               )}
@@ -217,15 +224,6 @@ export default function ModuleWorkspace({
                     <p className="text-muted mt-2 text-sm">
                       {WORKSPACE_MODULES[quoteModule].description}
                     </p>
-                    <p className="text-muted mt-2 text-xs">
-                      Saved quote policy:{' '}
-                      {
-                        moduleModes.find(
-                          (m) => m.value === quotes.view?.config.mode
-                        )?.label
-                      }
-                      . Shared by enabled quote modules.
-                    </p>
                   </div>
                   <ModuleStatus value={status(quoteModule)} />
                 </header>
@@ -253,11 +251,15 @@ export default function ModuleWorkspace({
           </div>
         </div>
       )}
-      {quotes.view && (
-        <QuotePolicySettings state={quotes} editable={bot.editable} />
-      )}
     </section>
   )
+}
+
+const badgeTone: Record<BadgeMode, string> = {
+  live: 'bg-success/10 text-success',
+  on: 'bg-success/10 text-success',
+  shadow: 'bg-warning/10 text-warning',
+  off: 'bg-canvas text-muted',
 }
 
 function ModuleStatus({ value }: { value: string }) {

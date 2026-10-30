@@ -492,7 +492,7 @@ fn modules_runtime(
     price_source: &str,
 ) -> anyhow::Result<Option<crate::modules::runtime::Runtime>> {
     use crate::modules::runtime::{pending_floor_saved, settling_only_config, Runtime};
-    let modules_on = cfg.modules_enabled && cfg.modules.mode != crate::modules::Mode::Off;
+    let modules_on = cfg.modules_enabled && cfg.modules.runtime_on();
     let dir = match config_dir {
         Some(dir) => dir,
         None if modules_on => anyhow::bail!("modules need a persistent config directory"),
@@ -2233,10 +2233,7 @@ impl Engine {
             }
         }
         if let Some(modules) = &self.modules {
-            if modules.config.mode == crate::modules::Mode::Live
-                && modules.config.inventory.enabled
-                && plan.bid
-            {
+            if modules.config.is_live(crate::modules::Module::Inventory) && plan.bid {
                 let Some(context) = self.module_context(&book, &quote, now_secs) else {
                     return reject(RejectReason::Busy);
                 };
@@ -3538,8 +3535,9 @@ mod tests {
         let settling = modules_runtime(&cfg, Some(&dir), "http://feed")
             .unwrap()
             .expect("a settling-only runtime");
-        assert_eq!(settling.config.mode, crate::modules::Mode::Shadow);
+        // Nothing runs, so the normalized runtime config is Off throughout.
         let c = &settling.config;
+        assert!(crate::modules::Module::ALL.into_iter().all(|m| !c.runs(m)));
         assert!(
             !(c.inventory.enabled
                 || c.spreads.enabled

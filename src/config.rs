@@ -1213,23 +1213,18 @@ impl Config {
         .collect()
     }
 
-    /// Whether the inventory curve prices live quotes: modules on, the curve
-    /// switched on, and modules in Live. Preview only computes it.
+    /// Whether the inventory curve prices live quotes: modules on and the
+    /// curve in Live. Preview only computes it.
     pub fn curve_live(&self) -> bool {
-        self.modules_enabled
-            && self.modules.curve.enabled
-            && self.modules.mode == crate::modules::Mode::Live
+        self.modules_enabled && self.modules.is_live(crate::modules::Module::Curve)
     }
 
-    /// Whether profit unwind quotes with its lift: modules on, Live mode, and
-    /// profit unwind switched on with its own `live`. Otherwise it previews
-    /// (or doesn't run). Independent of the inventory curve.
+    /// Whether profit unwind quotes with its lift: modules on and profit
+    /// unwind in Live ([`crate::modules::ModulesConfig::mode_of`] reads its
+    /// older `live` switch too). Otherwise it previews (or doesn't run).
+    /// Independent of the inventory curve.
     pub fn profit_unwind_live(&self) -> bool {
-        let u = &self.modules.profit_unwind;
-        self.modules_enabled
-            && u.enabled
-            && u.live
-            && self.modules.mode == crate::modules::Mode::Live
+        self.modules_enabled && self.modules.is_live(crate::modules::Module::ProfitUnwind)
     }
 
     /// The price every reader of this bot's feed quotes around: the tick
@@ -1247,11 +1242,9 @@ impl Config {
     }
 
     /// Whether the liquidity schedule will send its own floor and recall
-    /// transactions: on, in Live mode, with modules on. Preview only reads.
+    /// transactions: the schedule in Live, with modules on. Preview only reads.
     pub fn liquidity_schedule_sends(&self) -> bool {
-        self.modules_enabled
-            && self.modules.liquidity.enabled
-            && self.modules.mode == crate::modules::Mode::Live
+        self.modules_enabled && self.modules.is_live(crate::modules::Module::Liquidity)
     }
 
     /// Whether this config broadcasts transactions from the operator wallet at

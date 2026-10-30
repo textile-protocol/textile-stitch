@@ -22,6 +22,7 @@ import {
   withLift,
 } from './curve'
 import { liftLimitNgn, unwindWeight } from './unwind'
+import type { Mode, ModulesConfig } from './modules'
 
 // The fixtures and golden values of src/pricing/curve.rs, so the Simulate
 // drawer prices exactly what the bot does.
@@ -205,14 +206,19 @@ describe('flat quote', () => {
   })
 
   it('reads the unadjusted feed price only while the curve runs Live', () => {
-    const config = (mode: 'off' | 'shadow' | 'live', enabled: boolean) => ({
-      mode,
-      curve: { enabled, ...knobs(0, 0) },
-    })
+    // Only the shared mode and the curve's table are read.
+    const config = (mode: Mode, enabled: boolean, own?: Mode) =>
+      ({
+        mode,
+        curve: { enabled, ...(own && { mode: own }), ...knobs(0, 0) },
+      }) as unknown as ModulesConfig
     expect(readsUnadjustedPrice(config('live', true))).toBe(true)
     expect(readsUnadjustedPrice(config('live', false))).toBe(false)
     expect(readsUnadjustedPrice(config('shadow', true))).toBe(false)
     expect(readsUnadjustedPrice(config('off', true))).toBe(false)
+    // The curve's own mode wins over the shared one.
+    expect(readsUnadjustedPrice(config('shadow', true, 'live'))).toBe(true)
+    expect(readsUnadjustedPrice(config('live', true, 'shadow'))).toBe(false)
   })
 
   it('goes flat, as the bot does, once the reference is 1% from the feed', () => {

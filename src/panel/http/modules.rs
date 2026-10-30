@@ -6,7 +6,7 @@ use crate::{
     config::Config,
     modules::{
         runtime::{Status, STATUS_FILE},
-        ModulesConfig,
+        Module, ModulesConfig,
     },
     panel::inventory::Bot,
     pricing::quote::Spread,
@@ -173,10 +173,12 @@ pub async fn update(
         ));
     }
     body.config.validate().map_err(ApiError::bad_request)?;
+    // Written in the shape older bots read whenever the modes allow it.
+    let config = body.config.normalized();
     // Turning the schedule on needs a vault with a yield adapter. A config
     // that already has it on is not re-checked, so unrelated module edits
     // never wait on the chain; the bot doesn't act without one either way.
-    if body.config.liquidity.enabled && !saved.modules.liquidity.enabled {
+    if config.runs(Module::Liquidity) && !saved.modules.runs(Module::Liquidity) {
         if let Some(why) = liquidity_refusal(&state, &saved).await {
             return Err(ApiError::bad_request(format!(
                 "The liquidity schedule needs a vault that stakes its idle settlement. {why}."
@@ -186,7 +188,7 @@ pub async fn update(
     let mut doc = raw
         .parse::<toml_edit::DocumentMut>()
         .map_err(ApiError::bad_request)?;
-    let block = toml::to_string(&body.config)
+    let block = toml::to_string(&config)
         .map_err(ApiError::bad_request)?
         .parse::<toml_edit::DocumentMut>()
         .map_err(ApiError::bad_request)?;
@@ -330,10 +332,11 @@ fn and_list(items: &[&str]) -> String {
 /// `raw` with the root `modules_enabled` flag set. A root key prints above the
 /// first table, where the loader reads it; everything else, comments
 /// included, stays as written. Turning modules on first turns off what they
-/// can't run beside ([`crate::setup::turn_off_module_conflicts`]), and puts a
-/// saved `[modules].mode` back to `shadow`: turning modules off keeps that
-/// table, so a bot last run in Live would otherwise restart straight into Live
-/// and change quotes. An absent mode already defaults to `shadow`.
+/// can't run beside ([`crate::setup::turn_off_module_conflicts`]), and puts
+/// every saved mode back to `shadow`: the shared `[modules].mode`, and any a
+/// module's own table names. Turning modules off keeps those tables, so a bot
+/// last run in Live would otherwise restart straight into Live and change
+/// quotes. An absent mode already defaults to `shadow`.
 ///
 /// On a bot that trades from its own wallet the inventory curve is the one
 /// module that can run, so turning modules on there turns it on too. A vault
@@ -353,6 +356,15 @@ pub fn with_modules_flag(raw: &str, enabled: bool) -> anyhow::Result<String> {
             .and_then(toml_edit::Item::as_table_like_mut)
         {
             modules.insert("mode", toml_edit::value("shadow"));
+            for (_, table) in modules.iter_mut() {
+                if let Some(table) = table.as_table_like_mut() {
+                    // A module left Off by its own mode stays off.
+                    if table.get("mode").and_then(toml_edit::Item::as_str) == Some("off") {
+                        table.insert("enabled", toml_edit::value(false));
+                    }
+                    table.remove("mode");
+                }
+            }
         }
         if doc.get("vault").is_none() {
             doc["modules"]["curve"]["enabled"] = toml_edit::value(true);
@@ -506,6 +518,60 @@ mod tests {
             "stale edits must not overwrite newer settings"
         );
     }
+    /// Each module saves its own mode. Mixed modes keep Preview shared and
+    /// name Live where a module runs it; one mode for every running module
+    /// goes back to the shared key alone, the file older bots read.
+    #[tokio::test]
+    async fn module_modes_are_saved_in_the_shape_older_bots_read_when_they_can() {
+        let h = harness("module-modes");
+        seed(&h, true);
+        let path = h.root.join("bot-a/stitch.toml");
+        let save = |config: serde_json::Value| {
+            let h = &h;
+            async move {
+                let (_, body) = h.get("/api/bots/bot-a/modules").await;
+                let revision = Harness::parse(&body)["revision"].clone();
+                let (status, body) = h
+                    .put_json(
+                        "/api/bots/bot-a/modules",
+                        serde_json::json!({"revision": revision, "config": config}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+        };
+        let (_, body) = h.get("/api/bots/bot-a/modules").await;
+        let mut config = Harness::parse(&body)["config"].clone();
+        config["inventory"]["mode"] = serde_json::json!("live");
+        config["spreads"]["mode"] = serde_json::json!("shadow");
+        save(config.clone()).await;
+        let written = std::fs::read_to_string(&path).unwrap();
+        let doc = written.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(doc["modules"]["mode"].as_str(), Some("shadow"), "{written}");
+        assert_eq!(doc["modules"]["inventory"]["mode"].as_str(), Some("live"));
+        assert!(doc["modules"]["spreads"].get("mode").is_none(), "{written}");
+        let stored = Config::from_toml(&written).unwrap().modules;
+        assert_eq!(
+            stored.mode_of(Module::Inventory),
+            crate::modules::Mode::Live
+        );
+        assert_eq!(
+            stored.mode_of(Module::Spreads),
+            crate::modules::Mode::Shadow
+        );
+
+        config["spreads"]["mode"] = serde_json::json!("live");
+        save(config).await;
+        let written = std::fs::read_to_string(&path).unwrap();
+        let doc = written.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(doc["modules"]["mode"].as_str(), Some("live"), "{written}");
+        for module in ["inventory", "spreads", "rebalance", "liquidity", "curve"] {
+            assert!(
+                doc["modules"][module].get("mode").is_none(),
+                "{module}: {written}"
+            );
+        }
+    }
     #[tokio::test]
     async fn the_view_carries_the_corridor_spreads_modules_start_from() {
         let h = harness("module-corridor-spreads");
@@ -639,6 +705,9 @@ mod tests {
         let view = Harness::parse(&body);
         let mut config = view["config"].clone();
         config["mode"] = serde_json::json!("live");
+        // A module's own Live comes back as Preview too.
+        config["spreads"]["mode"] = serde_json::json!("shadow");
+        config["inventory"]["mode"] = serde_json::json!("live");
         let (status, body) = h
             .put_json(
                 "/api/bots/bot-a/modules",
@@ -658,10 +727,33 @@ mod tests {
         let (_, body) = h.get("/api/bots/bot-a/modules").await;
         let view = Harness::parse(&body);
         assert_eq!(view["config"]["mode"], "shadow");
+        assert!(view["config"]["inventory"].get("mode").is_none(), "{view}");
         assert_eq!(
             view["config"]["inventory"]["target_bps"],
             config["inventory"]["target_bps"]
         );
+    }
+    /// A module a hand edit left Off by its own mode doesn't come back on.
+    #[tokio::test]
+    async fn turning_modules_on_keeps_a_module_off_by_its_own_mode() {
+        let h = harness("module-reenable-off");
+        seed(&h, true);
+        let path = h.root.join("bot-a/stitch.toml");
+        let mut doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["modules"]["spreads"]["enabled"] = toml_edit::value(true);
+        doc["modules"]["spreads"]["mode"] = toml_edit::value("off");
+        doc["modules"]["inventory"]["mode"] = toml_edit::value("live");
+        let on = with_modules_flag(&doc.to_string(), true).unwrap();
+        let modules = Config::from_toml(&on).unwrap().modules;
+        assert_eq!(modules.mode_of(Module::Spreads), crate::modules::Mode::Off);
+        assert_eq!(
+            modules.mode_of(Module::Inventory),
+            crate::modules::Mode::Shadow
+        );
+        assert!(modules.spreads.mode.is_none() && modules.inventory.mode.is_none());
     }
     /// The bot without a vault, as the panel creates it.
     fn seed_wallet_bot(h: &Harness) -> std::path::PathBuf {

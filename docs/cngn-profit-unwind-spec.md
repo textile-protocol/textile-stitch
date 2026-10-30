@@ -245,13 +245,14 @@ paid +10.6 bps at a 25 bps first leg.)
 
 ## 6. Knobs
 
-These live in their own block, `[modules.profit_unwind]`. The lift only quotes with `live = true`
-in Live mode (`[modules].mode`), with or without the curve.
+These live in their own block, `[modules.profit_unwind]`. The lift only quotes with profit unwind
+in Live, with or without the curve: its own `mode = "live"`, or, in a file from before per-module
+modes, a shared Live (`[modules].mode`) with `live = true`.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Off unless switched on. Runs with or without `[modules.curve]` |
-| `live` | `false` | Quote with the lift. Off, the bot tracks the cost, computes the lift and logs the price it would quote, and quotes without it |
+| `live` | `false` | Quote with the lift while following a shared Live. Off, the bot tracks the cost, computes the lift and logs the price it would quote, and quotes without it. A module `mode` wins over it; the panel keeps the two in step |
 | `share` | `0.5` | Share of the gain passed back as a better price. Allowed range 0–1 |
 | `cap_ngn` | `2` | The most profit unwind ever lifts the price, in NGN. Quoted as set; the panel warns above the round-trip limit (§3) |
 | `min_gain_ngn` | `0.7` | Ignore gains smaller than this, in NGN per USDT (about 5 bps), so feed noise doesn't move the price |

@@ -157,27 +157,30 @@ export function Popover({
   )
 }
 
-const modeDots = {
+export const modeDots = {
   off: 'bg-faint',
   shadow: 'bg-warning',
   live: 'bg-success',
 } as const
 
-/** Off / Preview / Live, the run mode every module card carries in its
- * header. `modes` supplies the labels and hover hints. */
+/** Off / Preview / Live, the run mode each module's Settings header carries.
+ * `modes` supplies the labels and hover hints. */
 export function ModeSwitch<M extends keyof typeof modeDots>({
   modes,
   value,
   onChange,
+  label = 'Module mode',
 }: {
   modes: readonly { value: M; label: string; hint: string }[]
   value: M
   onChange: (mode: M) => void
+  label?: string
 }) {
+  const name = useId()
   return (
     <div
       role="radiogroup"
-      aria-label="Module mode"
+      aria-label={label}
       className="bg-active inline-flex rounded-lg p-0.5"
     >
       {modes.map((mode) => (
@@ -188,7 +191,7 @@ export function ModeSwitch<M extends keyof typeof modeDots>({
         >
           <input
             type="radio"
-            name="module-mode"
+            name={name}
             value={mode.value}
             checked={value === mode.value}
             onChange={() => onChange(mode.value)}

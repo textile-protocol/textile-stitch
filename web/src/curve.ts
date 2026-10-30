@@ -8,6 +8,7 @@
 // amounts are the reciprocal; the panel never needs them.
 
 import type { CurveModuleConfig, ModulesConfig, ModulesView } from './modules'
+import { isLive, moduleMode } from './moduleModes'
 import {
   averageUnwindWeight,
   flooredAskNgn,
@@ -302,10 +303,8 @@ export function flatPrice(
 /** Whether a bot on this config quotes around `unadjustedPrice`, the feed
  * price before manual adjustments: only while the curve runs Live. Otherwise
  * it reads `price`. `Config::price_basis` in src/config.rs. */
-export function readsUnadjustedPrice(
-  config: Pick<ModulesConfig, 'mode' | 'curve'>
-): boolean {
-  return config.mode === 'live' && config.curve.enabled
+export function readsUnadjustedPrice(config: ModulesConfig): boolean {
+  return isLive(config, 'curve')
 }
 
 /** How far the reference mid or buy may sit from the feed price, bps, before
@@ -493,14 +492,14 @@ export function curveOverviewState(
   view: Pick<ModulesView, 'running' | 'status' | 'config'>,
   now: number
 ): { title: string; message: string; pill: string } {
-  const mode = view.config.mode
+  const mode = moduleMode(view.config, 'curve')
   if (!view.running)
     return {
       title: 'Ready when you are',
       message: 'The bot is stopped. You can still edit its settings.',
       pill: 'Bot stopped',
     }
-  if (mode === 'off' || !view.config.curve.enabled)
+  if (mode === 'off')
     return {
       title: 'The curve is off',
       message:
@@ -518,7 +517,7 @@ export function curveOverviewState(
     ? {
         title: 'Previewing the curve',
         message:
-          'The bot records what the curve would quote. Swap quotes still use your corridor spread until you switch to Live.',
+          'The bot records what the curve would quote. Swap quotes still use your corridor spread until you set the curve to Live.',
         pill: 'Preview mode',
       }
     : {

@@ -59,8 +59,8 @@ stay Live while the curve is Off. Their settings and permissions are separate:
 The existing `modules_enabled` setting is not a master switch for hedging.
 Turning it off removes the quote controls; the Modules tab stays available
 when the hedge has an assignment or needs monitoring. Turning the hedge off leaves curve settings intact.
-Each group keeps its own Preview/Live choice. Quote modules retain their
-existing shared policy mode and individual enable switches.
+The hedge keeps its own Preview/Live choice, and each quote module has its
+own Off/Preview/Live mode. Neither changes the other.
 
 The curve is currency-agnostic and uses the configured token decimals and
 reference book. For IDRX these are 2 collateral decimals and 6 USDT decimals.
@@ -73,17 +73,16 @@ this UI change does not apply the curve to recall quotes or change hedge marks.
 On **Modules**, each capability is a peer in one workspace. The always-visible list
 uses Capital, Pricing and Liquidity categories and includes disabled modules,
 even for a bot with just one module. Mobile shows the same list above the editor.
-Selecting a module does not enable it. Enabled/Disabled badges show the saved
-configuration separately from current activity. **Overview** shows readings,
+Selecting a module does not turn it on. Each badge shows the saved mode (Off,
+Preview or Live) separately from current activity. **Overview** shows readings,
 **Settings** holds the controls and **Activity** shows history. Drafts survive
 module navigation; the selected module and section survive refresh in the URL.
 Refreshing still reloads saved settings, not unsaved drafts.
 
-Quote modules retain a **Shared quote policy** mode, with every affected module
-named before saving. This group-wide control sits below the workspace and has
-its own Save button. Each module saves only its own settings; sibling drafts
-remain unsaved, and module toggles never change the shared mode. Hedge settings
-have a separate draft and write path. An assigned hedge stays in navigation
+Each quote module's mode sits at the top of its Settings and saves with that
+module's other settings. Saving one module never changes another's mode or
+settings; sibling drafts remain unsaved. Hedge settings have a separate draft
+and write path. An assigned hedge stays in navigation
 when disabled, while its empty dashboard summary can still disappear. Errors in one service leave
 the other controls accessible. Search and navigation never save configuration.
 

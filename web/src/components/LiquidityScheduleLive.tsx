@@ -6,6 +6,7 @@ import {
   percentage,
   shareBps,
 } from '../modulePresentation'
+import { moduleMode } from '../moduleModes'
 import { Banner, Card } from './ui'
 
 const when = (at: number) =>
@@ -31,7 +32,8 @@ export default function LiquidityScheduleLive({
 }) {
   const l = view.status?.liquidity ?? null
   const state = liquidityState(view, now)
-  const shadow = (view.status?.config ?? view.config).mode === 'shadow'
+  const shadow =
+    moduleMode(view.status?.config ?? view.config, 'liquidity') === 'shadow'
   const amount = (raw: string | null) =>
     raw === null ? '—' : formatAtomic(raw, view.settlement_decimals)
   const ofFree = (raw: string | null) => {

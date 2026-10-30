@@ -1,15 +1,23 @@
 import type { CurveStatus } from './curve'
 import type { UnwindStatus } from './unwind'
+import { isLive, moduleMode } from './moduleModes'
+/** `shadow` is called Preview in the panel. */
+export type Mode = 'off' | 'shadow' | 'live'
+/** A module's own run mode. Absent, it follows the shared `ModulesConfig.mode`;
+ * Off while `enabled` is false either way. See `moduleModes.ts`. */
+type OwnMode = { mode?: Mode }
 export interface ModulesConfig {
-  mode: 'off' | 'shadow' | 'live'
-  inventory: {
+  /** The mode modules without their own follow. The panel edits each
+   * module's own mode and saves the shape older bots read when it can. */
+  mode: Mode
+  inventory: OwnMode & {
     enabled: boolean
     target_bps: number
     max_bps: number
     max_skew_bps: number
     spread_floor_bps: number
   }
-  spreads: {
+  spreads: OwnMode & {
     enabled: boolean
     /** Absent in status/config responses from older releases; defaults off. */
     inventory_aware?: boolean
@@ -18,7 +26,7 @@ export interface ModulesConfig {
     multiplier: number
     max_extra_bps: number
   }
-  rebalance: {
+  rebalance: OwnMode & {
     method?: 'manual' | 'dealer'
     enabled: boolean
     trigger_bps: number
@@ -41,9 +49,10 @@ export interface ModulesConfig {
 }
 /** Mirrors `ProfitUnwindConfig` in src/modules/config.rs. Amounts are in the
  * corridor's soft currency per dollar, like the curve's offsets. */
-export interface ProfitUnwindConfig {
+export interface ProfitUnwindConfig extends OwnMode {
   enabled: boolean
-  /** Quote with the lift (in Live mode); off, the bot previews it. */
+  /** Quote with the lift while following a shared Live mode; off, that
+   * previews. From before each module had its own mode, which wins when set. */
   live: boolean
   /** Share of the gain passed back, 0..1. */
   share: number
@@ -53,14 +62,14 @@ export interface ProfitUnwindConfig {
   start_pct: number
   refresh_secs: number
 }
-export interface CurveModuleConfig {
+export interface CurveModuleConfig extends OwnMode {
   enabled: boolean
   start_below_mid: number
   end_above_buy: number
   shape: number
 }
 export type Weekday = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun'
-export interface LiquidityConfig {
+export interface LiquidityConfig extends OwnMode {
   enabled: boolean
   /** "HH:MM", 24h, UTC. Start of market hours. */
   open_utc: string
@@ -138,6 +147,10 @@ export interface ModuleStatus {
         extra_bps: number | null
       }
     } | null
+    /** The sides quotes went out at when that isn't `decision`: one of
+     * inventory balancing and dynamic spreads ran Live and the other in
+     * Preview, so only the Live one reached a quote. Absent otherwise. */
+    quoted?: { buy_bps: number | null; sell_bps: number | null } | null
   }[]
   rebalance_status: string
   next_attempt_at: number
@@ -248,7 +261,7 @@ export function dynamicSpreadState(
     return {
       label: 'Bot stopped',
       message:
-        'Start the bot to observe dynamic spreads. Saved Live mode alone does not start it.',
+        'Start the bot to observe dynamic spreads. Saving Live alone does not start it.',
       current: false,
     }
   if (!status)
@@ -271,7 +284,8 @@ export function dynamicSpreadState(
         'No current module evaluation. Check the RFQ connection, price feed and vault RPC reads in the bot logs. Previous readings are retained below.',
       current: false,
     }
-  if (!status.config.spreads.enabled || status.config.mode === 'off')
+  const mode = moduleMode(status.config, 'spreads')
+  if (mode === 'off')
     return {
       label: 'Dynamic spreads off',
       message:
@@ -290,11 +304,11 @@ export function dynamicSpreadState(
       message: `Collecting ${status.config.spreads.warmup_secs}s of price history. Until then quotes stay live and carry the maximum addition of ${status.config.spreads.max_extra_bps} bps.`,
       current: true,
     }
-  const shadow = status.config.mode === 'shadow'
+  const shadow = mode === 'shadow'
   const additions = dynamicSpreadAdditions(last)
   const inventoryRemovesBuffer =
     status.config.spreads.inventory_aware &&
-    status.config.inventory.enabled &&
+    isLive(status.config, 'inventory') &&
     !!last?.decision.volatility_bps &&
     (last.decision.inventory_bps === 0 ||
       (last.decision.inventory_bps ?? 0) >= status.config.inventory.max_bps) &&
@@ -302,10 +316,10 @@ export function dynamicSpreadState(
     (additions.buy === 0 || additions.buy === null) &&
     (additions.sell === 0 || additions.sell === null)
   return {
-    label: shadow ? 'Shadow · preview only' : 'Live quote policy',
+    label: shadow ? 'Preview only' : 'Live quote policy',
     current: true,
     message: shadow
-      ? 'These adjustments are recorded for comparison. Shadow mode leaves live quotes unchanged.'
+      ? 'These adjustments are recorded for comparison. In Preview, dynamic spreads leave live quotes unchanged.'
       : inventoryRemovesBuffer
         ? 'Inventory weighting removes the extra volatility buffer on the enabled side at this exposure. Inventory-adjusted spreads and side limits still apply.'
         : last?.decision.volatility_bps === 0

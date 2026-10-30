@@ -1,6 +1,7 @@
 import { curveOverviewState, freshReading } from '../curve'
 import { freshUnwindReading, unwindOverviewState } from '../unwind'
 import { type ModulesView } from '../modules'
+import { isLive, moduleMode } from '../moduleModes'
 import {
   moduleOverviewState,
   percentage,
@@ -56,7 +57,8 @@ export default function ModulesOverview({
   const current = state.current ? latest : undefined
   const share = current?.inventory_bps
   const margins = current && !current.blocked
-  const shadow = config.mode === 'shadow'
+  const own = moduleMode(config, 'inventory')
+  const shadow = own === 'shadow'
   const differs = runningConfigDiffers(view)
   if (selected === 'spreads')
     return <DynamicSpreadsLive view={view} now={now} />
@@ -79,7 +81,7 @@ export default function ModulesOverview({
             {view.running
               ? shadow
                 ? 'Preview mode'
-                : config.mode === 'off'
+                : own === 'off'
                   ? 'Off'
                   : 'Live mode'
               : 'Bot stopped'}
@@ -305,7 +307,7 @@ function UnwindOverview({
   const reading = freshUnwindReading(view.status?.profit_unwind, now)
   const quotes = view.status?.profit_unwind?.quotes ?? []
   const u = view.config.profit_unwind
-  const onCurve = view.config.curve.enabled && view.config.mode === 'live'
+  const onCurve = isLive(view.config, 'curve')
   return (
     <div className="space-y-4">
       <Card className="!rounded-none !border-0 !p-0">

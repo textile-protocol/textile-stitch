@@ -65,6 +65,18 @@ pub struct Observation {
     /// Optional for status files written by older bot releases.
     #[serde(default)]
     pub inputs: Option<DecisionInputs>,
+    /// The sides quotes went out at, when that isn't `decision`: one of
+    /// inventory balancing and dynamic spreads ran Live and the other in
+    /// Preview, so only the Live one reached a quote. Absent otherwise, and
+    /// from older bot releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<QuotedSides>,
+}
+/// Spreads in bps; `None` is a side the policy paused.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct QuotedSides {
+    pub buy_bps: Option<u32>,
+    pub sell_bps: Option<u32>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DecisionInputs {
@@ -440,6 +452,8 @@ impl Runtime {
     /// `price_source` is the feed URL the module prices come from; it keys
     /// the saved price window so a changed feed never inherits old samples.
     pub fn new(config: ModulesConfig, dir: &Path, price_source: &str) -> Result<Self> {
+        // Normalized, so `enabled` means the module runs in Preview or Live.
+        let config = config.normalized();
         let path = dir.join(ATTEMPTS_FILE);
         let next_attempt_at = if path.exists() {
             let attempt: Attempt = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -458,8 +472,7 @@ impl Runtime {
         // A live schedule may restart over an unfunded floor or a raise still
         // landing. Until its first trusted read says what is liquid, quotes
         // promise no settlement at all (see `rfq::liquidity::publish_cap`).
-        let starting_cap =
-            (config.liquidity.enabled && config.mode == Mode::Live).then_some(U256::ZERO);
+        let starting_cap = config.is_live(Module::Liquidity).then_some(U256::ZERO);
         let liquidity = LiquidityShared {
             cap: saved_floor
                 .as_ref()
@@ -527,7 +540,18 @@ impl Runtime {
             saved_floor,
         })
     }
+    /// The decision every running module proposes, recorded for the panel.
     pub fn decide(&self, context: &Context) -> Decision {
+        self.evaluate_and_record(context).0
+    }
+    /// The decision quotes go out at: [`Self::decide`], except that a
+    /// Preview pricing module beside a Live one is left out
+    /// ([`ModulesConfig::live_quotes`]).
+    pub fn quote_decision(&self, context: &Context) -> Decision {
+        let (proposed, quoted) = self.evaluate_and_record(context);
+        quoted.unwrap_or(proposed)
+    }
+    fn evaluate_and_record(&self, context: &Context) -> (Decision, Option<Decision>) {
         let mut state = self.state.lock().expect("module state poisoned");
         let history = &mut state.history;
         // A degraded print (held, clamped or fallback) isn't the market the
@@ -557,6 +581,10 @@ impl Runtime {
             let _ = self.history_writer.send_replace(history.clone());
         }
         let decision = evaluate(&self.config, context, history);
+        let quoted = self
+            .config
+            .quote_modes_differ()
+            .then(|| evaluate(&self.config.live_quotes(), context, history));
         let inventory = decision
             .inventory_bps
             .filter(|_| self.config.inventory.enabled)
@@ -586,6 +614,10 @@ impl Runtime {
                 settlement: context.settlement,
                 corridor: context.corridor,
                 inputs: Some(inputs),
+                quoted: quoted.as_ref().map(|q| QuotedSides {
+                    buy_bps: q.buy_bps,
+                    sell_bps: q.sell_bps,
+                }),
             });
             if state.status.decisions.len() > MAX_DECISIONS {
                 state.status.decisions.remove(0);
@@ -593,7 +625,7 @@ impl Runtime {
             state.status.at = context.now;
             let _ = self.writer.send_replace(state.status.clone());
         }
-        decision
+        (decision, quoted)
     }
     /// Diagnostic only. Never changes quote eligibility, prices or reservations.
     pub fn quote_status(&self, state: QuoteState, message: &str, now: u64) {
@@ -721,7 +753,7 @@ impl Runtime {
     /// bounds them. That's the same bound the modules hold balances to, and
     /// about when quote inventory goes dark.
     fn liquid_shortfall_cap(&self, now: u64, pending_raise: Option<U256>) -> Option<U256> {
-        let live = self.config.liquidity.enabled && self.config.mode == Mode::Live;
+        let live = self.config.is_live(Module::Liquidity);
         if !live && pending_raise.is_none() {
             return None;
         }

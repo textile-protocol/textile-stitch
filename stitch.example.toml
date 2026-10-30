@@ -1,5 +1,6 @@
 # First-party FX modules (OperatorVault, one RFQ corridor). Defaults to off.
-# Enable this one root property to expose Modules; initial mode is shadow.
+# Enable this one root property to expose Modules; every module starts in Preview
+# (shadow) and runs in its own mode from there.
 # See docs/modules.md for strategies and the dealer API.
 modules_enabled = false
 # The liquidity schedule ([modules.liquidity]) moves the vault's liquid floor

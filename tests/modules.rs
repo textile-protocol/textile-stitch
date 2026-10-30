@@ -790,3 +790,68 @@ async fn a_restart_resumes_the_saved_window_from_the_same_feed_only() {
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Inventory balancing Live beside dynamic spreads in Preview: quotes carry
+/// only the inventory skew, while the recorded decision still shows what
+/// dynamic spreads would add, and the status says what was quoted.
+#[tokio::test]
+async fn a_preview_pricing_module_beside_a_live_one_never_reaches_a_quote() {
+    let dir = std::env::temp_dir().join(format!("stitch-mixed-modes-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = ModulesConfig::default();
+    cfg.inventory.mode = Some(Mode::Live);
+    cfg.spreads.mode = Some(Mode::Shadow);
+    let cfg = cfg.normalized();
+    assert_eq!(cfg.mode, Mode::Shadow);
+    assert_eq!(cfg.mode_of(Module::Inventory), Mode::Live);
+    let rt = runtime::Runtime::new(cfg.clone(), &dir, FEED).unwrap();
+    let ctx = Context {
+        settlement: u(70_000_000),
+        corridor: u(30_000_000),
+        ..context()
+    };
+    // A cold window holds dynamic spreads at its cap, so its addition is known.
+    let quoted = rt.quote_decision(&ctx);
+    let inventory_only = evaluate(&cfg.live_quotes(), &ctx, &[]);
+    assert_eq!(quoted, inventory_only);
+    let both = evaluate(&cfg, &ctx, &[]);
+    assert_eq!(both.volatility_bps, cfg.spreads.max_extra_bps);
+    assert_ne!(quoted.buy_bps, both.buy_bps);
+    // The panel reads what every running module proposed, and what went out.
+    let path = dir.join(runtime::STATUS_FILE);
+    let mut status = serde_json::Value::Null;
+    for _ in 0..100 {
+        status = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if status["decisions"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let observation = &status["decisions"][0];
+    assert_eq!(observation["decision"]["buy_bps"], both.buy_bps.unwrap());
+    assert_eq!(observation["quoted"]["buy_bps"], quoted.buy_bps.unwrap());
+    assert_eq!(observation["quoted"]["sell_bps"], quoted.sell_bps.unwrap());
+    drop(rt);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // One mode for both: the decision is what quotes, and nothing extra is written.
+    let dir = std::env::temp_dir().join(format!("stitch-one-mode-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rt = runtime::Runtime::new(ModulesConfig::default(), &dir, FEED).unwrap();
+    assert_eq!(rt.quote_decision(&ctx), rt.decide(&ctx));
+    let path = dir.join(runtime::STATUS_FILE);
+    for _ in 0..100 {
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if let Some(first) = status["decisions"].as_array().and_then(|d| d.first()) {
+            assert!(first.get("quoted").is_none(), "{first}");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    drop(rt);
+    let _ = std::fs::remove_dir_all(dir);
+}

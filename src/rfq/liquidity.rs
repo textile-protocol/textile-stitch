@@ -435,7 +435,7 @@ impl Liquidity {
             vault,
             authority,
             decimals,
-            live: modules.config.mode == crate::modules::Mode::Live,
+            live: modules.config.is_live(crate::modules::Module::Liquidity),
             execution: Arc::new(Mutex::new(Execution::resume(modules.saved_pending_floor()))),
             modules,
         }
@@ -1269,8 +1269,16 @@ mod tests {
             Some(U256::from(100u64))
         );
         assert!(!me.finished());
+        // A switched-off schedule isn't Live, whatever the shared mode says:
+        // it sends nothing and only waits on the saved change's nonce.
         let status = modules.status_snapshot().liquidity.unwrap();
-        assert!(status.message.contains("nonce 5"), "{}", status.message);
+        assert!(
+            status.message.starts_with("The schedule is off"),
+            "{}",
+            status.message
+        );
+        let in_flight = status.in_flight.unwrap_or_default();
+        assert!(in_flight.contains("nonce 5"), "{in_flight}");
 
         me.tick(Some(high_floor()), Some(6)).await;
         assert!(me.finished());

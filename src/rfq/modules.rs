@@ -3,22 +3,20 @@
 //! Adapter between pure module decisions and RFQ's sole order/reservation owner.
 use super::*;
 use crate::modules::runtime::QuoteState;
-use crate::modules::{self as policy, dealer, Context, Mode};
+use crate::modules::{self as policy, dealer, Context, Module};
 use crate::protocol::types::OrderParams;
 use tokio::sync::oneshot;
 
 /// The inventory curve every book carries, from `[modules.curve]`: on while
-/// modules run with the curve switched on and the mode isn't Off. Modules
+/// modules run with the curve in Preview or Live. Modules
 /// quote one corridor, so it is that corridor's. Funding doesn't matter here:
 /// the curve runs on a wallet bot and on a vault, and the share it reads is
 /// picked per bot by [`Engine::curve_inputs`].
 pub(super) fn book_curve(cfg: &Config) -> Option<super::responder::BookCurve> {
     let m = &cfg.modules;
-    (cfg.modules_enabled && m.curve.enabled && m.mode != Mode::Off).then(|| {
-        super::responder::BookCurve {
-            live: cfg.curve_live(),
-            params: m.curve.params(),
-        }
+    (cfg.modules_enabled && m.runs(Module::Curve)).then(|| super::responder::BookCurve {
+        live: cfg.curve_live(),
+        params: m.curve.params(),
     })
 }
 
@@ -62,15 +60,14 @@ impl Unwind {
     }
 }
 
-/// Profit unwind when it runs: while modules run, switched on, and the mode
-/// isn't Off. It lifts whatever price goes out, the inventory curve's or the
+/// Profit unwind when it runs: while modules run with it in Preview or Live. It lifts whatever price goes out, the inventory curve's or the
 /// flat one, so it doesn't need the curve; like the curve it runs on a wallet
 /// bot and on a vault.
 pub(super) fn unwind_runtime(cfg: &Config, config_dir: Option<&Path>) -> Option<Arc<Unwind>> {
     use crate::pricing::feed::PriceBasis;
     use crate::pricing::unwind::{load_bases, BASIS_FILE};
     let m = &cfg.modules;
-    if !(cfg.modules_enabled && m.profit_unwind.enabled && m.mode != Mode::Off) {
+    if !(cfg.modules_enabled && m.runs(Module::ProfitUnwind)) {
         return None;
     }
     let path = config_dir.map(|dir| dir.join(BASIS_FILE));
@@ -450,8 +447,8 @@ impl Engine {
         if self.vault.is_none() {
             return Some(book.clone());
         }
-        let changes_quotes = modules.config.mode == Mode::Live
-            && (modules.config.inventory.enabled || modules.config.spreads.enabled);
+        let changes_quotes =
+            modules.config.is_live(Module::Inventory) || modules.config.is_live(Module::Spreads);
         let Some(context) = self.module_context(book, quote, now) else {
             modules.quote_status(
                 QuoteState::WaitingForVault,
@@ -463,7 +460,7 @@ impl Engine {
             return (!changes_quotes).then(|| book.clone());
         };
         modules.quote_status(QuoteState::Evaluating, "Evaluating the quote policy", now);
-        let decision = modules.decide(&context);
+        let decision = modules.quote_decision(&context);
         Some(if changes_quotes {
             policy::apply(book, &decision)
         } else {
@@ -476,8 +473,7 @@ impl Engine {
         let Some(modules) = self.modules.clone() else {
             return;
         };
-        if modules.config.mode != Mode::Live
-            || !modules.config.rebalance.enabled
+        if !modules.config.is_live(Module::Rebalance)
             || modules.config.rebalance.method != policy::config::RebalanceMethod::Dealer
         {
             return;

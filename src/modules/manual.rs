@@ -98,9 +98,7 @@ impl Sale {
     ) -> Result<()> {
         self.validate(ctx.now)?;
         ensure!(
-            cfg.mode == Mode::Live
-                && cfg.rebalance.enabled
-                && cfg.rebalance.method == RebalanceMethod::Manual,
+            cfg.is_live(Module::Rebalance) && cfg.rebalance.method == RebalanceMethod::Manual,
             "Manual sales require enabled live spot rebalancing"
         );
         // Share the live module's freshness and NAV gates, without requiring a
@@ -313,6 +311,17 @@ mod tests {
         preview.mode = Mode::Shadow;
         assert!(sale
             .allows(&preview, &ctx, U256::from(20), U256::from(20))
+            .is_err());
+        // Spot rebalancing's own mode decides, not the shared one.
+        let mut own_live = preview.clone();
+        own_live.rebalance.mode = Some(Mode::Live);
+        assert!(sale
+            .allows(&own_live, &ctx, U256::from(20), U256::from(20))
+            .is_ok());
+        let mut own_preview = cfg.clone();
+        own_preview.rebalance.mode = Some(Mode::Shadow);
+        assert!(sale
+            .allows(&own_preview, &ctx, U256::from(20), U256::from(20))
             .is_err());
     }
     #[test]

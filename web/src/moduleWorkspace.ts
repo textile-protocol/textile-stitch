@@ -2,20 +2,20 @@ import { freshReading } from './curve'
 import { freshUnwindReading } from './unwind'
 import {
   moduleNames,
-  moduleKeys,
   modulesFor,
   runningConfigDiffers,
   liquidityState,
-  type ModuleKey,
 } from './modulePresentation'
+import { moduleKeys, moduleMode, type ModuleKey } from './moduleModes'
 import {
   moduleStatusFresh,
+  type Mode,
   type ModulesConfig,
   type ModulesView,
 } from './modules'
 import type { PerpsView } from './api'
 import type { BotTab } from './botRoutes'
-import { showHedgeModule } from './perps'
+import { hedgeMode, showHedgeModule } from './perps'
 
 // Presentation only. Each module owns its configuration, mode and permissions.
 // In particular, modulesEnabled gates quote policy, not FX hedging.
@@ -137,11 +137,10 @@ export function selectedWorkspaceModule(
   )
 }
 
-export type QuoteConfigScope = ModuleKey | 'policy'
+/** Each module saves its own table, its run mode included. */
+export type QuoteConfigScope = ModuleKey
 
-/** Each module saves its own table. Shared mode has its own save scope. */
-const configKeys = (scope: QuoteConfigScope): (keyof ModulesConfig)[] =>
-  scope === 'policy' ? ['mode'] : [scope]
+const configKeys = (scope: QuoteConfigScope): (keyof ModulesConfig)[] => [scope]
 
 /** Construct the full API payload from one revision's saved config and one editor. */
 export function quoteConfigForScope(
@@ -163,7 +162,7 @@ export function remainingQuoteDraft(
   scope: QuoteConfigScope
 ): ModulesConfig {
   const owned = configKeys(scope)
-  const keys: (keyof ModulesConfig)[] = ['mode', ...moduleKeys]
+  const keys: readonly (keyof ModulesConfig)[] = moduleKeys
   return {
     ...next,
     ...Object.fromEntries(
@@ -195,13 +194,12 @@ export function quoteModuleStatus(
 ): string {
   if (!view.running) return 'Bot stopped'
   if (runningConfigDiffers(view)) return 'Update pending'
-  if (view.config.mode === 'off' || !view.config[key].enabled) return 'Off'
+  const mode = moduleMode(view.config, key)
+  if (mode === 'off') return 'Off'
   if (key === 'curve') {
     if (!freshReading(view.status?.curve, now)) return 'Waiting'
   } else if (key === 'profit_unwind') {
     if (!freshUnwindReading(view.status?.profit_unwind, now)) return 'Waiting'
-    // It quotes only with its own switch on, in Live mode.
-    if (!view.config.profit_unwind.live) return 'Preview'
   } else if (key === 'liquidity') {
     if (!liquidityState(view, now).current) return 'Waiting'
   } else if (!moduleStatusFresh(view.status, view.running, now)) return 'Stale'
@@ -212,5 +210,14 @@ export function quoteModuleStatus(
     view.status?.decisions.at(-1)?.decision.blocked
   )
     return 'Blocked'
-  return view.config.mode === 'shadow' ? 'Preview' : 'Live'
+  return mode === 'shadow' ? 'Preview' : 'Live'
+}
+
+/** A sidebar badge: a module's saved mode, or `on` for a hedge that is
+ * switched on while its remote mode can't be read. */
+export type BadgeMode = Mode | 'on'
+export function hedgeBadge(view: PerpsView | null): BadgeMode | null {
+  if (!view) return null
+  const mode = hedgeMode(view)
+  return mode === 'preview' ? 'shadow' : mode === 'unknown' ? 'on' : mode
 }

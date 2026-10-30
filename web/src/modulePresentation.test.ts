@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import type { LiquidityStatus, ModulesConfig, ModulesView } from './modules'
+import type {
+  LiquidityStatus,
+  Mode,
+  ModulesConfig,
+  ModulesView,
+} from './modules'
+import { withModuleMode } from './moduleModes'
 import {
   corridorSpreadBps,
   corridorSpreads,
@@ -14,6 +20,7 @@ import {
   liveRow,
   marketMinutes,
   moduleChanges,
+  moduleModeEffect,
   moduleOverviewState,
   moduleParameterErrors,
   quoteBreakdown,
@@ -191,6 +198,58 @@ describe('the simulated spread starts from the corridor spread', () => {
       },
     ])
   })
+  it('quotes only the Live pricing module beside one in Preview', () => {
+    const c = withModuleMode(config(), 'spreads', 'shadow')
+    const base = { buy: 10, sell: 60 }
+    expect(quoteBreakdown(c, base, 6000, 20).slice(2)).toEqual([
+      {
+        key: 'spreads',
+        label: 'Dynamic spreads (Preview)',
+        on: true,
+        buy: '+0.2%',
+        sell: '+0.1%',
+      },
+      {
+        key: 'proposed',
+        label: 'Proposed spread',
+        on: false,
+        buy: '0.5%',
+        sell: '0.5%',
+      },
+      // Inventory balancing alone, as the bot quotes it.
+      {
+        key: 'quoted',
+        label: 'Quoted spread',
+        on: true,
+        buy: '0.3%',
+        sell: '0.4%',
+      },
+    ])
+    const preview = withModuleMode(c, 'inventory', 'shadow')
+    const rows = quoteBreakdown(preview, base, 6000, 20)
+    expect(rows.map((r) => r.label)).toEqual([
+      'Corridor spread',
+      'Inventory balancing',
+      'Dynamic spreads',
+      'Proposed spread',
+    ])
+  })
+  it('names what each module does in each mode', () => {
+    const c = config()
+    expect(moduleModeEffect('inventory', 'live', c)).toBe(
+      'Skews buy and sell margins toward 40% held. Buys pause at 80%.'
+    )
+    expect(moduleModeEffect('inventory', 'shadow', c)).toMatch(
+      /Quotes don’t change/
+    )
+    expect(moduleModeEffect('liquidity', 'off', c)).toMatch(/floor stays/)
+    expect(
+      moduleModeEffect('rebalance', 'live', {
+        ...c,
+        rebalance: { ...c.rebalance, method: 'dealer' },
+      })
+    ).toMatch(/through the dealer/)
+  })
   it('applies the minimum margin to the corridor spread, not to a fixed example', () => {
     const c = config()
     c.spreads.enabled = false
@@ -238,9 +297,10 @@ describe('the simulated spread starts from the corridor spread', () => {
         buy: 'Off',
         sell: 'Off',
       },
+      // Nothing moves the corridor spread, so it is what quotes.
       {
         key: 'quoted',
-        label: 'Proposed spread',
+        label: 'Quoted spread',
         on: true,
         buy: '0.25%',
         sell: '0.3%',
@@ -285,12 +345,22 @@ describe('the simulated spread starts from the corridor spread', () => {
     expect(warmupNote(c, base, 6000, 20)).toBeNull()
   })
   it('says when the bot will not quote the simulated spread', () => {
-    expect(quoteModeNote('live')).toBeNull()
-    expect(quoteModeNote('shadow')).toMatch(
-      /Live quotes stay at the corridor spread/
+    const c = (inventory: Mode, spreads: Mode) =>
+      withModuleMode(
+        withModuleMode(config(), 'inventory', inventory),
+        'spreads',
+        spreads
+      )
+    expect(quoteModeNote(c('live', 'live'))).toBeNull()
+    expect(quoteModeNote(c('live', 'off'))).toBeNull()
+    expect(quoteModeNote(c('shadow', 'shadow'))).toMatch(
+      /Quotes stay at the corridor spread until a module is Live/
     )
-    expect(quoteModeNote('off')).toMatch(
-      /live quotes stay at the corridor spread/
+    expect(quoteModeNote(c('off', 'off'))).toMatch(
+      /quotes stay at the corridor spread/
+    )
+    expect(quoteModeNote(c('live', 'shadow'))).toBe(
+      'Only inventory balancing reaches quotes. Dynamic spreads is in Preview, so the quoted spread leaves it out.'
     )
   })
 })
@@ -445,6 +515,19 @@ describe('the Simulate table starts from what the bot sees now', () => {
       sell: 6,
     })
   })
+  it('reads what went out when a Preview pricing module sat beside a Live one', () => {
+    const v = cngnVault()
+    v.status!.decisions[0]!.quoted = { buy_bps: 5, sell_bps: 6 }
+    expect(liveReading(v, 101)!.quoted).toEqual({ buy: 5, sell: 6 })
+    // Neither pricing module Live: the decision is only a proposal.
+    v.status!.decisions[0]!.quoted = undefined
+    v.status!.config = withModuleMode(
+      withModuleMode(v.status!.config, 'inventory', 'shadow'),
+      'spreads',
+      'shadow'
+    )
+    expect(liveReading(v, 101)!.mode).toBe('shadow')
+  })
   it('has no reading for a stale, blocked, off or input-less evaluation', () => {
     expect(liveReading(cngnVault(), 111)).toBeNull()
     const blocked = cngnVault()
@@ -513,14 +596,18 @@ describe('concise overview truthfulness', () => {
       'Collecting price history for dynamic spreads',
     ]
     expect(moduleOverviewState(v, 101).title).toBe('Getting ready')
+    // Off is read off the running config, fresh or not.
     v.status!.config.mode = 'off'
     expect(moduleOverviewState(v, 101).current).toBe(false)
-    expect(moduleOverviewState(v, 111).title).toBe('Waiting for an update')
+    expect(moduleOverviewState(v, 111).title).toBe('Inventory balancing is off')
     v.status!.config.mode = 'live'
+    expect(moduleOverviewState(v, 111).title).toBe('Waiting for an update')
     v.status!.decisions[0]!.decision.blocked = false
-    for (const key of ['inventory', 'spreads', 'rebalance'] as const)
-      v.status!.config[key].enabled = false
-    expect(moduleOverviewState(v, 101).title).toBe('No modules enabled')
+    v.status!.config = withModuleMode(v.status!.config, 'inventory', 'off')
+    expect(moduleOverviewState(v, 101).title).toBe('Inventory balancing is off')
+    // Its own mode, whatever the shared one says.
+    v.status!.config = withModuleMode(v.status!.config, 'inventory', 'shadow')
+    expect(moduleOverviewState(v, 101).title).toBe('Previewing your strategy')
   })
 })
 
@@ -538,14 +625,20 @@ describe('strategy rows and the save bar', () => {
     ])
     expect(saved).toEqual(config())
   })
-  it('names modes and switches as the panel does', () => {
-    const draft = config()
-    draft.mode = 'shadow'
-    draft.rebalance.enabled = true
+  it('names each module mode as the panel does', () => {
+    const draft = withModuleMode(
+      withModuleMode(config(), 'inventory', 'shadow'),
+      'rebalance',
+      'live'
+    )
     expect(moduleChanges(config(), draft)).toEqual([
-      { label: 'Run mode', from: 'Live', to: 'Preview' },
-      { label: 'Spot rebalancing', from: 'Off', to: 'On' },
+      { label: 'Inventory balancing', from: 'Live', to: 'Preview' },
+      { label: 'Spot rebalancing', from: 'Off', to: 'Live' },
     ])
+    // Naming the mode it already follows is no change.
+    expect(
+      moduleChanges(config(), withModuleMode(config(), 'inventory', 'live'))
+    ).toEqual([])
   })
   it('treats a missing inventory weighting flag as off', () => {
     const saved = config()
@@ -566,7 +659,7 @@ describe('strategy rows and the save bar', () => {
     draft.liquidity.enabled = true
     draft.liquidity.days = ['mon', 'tue']
     expect(moduleChanges(config(), draft)).toEqual([
-      { label: 'Liquidity schedule', from: 'Off', to: 'On' },
+      { label: 'Liquidity schedule', from: 'Off', to: 'Live' },
       {
         label: 'Market days (UTC)',
         from: 'Mon, Tue, Wed, Thu, Fri',
@@ -671,13 +764,22 @@ describe('liquidity schedule validation', () => {
       expect(moduleParameterErrors(c)).toHaveLength(1)
     }
   })
-  it('requires an authority only when enabled in Live mode', () => {
+  it('requires an authority only while the schedule runs Live', () => {
     const c = config()
     c.liquidity.enabled = true
-    expect(moduleParameterErrors(c)).toEqual([
-      'Liquidity schedule: Live mode needs the Roles modifier and role key that let this bot change the floor.',
-    ])
+    const missing =
+      'Liquidity schedule: Live needs the Roles modifier and role key that let this bot change the floor.'
+    expect(moduleParameterErrors(c)).toEqual([missing])
     expect(moduleParameterErrors({ ...c, mode: 'shadow' })).toEqual([])
+    // Its own mode decides, not the shared one.
+    expect(
+      moduleParameterErrors(withModuleMode(c, 'liquidity', 'shadow'))
+    ).toEqual([])
+    expect(
+      moduleParameterErrors(
+        withModuleMode({ ...c, mode: 'shadow' }, 'liquidity', 'live')
+      )
+    ).toEqual([missing])
     c.liquidity.authority = { roles_modifier: ROLES, role_key: ROLE_KEY }
     expect(moduleParameterErrors(c)).toEqual([])
   })
@@ -885,12 +987,21 @@ describe('running config comparison', () => {
     v.status!.config = runnableConfig(v.config, false)
     expect(runningConfigDiffers(v)).toBe(true)
   })
+  it('compares a running config from before the curve and profit unwind', () => {
+    const v = view()
+    const { curve: _, profit_unwind: __, ...older } = v.status!.config
+    v.status!.config = older as ModulesConfig
+    expect(() => runningConfigDiffers(v)).not.toThrow()
+    expect(runningConfigDiffers(v)).toBe(true)
+    expect(liveReading(v, 101)).toBeNull()
+  })
   it('does not crash the overview on an older running config', () => {
     const v = view()
     const { liquidity: _, ...older } = v.status!.config
     v.status!.config = older as ModulesConfig
     for (const key of ['inventory', 'spreads', 'rebalance'] as const)
       v.status!.config[key].enabled = false
-    expect(moduleOverviewState(v, 101).title).toBe('No modules enabled')
+    expect(moduleOverviewState(v, 101).title).toBe('Inventory balancing is off')
+    expect(liquidityState(v, 101).label).toBe('No liquidity data')
   })
 })

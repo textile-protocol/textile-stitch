@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import type { LiquidityConfig, ModulesConfig, Weekday } from '../modules'
+import { isLive, moduleMode } from '../moduleModes'
 import {
   clockMinutes,
   shiftClock,
@@ -101,9 +102,18 @@ export function SpreadFields({ draft, onChange }: FieldProps) {
         </p>
         {draft.spreads.inventory_aware && !draft.inventory.enabled && (
           <p className="mt-2 text-xs font-bold text-warning">
-            Enable inventory balancing for this option to take effect.
+            Set inventory balancing to Preview or Live for this option to take
+            effect.
           </p>
         )}
+        {draft.spreads.inventory_aware &&
+          isLive(draft, 'spreads') &&
+          moduleMode(draft, 'inventory') === 'shadow' && (
+            <p className="mt-2 text-xs font-bold text-warning">
+              Inventory balancing is in Preview, so live quotes add the full
+              buffer on both sides. The weighting is only recorded.
+            </p>
+          )}
       </div>
       <SecondarySettings title="Observation timing">
         <NumberControl

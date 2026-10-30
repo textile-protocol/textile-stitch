@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import { isLive } from '../moduleModes'
 import {
   saleAtomic,
   saleDecimal,
@@ -52,8 +53,7 @@ export default function ManualSales({
     }
   }, [name])
   const c = view.config
-  const ready =
-    c.mode === 'live' && c.rebalance.enabled && c.rebalance.method !== 'dealer'
+  const ready = isLive(c, 'rebalance') && c.rebalance.method !== 'dealer'
   const decimals = view.corridor_decimals
   const atomicAmount = saleAtomic(amount, decimals)
   const atomicMinimum = saleAtomic(minimum, view.settlement_decimals)
@@ -153,8 +153,8 @@ export default function ManualSales({
         {!ready && (
           <div className="mt-4">
             <Banner tone="info">
-              Enable spot rebalancing in Live mode and save in Settings to
-              create a sale.{' '}
+              Set spot rebalancing to Live and save in Settings to create a
+              sale.{' '}
               <button className="font-bold underline" onClick={onConfigure}>
                 Open settings
               </button>

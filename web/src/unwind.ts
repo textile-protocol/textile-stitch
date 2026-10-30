@@ -7,6 +7,7 @@
 // the curve.
 
 import type { ModulesView, ProfitUnwindConfig } from './modules'
+import { moduleMode } from './moduleModes'
 
 /** What profit unwind sees this tick. Mirrors `UnwindReading` in
  * src/modules/runtime.rs. */
@@ -387,15 +388,15 @@ export function unwindOverviewState(
   view: Pick<ModulesView, 'running' | 'status' | 'config'>,
   now: number
 ): { title: string; message: string; pill: string } {
-  const { mode, profit_unwind: u } = view.config
-  const live = mode === 'live' && u.live
+  const mode = moduleMode(view.config, 'profit_unwind')
+  const live = mode === 'live'
   if (!view.running)
     return {
       title: 'Ready when you are',
       message: 'The bot is stopped. You can still edit its settings.',
       pill: 'Bot stopped',
     }
-  if (mode === 'off' || !u.enabled)
+  if (mode === 'off')
     return {
       title: 'Profit unwind is off',
       message:
@@ -429,7 +430,7 @@ export function unwindOverviewState(
     : {
         title: 'Previewing the lift',
         message:
-          'The bot records what profit unwind would quote. Swap quotes carry no lift until you switch it to quote, in Live mode.',
+          'The bot records what profit unwind would quote. Swap quotes carry no lift until you set it to Live.',
         pill: 'Preview',
       }
 }

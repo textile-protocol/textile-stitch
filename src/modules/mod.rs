@@ -14,7 +14,7 @@ use crate::pricing::quote::{ask_price, bid_price};
 use crate::pricing::tick::is_stale;
 use crate::rfq::{math, responder::CorridorBook};
 use alloy_primitives::U256;
-pub use config::{Mode, ModulesConfig};
+pub use config::{Mode, Module, ModulesConfig};
 use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 1;

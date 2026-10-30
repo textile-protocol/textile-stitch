@@ -20,6 +20,7 @@ import {
   type ExampleSide,
 } from '../curve'
 import { equalSpreadBps, percentage } from '../modulePresentation'
+import { isLive, moduleMode } from '../moduleModes'
 import type { ModulesConfig, ModulesView } from '../modules'
 import {
   draftUnwindLift,
@@ -105,7 +106,7 @@ export function CurveFields({
       : null
   return (
     <>
-      {draft.mode === 'live' && c.enabled && (
+      {isLive(draft, 'curve') && (
         <Banner tone="warning">
           Live replaces the flat price on Swap quotes and on the levels Textile
           routes on. The bot then prices off the feed&apos;s centre before any
@@ -337,9 +338,9 @@ export function CurveExample({
         </p>
       )}
       <p className="text-muted text-xs leading-relaxed">
-        {draft.mode === 'live'
+        {isLive(draft, 'curve')
           ? 'Live quotes and published levels use this price.'
-          : 'Preview records this quote. Live quotes stay flat until you switch to Live.'}
+          : 'Preview records this quote. Live quotes stay flat until you set the curve to Live.'}
         {/* Without the feed price the 1% check can't run, so the quote is
             what the curve says, not necessarily what the bot sends. */}
         {feed === null &&
@@ -396,7 +397,7 @@ export function CurveNow({
   const f = reading?.share ?? null
   const until =
     curve && reading ? cheapestUntil(curve, reading.half_range_bps) : null
-  const preview = config.mode === 'shadow'
+  const preview = moduleMode(config, 'curve') === 'shadow'
   const quotes = (
     [
       [`Bot buys ${currency}`, true],

@@ -7,6 +7,17 @@ import {
 } from './unwind'
 import { formatAtomic } from './format'
 import {
+  isLive,
+  liveQuotes,
+  moduleKeys,
+  moduleMode,
+  normalizeModes,
+  quoteModesDiffer,
+  runtimeOn,
+  sameConfig,
+  type ModuleKey,
+} from './moduleModes'
+import {
   isWarmingUp,
   moduleStatusFresh,
   type CorridorSpread,
@@ -17,17 +28,12 @@ import {
   type ModuleStatus,
   type ModulesConfig,
   type ModulesView,
+  type Mode,
   type ProfitUnwindConfig,
   type Weekday,
 } from './modules'
 
-export type ModuleKey =
-  | 'inventory'
-  | 'spreads'
-  | 'rebalance'
-  | 'liquidity'
-  | 'curve'
-  | 'profit_unwind'
+export { moduleKeys, type ModuleKey }
 export const moduleNames: Record<ModuleKey, string> = {
   inventory: 'Inventory balancing',
   spreads: 'Dynamic spreads',
@@ -36,21 +42,13 @@ export const moduleNames: Record<ModuleKey, string> = {
   curve: 'Inventory curve',
   profit_unwind: 'Profit unwind',
 }
-export const moduleKeys: ModuleKey[] = [
-  'inventory',
-  'spreads',
-  'rebalance',
-  'liquidity',
-  'curve',
-  'profit_unwind',
-]
 
 /** The modules that can run on this bot's funds, in display order. Every
  * module runs on a vault; a bot that trades from its own wallet has nothing
  * for the others to read or act through, so it gets the inventory curve and
  * profit unwind. Mirrors `ModulesConfig::runnable` in the bot. */
 export const modulesFor = (vault: boolean): ModuleKey[] =>
-  vault ? moduleKeys : ['curve', 'profit_unwind']
+  vault ? [...moduleKeys] : ['curve', 'profit_unwind']
 
 /** Inventory balancing and the inventory curve both lean quotes on what the
  * vault holds, so one stays off while the other runs. The bot refuses both. */
@@ -73,37 +71,68 @@ export function leanConflict(
 export const percentage = (bps: number) =>
   `${(bps / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
 
-type Mode = ModulesConfig['mode']
-/** `shadow` is called Preview in the panel. `effect` says what saving does. */
+/** A module's run modes. `shadow` is called Preview in the panel. */
 export const moduleModes: readonly {
   value: Mode
   label: string
   hint: string
-  effect: string
 }[] = [
-  {
-    value: 'off',
-    label: 'Off',
-    hint: 'Regular quotes',
-    effect:
-      'Saving turns off new module activity. Already signed orders remain valid until they expire.',
-  },
-  {
-    value: 'shadow',
-    label: 'Preview',
-    hint: 'Observe only',
-    effect:
-      'Preview records proposed adjustments without changing live quotes.',
-  },
-  {
-    value: 'live',
-    label: 'Live',
-    hint: 'Apply to quotes',
-    effect:
-      'Saving applies these settings to live quotes and restarts a running bot.',
-  },
+  { value: 'off', label: 'Off', hint: 'Doesn’t run' },
+  { value: 'shadow', label: 'Preview', hint: 'Records, changes nothing' },
+  { value: 'live', label: 'Live', hint: 'Acts' },
 ]
+export const modeLabel = (mode: Mode) =>
+  moduleModes.find((m) => m.value === mode)?.label ?? mode
 
+const offEffect: Record<ModuleKey, string> = {
+  inventory: 'Doesn’t run. Quotes keep the corridor spreads.',
+  spreads: 'Doesn’t run. Quotes keep the corridor spreads.',
+  rebalance: 'Doesn’t run. No sale suggestions.',
+  liquidity: 'Doesn’t run. The vault’s floor stays where it is.',
+  curve: 'Doesn’t run. Quotes stay flat.',
+  profit_unwind: 'Doesn’t run. Quotes carry no lift.',
+}
+
+/** One sentence on what a module does in a run mode, with the draft's own
+ * numbers. Shown under the module's mode switch. */
+export function moduleModeEffect(
+  key: ModuleKey,
+  mode: Mode,
+  c: ModulesConfig
+): string {
+  if (mode === 'off') return offEffect[key]
+  const live = mode === 'live'
+  switch (key) {
+    case 'inventory':
+      return live
+        ? `Skews buy and sell margins toward ${percentage(c.inventory.target_bps)} held. Buys pause at ${percentage(c.inventory.max_bps)}.`
+        : 'Records the skew it would apply. Quotes don’t change.'
+    case 'spreads':
+      return live
+        ? `Adds up to ${percentage(c.spreads.max_extra_bps)} per side when prices move.`
+        : 'Records the margin it would add. Quotes don’t change.'
+    case 'rebalance':
+      return !live
+        ? 'Records when it would suggest a sale. No sale requests.'
+        : c.rebalance.method === 'dealer'
+          ? `Sells holdings above ${percentage(c.rebalance.trigger_bps)} through the dealer.`
+          : `Suggests a sale above ${percentage(c.rebalance.trigger_bps)} and lets you create sale requests.`
+    case 'liquidity':
+      return live
+        ? 'Moves the vault’s liquidity floor on schedule. The bot signer sends and pays gas.'
+        : 'Plans floor changes and records them. Sends nothing.'
+    case 'curve':
+      return live
+        ? 'Quotes along the curve, from the price before manual adjustments.'
+        : 'Computes the curve price. Quotes stay flat.'
+    case 'profit_unwind':
+      return live
+        ? 'Gives part of the holding gain back as a better price.'
+        : 'Logs the lift it would give. Quotes don’t change.'
+  }
+}
+
+const shownMode = (v: unknown) => modeLabel(v as Mode)
 // A typed-over field can be NaN; show a dash rather than "NaN%".
 const shownPercent = (v: unknown) =>
   typeof v === 'number' && Number.isFinite(v) ? percentage(v) : '—'
@@ -125,17 +154,12 @@ const editableSettings: readonly [
   (c: ModulesConfig) => unknown,
   (v: unknown, priceUnit: string) => string,
 ][] = [
-  [
-    'Run mode',
-    (c) => c.mode,
-    (v) => moduleModes.find((m) => m.value === v)?.label ?? String(v),
-  ],
-  ['Inventory balancing', (c) => c.inventory.enabled, shownSwitch],
+  ['Inventory balancing', (c) => moduleMode(c, 'inventory'), shownMode],
   ['Target holdings', (c) => c.inventory.target_bps, shownPercent],
   ['Pause purchases at', (c) => c.inventory.max_bps, shownPercent],
   ['Maximum price adjustment', (c) => c.inventory.max_skew_bps, shownPercent],
   ['Minimum quote margin', (c) => c.inventory.spread_floor_bps, shownPercent],
-  ['Dynamic spreads', (c) => c.spreads.enabled, shownSwitch],
+  ['Dynamic spreads', (c) => moduleMode(c, 'spreads'), shownMode],
   ['Maximum extra margin', (c) => c.spreads.max_extra_bps, shownPercent],
   [
     'Sensitivity',
@@ -149,7 +173,7 @@ const editableSettings: readonly [
   ],
   ['Price history window', (c) => c.spreads.window_secs, shownSeconds],
   ['Warmup time', (c) => c.spreads.warmup_secs, shownSeconds],
-  ['Spot rebalancing', (c) => c.rebalance.enabled, shownSwitch],
+  ['Spot rebalancing', (c) => moduleMode(c, 'rebalance'), shownMode],
   [
     'Sale method',
     (c) => c.rebalance.method ?? 'manual',
@@ -160,7 +184,7 @@ const editableSettings: readonly [
   ['Maximum price discount', (c) => c.rebalance.max_slippage_bps, shownPercent],
   ['Wait between sales', (c) => c.rebalance.cooldown_secs, shownSeconds],
   ['Order lifetime', (c) => c.rebalance.order_lifetime_secs, shownSeconds],
-  ['Liquidity schedule', (c) => c.liquidity.enabled, shownSwitch],
+  ['Liquidity schedule', (c) => moduleMode(c, 'liquidity'), shownMode],
   ['Market opens (UTC)', (c) => c.liquidity.open_utc, shownText],
   ['Market closes (UTC)', (c) => c.liquidity.close_utc, shownText],
   [
@@ -190,7 +214,7 @@ const editableSettings: readonly [
   ],
   ['Role key', (c) => c.liquidity.authority?.role_key ?? '', shownText],
   ['Ignore gaps smaller than', (c) => c.liquidity.tolerance_bps, shownPercent],
-  ['Inventory curve', (c) => c.curve.enabled, shownSwitch],
+  ['Inventory curve', (c) => moduleMode(c, 'curve'), shownMode],
   ['Start below the mid', (c) => c.curve.start_below_mid, shownPriceOffset],
   [
     'End above the reference buy',
@@ -198,12 +222,7 @@ const editableSettings: readonly [
     shownPriceOffset,
   ],
   ['Curve shape', (c) => c.curve.shape, (v) => shapeLabel(Number(v))],
-  ['Profit unwind', (c) => c.profit_unwind.enabled, shownSwitch],
-  [
-    'Profit unwind quotes',
-    (c) => c.profit_unwind.live,
-    (v) => (v ? 'Live' : 'Preview'),
-  ],
+  ['Profit unwind', (c) => moduleMode(c, 'profit_unwind'), shownMode],
   [
     'Share of gain given back',
     (c) => c.profit_unwind.share,
@@ -273,7 +292,7 @@ export function moduleParameterErrors(
       r.cooldown_secs < r.order_lifetime_secs + 30) &&
       'Spot timing: orders last 10–300 seconds; the wait between sales must be at least 30 seconds longer.',
     ...liquidityScheduleErrors(c.liquidity),
-    ...liquidityAuthorityErrors(c.liquidity, c.mode),
+    ...liquidityAuthorityErrors(c.liquidity, moduleMode(c, 'liquidity')),
     ...curveConfigErrors(c.curve).map((m) => `Inventory curve: ${m}`),
     ...profitUnwindErrors(c.profit_unwind).map((m) => `Profit unwind: ${m}`),
     vault &&
@@ -462,11 +481,12 @@ export function liquidityScheduleErrors(l: LiquidityConfig): string[] {
 const nonZeroHex = (value: string, digits: number) =>
   new RegExp(`^0x[0-9a-fA-F]{${digits}}$`).test(value) && !/^0x0+$/.test(value)
 
-/** Authority format applies whenever one is entered; Live mode with the
- * schedule enabled needs one, because the bot must be able to send the change. */
+/** Authority format applies whenever one is entered; the schedule in Live
+ * needs one, because the bot must be able to send the change. `mode` is the
+ * schedule's own. */
 export function liquidityAuthorityErrors(
   l: LiquidityConfig,
-  mode: ModulesConfig['mode']
+  mode: Mode
 ): string[] {
   return [
     l.authority &&
@@ -475,10 +495,9 @@ export function liquidityAuthorityErrors(
     l.authority &&
       !nonZeroHex(l.authority.role_key, 64) &&
       'Liquidity schedule: the role key must be a non-zero 0x value with 64 hex characters.',
-    l.enabled &&
-      mode === 'live' &&
+    mode === 'live' &&
       !l.authority &&
-      'Liquidity schedule: Live mode needs the Roles modifier and role key that let this bot change the floor.',
+      'Liquidity schedule: Live needs the Roles modifier and role key that let this bot change the floor.',
   ].filter((message): message is string => typeof message === 'string')
 }
 
@@ -609,8 +628,6 @@ export function liquidityState(
 ): { label: string; message: string; current: boolean } {
   const status = view.status
   const l = status?.liquidity
-  // Older bots report a running config without the liquidity key.
-  const running = status?.config.liquidity
   if (!view.running)
     return {
       label: 'Bot stopped',
@@ -639,14 +656,16 @@ export function liquidityState(
         'No current liquidity reading. Check the vault RPC reads in the bot logs. The last values are shown below.',
       current: false,
     }
-  if (status.config.mode === 'off' || !running?.enabled)
+  // An older bot's running config has no liquidity table: Off.
+  const mode = moduleMode(status.config, 'liquidity')
+  if (mode === 'off')
     return {
       label: 'Schedule off',
       message:
         'The running configuration does not move the floor. The last readings are shown for reference.',
       current: false,
     }
-  const shadow = status.config.mode === 'shadow'
+  const shadow = mode === 'shadow'
   const [live, preview] = liquidityLabels[l.step]
   return {
     label: shadow ? preview : live,
@@ -669,37 +688,43 @@ export function liquiditySetupHint(l: LiquidityStatus): string | null {
   return null
 }
 
-/** The settings the bot runs from a saved config. On a wallet bot the
- * vault-only modules stay off whatever the file says. Mirrors
+/** The settings the bot runs from a saved config: normalized, and on a
+ * wallet bot with the vault-only modules off whatever the file says. Mirrors
  * `ModulesConfig::runnable` in the bot. */
 export function runnableConfig(
   c: ModulesConfig,
   vault: boolean
 ): ModulesConfig {
-  if (vault) return c
-  return {
-    ...c,
-    inventory: { ...c.inventory, enabled: false },
-    spreads: { ...c.spreads, enabled: false },
-    rebalance: { ...c.rebalance, enabled: false },
-    liquidity: { ...c.liquidity, enabled: false },
-  }
+  return normalizeModes(
+    vault
+      ? c
+      : {
+          ...c,
+          inventory: { ...c.inventory, enabled: false },
+          spreads: { ...c.spreads, enabled: false },
+          rebalance: { ...c.rebalance, enabled: false },
+          liquidity: { ...c.liquidity, enabled: false },
+        }
+  )
 }
 
 /** Whether the bot runs different settings than the saved ones would give it.
- * Older bots don't report `liquidity`; that only counts when the saved
- * schedule is on. */
+ * Both sides are compared normalized: an older bot reports its config as the
+ * file had it. Older bots don't report `liquidity`; that only counts when the
+ * saved schedule is on. */
 export function runningConfigDiffers(view: ModulesView): boolean {
   const running = view.status?.config
   if (!running) return false
   const expected = runnableConfig(view.config, view.vault ?? true)
   if (running.liquidity === undefined) {
     const { liquidity, ...saved } = expected
-    return (
-      liquidity.enabled || JSON.stringify(saved) !== JSON.stringify(running)
-    )
+    const { liquidity: _, ...ran } = normalizeModes({
+      ...running,
+      liquidity: { ...liquidity, enabled: false },
+    })
+    return liquidity.enabled || !sameConfig(saved, ran)
   }
-  return JSON.stringify(running) !== JSON.stringify(expected)
+  return !sameConfig(normalizeModes(running), expected)
 }
 
 /** Illustrations only: the same integer rounding as the Rust strategies, with
@@ -802,11 +827,11 @@ export function quoteIllustration(
   }
 }
 
-type BreakdownKey = 'corridor' | 'inventory' | 'spreads' | 'quoted'
+type BreakdownKey = 'corridor' | 'inventory' | 'spreads' | 'proposed' | 'quoted'
 export type QuoteBreakdownRow = {
   key: BreakdownKey
   label: string
-  /** False for a module that is switched off. */
+  /** False for a module that is off, and for a proposal nothing quotes. */
   on: boolean
   buy: string
   sell: string
@@ -817,7 +842,9 @@ const signedPercentage = (bps: number) =>
 
 /** The Simulate panel's spread table: each step's change per side, and the
  * spread that results. Rebalancing sells inventory but never moves a quote, so
- * it has no row. */
+ * it has no row. With one of the two pricing modules Live and the other in
+ * Preview, the table shows both totals: the proposal with every running
+ * module, and the quoted spread with only the Live one, as the bot quotes. */
 export function quoteBreakdown(
   c: ModulesConfig,
   base: QuoteSides,
@@ -825,6 +852,10 @@ export function quoteBreakdown(
   rangeBps: number
 ): QuoteBreakdownRow[] {
   const { inventory, quoted } = quoteIllustration(c, base, share, rangeBps)
+  const mixed = quoteModesDiffer(c)
+  const live = mixed
+    ? quoteIllustration(liveQuotes(c), base, share, rangeBps).quoted
+    : quoted
   const change = (
     on: boolean,
     before: number | null,
@@ -837,24 +868,41 @@ export function quoteBreakdown(
         : after === null
           ? 'Paused'
           : signedPercentage(after - before)
+  const total = (bps: number | null, corridor: number | null) =>
+    bps !== null ? percentage(bps) : corridor === null ? 'Off' : 'Paused'
   const side = (key: 'buy' | 'sell'): Record<BreakdownKey, string> => ({
     corridor: base[key] === null ? 'Off' : percentage(base[key]),
     inventory: change(c.inventory.enabled, base[key], inventory[key]),
     spreads: change(c.spreads.enabled, inventory[key], quoted[key]),
-    quoted:
-      quoted[key] !== null
-        ? percentage(quoted[key])
-        : base[key] === null
-          ? 'Off'
-          : 'Paused',
+    proposed: total(quoted[key], base[key]),
+    quoted: total(live[key], base[key]),
   })
   const buy = side('buy')
   const sell = side('sell')
+  const step = (key: 'inventory' | 'spreads') =>
+    mixed && moduleMode(c, key) === 'shadow'
+      ? `${moduleNames[key]} (Preview)`
+      : moduleNames[key]
+  const pricing = (['inventory', 'spreads'] as const).filter(
+    (key) => moduleMode(c, key) !== 'off'
+  )
+  const previewOnly =
+    pricing.length > 0 &&
+    pricing.every((key) => moduleMode(c, key) === 'shadow')
   const rows: [BreakdownKey, string, boolean][] = [
     ['corridor', 'Corridor spread', true],
-    ['inventory', moduleNames.inventory, c.inventory.enabled],
-    ['spreads', moduleNames.spreads, c.spreads.enabled],
-    ['quoted', c.mode === 'live' ? 'Quoted spread' : 'Proposed spread', true],
+    ['inventory', step('inventory'), c.inventory.enabled],
+    ['spreads', step('spreads'), c.spreads.enabled],
+    ...(mixed
+      ? [
+          ['proposed', 'Proposed spread', false] as [
+            BreakdownKey,
+            string,
+            boolean,
+          ],
+        ]
+      : []),
+    ['quoted', previewOnly ? 'Proposed spread' : 'Quoted spread', true],
   ]
   return rows.map(([key, label, on]) => ({
     key,
@@ -869,18 +917,20 @@ const quotedSide = (bps: number | null, corridor: number | null) =>
   bps !== null ? percentage(bps) : corridor === null ? 'off' : 'paused'
 
 /** What Live quotes start at while dynamic spreads has too little price
- * history: the full maximum on top of inventory balancing. The bot keeps its
- * window across restarts, but Off mode records none, and a stop longer than
- * the window lets it expire. Null when that start matches the table. */
+ * history: the full maximum on top of inventory balancing, if that is Live
+ * too. The bot keeps its window across restarts, but Off records none, and a
+ * stop longer than the window lets it expire. Null when that start matches
+ * the table. */
 export function warmupNote(
   c: ModulesConfig,
   base: QuoteSides,
   share: number,
   rangeBps: number
 ): string | null {
-  if (c.mode !== 'live' || !c.spreads.enabled) return null
-  const warm = quoteIllustration(c, base, share, null).quoted
-  const now = quoteIllustration(c, base, share, rangeBps).quoted
+  if (!isLive(c, 'spreads')) return null
+  const quotes = liveQuotes(c)
+  const warm = quoteIllustration(quotes, base, share, null).quoted
+  const now = quoteIllustration(quotes, base, share, rangeBps).quoted
   if (warm.buy === now.buy && warm.sell === now.sell) return null
   return `Until the bot has ${c.spreads.warmup_secs.toLocaleString()} sec of price history, dynamic spreads add their full maximum: buys ${quotedSide(warm.buy, base.buy)}, sells ${quotedSide(warm.sell, base.sell)}. Expect that right after switching from Off, or after a stop longer than the ${c.spreads.window_secs.toLocaleString()} sec window.`
 }
@@ -905,7 +955,8 @@ export type LiveReading = {
   share: number
   /** Null while dynamic spreads is warming up. */
   rangeBps: number | null
-  /** What that evaluation put on the book (Live) or proposed (Preview). */
+  /** What that evaluation put on the book (`live`), or proposed while no
+   * pricing module was Live (`shadow`). */
   quoted: QuoteSides
   /** The corridor spread it started from, to tell an off side from a pause. */
   base: QuoteSides
@@ -925,16 +976,21 @@ export function liveReading(
     !last?.inputs ||
     last.decision.blocked ||
     last.decision.inventory_bps === null ||
-    status.config.mode === 'off' ||
+    !runtimeOn(status.config) ||
     !moduleStatusFresh(status, view.running, now)
   )
     return null
+  const quoting =
+    isLive(status.config, 'inventory') || isLive(status.config, 'spreads')
+  // A Preview pricing module beside a Live one: the bot records what it put
+  // on the book separately from the full proposal.
+  const quoted = last.quoted ?? last.decision
   return {
     share: last.decision.inventory_bps,
     rangeBps: windowRangeBps(last.inputs.spread_window),
-    quoted: { buy: last.decision.buy_bps, sell: last.decision.sell_bps },
+    quoted: { buy: quoted.buy_bps, sell: quoted.sell_bps },
     base: { buy: last.inputs.base_buy_bps, sell: last.inputs.base_sell_bps },
-    mode: status.config.mode,
+    mode: quoting ? 'live' : 'shadow',
   }
 }
 
@@ -955,19 +1011,28 @@ export function liveRow(reading: LiveReading): {
   }
 }
 
-/** Why the spread table isn't what the bot quotes today, when it isn't. The
- * bot only applies modules in Live mode. */
-export function quoteModeNote(mode: ModulesConfig['mode']): string | null {
-  return mode === 'off'
-    ? 'Modules are off, so live quotes stay at the corridor spread.'
-    : mode === 'shadow'
-      ? 'Preview records this proposed spread. Live quotes stay at the corridor spread until you switch to Live.'
-      : null
+/** Why the spread table isn't what the bot quotes today, when it isn't. Only
+ * a Live pricing module moves quotes. */
+export function quoteModeNote(c: ModulesConfig): string | null {
+  const inventory = moduleMode(c, 'inventory')
+  const spreads = moduleMode(c, 'spreads')
+  if (inventory === 'off' && spreads === 'off')
+    return 'Inventory balancing and dynamic spreads are off, so quotes stay at the corridor spread.'
+  if (quoteModesDiffer(c)) {
+    const [live, preview]: [ModuleKey, ModuleKey] =
+      inventory === 'live' ? ['inventory', 'spreads'] : ['spreads', 'inventory']
+    return `Only ${moduleNames[live].toLowerCase()} reaches quotes. ${moduleNames[preview]} is in Preview, so the quoted spread leaves it out.`
+  }
+  return inventory !== 'live' && spreads !== 'live'
+    ? 'Preview records this proposed spread. Quotes stay at the corridor spread until a module is Live.'
+    : null
 }
 
+/** Overview headline for inventory balancing, from the running config. */
 export function moduleOverviewState(view: ModulesView, now: number) {
   const fresh = moduleStatusFresh(view.status, view.running, now)
   const c = view.status?.config ?? view.config
+  const mode = moduleMode(c, 'inventory')
   const d = view.status?.decisions.at(-1)?.decision
   if (!view.running)
     return {
@@ -975,15 +1040,11 @@ export function moduleOverviewState(view: ModulesView, now: number) {
       message: 'The bot is stopped. You can still edit its settings.',
       current: false,
     }
-  if (
-    c.mode === 'off' &&
-    view.status &&
-    view.status.at <= now &&
-    now - view.status.at <= 10
-  )
+  if (mode === 'off')
     return {
-      title: 'Modules are off',
-      message: 'The bot uses its regular quote settings.',
+      title: 'Inventory balancing is off',
+      message:
+        'Quotes keep the corridor spreads. Set it to Preview or Live in Settings.',
       current: false,
     }
   if (!fresh)
@@ -997,7 +1058,7 @@ export function moduleOverviewState(view: ModulesView, now: number) {
     return {
       title: isWarmingUp(d)
         ? 'Getting ready'
-        : c.mode === 'shadow'
+        : mode === 'shadow'
           ? 'Preview is waiting'
           : 'Quotes are paused',
       message: isWarmingUp(d)
@@ -1005,21 +1066,14 @@ export function moduleOverviewState(view: ModulesView, now: number) {
         : 'The latest evaluation could not produce quotes. Open details for the reason.',
       current: true,
     }
-  if (c.mode === 'shadow')
+  if (mode === 'shadow')
     return {
       title: 'Previewing your strategy',
       message:
         'These are proposed adjustments. Your live quotes stay unchanged.',
       current: true,
     }
-  // `?.`: an older bot's running config has no liquidity key.
-  if (!moduleKeys.some((key) => c[key]?.enabled))
-    return {
-      title: 'No modules enabled',
-      message: 'Turn on a module in Settings to adjust the bot’s behavior.',
-      current: true,
-    }
-  if (d && c.spreads.enabled && isWarmingUp(d))
+  if (d && isLive(c, 'spreads') && isWarmingUp(d))
     return {
       title: 'Getting ready',
       message:
@@ -1027,8 +1081,8 @@ export function moduleOverviewState(view: ModulesView, now: number) {
       current: true,
     }
   return {
-    title: 'Your modules are running',
-    message: 'Quote adjustments follow the bot’s active settings.',
+    title: 'Inventory balancing is live',
+    message: 'Quotes lean toward your inventory target.',
     current: true,
   }
 }

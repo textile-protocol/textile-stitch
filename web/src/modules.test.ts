@@ -116,7 +116,7 @@ describe('dynamic spread visibility', () => {
     v.status!.config.spreads.multiplier = 0
     expect(dynamicSpreadState(v, 101).message).toContain('multiplier')
     v.status!.config.mode = 'shadow'
-    expect(dynamicSpreadState(v, 101).label).toContain('Shadow')
+    expect(dynamicSpreadState(v, 101).label).toContain('Preview')
     v.status!.config.spreads.enabled = false
     expect(dynamicSpreadState(v, 101).current).toBe(false)
   })
@@ -233,7 +233,7 @@ describe('dynamic spread visibility', () => {
     )
     v.status!.config.mode = 'shadow'
     expect(dynamicSpreadState(v, 101).message).toContain(
-      'leaves live quotes unchanged'
+      'leave live quotes unchanged'
     )
   })
 })

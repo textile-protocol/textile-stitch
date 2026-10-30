@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
-import {
-  moduleParameterErrors,
-} from './modulePresentation'
+import { moduleParameterErrors } from './modulePresentation'
 import type { ModulesConfig, ModulesView } from './modules'
+import { expandModes, normalizeModes, sameConfig } from './moduleModes'
 import { poll } from './poll'
 import {
   quoteConfigForScope,
@@ -11,7 +10,10 @@ import {
   type QuoteConfigScope,
 } from './moduleWorkspace'
 
-/** One revision-checked draft for all quote modules, independent of hedge mode. */
+/** One revision-checked draft for all quote modules, independent of hedge
+ * mode. `base` and `draft` name every running module's mode
+ * (`expandModes`), so saving one module never moves another's; `view` keeps
+ * the config as the server sent it. */
 export function useQuoteModules(
   name: string,
   enabled: boolean,
@@ -40,8 +42,14 @@ export function useQuoteModules(
           const next = await api.modules(name)
           if (cancelled || version !== generation.current) return
           setView(next)
-          setDraft((current) => current ?? next.config)
-          setBase((current) => current ?? next)
+          setDraft((current) => current ?? expandModes(next.config))
+          setBase(
+            (current) =>
+              current ?? {
+                config: expandModes(next.config),
+                revision: next.revision,
+              }
+          )
         } catch (e) {
           if (!cancelled && version === generation.current) setError(String(e))
         }
@@ -68,10 +76,7 @@ export function useQuoteModules(
       !config ||
       !editable ||
       saving.current ||
-      moduleParameterErrors(
-        config,
-        view.vault ?? true
-      ).length
+      moduleParameterErrors(config, view.vault ?? true).length
     )
       return
     saving.current = true
@@ -80,19 +85,23 @@ export function useQuoteModules(
     setError(null)
     setNote(null)
     try {
-      const result = await api.saveModules(name, base.revision, config)
+      // The server saves the same normalized shape; sending it keeps the
+      // check below exact.
+      const sent = normalizeModes(config)
+      const result = await api.saveModules(name, base.revision, sent)
       const next = await api.modules(name)
       setView(next)
       // Another writer may have changed a sibling between PUT and GET. Do not
       // grant our retained drafts that writer's revision and overwrite it later.
-      if (JSON.stringify(next.config) !== JSON.stringify(config)) {
+      if (!sameConfig(next.config, sent)) {
         setError(
           'Configuration changed again while saving. Reload to review saved settings; unsaved edits were kept.'
         )
         return
       }
-      setDraft(remainingQuoteDraft(base.config, draft, next.config, scope))
-      setBase(next)
+      const saved = expandModes(next.config)
+      setDraft(remainingQuoteDraft(base.config, draft, saved, scope))
+      setBase({ config: saved, revision: next.revision })
       setNote(result.message)
       if (result.restartError)
         setError(

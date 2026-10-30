@@ -9,7 +9,7 @@ type Preset = {
     ModulesConfig['inventory'],
     'target_bps' | 'max_bps' | 'max_skew_bps'
   >
-  spreads: Required<Omit<ModulesConfig['spreads'], 'enabled'>>
+  spreads: Required<Omit<ModulesConfig['spreads'], 'enabled' | 'mode'>>
   tradeoff: Record<PresetModule, string>
 }
 

@@ -3,7 +3,7 @@
 use super::{ApiError, AppState};
 use crate::{
     config::Config,
-    modules::{config::RebalanceMethod, manual, Mode},
+    modules::{config::RebalanceMethod, manual, Module},
 };
 use axum::{
     extract::{Path, State},
@@ -79,12 +79,11 @@ pub async fn create(
     let (_lock, bot) = super::bots::lock_config(&name, &state).await?;
     super::require_editable(&bot)?;
     let (path, _, cfg) = super::modules::read(&bot)?;
-    if cfg.modules.mode != Mode::Live
-        || !cfg.modules.rebalance.enabled
+    if !cfg.modules.is_live(Module::Rebalance)
         || cfg.modules.rebalance.method != RebalanceMethod::Manual
     {
         return Err(ApiError::bad_request(
-            "Enable spot rebalancing in Live mode and save before creating a sale",
+            "Set spot rebalancing to Live and save before creating a sale",
         ));
     }
     let pool = &cfg.pools[0];
