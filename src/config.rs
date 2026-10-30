@@ -1339,7 +1339,8 @@ impl Config {
     }
 
     /// What profit unwind needs, once modules are known to quote one
-    /// corridor. Its round-trip limit is a multiple of the spread
+    /// corridor. It lifts both sides by the same bps, and its advisory
+    /// round-trip limit is a multiple of the spread
     /// ([`crate::pricing::unwind::lift_limit_ngn`]), so the spreads must be
     /// bps; and it tracks what the collateral cost in the debt, so the
     /// collateral must be the soft currency.
@@ -1358,8 +1359,8 @@ impl Config {
         );
         anyhow::ensure!(
             spreads.iter().all(|sp| matches!(sp, Spread::Bps(_))),
-            "profit unwind holds its lift to a multiple of the spread, so it needs bps spreads, \
-             not absolute offsets"
+            "profit unwind moves both sides by the same bps and sizes its round-trip limit off \
+             the spread, so it needs bps spreads, not absolute offsets"
         );
         let feed = pool.feed_url.as_deref().unwrap_or(&self.feed.url);
         anyhow::ensure!(

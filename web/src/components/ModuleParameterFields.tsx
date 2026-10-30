@@ -245,9 +245,9 @@ export const moduleGuides: Record<
           You decide when to sell.
         </p>
         <p className="mt-3">
-          Open this module’s Overview to choose an amount and minimum proceeds. Use your
-          own wallet or invite a buyer. Each buyer reviews a fresh price and
-          confirms the swap.
+          Open this module’s Overview to choose an amount and minimum proceeds.
+          Use your own wallet or invite a buyer. Each buyer reviews a fresh
+          price and confirms the swap.
         </p>
       </>
     ),
@@ -279,8 +279,8 @@ export const moduleGuides: Record<
         <p>
           Swap prices move with the share of the bot&apos;s holdings in{' '}
           {currency}. With none, it sells {settlement} at the reference mid.
-          Full of it, it pays the reference buy, what clearing {currency} on
-          the reference market would cost. The two offsets widen either end.
+          Full of it, it pays the reference buy, what clearing {currency} on the
+          reference market would cost. The two offsets widen either end.
         </p>
         <p className="mt-3">
           Every quote pays the average lean across the holdings it moves
@@ -313,14 +313,15 @@ export const moduleGuides: Record<
           It lifts whatever price goes out: the inventory curve&apos;s when the
           curve quotes, the flat price otherwise. Nothing moves below the start
           share; above it the lift grows evenly to full at 100%. Every quote
-          pays the average lift across the holdings it moves, and the lift is
-          held to a multiple of the spread, so a trade out and back never pays
-          the taker.
+          pays the average lift across the holdings it moves, so a trade out and
+          back at one lift never pays the taker. A cap above the round-trip
+          limit lets a taker profit when the lift falls between trades, out of
+          the gain you give back; the cap field warns when it is.
         </p>
         <p className="mt-3">
           {currency} coming in is marked at the feed and {currency} going out
-          leaves at the average cost, so takers can only pull the gain down.
-          The cost is frozen every 15 minutes, except that new {currency}
+          leaves at the average cost, so takers can only pull the gain down. The
+          cost is frozen every 15 minutes, except that new {currency}
           lowering it applies at once.
         </p>
       </>

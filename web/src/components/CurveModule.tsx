@@ -26,8 +26,7 @@ import {
   flatOrderNgn,
   flatUnwindSide,
   freshUnwindReading,
-  heldLift,
-  liftLimitNgn,
+  trustedLift,
 } from '../unwind'
 import CurveChart from './CurveChart'
 import {
@@ -238,8 +237,8 @@ export function CurveExample({
         Simulating needs a reference book and balances from the running bot.
       </p>
     )
-  // Profit unwind's lift when it's on, live or in its preview, held to the
-  // curve's round-trip limit by withLift. Only a live lift is in the quote.
+  // Profit unwind's lift when it's on, live or in its preview, quoted as
+  // set. Only a live lift is in the quote.
   const lift = draftUnwindLift(
     draft.profit_unwind,
     freshUnwindReading(view.status?.profit_unwind, now)
@@ -255,12 +254,8 @@ export function CurveExample({
     readsUnadjustedPrice(draft) === readsUnadjustedPrice(running)
   const feed = sameBasis ? feedPrice(reading) : null
   const flatOnly = feed !== null && referenceTooFar(reading, feed)
-  // Quoting flat, the bot puts the lift on the flat price instead, held to
-  // the limit at the configured spread (equal on both sides here).
-  const flatLift =
-    lift && flatOnly && feed !== null
-      ? heldLift(lift, liftLimitNgn(curve.spreadBps, feed, lift.startPct))
-      : null
+  // Quoting flat, the bot puts the lift on the flat price instead.
+  const flatLift = lift && flatOnly && feed !== null ? trustedLift(lift) : null
   const sides = ([true, false] as const).map((botBuys) =>
     exampleSide({
       plain: curve,
@@ -339,9 +334,6 @@ export function CurveExample({
             : unwindLive
               ? `Profit unwind, its own module, lifts both prices by up to ${priceText(lifted.lift.fullNgn)} at full ${currency}, less below that, averaged over this trade. When the bot sells ${currency} it stops at the ${priceText(lift.costNgn)} average cost.`
               : `Profit unwind is in preview: the quote leaves it out. Quoting with it would add this row to both prices, up to ${priceText(lifted.lift.fullNgn)} at full ${currency}.`}
-          {lifted.lift &&
-            lifted.lift.fullNgn < lift.fullNgn - 1e-9 &&
-            ` The ${priceText(lift.fullNgn)} it would give is held to that by the round-trip limit at this spread.`}
         </p>
       )}
       <p className="text-muted text-xs leading-relaxed">

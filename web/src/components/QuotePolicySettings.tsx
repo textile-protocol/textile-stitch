@@ -1,5 +1,4 @@
 import {
-  enforcedUnwindCapLimit,
   moduleModes,
   moduleNames,
   moduleParameterErrors,
@@ -26,8 +25,7 @@ export default function QuotePolicySettings({
   const changed = draft.mode !== base.config.mode
   const errors = moduleParameterErrors(
     config,
-    view.vault ?? true,
-    enforcedUnwindCapLimit(view, base.config, config, Date.now() / 1000)
+    view.vault ?? true
   )
   return (
     <details className="border-line-soft bg-surface rounded-xl border px-4 py-3">

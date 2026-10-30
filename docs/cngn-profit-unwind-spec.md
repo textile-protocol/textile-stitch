@@ -114,7 +114,7 @@ legs: naira they sell back enters the basis at the feed and pulls `C` (and so `L
 Tomer's three legs show it: buy most of the naira at the full lift, sell part back near empty
 (where `w` is small, so it costs almost no lift) to dilute `C`, then sell the rest back at the
 lower lift. The taker keeps about `(L1 - L2) * mean(w)`, and draining the whole book averages `w`
-to `(1 - start) / 2`. So when each quote is priced, the full lift is held to
+to `(1 - start) / 2`. So the round trip can't pay the taker while the full lift stays within
 
 ```
 L <= 4 * spread * mid / (1 - start)
@@ -125,9 +125,14 @@ and `mid` is the mid the lift is turned into bps against: the curve's reference 
 price's centre. That keeps `L * (1 - start) / 2` within `2 * spread`, the one cost every round trip
 is sure to pay. The venue fee isn't in it: it arrives per request, and the legs of a round trip
 needn't pay the same one, so a dear first leg and cheap returns would otherwise leave room. At a
-1 bps spread and a 1,380 mid the limit is about 0.55 NGN at start 0 and 1.1 NGN at start 50, so
-there the default 2 NGN cap is cut to 1.1. A larger `cap_ngn` is cut to the limit when quoting; the
-panel shows the limit next to the cap and won't save a cap above it at the current reading.
+1 bps spread and a 1,380 mid the limit is about 0.55 NGN at start 0 and 1.1 NGN at start 50.
+
+The limit is advisory. The bot quotes `cap_ngn` as set, and the panel saves a cap above the limit
+and warns in the cap's hint. Above it the drain, dilute, return round trip can pay the taker, but
+only out of the lift: every sale still clears at or above the cost (the ask floor), and naira sold
+back is a new position that enters the basis at the feed, so nothing comes out of the cost. The
+panel sizes the limit at the lower of the feed and, with the curve on, the curve's reference mid,
+and says so in words when it has no fresh reading to size it.
 
 **Why both sides move, never only the side that pays for USDT.** The two sides sit only about 0.55
 NGN apart (twice the all-in). Raise only the price the stitch pays for USDT by 1.5 NGN and it pays
@@ -231,9 +236,12 @@ about 4 bps, twice the all-in. Pricing the lift at the share a quote starts from
 stretch fails it at about +6 bps. Next to it,
 `a_drain_dilute_return_round_trip_never_pays_the_taker` runs Tomer's three legs (drain, dilute,
 return across a refresh) at caps up to 10 NGN, starts at 0, 30 and 50%, and venue fees of 1/1, 10/1
-and 25/1 bps on the way out and back; with the round-trip limit the best case for the taker is about
--2.1 bps. Without it, cap 2 at start 0 paid the taker +2.5 bps, and a limit that counted the fee
-paid +10.6 bps at a 25 bps first leg.
+and 25/1 bps on the way out and back. It's split in two:
+`a_drain_dilute_return_round_trip_never_pays_the_taker_under_the_limit` keeps every cap within the
+limit and the taker never profits, and `above_the_limit_a_round_trip_never_pays_more_than_the_lift`
+runs caps 2, 3 and 10 past it and checks the taker never collects more than the full lift. (Before
+the limit went advisory, cap 2 at start 0 paid the taker +2.5 bps, and a limit that counted the fee
+paid +10.6 bps at a 25 bps first leg.)
 
 ## 6. Knobs
 
@@ -245,7 +253,7 @@ in Live mode (`[modules].mode`), with or without the curve.
 | `enabled` | `false` | Off unless switched on. Runs with or without `[modules.curve]` |
 | `live` | `false` | Quote with the lift. Off, the bot tracks the cost, computes the lift and logs the price it would quote, and quotes without it |
 | `share` | `0.5` | Share of the gain passed back as a better price. Allowed range 0–1 |
-| `cap_ngn` | `2` | The most profit unwind ever lifts the price, in NGN. Held to the round-trip limit (§3) when quoting |
+| `cap_ngn` | `2` | The most profit unwind ever lifts the price, in NGN. Quoted as set; the panel warns above the round-trip limit (§3) |
 | `min_gain_ngn` | `0.7` | Ignore gains smaller than this, in NGN per USDT (about 5 bps), so feed noise doesn't move the price |
 | `start_pct` | `50` | Start profit unwind at this naira share, in %. Below it, no lift; above it the lift grows to full at 100%. Allowed range 0–99 |
 | `refresh_secs` | `900` | How often the cost is frozen again (§5). TOML only, not on the panel |
@@ -342,6 +350,14 @@ curve's Simulate shows the same row under its lean. Its maths is pinned to the b
 
 ## Decision log
 
+- **29 Oct 2026 (Tomer, #2838): the round-trip limit is advisory.** The bot quotes the cap as set
+  and the panel warns above the limit instead of refusing to save. Each position starts and ends in
+  USDT, so it stands on its own: the stitch's sale closes its naira at or above cost, and naira the
+  taker sells back is a new position at the feed. What a drain, dilute, return round trip collects
+  above the limit comes out of the lift the operator chose to give back, never out of the cost. The
+  bps-spread requirement stays: the lift moves both sides by the same bps, and a book with an
+  absolute side gets no lift at all. Inventory balancing stays refused beside it on a vault, so the
+  limit's guarantee still holds for caps under it.
 - **29 Oct 2026 (Benoit): its own module.** Profit unwind is a module of its own, not part of the
   curve: a bot can run it on a flat price or on the curve. On flat it lifts both sides of the flat
   signed order by the averaged lift in bps of the flat centre, with the ask floored at the cost, and

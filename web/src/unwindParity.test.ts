@@ -2,9 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { curveFor, takerPrice, withLift } from './curve'
 import {
   averageUnwindWeight,
-  heldLift,
+  trustedLift,
   liftedFlatOrderNgn,
-  liftLimitNgn,
   unwindFullNgn,
 } from './unwind'
 import cases from './unwindParity.json'
@@ -70,10 +69,11 @@ describe('the panel lifts the curve as the bot does', () => {
       close(takerPrice(plain, false, f0, f1), c.plain_ask)
       // The same lift on the flat signed order around the feed.
       const half = c.spread_bps / 10_000
-      const flat = heldLift(
-        { fullNgn: full, startPct: c.knobs.start_pct, costNgn: c.cost },
-        liftLimitNgn(c.spread_bps, c.feed_mid, c.knobs.start_pct)
-      )
+      const flat = trustedLift({
+        fullNgn: full,
+        startPct: c.knobs.start_pct,
+        costNgn: c.cost,
+      })
       const order = (buys: boolean) =>
         buys ? c.feed_mid / (1 - half) : c.feed_mid / (1 + half)
       const lifted_ = (buys: boolean) =>

@@ -79,27 +79,18 @@ pub struct UnwindInput {
     /// False in profit unwind's own preview: the lifted price is computed
     /// and logged, and the price without it goes out.
     pub live: bool,
-    /// The corridor's smaller bps spread as configured, before any module
-    /// widens it ([`min_bps_spread`] of the configured book). On a flat price
-    /// the lift is held to the round-trip limit at it: dynamic spreads only
-    /// ever add to it, so a return leg quoted later, at the narrowest spread
-    /// the bot uses, still pays at least this.
-    pub limit_spread_bps: f64,
 }
 
-/// The smaller of a book's spreads in bps, or `None` when a side is
-/// absolute or neither side quotes.
-pub fn min_bps_spread(book: &CorridorBook) -> Option<f64> {
-    [book.buy_spread, book.sell_spread]
+/// Whether profit unwind may lift this book: it quotes at least one side and
+/// every side it quotes is a bps spread. The lift moves both directions by
+/// the same bps, so a book with an absolute side gets no lift at all rather
+/// than a lift on one side only. `book` is the corridor as configured.
+pub fn bps_spreads_only(book: &CorridorBook) -> bool {
+    let sides: Vec<Spread> = [book.buy_spread, book.sell_spread]
         .into_iter()
         .flatten()
-        .map(|s| match s {
-            Spread::Bps(b) => Some(f64::from(b)),
-            Spread::Abs(_) => None,
-        })
-        .collect::<Option<Vec<f64>>>()?
-        .into_iter()
-        .reduce(f64::min)
+        .collect();
+    !sides.is_empty() && sides.iter().all(|s| matches!(s, Spread::Bps(_)))
 }
 
 /// Whether an ask priced with profit unwind's `priced` input may still go
@@ -379,7 +370,7 @@ pub struct UnwindNote {
     pub unwound: f64,
     pub f0: f64,
     pub f1: f64,
-    /// The lift it priced with, held to the round-trip limit.
+    /// The lift it priced with, as set.
     pub lift: Lift,
 }
 
@@ -487,8 +478,8 @@ trait Stretch {
     /// quotes or previews. `None` while it doesn't run.
     fn unwound_price(&self, bid: bool, from: f64, to: f64) -> Option<f64>;
 
-    /// Profit unwind's input, its lift held to this side's round-trip limit
-    /// ([`unwind::lift_limit_ngn`]); `None` while it doesn't run.
+    /// Profit unwind's input with a lift it can trust; `None` while it
+    /// doesn't run or lifts nothing.
     fn unwind(&self) -> Option<UnwindInput>;
 
     /// The signed order's price for the stretch: lifted when profit unwind
@@ -526,17 +517,14 @@ impl Stretch for CurveStart {
     fn unwound_price(&self, bid: bool, from: f64, to: f64) -> Option<f64> {
         let u = self.unwind?;
         self.plain
-            .with_lift(u.lift, self.order_half_bps)
+            .with_lift(u.lift)
             .price(bid, from, to, self.order_half_bps)
     }
 
     fn unwind(&self) -> Option<UnwindInput> {
         let u = self.unwind?;
-        let limit = self
-            .plain
-            .lift_limit_ngn(u.lift.start_pct, self.order_half_bps);
         Some(UnwindInput {
-            lift: u.lift.held_to(limit)?,
+            lift: u.lift.trusted()?,
             ..u
         })
     }
@@ -576,9 +564,8 @@ impl Stretch for FlatStart {
 
     fn unwind(&self) -> Option<UnwindInput> {
         let u = self.unwind;
-        let limit = unwind::lift_limit_ngn(u.limit_spread_bps, 1.0 / self.mid, u.lift.start_pct);
         Some(UnwindInput {
-            lift: u.lift.held_to(limit)?,
+            lift: u.lift.trusted()?,
             ..u
         })
     }
@@ -586,8 +573,7 @@ impl Stretch for FlatStart {
 
 /// Profit unwind on a flat side: the flat price around the jump-guarded
 /// `mid`, valued and lifted off the same print. Needs a bps spread on the
-/// side, and balances for the share. The lift's limit comes with the input
-/// ([`UnwindInput::limit_spread_bps`]), off the configured spreads.
+/// side, and balances for the share.
 fn flat_start(
     book: &CorridorBook,
     bid: bool,
@@ -1632,6 +1618,24 @@ mod tests {
     }
 
     #[test]
+    fn profit_unwind_lifts_only_a_book_with_every_side_in_bps() {
+        let mut b = book();
+        b.buy_spread = Some(Spread::Bps(1));
+        b.sell_spread = Some(Spread::Bps(1));
+        assert!(bps_spreads_only(&b));
+        // One side quoting is enough, as long as it's bps.
+        b.sell_spread = None;
+        assert!(bps_spreads_only(&b));
+        // A mixed book would lift one direction only: no lift at all.
+        b.sell_spread = Some(Spread::Abs(1.0));
+        assert!(!bps_spreads_only(&b));
+        b.buy_spread = None;
+        assert!(!bps_spreads_only(&b));
+        b.sell_spread = None;
+        assert!(!bps_spreads_only(&b));
+    }
+
+    #[test]
     fn an_unfunded_side_rejects_as_inventory() {
         let mut one_sided = book();
         one_sided.sell_spread = None;
@@ -2384,8 +2388,6 @@ mod tests {
                 cost_ngn: snap.cost_ngn,
             },
             live,
-            // The fixture's configured 1 bps spread.
-            limit_spread_bps: 1.0,
         })
     }
 
@@ -2558,8 +2560,6 @@ mod tests {
         back_frac: f64,
         fee_out: u32,
         fee_back: u32,
-        /// The configured spread the host hands profit unwind.
-        limit_spread_bps: f64,
     }
 
     /// Tomer's three legs (#2817), the taker's result in bps. The taker buys
@@ -2576,12 +2576,8 @@ mod tests {
             cap_ngn: r.cap,
             ..unwind_params(r.start_pct)
         };
-        let input = |tr: &crate::pricing::unwind::Tracker, now: u64| {
-            unwind_input(tr, &p, now, true).map(|u| UnwindInput {
-                limit_spread_bps: r.limit_spread_bps,
-                ..u
-            })
-        };
+        let input =
+            |tr: &crate::pricing::unwind::Tracker, now: u64| unwind_input(tr, &p, now, true);
         let coll = (total * r.share / ref_mid() * 1e6).round() as u128;
         let debt = (total * (1.0 - r.share) * 1e6).round() as u128;
         let held = (U256::from(coll), U256::from(debt));
@@ -2624,19 +2620,17 @@ mod tests {
         (returned / units(p1.sell_amount) - 1.0) * 10_000.0
     }
 
-    #[test]
-    fn a_drain_dilute_return_round_trip_never_pays_the_taker() {
-        // The round-trip limit holds the lift to what Tomer's three legs
-        // can't beat, at any cap or start, on a Live curve or a flat price,
-        // and whatever fee each leg pays: a dear first leg and 1 bps returns
-        // (the responder refuses a request with no fee) is the cheapest way
-        // back.
-        let mut worst = f64::NEG_INFINITY;
+    /// Tomer's three legs over every knob, on a Live curve and a flat price,
+    /// whatever fee each leg pays: a dear first leg and 1 bps returns (the
+    /// responder refuses a request with no fee) is the cheapest way back.
+    /// Each run with its full lift in bps.
+    fn drain_dilute_return_sweep(caps: impl Fn(f64) -> Vec<f64>) -> Vec<(f64, f64)> {
+        let mut runs = Vec::new();
         for mode in [Mode::Live, Mode::Off] {
             let b = curve_book(mode, 0.0, 0.0);
             for (fee_out, fee_back) in [(1u32, 1u32), (10, 1), (25, 1)] {
-                for cap in [2.0, 3.0, 10.0] {
-                    for start_pct in [0.0, 30.0, 50.0] {
+                for start_pct in [0.0, 30.0, 50.0] {
+                    for cap in caps(start_pct) {
                         for gain in [2.0 * cap, 6.0, 20.0] {
                             for share in [0.75, 0.9, 0.97] {
                                 for drain_to in [0.02, 0.1, 0.3] {
@@ -2650,9 +2644,9 @@ mod tests {
                                             back_frac,
                                             fee_out,
                                             fee_back,
-                                            limit_spread_bps: 1.0,
                                         };
-                                        worst = worst.max(drain_dilute_return(&b, &b, run));
+                                        let full_bps = cap.min(0.5 * gain) / MID_NGN * 10_000.0;
+                                        runs.push((drain_dilute_return(&b, &b, run), full_bps));
                                     }
                                 }
                             }
@@ -2661,7 +2655,21 @@ mod tests {
                 }
             }
         }
-        eprintln!("worst drain, dilute and return: {worst:.3} bps");
+        runs
+    }
+
+    #[test]
+    fn a_drain_dilute_return_round_trip_never_pays_the_taker_under_the_limit() {
+        // At or under the round-trip limit (the fixture's 1 bps spread),
+        // Tomer's three legs can't beat the spread.
+        let limit = |start_pct| crate::pricing::unwind::lift_limit_ngn(1.0, MID_NGN, start_pct);
+        let worst = drain_dilute_return_sweep(|start_pct| {
+            vec![0.5 * limit(start_pct), 0.99 * limit(start_pct)]
+        })
+        .into_iter()
+        .map(|(bps, _)| bps)
+        .fold(f64::NEG_INFINITY, f64::max);
+        eprintln!("worst drain, dilute and return under the limit: {worst:.3} bps");
         assert!(
             worst < 0.0,
             "drain, dilute and return paid the taker {worst} bps"
@@ -2669,38 +2677,20 @@ mod tests {
     }
 
     #[test]
-    fn a_wider_first_leg_cannot_raise_the_flat_limit() {
-        // Dynamic spreads widen both sides by a buffer that can shrink
-        // between a taker's legs. On a flat price the limit is held to the
-        // configured spread, so a dear first leg doesn't buy the taker a
-        // bigger lift to return against at the narrow spread.
-        let narrow = curve_book(Mode::Off, 0.0, 0.0);
-        let mut wide = narrow.clone();
-        wide.buy_spread = Some(Spread::Bps(21));
-        wide.sell_spread = Some(Spread::Bps(21));
-        let run = DrainRun {
-            cap: 10.0,
-            start_pct: 0.0,
-            gain: 20.0,
-            share: 0.97,
-            drain_to: 0.02,
-            back_frac: 0.3,
-            fee_out: 1,
-            fee_back: 1,
-            limit_spread_bps: 1.0,
-        };
-        let held = drain_dilute_return(&wide, &narrow, run);
-        assert!(held < 0.0, "paid the taker {held} bps");
-        // Held to the first leg's 21 bps instead, the same legs pay.
-        let loose = drain_dilute_return(
-            &wide,
-            &narrow,
-            DrainRun {
-                limit_spread_bps: 21.0,
-                ..run
-            },
-        );
-        assert!(loose > 0.0, "the attack this closes: {loose} bps");
+    fn above_the_limit_a_round_trip_never_pays_more_than_the_lift() {
+        // The limit is advisory: above it the lift goes out as set, and the
+        // three legs can pay. But only out of the lift itself, the slice of
+        // the gain given back: every sale still clears at or above the cost,
+        // and naira sold back enters at the feed as a new position.
+        let mut paid = false;
+        for (bps, full_bps) in drain_dilute_return_sweep(|_| vec![2.0, 3.0, 10.0]) {
+            paid |= bps > 0.0;
+            assert!(
+                bps < full_bps,
+                "the taker made {bps} bps against a {full_bps} bps lift"
+            );
+        }
+        assert!(paid, "the sweep no longer reaches above the limit");
     }
 
     #[test]
@@ -2713,7 +2703,6 @@ mod tests {
                     cost_ngn,
                 },
                 live,
-                limit_spread_bps: 1.0,
             })
         };
         let priced = at(1386.0, 2.0, true);

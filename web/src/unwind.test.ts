@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   defaultCurve,
   defaultProfitUnwind,
-  enforcedUnwindCapLimit,
+  draftUnwindCapLimit,
   leanConflict,
 } from './modulePresentation'
 import type { ModulesView } from './modules'
@@ -13,6 +13,7 @@ import {
   liftedFlatOrderNgn,
   minSpreadBps,
   profitUnwindErrors,
+  unwindCapHint,
   unwindFullNgn,
   unwindOverviewState,
   unwindRequirements,
@@ -57,11 +58,26 @@ describe('profit unwind', () => {
     expect(averageUnwindWeight(0.1, 0.4, 50)).toBe(0)
   })
 
-  it('refuses a cap above the round-trip limit', () => {
+  it('lets a cap above the round-trip limit save', () => {
+    // The limit is advisory: the cap field warns, the bot quotes it as set.
     const base = { ...knobs, enabled: true, live: false, refresh_secs: 900 }
-    expect(profitUnwindErrors({ ...base, cap_ngn: 2 }, 1.1)).toHaveLength(1)
-    expect(profitUnwindErrors({ ...base, cap_ngn: 1 }, 1.1)).toEqual([])
-    expect(profitUnwindErrors({ ...base, cap_ngn: 2 }, null)).toEqual([])
+    expect(profitUnwindErrors({ ...base, cap_ngn: 4.6 })).toEqual([])
+  })
+
+  it("warns about a cap above the limit, and when it can't size it", () => {
+    const hint = (cap: number, limit: number | null) =>
+      unwindCapHint(cap, limit, 'USDT', (n) => n.toFixed(2))
+    const risk = 'a taker can profit from the lift falling between trades'
+    expect(hint(2, 1.1)).toContain(
+      `Above 1.10 at today's spread and start, ${risk}`
+    )
+    expect(hint(1, 1.1)).toContain(
+      "Up to 1.10 at today's spread and start, a taker can't"
+    )
+    // No fresh reading (first enable, or stale): Save lets any cap through,
+    // so the hint still names the risk.
+    expect(hint(2, null)).toContain(risk)
+    expect(hint(2, null)).toContain("can't size the round-trip limit")
   })
 
   it('runs without the curve and checks its knobs', () => {
@@ -272,20 +288,34 @@ describe('profit unwind beside other modules and saves', () => {
     ).toBe(false)
   })
 
-  it('only enforces the cap limit on a save that moves the cap or start', () => {
-    // About 0.55 NGN at a 1 bps spread and start 0, 1.1 at start 50: the
-    // saved 2 NGN cap is past it, and the bot holds the lift to it anyway.
-    const v = view(true)
-    const saved = config()
-    expect(enforcedUnwindCapLimit(v, saved, saved, 100)).toBeNull()
-    const other = config({ mode: 'shadow' })
-    expect(enforcedUnwindCapLimit(v, saved, other, 100)).toBeNull()
-    const cap = config({
-      profit_unwind: { ...saved.profit_unwind, cap_ngn: 3 },
-    })
-    expect(enforcedUnwindCapLimit(v, saved, cap, 100)).toBeCloseTo(
-      (4 * 1e-4 * 1380) / 0.5,
+  it('sizes the cap limit off the lower of the feed and the curve mid', () => {
+    // 4 x 1 bps x mid / (1 - 0.5): about 1.10 NGN at the 1380 feed.
+    const limit = (mid: number) => (4 * 1e-4 * mid) / 0.5
+    const flat = config()
+    expect(draftUnwindCapLimit(view(true), flat, 100)).toBeCloseTo(
+      limit(1380),
       9
     )
+    // With the curve on the bot may quote off its reference mid, up to 1%
+    // under the feed: the limit there is lower, so that's the one to show.
+    const onCurve = config({ curve: { ...defaultCurve(), enabled: true } })
+    const withCurve = (referenceMid: number) =>
+      ({
+        ...view(true),
+        status: {
+          profit_unwind: { reading, quotes: [] },
+          curve: { reading: { at: 100, reference_mid: referenceMid } },
+        },
+      }) as unknown as ModulesView
+    expect(draftUnwindCapLimit(withCurve(1370), onCurve, 100)).toBeCloseTo(
+      limit(1370),
+      9
+    )
+    expect(draftUnwindCapLimit(withCurve(1390), onCurve, 100)).toBeCloseTo(
+      limit(1380),
+      9
+    )
+    // No fresh curve reading: the curve's limit is unknown, so no limit.
+    expect(draftUnwindCapLimit(view(true), onCurve, 100)).toBeNull()
   })
 })

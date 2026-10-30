@@ -81,9 +81,8 @@ struct Case {
     bid: f64,
     ask: f64,
     plain_ask: f64,
-    /// The same lift on a flat price around the feed, held to the flat
-    /// round-trip limit at `spread_bps`: the signed order's price, NGN per
-    /// USDT, before the venue's fee.
+    /// The same lift on a flat price around the feed at `spread_bps`: the
+    /// signed order's price, NGN per USDT, before the venue's fee.
     flat_bid: f64,
     flat_ask: f64,
 }
@@ -179,14 +178,11 @@ fn case(rng: &mut Rng, floored: bool) -> Case {
         feed_mid,
         NOW,
     );
-    let lifted = plain.with_lift(
-        Lift {
-            full_ngn: s.full_ngn,
-            start_pct: knobs.start_pct,
-            cost_ngn: cost,
-        },
-        spread_bps,
-    );
+    let lifted = plain.with_lift(Lift {
+        full_ngn: s.full_ngn,
+        start_pct: knobs.start_pct,
+        cost_ngn: cost,
+    });
     // The flat signed order around the feed, in the bot's units, and the same
     // lift on it.
     let flat_order = |bid: bool| {
@@ -202,7 +198,7 @@ fn case(rng: &mut Rng, floored: bool) -> Case {
         start_pct: knobs.start_pct,
         cost_ngn: cost,
     }
-    .held_to(lift_limit_ngn(spread_bps, feed_mid, knobs.start_pct));
+    .trusted();
     let flat = |bid: bool| {
         1.0 / flat_lift.map_or(flat_order(bid), |l| {
             lifted_flat_price(flat_order(bid), bid, l, feed_mid, f0, f1)
@@ -268,7 +264,7 @@ fn the_panel_fixture_matches_the_bot() {
         && c.ask > c.plain_ask + 1e-6
         && (c.ask - at_floor(c)).abs() < 1e-6
         && c.ask < c.cost - 1e-3));
-    // On a flat price: lifted, and held to the flat limit.
+    // On a flat price: lifted, past the round-trip limit too (it's advisory).
     let flat_bid = |c: &Case| c.feed_mid / (1.0 - c.spread_bps / 10_000.0);
     assert!(cases.iter().any(|c| c.flat_bid > flat_bid(c) + 1e-6));
     assert!(cases.iter().any(|c| {

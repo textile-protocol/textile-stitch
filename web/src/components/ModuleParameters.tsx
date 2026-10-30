@@ -4,7 +4,6 @@ import { CurveExample, CurveFields } from './CurveModule'
 import { ProfitUnwindFields, UnwindExample } from './ProfitUnwindModule'
 import ModulePresets from './ModulePresets'
 import {
-  enforcedUnwindCapLimit,
   leanConflict,
   liquidityScheduleErrors,
   moduleNames,
@@ -344,8 +343,7 @@ function ModuleExample({
   const valid =
     moduleParameterErrors(
       draft,
-      view.vault ?? true,
-      enforcedUnwindCapLimit(view, view.config, draft, now)
+      view.vault ?? true
     ).length === 0
   const enabled = draft[module].enabled
   const breakdown =

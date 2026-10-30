@@ -272,16 +272,16 @@ describe('profit unwind on the curve', () => {
     )
   })
 
-  it('holds the lift to the round-trip limit, as the bot does', () => {
+  it('quotes the lift as set past the round-trip limit, as the bot does', () => {
     // 4 x spread x mid / (1 - start): about 0.55 NGN at a 1 bps spread and
-    // start 0. The fee isn't in it: it arrives per request.
+    // start 0. The fee isn't in it: it arrives per request. It's advisory.
     const limit = liftLimitNgn(ALL_IN - 1, MID, 0)
     expect(limit).toBeCloseTo((4 * (ALL_IN - 1) * MID) / 10_000, 9)
     expect(liftLimitNgn(ALL_IN - 1, MID, 50)).toBeCloseTo(2 * limit, 9)
     const c = curveFor(reference, ALL_IN, knobs0(), ALL_IN - 1)!
     const big = withLift(c, { fullNgn: 10, startPct: 0, costNgn: MID * 2 })
-    expect(big.lift?.fullNgn).toBeCloseTo(limit, 9)
-    // A NaN lift stays off rather than becoming the limit.
+    expect(big.lift?.fullNgn).toBe(10)
+    // A NaN lift stays off.
     expect(
       withLift(c, { fullNgn: NaN, startPct: 0, costNgn: MID * 2 }).lift
     ).toBe(undefined)

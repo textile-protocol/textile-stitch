@@ -16,9 +16,8 @@ import {
   flatOrderNgn,
   flatUnwindSide,
   freshUnwindReading,
-  heldLift,
-  liftLimitNgn,
-  minSpreadBps,
+  trustedLift,
+  unwindCapHint,
   unwindRequirements,
   unwindWeight,
   type UnwindLift,
@@ -57,18 +56,15 @@ const ago = (secs: number) =>
     : `${Math.round(secs / 60)} min ago`
 
 /** The lift the bot would quote with now for the draft's knobs: sized off
- * its frozen cost, held to the round-trip limit at the corridor spread.
- * Null while there's no lift: off, no cost yet, or nothing to give back. */
+ * its frozen cost. Null while there's no lift: off, no cost yet, or nothing
+ * to give back. */
 function liftNow(
-  view: ModulesView,
   draft: ModulesConfig,
-  reading: UnwindReading | null,
-  now: number
+  reading: UnwindReading | null
 ): UnwindLift | null {
   const lift = draftUnwindLift(draft.profit_unwind, reading)
   if (!lift) return null
-  const limit = draftUnwindCapLimit(view, draft, now)
-  return heldLift(lift, limit ?? Infinity)
+  return trustedLift(lift)
 }
 
 /** The editor: the lift across the holdings, whether it quotes, the four
@@ -93,8 +89,8 @@ export function ProfitUnwindFields({
     onChange({ ...draft, profit_unwind: { ...u, ...patch } })
   const reading = freshUnwindReading(view.status?.profit_unwind, now)
   const capLimit = draftUnwindCapLimit(view, draft, now)
-  const lift = liftNow(view, draft, reading, now)
-  const most = Math.min(Math.max(0, u.cap_ngn), capLimit ?? Infinity)
+  const lift = liftNow(draft, reading)
+  const most = Math.max(0, u.cap_ngn)
   return (
     <>
       {draft.mode === 'live' && u.enabled && u.live && (
@@ -158,11 +154,7 @@ export function ProfitUnwindFields({
         sliderMax={5}
         value={u.cap_ngn}
         onChange={(cap_ngn) => set({ cap_ngn })}
-        hint={
-          capLimit === null
-            ? `The most both prices ever move, per ${settlement}.`
-            : `The most both prices ever move, per ${settlement}. At today's spread and start it can be at most ${priceText(capLimit)}, so a taker can't profit from the lift falling between trades.`
-        }
+        hint={unwindCapHint(u.cap_ngn, capLimit, settlement, priceText)}
       />
       <NumberControl
         label="Ignore gains under"
@@ -283,7 +275,7 @@ const PLOT_H = H - PAD.top - PAD.bottom
 
 /** How far both prices lift across the corridor-currency share: nothing up
  * to the start, then evenly to the full lift at 100%. The dashed line is the
- * most it can lift, the cap held to the round-trip limit. */
+ * most it can lift, the cap. */
 function UnwindChart({
   fullNgn,
   mostNgn,
@@ -459,7 +451,7 @@ export function ProfitUnwindNow({
   settlement: string
 }) {
   const reading = freshUnwindReading(view.status?.profit_unwind, now)
-  const lift = liftNow(view, view.config, reading, now)
+  const lift = liftNow(view.config, reading)
   const full = lift?.fullNgn ?? 0
   const f = reading?.share ?? null
   const start = view.config.profit_unwind.start_pct / 100
@@ -606,11 +598,7 @@ export function UnwindExample({
     plain !== null &&
     curveReading !== null &&
     !(curveFeed !== null && referenceTooFar(curveReading, curveFeed))
-  const limitSpread = minSpreadBps(view)
-  const flatLift =
-    raw && limitSpread !== null
-      ? heldLift(raw, liftLimitNgn(limitSpread, reading.feed_mid, u.start_pct))
-      : null
+  const flatLift = raw ? trustedLift(raw) : null
   const curveLift = raw && plain ? (withLift(plain, raw).lift ?? null) : null
   const held = onCurve ? curveLift : flatLift
   const sides: UnwindSide[] = ([true, false] as const).map((botBuys) => {
@@ -703,11 +691,7 @@ export function UnwindExample({
           ? `Nothing to give back right now: the ${priceText(reading.cost)} average cost isn't far enough above the feed.`
           : u.live
             ? `Both prices lift by up to ${priceText(held.fullNgn)} at full ${currency}, less below that. When the bot sells ${currency} it stops at the ${priceText(reading.cost)} average cost.`
-            : `Preview: the quote leaves the lift out. Quoting with it would add this row to both prices, up to ${priceText(held.fullNgn)} at full ${currency}.`}
-        {raw &&
-          held &&
-          held.fullNgn < raw.fullNgn - 1e-9 &&
-          ` The ${priceText(raw.fullNgn)} it would give is held to that by the round-trip limit at this spread.`}{' '}
+            : `Preview: the quote leaves the lift out. Quoting with it would add this row to both prices, up to ${priceText(held.fullNgn)} at full ${currency}.`}{' '}
         {draft.mode === 'live'
           ? u.live
             ? 'Live quotes and published levels use this price.'

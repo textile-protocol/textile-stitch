@@ -1,4 +1,4 @@
-import { curveConfigErrors, shapeLabel } from './curve'
+import { curveConfigErrors, freshReading, shapeLabel } from './curve'
 import {
   freshUnwindReading,
   liftLimitNgn,
@@ -238,8 +238,7 @@ export const moduleChanges = (
  * related setting silently when a slider moves. */
 export function moduleParameterErrors(
   c: ModulesConfig,
-  vault = true,
-  unwindCapLimitNgn: number | null = null
+  vault = true
 ): string[] {
   const i = c.inventory,
     s = c.spreads,
@@ -276,9 +275,7 @@ export function moduleParameterErrors(
     ...liquidityScheduleErrors(c.liquidity),
     ...liquidityAuthorityErrors(c.liquidity, c.mode),
     ...curveConfigErrors(c.curve).map((m) => `Inventory curve: ${m}`),
-    ...profitUnwindErrors(c.profit_unwind, unwindCapLimitNgn).map(
-      (m) => `Profit unwind: ${m}`
-    ),
+    ...profitUnwindErrors(c.profit_unwind).map((m) => `Profit unwind: ${m}`),
     vault &&
       c.curve.enabled &&
       c.inventory.enabled &&
@@ -349,10 +346,13 @@ export function equalSpreadBps(view: Pick<ModulesView, 'corridor_spreads'>) {
     : null
 }
 
-/** The most the draft's profit unwind cap may be at the bot's last reading:
- * the round-trip limit at the corridor's smaller spread, the feed and the
- * draft's start. Null without a fresh reading; the bot holds the lift to it
- * when it quotes (on the curve, at the curve's own mid, within 1% of it). */
+/** The cap above which the panel warns, at the bot's last readings: the
+ * round-trip limit at the corridor's smaller spread and the draft's start,
+ * sized off every mid the lift may go out on. Flat that's the feed; with the
+ * curve on, the bot may quote either (the curve's reference mid is within 1%
+ * of the feed, flat past that), so it's the lower of the two. Null when a mid
+ * it needs has no fresh reading, or there's no bps spread. The bot quotes the
+ * cap as set. */
 export function draftUnwindCapLimit(
   view: ModulesView,
   draft: ModulesConfig,
@@ -361,26 +361,16 @@ export function draftUnwindCapLimit(
   const reading = freshUnwindReading(view.status?.profit_unwind, now)
   const spread = minSpreadBps(view)
   if (!reading || spread === null) return null
-  return liftLimitNgn(spread, reading.feed_mid, draft.profit_unwind.start_pct)
-}
-
-/** The cap limit Save enforces: only while the draft moves profit unwind's
- * cap or start. A saved cap the feed has since moved past is held to the
- * limit by the bot when it quotes, so it doesn't lock other saves. */
-export function enforcedUnwindCapLimit(
-  view: ModulesView,
-  saved: ModulesConfig,
-  draft: ModulesConfig,
-  now: number
-): number | null {
-  const [was, is] = [saved.profit_unwind, draft.profit_unwind]
-  if (
-    was &&
-    Object.is(was.cap_ngn, is.cap_ngn) &&
-    Object.is(was.start_pct, is.start_pct)
+  const curve = draft.curve.enabled
+    ? freshReading(view.status?.curve, now)
+    : undefined
+  if (curve === null) return null
+  const mids = [reading.feed_mid, ...(curve ? [curve.reference_mid] : [])]
+  return Math.min(
+    ...mids.map((mid) =>
+      liftLimitNgn(spread, mid, draft.profit_unwind.start_pct)
+    )
   )
-    return null
-  return draftUnwindCapLimit(view, draft, now)
 }
 
 /** Server defaults for a config saved before profit unwind existed. */

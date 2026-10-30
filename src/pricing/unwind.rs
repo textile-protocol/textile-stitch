@@ -48,9 +48,12 @@
 //!
 //! Pulling the cost down lowers the lift, and that is a taker's one lever:
 //! drain the stitch at the full lift, sell a little back to dilute the cost,
-//! return the rest at the lower lift. [`lift_limit_ngn`] holds the full lift
-//! to what that can't beat after the round trip, and pricing applies it to
-//! every quote, on the curve or flat.
+//! return the rest at the lower lift. The bot doesn't hold the lift against
+//! it: every sale still clears at or above the cost (the ask floor), and naira
+//! sold back is a new position that enters at the feed, so what a taker can
+//! collect this way comes out of the slice of the gain the operator chose to
+//! give back, never out of the cost. [`lift_limit_ngn`] is the cap under which
+//! the lever can't pay at all, and the panel warns above it.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -197,8 +200,9 @@ fn start_fraction(start_pct: f64) -> f64 {
     (start_pct / 100.0).clamp(0.0, 0.99)
 }
 
-/// The most the full lift may be, NGN per USDT, so that a change in the lift
-/// between a taker's legs never pays them.
+/// The biggest full lift, NGN per USDT, at which a change in the lift between
+/// a taker's legs can't pay them. Advisory: the panel warns above it, the bot
+/// quotes the cap as set (see the module docs for why that's safe).
 ///
 /// Out and back at one lift cancel. But the lift can fall between the legs:
 /// naira a taker sells back enters the basis at the feed and pulls the cost
@@ -206,8 +210,8 @@ fn start_fraction(start_pct: f64) -> f64 {
 /// lower one keeps at most `full * mean(w)` over the stretch, and the whole
 /// book (share 1 to 0) averages `w` to `(1 - start) / 2`. A round trip is only
 /// sure to cost them twice the spread: the venue's fee arrives per request,
-/// and the two legs needn't pay the same one, or any. So the full lift is held
-/// to `full * (1 - start) / 2 <= 2 * spread * mid`. `spread_bps` is the
+/// and the two legs needn't pay the same one, or any. So the limit is
+/// `full * (1 - start) / 2 <= 2 * spread * mid`. `spread_bps` is the
 /// corridor spread alone, the signed order's half-width (on flat, the smaller
 /// side's); `mid_ngn` the mid the lift is turned into bps against.
 pub fn lift_limit_ngn(spread_bps: f64, mid_ngn: f64, start_pct: f64) -> f64 {
@@ -231,17 +235,14 @@ pub struct Lift {
 }
 
 impl Lift {
-    /// The lift with its full size held to `limit_ngn`
-    /// ([`lift_limit_ngn`]), or `None` when it lifts nothing: a lift of zero,
-    /// or one it can't trust.
-    pub fn held_to(self, limit_ngn: f64) -> Option<Self> {
-        // Checked before the limit: `f64::min` would turn a NaN into the limit.
+    /// The lift, or `None` when it lifts nothing: a lift of zero, or one it
+    /// can't trust.
+    pub fn trusted(self) -> Option<Self> {
         let trusted = self.full_ngn.is_finite()
             && self.start_pct.is_finite()
             && self.cost_ngn.is_finite()
             && self.cost_ngn > 0.0;
-        let full_ngn = self.full_ngn.min(limit_ngn);
-        (trusted && full_ngn > 0.0).then_some(Self { full_ngn, ..self })
+        (trusted && self.full_ngn > 0.0).then_some(self)
     }
 }
 
@@ -297,8 +298,8 @@ pub fn floored_ask_ngn(lifted: f64, plain: f64, cost_ngn: f64) -> f64 {
 /// full lift in bps of `mid_ngn`, the flat centre, averaged over the stretch
 /// ([`average_weight`]), raises both sides in NGN per USDT, and the ask stops
 /// at the cost ([`floored_ask_ngn`]). `flat` is the signed order's flat
-/// price for this side, and `lift` is already held to its limit
-/// ([`Lift::held_to`]). A lift of zero, or one it can't trust, leaves the
+/// price for this side, and `lift` is already checked
+/// ([`Lift::trusted`]). A lift of zero, or one it can't trust, leaves the
 /// flat price.
 pub fn lifted_flat_price(
     flat: f64,

@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
 import {
-  enforcedUnwindCapLimit,
   moduleParameterErrors,
 } from './modulePresentation'
 import type { ModulesConfig, ModulesView } from './modules'
@@ -71,8 +70,7 @@ export function useQuoteModules(
       saving.current ||
       moduleParameterErrors(
         config,
-        view.vault ?? true,
-        enforcedUnwindCapLimit(view, base.config, config, Date.now() / 1000)
+        view.vault ?? true
       ).length
     )
       return

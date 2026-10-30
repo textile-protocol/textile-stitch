@@ -10,7 +10,6 @@ import ModuleSaveBar from './ModuleSaveBar'
 import { pairSymbols } from './SpreadExample'
 import {
   corridorSpreads,
-  enforcedUnwindCapLimit,
   liveReading,
   moduleChanges,
   moduleParameterErrors,
@@ -62,8 +61,7 @@ export default function ModulesPanel({
   const status = view.status
   const parameterErrors = moduleParameterErrors(
     scoped,
-    vault,
-    enforcedUnwindCapLimit(view, base.config, scoped, now)
+    vault
   )
   const valid = parameterErrors.length === 0
   // Corridor names use " / ", "→" or "↔" depending on where they were listed.

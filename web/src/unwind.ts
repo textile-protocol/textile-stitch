@@ -27,7 +27,7 @@ export interface UnwindReading {
   /** Cost minus the feed: positive is a gain per dollar. */
   gain: number
   /** How far both sides lift at 100% naira; at share f, this times the
-   * weight at f. Before the round-trip limit. */
+   * weight at f. */
   full_shift: number
   /** Whether the lift quotes, or is profit unwind's preview. */
   live: boolean
@@ -122,8 +122,8 @@ export function unwindFullNgn(
   return Number.isFinite(full) ? full : 0
 }
 
-/** The draft's lift off the bot's frozen cost, live or preview, before the
- * round-trip limit; null while it is off or the bot hasn't reported a cost. */
+/** The draft's lift off the bot's frozen cost, live or preview; null while
+ * it is off or the bot hasn't reported a cost. */
 export function draftUnwindLift(
   config: ProfitUnwindConfig,
   reading: UnwindReading | null
@@ -148,10 +148,11 @@ export function flooredAskNgn(
   return Math.min(lifted, Math.max(plain, costNgn))
 }
 
-/** The most the full lift may be, NGN per USDT, so a lift that falls
- * between a taker's legs can't pay them: draining the whole book collects at
- * most `full * (1 - start) / 2`, and a round trip is only sure to cost twice
- * the spread (the venue fee is per request). Mirrors `lift_limit_ngn`. */
+/** The biggest full lift, NGN per USDT, at which a lift that falls between
+ * a taker's legs can't pay them: draining the whole book collects at most
+ * `full * (1 - start) / 2`, and a round trip is only sure to cost twice the
+ * spread (the venue fee is per request). Advisory: the panel warns above it
+ * and the bot quotes the cap as set. Mirrors `lift_limit_ngn`. */
 export function liftLimitNgn(
   spreadBps: number,
   midNgn: number,
@@ -160,26 +161,41 @@ export function liftLimitNgn(
   return (4 * (spreadBps / 10_000) * midNgn) / (1 - startFraction(startPct))
 }
 
-/** The lift held to `limitNgn`, or null when it lifts nothing: a lift of
- * zero, or one it can't trust. Mirrors `Lift::held_to`. */
-export function heldLift(
-  lift: UnwindLift,
-  limitNgn: number
-): UnwindLift | null {
-  // Checked before the limit: Math.min would turn a NaN into the limit.
+/** The cap field's hint. Save doesn't stop a cap above the round-trip limit,
+ * so the hint always names the risk: against `limitNgn` when there's one,
+ * and in words when the panel can't size it (no fresh reading, or no bps
+ * spread). `price` formats NGN. */
+export function unwindCapHint(
+  capNgn: number,
+  limitNgn: number | null,
+  settlement: string,
+  price: (n: number) => string
+): string {
+  const most = `The most both prices ever move, per ${settlement}.`
+  const risk =
+    'a taker can profit from the lift falling between trades, out of the gain you give back. Every sale still clears at or above the cost.'
+  if (limitNgn === null)
+    return `${most} The panel can't size the round-trip limit without a fresh reading and a bps spread. Above it, ${risk}`
+  return capNgn > limitNgn
+    ? `${most} Above ${price(limitNgn)} at today's spread and start, ${risk}`
+    : `${most} Up to ${price(limitNgn)} at today's spread and start, a taker can't profit from the lift falling between trades.`
+}
+
+/** The lift, or null when it lifts nothing: a lift of zero, or one it can't
+ * trust. Mirrors `Lift::trusted`. */
+export function trustedLift(lift: UnwindLift): UnwindLift | null {
   const trusted =
     Number.isFinite(lift.fullNgn) &&
     Number.isFinite(lift.startPct) &&
     Number.isFinite(lift.costNgn) &&
     lift.costNgn > 0
-  const fullNgn = Math.min(lift.fullNgn, limitNgn)
-  return trusted && fullNgn > 0 ? { ...lift, fullNgn } : null
+  return trusted && lift.fullNgn > 0 ? lift : null
 }
 
 /** A flat signed order with the lift for the stretch `f0..f1`, NGN per
  * USDT: the full lift in bps of `midNgn`, the flat centre, averaged over the
  * stretch, raises both sides, and the ask stops at the cost. `lift` is
- * already held to its limit. Mirrors `lifted_flat_price`, in NGN. */
+ * already checked. Mirrors `lifted_flat_price`, in NGN. */
 export function liftedFlatOrderNgn(
   orderNgn: number,
   botBuys: boolean,
@@ -232,7 +248,7 @@ export interface FlatUnwindSide {
 /** Profit unwind's lift on a flat quote for the stretch `share..after`.
  * `base` is the flat all-in quote the caller shows; the lift moves it as it
  * moves the flat signed order `order` (`flatOrderNgn`), so the venue fee on
- * top is left as it is. `lift` is already held to its limit. */
+ * top is left as it is. `lift` is already checked (`trustedLift`). */
 export function flatUnwindSide({
   base,
   order,
@@ -281,10 +297,7 @@ export function minSpreadBps(
 }
 
 /** Problems with the draft, in the words the form shows. */
-export function profitUnwindErrors(
-  config: ProfitUnwindConfig,
-  capLimitNgn: number | null = null
-): string[] {
+export function profitUnwindErrors(config: ProfitUnwindConfig): string[] {
   const errors: string[] = []
   if (
     !(Number.isFinite(config.share) && config.share >= 0 && config.share <= 1)
@@ -304,10 +317,6 @@ export function profitUnwindErrors(
     errors.push('The start must be 0–99%.')
   if (!(Number.isSafeInteger(config.refresh_secs) && config.refresh_secs >= 60))
     errors.push('The refresh must be at least 60 seconds.')
-  if (config.enabled && capLimitNgn !== null && config.cap_ngn > capLimitNgn)
-    errors.push(
-      `The cap can be at most ${capLimitNgn.toFixed(2)} NGN at today's spread and start. Above that a taker could profit from the lift falling between trades.`
-    )
   return errors
 }
 
@@ -351,8 +360,8 @@ export function unwindRequirements(
       ok: spread !== null,
       detail:
         spread !== null
-          ? `The lift is held to a multiple of the ${spread} bps configured spread, so a round trip never pays.`
-          : 'Set bps spreads in Corridors. The lift is held to a multiple of the spread.',
+          ? `The lift moves both sides by the same bps, and the cap's round-trip limit is a multiple of the ${spread} bps configured spread.`
+          : 'Set bps spreads in Corridors. The lift moves both sides by the same bps, and the round-trip limit is a multiple of the spread.',
     },
     {
       label: 'Feed the right way round',

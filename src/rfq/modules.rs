@@ -271,9 +271,9 @@ impl Engine {
         })
     }
 
-    /// What pricing lifts with: the lift sized off the snapshot, whether it
-    /// quotes, and the spread its limit is held to. `book` is the corridor
-    /// as configured, before modules move its spreads.
+    /// What pricing lifts with: the lift sized off the snapshot and whether
+    /// it quotes. `None` unless every side of `book`, the corridor as
+    /// configured before modules move its spreads, is a bps spread.
     fn unwind_input(
         &self,
         book: &CorridorBook,
@@ -281,6 +281,9 @@ impl Engine {
         now: u64,
     ) -> Option<super::responder::UnwindInput> {
         let unwind = self.unwind.as_ref()?;
+        if !super::responder::bps_spreads_only(book) {
+            return None;
+        }
         let (snapshot, shift) = self.unwind_shift(book, quote, now)?;
         Some(super::responder::UnwindInput {
             lift: crate::pricing::unwind::Lift {
@@ -289,7 +292,6 @@ impl Engine {
                 cost_ngn: snapshot.cost_ngn,
             },
             live: unwind.live,
-            limit_spread_bps: super::responder::min_bps_spread(book)?,
         })
     }
 

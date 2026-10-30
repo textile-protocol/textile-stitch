@@ -163,24 +163,13 @@ impl Curve {
 
     /// The same curve with profit unwind's lift on top. At any one share
     /// both sides lift by the same bps, and a quote pays the lift's mean over
-    /// its stretch, so out and back still cancel to minus the spread. The
-    /// full lift is held to [`Curve::lift_limit_ngn`] at `spread_bps`, the
-    /// signed order's half-width, so a lift that falls between a taker's legs
-    /// can't pay them either. A lift of zero, or one it can't trust, leaves
-    /// the curve plain.
-    pub fn with_lift(self, lift: Lift, spread_bps: f64) -> Self {
+    /// its stretch, so out and back still cancel to minus the spread. A lift
+    /// of zero, or one it can't trust, leaves the curve plain.
+    pub fn with_lift(self, lift: Lift) -> Self {
         Self {
-            lift: lift.held_to(self.lift_limit_ngn(lift.start_pct, spread_bps)),
+            lift: lift.trusted(),
             ..self
         }
-    }
-
-    /// The most profit unwind's full lift may be on this curve, NGN per
-    /// USDT: [`crate::pricing::unwind::lift_limit_ngn`] at `spread_bps` and
-    /// this curve's reference mid. Not the all-in: the venue fee is per
-    /// request, so only the spread is a cost every round trip pays.
-    pub fn lift_limit_ngn(&self, start_pct: f64, spread_bps: f64) -> f64 {
-        crate::pricing::unwind::lift_limit_ngn(spread_bps, self.mid, start_pct)
     }
 
     /// Shade at one inventory share, bps off the reference mid, lift included.
@@ -504,7 +493,7 @@ mod tests {
         // Profit unwind: at every share both prices move by full * w(f).
         // A cost far above the curve keeps the ask floor out of the way.
         let base = curve(0.0, 0.0);
-        let up = base.with_lift(lift(1.5, 50.0, MID_NGN * 2.0), ALL_IN);
+        let up = base.with_lift(lift(1.5, 50.0, MID_NGN * 2.0));
         for f in [0.0, 0.3, 0.5, 0.75, 1.0] {
             let w = crate::pricing::unwind::weight(f, 50.0);
             let want_bps = 1.5 / MID_NGN * 10_000.0 * w;
@@ -525,32 +514,30 @@ mod tests {
             &CurveParams::default(),
         )
         .unwrap();
-        let wide_up = wide.with_lift(lift(1.0, 0.0, MID_NGN * 2.0), ALL_IN);
+        let wide_up = wide.with_lift(lift(1.0, 0.0, MID_NGN * 2.0));
         let centre = |c: &Curve| 1.0 / c.price(true, 1.0, 1.0, 0.0).unwrap();
         assert!((centre(&wide_up) - centre(&wide) - 1.0).abs() < 1e-9);
         // Nothing to trust, nothing lifted.
-        assert_eq!(base.with_lift(lift(f64::NAN, 50.0, MID_NGN), ALL_IN), base);
-        assert_eq!(base.with_lift(lift(0.0, 50.0, MID_NGN), ALL_IN), base);
-        assert_eq!(base.with_lift(lift(10.0, 50.0, 0.0), ALL_IN), base);
+        assert_eq!(base.with_lift(lift(f64::NAN, 50.0, MID_NGN)), base);
+        assert_eq!(base.with_lift(lift(0.0, 50.0, MID_NGN)), base);
+        assert_eq!(base.with_lift(lift(10.0, 50.0, 0.0)), base);
     }
 
     #[test]
-    fn the_lift_is_held_to_the_round_trip_limit() {
+    fn the_lift_is_quoted_as_set_past_the_round_trip_limit() {
         // 4 x spread x mid / (1 - start): about 0.55 NGN at a 1 bps spread
         // and start 0, twice that at start 50. The fee isn't in it: it
         // arrives per request, so only the spread is a cost every round trip
-        // pays. A bigger lift is cut to it.
+        // pays. It's advisory: a bigger lift goes out as set.
+        use crate::pricing::unwind::lift_limit_ngn;
         let base = curve(0.0, 0.0);
         let spread = ALL_IN - 1.0;
-        let limit = base.lift_limit_ngn(0.0, spread);
+        let limit = lift_limit_ngn(spread, MID_NGN, 0.0);
         assert!((limit - 4.0 * spread / 10_000.0 * MID_NGN).abs() < 1e-9);
-        assert!((base.lift_limit_ngn(50.0, spread) - 2.0 * limit).abs() < 1e-9);
-        assert_eq!(
-            base.with_lift(lift(10.0, 0.0, MID_NGN * 2.0), spread),
-            base.with_lift(lift(limit, 0.0, MID_NGN * 2.0), spread)
-        );
-        // No spread, no room: the lift is off, whatever the fee.
-        assert_eq!(base.with_lift(lift(1.0, 0.0, MID_NGN * 2.0), 0.0), base);
+        assert!((lift_limit_ngn(spread, MID_NGN, 50.0) - 2.0 * limit).abs() < 1e-9);
+        let big = base.with_lift(lift(10.0, 0.0, MID_NGN * 2.0));
+        assert_eq!(big.lift.map(|l| l.full_ngn), Some(10.0));
+        assert_ne!(big, base.with_lift(lift(limit, 0.0, MID_NGN * 2.0)));
     }
 
     #[test]
@@ -566,7 +553,7 @@ mod tests {
             (50.0, MID_NGN * 1.0005),
             (90.0, MID_NGN * 1.0002),
         ] {
-            let c = curve(0.0, 0.0).with_lift(lift(2.0, start_pct, cost), ALL_IN);
+            let c = curve(0.0, 0.0).with_lift(lift(2.0, start_pct, cost));
             let mut worst = f64::NEG_INFINITY;
             for i in 0..=50 {
                 let f0 = f64::from(i) / 50.0;
@@ -600,7 +587,7 @@ mod tests {
         let base = curve(0.0, 0.0);
         let plain_ngn = 1.0 / base.price(false, 1.0, 0.98, 1.0).unwrap();
         let cost = plain_ngn + 0.3;
-        let up = base.with_lift(lift(2.0, 0.0, cost), ALL_IN);
+        let up = base.with_lift(lift(2.0, 0.0, cost));
         let lifted_ngn = 1.0 / up.price(false, 1.0, 0.98, 1.0).unwrap();
         assert!((lifted_ngn - cost).abs() < 1e-9, "{lifted_ngn} vs {cost}");
         // The bid keeps the whole lift: the gap only widens.
@@ -608,7 +595,7 @@ mod tests {
         let bid_lifted = 1.0 / up.price(true, 0.98, 1.0, 1.0).unwrap();
         assert!(bid_lifted - bid_plain > lifted_ngn - plain_ngn);
         // A cost under the plain ask leaves the plain ask alone.
-        let under = base.with_lift(lift(2.0, 0.0, plain_ngn - 1.0), ALL_IN);
+        let under = base.with_lift(lift(2.0, 0.0, plain_ngn - 1.0));
         assert_eq!(
             under.price(false, 1.0, 0.98, 1.0),
             base.price(false, 1.0, 0.98, 1.0)

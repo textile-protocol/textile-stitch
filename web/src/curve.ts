@@ -11,8 +11,7 @@ import type { CurveModuleConfig, ModulesConfig, ModulesView } from './modules'
 import {
   averageUnwindWeight,
   flooredAskNgn,
-  heldLift,
-  liftLimitNgn,
+  trustedLift,
   unwindWeight,
   type FlatUnwindSide,
   type UnwindLift,
@@ -122,15 +121,10 @@ export function curveFor(
 
 const clamp01 = (f: number) => Math.min(1, Math.max(0, f))
 
-/** The same curve with profit unwind's lift on top, held to the round-trip
- * limit. A lift of zero, or one it can't trust, leaves the curve plain.
- * Mirrors `Curve::with_lift`. */
+/** The same curve with profit unwind's lift on top. A lift of zero, or one
+ * it can't trust, leaves the curve plain. Mirrors `Curve::with_lift`. */
 export function withLift(curve: Curve, lift: UnwindLift): Curve {
-  const held = heldLift(
-    lift,
-    liftLimitNgn(curve.spreadBps, curve.mid, lift.startPct)
-  )
-  return { ...curve, lift: held ?? undefined }
+  return { ...curve, lift: trustedLift(lift) ?? undefined }
 }
 
 const plainShadeAt = (curve: Curve, f: number) =>
