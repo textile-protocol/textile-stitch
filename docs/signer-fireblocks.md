@@ -11,9 +11,10 @@ bot, so from Stitch's side this is plain HTTPS, the same shape as Turnkey.
 The thing that makes this setup different from the other two: **Stitch signs
 Fireblocks typed messages, not raw payloads.** Raw Signing is a paid entitlement
 Fireblocks only turns on after a conversation with your Customer Success
-Manager. Typed message signing isn't. You write one policy rule in the console
-and you're done. Everything a quoting bot signs (RFQ quotes, resting ladder
-orders, the venue handshake, enrolment) is EIP-712, so typed messages cover it.
+Manager. Typed message signing isn't: you write a policy rule in the console,
+and run a callback handler that checks what gets signed (the Signing Guard,
+step 3). Everything a quoting bot signs (RFQ quotes, resting ladder orders, the
+venue handshake, enrolment) is EIP-712, so typed messages cover it.
 
 What they don't cover is on-chain transactions. A transaction signing hash isn't
 typed data, so the taker and closer legs need raw signing. Stitch refuses that
@@ -88,11 +89,33 @@ panel. The Owner and your admin quorum approve the new user on the mobile app.
 Its **API key** (a UUID) is in the **API User (ID)** column of the API users
 list. That plus the key file is everything.
 
-## 2. Pick (or create) the vault account
+**Then lock it to the bot host.** With no IP allowlist the key works from any
+machine, so a copied key works anywhere. Fireblocks lets the workspace Owner
+pin each API user to single IP addresses, /32 only, no ranges ([Fireblocks:
+Whitelist IPs for API
+keys](https://developers.fireblocks.com/docs/whitelist-ips-for-api-keys),
+[Manage API Access](https://developers.fireblocks.com/docs/manage-api-keys)).
+The Owner picks **Allowlist IP address** from this user's ⋮ menu under
+**Developer Center → API users** and adds the bot host's fixed public egress
+address. The panel calls Fireblocks too (Load vault accounts, Verify, Connect,
+the Permit2 approvals), so run it on the same host or list its address as well.
 
-Any vault account works. Note that on EVM chains a Fireblocks vault account has
-**one address across every EVM network**. Celo, Base, Arbitrum, Ethereum and
-BSC all share it, so one vault account covers every corridor you run.
+When the host moves or its address changes, add the new address before the move
+and drop the old one after. Move first and Fireblocks refuses the bot's
+requests, so it stops signing and quoting until the Owner catches up. Don't
+empty the list to get unstuck: an empty list accepts any address.
+
+## 2. Create a dedicated vault account
+
+Use a vault account that holds only the bot's trading inventory. Create one
+rather than reuse one that holds anything else. The Typed Message rule, the
+Permit2 allowance and anything a bad signature could reach all stop at that one
+account, so treasury and other balances stay out of the bot's reach as long as
+they live elsewhere.
+
+On EVM chains a Fireblocks vault account has **one address across every EVM
+network**. Celo, Base, Arbitrum, Ethereum and BSC all share it, so one vault
+account covers every corridor you run.
 
 The vault needs at least one **EVM asset wallet** for the panel to read its
 address. If the vault is new, add one: **Ethereum** on a mainnet or testnet
@@ -105,7 +128,42 @@ mints the wallet and its address.
 Fund it with a little native gas on each chain you trade. Permit2 approvals
 need it.
 
-## 3. Add the Typed Message policy rule
+## 3. Run the Signing Guard
+
+**Required whenever the Typed Message rule auto-approves**, which it has to for
+the bot to quote. Do this before step 4, so that rule never runs without it.
+
+Fireblocks policy decides who may sign for which vault. It doesn't read what an
+EIP-712 message says. So with an auto-approving rule and nothing checking
+contents, a stolen bot credential can sign any typed message for the vault: a
+Permit2 order that pays your tokens to someone else, or an EIP-2612 `permit`
+under a token's own domain, which grants an allowance with no Permit2 involved.
+
+The fix is a co-signer callback handler. Once one is configured for an API user,
+the co-signer sends it every signing request for that user and signs only what
+it approves; a rejection or no answer fails the request ([Fireblocks: Setup API
+Co-signer Callback
+Handler](https://developers.fireblocks.com/cosigners/callback-handler/create-api-co-signer-callback-handler)).
+These docs call that handler the Signing Guard. Textile is building a reference
+Signing Guard for Stitch and will open-source it; once it's ready, this page
+will link its public repository here. Until then, run your own: the checks it
+needs are in [What the Signing Guard
+checks](https://docs.textilecredit.com/guides/fireblocks-custody#what-the-signing-guard-checks),
+and Fireblocks' [plugin-based callback
+handler](https://github.com/fireblocks/plugin-based-callback-handler) is a
+starting point.
+
+Run it on its own server, not the bot host: it's the check a stolen bot
+credential mustn't be able to reach. Then in **Developer Center → Co-signers**,
+expand your co-signer and configure a callback handler for this API user
+([Fireblocks: Configure the Callback
+Handler](https://developers.fireblocks.com/cosigners/operations/api-cosigner-operate#configure-the-callback-handler)).
+
+It sits on every signature's path, so it has to answer fast. If it's down the
+bot stops quoting, which is the right way to fail. Verify in step 5 signs
+through it.
+
+## 4. Add the policy rules
 
 This is the step people miss, and the failure is opaque without it: signing
 requests come back `BLOCKED` or `REJECTED`.
@@ -119,9 +177,26 @@ this key sign for vaults it has nothing to do with.
 
 Make sure the rule **auto-approves**. A rule that routes to a human approver is
 technically fine and practically useless: the venue stops listening for a quote
-about 5500 ms after it asks.
+about 5500 ms after it asks. Auto-approving means nothing but the Signing Guard
+sits between a typed message for this vault and a signature, which is why step 3
+comes first.
 
-## 4. Configure the bot
+**Then block transfers for this user.** A Signer API user can start transfers
+like any console user, so a broad Transfer rule that allows it hands a stolen bot
+credential the vault's funds directly, no typed message needed. Stitch never
+sends a transfer. In the **Transfer** policy, add a rule at the top with this API
+user as **Initiator**, any source, destination and asset, set to block, and
+publish it.
+
+Fireblocks applies the first rule that matches ([Fireblocks: Set
+Policies](https://developers.fireblocks.com/docs/set-transaction-authorization-policy)),
+so that's also how to check it: read the Transfer policy from the top, and the
+first rule whose Initiator takes in this user (by name, through a group, or as
+all users) has to be your block. Re-check after anyone edits the policy. The
+Signing Guard would refuse a transfer too, but policy is the layer Fireblocks
+enforces before the co-signer ever sees the request.
+
+## 5. Configure the bot
 
 **Desktop / panel.** Open the bot's Settings, pick **Signer → Fireblocks**, and
 enter the API key. For the private key, drop `fireblocks_secret.key` onto the
@@ -138,9 +213,10 @@ puts the editor back. Then:
 
 Verify is worth doing even though it's optional-looking, because it's the only
 thing that checks the whole path at once: the credentials parse, the co-signer
-is online, the policy rule exists and auto-approves, the vault resolves to an
-address, and how long a signature actually takes. It signs a payload under its
-own domain that authorises nothing: no gas, no chain, no order.
+is online, the Signing Guard approves it, the policy rule exists and
+auto-approves, the vault resolves to an address, and how long a signature
+actually takes. It signs a payload under its own domain that authorises
+nothing: no gas, no chain, no order.
 
 The address it reports is the one written to `stitch.toml`. It's not read off an
 API response; it's the address the signature recovered to.
@@ -150,7 +226,7 @@ API response; it's the address the signature recovered to.
 ```toml
 [signer]
 provider         = "fireblocks"
-vault_account_id = "0"
+vault_account_id = "<the bot's dedicated vault account id>"
 operator_address = "0x<the EVM address that vault account resolves to>"
 asset_id         = "ETH"                        # optional default
 api_base_url     = "https://api.fireblocks.io"  # optional default; regional endpoints (eu-api, eu2-api, us-east-1-api, sandbox-api) are also accepted
@@ -178,13 +254,19 @@ Set the region picker to **Sandbox** (or `api_base_url =
 Two things the sandbox **cannot** tell you, both because it auto-approves every
 transaction and its policies are not editable:
 
-- Whether your production Typed Message policy rule is correct. Sandbox has no
-  rule to write, so a sandbox pass says nothing about step 3 above.
+- Whether your production policy rules are correct, the Transfer block
+  included. Sandbox has no rules to write, so a sandbox pass says nothing about
+  step 4 above.
 - What signing actually costs you. Auto-approval is the best case; a production
   TAP rule adds latency on top, so treat a sandbox latency number as a floor,
   not a forecast.
 
-## 5. Validate with a dry run
+You can try the Signing Guard there, though. Fireblocks lets you configure a
+callback handler for an API user on the Communal Test Co-signer, just not for
+performance testing ([Fireblocks: Using the Communal Test
+Co-signer](https://developers.fireblocks.com/cosigners/overview/use-communal-cosigner)).
+
+## 6. Validate with a dry run
 
 ```bash
 RUST_LOG=info,stitch=debug,stitch_bot=debug \
@@ -206,7 +288,8 @@ venue answer in ~22 ms. The window is rarely what you lose to; speed is.
 Measure yours with Verify before committing to it. Under ~400 ms per signature
 you're fine; well above that and faster makers take quotes your prices deserved
 to win. If Verify reports a slow signature, the usual cause is a policy rule
-that isn't auto-approving.
+that isn't auto-approving, or a Signing Guard that's slow to answer. Its round
+trip is part of every signature Verify times.
 
 Nothing about it is unsafe, since every signature is verified before use, but
 whether it's fast enough depends on your workspace, and that's yours to measure,
@@ -261,53 +344,109 @@ What you need:
    contract call is an arbitrary transaction, so an auto-approving rule lets
    anyone holding the bot's credentials move the vault however they like, which
    is the containment this whole backend exists to give you. Route it to a human
-   approver or to an allowlist of the token contracts. With **Request
-   approval**, leave **Transaction initiator can approve** off: with it on and a
-   threshold of 1, the bot approves its own calls. Approvals are rare and
-   you're at the panel when they happen, and the request waits 3 minutes for the
-   call to mine, so there's time to approve it in the console.
+   approver. With **Request approval**, leave **Transaction initiator can
+   approve** off: with it on and a threshold of 1, the bot approves its own
+   calls. Approvals are rare and you're at the panel when they happen, and the
+   request waits 3 minutes for the call to mine, so there's time to approve it
+   in the console. When it comes in, check the destination is one of your
+   tokens, the spender in the calldata is Permit2, and the amount is the one you
+   meant to grant.
 2. A little native gas in the vault on the chain you're trading. The approve is
    ~46k gas, so this is cents on every chain except Ethereum.
 
-Then either let the add-bot wizard do it, since it sends one approval per
-token on its way to a live bot, or open the bot's **Tools** tab and press
-**Approve** next to each token that reads "Not approved".
+**Cap the allowance for custodied inventory.** A Permit2 order settles against
+this allowance, not the vault balance, so the allowance is the most any order
+can take, including one signed with a stolen credential that got past the
+Signing Guard. Unlimited is the right default for a hot wallet. For a custodied
+vault, approve each token for about the liquidity you quote with it.
+
+The panel can't send a capped approval. Its **Approve** button and the add-bot
+wizard always approve an unlimited amount, and `stitch approve --exact` signs
+its own transaction, so it doesn't run here without raw signing. Send
+`approve(Permit2, amount)` to the token yourself as a `CONTRACT_CALL` from the
+vault, through the Fireblocks API, SDK or CLI ([Fireblocks: Contract
+calls](https://developers.fireblocks.com/transactions/contract-calls)). Its
+`assetId` is the chain's native asset (`ETH` on Ethereum, for example), and
+that id is what picks the chain, so check it. Sent as this API user from the
+bot host, it goes through the rule above and the Signing Guard like the panel's
+approvals; any other user needs a Contract Call rule of its own. On Ethereum,
+USDT won't change one non-zero allowance to another, so set it to 0 first. In
+the add-bot wizard, press **Skip** on the approval step so it doesn't send
+unlimited ones.
+
+A capped allowance needs fixed `buy_total_liquidity_debt` /
+`sell_total_liquidity_collateral` first, because a side left on `"max"` only
+accepts an effectively unlimited allowance and preflight refuses to start
+against a smaller one. A token's allowance has to cover the total across every
+side that spends it. Fills spend it down: the bot keeps quoting what's left, but
+won't start again while it's below the configured liquidity, and the **Tools**
+tab shows the token as "Not approved". Top up with another capped approval, not
+the **Approve** button, which would send an unlimited one.
+
+**Or approve unlimited, on purpose.** Let the add-bot wizard do it, since it
+sends one approval per token on its way to a live bot, or open the bot's
+**Tools** tab and press **Approve** next to each token that reads "Not
+approved". The bot can then quote the whole vault balance with `"max"`
+liquidity and never needs a top-up. The cost is that the allowance limits
+nothing: an order that gets past the Signing Guard can take the vault's whole
+balance of that token.
 
 The panel picks the Fireblocks asset id for the chain by reading
 `/v1/blockchains` and then `/v1/assets` from your workspace, so it files the
 call under the right network without you configuring anything. A chain your
 workspace doesn't have is reported as such rather than guessed at.
 
-The panel always approves an unlimited amount. That's the right default for a
-hot wallet and a decision for custodied inventory: a Permit2 order settles
-against this allowance, not the vault balance, so it's the cap on what a stolen
-signature can take. Bounding it is manual, from the console or the Token
-Allowance Manager, and it needs fixed `buy_total_liquidity_debt` /
-`sell_total_liquidity_collateral` first, because a side left on `"max"` only
-accepts an effectively unlimited allowance and preflight refuses to start
-against a smaller one.
-
-The request stays open until the call is mined, which is normally a few
-seconds. If it sits there, the usual cause is a policy rule routing to a human
-approver rather than auto-approving, the same thing that makes Verify slow.
+The request stays open until the call is mined, which is normally a few seconds
+after your approver approves it. If it still hangs after that, check the rule
+covers this vault account and API user.
 
 This covers approvals and nothing else. The taker and closer legs still build
 and sign their own transactions on every fill, so they still need raw signing;
 see [The on-chain legs](#the-on-chain-legs).
 
-For the operator-facing version, including the threat model and the callback
-handler that makes the rest of it mean anything, see [Running Stitch on
+## Revocation drill
+
+Run this once at onboarding, after the bot is quoting and before full inventory
+goes in. It proves you can stop the bot from the Fireblocks side without
+touching the bot host, and tells you how long that takes and who has to act.
+
+1. **Cut off the API user.** Fireblocks documents no pause switch for an API
+   user. In a real incident the workspace Owner deletes it: that's immediate,
+   needs no mobile approval and fails anything in flight, but it's permanent, so
+   coming back means a new API user, a new CSR and updated policy rules ([Rename and
+   delete API
+   users](https://support.fireblocks.io/hc/en-us/articles/27491829465372-Rename-and-delete-API-users)).
+   For the drill, have the Owner swap the bot host's address in the IP
+   allowlist for one you don't use. Don't empty the list.
+2. **Revoke the Permit2 allowance.** Send `approve(Permit2, 0)` to each token
+   from the vault as a contract call. The console's **Web3 Access → Token
+   allowances** page can send the same revoke for allowances it lists. Whoever
+   sends it needs a Contract Call rule that covers them, and finding out whether
+   yours does is half the point. Once it lands, no outstanding order can fill.
+3. **Confirm quoting stops.** Verify fails, the bot logs signing failures
+   instead of quotes, and the **Tools** tab reads "Not approved" for each token.
+
+Then put the address back, approve again and run Verify. Note how long each step
+took and who had to act; only the Owner can do step 1.
+
+For the operator-facing version, including the threat model and what the
+Signing Guard checks, see [Running Stitch on
 Fireblocks](https://docs.textilecredit.com/guides/fireblocks-custody).
 
 ## Troubleshooting
 
 - **`Fireblocks refused the typed-message request: BLOCKED`**: no Typed Message
-  policy rule, or one that doesn't cover this vault account and API user. Step 3.
+  policy rule, or one that doesn't cover this vault account and API user. Step 4.
+- **Verify fails, or every signature is refused, once the Signing Guard is on**:
+  the guard rejected the request or didn't answer in time, and the co-signer
+  fails it either way. The guard's own log says which. A guard that leaves out
+  `SignerCheck` fails every Verify.
 - **`Fireblocks refused the raw request: BLOCKED`**: only reachable with
   `raw_signing = true`. The Typed Message rule doesn't cover raw signing; that
   needs its own policy rule scoped to the same vault account and API user.
 - **Signing works but takes seconds**: the policy rule is routing to a human
-  approver instead of the co-signer. Make it auto-approve.
+  approver instead of the co-signer, or the Signing Guard is slow to answer.
+  Make the rule auto-approve, and check the guard's response time.
 - **`vault account N has no EVM wallet`**: the vault has no EVM asset wallet at
   all, so there is no address to read. Add one in the console (Ethereum, or a
   testnet asset such as ETH_TEST5 on a Sandbox). Step 2. The panel accepts any
@@ -328,6 +467,9 @@ Fireblocks](https://docs.textilecredit.com/guides/fireblocks-custody).
   `fireblocks_secret.key`, including the `BEGIN`/`END` lines. If you dropped a
   file and it was rejected, check you grabbed the key and not `fireblocks.csr`;
   they land in the same directory from the same command.
+- **Every Fireblocks call fails after a host move or an IP change**: the API
+  user's IP allowlist doesn't list the address the request came from. Both the
+  bot and the panel call Fireblocks, so list the address they leave from. Step 1.
 - **`api_base_url host ... is not an official fireblocks API host`**: if your
   workspace is in a region, point `api_base_url` at its endpoint
   (`https://eu-api.fireblocks.io` and friends are accepted).
@@ -345,4 +487,5 @@ Fireblocks](https://docs.textilecredit.com/guides/fireblocks-custody).
   and the corridor is on a mainnet.
 - **Quotes rejected as `Busy` with `signing did not finish inside the reply
   budget` in the log**: signing is slower than the venue's window. Same cause as
-  a slow Verify: a policy rule that isn't auto-approving.
+  a slow Verify: a policy rule that isn't auto-approving, or a slow Signing
+  Guard.

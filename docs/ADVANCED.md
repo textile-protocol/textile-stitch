@@ -434,12 +434,13 @@ Six options:
   one shared service for many operators: MPCVault binds one client-signer per
   vault and each operator needs their own vault and funds, so it's one sidecar
   per operator.
-- **Fireblocks**: MPC custody with no sidecar — the API Co-Signer is part of the
-  operator's own Fireblocks workspace. Signs EIP-712 **typed messages**, which
-  needs only a Typed Message policy rule the operator writes themselves, not the
-  Raw Signing entitlement Fireblocks has to enable for you. That covers RFQ
-  quoting and the ladder. The on-chain legs need `raw_signing = true`, so on a
-  default setup they don't run here — give that bot a hot wallet rather than
+- **Fireblocks**: MPC custody with no sidecar, since the API Co-Signer is part
+  of the operator's own Fireblocks workspace. Signs EIP-712 **typed messages**,
+  which needs a Typed Message policy rule the operator writes themselves (not the
+  Raw Signing entitlement Fireblocks has to enable for you) and the Signing
+  Guard, a co-signer callback handler that checks what gets signed. That covers
+  RFQ quoting and the ladder. The on-chain legs need `raw_signing = true`, so on
+  a default setup they don't run here: give that bot a hot wallet rather than
   going after the entitlement. Signing is create-then-poll rather than one call,
   so measure the latency before relying on it to quote.
 - **Google Cloud KMS**: the key lives in Cloud KMS, normally at the HSM
@@ -519,7 +520,7 @@ Fireblocks:
 ```toml
 [signer]
 provider         = "fireblocks"
-vault_account_id = "0"                          # the vault account holding the operator wallet
+vault_account_id = "<id>"                       # a vault account holding only the bot's inventory
 operator_address = "0x<the EVM address that vault account resolves to>"
 asset_id         = "ETH"                        # optional, default; picks the key format, not a network
 api_base_url     = "https://api.fireblocks.io"  # optional, default
@@ -537,16 +538,37 @@ On EVM chains one Fireblocks vault account has the same address on every
 network, so one vault account covers every corridor.
 
 With `raw_signing = false` (the default) the bot signs typed messages only. That
-covers RFQ quoting *and* the ladder — both only sign Permit2 orders — but not the
-EIP-1559 transaction hash, so `limit_taker` and closer pools are rejected at
-config time with a message saying so — run those on a hot-wallet bot. The one
+covers RFQ quoting *and* the ladder, since both only sign Permit2 orders, but not
+the EIP-1559 transaction hash, so `limit_taker` and closer pools are rejected at
+config time with a message saying so. Run those on a hot-wallet bot. The one
 on-chain need left is the Permit2 approval, and that no longer needs raw signing:
 the panel has Fireblocks send it as a contract call, which takes a Contract Call
 policy rule and no entitlement.
 
-For the full walkthrough (API user and co-signer, the vault account, the Typed
-Message policy rule, and the panel's Verify step), see [Fireblocks signer
-setup](signer-fireblocks.md).
+The Typed Message rule has to auto-approve for the bot to quote, and an
+auto-approving rule signs whatever typed message this key asks for. So before
+this bot quotes real inventory it also needs the Signing Guard: a co-signer
+callback handler that approves only the messages Stitch signs. And since a
+Signer API user can start transfers like any console user, no Transfer rule may
+let this one start a transfer: put a rule that blocks it at the top of the
+Transfer policy. Have the workspace Owner pin the API user to the bot host's
+fixed IP address with Fireblocks' per-user IP allowlist, since with an empty
+list the key works from anywhere. And give the bot a vault account that holds
+only its trading inventory, so nothing else sits within reach of its key.
+
+For custodied inventory we also recommend a capped Permit2 allowance, since the
+allowance is the most any order can pull. The panel's **Approve** only sends
+unlimited ones and `stitch approve --exact` needs raw signing, so a capped
+approval goes out as a contract call you send yourself, with fixed liquidity
+instead of `"max"`. [Permit2 approvals without raw
+signing](signer-fireblocks.md#permit2-approvals-without-raw-signing) has the
+details. Once the bot is quoting, run the [revocation
+drill](signer-fireblocks.md#revocation-drill) once, so you know you can stop it
+from the Fireblocks side.
+
+For the full walkthrough (API user and co-signer, the vault account, the Signing
+Guard, the Typed Message and Transfer policy rules, and the panel's Verify
+step), see [Fireblocks signer setup](signer-fireblocks.md).
 
 Google Cloud KMS:
 
