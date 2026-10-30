@@ -206,14 +206,14 @@ impl ModulesConfig {
         c.normalized()
     }
 
-    /// The vault-only modules switched on in the file, by name: what
+    /// The vault-only modules the file runs, by name: what
     /// [`Self::runnable`] turns off on a wallet bot.
     pub fn vault_only_enabled(&self) -> Vec<&'static str> {
         [
-            (self.inventory.enabled, "inventory balancing"),
-            (self.spreads.enabled, "dynamic spreads"),
-            (self.rebalance.enabled, "spot rebalancing"),
-            (self.liquidity.enabled, "the liquidity schedule"),
+            (self.runs(Module::Inventory), "inventory balancing"),
+            (self.runs(Module::Spreads), "dynamic spreads"),
+            (self.runs(Module::Rebalance), "spot rebalancing"),
+            (self.runs(Module::Liquidity), "the liquidity schedule"),
         ]
         .into_iter()
         .filter_map(|(on, name)| on.then_some(name))
@@ -570,7 +570,8 @@ impl ModulesConfig {
         );
         let r = &self.rebalance;
         ensure!(
-            !r.enabled || (r.trigger_bps > i.target_bps && r.trigger_bps <= i.max_bps),
+            !self.runs(Module::Rebalance)
+                || (r.trigger_bps > i.target_bps && r.trigger_bps <= i.max_bps),
             "rebalance trigger_bps must be above inventory target and at most max_bps"
         );
         ensure!(

@@ -1281,7 +1281,9 @@ impl Config {
     /// vault beside the others except inventory balancing.
     fn validate_curve(&self) -> anyhow::Result<()> {
         let m = &self.modules;
-        if !m.curve.enabled {
+        // Whether a module runs, not its raw switch: `mode = "off"` turns a
+        // module off even with `enabled = true`.
+        if !m.runs(crate::modules::Module::Curve) {
             return Ok(());
         }
         let pool = &self.pools[0];
@@ -1326,7 +1328,7 @@ impl Config {
         // (weighting it by inventory needs inventory balancing), so the curve
         // only sees a wider all-in.
         anyhow::ensure!(
-            self.vault.is_none() || !m.inventory.enabled,
+            self.vault.is_none() || !m.runs(crate::modules::Module::Inventory),
             "inventory balancing and the inventory curve both lean quotes on what the vault \
              holds; turn one of them off"
         );
@@ -1340,7 +1342,7 @@ impl Config {
     /// bps; and it tracks what the collateral cost in the debt, so the
     /// collateral must be the soft currency.
     fn validate_profit_unwind(&self) -> anyhow::Result<()> {
-        if !self.modules.profit_unwind.enabled {
+        if !self.modules.runs(crate::modules::Module::ProfitUnwind) {
             return Ok(());
         }
         let pool = &self.pools[0];
@@ -1369,7 +1371,7 @@ impl Config {
         // the vault's share moves, so between a taker's legs; dynamic spreads
         // only add to it, so they can stay.
         anyhow::ensure!(
-            self.vault.is_none() || !self.modules.inventory.enabled,
+            self.vault.is_none() || !self.modules.runs(crate::modules::Module::Inventory),
             "inventory balancing narrows a side below the configured spread, which profit \
              unwind's round-trip limit counts on; turn one of them off"
         );
@@ -2017,6 +2019,32 @@ mod tests {
              [modules.curve]\nenabled = true\n{modules_extra}",
             rfq_only_with_signer("")
         )
+    }
+
+    /// A module a file turns off with its own `mode = "off"` doesn't run, so
+    /// it can't conflict: the bot still starts.
+    #[test]
+    fn a_module_off_by_its_own_mode_is_not_validated_as_running() {
+        // A curve that is off beside inventory balancing on a vault, then
+        // inventory balancing off beside a curve and profit unwind.
+        let off_curve = curve_bot(
+            "",
+            true,
+            "mode = \"off\"\n[modules.inventory]\nenabled = true\n",
+        );
+        let cfg = Config::from_toml(&off_curve).unwrap();
+        assert!(!cfg.modules.runs(crate::modules::Module::Curve));
+        let off_inventory = curve_bot(
+            "",
+            true,
+            "[modules.inventory]\nenabled = true\nmode = \"off\"\n\
+             [modules.profit_unwind]\nenabled = true\n",
+        );
+        Config::from_toml(&off_inventory).unwrap();
+        // While inventory balancing runs, the conflict still refuses.
+        let both = curve_bot("", true, "[modules.inventory]\nenabled = true\n");
+        let err = Config::from_toml(&both).unwrap_err().to_string();
+        assert!(err.contains("turn one of them off"), "{err}");
     }
 
     #[test]

@@ -79,9 +79,9 @@ Preview or Live) separately from current activity. **Overview** shows readings,
 module navigation; the selected module and section survive refresh in the URL.
 Refreshing still reloads saved settings, not unsaved drafts.
 
-Each quote module's mode sits at the top of its Settings and saves with that
-module's other settings. Saving one module never changes another's mode or
-settings; sibling drafts remain unsaved. Hedge settings have a separate draft
+Each quote module's mode switch sits at the top right of its pane, in every
+section, and saves only that mode after a confirmation. Saving one module never
+changes another's mode or settings; unsaved drafts stay unsaved. Hedge settings have a separate draft
 and write path. An assigned hedge stays in navigation
 when disabled, while its empty dashboard summary can still disappear. Errors in one service leave
 the other controls accessible. Search and navigation never save configuration.

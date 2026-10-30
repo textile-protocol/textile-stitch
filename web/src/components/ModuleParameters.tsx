@@ -3,12 +3,9 @@ import type { ModulesConfig, ModulesView } from '../modules'
 import { CurveExample, CurveFields } from './CurveModule'
 import { ProfitUnwindFields, UnwindExample } from './ProfitUnwindModule'
 import ModulePresets from './ModulePresets'
-import { moduleMode, withModuleMode } from '../moduleModes'
 import {
   leanConflict,
   liquidityScheduleErrors,
-  moduleModeEffect,
-  moduleModes,
   moduleNames,
   moduleParameterErrors,
   percentage,
@@ -23,8 +20,6 @@ import {
 import {
   AllocationBar,
   Chevron,
-  modeDots,
-  ModeSwitch,
   NumberControl,
   Popover,
   QuoteBreakdown,
@@ -129,37 +124,18 @@ export default function ModuleParameters({
   const titleId = useId()
   const conflict = leanConflict(draft, selected, vault)
   const blockedReason = selected === 'liquidity' ? liquidityRefusal : null
-  const mode = moduleMode(draft, selected)
   return (
     <section
       aria-labelledby={titleId}
       className="border-line-soft bg-surface @container rounded-xl border"
     >
-      <header className="border-line-soft flex flex-wrap items-center justify-between gap-3 border-b px-5 py-4">
-        <div className="min-w-0">
-          <h3 id={titleId} className="text-sm font-bold">
-            {moduleNames[selected]}
-          </h3>
-          <p className="text-muted mt-1 flex items-baseline gap-1.5 text-xs">
-            <span
-              aria-hidden
-              className={`size-1.5 shrink-0 translate-y-[-1px] rounded-full ${modeDots[mode]}`}
-            />
-            {moduleModeEffect(selected, mode, draft)}
-          </p>
-        </div>
-        <fieldset
-          disabled={
-            mode === 'off' && (conflict !== null || blockedReason !== null)
-          }
-        >
-          <ModeSwitch
-            label={`${moduleNames[selected]} mode`}
-            modes={moduleModes}
-            value={mode}
-            onChange={(next) => onChange(withModuleMode(draft, selected, next))}
-          />
-        </fieldset>
+      <header className="border-line-soft border-b px-5 py-4">
+        <h3 id={titleId} className="text-sm font-bold">
+          {moduleNames[selected]} settings
+        </h3>
+        <p className="text-muted mt-1 text-xs">
+          Changes apply only to this module. Its mode is at the top of the page.
+        </p>
       </header>
       <ModuleEditor
         module={selected}

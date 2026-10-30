@@ -13,12 +13,15 @@ import {
   type ModuleSection,
   type WorkspaceModuleId,
 } from '../moduleWorkspace'
-import { modeLabel } from '../modulePresentation'
-import { moduleMode } from '../moduleModes'
+import { modeLabel, moduleModeEffect } from '../modulePresentation'
+import { moduleMode, type ModuleKey } from '../moduleModes'
+import type { ModulesConfig } from '../modules'
+import { modeDots } from './ModuleControls'
 import { hedgeStatus } from '../perps'
 import type { Bot, Funding } from '../types'
 import type { PerpsState } from '../usePerps'
 import { useQuoteModules } from '../useQuoteModules'
+import ModuleModeControl from './ModuleModeControl'
 import ModulesPanel from './ModulesPanel'
 import PerpsModule from './PerpsModule'
 import ScrollTabs from './ScrollTabs'
@@ -224,8 +227,32 @@ export default function ModuleWorkspace({
                     <p className="text-muted mt-2 text-sm">
                       {WORKSPACE_MODULES[quoteModule].description}
                     </p>
+                    {quotes.base && (
+                      <ModeEffect
+                        config={quotes.base.config}
+                        module={quoteModule}
+                      />
+                    )}
                   </div>
-                  <ModuleStatus value={status(quoteModule)} />
+                  <div className="ml-auto flex flex-col items-end gap-1.5">
+                    {/* Keyed: a confirmation open for one module must not
+                        follow navigation to another and save its mode. */}
+                    <ModuleModeControl
+                      key={quoteModule}
+                      state={quotes}
+                      module={quoteModule}
+                      editable={bot.editable}
+                      refusal={
+                        quoteModule === 'liquidity'
+                          ? (quotes.view?.liquidity_refusal ?? null)
+                          : null
+                      }
+                    />
+                    {/* Activity beyond what the switch already says. */}
+                    {!['Live', 'Preview', 'Off'].includes(
+                      status(quoteModule)
+                    ) && <ModuleStatus value={status(quoteModule)} />}
+                  </div>
                 </header>
                 <ScrollTabs
                   label="Module sections"
@@ -282,5 +309,28 @@ function ModuleStatus({ value }: { value: string }) {
       <span aria-hidden className="size-1.5 rounded-full bg-current" />
       {value}
     </span>
+  )
+}
+
+/** What the saved mode means for this module, under its description. */
+function ModeEffect({
+  config,
+  module,
+}: {
+  config: ModulesConfig
+  module: ModuleKey
+}) {
+  const mode = moduleMode(config, module)
+  return (
+    <p className="text-muted mt-2 flex items-baseline gap-1.5 text-xs">
+      <span
+        aria-hidden
+        className={`size-1.5 shrink-0 translate-y-[-1px] rounded-full ${modeDots[mode]}`}
+      />
+      <span>
+        <span className="text-ink font-bold">{modeLabel(mode)}:</span>{' '}
+        {moduleModeEffect(module, mode, config)}
+      </span>
+    </p>
   )
 }

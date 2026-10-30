@@ -9,6 +9,7 @@ import {
   selectedWorkspaceModule,
   quoteModuleStatus,
   hedgeBadge,
+  draftAfterModeSave,
   quoteModuleUnsaved,
 } from './moduleWorkspace'
 import {
@@ -434,6 +435,34 @@ describe('independent module saves', () => {
       ...draft,
       curve: saved.curve,
     })
+  })
+
+  it('saves a mode from the header and keeps every unsaved edit', () => {
+    const saved = expandModes({
+      ...config(),
+      mode: 'shadow',
+      inventory: { ...config().inventory, enabled: true },
+      spreads: { ...config().spreads, enabled: true },
+    })
+    // Unsaved: a new inventory target and a spreads edit.
+    const draft = {
+      ...saved,
+      inventory: { ...saved.inventory, target_bps: 2500 },
+      spreads: { ...saved.spreads, max_extra_bps: 70 },
+    }
+    // What the header saves: only the mode, on top of the saved settings.
+    const sent = withModuleMode(saved, 'inventory', 'live')
+    expect(sent.inventory.target_bps).toBe(saved.inventory.target_bps)
+    const next = expandModes(normalizeModes(sent))
+    const after = draftAfterModeSave(saved, draft, next, 'inventory', 'live')
+    expect(moduleMode(after, 'inventory')).toBe('live')
+    expect(after.inventory.target_bps).toBe(2500)
+    expect(after.spreads.max_extra_bps).toBe(70)
+    expect(moduleMode(after, 'spreads')).toBe('shadow')
+    // With no unsaved edits the draft is the saved config.
+    expect(draftAfterModeSave(saved, saved, next, 'inventory', 'live')).toEqual(
+      next
+    )
   })
 
   it('takes refreshed server values for untouched scopes after saving', () => {

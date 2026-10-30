@@ -1,10 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
 import { moduleParameterErrors } from './modulePresentation'
-import type { ModulesConfig, ModulesView } from './modules'
-import { expandModes, normalizeModes, sameConfig } from './moduleModes'
+import type { Mode, ModulesConfig, ModulesView } from './modules'
+import {
+  expandModes,
+  normalizeModes,
+  sameConfig,
+  withModuleMode,
+  type ModuleKey,
+} from './moduleModes'
 import { poll } from './poll'
 import {
+  draftAfterModeSave,
   quoteConfigForScope,
   remainingQuoteDraft,
   type QuoteConfigScope,
@@ -66,14 +73,37 @@ export function useQuoteModules(
   const configFor = (scope: QuoteConfigScope) =>
     base && draft ? quoteConfigForScope(base.config, draft, scope) : null
 
-  async function save(scope: QuoteConfigScope) {
+  /** One module's Settings, through its save bar. */
+  const save = (scope: QuoteConfigScope) => {
     const config = configFor(scope)
+    return config
+      ? commit(config, (saved, current, next) =>
+          remainingQuoteDraft(saved, current, next, scope)
+        )
+      : Promise.resolve()
+  }
+
+  /** Only `key`'s mode, from the module header. Other edits stay drafts. */
+  const saveMode = (key: ModuleKey, mode: Mode) =>
+    base
+      ? commit(withModuleMode(base.config, key, mode), (saved, current, next) =>
+          draftAfterModeSave(saved, current, next, key, mode)
+        )
+      : Promise.resolve()
+
+  async function commit(
+    config: ModulesConfig,
+    nextDraft: (
+      saved: ModulesConfig,
+      draft: ModulesConfig,
+      next: ModulesConfig
+    ) => ModulesConfig
+  ) {
     if (
       !enabled ||
       !view ||
       !draft ||
       !base ||
-      !config ||
       !editable ||
       saving.current ||
       moduleParameterErrors(config, view.vault ?? true).length
@@ -100,7 +130,7 @@ export function useQuoteModules(
         return
       }
       const saved = expandModes(next.config)
-      setDraft(remainingQuoteDraft(base.config, draft, saved, scope))
+      setDraft(nextDraft(base.config, draft, saved))
       setBase({ config: saved, revision: next.revision })
       setNote(result.message)
       if (result.restartError)
@@ -127,6 +157,7 @@ export function useQuoteModules(
     setNote,
     busy,
     save,
+    saveMode,
     discard: (scope: QuoteConfigScope) => {
       if (!base) return
       setDraft(

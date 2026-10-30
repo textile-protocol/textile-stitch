@@ -6,7 +6,12 @@ import {
   runningConfigDiffers,
   liquidityState,
 } from './modulePresentation'
-import { moduleKeys, moduleMode, type ModuleKey } from './moduleModes'
+import {
+  moduleKeys,
+  moduleMode,
+  withModuleMode,
+  type ModuleKey,
+} from './moduleModes'
 import {
   moduleStatusFresh,
   type Mode,
@@ -159,9 +164,9 @@ export function remainingQuoteDraft(
   saved: ModulesConfig,
   draft: ModulesConfig,
   next: ModulesConfig,
-  scope: QuoteConfigScope
+  scope: QuoteConfigScope | null
 ): ModulesConfig {
-  const owned = configKeys(scope)
+  const owned = scope ? configKeys(scope) : []
   const keys: readonly (keyof ModulesConfig)[] = moduleKeys
   return {
     ...next,
@@ -175,6 +180,22 @@ export function remainingQuoteDraft(
         .map((key) => [key, draft[key]])
     ),
   }
+}
+
+/** Drafts after saving only `key`'s mode from the module header: every
+ * unsaved edit stays a draft, and `key` takes the mode it was saved with. */
+export function draftAfterModeSave(
+  saved: ModulesConfig,
+  draft: ModulesConfig,
+  next: ModulesConfig,
+  key: ModuleKey,
+  mode: Mode
+): ModulesConfig {
+  return withModuleMode(
+    remainingQuoteDraft(saved, draft, next, null),
+    key,
+    mode
+  )
 }
 
 export function quoteModuleUnsaved(
