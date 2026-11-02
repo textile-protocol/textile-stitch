@@ -504,7 +504,7 @@ pub async fn read_funding(
     let (asks, slots) = funding_asks(&owners, &plans);
     let (answers, feed_prices, native) = tokio::join!(
         read_cached(
-            &cfg.rpc_url,
+            cfg.rpc_endpoints(),
             cfg.chain_id,
             &state.chain_constants,
             snapshot.as_ref(),

@@ -89,7 +89,7 @@ pub async fn allowances(
                 .iter()
                 .map(|req| allowance_ask(req.token, owner, permit2))
                 .collect();
-            let answers = read_all(&cfg.rpc_url, &asks).await;
+            let answers = read_all(cfg.rpc_endpoints(), &asks).await;
             for (ask, answer) in asks.iter().zip(&answers) {
                 match token_uint(answer, &ask.what) {
                     Ok(v) => current.push(Some(v)),

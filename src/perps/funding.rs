@@ -33,7 +33,7 @@ pub async fn tick(
             })),
         )
         .await?;
-        let wallet = Wallet::new(cfg.rpc_url.clone(), signer.clone(), cfg.chain_id);
+        let wallet = Wallet::new(cfg.rpc_endpoints(), signer.clone(), cfg.chain_id);
         if wallet
             .rpc()
             .latest_transaction_count(signer.address())
@@ -134,7 +134,7 @@ pub async fn tick(
         .ok_or_else(|| anyhow::anyhow!("Missing operation ID"))?
         .to_owned();
     let wallet =
-        Wallet::new(cfg.rpc_url.clone(), signer, cfg.chain_id).with_gas_caps(cfg.gas_caps());
+        Wallet::new(cfg.rpc_endpoints(), signer, cfg.chain_id).with_gas_caps(cfg.gas_caps());
     wallet.journal_transaction(&operation.clone(), to, data, U256::ZERO, |raw| async move {
         // Repeating these exact bytes is safe if the journal response is lost.
         request(cfg, dir, reqwest::Method::POST, &p.assignment_id, "/funding/journal", Some(json!({"operationId": operation, "signedTransaction": alloy_primitives::hex::encode_prefixed(raw)}))).await?;

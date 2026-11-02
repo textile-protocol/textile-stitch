@@ -264,7 +264,7 @@ async fn read_chain(
     agent_id: Option<u64>,
     defaults: &Profile,
 ) -> Reads {
-    let rpc = Rpc::new(cfg.rpc_url.clone());
+    let rpc = Rpc::new(cfg.rpc_endpoints());
     let mut reads = Reads::default();
     let mut note = |e: anyhow::Error, what: &str| {
         reads_error(&mut reads.error, format!("couldn't read {what}: {e:#}"));
@@ -524,7 +524,7 @@ async fn record(
     let owner = owner_of_bot(&bot).ok_or_else(|| {
         ApiError::conflict(format!("{name} has no operator address the panel can read"))
     })?;
-    confirm_ownership(&Rpc::new(cfg.rpc_url.clone()), registry, owner, id).await?;
+    confirm_ownership(&Rpc::new(cfg.rpc_endpoints()), registry, owner, id).await?;
     let next = crate::setup::set_erc8004_agent_id(&toml, id).map_err(ApiError::bad_request)?;
     let origin = super::changes::origin(identity, crate::changelog::Source::PanelIdentity, name);
     super::changes::write_config(state, &path, &next, &origin)?;
@@ -757,7 +757,7 @@ pub async fn register_via_custody(
                     "couldn't build a Fireblocks client from {name}'s config: {e:#}"
                 ))
             })?;
-    let rpc = Rpc::new(cfg.rpc_url.clone());
+    let rpc = Rpc::new(cfg.rpc_endpoints());
 
     let (pending, fireblocks_tx_id) = match read_pending(&store, key)? {
         Some(pending) => {

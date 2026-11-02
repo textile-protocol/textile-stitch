@@ -153,6 +153,8 @@ impl From<&setup::PoolSummary> for PoolSummaryBody {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsBody {
     pub rpc_url: String,
+    /// Backup RPC endpoints, in the order the bot tries them.
+    pub rpc_fallback_urls: Vec<String>,
     pub feed_url: String,
     pub buy: SpreadBody,
     pub sell: SpreadBody,
@@ -213,6 +215,7 @@ impl SettingsBody {
     ) -> Self {
         Self {
             rpc_url: v.rpc_url.clone(),
+            rpc_fallback_urls: v.rpc_fallback_urls.clone(),
             feed_url: v.feed_url.clone(),
             buy: SpreadBody::from(&v.buy),
             sell: SpreadBody::from(&v.sell),
@@ -367,6 +370,10 @@ pub struct SettingsUpdate {
     pub debt: Option<String>,
     #[serde(default)]
     pub rpc_url: Option<String>,
+    /// The whole list, replacing what's there. Blank rows are dropped; an
+    /// empty list removes every fallback.
+    #[serde(default)]
+    pub rpc_fallback_urls: Option<Vec<String>>,
     #[serde(default)]
     pub feed_url: Option<String>,
     #[serde(default)]
@@ -430,6 +437,9 @@ impl SettingsUpdate {
         }
         if let Some(v) = &self.rpc_url {
             patch.rpc_url = v.trim().to_string();
+        }
+        if let Some(v) = &self.rpc_fallback_urls {
+            patch.rpc_fallback_urls = Some(v.clone());
         }
         if let Some(v) = &self.feed_url {
             patch.feed_url = v.trim().to_string();
@@ -3027,6 +3037,29 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         // And nothing was restarted on a refused save.
         assert!(h.docker.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_rpcs_are_saved_and_shown_back() {
+        let h = harness("settings-rpc-fallbacks");
+        seed(&h, "bot-a");
+        let (status, body) = h.get("/api/bots/bot-a/settings").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(Harness::parse(&body)["rpcFallbackUrls"], json!([]));
+
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "rpcFallbackUrls": ["https://backup.example/key", ""] }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            Harness::parse(&body)["settings"]["rpcFallbackUrls"],
+            json!(["https://backup.example/key"])
+        );
+        let toml = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+        assert!(toml.contains(r#"rpc_fallback_urls = ["https://backup.example/key"]"#));
     }
 
     #[tokio::test]

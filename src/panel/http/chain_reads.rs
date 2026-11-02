@@ -34,7 +34,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, Bytes, U256};
 
 use crate::chain::multicall::{encode_get_eth_balance, Batcher, Call, CANONICAL_MULTICALL3};
-use crate::chain::rpc::Rpc;
+use crate::chain::rpc::{Rpc, RpcEndpoints};
 use crate::chain::snapshot::ChainReads;
 
 /// Each chain read gets this long. The shared RPC client allows fifteen
@@ -114,7 +114,7 @@ impl ChainConstants {
 /// that reach the chain are remembered. The caller vouches for the snapshot
 /// being this chain's and fresh enough.
 pub(super) async fn read_cached(
-    rpc_url: &str,
+    rpc: impl Into<RpcEndpoints>,
     chain_id: u64,
     constants: &ChainConstants,
     snapshot: Option<&ChainReads>,
@@ -135,7 +135,7 @@ pub(super) async fn read_cached(
         .filter(|(_, hit)| hit.is_none())
         .map(|(ask, _)| ask.clone())
         .collect();
-    let mut fresh = read_all(rpc_url, &misses).await.into_iter();
+    let mut fresh = read_all(rpc, &misses).await.into_iter();
     asks.iter()
         .zip(cached)
         .map(|(ask, hit)| match hit {
@@ -175,7 +175,9 @@ fn batched_call(read: &Read) -> Call {
     }
 }
 
-/// The message every read gets when the node ran out of time.
+/// The message every read gets when the node ran out of time. Names the
+/// primary: a fallback only gets a turn inside the budget once the primary
+/// has failed outright.
 pub(super) fn timed_out(rpc_url: &str) -> String {
     format!(
         "the RPC at {rpc_url} didn't answer within {} seconds",
@@ -185,8 +187,11 @@ pub(super) fn timed_out(rpc_url: &str) -> String {
 
 /// Every read, in order, one answer each. One request where the chain has
 /// Multicall3; one request per read where it doesn't.
-pub(super) async fn read_all(rpc_url: &str, asks: &[Ask]) -> Vec<Answer> {
-    let rpc = Rpc::new(rpc_url.to_string());
+pub(super) async fn read_all(rpc: impl Into<RpcEndpoints>, asks: &[Ask]) -> Vec<Answer> {
+    let endpoints = rpc.into();
+    let rpc_url = endpoints.primary().to_string();
+    let rpc_url = rpc_url.as_str();
+    let rpc = Rpc::new(endpoints);
     match asks {
         [] => Vec::new(),
         // Nothing to batch with: wrapping one call in `aggregate3` saves

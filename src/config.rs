@@ -7,6 +7,7 @@ use alloy_primitives::U256;
 use anyhow::Context;
 use serde::Deserialize;
 
+pub use crate::chain::rpc::MAX_RPC_FALLBACKS;
 use crate::pricing::lean::{LeanMode, LeanParams, DEFAULT_BASE_BPS, DEFAULT_WIDE_BPS};
 use crate::pricing::quote::Spread;
 
@@ -54,6 +55,11 @@ pub struct Config {
     pub modules: crate::modules::ModulesConfig,
     pub chain_id: u64,
     pub rpc_url: String,
+    /// Optional backup JSON-RPC endpoints, tried in order when `rpc_url`
+    /// can't be reached. At most [`MAX_RPC_FALLBACKS`]; each must serve
+    /// `chain_id` or the bot never uses it. See [`crate::chain::rpc::Rpc`].
+    #[serde(default)]
+    pub rpc_fallback_urls: Vec<String>,
     /// Textile indexer base URL (receives signed orders, serves the estimate).
     pub indexer_url: String,
     /// Canonical Permit2 for this chain.
@@ -590,6 +596,50 @@ fn assert_feed_url_with(raw: &str, field: &str, allow_cleartext: bool) -> anyhow
         }
         other => anyhow::bail!("{field} must be an http(s):// URL, got scheme {other:?}"),
     }
+}
+
+/// `rpc_fallback_urls`: at most [`MAX_RPC_FALLBACKS`] distinct http(s) URLs,
+/// none of them the primary. Held to the primary's rules, not the feed's:
+/// the primary has always been allowed a remote http:// node, and a fallback
+/// is the same kind of endpoint.
+///
+/// `field` names entry `idx` in errors: the TOML key for the loader, the row
+/// the operator sees for the panel.
+pub fn assert_rpc_fallbacks(
+    primary: &str,
+    fallbacks: &[String],
+    field: impl Fn(usize) -> String,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        fallbacks.len() <= MAX_RPC_FALLBACKS,
+        "{} fallback RPC endpoints are listed; a bot can use at most {MAX_RPC_FALLBACKS}",
+        fallbacks.len()
+    );
+    for (idx, raw) in fallbacks.iter().enumerate() {
+        let field = field(idx);
+        let url = raw.trim();
+        let parsed = url::Url::parse(url)
+            .with_context(|| format!("{field} must be a valid http(s) URL, got {raw:?}"))?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "{field} must be an http(s):// URL, got scheme {:?}",
+            parsed.scheme()
+        );
+        anyhow::ensure!(
+            parsed.host_str().is_some_and(|h| !h.is_empty()),
+            "{field} must include a host"
+        );
+        anyhow::ensure!(
+            url != primary.trim(),
+            "{field} is the same endpoint as the primary RPC URL, so it can't stand in when \
+             the primary is down"
+        );
+        anyhow::ensure!(
+            !fallbacks[..idx].iter().any(|earlier| earlier.trim() == url),
+            "{field} repeats an earlier fallback"
+        );
+    }
+    Ok(())
 }
 
 /// The closer's subgraph endpoint, held to the feed URL's rules.
@@ -1406,6 +1456,15 @@ impl Config {
 
     /// The gas ceilings every wallet this config builds signs under: the
     /// chain's built-in ones, with any `[gas]` keys applied.
+    /// `rpc_url` and its fallbacks, for every client that talks to the chain.
+    pub fn rpc_endpoints(&self) -> crate::chain::rpc::RpcEndpoints {
+        crate::chain::rpc::RpcEndpoints::with_fallbacks(
+            self.rpc_url.clone(),
+            self.rpc_fallback_urls.iter().cloned(),
+            self.chain_id,
+        )
+    }
+
     pub fn gas_caps(&self) -> crate::chain::gas_caps::GasCaps {
         let gas = self.gas.clone().unwrap_or_default();
         crate::chain::gas_caps::GasCaps::for_chain(self.chain_id)
@@ -1504,6 +1563,9 @@ impl Config {
             }
         }
         assert_feed_url(&self.feed.url, "[feed].url")?;
+        assert_rpc_fallbacks(&self.rpc_url, &self.rpc_fallback_urls, |idx| {
+            format!("rpc_fallback_urls[{idx}]")
+        })?;
         if let Some(gas) = &self.gas {
             assert_gas_ceiling(gas.max_fee_per_gas_gwei, "[gas].max_fee_per_gas_gwei")?;
             assert_gas_ceiling(gas.max_tx_fee, "[gas].max_tx_fee")?;
@@ -1966,6 +2028,37 @@ mod tests {
         let cfg = Config::from_toml(&toml).expect("a hot wallet signs transactions as before");
         assert!(cfg.book_enabled);
         assert!(cfg.pools[0].limit_taker_enabled());
+    }
+
+    #[test]
+    fn fallback_rpcs_load_in_order_and_bad_ones_are_refused() {
+        let with = |list: &str| {
+            Config::from_toml(&rfq_only_with_signer("").replace(
+                "rpc_url = \"http://x\"",
+                &format!("rpc_url = \"http://x\"\nrpc_fallback_urls = [{list}]"),
+            ))
+        };
+        let cfg = with(r#""https://a.example", "http://b.example""#).unwrap();
+        assert_eq!(
+            cfg.rpc_endpoints().urls(),
+            ["http://x", "https://a.example", "http://b.example"]
+        );
+        assert_eq!(
+            Config::from_toml(&rfq_only_with_signer(""))
+                .unwrap()
+                .rpc_endpoints()
+                .urls(),
+            ["http://x"]
+        );
+        let refused = |list: &str| with(list).unwrap_err().to_string();
+        assert!(refused(r#""http://x""#).contains("same endpoint as the primary"));
+        assert!(refused(r#""https://a.example", "https://a.example""#).contains("repeats"));
+        assert!(refused(r#""wss://a.example""#).contains("http(s)"));
+        assert!(refused(r#""not a url""#).contains("rpc_fallback_urls[0]"));
+        assert!(refused(
+            r#""https://a.example", "https://b.example", "https://c.example", "https://d.example""#
+        )
+        .contains("at most 3"));
     }
 
     /// A minimal RFQ-only config (no ladder, no taker, no closer) with whatever

@@ -145,6 +145,59 @@ instantaneous feed — it values a one-shot on-chain fill at execution time,
 where the current price is the right mark; the TWAP smooths standing quotes
 that rest in the book waiting to be picked off.
 
+### Fallback RPCs
+
+`rpc_url` is the node Stitch uses for everything. You can list up to three
+backups after it, in the order to try them:
+
+```toml
+rpc_url = "https://mainnet.base.org"
+rpc_fallback_urls = ["https://base-rpc.publicnode.com", "https://base.llamarpc.com"]
+```
+
+Or in Fleet: **Corridors → Endpoints → Add fallback RPC**. Saving restarts the
+bot, same as any other setting.
+
+A call moves to the next endpoint when the current one can't give an answer:
+the connection fails, it times out (15 seconds), or it answers with a non-2xx
+status or a body that isn't JSON. A JSON-RPC error (a revert, "insufficient
+funds", "nonce too low") is a real answer and is returned as is, never retried
+somewhere else. That includes the rate-limit errors some public endpoints send
+with a 200, so those don't fail over. Once a fallback answers, every client in
+the bot starts there, and the primary gets one call a minute until it answers
+again.
+
+Before a fallback serves its first call, Stitch asks it for `eth_chainId`. One
+that reports a different chain from `chain_id` is never used, and the bot logs
+an error naming its host. The primary isn't checked; it's the node the bot has
+always trusted.
+
+Broadcasts are stricter. If the primary refuses a signed transaction, that's
+final. If the primary's answer is lost (the connection drops after sending),
+the same signed bytes go to the next endpoint, and on down the list until one
+accepts them. They can only land once, so this is safe. But if none accepts
+them, the bot still treats the outcome as unknown: the first node may already have the transaction, so a
+"nonce too low" or "already known" proves nothing, and the nonce stays claimed
+until the chain says what happened.
+
+Before each send the bot asks every usable endpoint for its pending nonce
+(waiting up to 3 seconds on the others) and takes the highest. A transaction
+that went out through a fallback may not be in the primary's pool yet, and
+reading the lower count would sign a different transaction at the same nonce.
+
+If your primary is a private relay, a lost broadcast goes to the fallbacks
+and so to the public mempool. Leave fallbacks off on a bot where that
+matters.
+
+Logs and errors name endpoints by host only (`fallback 1 base.llamarpc.com`),
+since RPC URLs often carry an API key. The panel's own reads (balances on the
+bot page, the vault card) use the fallbacks too, inside their 6-second budget.
+A primary that hangs rather than refusing eats that budget before a fallback
+gets its turn, so those cards can still show a timeout while the bot itself
+has moved on. The same goes for the bot's own time-boxed reads (the vault
+checks before a redeem close or attestation) during the one call a minute
+that retries a hung primary.
+
 ### What Stitch Costs Your RPC
 
 Two loops read the chain on a timer, and both batch through
@@ -731,7 +784,8 @@ this should clear itself. If you still see it:
 - Check the pending transaction on the explorer. If it is still there, replace
   that nonce from your wallet with a higher gas price.
 - Point `rpc_url` at your own node or a paid provider. The free public endpoints
-  are fine for reads but give you no priority.
+  are fine for reads but give you no priority. Public endpoints work well as
+  `rpc_fallback_urls`, see [Fallback RPCs](#fallback-rpcs).
 
 ### Approve Fails With "in-flight transaction limit reached"
 

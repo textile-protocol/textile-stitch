@@ -175,17 +175,272 @@ fn parse_quantity(v: &Value) -> anyhow::Result<U256> {
     U256::from_str_radix(trimmed, 16).map_err(|e| anyhow::anyhow!("bad quantity {s}: {e}"))
 }
 
-/// Low-level JSON-RPC transport.
+/// Most fallback endpoints a bot may list after its primary `rpc_url`.
+pub const MAX_RPC_FALLBACKS: usize = 3;
+
+/// How long a client stays on a fallback before it offers the primary a call
+/// again. Short enough that a primary back from a blip takes over within a
+/// minute, long enough that a dead one costs at most one failed attempt a
+/// minute rather than one per call.
+const PRIMARY_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long the other endpoints get to report a pending nonce, once one
+/// endpoint has. See [`Rpc::transaction_count`].
+const NONCE_CROSSCHECK_BUDGET: Duration = Duration::from_secs(3);
+
+/// The JSON-RPC endpoints one bot talks to: the primary `rpc_url` first, then
+/// the operator's fallbacks in the order they listed them.
+///
+/// Fallbacks only exist together with the chain id they must serve. A client
+/// checks `eth_chainId` on a fallback before its first call there and skips
+/// one that answers for another network, so a mistyped fallback can never
+/// feed balances or prices from the wrong chain. The primary isn't checked:
+/// it is the endpoint the bot always ran against.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RpcEndpoints {
+    /// Never empty. Index 0 is the primary.
+    urls: Vec<String>,
+    /// `Some` whenever `urls` has fallbacks.
+    chain_id: Option<u64>,
+}
+
+impl RpcEndpoints {
+    /// A primary with fallbacks. Blank and repeated fallbacks are dropped, so
+    /// the list is the distinct endpoints in the order to try them.
+    pub fn with_fallbacks(
+        primary: impl Into<String>,
+        fallbacks: impl IntoIterator<Item = String>,
+        chain_id: u64,
+    ) -> Self {
+        let primary = primary.into();
+        let urls = fallbacks
+            .into_iter()
+            .map(|url| url.trim().to_string())
+            .fold(vec![primary], |mut urls, url| {
+                if !url.is_empty() && !urls.contains(&url) {
+                    urls.push(url);
+                }
+                urls
+            });
+        Self {
+            urls,
+            chain_id: Some(chain_id),
+        }
+    }
+
+    pub fn primary(&self) -> &str {
+        &self.urls[0]
+    }
+
+    pub fn urls(&self) -> &[String] {
+        &self.urls
+    }
+
+    fn has_fallbacks(&self) -> bool {
+        self.urls.len() > 1
+    }
+}
+
+impl From<String> for RpcEndpoints {
+    fn from(url: String) -> Self {
+        Self {
+            urls: vec![url],
+            chain_id: None,
+        }
+    }
+}
+
+impl From<&str> for RpcEndpoints {
+    fn from(url: &str) -> Self {
+        url.to_string().into()
+    }
+}
+
+impl From<&String> for RpcEndpoints {
+    fn from(url: &String) -> Self {
+        url.clone().into()
+    }
+}
+
+impl From<&RpcEndpoints> for RpcEndpoints {
+    fn from(endpoints: &RpcEndpoints) -> Self {
+        endpoints.clone()
+    }
+}
+
+/// An endpoint's host for logs. RPC URLs routinely carry an API key in the
+/// path or query, so neither is printed.
+fn endpoint_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "an unparseable URL".to_string())
+}
+
+/// Which endpoint calls go to first, and since when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Route {
+    active: usize,
+    since: std::time::Instant,
+}
+
+impl Route {
+    /// On a fallback long enough that the primary gets another try.
+    fn primary_due(self, now: std::time::Instant) -> bool {
+        self.active != 0 && now.duration_since(self.since) >= PRIMARY_RETRY_AFTER
+    }
+}
+
+/// Endpoint indices in the order one call tries them: the active endpoint (or
+/// the primary, once it's due another try), then every other in list order.
+fn attempt_order(len: usize, route: Route, now: std::time::Instant) -> Vec<usize> {
+    let first = if route.primary_due(now) {
+        0
+    } else {
+        route.active
+    };
+    std::iter::once(first)
+        .chain((0..len).filter(|&i| i != first))
+        .collect()
+}
+
+/// The route a call plans from, and the route it leaves behind. When the
+/// primary is due, the first call to plan takes the retry: it tries the
+/// primary first and restarts the wait, so calls planned meanwhile stay on
+/// the fallback instead of all queueing on a primary that may hang.
+fn claim_retry(route: Route, now: std::time::Instant) -> Route {
+    if route.primary_due(now) {
+        Route {
+            since: now,
+            ..route
+        }
+    } else {
+        route
+    }
+}
+
+/// The route after endpoint `served` answered a call planned from `route`.
+fn route_after(route: Route, served: usize, now: std::time::Instant) -> Route {
+    if served == route.active {
+        route
+    } else {
+        Route {
+            active: served,
+            since: now,
+        }
+    }
+}
+
+/// Failover state for one endpoint list, shared by every [`Rpc`] built from
+/// it in this process. Wallets are built per send, so state kept on one
+/// client would forget a dead primary on the next transaction.
+#[derive(Debug)]
+struct Failover {
+    route: std::sync::Mutex<Route>,
+    /// Per endpoint: `None` until its chain id is checked, then whether it
+    /// matched. The primary is always `Some(true)`.
+    chain_ok: std::sync::Mutex<Vec<Option<bool>>>,
+}
+
+impl Failover {
+    fn new(len: usize) -> Self {
+        Self {
+            route: std::sync::Mutex::new(Route {
+                active: 0,
+                since: std::time::Instant::now(),
+            }),
+            chain_ok: std::sync::Mutex::new(
+                std::iter::once(Some(true))
+                    .chain(std::iter::repeat_n(None, len - 1))
+                    .collect(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn route(&self) -> Route {
+        *self.route.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The order one call tries `len` endpoints in, and the route it was
+    /// planned from (to hand back to [`Self::served`]).
+    fn plan(&self, len: usize) -> (Route, Vec<usize>) {
+        let now = std::time::Instant::now();
+        let mut route = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        let order = attempt_order(len, *route, now);
+        *route = claim_retry(*route, now);
+        (*route, order)
+    }
+
+    fn served(&self, planned: Route, served: usize, endpoints: &RpcEndpoints) {
+        let now = std::time::Instant::now();
+        let mut route = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        // Another call may have moved the route while this one was in flight;
+        // the newer move wins.
+        if *route != planned {
+            return;
+        }
+        let next = route_after(planned, served, now);
+        if next.active != planned.active {
+            if served == 0 {
+                tracing::info!(
+                    endpoint = %endpoint_host(endpoints.primary()),
+                    "primary RPC is answering again; switched back to it"
+                );
+            } else {
+                tracing::warn!(
+                    endpoint = %endpoint_host(&endpoints.urls()[served]),
+                    fallback = served,
+                    "RPC failover: calls now go to fallback {served}"
+                );
+            }
+        }
+        *route = next;
+    }
+
+    fn chain_ok(&self, idx: usize) -> Option<bool> {
+        self.chain_ok.lock().unwrap_or_else(|e| e.into_inner())[idx]
+    }
+
+    fn set_chain_ok(&self, idx: usize, ok: bool) {
+        self.chain_ok.lock().unwrap_or_else(|e| e.into_inner())[idx] = Some(ok);
+    }
+}
+
+fn failover_for(endpoints: &RpcEndpoints) -> std::sync::Arc<Failover> {
+    type Registry = std::collections::HashMap<RpcEndpoints, std::sync::Arc<Failover>>;
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<Registry>> = std::sync::OnceLock::new();
+    REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(endpoints.clone())
+        .or_insert_with(|| std::sync::Arc::new(Failover::new(endpoints.urls().len())))
+        .clone()
+}
+
+/// Low-level JSON-RPC transport over one or more endpoints.
+///
+/// With fallbacks, a call that can't get an answer out of an endpoint (the
+/// connection fails, it times out, it answers a non-2xx status or a body that
+/// isn't JSON) moves on to the next. A JSON-RPC `error` is a real answer —
+/// a revert, a rejected transaction — and is returned as is: asking another
+/// node would only get the same answer, or worse, a different one.
 #[derive(Clone)]
 pub struct Rpc {
-    url: String,
+    endpoints: RpcEndpoints,
+    /// `None` for a single endpoint, which never fails over.
+    failover: Option<std::sync::Arc<Failover>>,
     client: reqwest::Client,
 }
 
 impl Rpc {
-    pub fn new(url: impl Into<String>) -> Self {
+    pub fn new(endpoints: impl Into<RpcEndpoints>) -> Self {
+        let endpoints = endpoints.into();
+        let failover = endpoints.has_fallbacks().then(|| failover_for(&endpoints));
         Self {
-            url: url.into(),
+            endpoints,
+            failover,
             client: http_client(),
         }
     }
@@ -195,15 +450,98 @@ impl Rpc {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
     }
 
-    async fn response(&self, method: &str, params: Value) -> reqwest::Result<Value> {
+    async fn post(&self, url: &str, body: &Value) -> reqwest::Result<Value> {
         self.client
-            .post(&self.url)
-            .json(&Self::request(method, params))
+            .post(url)
+            .json(body)
             .send()
             .await?
             .error_for_status()?
             .json()
             .await
+    }
+
+    /// Whether endpoint `idx` serves this bot's chain, asking it once.
+    /// `false` covers both a wrong chain (remembered) and no answer (asked
+    /// again next time).
+    async fn serves_chain(&self, failover: &Failover, idx: usize) -> bool {
+        if let Some(ok) = failover.chain_ok(idx) {
+            return ok;
+        }
+        let url = &self.endpoints.urls()[idx];
+        let answer = self
+            .post(url, &Self::request("eth_chainId", json!([])))
+            .await
+            .ok()
+            .and_then(|resp| resp.get("result").cloned())
+            .and_then(|v| parse_quantity(&v).ok());
+        let Some(reported) = answer else {
+            return false;
+        };
+        let ok = self
+            .endpoints
+            .chain_id
+            .is_some_and(|want| reported == U256::from(want));
+        if !ok {
+            tracing::error!(
+                endpoint = %endpoint_host(url),
+                fallback = idx,
+                reported = %reported,
+                expected = ?self.endpoints.chain_id,
+                "fallback RPC serves a different chain; it will never be used"
+            );
+        }
+        failover.set_chain_ok(idx, ok);
+        ok
+    }
+
+    async fn response(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let body = Self::request(method, params);
+        let Some(failover) = &self.failover else {
+            return Ok(self.post(self.endpoints.primary(), &body).await?);
+        };
+        let (planned, order) = failover.plan(self.endpoints.urls().len());
+        let mut failures = Vec::new();
+        for idx in order {
+            if !self.serves_chain(failover, idx).await {
+                failures.push(format!("{}: not usable for this chain", self.label(idx)));
+                continue;
+            }
+            match self.post(&self.endpoints.urls()[idx], &body).await {
+                Ok(resp) => {
+                    failover.served(planned, idx, &self.endpoints);
+                    return Ok(resp);
+                }
+                Err(err) => failures.push(format!(
+                    "{}: {:#}",
+                    self.label(idx),
+                    self.transport_error(err)
+                )),
+            }
+        }
+        anyhow::bail!(
+            "rpc {method}: no RPC endpoint answered ({})",
+            failures.join("; ")
+        )
+    }
+
+    /// A transport failure as an error. With fallbacks the endpoint is named
+    /// by [`Self::label`], so reqwest's copy of the full URL, often with an
+    /// API key in it, is dropped. A single endpoint keeps it, as it always has.
+    fn transport_error(&self, err: reqwest::Error) -> anyhow::Error {
+        match self.failover {
+            Some(_) => err.without_url().into(),
+            None => err.into(),
+        }
+    }
+
+    /// How logs and errors name endpoint `idx`, without its path or key.
+    fn label(&self, idx: usize) -> String {
+        let host = endpoint_host(&self.endpoints.urls()[idx]);
+        match idx {
+            0 => format!("primary {host}"),
+            n => format!("fallback {n} {host}"),
+        }
     }
 
     async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -221,14 +559,45 @@ impl Rpc {
     }
 
     /// Pending nonce for `addr` (counts queued txs, so approve→fill chains work).
+    ///
+    /// With fallbacks, the highest count any usable endpoint reports. A
+    /// transaction broadcast through one endpoint may not be in another's
+    /// pool yet, and reading the lower count there would sign a second,
+    /// different transaction at a nonce already in flight. Erring high can
+    /// only queue the next send behind one that is pending somewhere. The
+    /// other endpoints get [`NONCE_CROSSCHECK_BUDGET`] to answer; one that
+    /// doesn't is left out.
     pub async fn transaction_count(&self, addr: Address) -> anyhow::Result<u64> {
-        let r = self
-            .call(
-                "eth_getTransactionCount",
-                json!([addr.to_string(), "pending"]),
-            )
-            .await?;
-        Ok(parse_quantity(&r)?.to::<u64>())
+        let params = json!([addr.to_string(), "pending"]);
+        let first = parse_quantity(&self.call("eth_getTransactionCount", params.clone()).await?)?
+            .to::<u64>();
+        let Some(failover) = &self.failover else {
+            return Ok(first);
+        };
+        let body = Self::request("eth_getTransactionCount", params);
+        let asks = (0..self.endpoints.urls().len()).map(|idx| {
+            let body = &body;
+            async move {
+                let ask = async {
+                    if !self.serves_chain(failover, idx).await {
+                        return None;
+                    }
+                    let resp = self.post(&self.endpoints.urls()[idx], body).await.ok()?;
+                    parse_quantity(resp.get("result")?)
+                        .ok()
+                        .map(|n| n.to::<u64>())
+                };
+                tokio::time::timeout(NONCE_CROSSCHECK_BUDGET, ask)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        });
+        Ok(futures_util::future::join_all(asks)
+            .await
+            .into_iter()
+            .flatten()
+            .fold(first, u64::max))
     }
 
     pub async fn gas_price(&self) -> anyhow::Result<U256> {
@@ -313,12 +682,60 @@ impl Rpc {
 
     /// Submit a signed transaction without erasing whether the node gave a
     /// definitive JSON-RPC rejection or the transport lost the outcome.
+    ///
+    /// With fallbacks, a lost outcome moves on to the next endpoint with the
+    /// same signed bytes, which can only land once, and keeps going until one
+    /// accepts them or every endpoint has had them. A rejection is final only
+    /// from the first endpoint that got the bytes: after a lost outcome an
+    /// endpoint that refuses them may be refusing a transaction that already
+    /// reached the pool ("already known", "nonce too low"), so the outcome
+    /// stays unknown and the caller keeps its nonce claim.
     async fn send_raw_tracked(&self, raw: &Bytes) -> Result<B256, SendRawFailure> {
+        let body = Self::request("eth_sendRawTransaction", json!([hex::encode_prefixed(raw)]));
+        let Some(failover) = &self.failover else {
+            return self.send_raw_to(self.endpoints.primary(), &body).await;
+        };
+        let (planned, order) = failover.plan(self.endpoints.urls().len());
+        let mut lost: Vec<String> = Vec::new();
+        for idx in order {
+            if !self.serves_chain(failover, idx).await {
+                continue;
+            }
+            match self.send_raw_to(&self.endpoints.urls()[idx], &body).await {
+                Ok(hash) => {
+                    failover.served(planned, idx, &self.endpoints);
+                    return Ok(hash);
+                }
+                Err(SendRawFailure::Rejected(err)) if lost.is_empty() => {
+                    return Err(SendRawFailure::Rejected(err));
+                }
+                // After a lost outcome no single answer is final, so every
+                // remaining endpoint still gets the bytes: one may accept
+                // them where this one refused (a rate limit, a lagging pool).
+                Err(SendRawFailure::Rejected(err) | SendRawFailure::Unknown(err)) => {
+                    lost.push(format!("{}: {err:#}", self.label(idx)));
+                }
+            }
+        }
+        // The primary is always tried, so `lost` is empty only if nothing
+        // was ever sent, which is safe to retry.
+        Err(if lost.is_empty() {
+            SendRawFailure::Rejected(anyhow::anyhow!("no RPC endpoint was usable"))
+        } else {
+            SendRawFailure::Unknown(anyhow::anyhow!(
+                "broadcast outcome unknown: {}",
+                lost.join("; ")
+            ))
+        })
+    }
+
+    /// One `eth_sendRawTransaction` to one endpoint.
+    async fn send_raw_to(&self, url: &str, body: &Value) -> Result<B256, SendRawFailure> {
         let method = "eth_sendRawTransaction";
         let response = self
-            .response(method, json!([hex::encode_prefixed(raw)]))
+            .post(url, body)
             .await
-            .map_err(|err| SendRawFailure::Unknown(err.into()))?;
+            .map_err(|err| SendRawFailure::Unknown(self.transport_error(err)))?;
         if let Some(err) = response.get("error") {
             return Err(SendRawFailure::Rejected(anyhow::anyhow!(
                 "rpc {method} error: {err}"
@@ -448,10 +865,10 @@ pub struct Wallet {
 impl Wallet {
     /// A wallet with `chain_id`'s built-in gas ceilings. Use
     /// [`Self::with_gas_caps`] to apply the operator's `[gas]` overrides.
-    pub fn new(rpc_url: impl Into<String>, signer: DynSigner, chain_id: u64) -> Self {
+    pub fn new(rpc: impl Into<RpcEndpoints>, signer: DynSigner, chain_id: u64) -> Self {
         let address = signer.address();
         Self {
-            rpc: Rpc::new(rpc_url),
+            rpc: Rpc::new(rpc),
             signer,
             address,
             chain_id,
@@ -988,6 +1405,275 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A node that answers `eth_chainId` with `chain_id` and every other
+    /// method with `status` and `body`, counting only the other methods.
+    async fn chain_node(
+        chain_id: u64,
+        status: u16,
+        body: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let (status, body) = if req.contains("eth_chainId") {
+                        (
+                            200,
+                            format!(r#"{{"jsonrpc":"2.0","id":1,"result":"0x{chain_id:x}"}}"#),
+                        )
+                    } else {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (status, body.to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// An address nothing listens on: every call fails to connect.
+    async fn dead_node() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        url
+    }
+
+    fn hits(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    const BALANCE_ONE: &str = r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#;
+    const OWNER: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+
+    #[test]
+    fn endpoints_keep_order_and_drop_blank_and_repeated_fallbacks() {
+        let e = RpcEndpoints::with_fallbacks(
+            "https://a.example",
+            [
+                " https://b.example ",
+                "",
+                "https://a.example",
+                "https://b.example",
+                "https://c.example",
+            ]
+            .map(String::from),
+            1,
+        );
+        assert_eq!(
+            e.urls(),
+            [
+                "https://a.example",
+                "https://b.example",
+                "https://c.example"
+            ]
+        );
+        assert_eq!(e.primary(), "https://a.example");
+        assert!(!RpcEndpoints::from("https://a.example").has_fallbacks());
+    }
+
+    #[test]
+    fn calls_stay_on_a_fallback_until_the_primary_is_due_a_retry() {
+        let t0 = std::time::Instant::now();
+        let on_primary = Route {
+            active: 0,
+            since: t0,
+        };
+        assert_eq!(attempt_order(3, on_primary, t0), [0, 1, 2]);
+
+        let on_second = Route {
+            active: 2,
+            since: t0,
+        };
+        assert_eq!(attempt_order(3, on_second, t0), [2, 0, 1]);
+        let later = t0 + PRIMARY_RETRY_AFTER;
+        assert_eq!(attempt_order(3, on_second, later), [0, 1, 2]);
+
+        // The first call once the primary is due takes the retry; calls
+        // planned after it stay on the fallback for another window.
+        let claimed = claim_retry(on_second, later);
+        assert_eq!(
+            claimed,
+            Route {
+                active: 2,
+                since: later
+            }
+        );
+        assert_eq!(attempt_order(3, claimed, later), [2, 0, 1]);
+        assert_eq!(claim_retry(on_second, t0), on_second);
+        // Served where it planned to go: unchanged.
+        assert_eq!(route_after(claimed, 2, later), claimed);
+        // The primary answered: back on it.
+        assert_eq!(route_after(claimed, 0, later).active, 0);
+        // The primary stopped answering: onto the first fallback that did.
+        assert_eq!(route_after(on_primary, 1, t0).active, 1);
+    }
+
+    #[tokio::test]
+    async fn a_dead_primary_fails_over_and_later_calls_skip_it() {
+        let primary = dead_node().await;
+        let (fallback, served) = chain_node(8453, 200, BALANCE_ONE).await;
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(primary, [fallback], 8453));
+        assert_eq!(rpc.get_balance(OWNER).await.unwrap(), U256::from(1u8));
+        assert_eq!(rpc.failover.as_ref().unwrap().route().active, 1);
+        assert_eq!(rpc.get_balance(OWNER).await.unwrap(), U256::from(1u8));
+        assert_eq!(hits(&served), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failing_status_fails_over_and_wallets_share_the_route() {
+        let (primary, primary_hits) = chain_node(8453, 503, "busy").await;
+        let (fallback, _) = chain_node(8453, 200, BALANCE_ONE).await;
+        let endpoints = RpcEndpoints::with_fallbacks(primary, [fallback], 8453);
+        Rpc::new(&endpoints).get_balance(OWNER).await.unwrap();
+        // A client built afresh, as every send builds its wallet, starts on
+        // the fallback instead of paying for the dead primary again.
+        Rpc::new(&endpoints).get_balance(OWNER).await.unwrap();
+        assert_eq!(hits(&primary_hits), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_on_another_chain_is_never_used() {
+        let primary = dead_node().await;
+        let (wrong, wrong_hits) = chain_node(1, 200, BALANCE_ONE).await;
+        let (right, _) = chain_node(8453, 200, BALANCE_ONE).await;
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(primary, [wrong, right], 8453));
+        assert_eq!(rpc.get_balance(OWNER).await.unwrap(), U256::from(1u8));
+        assert_eq!(hits(&wrong_hits), 0);
+        assert_eq!(rpc.failover.as_ref().unwrap().route().active, 2);
+    }
+
+    #[tokio::test]
+    async fn a_jsonrpc_error_is_an_answer_not_a_reason_to_fail_over() {
+        let (primary, _) = chain_node(
+            8453,
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}}"#,
+        )
+        .await;
+        let (fallback, fallback_hits) = chain_node(8453, 200, BALANCE_ONE).await;
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(primary, [fallback], 8453));
+        let err = rpc.get_balance(OWNER).await.unwrap_err();
+        assert!(err.to_string().contains("execution reverted"), "{err}");
+        assert_eq!(hits(&fallback_hits), 0);
+    }
+
+    #[tokio::test]
+    async fn every_endpoint_down_names_each_without_its_path() {
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(
+            format!("{}/v2/secret-key", dead_node().await),
+            [dead_node().await],
+            8453,
+        ));
+        let err = rpc.get_balance(OWNER).await.unwrap_err().to_string();
+        assert!(err.contains("primary 127.0.0.1"), "{err}");
+        assert!(err.contains("fallback 1 127.0.0.1"), "{err}");
+        assert!(!err.contains("secret-key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_pending_nonce_is_the_highest_any_endpoint_reports() {
+        // The fallback carried the last broadcast while the primary was
+        // away; the primary's pool never saw it.
+        let (primary, _) =
+            chain_node(8453, 200, r#"{"jsonrpc":"2.0","id":1,"result":"0x5"}"#).await;
+        let (fallback, _) =
+            chain_node(8453, 200, r#"{"jsonrpc":"2.0","id":1,"result":"0x6"}"#).await;
+        let (wrong_chain, _) =
+            chain_node(1, 200, r#"{"jsonrpc":"2.0","id":1,"result":"0x99"}"#).await;
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(
+            primary,
+            [wrong_chain, fallback, dead_node().await],
+            8453,
+        ));
+        assert_eq!(rpc.transaction_count(OWNER).await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_primary_rejection_is_final_and_never_rebroadcast() {
+        let (primary, _) = chain_node(
+            8453,
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+        )
+        .await;
+        let (fallback, fallback_hits) = chain_node(8453, 200, BALANCE_ONE).await;
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(primary, [fallback], 8453));
+        let failure = rpc.send_raw_tracked(&Bytes::new()).await.unwrap_err();
+        assert!(matches!(failure, SendRawFailure::Rejected(_)));
+        assert_eq!(hits(&fallback_hits), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_after_a_lost_broadcast_stays_unknown() {
+        // The primary may have taken the bytes before the connection died, so
+        // the fallback's "already known" can't prove the nonce is free.
+        let primary = dead_node().await;
+        let (fallback, _) = chain_node(
+            8453,
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"already known"}}"#,
+        )
+        .await;
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(primary, [fallback], 8453));
+        let failure = rpc.send_raw_tracked(&Bytes::new()).await.unwrap_err();
+        assert!(matches!(failure, SendRawFailure::Unknown(_)));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_a_lost_broadcast_still_tries_the_next_fallback() {
+        let primary = dead_node().await;
+        let (limited, _) = chain_node(
+            8453,
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"rate limited"}}"#,
+        )
+        .await;
+        let (healthy, healthy_hits) = chain_node(
+            8453,
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#,
+        )
+        .await;
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(
+            primary,
+            [limited, healthy],
+            8453,
+        ));
+        assert!(rpc.send_raw_tracked(&Bytes::new()).await.is_ok());
+        assert_eq!(hits(&healthy_hits), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lost_broadcast_lands_through_the_fallback() {
+        let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let primary = dead_node().await;
+        let (fallback, _) = chain_node(
+            8453,
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#,
+        )
+        .await;
+        let rpc = Rpc::new(RpcEndpoints::with_fallbacks(primary, [fallback], 8453));
+        let landed = rpc.send_raw_tracked(&Bytes::new()).await.unwrap();
+        assert_eq!(landed, hash.parse::<B256>().unwrap());
     }
 
     #[tokio::test]

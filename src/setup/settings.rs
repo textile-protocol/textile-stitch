@@ -21,8 +21,8 @@ use anyhow::{bail, Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::config::{
-    assert_feed_url, assert_rfq_stream_url, parse_liquidity_amount, parse_min_slice_debt,
-    requested_rfq_staleness_secs, Config,
+    assert_feed_url, assert_rfq_stream_url, assert_rpc_fallbacks, parse_liquidity_amount,
+    parse_min_slice_debt, requested_rfq_staleness_secs, Config,
 };
 
 /// How a side's spread is expressed in the config. Editing preserves whichever
@@ -93,6 +93,8 @@ pub struct PoolSummary {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsView {
     pub rpc_url: String,
+    /// Backup RPC endpoints, in the order the bot tries them. Empty for none.
+    pub rpc_fallback_urls: Vec<String>,
     pub feed_url: String,
     pub buy: SpreadEdit,
     pub sell: SpreadEdit,
@@ -164,6 +166,8 @@ impl SettingsView {
         SettingsPatch {
             pool_index: self.pool_index,
             rpc_url: self.rpc_url.clone(),
+            // Opt-in like RFQ: a save that didn't touch them leaves them alone.
+            rpc_fallback_urls: None,
             feed_url: self.feed_url.clone(),
             buy: self.buy.clone(),
             sell: self.sell.clone(),
@@ -204,6 +208,9 @@ pub struct SettingsPatch {
     /// Which pool the pool-scoped fields apply to. Defaults to the first.
     pub pool_index: usize,
     pub rpc_url: String,
+    /// `None` leaves `rpc_fallback_urls` alone. Blank entries are dropped and
+    /// an empty list removes the key.
+    pub rpc_fallback_urls: Option<Vec<String>>,
     pub feed_url: String,
     pub buy: SpreadEdit,
     pub sell: SpreadEdit,
@@ -252,6 +259,7 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
     })?;
     Ok(SettingsView {
         rpc_url: cfg.rpc_url.clone(),
+        rpc_fallback_urls: cfg.rpc_fallback_urls.clone(),
         // The bot prefers a pool's feed_url override over [feed].url (see
         // main.rs), so surface the endpoint that's actually effective.
         feed_url: pool
@@ -463,6 +471,9 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
         "rpc_url",
         Value::from(patch.rpc_url.trim()),
     );
+    if let Some(fallbacks) = &patch.rpc_fallback_urls {
+        apply_rpc_fallbacks(&mut doc, patch.rpc_url.trim(), fallbacks)?;
+    }
 
     if let Some(secs) = patch.tick_interval_secs {
         anyhow::ensure!(secs > 0, "the tick interval must be at least 1 second");
@@ -1394,6 +1405,28 @@ fn apply_optional_f64(pool: &mut Table, key: &str, raw: &str, label: &str) -> Re
     Ok(())
 }
 
+/// Write `rpc_fallback_urls`, dropping blank rows so a form can send its
+/// empty inputs as they are. No fallbacks removes the key rather than
+/// leaving `rpc_fallback_urls = []` behind.
+fn apply_rpc_fallbacks(doc: &mut DocumentMut, primary: &str, fallbacks: &[String]) -> Result<()> {
+    let urls: Vec<String> = fallbacks
+        .iter()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+    assert_rpc_fallbacks(primary, &urls, |idx| format!("Fallback RPC {}", idx + 1))?;
+    if urls.is_empty() {
+        doc.as_table_mut().remove("rpc_fallback_urls");
+    } else {
+        set_value(
+            doc.as_table_mut(),
+            "rpc_fallback_urls",
+            Value::Array(urls.into_iter().collect()),
+        );
+    }
+    Ok(())
+}
+
 /// Set a key's value while preserving its existing decor (the surrounding
 /// whitespace and any inline `# comment`). Inserts a fresh key when it's absent.
 fn set_value(table: &mut Table, key: &str, new: Value) {
@@ -1706,6 +1739,54 @@ mod tests {
         let out = apply_settings(&src, &patch_from(&view)).unwrap();
         assert!(out.contains("buy_offset_abs = 0.0000025"));
         assert!(!out.contains("buy_offset_bps"));
+    }
+
+    #[test]
+    fn fallback_rpcs_are_written_read_back_and_removed() {
+        let view = read_settings(TEMPLATE).unwrap();
+        assert!(view.rpc_fallback_urls.is_empty());
+        let mut patch = patch_from(&view);
+        patch.rpc_fallback_urls = Some(vec![
+            " https://one.example ".into(),
+            "".into(),
+            "https://two.example/key".into(),
+        ]);
+        let out = apply_settings(TEMPLATE, &patch).unwrap();
+        let back = read_settings(&out).unwrap();
+        assert_eq!(
+            back.rpc_fallback_urls,
+            ["https://one.example", "https://two.example/key"]
+        );
+        // A save that doesn't mention fallbacks leaves them alone.
+        let untouched = apply_settings(&out, &patch_from(&back)).unwrap();
+        assert_eq!(
+            read_settings(&untouched).unwrap().rpc_fallback_urls.len(),
+            2
+        );
+        // Clearing every row removes the key instead of leaving `= []`.
+        let mut clear = patch_from(&back);
+        clear.rpc_fallback_urls = Some(vec!["".into()]);
+        let cleared = apply_settings(&out, &clear).unwrap();
+        assert!(!cleared.contains("rpc_fallback_urls"));
+    }
+
+    #[test]
+    fn a_bad_fallback_rpc_is_named_by_its_row() {
+        let view = read_settings(TEMPLATE).unwrap();
+        let attempt = |urls: Vec<String>| {
+            let mut patch = patch_from(&view);
+            patch.rpc_fallback_urls = Some(urls);
+            apply_settings(TEMPLATE, &patch).unwrap_err().to_string()
+        };
+        let err = attempt(vec![
+            "https://ok.example".into(),
+            "ws://node.example".into(),
+        ]);
+        assert!(err.contains("Fallback RPC 2"), "{err}");
+        let err = attempt(vec![view.rpc_url.clone()]);
+        assert!(err.contains("same endpoint as the primary"), "{err}");
+        let err = attempt((0..4).map(|i| format!("https://rpc{i}.example")).collect());
+        assert!(err.contains("at most 3"), "{err}");
     }
 
     #[test]

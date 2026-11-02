@@ -41,7 +41,7 @@ use super::enroll::{
 use super::funding::{budgeted, decode_string_return, format_units, symbol_ask};
 use super::settings::{config_path, network_name, read_toml, save_and_restart};
 use super::{ApiError, AppState};
-use crate::chain::rpc::Rpc;
+use crate::chain::rpc::{Rpc, RpcEndpoints};
 use crate::config::{rfq_default_flag_in_dir, Config};
 use crate::panel::inventory::Bot;
 use crate::protocol::vault::{
@@ -766,8 +766,9 @@ fn as_bool(word: U256) -> Option<bool> {
 }
 
 /// Every chain read at once: the code check beside one batch of views.
-async fn read_chain(rpc_url: &str, vault: Address) -> ChainFacts {
-    let rpc = Rpc::new(rpc_url.to_string());
+async fn read_chain(endpoints: &RpcEndpoints, vault: Address) -> ChainFacts {
+    let rpc_url = endpoints.primary();
+    let rpc = Rpc::new(endpoints);
     let asks: Vec<Ask> = [
         (encode_settlement_asset(), "settlementAsset()"),
         (encode_corridor_asset(), "corridorAsset()"),
@@ -784,7 +785,7 @@ async fn read_chain(rpc_url: &str, vault: Address) -> ChainFacts {
     .collect();
     let (code, answers) = tokio::join!(
         budgeted(rpc_url, rpc.get_code(vault)),
-        read_all(rpc_url, &asks),
+        read_all(endpoints, &asks),
     );
     let views: Vec<Option<U256>> = asks
         .iter()
@@ -822,7 +823,7 @@ async fn read_symbols(cfg: &Config, chain: &ChainFacts) -> HashMap<Address, Stri
         .filter(|token| !known.contains_key(&format!("{token:#x}")))
         .collect();
     let asks: Vec<Ask> = unknown.iter().map(|token| symbol_ask(*token)).collect();
-    let answers = read_all(&cfg.rpc_url, &asks).await;
+    let answers = read_all(cfg.rpc_endpoints(), &asks).await;
     let read = unknown.iter().zip(&answers).filter_map(|(token, answer)| {
         let symbol = decode_string_return(answer.as_ref().ok()?)?;
         Some((*token, symbol))
@@ -859,7 +860,7 @@ async fn assess(cfg: &Config, signer: Address, raw: &str, venue_url: Option<&str
             }
         }
     };
-    let chain = read_chain(&cfg.rpc_url, vault).await;
+    let chain = read_chain(&cfg.rpc_endpoints(), vault).await;
     let symbols = read_symbols(cfg, &chain).await;
     let mut facts = Facts {
         chain,

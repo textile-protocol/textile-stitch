@@ -119,7 +119,7 @@ pub async fn approve_via_custody(
     let cfg = read_config(&bot)?;
     let plan = plan_for(&cfg, &name, token)?;
 
-    let rpc = Rpc::new(cfg.rpc_url.clone());
+    let rpc = Rpc::new(cfg.rpc_endpoints());
     let allowance = read_allowance(&rpc, token, plan.owner, plan.permit2)
         .await
         .map_err(|e| ApiError::conflict(format!("couldn't read the current allowance: {e:#}")))?;

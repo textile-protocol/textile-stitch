@@ -75,7 +75,7 @@ async fn liquidity_refusal(state: &AppState, cfg: &Config) -> Option<String> {
     let what = format!("yieldAdapter() on {vault}");
     let ask = Ask::call(vault, crate::protocol::vault::encode_yield_adapter(), &what).constant();
     let answers = read_cached(
-        &cfg.rpc_url,
+        cfg.rpc_endpoints(),
         cfg.chain_id,
         &state.chain_constants,
         None,

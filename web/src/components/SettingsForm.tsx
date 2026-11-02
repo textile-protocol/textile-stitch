@@ -15,6 +15,13 @@ import {
   Toggle,
 } from './ui'
 import { andList, shortAddress } from '../format'
+import {
+  MAX_RPC_FALLBACKS,
+  addFallback,
+  canAddFallback,
+  removeFallback,
+  setFallback,
+} from '../rpcFallbacks'
 import { botPath } from '../botRoutes'
 import type {
   Bot,
@@ -266,6 +273,11 @@ export default function SettingsForm({
               disabled={!loaded.editable}
             />
           </Field>
+          <RpcFallbackFields
+            urls={draft.rpcFallbackUrls}
+            disabled={!loaded.editable}
+            onChange={(urls) => set('rpcFallbackUrls', urls)}
+          />
           <Field label="Price feed URL">
             <Input
               value={draft.feedUrl}
@@ -1517,6 +1529,64 @@ function RfqCard({
 }
 
 /**
+ * Optional backup RPCs under the primary. The bot tries them in this order
+ * when the one before can't be reached, and only uses one that serves the
+ * bot's chain. Blank rows are dropped on save.
+ */
+function RpcFallbackFields({
+  urls,
+  disabled,
+  onChange,
+}: {
+  urls: string[]
+  disabled: boolean
+  onChange: (urls: string[]) => void
+}) {
+  return (
+    <div>
+      <span className="mb-1 block text-sm font-bold">Fallback RPC URLs</span>
+      {urls.length > 0 && (
+        <ol className="mb-2 space-y-2">
+          {urls.map((url, i) => (
+            <li key={i} className="flex items-center gap-2">
+              <span className="w-5 shrink-0 text-right text-xs text-faint">{i + 1}.</span>
+              <Input
+                aria-label={`Fallback RPC ${i + 1}`}
+                placeholder="https://"
+                value={url}
+                disabled={disabled}
+                onChange={(e) => onChange(setFallback(urls, i, e.target.value))}
+              />
+              <Button
+                variant="ghost"
+                disabled={disabled}
+                aria-label={`Remove fallback RPC ${i + 1}`}
+                onClick={() => onChange(removeFallback(urls, i))}
+              >
+                Remove
+              </Button>
+            </li>
+          ))}
+        </ol>
+      )}
+      {canAddFallback(urls) && (
+        <Button
+          variant="secondary"
+          disabled={disabled}
+          onClick={() => onChange(addFallback(urls))}
+        >
+          Add fallback RPC
+        </Button>
+      )}
+      <span className="mt-1 block text-xs text-faint">
+        Optional, up to {MAX_RPC_FALLBACKS}. Used in order when the RPC above stops answering.
+        Each must be on this bot's chain.
+      </span>
+    </div>
+  )
+}
+
+/**
  * Only the fields that changed, plus the pool index the API needs. Shared with
  * the Textile overrides under Tools, which edit the `rfq*` keys the same way.
  */
@@ -1535,6 +1605,7 @@ export function changedFields(
   }
   const keys: (keyof Settings)[] = [
     'rpcUrl',
+    'rpcFallbackUrls',
     'feedUrl',
     'buy',
     'sell',

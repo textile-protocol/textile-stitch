@@ -62,7 +62,7 @@ use crate::chain::gas_reserve::GasReserve;
 use crate::chain::multicall::{
     decode_uint, encode_get_eth_balance, Batcher, Call, CANONICAL_MULTICALL3,
 };
-use crate::chain::rpc::{transaction_may_still_land, Rpc, Wallet};
+use crate::chain::rpc::{transaction_may_still_land, Rpc, RpcEndpoints, Wallet};
 use crate::chain::snapshot::{record, Publisher, RecordedRead};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
@@ -121,7 +121,7 @@ pub struct RfqRuntime {
     permit2: Address,
     reactor: Address,
     validation_contract: Address,
-    rpc_url: String,
+    rpc: RpcEndpoints,
     /// `[gas]` ceilings for every wallet the responder builds.
     gas_caps: GasCaps,
     /// Gas held out of the wallet's funded figure when a quoted token is the
@@ -449,7 +449,7 @@ fn build_runtime(
             .validation_contract
             .parse()
             .context("invalid [rfq].validation_contract")?,
-        rpc_url: cfg.rpc_url.clone(),
+        rpc: cfg.rpc_endpoints(),
         gas_caps: cfg.gas_caps(),
         gas_reserve: cfg.gas_reserve(),
         books,
@@ -795,7 +795,7 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
     let tokens = wallet_tokens(&rt.books, rt.unwind.is_some());
     if !tokens.is_empty() || rt.vault.is_some() {
         let wallet =
-            Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id).with_gas_caps(rt.gas_caps);
+            Wallet::new(&rt.rpc, rt.signer.clone(), rt.chain_id).with_gas_caps(rt.gas_caps);
         tokio::spawn(inventory_loop(
             wallet,
             rt.permit2,
@@ -824,7 +824,7 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
         // with the schedule, or modules, since turned off.
         if modules.config.liquidity.enabled || modules.saved_pending_floor().is_some() {
             let wallet =
-                Wallet::new(&rt.rpc_url, rt.signer.clone(), rt.chain_id).with_gas_caps(rt.gas_caps);
+                Wallet::new(&rt.rpc, rt.signer.clone(), rt.chain_id).with_gas_caps(rt.gas_caps);
             tokio::spawn(liquidity::liquidity_loop(
                 wallet,
                 vault,
@@ -1343,8 +1343,8 @@ async fn session_loop_inner(
         trading_epoch: rt.trading_epoch.clone(),
         vault_policy: rt.vault_policy.clone(),
         nonce_salt: rand::random(),
-        rpc: Rpc::new(&rt.rpc_url),
-        rpc_url: rt.rpc_url.clone(),
+        rpc: Rpc::new(&rt.rpc),
+        rpc_endpoints: rt.rpc.clone(),
         gas_caps: rt.gas_caps,
         closing: rt.closing.clone(),
         modules: rt.modules.clone(),
@@ -1562,7 +1562,7 @@ struct Engine {
     /// Kept alongside `rpc` so a redeem close can build its own [`Wallet`]:
     /// the broadcast outlives the frame that asked for it, and nothing that
     /// sends a transaction may borrow the session loop.
-    rpc_url: String,
+    rpc_endpoints: RpcEndpoints,
     /// `[gas]` ceilings for that [`Wallet`].
     gas_caps: GasCaps,
     /// Process-scoped redeem epochs with a close in flight. The venue asks
@@ -2651,7 +2651,7 @@ impl Engine {
             return reject(CloseRedeemRejectReason::InFlight);
         }
 
-        let wallet = Wallet::new(&self.rpc_url, self.signer.clone(), self.chain_id)
+        let wallet = Wallet::new(&self.rpc_endpoints, self.signer.clone(), self.chain_id)
             .with_gas_caps(self.gas_caps);
         let closing = self.closing.clone();
         let request_id = req.request_id.clone();
@@ -4618,7 +4618,7 @@ mod tests {
             vault_policy: Arc::new(RwLock::new(None)),
             nonce_salt: 7,
             rpc: Rpc::new("http://127.0.0.1:1"),
-            rpc_url: "http://127.0.0.1:1".into(),
+            rpc_endpoints: "http://127.0.0.1:1".into(),
             gas_caps: GasCaps::for_chain(8453),
             closing: Arc::new(Mutex::new(HashMap::new())),
             modules: None,

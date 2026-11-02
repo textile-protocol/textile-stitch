@@ -157,6 +157,8 @@ export interface PoolSummary {
 
 export interface Settings {
   rpcUrl: string
+  /** Backup RPCs, tried in order when the primary can't be reached. */
+  rpcFallbackUrls: string[]
   feedUrl: string
   buy: Spread
   sell: Spread
