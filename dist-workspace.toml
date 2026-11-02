@@ -32,6 +32,12 @@ include = [
   "packaging/linux/stitch.png",
 ]
 
+# dist 0.32 defaults aarch64-apple-darwin to macos-14, which GitHub retired on
+# 2026-11-02. Pin the Apple Silicon build to macos-15 (same image as
+# macos-app.yml). x86_64-apple-darwin already defaults to macos-15-intel.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # cargo-dist packages every [[bin]] by default. Allowlist the three we ship.
 [dist.binaries]
 "*" = ["stitch", "stitch-panel", "stitch-desktop"]
