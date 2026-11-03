@@ -34,7 +34,13 @@ export interface ModulesConfig {
     max_slippage_bps: number
     cooldown_secs: number
     order_lifetime_secs: number
-    dealer: { url: string; taker: string; api_key_env: string | null } | null
+    /** `api_key_env` only switches the bearer credential on; the bot accepts
+     * no name but `STITCH_DEALER_API_KEY`. */
+    dealer: {
+      url: string
+      taker: string
+      api_key_env: 'STITCH_DEALER_API_KEY' | null
+    } | null
   }
   /** Moves the vault's on-chain `minLiquidSettlement` on a UTC schedule.
    * Floors and tolerance are shares of free settlement (liquid + staked). */

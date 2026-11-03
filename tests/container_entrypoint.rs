@@ -14,7 +14,7 @@ const ENTRYPOINT: &str = concat!(
 );
 
 /// (inline env var, file env var, file name) for every secret the signer
-/// backends and the RFQ client read. Keep in step with the entrypoint.
+/// backends, the RFQ client and the dealer client read. Keep in step with the entrypoint.
 const SECRETS: &[(&str, &str, &str)] = &[
     (
         "STITCH_PRIVATE_KEY",
@@ -25,6 +25,11 @@ const SECRETS: &[(&str, &str, &str)] = &[
         "STITCH_RFQ_API_KEY",
         "STITCH_RFQ_API_KEY_FILE",
         "rfq-api.key",
+    ),
+    (
+        "STITCH_DEALER_API_KEY",
+        "STITCH_DEALER_API_KEY_FILE",
+        "dealer-api.key",
     ),
     (
         "TURNKEY_API_PRIVATE_KEY",

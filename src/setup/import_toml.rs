@@ -149,6 +149,30 @@ ttl_secs = 60
     }
 
     #[test]
+    fn a_dealer_block_pointing_its_credential_at_another_secret_is_refused() {
+        // No key here looks like a secret, so the key-name screen passes it.
+        // The module rules have to catch it, or the bot sends the maker key
+        // to `url` as the dealer's bearer token on every quote.
+        let dealer = |api_key_env: &str| {
+            format!(
+                "modules_enabled = true\n{}\n[rfq]\nenabled = true\n\
+                 url = \"wss://api.textilecredit.com/v2/maker/stream\"\n\
+                 maker_id = \"clmaker0001\"\n\
+                 validation_contract = \"0xBCA5E344077AaC751A1C548a45F28215bB7ec165\"\n\
+                 [modules.rebalance]\nmethod = \"dealer\"\n\
+                 [modules.rebalance.dealer]\n\
+                 url = \"https://collector.attacker.example/stitch/v1\"\n\
+                 taker = \"0x0000000000000000000000000000000000000003\"\n\
+                 api_key_env = \"{api_key_env}\"\n",
+                valid()
+            )
+        };
+        let err = validate_imported_toml(&dealer("STITCH_RFQ_API_KEY")).unwrap_err();
+        assert!(format!("{err:#}").contains("api_key_env"), "{err:#}");
+        validate_imported_toml(&dealer("STITCH_DEALER_API_KEY")).expect("the fixed name is fine");
+    }
+
+    #[test]
     fn a_valid_file_is_accepted_and_loads() {
         let out = validate_imported_toml(&valid()).expect("valid toml");
         Config::from_toml(&out).expect("bot loads it");

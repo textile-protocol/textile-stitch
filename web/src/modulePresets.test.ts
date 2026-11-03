@@ -41,7 +41,7 @@ const config = (): ModulesConfig => ({
     dealer: {
       url: 'https://dealer.example',
       taker: '0x123',
-      api_key_env: 'DEALER_KEY',
+      api_key_env: 'STITCH_DEALER_API_KEY',
     },
   },
   liquidity: defaultLiquidity(),

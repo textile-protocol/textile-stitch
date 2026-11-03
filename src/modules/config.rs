@@ -423,9 +423,17 @@ pub struct DealerConfig {
     pub url: String,
     /// Only this counterparty may fill a signed rebalance order.
     pub taker: String,
-    /// Optional bearer credential; the secret itself is never in TOML or the panel.
+    /// Whether the dealer gets a bearer credential. Left out, requests carry
+    /// no `Authorization` header. Set, the only accepted value is
+    /// [`DEALER_API_KEY_ENV`], and the credential is always read from that
+    /// variable (or its `_FILE` form), never from a name in this field: a name
+    /// the file picks could be any other secret in the bot's environment
+    /// (`STITCH_RFQ_API_KEY`, say), which `post` would then send to `url`.
     pub api_key_env: Option<String>,
 }
+/// Where the dealer credential is read from (plus `_FILE`). See
+/// [`DealerConfig::api_key_env`].
+pub const DEALER_API_KEY_ENV: &str = "STITCH_DEALER_API_KEY";
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Weekday {
@@ -629,10 +637,13 @@ impl ModulesConfig {
                 !d.taker.parse::<Address>()?.is_zero(),
                 "dealer taker cannot be zero"
             );
-            if let Some(env) = &d.api_key_env {
+            if let Some(env) = d.api_key_env.as_deref().map(str::trim) {
                 ensure!(
-                    !env.is_empty() && env.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                    "invalid dealer api_key_env"
+                    env == DEALER_API_KEY_ENV,
+                    "[modules.rebalance.dealer].api_key_env must be {DEALER_API_KEY_ENV:?} \
+                     (or left out for a dealer that takes no credential), got {env:?}. The \
+                     dealer credential is read from {DEALER_API_KEY_ENV}[_FILE]; the file \
+                     can't point it at another variable.",
                 );
             }
         }
@@ -683,6 +694,58 @@ mod tests {
         ModulesConfig {
             liquidity,
             ..ModulesConfig::default()
+        }
+    }
+
+    fn with_dealer(url: &str, api_key_env: Option<&str>) -> ModulesConfig {
+        let mut c = ModulesConfig::default();
+        c.rebalance.dealer = Some(DealerConfig {
+            url: url.into(),
+            taker: "0x0000000000000000000000000000000000000003".into(),
+            api_key_env: api_key_env.map(Into::into),
+        });
+        c
+    }
+
+    #[test]
+    fn dealer_api_key_env_cannot_name_another_secret() {
+        // `post` sends the credential to `url`, and both come from the file. A
+        // name the file could pick could be the maker key or any other raw
+        // secret in the bot's environment.
+        let url = "https://dealer.example/stitch/v1";
+        with_dealer(url, None).validate().expect("no credential");
+        with_dealer(url, Some(DEALER_API_KEY_ENV))
+            .validate()
+            .expect("the fixed name");
+        for hostile in [
+            "STITCH_RFQ_API_KEY",
+            "STITCH_PRIVATE_KEY",
+            "MPCVAULT_API_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "DEALER_KEY",
+            "",
+        ] {
+            let err = with_dealer(url, Some(hostile)).validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("[modules.rebalance.dealer].api_key_env"),
+                "{hostile}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dealer_url_cannot_carry_credentials_or_a_query() {
+        // https-unless-loopback is `assert_feed_url`, tested in crate::config.
+        with_dealer("https://dealer.example/v1", None)
+            .validate()
+            .expect("plain https");
+        for bad in [
+            "https://user:pw@dealer.example",
+            "https://dealer.example/v1?key=x",
+            "https://dealer.example/v1#x",
+        ] {
+            assert!(with_dealer(bad, None).validate().is_err(), "{bad}");
         }
     }
 

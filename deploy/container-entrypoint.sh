@@ -45,6 +45,9 @@ file_secret() {
 # not secrets, so they stay plain env vars.
 file_secret STITCH_PRIVATE_KEY STITCH_PRIVATE_KEY_FILE "${key_path}"
 file_secret STITCH_RFQ_API_KEY STITCH_RFQ_API_KEY_FILE "${runtime_dir}/rfq-api.key"
+# The optional [modules.rebalance.dealer] bearer credential, only ever read
+# from this name (`api_key_env` can't change it).
+file_secret STITCH_DEALER_API_KEY STITCH_DEALER_API_KEY_FILE "${runtime_dir}/dealer-api.key"
 file_secret TURNKEY_API_PRIVATE_KEY TURNKEY_API_PRIVATE_KEY_FILE "${runtime_dir}/turnkey-api.key"
 file_secret MPCVAULT_API_TOKEN MPCVAULT_API_TOKEN_FILE "${runtime_dir}/mpcvault-api.token"
 file_secret FIREBLOCKS_API_PRIVATE_KEY FIREBLOCKS_API_PRIVATE_KEY_FILE "${runtime_dir}/fireblocks-api.key"

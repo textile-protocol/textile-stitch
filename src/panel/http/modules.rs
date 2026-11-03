@@ -641,6 +641,33 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path).unwrap(), before);
     }
 
+    #[tokio::test]
+    async fn a_dealer_credential_pointed_at_another_variable_is_never_saved() {
+        // The Parameters form has no dealer fields, but this route takes the
+        // whole modules block, dealer included.
+        let h = harness("module-dealer-key");
+        seed(&h, true);
+        let (_, body) = h.get("/api/bots/bot-a/modules").await;
+        let view = Harness::parse(&body);
+        let path = h.root.join("bot-a/stitch.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mut cfg = view["config"].clone();
+        cfg["rebalance"]["dealer"] = serde_json::json!({
+            "url": "https://collector.attacker.example/stitch/v1",
+            "taker": "0x0000000000000000000000000000000000000003",
+            "api_key_env": "STITCH_RFQ_API_KEY",
+        });
+        let (status, body) = h
+            .put_json(
+                "/api/bots/bot-a/modules",
+                serde_json::json!({"revision":view["revision"], "config":cfg}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("api_key_env"), "{body}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+
     fn table_headers(toml: &str) -> Vec<String> {
         toml.lines()
             .map(str::trim)

@@ -216,8 +216,10 @@ The dealer adapter remains available through explicit `modules.rebalance.method 
 [modules.rebalance.dealer]
 url = "https://your-dealer.example/stitch/v1"
 taker = "0x0000000000000000000000000000000000000003" # replace
-api_key_env = "STITCH_DEALER_API_KEY" # optional; set the secret in stitch.env
+api_key_env = "STITCH_DEALER_API_KEY" # optional; the only accepted value
 ```
+
+`api_key_env` only switches the credential on. Leave it out for a dealer that takes no credential. Set, it must be `STITCH_DEALER_API_KEY`, and Stitch reads the key from `STITCH_DEALER_API_KEY_FILE` (preferred) or `STITCH_DEALER_API_KEY`, in stitch.env or the bot's environment. Any other name fails to load: the file sets the dealer URL too, so letting it pick the variable would let it send any secret in the bot's environment (the maker key, say) to any host.
 
 Stitch sends `POST {url}/quote`:
 
@@ -234,7 +236,7 @@ Stitch sends `POST {url}/quote`:
 }
 ```
 
-The dealer returns `requestId`, `taker`, `sellAmount`, `buyAmount`, and `expiresAt` (Unix seconds). Amounts are decimal strings in atomic units. `buyAmount` is the **net amount the vault receives**, including all dealer charges. The configured taker and exact sell amount must match; proceeds must meet the price floor; expiry must fit the request. Redirects are refused. Requests are bounded to five seconds and quote responses to 16 KiB. Credentials come from the named environment variable and never appear in decisions.
+The dealer returns `requestId`, `taker`, `sellAmount`, `buyAmount`, and `expiresAt` (Unix seconds). Amounts are decimal strings in atomic units. `buyAmount` is the **net amount the vault receives**, including all dealer charges. The configured taker and exact sell amount must match; proceeds must meet the price floor; expiry must fit the request. Redirects are refused. Requests are bounded to five seconds and quote responses to 16 KiB. The credential is sent as `Authorization: Bearer ...` and never appears in decisions.
 
 After checking the response against current exposure and prices, Stitch constructs the order itself: maker and output recipient are the vault, tokens are its configured pair, and preferred fillers bind the configured counterparty (plus the configured VaultOrderExecutor). It durably reserves inventory **before** starting background EIP-712 signing. Completed signatures return to the RFQ engine, which rechecks current reservations, price, inventory, order caps, epoch and expiry before sending `POST {url}/execute` with `requestId`, `chainId`, `encodedOrder`, and `strategySignature`. Any other live reservation withholds the signature. Disconnecting before this check drops the pending result; the durable reservation remains until expiry.
 

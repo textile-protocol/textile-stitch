@@ -28,6 +28,11 @@ Environment variables the entrypoint understands:
   `STITCH_PRIVATE_KEY_FILE` is exported automatically).
 - `STITCH_RFQ_API_KEY` — the maker credential from `stitch connect` (written to
   `rfq-api.key`, then `STITCH_RFQ_API_KEY_FILE` is exported automatically).
+- `STITCH_DEALER_API_KEY` — only if you run the [dealer adapter](modules.md#dealer-execution-optional-later-rollout)
+  with `api_key_env = "STITCH_DEALER_API_KEY"` (written to `dealer-api.key`, then
+  `STITCH_DEALER_API_KEY_FILE` is exported automatically). To mount the file
+  instead, also pass `-e STITCH_DEALER_API_KEY_FILE=/home/stitch/run/dealer-api.key`;
+  unlike `rfq-api.key`, the bot doesn't look for it beside the config.
 - `TURNKEY_API_PRIVATE_KEY`, `MPCVAULT_API_TOKEN`, `FIREBLOCKS_API_PRIVATE_KEY`,
   `GCP_KMS_CREDENTIALS`, `AWS_KMS_CREDENTIALS` — the signer secret for whichever
   `[signer]` backend you use (written to `turnkey-api.key`, `mpcvault-api.token`,
