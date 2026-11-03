@@ -1318,22 +1318,49 @@ impl Config {
     /// Why `modules_enabled = true` would be refused on this config, in the
     /// order `validate` reports them. Empty when modules can be turned on. The
     /// panel shows these before the operator tries, so they read as fixes.
-    pub fn modules_blockers(&self) -> Vec<&'static str> {
+    pub fn modules_blockers(&self) -> Vec<String> {
         [
-            (!(self.pools.len() == 1 && self.rfq_active()))
-                .then_some("modules require one corridor and enabled RFQ"),
-            (self.book_enabled || !self.on_chain_legs().is_empty()).then_some(
-                "modules require RFQ-only operation; disable the ladder, limit taker and closer",
-            ),
+            self.modules_corridor_blocker(),
+            (!self.rfq.as_ref().is_some_and(|r| r.enabled)).then(|| {
+                "modules answer Swap quotes over RFQ, which is off for this bot. \
+                 Connect to Textile under Textile connection first \
+                 (that sets enabled = true under [rfq] in stitch.toml)"
+                    .to_string()
+            }),
+            (self.book_enabled || !self.on_chain_legs().is_empty()).then(|| {
+                "modules require RFQ-only operation; disable the ladder, limit taker and closer"
+                    .to_string()
+            }),
             (!self
                 .pools
                 .iter()
                 .all(|p| p.lean_mode() == LeanMode::Off && p.twap_window_secs.is_none()))
-            .then_some("modules cannot be combined with legacy lean or TWAP settings"),
+            .then(|| "modules cannot be combined with legacy lean or TWAP settings".to_string()),
         ]
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    /// Modules hold one corridor's inventory, so they need exactly one
+    /// `[[pools]]` entry. With several, the message names each pair so the
+    /// operator knows what to remove; a bare count reads as "one corridor" to
+    /// someone who thinks of the bot as quoting one market.
+    fn modules_corridor_blocker(&self) -> Option<String> {
+        match self.pools.len() {
+            1 => None,
+            0 => Some(
+                "modules need a corridor to run on, and this bot has none. \
+                 Add one first"
+                    .to_string(),
+            ),
+            n => Some(format!(
+                "modules run on one corridor, and this bot has {n}: {}. \
+                 Remove all but one under Corridors, or move the others to a bot of their own \
+                 (each corridor is a [[pools]] entry in stitch.toml)",
+                crate::chain::erc8004::pair_labels(self).join(", ")
+            )),
+        }
     }
 
     /// What the inventory curve needs, once modules are known to quote one
@@ -2150,6 +2177,47 @@ mod tests {
         let both = curve_bot("", true, "[modules.inventory]\nenabled = true\n");
         let err = Config::from_toml(&both).unwrap_err().to_string();
         assert!(err.contains("turn one of them off"), "{err}");
+    }
+
+    /// An operator who thinks of the bot as "one corridor" needs to be told
+    /// it has several, and which, or the refusal reads as wrong.
+    #[test]
+    fn modules_on_several_corridors_name_each_one_and_the_fix() {
+        let mut cfg: Config = toml::from_str(&curve_bot("", false, "")).unwrap();
+        assert!(cfg.modules_blockers().is_empty());
+        let stamp = |pool: &mut PoolConfig, id: &str, name: &str| {
+            pool.corridor_id = Some(id.to_string());
+            pool.corridor_name = Some(name.to_string());
+            pool.corridor_network = Some("Base".to_string());
+        };
+        stamp(&mut cfg.pools[0], "c1", "cNGN → USDC");
+        let mut second = cfg.pools[0].clone();
+        stamp(&mut second, "c2", "KES → USDC");
+        cfg.pools.push(second);
+        let blockers = cfg.modules_blockers();
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        let msg = &blockers[0];
+        assert!(
+            msg.contains("this bot has 2: cNGN → USDC, KES → USDC"),
+            "{msg}"
+        );
+        assert!(msg.contains("Remove all but one under Corridors"), "{msg}");
+        // RFQ is on, so the message doesn't send the operator looking there.
+        assert!(!msg.contains("RFQ"), "{msg}");
+
+        cfg.pools.clear();
+        assert!(cfg.modules_blockers()[0].contains("has none"));
+    }
+
+    #[test]
+    fn modules_with_rfq_off_say_so_and_where_to_turn_it_on() {
+        let off =
+            curve_bot("", false, "").replace("[rfq]\nenabled = true", "[rfq]\nenabled = false");
+        let err = Config::from_toml(&off).unwrap_err().to_string();
+        assert!(err.contains("RFQ, which is off for this bot"), "{err}");
+        assert!(err.contains("Connect to Textile"), "{err}");
+        // One corridor, so nothing about corridors.
+        assert!(!err.contains("corridor"), "{err}");
     }
 
     #[test]

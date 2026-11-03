@@ -1271,7 +1271,7 @@ pub async fn save_raw(
     // the escape hatch being server-validated rather than a blind file write.
     let incoming = Config::from_toml(&body.toml).map_err(|e| {
         ApiError::bad_request(format!(
-            "that config isn't valid, and the bot would fail to start on it: {e:#}"
+            "not saved, because the bot would fail to start on this config: {e:#}"
         ))
     })?;
 
