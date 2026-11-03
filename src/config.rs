@@ -536,6 +536,8 @@ const LIVE_FETCHED_PAIRS: &[&str] = &[
     "wars-usdt",
     "wbrl-usdt",
     "weth-usdt",
+    "xaue-usdt",
+    "xaue-xaut",
     "xaut-usdt",
 ];
 
