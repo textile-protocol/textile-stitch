@@ -866,8 +866,9 @@ pub fn rfq_key_reaches_bot(
     path: &Path,
     runtime: PanelRuntime,
 ) -> bool {
-    cfg.rfq.as_ref().is_some_and(|r| {
-        crate::rfq::api_key_configured(&r.api_key_env, path.parent(), |name| match runtime {
+    let key_env = crate::config::RFQ_API_KEY_ENV;
+    cfg.rfq.is_some()
+        && crate::rfq::api_key_configured(key_env, path.parent(), |name| match runtime {
             // `bot_container_spec` hands the container an explicitly built env
             // list: it neither sources the bot's stitch.env nor inherits the
             // panel's own environment. So for Docker the sibling rfq-api.key
@@ -883,7 +884,6 @@ pub fn rfq_key_reaches_bot(
             PanelRuntime::Process => crate::panel::provision::env_assignment(path, name)
                 .or_else(|| std::env::var(name).ok()),
         })
-    })
 }
 
 /// See [`VenueSeat`]. The credential lives beside the config, in the same
@@ -1273,6 +1273,39 @@ mod tests {
                 .venue,
             VenueSeat::Seated
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_signer_secret_never_counts_as_the_maker_key() {
+        // A seeded bot has STITCH_PRIVATE_KEY_FILE in stitch.env. Even a config
+        // that skipped validation and names that variable in `api_key_env`
+        // must not have the wallet key read as its maker credential.
+        let (_cfg, root) = test_cfg("rfq-key-env");
+        let dir = seed_bot_dir(&root, "bot-k");
+        let config_path = dir.join("stitch.toml");
+        // Blank maker vars in stitch.env win over whatever the test process has.
+        let env = std::fs::read_to_string(dir.join("stitch.env")).unwrap();
+        assert!(env.contains("STITCH_PRIVATE_KEY_FILE"), "{env}");
+        std::fs::write(
+            dir.join("stitch.env"),
+            format!("{env}\nSTITCH_RFQ_API_KEY=\nSTITCH_RFQ_API_KEY_FILE=\n"),
+        )
+        .unwrap();
+        let toml = format!(
+            "{}\n[rfq]\nenabled = true\nurl = \"wss://x/v2/maker/stream\"\n\
+             maker_id = \"cmu1\"\napi_key_env = \"STITCH_PRIVATE_KEY\"\n\
+             validation_contract = \"0x10B9EbA3a175Df418a35CB8329a527691EE258C5\"\n",
+            std::fs::read_to_string(&config_path).unwrap()
+        );
+        let unvalidated: crate::config::Config = toml::from_str(&toml).unwrap();
+
+        assert!(!rfq_key_reaches_bot(
+            &unvalidated,
+            &config_path,
+            PanelRuntime::Process
+        ));
 
         std::fs::remove_dir_all(&root).ok();
     }

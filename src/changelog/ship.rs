@@ -401,7 +401,7 @@ pub fn shipment_for(cfg: &Config, config_path: &Path, wallet: Option<String>) ->
          credential to ship with. Connect it to Textile first.",
     )?;
     let dir = config_path.parent().filter(|p| !p.as_os_str().is_empty());
-    let api_key = crate::rfq::load_rfq_api_key(&rfq.api_key_env, dir)
+    let api_key = crate::rfq::load_rfq_api_key(dir)
         .context("[change_log] ship is on, but the maker API key can't be read")?;
     let origin = crate::venue::enroll::venue_origin_from_config(cfg, None);
     let endpoint = format!("{}{ENDPOINT_PATH}", origin.trim_end_matches('/'));
@@ -496,6 +496,32 @@ mod tests {
             config_sha256_after: None,
         };
         serde_json::to_string(&record).unwrap() + "\n"
+    }
+
+    #[test]
+    fn a_disabled_rfq_block_cannot_point_the_shipped_key_at_the_signer() {
+        // Validation only checks `api_key_env` when `[rfq]` is enabled, and
+        // shipping runs either way, so the loader itself must ignore the name.
+        let dir =
+            std::env::temp_dir().join(format!("ship-key-{}-{}", std::process::id(), random_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("rfq-api.key"), "tx_live_maker").unwrap();
+        std::fs::write(dir.join("signer"), "0xsigner-secret").unwrap();
+        let var = "STITCH_SHIP_SIGNER_STANDIN_TEST";
+        std::env::set_var(format!("{var}_FILE"), dir.join("signer"));
+        let mut cfg: Config = toml::from_str(CONFIG).unwrap();
+        cfg.rfq = Some(crate::config::RfqConfig {
+            enabled: false,
+            url: "wss://api.textilecredit.com/v2/rfq/stream".into(),
+            maker_id: "fixture".into(),
+            api_key_env: var.into(),
+            validation_contract: String::new(),
+            instance_id: None,
+        });
+        let shipment = shipment_for(&cfg, &dir.join("stitch.toml"), None).unwrap();
+        std::env::remove_var(format!("{var}_FILE"));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_ne!(shipment.api_key, "0xsigner-secret");
     }
 
     #[test]

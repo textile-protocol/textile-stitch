@@ -237,7 +237,8 @@ pub fn maybe_spawn(
         return None;
     }
     let rfq = cfg.rfq.as_ref()?; // rfq_active() implies Some
-    let api_key = match load_rfq_api_key(&rfq.api_key_env, config_dir) {
+
+    let api_key = match load_rfq_api_key(config_dir) {
         Ok(k) => k,
         Err(e) => {
             error!(
@@ -391,10 +392,15 @@ pub(crate) fn existing_instance_id(
 ///
 /// Order: `{NAME}_FILE` (preferred, same as the wallet), then `{NAME}`, then
 /// `rfq-api.key` next to the config. The last is what the panel writes.
-pub(crate) fn load_rfq_api_key(
-    api_key_env: &str,
-    config_dir: Option<&Path>,
-) -> anyhow::Result<String> {
+/// Always [`crate::config::RFQ_API_KEY_ENV`]: the variable is never taken
+/// from stitch.toml, because a name the file picks can be the signer's.
+pub(crate) fn load_rfq_api_key(config_dir: Option<&Path>) -> anyhow::Result<String> {
+    load_rfq_api_key_from(crate::config::RFQ_API_KEY_ENV, config_dir)
+}
+
+/// [`load_rfq_api_key`] with the variable name as a parameter, so tests can
+/// use one no other test touches.
+fn load_rfq_api_key_from(api_key_env: &str, config_dir: Option<&Path>) -> anyhow::Result<String> {
     let file_env = format!("{api_key_env}_FILE");
     if let Ok(key) = crate::signer::read_env_secret(&file_env, api_key_env) {
         if !key.is_empty() {
@@ -6944,7 +6950,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("rfq-api.key"), "  tx_live_from_file  \n").unwrap();
-        let key = load_rfq_api_key("STITCH_RFQ_API_KEY_UNSET_FOR_TEST", Some(&dir)).unwrap();
+        let key = load_rfq_api_key_from("STITCH_RFQ_API_KEY_UNSET_FOR_TEST", Some(&dir)).unwrap();
         assert_eq!(key, "tx_live_from_file");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6967,7 +6973,7 @@ mod tests {
         let var = "STITCH_RFQ_API_KEY_UNSTAGED_CRED_TEST";
         // No sibling `rfq-api.key` either, which is the systemd layout.
         std::env::set_var(format!("{var}_FILE"), dir.join("never-staged"));
-        let err = load_rfq_api_key(var, Some(&dir))
+        let err = load_rfq_api_key_from(var, Some(&dir))
             .expect_err("an unstaged credential is not a usable key");
         assert!(err.to_string().contains(var), "{err}");
 
@@ -6976,7 +6982,7 @@ mod tests {
         let blank = dir.join("blank-credential");
         std::fs::write(&blank, "").unwrap();
         std::env::set_var(format!("{var}_FILE"), &blank);
-        assert!(load_rfq_api_key(var, Some(&dir)).is_err());
+        assert!(load_rfq_api_key_from(var, Some(&dir)).is_err());
 
         std::env::remove_var(format!("{var}_FILE"));
         std::fs::remove_dir_all(&dir).ok();

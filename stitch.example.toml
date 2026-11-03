@@ -182,7 +182,7 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # enabled = false                                        # master kill switch
 # url = "wss://api.textilecredit.com/v2/maker/stream"
 # maker_id = "mk_your_maker_id"
-# api_key_env = "STITCH_RFQ_API_KEY"                     # env var holding the maker API key
+# api_key_env = "STITCH_RFQ_API_KEY"                     # fixed; no other value is accepted
 # validation_contract = "0x0000000000000000000000000000000000000000"  # PreferredFillerValidation (per chain)
 
 # ----- OperatorVault maker. The bot key is the strategy signer; the vault is

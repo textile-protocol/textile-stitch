@@ -39,9 +39,9 @@ file_secret() {
 # (src/panel/provision.rs). A new secret env var belongs in this list, and in
 # tests/container_entrypoint.rs.
 #
-# STITCH_RFQ_API_KEY is the maker credential from `stitch connect`. Only the
-# default `[rfq].api_key_env` name is handled; a custom one is the operator's
-# to pass. The Turnkey API public key and FIREBLOCKS_API_KEY are identifiers,
+# STITCH_RFQ_API_KEY is the maker credential from `stitch connect`, and the
+# only name the bot reads it from (`[rfq].api_key_env` can't change it).
+# The Turnkey API public key and FIREBLOCKS_API_KEY are identifiers,
 # not secrets, so they stay plain env vars.
 file_secret STITCH_PRIVATE_KEY STITCH_PRIVATE_KEY_FILE "${key_path}"
 file_secret STITCH_RFQ_API_KEY STITCH_RFQ_API_KEY_FILE "${runtime_dir}/rfq-api.key"

@@ -270,8 +270,9 @@ pub struct VaultConfig {
 }
 
 /// The `[rfq]` block: connection details for the venue's maker quote stream.
-/// The maker API key is NOT here — it comes from the environment variable
-/// named by `api_key_env`, mirroring how the wallet key stays out of the file.
+/// The maker API key is NOT here — it comes from `STITCH_RFQ_API_KEY[_FILE]`
+/// or the panel-written `rfq-api.key`, mirroring how the wallet key stays out
+/// of the file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RfqConfig {
     /// Master switch. `false` (the default) keeps the responder fully off even
@@ -282,7 +283,10 @@ pub struct RfqConfig {
     pub url: String,
     /// The maker id the venue issued at onboarding (sent as `X-Textile-Maker-Id`).
     pub maker_id: String,
-    /// Name of the environment variable holding the maker API key.
+    /// Legacy knob. Only [`RFQ_API_KEY_ENV`] is accepted and the loader never
+    /// reads it: letting the file name the variable let it name the signer's
+    /// secret instead (`STITCH_PRIVATE_KEY` reads `STITCH_PRIVATE_KEY_FILE`),
+    /// which the handshake then sends to `url` as a bearer token.
     #[serde(default = "default_rfq_api_key_env")]
     pub api_key_env: String,
     /// The chain's PreferredFillerValidation contract. Every RFQ order binds
@@ -302,8 +306,12 @@ pub struct RfqConfig {
     pub instance_id: Option<String>,
 }
 
+/// The one environment variable the maker API key is read from (plus its
+/// `_FILE` form). Fixed, not configurable: see [`RfqConfig::api_key_env`].
+pub const RFQ_API_KEY_ENV: &str = "STITCH_RFQ_API_KEY";
+
 fn default_rfq_api_key_env() -> String {
-    "STITCH_RFQ_API_KEY".to_string()
+    RFQ_API_KEY_ENV.to_string()
 }
 
 /// Venue maker stream: `wss://` anywhere, or `ws://` only on loopback.
@@ -1825,8 +1833,11 @@ impl Config {
         assert_rfq_stream_url(&rfq.url)?;
         anyhow::ensure!(!rfq.maker_id.trim().is_empty(), "[rfq].maker_id is empty");
         anyhow::ensure!(
-            !rfq.api_key_env.trim().is_empty(),
-            "[rfq].api_key_env is empty"
+            rfq.api_key_env.trim() == RFQ_API_KEY_ENV,
+            "[rfq].api_key_env must be {RFQ_API_KEY_ENV:?} (or left out), got {:?}. \
+             The maker API key is read from {RFQ_API_KEY_ENV}[_FILE] or rfq-api.key \
+             next to stitch.toml; the file can't point it at another variable.",
+            rfq.api_key_env.trim()
         );
         let validation_contract = rfq
             .validation_contract
@@ -2109,7 +2120,6 @@ mod tests {
         format!(
             "modules_enabled = true\n{}{pool_extra}\n{vault}\
              [rfq]\nenabled = true\nurl = \"wss://x\"\nmaker_id = \"mk\"\n\
-             api_key_env = \"K\"\n\
              validation_contract = \"0x2222222222222222222222222222222222222222\"\n\
              [modules.curve]\nenabled = true\n{modules_extra}",
             rfq_only_with_signer("")
@@ -3460,6 +3470,34 @@ mod tests {
             "STITCH_RFQ_API_KEY",
             "the api key env var name has a default"
         );
+    }
+
+    #[test]
+    fn rfq_api_key_env_cannot_name_another_secret() {
+        // The loader reads `{api_key_env}_FILE`, and the panel gives every bot
+        // `STITCH_PRIVATE_KEY_FILE` (or an MPC `*_FILE`). A file that could
+        // pick the name could hand the signer's secret to `[rfq].url`.
+        let base = format!("{LEAN_POOL_BASE}\n{RFQ_BLOCK}");
+        let with = |name: &str| base.replace("[rfq]", &format!("[rfq]\napi_key_env = {name:?}"));
+
+        for hostile in [
+            "STITCH_PRIVATE_KEY",
+            "MPCVAULT_API_TOKEN",
+            "TURNKEY_API_PRIVATE_KEY",
+            "FIREBLOCKS_API_PRIVATE_KEY",
+            "STITCH_MAKER_API_KEY",
+        ] {
+            let err = format!("{:#}", Config::from_toml(&with(hostile)).unwrap_err());
+            assert!(err.contains("[rfq].api_key_env"), "{hostile}: {err}");
+        }
+
+        // Left out, or spelled out as the default, still loads.
+        assert!(Config::from_toml(&base).is_ok());
+        assert!(Config::from_toml(&with("STITCH_RFQ_API_KEY")).is_ok());
+
+        // A disabled block is inert, as with every other [rfq] rule.
+        let off = with("STITCH_PRIVATE_KEY").replace("enabled = true", "enabled = false");
+        assert!(Config::from_toml(&off).is_ok());
     }
 
     #[test]

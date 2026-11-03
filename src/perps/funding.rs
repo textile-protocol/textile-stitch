@@ -205,7 +205,7 @@ mod tests {
             enabled: false,
             url: origin,
             maker_id: "fixture".into(),
-            api_key_env: "UNSET_RECALL_RECOVERY_TEST".into(),
+            api_key_env: crate::config::RFQ_API_KEY_ENV.into(),
             validation_contract: format!("{}", Address::repeat_byte(2)),
             instance_id: None,
         });

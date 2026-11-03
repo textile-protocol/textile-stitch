@@ -2001,7 +2001,7 @@ mod tests {
             .unwrap();
         let wallet = format!(
             "modules_enabled = true\n{TEMPLATE}\n\
-             [rfq]\nenabled = true\nurl = \"wss://x\"\nmaker_id = \"mk\"\napi_key_env = \"K\"\n\
+             [rfq]\nenabled = true\nurl = \"wss://x\"\nmaker_id = \"mk\"\n\
              validation_contract = \"0x2222222222222222222222222222222222222222\"\n\
              [modules]\nmode = \"shadow\"\n\n[modules.curve]\nenabled = true\n"
         );

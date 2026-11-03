@@ -67,11 +67,8 @@ pub async fn request(
         (8..=64).contains(&id.len()) && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
         "Invalid assignment ID"
     );
-    let rfq = cfg
-        .rfq
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Connect this Stitch to Textile first"))?;
-    let key = crate::rfq::load_rfq_api_key(&rfq.api_key_env, Some(dir))?;
+    anyhow::ensure!(cfg.rfq.is_some(), "Connect this Stitch to Textile first");
+    let key = crate::rfq::load_rfq_api_key(Some(dir))?;
     let origin = crate::venue::enroll::venue_origin_from_config(cfg, None);
     let url = format!(
         "{}/v2/maker/perps/{id}{suffix}",

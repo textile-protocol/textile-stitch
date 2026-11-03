@@ -19,14 +19,11 @@ async fn venue(
     route: &str,
     body: Option<Value>,
 ) -> Result<Value, ApiError> {
-    let key = crate::rfq::load_rfq_api_key(
-        &cfg.rfq
-            .as_ref()
-            .ok_or_else(|| ApiError::bad_request("RFQ is not configured"))?
-            .api_key_env,
-        Some(dir),
-    )
-    .map_err(|_| ApiError::bad_request("Connect this bot to Textile first"))?;
+    cfg.rfq
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("RFQ is not configured"))?;
+    let key = crate::rfq::load_rfq_api_key(Some(dir))
+        .map_err(|_| ApiError::bad_request("Connect this bot to Textile first"))?;
     let origin = crate::venue::enroll::venue_origin_from_config(cfg, None);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
