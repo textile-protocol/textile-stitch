@@ -1449,10 +1449,19 @@ mod tests {
     }
 
     /// An address nothing listens on: every call fails to connect.
+    /// An endpoint that takes the connection and hangs up without answering,
+    /// so the client sees a transport error (a lost outcome). The port stays
+    /// bound for the whole test: dropping the listener instead would free it,
+    /// and the OS can hand that port straight to the next `chain_node`, which
+    /// then answers as if it were this "dead" node.
     async fn dead_node() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                drop(sock);
+            }
+        });
         url
     }
 
