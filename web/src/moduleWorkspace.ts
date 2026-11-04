@@ -19,16 +19,13 @@ import {
   type ModulesView,
 } from './modules'
 import type { PerpsView } from './api'
-import type { BotTab } from './botRoutes'
 import { hedgeMode, showHedgeModule } from './perps'
 
 // Presentation only. Each module owns its configuration, mode and permissions.
-// In particular, modulesEnabled gates quote policy, not FX hedging.
-export const MODULE_SURFACES = {
-  hedge: ['funds', 'dashboard', 'modules'],
-  quotes: ['modules'],
-} as const satisfies Record<string, readonly BotTab[]>
-export type BotModuleId = keyof typeof MODULE_SURFACES
+// In particular, modulesEnabled gates quote policy, not FX hedging. Every
+// module lives on the Modules tab and nowhere else.
+export const BOT_MODULES = ['hedge', 'quotes'] as const
+export type BotModuleId = (typeof BOT_MODULES)[number]
 
 export function visibleBotModules(
   {
@@ -52,15 +49,7 @@ export function visibleBotModules(
       showHedgeModule(hedge, now),
     quotes: quoteModulesEnabled,
   }
-  return (Object.keys(MODULE_SURFACES) as BotModuleId[]).filter(
-    (id) => visible[id]
-  )
-}
-
-export function modulesOnTab(ids: readonly BotModuleId[], tab: BotTab) {
-  return ids.filter((id) =>
-    (MODULE_SURFACES[id] as readonly BotTab[]).includes(tab)
-  )
+  return BOT_MODULES.filter((id) => visible[id])
 }
 
 export type ModuleSection = 'overview' | 'settings' | 'activity'

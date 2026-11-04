@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { PerpsView } from './api'
 import {
-  modulesOnTab,
   visibleBotModules,
   workspaceModules,
   quoteConfigForScope,
@@ -82,16 +81,6 @@ describe('independent module composition', () => {
         now
       )
     ).toEqual(['hedge', 'quotes'])
-  })
-
-  it('shows both groups on Modules and only the hedge summary on the dashboard', () => {
-    const ids = visibleBotModules(
-      { quoteModulesEnabled: true, hedge: hedge(true) },
-      now
-    )
-    expect(modulesOnTab(ids, 'modules')).toEqual(['hedge', 'quotes'])
-    expect(modulesOnTab(ids, 'dashboard')).toEqual(['hedge'])
-    expect(modulesOnTab(ids, 'settings')).toEqual([])
   })
 })
 

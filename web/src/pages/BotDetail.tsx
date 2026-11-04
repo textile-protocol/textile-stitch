@@ -1,4 +1,4 @@
-import BotModules from '../components/BotModules'
+import ModuleWorkspace from '../components/ModuleWorkspace'
 import { usePerps } from '../usePerps'
 import { showHedgeModule } from '../perps'
 import { visibleBotModules } from '../moduleWorkspace'
@@ -450,7 +450,15 @@ export default function BotDetail() {
         />
       </div>
 
-      <BotModules key={name} ids={visibleModules} tab={tab} bot={bot} perps={perps} funding={funding} />
+      {tab === 'modules' && (
+        <ModuleWorkspace
+          key={name}
+          ids={visibleModules}
+          bot={bot}
+          perps={perps}
+          funding={funding}
+        />
+      )}
 
       {tab === 'settings' &&
         (bot.editable ? (

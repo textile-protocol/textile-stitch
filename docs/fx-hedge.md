@@ -6,7 +6,7 @@ module opens for setup: open **Settings → Hedge configuration**, enter the ass
 supplied by Textile ops, then select **Preview**. Assignments still have to
 match the bot, wallet and corridor on the server.
 
-The module appears on **Funds**, **Dashboard** and **Modules**. It does not
+The module lives on **Modules** only. Funds and Dashboard don't show it. It does not
 require the separate inventory/quote-spread modules to be enabled. Experimental
 and the module use the same saved hedge state.
 
@@ -16,10 +16,8 @@ and the module use the same saved hedge state.
 | Live    | Allows execution within the assigned permissions and limits. Requires the deployment to permit execution, current inventory, configured limits and collateral-backed quoting permission. |
 | Off     | Stops new recall commitments, margin funding and hedge increases. Ordinary trading continues. Existing obligations, transaction reconciliation and protective exits remain active.       |
 
-On Funds and Dashboard, the module stays visible after Off while margin funds,
-positions, reservations or pending operations remain. Missing or stale data also
-keeps it visible. Those summaries can disappear once a current snapshot confirms
-an empty hedge and no pending work. An assigned hedge remains in the Modules list.
+An assigned hedge stays in the Modules list after Off, so its margin, positions
+and pending operations stay reachable for cleanup.
 
 Amounts use the collateral token’s decimals. **Authorized margin allocation**
 accepts whole-token amounts (for example `250000.00` IDRX), preserving the
@@ -83,11 +81,11 @@ Each quote module's mode switch sits at the top right of its pane, in every
 section, and saves only that mode after a confirmation. Saving one module never
 changes another's mode or settings; unsaved drafts stay unsaved. Hedge settings have a separate draft
 and write path. An assigned hedge stays in navigation
-when disabled, while its empty dashboard summary can still disappear. Errors in one service leave
+when disabled. Errors in one service leave
 the other controls accessible. Search and navigation never save configuration.
 
 `moduleWorkspace.ts` lists visibility, eligibility and navigation metadata;
-`BotModules` chooses the page surface and `ModuleWorkspace` renders the focused
+`BotDetail` renders `ModuleWorkspace` on the Modules tab, which shows the focused
 editor. Add future capabilities through that metadata and their own controller,
 without changing another module’s authorization. Visibility must never
 authorize execution, and unknown inventory must not hide cleanup.
