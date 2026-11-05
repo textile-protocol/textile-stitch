@@ -16,3 +16,10 @@ rfq.local.json
 
 # Permit2 slot-nonce ledger beside the config (stem.chainId.maker.slot-nonces.json)
 *.slot-nonces.json
+
+# Runtime state the bot writes beside its config: chain-read snapshot, price
+# guard history, RFQ instance id, and the local config's change log.
+chain-reads.json
+price-guard/
+rfq-instance-id
+stitch.local.toml.change-log.*
