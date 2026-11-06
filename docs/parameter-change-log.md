@@ -23,6 +23,8 @@ Bot-wide (scope `bot`): `max_loss_bps`, `max_jump_bps`, `settle_secs`, `stalenes
 
 Textile records the venue side the same way: a corridor's `mode`, `quoteTtlMs` and `replyBudgetMs` (scope `corridor:<slug>`), and the price source behind a feed (scope `price-source:<currency or pair>`).
 
+A pool that follows a feed switch (`/price?…&feedSwitch=<key>`) gets a record each time the switch's venue changes: parameter `feed_switch.selected`, under the pool's own scope, with the venue pair before and after. Source `api.feed-switch`. The actor is `feed-switch-signer:<address>` when an allowlisted signer flipped it, or the admin's wallet when Textile forced it. The pool's `feed_url` doesn't change when the venue does, so these records are the only place the switch shows up in its history.
+
 Credentials in URLs never make it into a record. A query value whose name looks like a key, and any `user:password@`, becomes `REDACTED#` plus eight hex digits of its SHA-256, so rotating a key still shows as a change.
 
 ## How each change is caught
