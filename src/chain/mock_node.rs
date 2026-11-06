@@ -54,6 +54,10 @@ pub struct MockChain {
     /// What Multicall3's `getBlockNumber()` answers. Zero answers no data,
     /// as a node without the view would.
     pub block_number: u64,
+    /// What `eth_chainId` answers; Ethereum's 1 when unset. A test seeding a
+    /// bot on another chain says so with [`MockChain::on`]: the client checks
+    /// every configured endpoint's chain before using it.
+    pub chain_id: Option<u64>,
 }
 
 /// Multicall3's canonical address, lowercase — where [`MockChain::with_multicall3`]
@@ -65,6 +69,14 @@ pub const MULTICALL3: &str = "0xca11bde05977b3631167028862be2a173976ca11";
 // that is not a reason to delete them.
 #[allow(dead_code)]
 impl MockChain {
+    /// An empty chain that reports `chain_id`.
+    pub fn on(chain_id: u64) -> Self {
+        Self {
+            chain_id: Some(chain_id),
+            ..Self::default()
+        }
+    }
+
     pub fn balance(mut self, token: &str, atomic: u128) -> Self {
         self.balances
             .insert(token.to_lowercase(), U256::from(atomic));
@@ -171,7 +183,7 @@ fn answer(chain: &MockChain, req: &Value) -> Value {
     let id = req.get("id").cloned().unwrap_or(json!(1));
     let method = req["method"].as_str().unwrap_or("");
     let result = match method {
-        "eth_chainId" => json!("0x1"),
+        "eth_chainId" => json!(format!("0x{:x}", chain.chain_id.unwrap_or(1))),
         "eth_getBalance" => json!(format!("0x{:x}", chain.native_wei)),
         "eth_getCode" => {
             let who = req["params"][0].as_str().unwrap_or("").to_lowercase();

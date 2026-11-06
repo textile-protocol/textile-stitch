@@ -1204,6 +1204,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    const CELO_CHAIN: u64 = 42220;
     const USDT: &str = "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e";
     const CNGN: &str = "0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f";
     const USDT_BSC: &str = "0x55d398326f99059fF775485246999027B3197955";
@@ -1493,7 +1494,7 @@ mod tests {
     async fn funding_reports_balances_gate_and_approvals() {
         let h = harness("funding-ok");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 25_000_000)
                 .balance(CNGN, 0)
                 .native(20_000_000_000_000_000_000),
@@ -1581,14 +1582,19 @@ mod tests {
     /// same wallet reads the same with and without Multicall3.
     #[tokio::test]
     async fn a_wallet_bot_is_one_request_with_multicall3() {
-        let chain = MockChain::default()
+        let chain = MockChain::on(CELO_CHAIN)
             .balance(USDT, 25_000_000)
             .balance(CNGN, 0)
             .native(20_000_000_000_000_000_000);
         let (one_by_one, _) = funding_with_hits("funding-seq", chain.clone(), None).await;
         let (batched, hits) =
             funding_with_hits("funding-batched", chain.with_multicall3(), None).await;
-        assert_eq!(hits, 1, "balances, allowances and gas in one request");
+        // The client asks a new endpoint list its chain once, then the
+        // whole poll is one batch.
+        assert_eq!(
+            hits, 2,
+            "the chain check, then balances, allowances and gas in one request"
+        );
         assert_eq!(batched, one_by_one);
         assert!(batched["readError"].is_null(), "{batched}");
     }
@@ -1596,7 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn a_vault_bot_is_one_request_with_multicall3() {
         let chain = vault_views(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance_of(USDT, VAULT, 25_000_000)
                 .balance_of(USDT, WALLET, 1_000_000)
                 .balance(CNGN, 0)
@@ -1613,7 +1619,10 @@ mod tests {
             Some(VAULT),
         )
         .await;
-        assert_eq!(hits, 1, "vault views, dust and gas in one request");
+        assert_eq!(
+            hits, 2,
+            "the chain check, then vault views, dust and gas in one request"
+        );
         assert_eq!(batched, one_by_one);
         assert_eq!(token(&batched, "USDT")["balanceText"], "25", "{batched}");
     }
@@ -1626,7 +1635,7 @@ mod tests {
     async fn a_vault_bot_reads_its_assets_once() {
         let h = harness("funding-vault-constants");
         let node = mock_rpc(vault_views(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance_of(USDT, WALLET, 1_000_000)
                 .native(20_000_000_000_000_000_000),
             25_000_000,
@@ -1650,8 +1659,9 @@ mod tests {
         assert_eq!(normalise(&first), normalise(&second));
         assert_eq!(
             after_first - after_second,
-            4,
-            "settlementAsset, corridorAsset and two balanceOf at the vault"
+            5,
+            "settlementAsset, corridorAsset, two balanceOf at the vault, and the \
+             endpoint's one chain check"
         );
     }
 
@@ -1710,7 +1720,7 @@ mod tests {
     /// The chain the snapshot tests disagree with: 1 USDT and 20 CELO.
     async fn chain_with_one_usdt() -> crate::chain::mock_node::MockNode {
         mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 1_000_000)
                 .balance(CNGN, 0)
                 .native(20_000_000_000_000_000_000),
@@ -1766,7 +1776,7 @@ mod tests {
     async fn the_remove_gate_reads_the_chain_even_with_a_fresh_snapshot() {
         let h = harness("funding-snapshot-remove");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 25_000_000)
                 .balance(CNGN, 0)
                 .native(20_000_000_000_000_000_000),
@@ -1799,7 +1809,7 @@ mod tests {
     async fn a_celo_corridor_splits_the_coins_between_gas_and_inventory() {
         let h = harness("funding-celo-split");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 25_000_000)
                 .balance(CELO, 100 * COIN)
                 .symbol(CELO, "CELO")
@@ -1829,7 +1839,7 @@ mod tests {
     async fn a_celo_wallet_under_the_reserve_is_all_gas() {
         let h = harness("funding-celo-low");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 0)
                 .balance(CELO, 3 * COIN)
                 .symbol(CELO, "CELO")
@@ -1852,7 +1862,7 @@ mod tests {
         let h = harness("funding-celo-spoof");
         let fake = "0x000000000000000000000000000000000000CE10";
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 0)
                 .balance(fake, 100 * COIN)
                 .symbol(fake, "CELO")
@@ -1879,7 +1889,7 @@ mod tests {
     async fn funding_on_bsc_asks_cents_of_gas_not_dollars() {
         let h = harness("funding-bsc");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(56)
                 .balance(USDT_BSC, 25_000_000_000_000_000_000)
                 .balance(CNGN_BSC, 0)
                 // 0.0001 BNB, the wallet from the report.
@@ -1915,7 +1925,7 @@ mod tests {
         // holds a dollar of dust and the gas.
         let h = harness("funding-vault");
         let node = mock_rpc(vault_views(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance_of(USDT, VAULT, 25_000_000)
                 .balance_of(USDT, WALLET, 1_000_000)
                 .balance(CNGN, 0)
@@ -1973,7 +1983,7 @@ mod tests {
     async fn a_vault_makers_own_dust_still_blocks_removal() {
         let h = harness("funding-vault-dust");
         let node = mock_rpc(vault_views(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance_of(USDT, VAULT, 25_000_000)
                 .balance_of(USDT, WALLET, 40_000_000)
                 .balance(CNGN, 0)
@@ -2002,7 +2012,7 @@ mod tests {
         // position is fillable, and that is the number the bot quotes.
         let h = harness("funding-vault-quotable");
         let node = mock_rpc(vault_views(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance_of(USDT, VAULT, 1_000_000)
                 .balance(CNGN, 0)
                 .native(20_000_000_000_000_000_000),
@@ -2030,7 +2040,7 @@ mod tests {
         // wallet answered, and it is the only thing removal can lose.
         let h = harness("funding-vault-unreadable");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance_of(USDT, WALLET, 1_000_000)
                 .balance(CNGN, 0)
                 .native(20_000_000_000_000_000_000),
@@ -2056,7 +2066,7 @@ mod tests {
     async fn funding_gate_needs_gas() {
         let h = harness("funding-gas-short");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 25_000_000)
                 .native(500_000_000_000_000_000),
         )
@@ -2077,7 +2087,7 @@ mod tests {
     async fn funding_values_soft_token_off_the_feed() {
         let h = harness("funding-soft-side");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 0)
                 .balance(CNGN, 30_000_000_000)
                 .native(20_000_000_000_000_000_000),
@@ -2102,7 +2112,7 @@ mod tests {
     async fn funding_soft_side_unpriced_when_feed_is_down() {
         let h = harness("funding-feed-down");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(CNGN, 30_000_000_000)
                 .native(20_000_000_000_000_000_000),
         )
@@ -2169,7 +2179,7 @@ mod tests {
     async fn funding_answers_within_budget_when_rpc_hangs() {
         let h = harness("funding-rpc-hang");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 25_000_000)
                 .hung_for(Duration::from_secs(20)),
         )
@@ -2199,7 +2209,7 @@ mod tests {
     async fn funding_gas_price_falls_back_when_both_lookups_fail() {
         let h = harness("funding-gas-fallback");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(USDT, 25_000_000)
                 .native(20_000_000_000_000_000_000),
         )
@@ -2224,7 +2234,7 @@ mod tests {
     #[tokio::test]
     async fn funding_gas_price_is_cached_for_60s() {
         let h = harness("funding-gas-cache");
-        let node = mock_rpc(MockChain::default().native(1)).await;
+        let node = mock_rpc(MockChain::on(CELO_CHAIN).native(1)).await;
         let api = mock_api(200, 200, 0.00073).await;
         seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
 
@@ -2240,7 +2250,7 @@ mod tests {
     #[tokio::test]
     async fn funding_no_operator_key_is_a_read_error() {
         let h = harness("funding-no-key");
-        let node = mock_rpc(MockChain::default().native(1)).await;
+        let node = mock_rpc(MockChain::on(CELO_CHAIN).native(1)).await;
         let api = mock_api(200, 200, 0.00073).await;
         seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
         std::fs::remove_file(h.root.join("bot-a").join("stitch.key")).unwrap();
@@ -2262,7 +2272,7 @@ mod tests {
     async fn funding_unknown_chain_counts_nonzero_gas() {
         let h = harness("funding-unknown-chain");
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(999)
                 .native(1)
                 .symbol(USDT, "USD₮")
                 .symbol(CNGN, "cNGN"),
@@ -2300,7 +2310,7 @@ mod tests {
 
         // Another chain, so the symbols just learned on 999 (kept, since they
         // can't change) don't answer for it.
-        let empty = mock_rpc(MockChain::default().native(0)).await;
+        let empty = mock_rpc(MockChain::on(998).native(0)).await;
         let toml = std::fs::read_to_string(&path)
             .unwrap()
             .replace(&node.url, &empty.url)
@@ -2331,7 +2341,7 @@ mod tests {
     async fn funding_prices_usdc_debt_at_one_dollar() {
         let h = harness("funding-usdc-base");
         let usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-        let node = mock_rpc(MockChain::default().balance(usdc, 40_000_000).native(1)).await;
+        let node = mock_rpc(MockChain::on(8453).balance(usdc, 40_000_000).native(1)).await;
         let api = mock_api(200, 200, 0.00073).await;
         let corridor = setup::find_corridor("cngn-usdc-base").unwrap();
         setup::write_config(h.root.join("bot-a"), corridor, TEST_KEY).unwrap();
@@ -2366,7 +2376,7 @@ mod tests {
         // GD on Celo, the debt token of the live cNGN/GD corridor.
         let gd = "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A";
         let node = mock_rpc(
-            MockChain::default()
+            MockChain::on(CELO_CHAIN)
                 .balance(gd, 20_000_000_000_000_000_000)
                 .balance(CNGN, 2_000_000)
                 .native(20_000_000_000_000_000_000)
@@ -2414,7 +2424,7 @@ mod tests {
     #[tokio::test]
     async fn a_dollar_pool_is_never_flagged_unpriceable() {
         let h = harness("funding-priceable");
-        let node = mock_rpc(MockChain::default().native(1)).await;
+        let node = mock_rpc(MockChain::on(CELO_CHAIN).native(1)).await;
         let api = mock_api(200, 200, 11.5).await;
         seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
 

@@ -1671,7 +1671,7 @@ mod tests {
         h: &Harness,
         name: &str,
     ) -> crate::panel::http::mock_chain::MockNode {
-        let node = mock_rpc(MockChain::default()).await;
+        let node = mock_rpc(MockChain::on(56)).await;
         seed_panel_bot(h, name);
         point_at_chain(h, name, &node.url);
         node
@@ -2517,8 +2517,7 @@ mod tests {
         // the same rule, but its read can be seconds old, so the route reads
         // the wallet again itself.
         let h = harness("delete-config-funded");
-        let node =
-            mock_rpc(MockChain::default().balance(BSC_USDT, 25_000_000_000_000_000_000)).await;
+        let node = mock_rpc(MockChain::on(56).balance(BSC_USDT, 25_000_000_000_000_000_000)).await;
         seed_panel_bot(&h, "bot-a");
         point_at_chain(&h, "bot-a", &node.url);
         let (status, body) = delete_config(&h, "bot-a").await;
@@ -2581,7 +2580,7 @@ mod tests {
         // Compose service `foo` mounting `bots/custom-dir` — the old path used
         // bots/foo and left the real config behind.
         let h = harness("delete-compose-path");
-        let node = mock_rpc(MockChain::default()).await;
+        let node = mock_rpc(MockChain::on(56)).await;
         write_bot(&h.root, "custom-dir");
         point_at_chain(&h, "custom-dir", &node.url);
         let mut c = container("stitch-foo", ContainerState::Running);
@@ -2615,7 +2614,7 @@ mod tests {
     #[tokio::test]
     async fn delete_config_removes_flat_layout_files() {
         let h = harness("delete-flat");
-        let node = mock_rpc(MockChain::default()).await;
+        let node = mock_rpc(MockChain::on(56)).await;
         let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
         let toml = h.root.join("stitch.bot1.toml");
         let key = h.root.join("stitch.bot1.key");
@@ -2654,7 +2653,7 @@ mod tests {
     #[tokio::test]
     async fn delete_config_removes_a_config_only_bot() {
         let h = harness("delete-config-only");
-        let node = mock_rpc(MockChain::default()).await;
+        let node = mock_rpc(MockChain::on(56)).await;
         write_bot(&h.root, "bot-a");
         point_at_chain(&h, "bot-a", &node.url);
         let (status, body) = delete_config(&h, "bot-a").await;

@@ -167,10 +167,13 @@ with a 200, so those don't fail over. Once a fallback answers, every client in
 the bot starts there, and the primary gets one call a minute until it answers
 again.
 
-Before a fallback serves its first call, Stitch asks it for `eth_chainId`. One
-that reports a different chain from `chain_id` is never used, and the bot logs
-an error naming its host. The primary isn't checked; it's the node the bot has
-always trusted.
+Before any endpoint serves its first call, the primary included, Stitch asks it
+for `eth_chainId`, once per process. One that reports a different chain from
+`chain_id` is never used, and the bot logs an error naming its host. If the
+primary is the one on the wrong chain and no fallback serves the right one,
+every call fails with "the RPC at … serves chain X, not chain Y" until the URL
+is fixed. The bot quotes nothing rather than quoting off another network's
+balances. The panel shows the same message.
 
 Broadcasts are stricter. If the primary refuses a signed transaction, that's
 final. If the primary's answer is lost (the connection drops after sending),

@@ -1758,7 +1758,7 @@ mod tests {
 
         /// A vault on the BSC cNGN/USDT pair, signed for by `strategy`.
         fn vault_chain(strategy: &str, settlement: &str, corridor: &str) -> MockChain {
-            MockChain::default()
+            MockChain::on(56)
                 .with_code(VAULT, vec![0x60, 0x80, 0x60, 0x40])
                 .view_address(VAULT, "settlementAsset()", settlement)
                 .view_address(VAULT, "corridorAsset()", corridor)
@@ -1909,7 +1909,7 @@ mod tests {
         #[tokio::test]
         async fn an_address_with_no_contract_writes_nothing() {
             let h = harness("vault-link-eoa");
-            let node = mock_rpc(MockChain::default()).await;
+            let node = mock_rpc(MockChain::on(56)).await;
             seed(&h, "bot-a", &node.url, ContainerState::Running);
             let before = config(&h, "bot-a");
             let venue = venue(Some(accepted(None)), 200, VAULT_KEY).await;

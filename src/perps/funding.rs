@@ -173,6 +173,11 @@ mod tests {
             }
         }
         async fn rpc(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            // The client confirms the endpoint serves the config's chain
+            // (Base, in the example config) before its first call.
+            if body["method"] == "eth_chainId" {
+                return Json(json!({"jsonrpc":"2.0","id":body["id"],"result":"0x2105"}));
+            }
             assert_eq!(body["method"], "eth_getTransactionCount");
             Json(json!({"jsonrpc":"2.0","id":body["id"],"result":"0x1"}))
         }
