@@ -1105,7 +1105,12 @@ async fn fetch_feed_prices(plans: &[TokenPlan]) -> HashMap<String, Result<f64, S
 /// With a price: the dollar test, against the figure this chain and this many
 /// pending approvals call for. Without one (a chain nobody prices): any
 /// non-zero balance, because there is no threshold to hold it to.
-fn gas_ok(balance: Option<U256>, usd: Option<f64>, priced: bool, min_usd: f64) -> Option<bool> {
+pub(super) fn gas_ok(
+    balance: Option<U256>,
+    usd: Option<f64>,
+    priced: bool,
+    min_usd: f64,
+) -> Option<bool> {
     let balance = balance?;
     if priced {
         return usd.map(|u| u >= min_usd);
@@ -1121,7 +1126,7 @@ fn gas_ok(balance: Option<U256>, usd: Option<f64>, priced: bool, min_usd: f64) -
 /// several dollars, so a flat $1 would pass the gate and then die on the second
 /// approve, with no way left in the wizard to end at either "live" or
 /// "waiting"; on Celo the same $1 asks for a hundred times what is needed.
-fn min_gas_usd(chain_id: u64, approvals_pending: usize) -> f64 {
+pub(super) fn min_gas_usd(chain_id: u64, approvals_pending: usize) -> f64 {
     let per_tx = gas_token(chain_id)
         .map(|g: GasToken| g.tx_gas_usd)
         .unwrap_or(FUND_MIN_GAS_USD);

@@ -13,10 +13,10 @@
 //! with the bot's own wallet.
 //!
 //! The checks are plain functions over facts fetched once up front: the chain's
-//! answers about the address, and the venue's own vault check. Later checks
-//! are skipped when an earlier one leaves nothing to ask (no contract means no
-//! views to read). The venue's check is advice; enroll runs the same rules and
-//! has the last word.
+//! answers about the address and the bot's signing wallet, and the venue's own
+//! vault check. Later checks are skipped when an earlier one leaves nothing to
+//! ask (no contract means no views to read). The venue's check is advice;
+//! enroll runs the same rules and has the last word.
 //!
 //! Every signer backend enrolls the same way: `MakerEnroll` is EIP-712 typed
 //! data signed through `sign_typed`, which local keys, Turnkey, MPCVault and
@@ -38,12 +38,15 @@ use super::enroll::{
     bot_dir, enrollment_body, refuse_connect_on_unmigrated_flat_layout, signer_for_bot,
     store_maker_key,
 };
-use super::funding::{budgeted, decode_string_return, format_units, symbol_ask};
+use super::funding::{
+    budgeted, decode_string_return, format_units, gas_ok, min_gas_usd, symbol_ask, units,
+};
 use super::settings::{config_path, network_name, read_toml, save_and_restart};
 use super::{ApiError, AppState};
 use crate::chain::rpc::{Rpc, RpcEndpoints};
 use crate::config::{rfq_default_flag_in_dir, Config};
 use crate::panel::inventory::Bot;
+use crate::panel::native_price::{gas_symbol, gas_token};
 use crate::protocol::vault::{
     encode_close_only, encode_corridor_asset, encode_operator_admin, encode_paused,
     encode_quotable_corridor, encode_quotable_settlement, encode_settlement_asset,
@@ -99,7 +102,7 @@ pub struct Check {
 
 /// The fixed rows, in the order they run. The `textile` row stands for the
 /// venue's answer, which can expand into several rows once it is in.
-const ROWS: [&str; 10] = [
+const ROWS: [&str; 11] = [
     "address",
     "not-signer",
     "contract",
@@ -110,6 +113,7 @@ const ROWS: [&str; 10] = [
     "paused",
     "close-only",
     "inventory",
+    "signer-gas",
 ];
 
 fn label(id: &str) -> &'static str {
@@ -126,6 +130,7 @@ fn label(id: &str) -> &'static str {
         "paused" => "Not paused",
         "close-only" => "Not close-only",
         "inventory" => "Has something to quote",
+        "signer-gas" => "Bot's wallet has gas",
         // `textile`, `textile-executor` and `textile-issue-N`.
         _ => "Textile would accept it",
     }
@@ -171,6 +176,7 @@ struct PoolPair {
 struct BotSide {
     /// The address the bot signs with. The vault's strategy signer must be it.
     signer: Address,
+    chain_id: u64,
     network: String,
     pools: Vec<PoolPair>,
 }
@@ -198,6 +204,7 @@ impl BotSide {
             .collect();
         Self {
             signer,
+            chain_id: cfg.chain_id,
             network: network_name(cfg.chain_id),
             pools,
         }
@@ -233,6 +240,9 @@ struct ChainFacts {
     close_only: Option<bool>,
     quotable_settlement: Option<U256>,
     quotable_corridor: Option<U256>,
+    /// The signer wallet's native balance, in wei. `Err` is the node not
+    /// answering.
+    signer_gas: Result<U256, String>,
 }
 
 /// The venue's answer to `/v2/maker/vault-check`.
@@ -250,6 +260,8 @@ enum Textile {
 #[derive(Debug, Clone)]
 struct Facts {
     chain: ChainFacts,
+    /// Dollars per whole gas coin, when anything could price it.
+    gas_usd: Option<f64>,
     textile: Textile,
     /// Tickers for the vault's two assets, where known.
     symbols: HashMap<Address, String>,
@@ -645,6 +657,73 @@ fn check_inventory(bot: &BotSide, facts: &Facts, settlement: Address, corridor: 
     )
 }
 
+/// The signer wallet pays gas for every transaction the bot sends while it
+/// trades the vault, like recalling staked settlement (`prepareSettlement`)
+/// and moving the liquid floor (`src/rfq/liquidity.rs`). Quotes themselves are
+/// signed off-chain, so a bot with an empty wallet connects, quotes, and then
+/// can't send the first of those. The bar is the funding gate's: one
+/// transaction's worth at the chain's [`min_gas_usd`], or any balance at all on
+/// a chain nothing can price.
+fn check_signer_gas(bot: &BotSide, chain: &ChainFacts, gas_usd: Option<f64>) -> Check {
+    let signer = bot.signer.to_checksum(None);
+    let network = &bot.network;
+    let symbol = gas_symbol(bot.chain_id);
+    let wei = match &chain.signer_gas {
+        Ok(wei) => *wei,
+        Err(e) => {
+            return row(
+                "signer-gas",
+                Status::Fail,
+                format!("Couldn't read the gas balance of {signer} on {network}: {e}"),
+            )
+        }
+    };
+    let min_usd = min_gas_usd(bot.chain_id, 1);
+    let usd = gas_usd.map(|price| units(wei, 18) * price);
+    let held = match usd {
+        Some(usd) => format!("{} {symbol} ({})", format_units(wei, 18), dollars(usd)),
+        None => format!("{} {symbol}", format_units(wei, 18)),
+    };
+    if gas_ok(Some(wei), usd, gas_usd.is_some(), min_usd) == Some(true) {
+        return row(
+            "signer-gas",
+            Status::Ok,
+            format!("{signer} holds {held} to pay for its transactions."),
+        );
+    }
+    let short = if wei.is_zero() {
+        format!("The bot's wallet {signer} holds no {symbol}.")
+    } else {
+        format!(
+            "The bot's wallet {signer} holds {held}, less than one transaction on {network} \
+             costs."
+        )
+    };
+    let ask = if gas_usd.is_some() {
+        format!("at least {} of {symbol}", dollars(min_usd))
+    } else {
+        format!("some {symbol}")
+    };
+    row(
+        "signer-gas",
+        Status::Fail,
+        format!(
+            "{short} It pays the gas for what the bot sends on the vault's behalf, like \
+             recalling staked funds and moving the liquid floor, and can't send any of it \
+             without gas. Send {ask} to {signer} on {network}, then check again."
+        ),
+    )
+}
+
+/// Dollars as the checklist shows them: cents, or "under $0.01".
+fn dollars(usd: f64) -> String {
+    if usd > 0.0 && usd < 0.01 {
+        "under $0.01".to_string()
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
 /// Every check after the precheck, over facts already fetched.
 fn assess_facts(bot: &BotSide, facts: &Facts, mut rows: Vec<Check>) -> Vec<Check> {
     rows.push(check_contract(&bot.network, &facts.chain));
@@ -665,6 +744,7 @@ fn assess_facts(bot: &BotSide, facts: &Facts, mut rows: Vec<Check>) -> Vec<Check
     rows.push(check_paused(&facts.chain));
     rows.push(check_close_only(facts, id.settlement, id.corridor));
     rows.push(check_inventory(bot, facts, id.settlement, id.corridor));
+    rows.push(check_signer_gas(bot, &facts.chain, facts.gas_usd));
     rows
 }
 
@@ -765,8 +845,9 @@ fn as_bool(word: U256) -> Option<bool> {
     }
 }
 
-/// Every chain read at once: the code check beside one batch of views.
-async fn read_chain(endpoints: &RpcEndpoints, vault: Address) -> ChainFacts {
+/// Every chain read at once: the code check beside one batch of views, with
+/// the signer wallet's gas balance in the same batch.
+async fn read_chain(endpoints: &RpcEndpoints, vault: Address, signer: Address) -> ChainFacts {
     let rpc_url = endpoints.primary();
     let rpc = Rpc::new(endpoints);
     let asks: Vec<Ask> = [
@@ -782,6 +863,7 @@ async fn read_chain(endpoints: &RpcEndpoints, vault: Address) -> ChainFacts {
     ]
     .into_iter()
     .map(|(data, view)| Ask::call(vault, data, format!("{view} on {vault}")))
+    .chain(std::iter::once(Ask::native(signer)))
     .collect();
     let (code, answers) = tokio::join!(
         budgeted(rpc_url, rpc.get_code(vault)),
@@ -805,6 +887,7 @@ async fn read_chain(endpoints: &RpcEndpoints, vault: Address) -> ChainFacts {
         close_only: flag(6),
         quotable_settlement: views[7],
         quotable_corridor: views[8],
+        signer_gas: word(&answers[9], &asks[9].what).map_err(|e| format!("{e:#}")),
     }
 }
 
@@ -847,8 +930,33 @@ async fn ask_textile(origin: &str, chain_id: u64, vault: Address, signer: Addres
     }
 }
 
+/// The gas coin's dollar price, from the same lookup the funding gate uses,
+/// asked of the Textile API this bot talks to. A known chain whose lookups all
+/// fail still gets its low fallback, so a slow price source never turns into
+/// "any balance will do".
+async fn gas_price_usd(state: &AppState, chain_id: u64, origin: &str) -> Option<f64> {
+    let looked_up = tokio::time::timeout(
+        GAS_PRICE_BUDGET,
+        state.native_prices.get(chain_id, Some(origin)),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|p| p.usd);
+    looked_up.or_else(|| gas_token(chain_id).map(|g| g.fallback_usd))
+}
+
+/// How long the checklist waits on the gas price before using the fallback.
+const GAS_PRICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// Run every check for `raw` against this bot. Reads only.
-async fn assess(cfg: &Config, signer: Address, raw: &str, venue_url: Option<&str>) -> Verdict {
+async fn assess(
+    state: &AppState,
+    cfg: &Config,
+    signer: Address,
+    raw: &str,
+    venue_url: Option<&str>,
+) -> Verdict {
     let bot = BotSide::of(cfg, signer);
     let (vault, rows) = match precheck(raw, signer) {
         Ok(found) => found,
@@ -860,15 +968,20 @@ async fn assess(cfg: &Config, signer: Address, raw: &str, venue_url: Option<&str
             }
         }
     };
-    let chain = read_chain(&cfg.rpc_endpoints(), vault).await;
+    let origin = venue_origin_from_config(cfg, venue_url);
+    let endpoints = cfg.rpc_endpoints();
+    let (chain, gas_usd) = tokio::join!(
+        read_chain(&endpoints, vault, signer),
+        gas_price_usd(state, cfg.chain_id, &origin),
+    );
     let symbols = read_symbols(cfg, &chain).await;
     let mut facts = Facts {
         chain,
+        gas_usd,
         textile: Textile::NotAsked,
         symbols,
     };
     if identity_ok(&bot, &facts) {
-        let origin = venue_origin_from_config(cfg, venue_url);
         facts.textile = ask_textile(&origin, cfg.chain_id, vault, signer).await;
     }
     let checks = assess_facts(&bot, &facts, rows);
@@ -946,7 +1059,14 @@ pub async fn check(
     let path = config_path(&bot)?;
     let cfg = parse_config(&read_toml(&path)?)?;
     let signer = configured_signer(&bot)?;
-    let verdict = assess(&cfg, signer, &body.address, body.venue_url.as_deref()).await;
+    let verdict = assess(
+        &state,
+        &cfg,
+        signer,
+        &body.address,
+        body.venue_url.as_deref(),
+    )
+    .await;
     Ok(Json(verdict.body()).into_response())
 }
 
@@ -968,7 +1088,14 @@ pub async fn link(
     // signer is only built once the checks pass: building an MPCVault signer
     // binds its callback port, which a refused connect has no reason to do.
     let checked_as = configured_signer(&bot)?;
-    let verdict = assess(&cfg, checked_as, &body.address, body.venue_url.as_deref()).await;
+    let verdict = assess(
+        &state,
+        &cfg,
+        checked_as,
+        &body.address,
+        body.venue_url.as_deref(),
+    )
+    .await;
     let Some(target) = verdict.target else {
         return Ok(refused(&verdict));
     };
@@ -1236,6 +1363,7 @@ mod tests {
     const USDT: &str = "0x55d398326f99059fF775485246999027B3197955";
     const CNGN: &str = "0xa8AEA66B361a8d53e8865c62D142167Af28Af058";
     const WBRL: &str = "0x00000000000000000000000000000000000000b1";
+    const ONE_BNB: u128 = 1_000_000_000_000_000_000;
 
     fn addr(s: &str) -> Address {
         s.parse().unwrap()
@@ -1254,6 +1382,7 @@ mod tests {
     fn bot() -> BotSide {
         BotSide {
             signer: addr(SIGNER),
+            chain_id: 56,
             network: "BNB Smart Chain".to_string(),
             pools: vec![pool("cNGN / USDT", CNGN, USDT)],
         }
@@ -1273,7 +1402,9 @@ mod tests {
                 close_only: Some(false),
                 quotable_settlement: Some(U256::from(25_000_000_000_000_000_000u128)),
                 quotable_corridor: Some(U256::ZERO),
+                signer_gas: Ok(U256::from(ONE_BNB / 10)),
             },
+            gas_usd: Some(600.0),
             textile: Textile::Answered(VaultCheckResponse {
                 registered: true,
                 risk_signer_ok: Some(true),
@@ -1320,6 +1451,7 @@ mod tests {
                 "paused",
                 "close-only",
                 "inventory",
+                "signer-gas",
             ]
         );
         assert_eq!(
@@ -1609,6 +1741,71 @@ mod tests {
     }
 
     #[test]
+    fn a_signer_with_gas_passes() {
+        let rows = rows_for(&facts());
+        let gas = status_of(&rows, "signer-gas");
+        assert_eq!(gas.status, Status::Ok, "{gas:?}");
+        assert_eq!(
+            gas.detail,
+            format!("{SIGNER} holds 0.1 BNB ($60.00) to pay for its transactions.")
+        );
+    }
+
+    #[test]
+    fn a_signer_with_no_gas_blocks_connecting() {
+        let mut f = facts();
+        f.chain.signer_gas = Ok(U256::ZERO);
+        let rows = rows_for(&f);
+        let gas = status_of(&rows, "signer-gas");
+        assert_eq!(gas.status, Status::Fail, "{gas:?}");
+        assert!(gas.detail.contains("holds no BNB"), "{gas:?}");
+        assert!(gas
+            .detail
+            .contains(&format!("to {SIGNER} on BNB Smart Chain")));
+        assert!(gas.detail.contains("at least $0.03 of BNB"), "{gas:?}");
+        assert!(failed(&rows));
+    }
+
+    #[test]
+    fn dust_below_one_transaction_blocks_connecting() {
+        let mut f = facts();
+        // 0.00001 BNB at $600 is $0.006, under BSC's $0.025 a transaction.
+        f.chain.signer_gas = Ok(U256::from(ONE_BNB / 100_000));
+        let rows = rows_for(&f);
+        let gas = status_of(&rows, "signer-gas");
+        assert_eq!(gas.status, Status::Fail, "{gas:?}");
+        assert!(gas.detail.contains("0.00001 BNB (under $0.01)"), "{gas:?}");
+        assert!(gas.detail.contains("less than one transaction"), "{gas:?}");
+
+        // One transaction's worth is enough.
+        f.chain.signer_gas = Ok(U256::from(ONE_BNB / 20_000));
+        assert_eq!(status_of(&rows_for(&f), "signer-gas").status, Status::Ok);
+    }
+
+    #[test]
+    fn an_unread_gas_balance_blocks_connecting() {
+        let mut f = facts();
+        f.chain.signer_gas = Err("connection refused".to_string());
+        let rows = rows_for(&f);
+        let gas = status_of(&rows, "signer-gas");
+        assert_eq!(gas.status, Status::Fail, "{gas:?}");
+        assert!(gas.detail.contains("connection refused"), "{gas:?}");
+    }
+
+    #[test]
+    fn an_unpriced_chain_asks_only_for_some_gas() {
+        let mut f = facts();
+        f.gas_usd = None;
+        f.chain.signer_gas = Ok(U256::from(1u8));
+        assert_eq!(status_of(&rows_for(&f), "signer-gas").status, Status::Ok);
+        f.chain.signer_gas = Ok(U256::ZERO);
+        let rows = rows_for(&f);
+        let gas = status_of(&rows, "signer-gas");
+        assert_eq!(gas.status, Status::Fail);
+        assert!(gas.detail.contains("Send some BNB"), "{gas:?}");
+    }
+
+    #[test]
     fn unread_flags_are_skipped_not_assumed() {
         let mut f = facts();
         f.chain.paused = None;
@@ -1777,6 +1974,8 @@ mod tests {
                     U256::from(25_000_000_000_000_000_000u128),
                 )
                 .view(VAULT, "quotableCorridor()", U256::ZERO)
+                // 0.1 BNB for the signer's gas.
+                .native(100_000_000_000_000_000)
         }
 
         async fn healthy_chain() -> MockNode {
@@ -1932,6 +2131,43 @@ mod tests {
                 venue.checks.load(Ordering::SeqCst),
                 0,
                 "Textile isn't asked"
+            );
+            assert!(venue.enrolls.lock().unwrap().is_empty());
+            assert_eq!(config(&h, "bot-a"), before);
+            assert_eq!(key(&h, "bot-a"), None);
+            assert!(!restarted(&h, "bot-a"));
+        }
+
+        #[tokio::test]
+        async fn a_signer_with_no_gas_writes_nothing() {
+            let h = harness("vault-link-no-gas");
+            let node = mock_rpc(vault_chain(SIGNER, USDT, CNGN).native(0)).await;
+            seed(&h, "bot-a", &node.url, ContainerState::Running);
+            let before = config(&h, "bot-a");
+            let venue = venue(Some(accepted(None)), 200, VAULT_KEY).await;
+
+            let (status, body) = h
+                .post_json(
+                    "/api/bots/bot-a/vault/check",
+                    json!({ "address": VAULT, "venueUrl": venue.origin }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v = Harness::parse(&body);
+            assert_eq!(v["ok"], false, "{body}");
+            assert_eq!(check_row(&v, "signer-gas")["status"], "fail");
+
+            let (status, body) = h
+                .post_json(
+                    "/api/bots/bot-a/vault",
+                    json!({ "address": VAULT, "venueUrl": venue.origin }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let v = Harness::parse(&body);
+            assert!(
+                v["error"].as_str().unwrap().contains("holds no BNB"),
+                "{body}"
             );
             assert!(venue.enrolls.lock().unwrap().is_empty());
             assert_eq!(config(&h, "bot-a"), before);
