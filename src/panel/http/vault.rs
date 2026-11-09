@@ -41,10 +41,11 @@ use super::enroll::{
 use super::funding::{
     budgeted, decode_string_return, format_units, gas_ok, min_gas_usd, symbol_ask, units,
 };
-use super::settings::{config_path, network_name, read_toml, save_and_restart};
+use super::settings::{config_path, network_name, read_toml, save_and_restart_with};
 use super::{ApiError, AppState};
 use crate::chain::rpc::{Rpc, RpcEndpoints};
 use crate::config::{rfq_default_flag_in_dir, Config};
+use crate::panel::docker::ContainerState;
 use crate::panel::inventory::Bot;
 use crate::panel::native_price::{gas_symbol, gas_token};
 use crate::protocol::vault::{
@@ -102,7 +103,7 @@ pub struct Check {
 
 /// The fixed rows, in the order they run. The `textile` row stands for the
 /// venue's answer, which can expand into several rows once it is in.
-const ROWS: [&str; 11] = [
+const ROWS: [&str; 12] = [
     "address",
     "not-signer",
     "contract",
@@ -114,6 +115,7 @@ const ROWS: [&str; 11] = [
     "close-only",
     "inventory",
     "signer-gas",
+    "bot-running",
 ];
 
 fn label(id: &str) -> &'static str {
@@ -131,6 +133,7 @@ fn label(id: &str) -> &'static str {
         "close-only" => "Not close-only",
         "inventory" => "Has something to quote",
         "signer-gas" => "Bot's wallet has gas",
+        "bot-running" => "Bot is running",
         // `textile`, `textile-executor` and `textile-issue-N`.
         _ => "Textile would accept it",
     }
@@ -171,18 +174,44 @@ struct PoolPair {
     debt_decimals: u8,
 }
 
+/// Whether the bot's process is up, as the panel's container runtime reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BotRun {
+    Running,
+    /// A container in any other state: stopped, paused, restarting.
+    NotRunning(ContainerState),
+    /// A config directory the panel has never launched a container for.
+    NoContainer,
+}
+
+impl BotRun {
+    fn of(bot: &Bot) -> Self {
+        Self::from_parts(bot.container_name.is_some(), bot.state)
+    }
+
+    fn from_parts(has_container: bool, state: ContainerState) -> Self {
+        match (has_container, state) {
+            (false, _) => BotRun::NoContainer,
+            (true, state) if state.is_running() => BotRun::Running,
+            (true, state) => BotRun::NotRunning(state),
+        }
+    }
+}
+
 /// The bot side of the comparison.
 #[derive(Debug, Clone)]
 struct BotSide {
+    name: String,
     /// The address the bot signs with. The vault's strategy signer must be it.
     signer: Address,
     chain_id: u64,
     network: String,
     pools: Vec<PoolPair>,
+    run: BotRun,
 }
 
 impl BotSide {
-    fn of(cfg: &Config, signer: Address) -> Self {
+    fn of(bot: &Bot, cfg: &Config, signer: Address) -> Self {
         let pools = cfg
             .pools
             .iter()
@@ -203,10 +232,12 @@ impl BotSide {
             })
             .collect();
         Self {
+            name: bot.name.clone(),
             signer,
             chain_id: cfg.chain_id,
             network: network_name(cfg.chain_id),
             pools,
+            run: BotRun::of(bot),
         }
     }
 
@@ -715,6 +746,85 @@ fn check_signer_gas(bot: &BotSide, chain: &ChainFacts, gas_usd: Option<f64>) -> 
     )
 }
 
+/// The vault settles deposit and redeem epochs only against a NAV attestation
+/// its strategy signer countersigned, and this bot is that signer: Textile asks
+/// it over the maker stream the bot holds open. So a vault whose bot isn't
+/// running quotes nothing and leaves every closed epoch waiting, depositors'
+/// money included, until it is.
+///
+/// Connecting restarts a running bot onto the vault and leaves a stopped one
+/// stopped (`restart_after_save`). That is a warning, not a refusal: connecting
+/// a stopped bot and starting it later is legitimate.
+///
+/// A container that is neither running nor stopped (paused, restarting,
+/// removing, or a state the runtime couldn't read) is a refusal. Its process
+/// holds the old config in memory and can't take a clean restart, so
+/// `save_and_restart` either refuses the switch after enroll has rotated the
+/// maker key, or writes the vault config without restarting and leaves the
+/// process to resume as the old wallet's maker. Refusing here, before enroll,
+/// is the only point where nothing has changed yet.
+fn check_bot_running(bot: &BotSide) -> Check {
+    row(
+        "bot-running",
+        bot_running_status(bot.run),
+        bot_running_detail(&bot.name, bot.run),
+    )
+}
+
+fn bot_running_status(run: BotRun) -> Status {
+    match run {
+        BotRun::Running => Status::Ok,
+        BotRun::NotRunning(state) if !state.is_terminal() => Status::Fail,
+        BotRun::NotRunning(_) | BotRun::NoContainer => Status::Warn,
+    }
+}
+
+fn bot_running_detail(name: &str, run: BotRun) -> String {
+    let waits = "Until it runs, the vault quotes nothing and deposits wait: each epoch \
+                 settles only once this bot countersigns its NAV.";
+    match run {
+        BotRun::Running => format!("{name} is running. Connecting restarts it on the vault."),
+        BotRun::NotRunning(state) if state.is_terminal() => format!(
+            "{name} is stopped, and connecting won't start it. {waits} Start it once the \
+             vault is connected."
+        ),
+        BotRun::NotRunning(ContainerState::Unknown) => format!(
+            "The panel can't tell whether {name} is running, so it can't move it onto the \
+             vault safely. Stop it, then check again."
+        ),
+        BotRun::NotRunning(state) => format!(
+            "{name} is {}, so it can't take the restart that moves it onto the vault and \
+             would keep running its old config. Stop it, then check again.",
+            state.as_str()
+        ),
+        BotRun::NoContainer => format!(
+            "{name} has no container, so it isn't running and connecting won't create one. \
+             {waits} Recreate it once the vault is connected."
+        ),
+    }
+}
+
+/// Refuses a maker switch for a bot that can't take the restart that applies
+/// it. Pure over the run state, so the handlers can call it on a fresh read.
+fn refuse_unrestartable(name: &str, run: BotRun) -> Result<(), ApiError> {
+    if bot_running_status(run) != Status::Fail {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "Nothing was changed. {}",
+        bot_running_detail(name, run)
+    )))
+}
+
+/// Re-reads the bot right before enroll rotates its maker key. The checklist's
+/// run state was read before several seconds of chain and venue calls, and a
+/// container can be paused or start restarting in that time; enroll is the
+/// last point where refusing still leaves nothing changed.
+async fn refuse_unrestartable_now(state: &AppState, name: &str) -> Result<(), ApiError> {
+    let fresh = state.bot(name).await?;
+    refuse_unrestartable(&fresh.name, BotRun::of(&fresh))
+}
+
 /// Dollars as the checklist shows them: cents, or "under $0.01".
 fn dollars(usd: f64) -> String {
     if usd > 0.0 && usd < 0.01 {
@@ -745,6 +855,7 @@ fn assess_facts(bot: &BotSide, facts: &Facts, mut rows: Vec<Check>) -> Vec<Check
     rows.push(check_close_only(facts, id.settlement, id.corridor));
     rows.push(check_inventory(bot, facts, id.settlement, id.corridor));
     rows.push(check_signer_gas(bot, &facts.chain, facts.gas_usd));
+    rows.push(check_bot_running(bot));
     rows
 }
 
@@ -952,12 +1063,13 @@ const GAS_PRICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 /// Run every check for `raw` against this bot. Reads only.
 async fn assess(
     state: &AppState,
+    panel_bot: &Bot,
     cfg: &Config,
     signer: Address,
     raw: &str,
     venue_url: Option<&str>,
 ) -> Verdict {
-    let bot = BotSide::of(cfg, signer);
+    let bot = BotSide::of(panel_bot, cfg, signer);
     let (vault, rows) = match precheck(raw, signer) {
         Ok(found) => found,
         Err(checks) => {
@@ -1061,6 +1173,7 @@ pub async fn check(
     let signer = configured_signer(&bot)?;
     let verdict = assess(
         &state,
+        &bot,
         &cfg,
         signer,
         &body.address,
@@ -1090,6 +1203,7 @@ pub async fn link(
     let checked_as = configured_signer(&bot)?;
     let verdict = assess(
         &state,
+        &bot,
         &cfg,
         checked_as,
         &body.address,
@@ -1107,6 +1221,7 @@ pub async fn link(
     let candidate_cfg = parse_config(&candidate)?;
     // Before enrolling the new maker: owed records ship under the old one.
     super::changes::deliver_before_key_change(&path).await?;
+    refuse_unrestartable_now(&state, &bot.name).await?;
     let enrolled = enroll(&candidate_cfg, &signer, body.venue_url.as_deref()).await?;
     let (edited, outcome) = apply_enrollment(
         &candidate,
@@ -1161,6 +1276,7 @@ pub async fn unlink(
     let candidate_cfg = parse_config(&candidate)?;
     // Before enrolling the new maker: owed records ship under the old one.
     super::changes::deliver_before_key_change(&path).await?;
+    refuse_unrestartable_now(&state, &bot.name).await?;
     let enrolled = enroll(&candidate_cfg, &signer, query.venue_url.as_deref()).await?;
     let (edited, outcome) = apply_enrollment(
         &candidate,
@@ -1268,7 +1384,9 @@ async fn switch_maker(
         undo();
         return Err(e);
     }
-    let saved = save_and_restart(state, bot, path, edited, origin, 0, Some(extra)).await;
+    // Enroll rotated the key, which the config diff may not show (same vault, same
+    // maker id), so the switch is applied by a clean restart or not at all.
+    let saved = save_and_restart_with(state, bot, path, edited, origin, 0, Some(extra), true).await;
     if read_toml(path).ok().as_deref() != Some(edited) {
         undo();
     }
@@ -1381,10 +1499,12 @@ mod tests {
 
     fn bot() -> BotSide {
         BotSide {
+            name: "bot-a".to_string(),
             signer: addr(SIGNER),
             chain_id: 56,
             network: "BNB Smart Chain".to_string(),
             pools: vec![pool("cNGN / USDT", CNGN, USDT)],
+            run: BotRun::Running,
         }
     }
 
@@ -1452,6 +1572,7 @@ mod tests {
                 "close-only",
                 "inventory",
                 "signer-gas",
+                "bot-running",
             ]
         );
         assert_eq!(
@@ -1738,6 +1859,126 @@ mod tests {
         assert_eq!(inventory.status, Status::Warn);
         assert!(inventory.detail.contains("Fund the vault"));
         assert!(!failed(&rows), "warnings never block");
+    }
+
+    #[test]
+    fn a_running_bot_passes_the_run_check() {
+        let rows = rows_for(&facts());
+        let run = status_of(&rows, "bot-running");
+        assert_eq!(run.status, Status::Ok, "{run:?}");
+        assert_eq!(
+            run.detail,
+            "bot-a is running. Connecting restarts it on the vault."
+        );
+    }
+
+    fn run_row(run: BotRun) -> (Check, Vec<Check>) {
+        let mut b = bot();
+        b.run = run;
+        let (_, rows) = precheck(VAULT, addr(SIGNER)).unwrap();
+        let rows = assess_facts(&b, &facts(), rows);
+        (status_of(&rows, "bot-running").clone(), rows)
+    }
+
+    #[test]
+    fn a_stopped_bot_is_a_warning_not_a_refusal() {
+        for run in [
+            BotRun::NotRunning(ContainerState::Exited),
+            BotRun::NotRunning(ContainerState::Created),
+            BotRun::NotRunning(ContainerState::Dead),
+            BotRun::NoContainer,
+        ] {
+            let (row, rows) = run_row(run);
+            assert_eq!(row.status, Status::Warn, "{run:?}: {row:?}");
+            assert!(row.detail.contains("deposits wait"), "{run:?}: {row:?}");
+            assert!(!failed(&rows), "{run:?} must not block connecting");
+        }
+    }
+
+    /// The same states `save_and_restart` can't apply a switch to: not running
+    /// and not stopped. Refused before enroll, while nothing has changed.
+    #[test]
+    fn a_bot_that_cant_take_a_clean_restart_blocks_connecting() {
+        for state in [
+            ContainerState::Paused,
+            ContainerState::Restarting,
+            ContainerState::Removing,
+            ContainerState::Unknown,
+        ] {
+            assert!(!state.is_running() && !state.is_terminal(), "{state:?}");
+            let (row, rows) = run_row(BotRun::NotRunning(state));
+            assert_eq!(row.status, Status::Fail, "{state:?}: {row:?}");
+            assert!(
+                row.detail.ends_with("Stop it, then check again."),
+                "{row:?}"
+            );
+            assert!(failed(&rows));
+        }
+        let (row, _) = run_row(BotRun::NotRunning(ContainerState::Paused));
+        assert!(row.detail.starts_with("bot-a is paused"), "{row:?}");
+        let (row, _) = run_row(BotRun::NotRunning(ContainerState::Unknown));
+        assert!(
+            row.detail.starts_with("The panel can't tell whether bot-a"),
+            "{row:?}"
+        );
+    }
+
+    /// The advice has to be something the panel can do from that state.
+    #[test]
+    fn the_advice_matches_what_the_panel_can_do() {
+        for state in [
+            ContainerState::Exited,
+            ContainerState::Created,
+            ContainerState::Dead,
+        ] {
+            let (row, _) = run_row(BotRun::NotRunning(state));
+            assert!(row.detail.starts_with("bot-a is stopped"), "{row:?}");
+            assert!(row
+                .detail
+                .ends_with("Start it once the vault is connected."));
+        }
+        let (row, _) = run_row(BotRun::NoContainer);
+        assert!(row.detail.starts_with("bot-a has no container"), "{row:?}");
+        assert!(row
+            .detail
+            .ends_with("Recreate it once the vault is connected."));
+    }
+
+    #[test]
+    fn only_a_bot_that_cant_restart_is_refused_a_maker_switch() {
+        assert!(refuse_unrestartable("bot-a", BotRun::Running).is_ok());
+        assert!(refuse_unrestartable("bot-a", BotRun::NoContainer).is_ok());
+        assert!(refuse_unrestartable("bot-a", BotRun::NotRunning(ContainerState::Exited)).is_ok());
+        for state in [
+            ContainerState::Paused,
+            ContainerState::Restarting,
+            ContainerState::Removing,
+            ContainerState::Unknown,
+        ] {
+            let err = refuse_unrestartable("bot-a", BotRun::NotRunning(state)).unwrap_err();
+            assert_eq!(err.status, StatusCode::CONFLICT, "{state:?}");
+            assert!(
+                err.message.starts_with("Nothing was changed."),
+                "{}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn the_run_state_comes_from_the_container() {
+        use BotRun::*;
+        let of = BotRun::from_parts;
+        assert_eq!(of(true, ContainerState::Running), Running);
+        assert_eq!(
+            of(true, ContainerState::Exited),
+            NotRunning(ContainerState::Exited)
+        );
+        assert_eq!(
+            of(true, ContainerState::Paused),
+            NotRunning(ContainerState::Paused)
+        );
+        assert_eq!(of(false, ContainerState::Unknown), NoContainer);
     }
 
     #[test]
@@ -2268,10 +2509,10 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_save_that_cant_land_puts_the_old_key_back() {
-            // Paused, with the taker on: turning the taker off is a change the
-            // panel won't persist without a clean restart, so the save is refused
-            // after enroll has already handed over a new key.
+        async fn a_paused_bot_is_refused_before_enroll() {
+            // A paused process holds its old config and can't take the restart
+            // that moves it onto the vault, so the checklist refuses it before
+            // enroll rotates the maker key: nothing is written or re-enrolled.
             let h = harness("vault-link-paused");
             let node = healthy_chain().await;
             seed(&h, "bot-a", &node.url, ContainerState::Paused);
@@ -2285,13 +2526,17 @@ mod tests {
                     json!({ "address": VAULT, "venueUrl": venue.origin }),
                 )
                 .await;
-            assert_eq!(status, StatusCode::CONFLICT, "{body}");
-            assert_eq!(config(&h, "bot-a"), before);
-            assert_eq!(
-                key(&h, "bot-a").as_deref(),
-                Some(OWN_KEY),
-                "the key goes with the config it was written for"
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let v = Harness::parse(&body);
+            assert_eq!(check_row(&v, "bot-running")["status"], "fail");
+            assert!(
+                v["error"].as_str().unwrap().contains("bot-a is paused"),
+                "{body}"
             );
+            assert_eq!(config(&h, "bot-a"), before);
+            assert_eq!(key(&h, "bot-a").as_deref(), Some(OWN_KEY));
+            assert!(venue.enrolls.lock().unwrap().is_empty(), "never enrolled");
+            assert!(!restarted(&h, "bot-a"));
         }
 
         #[tokio::test]
@@ -2362,6 +2607,28 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn disconnecting_a_paused_bot_is_refused_before_enroll() {
+            let h = harness("vault-unlink-paused");
+            let node = healthy_chain().await;
+            seed(&h, "bot-a", &node.url, ContainerState::Paused);
+            let path = h.root.join("bot-a").join("stitch.toml");
+            let linked =
+                setup::link_vault(&config(&h, "bot-a"), VAULT.parse().unwrap(), None).unwrap();
+            std::fs::write(&path, &linked).unwrap();
+            setup::write_rfq_api_key(h.root.join("bot-a"), VAULT_KEY).unwrap();
+            let venue = venue(None, 200, OWN_KEY).await;
+
+            let (status, body) = h
+                .delete(&format!("/api/bots/bot-a/vault?venueUrl={}", venue.origin))
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert!(body.contains("bot-a is paused"), "{body}");
+            assert_eq!(config(&h, "bot-a"), linked);
+            assert_eq!(key(&h, "bot-a").as_deref(), Some(VAULT_KEY));
+            assert!(venue.enrolls.lock().unwrap().is_empty(), "never enrolled");
+        }
+
+        #[tokio::test]
         async fn disconnecting_a_bot_with_no_vault_is_refused() {
             let h = harness("vault-unlink-none");
             let node = healthy_chain().await;
@@ -2371,6 +2638,40 @@ mod tests {
             assert!(
                 body.contains("already trades from its own wallet"),
                 "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stopped_bot_connects_with_a_warning_and_stays_stopped() {
+            let h = harness("vault-link-stopped");
+            let node = healthy_chain().await;
+            seed(&h, "bot-a", &node.url, ContainerState::Exited);
+            let venue = venue(Some(accepted(Some(EXECUTOR))), 200, VAULT_KEY).await;
+
+            let (status, body) = h
+                .post_json(
+                    "/api/bots/bot-a/vault/check",
+                    json!({ "address": VAULT, "venueUrl": venue.origin }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v = Harness::parse(&body);
+            assert_eq!(v["ok"], true, "a warning never blocks: {body}");
+            assert_eq!(check_row(&v, "bot-running")["status"], "warn");
+
+            let (status, body) = h
+                .post_json(
+                    "/api/bots/bot-a/vault",
+                    json!({ "address": VAULT, "venueUrl": venue.origin }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v = Harness::parse(&body);
+            assert_eq!(check_row(&v, "bot-running")["status"], "warn");
+            assert_eq!(v["settings"]["vaultAddress"], VAULT);
+            assert!(
+                !restarted(&h, "bot-a"),
+                "connecting doesn't start a stopped bot"
             );
         }
 

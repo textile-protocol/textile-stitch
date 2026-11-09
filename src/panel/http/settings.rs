@@ -1308,6 +1308,17 @@ pub async fn save_raw(
     save_and_restart(&state, &bot, &path, &body.toml, &origin, 0, None).await
 }
 
+/// Whether a save moves the bot onto, off or between vaults. Addresses compare
+/// case-insensitively; a blank address is no vault.
+fn funding_vault_changed(before: Option<&str>, after: Option<&str>) -> bool {
+    let norm = |a: Option<&str>| {
+        a.map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_lowercase)
+    };
+    norm(before) != norm(after)
+}
+
 /// Write the file, then bounce the container.
 ///
 /// The write is atomic (`write_toml_atomic`), so a bot reading its config at the
@@ -1323,6 +1334,27 @@ pub(super) async fn save_and_restart(
     origin: &Origin,
     pool: usize,
     extra: Option<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    save_and_restart_with(state, bot, path, toml, origin, pool, extra, false).await
+}
+
+/// [`save_and_restart`] for a save that only takes effect through a restart,
+/// whatever the TOML diff says. A maker switch is one: enroll has just rotated the
+/// maker key, and relinking the same vault keeps the maker id, the vault, the
+/// wallet and the transaction flags, so nothing in the config shows the change. A
+/// paused or restarting process would resume on the revoked key. With
+/// `needs_clean_restart` such a save is all-or-nothing like a wallet change:
+/// written and restarted, or refused without writing.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn save_and_restart_with(
+    state: &AppState,
+    bot: &Bot,
+    path: &std::path::Path,
+    toml: &str,
+    origin: &Origin,
+    pool: usize,
+    extra: Option<serde_json::Value>,
+    needs_clean_restart: bool,
 ) -> Result<Response, ApiError> {
     // Re-discover the bot *under the config lock the caller holds*, before anything
     // else. `bot` was read by the handler before it took that lock, so two overlapping
@@ -1385,8 +1417,18 @@ pub(super) async fn save_and_restart(
         .config
         .as_ref()
         .is_some_and(|c| c.sends_transactions);
-    let safety_relevant =
-        would_be.sends_transactions != was_transacting || would_be_wallet != pre_save.wallet();
+    // The funding wallet counts too. Moving a bot onto or off a vault re-enrolls it
+    // as a different maker, so a paused or restarting process left on the old config
+    // would come back quoting for the old funding wallet under a maker the key file no
+    // longer names. Refusing here is decided on the same locked read as the restart.
+    let was_vault = pre_save
+        .config
+        .as_ref()
+        .and_then(|c| c.vault_address.as_deref());
+    let safety_relevant = needs_clean_restart
+        || would_be.sends_transactions != was_transacting
+        || would_be_wallet != pre_save.wallet()
+        || funding_vault_changed(was_vault, would_be.vault_address.as_deref());
 
     if safety_relevant {
         if pre_save.state.is_running() {
@@ -1840,6 +1882,24 @@ async fn restart_after_save(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn moving_onto_or_off_a_vault_is_a_funding_change() {
+        let v = Some("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+        let lower = Some("0x70997970c51812dc3a010c7d01b50e0d17dc79c8");
+        assert!(super::funding_vault_changed(None, v));
+        assert!(super::funding_vault_changed(v, None));
+        assert!(super::funding_vault_changed(
+            v,
+            Some("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
+        ));
+        assert!(
+            !super::funding_vault_changed(v, lower),
+            "same vault, other casing"
+        );
+        assert!(!super::funding_vault_changed(None, Some("  ")));
+        assert!(!super::funding_vault_changed(None, None));
+    }
+
     use super::super::testkit::{harness, harness_with_corridor_api, Harness, TEST_KEY};
     use crate::panel::docker::fake::{container, dir_layout_mounts, Call};
     use crate::panel::docker::ContainerState;
@@ -2978,6 +3038,75 @@ mod tests {
         // Nothing was written: the real config is untouched and the orphan wasn't created.
         assert_eq!(std::fs::read_to_string(&real).unwrap(), before);
         assert!(!stale_path.exists(), "the stale path must not be written");
+    }
+
+    #[tokio::test]
+    async fn a_paused_bot_is_refused_a_move_onto_a_vault() {
+        // A maker-only bot (no taker, no closer, same operator wallet): moving it onto a
+        // vault changes neither, so before the funding wallet counted it would save
+        // without a restart and the paused process would resume as the old maker.
+        let h = harness("settings-paused-vault");
+        seed_in_state(&h, "bot-a", ContainerState::Paused);
+        let bot = h.state.bot("bot-a").await.unwrap();
+        let path = h.root.join("bot-a/stitch.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let linked = setup::link_vault(
+            &before,
+            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+                .parse()
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+        let summary = |toml: &str| {
+            crate::panel::inventory::summarise(toml, &path, h.state.cfg.runtime).unwrap()
+        };
+        assert_eq!(
+            summary(&before).sends_transactions,
+            summary(&linked).sends_transactions,
+            "only the funding wallet moves"
+        );
+
+        let err = super::save_and_restart(&h.state, &bot, &path, &linked, &test_origin(), 0, None)
+            .await
+            .expect_err("a paused bot can't be moved onto a vault");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.message.contains("paused"), "{}", err.message);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_save_that_needs_a_clean_restart_is_refused_for_a_paused_bot() {
+        // A maker switch that leaves the TOML's vault, wallet and flags alone (relinking
+        // the same vault): only the caller knows the key rotated, so it says so.
+        let h = harness("settings-paused-rekey");
+        seed_in_state(&h, "bot-a", ContainerState::Paused);
+        let bot = h.state.bot("bot-a").await.unwrap();
+        let path = h.root.join("bot-a/stitch.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let same = before.clone();
+
+        let err = super::save_and_restart_with(
+            &h.state,
+            &bot,
+            &path,
+            &same,
+            &test_origin(),
+            0,
+            None,
+            true,
+        )
+        .await
+        .expect_err("a rotated key can't be applied to a paused process");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.message.contains("paused"), "{}", err.message);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // The same save without the flag is the ordinary paused save: written, not applied.
+        let resp = super::save_and_restart(&h.state, &bot, &path, &same, &test_origin(), 0, None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
