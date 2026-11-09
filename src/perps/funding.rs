@@ -213,6 +213,7 @@ mod tests {
             api_key_env: crate::config::RFQ_API_KEY_ENV.into(),
             validation_contract: format!("{}", Address::repeat_byte(2)),
             instance_id: None,
+            allowed_takers: None,
         });
         let p = PerpsConfig {
             assignment_id: "recall-test".into(),

@@ -107,6 +107,18 @@ const SECONDS: &str = "seconds";
 const BOOL: &str = "bool";
 const URL: &str = "url";
 const PRICE_OFFSET: &str = "price units (collateral per debt)";
+const ADDRESSES: &str = "addresses";
+
+/// A list of addresses as one value: trimmed, lowercased, sorted and
+/// deduplicated, so reordering or recasing the list is not a change.
+fn address_list(raw: &[String]) -> String {
+    raw.iter()
+        .map(|a| a.trim().to_lowercase())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 fn bot_param(name: &str, unit: &str, value: Option<String>) -> (ParamKey, Param) {
     (
@@ -137,6 +149,14 @@ fn bot_params(cfg: &Config) -> Vec<(ParamKey, Param)> {
             "rfq_enabled",
             BOOL,
             Some(cfg.rfq.as_ref().is_some_and(|r| r.enabled).to_string()),
+        ),
+        bot_param(
+            "rfq.allowed_takers",
+            ADDRESSES,
+            cfg.rfq
+                .as_ref()
+                .and_then(|r| r.allowed_takers.as_deref())
+                .map(address_list),
         ),
         bot_param("book_enabled", BOOL, Some(cfg.book_enabled.to_string())),
         bot_param(
@@ -475,6 +495,41 @@ mod tests {
         );
         let off = params_of(ZARU).unwrap();
         assert!(!off.keys().any(|k| k.name.starts_with("modules.curve")));
+    }
+
+    #[test]
+    fn the_taker_allowlist_is_one_sorted_value() {
+        let rfq = |list: &str| {
+            format!(
+                "{ZARU}\n[rfq]\nenabled = false\nurl = \"wss://x\"\nmaker_id = \"mk\"\n\
+                 validation_contract = \"0x00000000000000000000000000000000000000aa\"\n{list}"
+            )
+        };
+        let open = params_of(&rfq("")).unwrap();
+        assert_eq!(value(&open, BOT_SCOPE, "rfq.allowed_takers"), None);
+
+        let listed = params_of(&rfq(
+            "allowed_takers = [\"0x00000000000000000000000000000000000000CD\", \
+             \"0x00000000000000000000000000000000000000ab\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            value(&listed, BOT_SCOPE, "rfq.allowed_takers").as_deref(),
+            Some(
+                "0x00000000000000000000000000000000000000ab,\
+                 0x00000000000000000000000000000000000000cd"
+            )
+        );
+        let reordered = params_of(&rfq(
+            "allowed_takers = [\"0x00000000000000000000000000000000000000ab\", \
+             \"0x00000000000000000000000000000000000000cd\"]\n",
+        ))
+        .unwrap();
+        assert!(diff(&listed, &reordered).is_empty());
+        let changes = diff(&open, &listed);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].key.name, "rfq.allowed_takers");
+        assert_eq!(changes[0].unit, "addresses");
     }
 
     #[test]

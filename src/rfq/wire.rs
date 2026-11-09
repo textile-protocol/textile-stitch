@@ -189,6 +189,13 @@ pub struct SessionFrame {
     /// then treats as one session per credential chain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// `[rfq].allowed_takers`, lowercased 0x hex. The venue only sends this
+    /// session requests from these takers and keeps its levels out of public
+    /// prices. Outside the signature for the same reason as `instance_id`: it
+    /// can only narrow this maker's own footprint. Omitted when the bot quotes
+    /// every taker, which is what older builds look like.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_takers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +268,10 @@ pub enum RejectReason {
     DegradedFeed,
     Size,
     Busy,
+    /// `[rfq].allowed_takers` is set and the request's taker is not on it.
+    /// A policy answer, not a failure to quote: the venue does not count it
+    /// as a miss against this maker's health.
+    TakerNotAllowed,
 }
 
 // --- NAV attestation co-signing ---
@@ -478,6 +489,7 @@ mod tests {
             (RejectReason::DegradedFeed, "degraded_feed"),
             (RejectReason::Size, "size"),
             (RejectReason::Busy, "busy"),
+            (RejectReason::TakerNotAllowed, "taker_not_allowed"),
         ] {
             assert_eq!(
                 serde_json::to_value(reason).unwrap(),
@@ -532,11 +544,16 @@ mod tests {
             issued_at: 1_754_388_000_000,
             signature: "0xsig".into(),
             instance_id: Some("bsc-cngn".into()),
+            allowed_takers: Some(vec!["0x00000000000000000000000000000000000000ab".into()]),
         });
         let v = serde_json::to_value(&session).unwrap();
         assert!(v["issuedAt"].is_u64());
         assert_eq!(v["issuedAt"], 1_754_388_000_000u64);
         assert_eq!(v["instanceId"], "bsc-cngn");
+        assert_eq!(
+            v["allowedTakers"],
+            serde_json::json!(["0x00000000000000000000000000000000000000ab"])
+        );
     }
 
     #[test]
@@ -577,9 +594,13 @@ mod tests {
             issued_at: 1,
             signature: "0xsig".into(),
             instance_id: None,
+            allowed_takers: None,
         });
         let v = serde_json::to_value(&session).unwrap();
         assert!(v.get("instanceId").is_none());
+        // Same for a bot that quotes every taker: no `allowedTakers`, never
+        // `null` or `[]`, which the venue refuses as an empty restriction.
+        assert!(v.get("allowedTakers").is_none());
     }
 
     #[test]

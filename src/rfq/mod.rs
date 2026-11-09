@@ -45,7 +45,7 @@ pub mod responder;
 pub mod session;
 pub mod wire;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -117,6 +117,8 @@ pub struct RfqRuntime {
     maker_id: String,
     /// This bot's name on the venue; `None` keeps the pre-instance behaviour.
     instance_id: Option<String>,
+    /// `[rfq].allowed_takers`, parsed. `None` quotes every taker.
+    allowed_takers: Option<BTreeSet<Address>>,
     chain_id: u64,
     permit2: Address,
     reactor: Address,
@@ -262,6 +264,16 @@ pub fn maybe_spawn(
         corridors = ?runtime.books.iter().map(|b| b.slug.as_str()).collect::<Vec<_>>(),
         "starting RFQ responder"
     );
+    // `[rfq]` accepts unknown keys, so a misspelled `allowed_takers` would
+    // otherwise go unnoticed and quote everyone. Say which way it went.
+    match &runtime.allowed_takers {
+        Some(takers) => info!(
+            takers = takers.len(),
+            "RFQ restricted to {} takers",
+            takers.len()
+        ),
+        None => info!("RFQ open to every taker"),
+    }
     Some(tokio::spawn(run(runtime, prices)))
 }
 
@@ -448,6 +460,7 @@ fn build_runtime(
         api_key,
         maker_id: rfq.maker_id.clone(),
         instance_id: resolve_instance_id(rfq.instance_id.as_deref(), config_dir),
+        allowed_takers: rfq.allowed_takers()?,
         chain_id: cfg.chain_id,
         permit2: cfg.permit2.parse().context("invalid permit2 address")?,
         reactor: cfg.reactor.parse().context("invalid reactor address")?,
@@ -642,6 +655,16 @@ fn unwind_quote_status(
         share_after: note.f1,
         lift_bps: (note.base / note.unwound - 1.0) * 10_000.0,
     }
+}
+
+/// Whether `[rfq].allowed_takers` lets this request through.
+///
+/// No list quotes everyone. A manual sale always passes: its taker is pinned
+/// to the dealer the operator authorised for that sale, checked against the
+/// saved record before this runs, so the list has nothing to add. A recall
+/// request is an ordinary taker request here and gets no exemption.
+fn taker_allowed(allowed: Option<&BTreeSet<Address>>, taker: Address, manual_sale: bool) -> bool {
+    manual_sale || allowed.is_none_or(|takers| takers.contains(&taker))
 }
 
 fn same_addr(value: &str, addr: Address) -> bool {
@@ -870,6 +893,7 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
             &rt.api_key,
             &rt.maker_id,
             rt.instance_id.as_deref(),
+            rt.allowed_takers.as_ref(),
             &rt.signer,
         )
         .await
@@ -1336,6 +1360,7 @@ async fn session_loop_inner(
             .and_then(|(p, dir)| crate::perps::recall::Runtime::load(p, dir, unix_now()).ok()),
         books,
         configured: rt.books.clone(),
+        allowed_takers: rt.allowed_takers.clone(),
         reservations,
         inventory: inventory.clone(),
         counter: 0,
@@ -1544,6 +1569,9 @@ struct Engine {
     /// stay visible to tagging and to shared-token accounting — otherwise that
     /// claim goes missing from the corridors that are still quoting.
     configured: Vec<CorridorBook>,
+    /// `[rfq].allowed_takers`. `None` quotes every taker; see
+    /// [`taker_allowed`] for who else gets through.
+    allowed_takers: Option<BTreeSet<Address>>,
     reservations: Reservations,
     inventory: InventoryCache,
     counter: u64,
@@ -1984,6 +2012,16 @@ impl Engine {
         } else {
             None
         };
+        let Ok(taker) = req.taker.parse::<Address>() else {
+            warn!(raw = %req.taker, "unparseable taker address");
+            return reject(RejectReason::Busy);
+        };
+        // Before any feed, deadline or pricing work: a taker off the list gets
+        // the same answer whatever the market is doing.
+        if !taker_allowed(self.allowed_takers.as_ref(), taker, manual_sale.is_some()) {
+            debug!(rfq_id = %req.rfq_id, %taker, "taker not on [rfq].allowed_takers");
+            return reject(RejectReason::TakerNotAllowed);
+        }
         let Some(book) = book_for_request(&self.books, &req) else {
             warn!(corridor = %req.corridor_id, "quote request for an unknown corridor");
             return reject(RejectReason::Busy);
@@ -2060,10 +2098,6 @@ impl Engine {
             }
         }
         let mut expires_ms = (now_ms + req.quote_ttl_ms).min(deadline_secs * 1_000);
-        let Ok(taker) = req.taker.parse::<Address>() else {
-            warn!(raw = %req.taker, "unparseable taker address");
-            return reject(RejectReason::Busy);
-        };
 
         let Some(effective_book) = self.module_book(&book, &quote, now_secs) else {
             return reject(RejectReason::Busy);
@@ -4597,6 +4631,7 @@ mod tests {
                 curve: None,
             }],
             configured: Vec::new(),
+            allowed_takers: None,
             reservations: Reservations::new(),
             inventory: {
                 let cache = InventoryCache::default();
@@ -4997,6 +5032,84 @@ mod tests {
             max_expires_at: format_iso_ms(deadline),
             fee_bps: 1,
         }
+    }
+
+    fn allowlist(takers: &[&str]) -> Option<BTreeSet<Address>> {
+        Some(takers.iter().map(|t| t.parse().unwrap()).collect())
+    }
+
+    #[test]
+    fn the_taker_allowlist_passes_listed_takers_and_manual_sales_only() {
+        let listed: Address = "0x0000000000000000000000000000000000000003"
+            .parse()
+            .unwrap();
+        let other = Address::repeat_byte(5);
+        let list = allowlist(&["0x0000000000000000000000000000000000000003"]);
+        assert!(taker_allowed(None, other, false), "no list quotes everyone");
+        assert!(taker_allowed(list.as_ref(), listed, false));
+        assert!(!taker_allowed(list.as_ref(), other, false));
+        assert!(
+            taker_allowed(list.as_ref(), other, true),
+            "manual sales pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_taker_off_the_allowlist_is_rejected_before_the_feed_is_read() {
+        let mut engine = test_engine();
+        engine.allowed_takers = allowlist(&["0x00000000000000000000000000000000000000ab"]);
+        // No price at all: the allowlist answers first, so the reason is the
+        // policy one rather than `stale_feed`.
+        let reply = engine
+            .respond(exact_input_request("rfq_off_list"), &PriceCache::default())
+            .await;
+        let MakerFrame::QuoteReject(rejected) = reply else {
+            panic!("an unlisted taker must not be quoted, got {reply:?}");
+        };
+        assert_eq!(rejected.reason, RejectReason::TakerNotAllowed);
+        assert!(engine.reservations.is_empty());
+
+        // A recall request is still a taker request.
+        let mut recall = exact_input_request("rfq_recall_off_list");
+        recall.recall = Some(wire::RecallOffer {
+            route: "gmx-recall-v1".into(),
+            assignment_id: "asg_1".into(),
+            executor: "0x00000000000000000000000000000000000000e2".into(),
+            created_at: unix_now(),
+            accept_by: format_iso_ms(unix_now_ms() + 60_000),
+            settle_by: format_iso_ms(unix_now_ms() + 90_000),
+            capacity_atoms: "150000".into(),
+            max_recall_price: "1".into(),
+            revision: 1,
+        });
+        let reply = engine.respond(recall, &fresh_prices()).await;
+        assert!(
+            matches!(&reply, MakerFrame::QuoteReject(r) if r.reason == RejectReason::TakerNotAllowed),
+            "{reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listed_taker_is_quoted_as_usual() {
+        let mut engine = test_engine();
+        engine.allowed_takers = allowlist(&[
+            "0x00000000000000000000000000000000000000ab",
+            "0x0000000000000000000000000000000000000003",
+        ]);
+        let reply = engine
+            .respond(exact_input_request("rfq_on_list"), &fresh_prices())
+            .await;
+        let MakerFrame::QuoteResponse(quoted) = reply else {
+            panic!("a listed taker must be quoted, got {reply:?}");
+        };
+        let MakerFrame::QuoteResponse(open) = test_engine()
+            .respond(exact_input_request("rfq_open"), &fresh_prices())
+            .await
+        else {
+            panic!("an open engine must quote");
+        };
+        assert_eq!(quoted.buy_amount, open.buy_amount);
+        assert!(!engine.reservations.is_empty());
     }
 
     /// `fresh_prices`, but the feed also publishes the reference book the
@@ -7494,6 +7607,50 @@ mod tests {
             engine.respond(req, &prices).await,
             MakerFrame::QuoteReject(_)
         ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_manual_sale_is_quoted_to_its_dealer_even_off_the_allowlist() {
+        use crate::modules::{manual, Mode};
+        let mut engine = test_engine();
+        let dir = enable_modules(&mut engine, Mode::Live, 4_000_000_000, 6_000_000_000);
+        engine.modules.as_mut().unwrap().config.rebalance.enabled = true;
+        engine.allowed_takers = allowlist(&["0x00000000000000000000000000000000000000ab"]);
+        let sale = manual::Sale {
+            id: "c".repeat(64),
+            chain_id: 8453,
+            vault: engine.vault.unwrap(),
+            taker: "0x0000000000000000000000000000000000000003"
+                .parse()
+                .unwrap(),
+            corridor_token: COLLATERAL.parse().unwrap(),
+            settlement_token: DEBT.parse().unwrap(),
+            corridor_amount: U256::from(100_000_000u64),
+            min_settlement: U256::from(99_500_000u64),
+            expires_at: unix_now() + 3600,
+            closed: false,
+        };
+        manual::write(&dir, &sale).unwrap();
+        let mut req = exact_input_request(&format!("{}{}:rfq_1", manual::PREFIX, sale.id));
+        req.sell_token = DEBT.into();
+        req.buy_token = COLLATERAL.into();
+        req.sell_amount = None;
+        req.buy_amount = Some(sale.corridor_amount.to_string());
+        let prices = fresh_prices();
+        let reply = engine.respond(req.clone(), &prices).await;
+        assert!(
+            matches!(reply, MakerFrame::QuoteResponse(_)),
+            "the sale's dealer is pinned by the sale record: {reply:?}"
+        );
+        // The same taker on an ordinary request is still off the list.
+        let reply = engine
+            .respond(exact_input_request("rfq_plain"), &prices)
+            .await;
+        assert!(
+            matches!(&reply, MakerFrame::QuoteReject(r) if r.reason == RejectReason::TakerNotAllowed),
+            "{reply:?}"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

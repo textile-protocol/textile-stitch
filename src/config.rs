@@ -304,7 +304,67 @@ pub struct RfqConfig {
     /// ("bsc-cngn", "base-majors") rather than a random id.
     #[serde(default)]
     pub instance_id: Option<String>,
+    /// Quote only these taker wallets. Absent (the default) quotes every
+    /// taker the venue sends. Each entry is a 0x address; an empty list is
+    /// refused rather than read as "nobody", so turning RFQ off stays the
+    /// job of `enabled`.
+    ///
+    /// Enforced twice: the venue reads the list from the session frame and
+    /// routes other takers elsewhere, and [`crate::rfq`] rejects any request
+    /// whose taker is off it (`taker_not_allowed`), so a venue that ignores
+    /// the field still can't get a quote out of the bot for them. Read it
+    /// through [`RfqConfig::allowed_takers`].
+    #[serde(default)]
+    pub allowed_takers: Option<Vec<String>>,
 }
+
+impl RfqConfig {
+    /// `allowed_takers` parsed and deduplicated. `Ok(None)` when the key is
+    /// absent, which means every taker. An empty list, an unparseable entry
+    /// or the zero address is an error naming the field.
+    pub fn allowed_takers(
+        &self,
+    ) -> anyhow::Result<Option<std::collections::BTreeSet<alloy_primitives::Address>>> {
+        let Some(raw) = &self.allowed_takers else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !raw.is_empty(),
+            "[rfq].allowed_takers is empty — omit allowed_takers to quote every taker"
+        );
+        let takers = raw
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let taker = entry
+                    .trim()
+                    .parse::<alloy_primitives::Address>()
+                    .with_context(|| {
+                        format!("[rfq].allowed_takers[{idx}] is not a valid address: {entry:?}")
+                    })?;
+                anyhow::ensure!(
+                    !taker.is_zero(),
+                    "[rfq].allowed_takers[{idx}] is the zero address"
+                );
+                Ok(taker)
+            })
+            .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+        anyhow::ensure!(
+            takers.len() <= MAX_ALLOWED_TAKERS,
+            "[rfq].allowed_takers lists {} distinct takers; the venue accepts at most {MAX_ALLOWED_TAKERS}",
+            takers.len()
+        );
+        Ok(Some(takers))
+    }
+}
+
+/// Most distinct takers `[rfq].allowed_takers` may list. The venue refuses a
+/// longer list at session time (`MAX_ALLOWED_TAKERS` in
+/// `api/src/v2/maker/allowedTakers.ts`), which would leave the bot reconnecting
+/// and quoting nobody after a clean start, so the config is held to the same
+/// cap. Counted after deduplication, since the session frame carries the set.
+/// `allowedTakers.test.ts` fails if the two drift apart.
+pub const MAX_ALLOWED_TAKERS: usize = 100;
 
 /// The one environment variable the maker API key is read from (plus its
 /// `_FILE` form). Fixed, not configurable: see [`RfqConfig::api_key_env`].
@@ -1846,7 +1906,28 @@ impl Config {
             );
         }
         self.price_guard.validate()?;
+        self.validate_allowed_takers()?;
         self.validate_rfq()?;
+        Ok(())
+    }
+
+    /// `[rfq].allowed_takers` rules. Checked even while `[rfq]` is disabled:
+    /// the list is a restriction the operator wrote down, and the panel's
+    /// RFQ switch must not be the thing that turns a bad list live.
+    ///
+    /// The public ladder can't honour the list. Its orders are resting
+    /// Permit2 orders any wallet can fill, so a restricted bot with
+    /// `book_enabled = true` would quote everyone anyway.
+    fn validate_allowed_takers(&self) -> anyhow::Result<()> {
+        let Some(rfq) = &self.rfq else { return Ok(()) };
+        if rfq.allowed_takers()?.is_none() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.book_enabled,
+            "[rfq].allowed_takers is set, but book_enabled = true rests public orders any \
+             wallet can fill. Set book_enabled = false (the default) or remove allowed_takers"
+        );
         Ok(())
     }
 
@@ -3604,6 +3685,89 @@ mod tests {
             format!("{:#}", Config::from_toml(&bad_contract).unwrap_err())
                 .contains("validation_contract")
         );
+    }
+
+    #[test]
+    fn rfq_allowed_takers_parse_into_a_deduplicated_set() {
+        let base = format!("{LEAN_POOL_BASE}\n{RFQ_BLOCK}");
+        let cfg = Config::from_toml(&base).unwrap();
+        assert_eq!(cfg.rfq.as_ref().unwrap().allowed_takers().unwrap(), None);
+
+        let listed = base.replace(
+            "[rfq]",
+            "[rfq]\nallowed_takers = [\n  \"0x00000000000000000000000000000000000000AB\",\n  \
+             \" 0x00000000000000000000000000000000000000ab \",\n  \
+             \"0x00000000000000000000000000000000000000cd\",\n]",
+        );
+        let set = Config::from_toml(&listed)
+            .unwrap()
+            .rfq
+            .unwrap()
+            .allowed_takers()
+            .unwrap()
+            .expect("a listed key is a restriction");
+        let expected: std::collections::BTreeSet<alloy_primitives::Address> = [
+            "0x00000000000000000000000000000000000000ab",
+            "0x00000000000000000000000000000000000000cd",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        assert_eq!(set, expected);
+    }
+
+    #[test]
+    fn rfq_allowed_takers_stop_at_the_venues_cap() {
+        let base = format!("{LEAN_POOL_BASE}\n{RFQ_BLOCK}");
+        // `n` distinct takers, plus `dupes` repeats of the first.
+        let with = |n: usize, dupes: usize| {
+            let takers = (1..=n)
+                .chain(std::iter::repeat_n(1, dupes))
+                .map(|i| format!("\"{i:#042x}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            base.replace("[rfq]", &format!("[rfq]\nallowed_takers = [{takers}]"))
+        };
+        let at_cap = Config::from_toml(&with(MAX_ALLOWED_TAKERS, 5))
+            .expect("duplicates don't count toward the cap");
+        let set = at_cap.rfq.unwrap().allowed_takers().unwrap().unwrap();
+        assert_eq!(set.len(), MAX_ALLOWED_TAKERS);
+
+        let over = format!(
+            "{:#}",
+            Config::from_toml(&with(MAX_ALLOWED_TAKERS + 1, 0)).unwrap_err()
+        );
+        assert!(over.contains("the venue accepts at most 100"), "{over}");
+    }
+
+    #[test]
+    fn rfq_allowed_takers_refuse_bad_lists_and_the_public_ladder() {
+        let base = format!("{LEAN_POOL_BASE}\n{RFQ_BLOCK}");
+        let with = |list: &str| base.replace("[rfq]", &format!("[rfq]\nallowed_takers = {list}"));
+        let err = |toml: &str| format!("{:#}", Config::from_toml(toml).unwrap_err());
+
+        assert!(err(&with("[]")).contains("omit allowed_takers to quote every taker"));
+        assert!(err(&with("[\"0x12\"]")).contains("[rfq].allowed_takers[0]"));
+        assert!(err(&with(
+            "[\"0x00000000000000000000000000000000000000ab\", \"nope\"]"
+        ))
+        .contains("[rfq].allowed_takers[1]"));
+        assert!(
+            err(&with("[\"0x0000000000000000000000000000000000000000\"]")).contains("zero address")
+        );
+
+        let one = with("[\"0x00000000000000000000000000000000000000ab\"]");
+        Config::from_toml(&one).expect("one taker, ladder off by default");
+        let ladder = one.replace(
+            "tick_interval_secs = 5",
+            "tick_interval_secs = 5\nbook_enabled = true",
+        );
+        assert!(err(&ladder).contains("book_enabled"));
+
+        // Unlike the other [rfq] rules, a disabled block is still checked, so
+        // flipping RFQ on can never be what turns a bad list live.
+        let off = with("[]").replace("enabled = true", "enabled = false");
+        assert!(err(&off).contains("allowed_takers"));
     }
 
     #[test]

@@ -179,6 +179,27 @@ ttl_secs = 60
     }
 
     #[test]
+    fn an_rfq_taker_allowlist_is_imported_as_written() {
+        let raw = format!(
+            "{}\n[rfq]\nenabled = true\n\
+             url = \"wss://api.textilecredit.com/v2/maker/stream\"\n\
+             maker_id = \"clmaker0001\"\n\
+             validation_contract = \"0xBCA5E344077AaC751A1C548a45F28215bB7ec165\"\n\
+             allowed_takers = [\"0x00000000000000000000000000000000000000ab\"]\n",
+            valid()
+        );
+        let out = validate_imported_toml(&raw).expect("an allowlist is not a secret");
+        assert!(out.contains("allowed_takers"), "{out}");
+        let takers = Config::from_toml(&out)
+            .unwrap()
+            .rfq
+            .unwrap()
+            .allowed_takers()
+            .unwrap();
+        assert_eq!(takers.map(|set| set.len()), Some(1));
+    }
+
+    #[test]
     fn a_signer_table_is_refused() {
         let err = validate_imported_toml(
             &(valid() + "\n[signer]\nbackend = \"local\"\nprivate_key = \"0xabc\"\n"),

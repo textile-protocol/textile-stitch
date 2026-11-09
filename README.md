@@ -441,6 +441,19 @@ settle_secs = 300
 
 With modules on, the panel's module status shows why a corridor is held.
 
+### Quoting only some takers
+
+Set `[rfq].allowed_takers` to a list of wallets and the bot quotes only those
+takers over RFQ. Everyone else gets `taker_not_allowed`, and the venue keeps
+the bot's book out of public prices. Leave it out to quote everyone. It can't
+be combined with `book_enabled = true`. See
+[Quoting only some takers](docs/ADVANCED.md#quoting-only-some-takers).
+
+```toml
+[rfq]
+allowed_takers = ["0x1111111111111111111111111111111111111111"]
+```
+
 ## Security Notes
 
 - Keep `STITCH_PRIVATE_KEY` out of `stitch.toml`, shell history, and process

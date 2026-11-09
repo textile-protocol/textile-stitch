@@ -184,6 +184,7 @@ refresh_threshold_bps = 10  # re-quote a side when its price moves >0.10%.
 # maker_id = "mk_your_maker_id"
 # api_key_env = "STITCH_RFQ_API_KEY"                     # fixed; no other value is accepted
 # validation_contract = "0x0000000000000000000000000000000000000000"  # PreferredFillerValidation (per chain)
+# allowed_takers = ["0x1111111111111111111111111111111111111111"]  # quote only these takers; omit to quote everyone. Needs book_enabled = false
 
 # ----- OperatorVault maker. The bot key is the strategy signer; the vault is
 # the UniswapX swapper/recipient. Connect then registers fundingWallet = vault.

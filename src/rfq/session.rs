@@ -5,6 +5,9 @@
 //! policy lives in [`super::run`]; this module does exactly one attempt so
 //! the backoff logic stays in one place.
 
+use std::collections::BTreeSet;
+
+use alloy_primitives::Address;
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -118,11 +121,12 @@ pub async fn connect_and_auth(
     api_key: &str,
     maker_id: &str,
     instance_id: Option<&str>,
+    allowed_takers: Option<&BTreeSet<Address>>,
     signer: &DynSigner,
 ) -> anyhow::Result<AuthedSession> {
     tokio::time::timeout(
         std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        handshake(url, api_key, maker_id, instance_id, signer),
+        handshake(url, api_key, maker_id, instance_id, allowed_takers, signer),
     )
     .await
     .context("venue handshake timed out")?
@@ -133,6 +137,7 @@ async fn handshake(
     api_key: &str,
     maker_id: &str,
     instance_id: Option<&str>,
+    allowed_takers: Option<&BTreeSet<Address>>,
     signer: &DynSigner,
 ) -> anyhow::Result<AuthedSession> {
     let mut request = url
@@ -185,6 +190,7 @@ async fn handshake(
         issued_at,
         signature: alloy_primitives::hex::encode_prefixed(signature),
         instance_id: instance_id.map(str::to_string),
+        allowed_takers: allowed_takers_wire(allowed_takers),
     });
     stream
         .send(Message::text(serde_json::to_string(&session)?))
@@ -200,12 +206,19 @@ async fn handshake(
     info!(
         maker_id,
         instance_id = ?instance_id,
+        allowed_takers = allowed_takers.map(BTreeSet::len),
         signing_address = %signer.address(),
         corridors = ?accepted.corridors,
         domain = %challenge.domain.name,
         "RFQ session accepted"
     );
     Ok(AuthedSession { stream, accepted })
+}
+
+/// The session frame's `allowedTakers`: lowercased 0x hex in address order,
+/// or `None` so the field is left out when the bot quotes every taker.
+fn allowed_takers_wire(allowed: Option<&BTreeSet<Address>>) -> Option<Vec<String>> {
+    allowed.map(|set| set.iter().map(|a| format!("{a:#x}")).collect())
 }
 
 /// Read venue frames until one parses, answering protocol pings along the way.
@@ -234,5 +247,29 @@ async fn next_frame(stream: &mut WsStream) -> anyhow::Result<VenueFrame> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_takers_go_on_the_wire_lowercased_or_not_at_all() {
+        assert_eq!(allowed_takers_wire(None), None);
+        let set: BTreeSet<Address> = [
+            "0x00000000000000000000000000000000000000CD",
+            "0xAbCdEf0000000000000000000000000000000001",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        assert_eq!(
+            allowed_takers_wire(Some(&set)),
+            Some(vec![
+                "0x00000000000000000000000000000000000000cd".to_string(),
+                "0xabcdef0000000000000000000000000000000001".to_string(),
+            ])
+        );
     }
 }

@@ -943,6 +943,40 @@ the bot. The panel refuses the switch when no side has both a spread and a size
 same for the sell side): the ladder would rest nothing, and you would restart
 into a bot quoting neither book nor RFQ. Sizing lives on the Raw config tab.
 
+### Quoting only some takers
+
+`[rfq].allowed_takers` limits the bot to the wallets you list. Leave the key
+out to quote every taker, which is the default.
+
+```toml
+[rfq]
+allowed_takers = [
+  "0x1111111111111111111111111111111111111111",
+  "0x2222222222222222222222222222222222222222",
+]
+```
+
+The bot sends the list to the venue when it connects. The venue then only asks
+this bot to quote those takers, keeps its book out of public prices (the
+indicative quote, tickers and the `/v2/rfq/levels` ladder, none of which have a
+taker), and doesn't credit it maker points, since nobody else can trade against
+it. The bot also checks every request itself and answers anyone else with
+`taker_not_allowed`, so the venue can't route around the list. The venue
+doesn't count that answer as a missed quote. A manual sale goes through
+whatever the list says: its buyer is the dealer you picked for that sale.
+
+The check runs before the feed, so an unlisted taker gets `taker_not_allowed`
+even when the feed is stale. Addresses are case-insensitive and duplicates are
+dropped. An empty list, a malformed address or the zero address won't load,
+and neither will `allowed_takers` with `book_enabled = true`: the public ladder
+rests Permit2 orders any wallet can fill, so it can't honour the list. The bot
+logs `RFQ restricted to N takers` or `RFQ open to every taker` at startup.
+`[rfq]` ignores unknown keys, so check that line after editing: a misspelled
+key quotes everyone.
+
+The panel has no field for it. Settings saves keep the key as written, and the
+change log records it as `rfq.allowed_takers`.
+
 ### Production cutover (ops)
 
 Web Swap is RFQ. Corridor mode stays `RFQ_BETA` until Limit is deleted —

@@ -517,6 +517,7 @@ mod tests {
             api_key_env: var.into(),
             validation_contract: String::new(),
             instance_id: None,
+            allowed_takers: None,
         });
         let shipment = shipment_for(&cfg, &dir.join("stitch.toml"), None).unwrap();
         std::env::remove_var(format!("{var}_FILE"));
