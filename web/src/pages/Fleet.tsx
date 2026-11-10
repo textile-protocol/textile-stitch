@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { botLabel, botPath } from '../botRoutes'
-import { Link, useLocation } from 'react-router-dom'
+import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { ApiError, api } from '../api'
 import { pageVisibility, poll } from '../poll'
 import {
@@ -26,6 +26,20 @@ import { useBalancesHidden } from '../balancePrivacy'
 import PrivateBalance, { Dots } from '../components/PrivateBalance'
 import { capitalUnpricedSymbols, capitalUsd } from '../funding'
 import { namesToRead, stillStopped } from '../fleetValues'
+import {
+  EMPTY_FILTER,
+  MIN_BOTS_TO_FILTER,
+  chainOptions,
+  effectiveFilter,
+  filterFleet,
+  isFiltered,
+  liveCounts,
+  readFilter,
+  vaultOptions,
+  writeFilter,
+  type FleetFilter,
+} from '../fleetFilter'
+import FleetFilters from '../components/FleetFilters'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
@@ -57,6 +71,11 @@ export default function Fleet() {
   const [settled, setSettled] = useState<ReadonlySet<string>>(new Set())
   const [capped, setCapped] = useState(false)
   const [balancesHidden, toggleBalances] = useBalancesHidden()
+  // The filter is the URL, so back from a bot returns to the same narrowed list.
+  // `replace`, so typing in the search box doesn't stack a history entry a key.
+  const [params, setParams] = useSearchParams()
+  const filter = readFilter(params)
+  const setFilter = (next: FleetFilter) => setParams(writeFilter(next), { replace: true })
 
   const load = useCallback(async () => {
     try {
@@ -155,11 +174,19 @@ export default function Fleet() {
     (updates?.bots ?? []).filter((b) => b.updateAvailable).map((b) => b.name),
   )
 
+  const total = data.bots.length
+  // One bot has nothing to narrow: no bar, and no filter from the URL either.
+  const canFilter = total >= MIN_BOTS_TO_FILTER
+  const applied = effectiveFilter(filter, total)
+  const filtered = isFiltered(applied)
+  const shown = filterFleet(arrangeFleet(data.bots, order), applied)
+
   return (
     <div className="space-y-4">
       <div className="flex items-baseline justify-between gap-4">
         <h1 className="text-xl font-bold">
-          {data.bots.length} {data.bots.length === 1 ? 'bot' : 'bots'}
+          {filtered && `${shown.length} of `}
+          {total} {total === 1 ? 'bot' : 'bots'}
         </h1>
         <Link to="/add">
           <Button variant="primary">Add corridor</Button>
@@ -188,21 +215,48 @@ export default function Fleet() {
           </p>
         </Empty>
       ) : (
-        <ul className="space-y-3">
-          {arrangeFleet(data.bots, order).map((bot) => (
-            <li key={bot.name}>
-              <BotRow
-                bot={bot}
-                value={values[bot.name]}
-                balancesHidden={balancesHidden}
-                onToggleBalances={toggleBalances}
-                updateAvailable={
-                  behind.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
-                }
-              />
-            </li>
-          ))}
-        </ul>
+        <>
+          {canFilter && (
+            <FleetFilters
+              filter={filter}
+              onChange={setFilter}
+              liveCounts={liveCounts(data.bots)}
+              chains={chainOptions(data.bots)}
+              vaults={vaultOptions(data.bots)}
+            />
+          )}
+          {shown.length === 0 ? (
+            <Empty title="No bots match">
+              <p>
+                Nothing in this fleet matches the filters.{' '}
+                <button
+                  type="button"
+                  onClick={() => setFilter(EMPTY_FILTER)}
+                  className="font-bold underline"
+                >
+                  Clear them
+                </button>{' '}
+                to see all {total}.
+              </p>
+            </Empty>
+          ) : (
+            <ul className="space-y-3">
+              {shown.map((bot) => (
+                <li key={bot.name}>
+                  <BotRow
+                    bot={bot}
+                    value={values[bot.name]}
+                    balancesHidden={balancesHidden}
+                    onToggleBalances={toggleBalances}
+                    updateAvailable={
+                      behind.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
+                    }
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
       )}
     </div>
   )
