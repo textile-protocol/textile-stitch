@@ -454,6 +454,16 @@ be combined with `book_enabled = true`. See
 allowed_takers = ["0x1111111111111111111111111111111111111111"]
 ```
 
+### Quoting a feed's own bid and ask
+
+A feed may send `bid` and `ask` next to `price`. A pool with
+`feed_sides = true` quotes those exactly over RFQ instead of spreads around
+`price`, for a source that sets both sides itself, like Textile's OTC desk feed
+(`/price?otc=<key>&pair=cngn-usdt`; keep the `pair` so cNGN gets its 240 s
+RFQ window). Its spreads must be 0, and TWAP, the lean, the limit-order taker,
+the closer, modules and the public ladder are refused alongside it. See
+[Feeds that set their own bid and ask](docs/ADVANCED.md#feeds-that-set-their-own-bid-and-ask).
+
 ## Security Notes
 
 - Keep `STITCH_PRIVATE_KEY` out of `stitch.toml`, shell history, and process

@@ -52,22 +52,62 @@ pub(super) fn order_refusal(
 /// pull the feed, so a signature is only sent if it still passes the gates
 /// `respond` applied before signing: no print, or a stale or invalid one, is
 /// `StaleFeed`; a degraded one is `DegradedFeed`; out of band is `Busy`.
+///
+/// `priced` is the print the order was priced from, which a `feed_sides`
+/// pool needs: see [`feed_sides_refusal`].
 pub(super) fn recheck_after_signing(
     prices: &PriceCache,
     order: &OrderParams,
     bid: bool,
     book: &CorridorBook,
     max_loss_bps: u32,
+    priced: Option<&Quote>,
 ) -> Result<(), RejectReason> {
     let quote = prices.get(&book.feed_url).ok_or(RejectReason::StaleFeed)?;
     usable(&quote, crate::time::unix_now(), book.staleness_secs).map_err(|why| match why {
         Unusable::Degraded => RejectReason::DegradedFeed,
         Unusable::Stale | Unusable::BadPrice => RejectReason::StaleFeed,
     })?;
+    if let Some(reason) = feed_sides_refusal(book, bid, priced, &quote) {
+        return Err(reason);
+    }
     match order_refusal(order, bid, book, &quote, max_loss_bps) {
         Some(_) => Err(RejectReason::Busy),
         None => Ok(()),
     }
+}
+
+/// Whether a `feed_sides` order may still go out after signing. Such an
+/// order is priced at the feed's own side, not a spread off the mid, so the
+/// band (a loss limit around the mid) can't see that side move: a source
+/// that sets both sides by hand can change one and keep the mid. So the
+/// print the cache holds now must still carry both sides (`StaleFeed` if
+/// not, as a request on it would be refused), and the order's side must not
+/// have moved against the maker since pricing (`Busy` if it has): a bid may
+/// only have risen, an ask only fallen. Sides are compared as printed, the
+/// same JSON numbers, so no rounding enters. With no `priced` print to
+/// compare to, a `feed_sides` order is withheld. `None` on any other pool.
+fn feed_sides_refusal(
+    book: &CorridorBook,
+    bid: bool,
+    priced: Option<&Quote>,
+    current: &Quote,
+) -> Option<RejectReason> {
+    if !book.feed_sides {
+        return None;
+    }
+    let Some((bid_now, ask_now)) = current.sides() else {
+        return Some(RejectReason::StaleFeed);
+    };
+    let Some((bid_then, ask_then)) = priced.and_then(Quote::sides) else {
+        return Some(RejectReason::Busy);
+    };
+    let held = if bid {
+        bid_now >= bid_then
+    } else {
+        ask_now <= ask_then
+    };
+    (!held).then_some(RejectReason::Busy)
 }
 
 /// The print a NAV attestation is judged against: the book's cached print,
@@ -159,6 +199,8 @@ mod tests {
             timestamp,
             degraded: false,
             reference: None,
+            bid: None,
+            ask: None,
         }
     }
 
@@ -281,6 +323,7 @@ mod tests {
             feed_url: URL.into(),
             staleness_secs: 60,
             curve: None,
+            feed_sides: false,
         }
     }
 
@@ -340,7 +383,7 @@ mod tests {
             if let Some(q) = cached {
                 cache.set(URL.to_string(), q);
             }
-            recheck_after_signing(&cache, &order, true, &book(6, 18), 1_500)
+            recheck_after_signing(&cache, &order, true, &book(6, 18), 1_500, None)
         };
         assert_eq!(recheck(Some(quote(0.00065, now))), Ok(()));
         assert_eq!(recheck(None), Err(RejectReason::StaleFeed));
@@ -364,6 +407,73 @@ mod tests {
         assert_eq!(
             recheck(Some(quote(0.00065 * 0.8, now))),
             Err(RejectReason::Busy)
+        );
+    }
+
+    #[test]
+    fn a_feed_sides_order_is_withheld_when_its_side_moved_while_signing() {
+        let sided = |bid: f64, ask: f64| Quote {
+            bid: Some(bid),
+            ask: Some(ask),
+            ..quote((bid + ask) / 2.0, crate::time::unix_now())
+        };
+        let sided_book = CorridorBook {
+            feed_sides: true,
+            ..book(6, 18)
+        };
+        // Priced at a 0.00064 bid and a 0.00066 ask; the order itself sits
+        // well inside the band, so only the side check can refuse it.
+        let priced = sided(0.00064, 0.00066);
+        let order = built(1_000_000, U256::from(1_538_461_538_461_538_461_538u128));
+        let recheck = |bid: bool, now: Option<Quote>, priced: Option<&Quote>| {
+            let cache = PriceCache::new(None, JUMP);
+            if let Some(q) = now {
+                cache.set(URL.to_string(), q);
+            }
+            recheck_after_signing(&cache, &order, bid, &sided_book, 1_500, priced)
+        };
+
+        assert_eq!(recheck(true, Some(priced.clone()), Some(&priced)), Ok(()));
+        assert_eq!(recheck(false, Some(priced.clone()), Some(&priced)), Ok(()));
+        // The desk lowered its bid (same mid): the signed bid now overpays.
+        assert_eq!(
+            recheck(true, Some(sided(0.00063, 0.00067)), Some(&priced)),
+            Err(RejectReason::Busy)
+        );
+        // Raised its ask: the signed ask now sells too cheap.
+        assert_eq!(
+            recheck(false, Some(sided(0.00063, 0.00067)), Some(&priced)),
+            Err(RejectReason::Busy)
+        );
+        // A move in the maker's favour on its own side lets the order go.
+        assert_eq!(
+            recheck(true, Some(sided(0.00065, 0.00066)), Some(&priced)),
+            Ok(())
+        );
+        assert_eq!(
+            recheck(false, Some(sided(0.00064, 0.00065)), Some(&priced)),
+            Ok(())
+        );
+        // The print lost its sides: no side to quote, as a request would see.
+        assert_eq!(
+            recheck(
+                true,
+                Some(quote(0.00065, crate::time::unix_now())),
+                Some(&priced)
+            ),
+            Err(RejectReason::StaleFeed)
+        );
+        // Nothing to compare against: withheld rather than guessed.
+        assert_eq!(
+            recheck(true, Some(priced.clone()), None),
+            Err(RejectReason::Busy)
+        );
+        // Another pool never consults the sides.
+        let cache = PriceCache::new(None, JUMP);
+        cache.set(URL.to_string(), quote(0.00065, crate::time::unix_now()));
+        assert_eq!(
+            recheck_after_signing(&cache, &order, true, &book(6, 18), 1_500, None),
+            Ok(())
         );
     }
 

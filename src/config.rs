@@ -798,6 +798,16 @@ pub struct PoolConfig {
     /// `feed_url` — a pool on the bot-level feed uses the bot-level setting.
     #[serde(default)]
     pub rfq_staleness_secs: Option<u64>,
+    /// Quote the feed's own `bid` and `ask` over RFQ instead of spreads around
+    /// `price`. For a source that sets both sides itself, such as Textile's
+    /// OTC desk feed. A print without the pair is treated as stale.
+    ///
+    /// Each side is still switched on by its spread key (`buy_offset_bps` /
+    /// `sell_offset_bps`), which has to be 0: the feed's side is the price, so
+    /// a spread on top would be a second one. Everything else that moves the
+    /// centre or the spreads is refused too (see [`Config::validate`]).
+    #[serde(default)]
+    pub feed_sides: bool,
     /// Optional venue slug override. Unset is fine: when `[rfq].enabled` the
     /// pool is solicitable and the bot matches quote requests by tokens.
     /// Kept so existing configs that already set it still parse.
@@ -981,6 +991,42 @@ pub struct PoolConfig {
 
 /// Pick a spread from the two optional representations. Bps wins if both are
 /// set (operators shouldn't, but be deterministic).
+/// The pool-level half of [`Config::validate_feed_sides`].
+fn feed_sides_pool_conflicts(pool: &PoolConfig, idx: usize) -> anyhow::Result<()> {
+    let nonzero_spread = [
+        ("buy_offset_bps", pool.buy_offset_bps.map(f64::from)),
+        ("buy_offset_abs", pool.buy_offset_abs),
+        ("sell_offset_bps", pool.sell_offset_bps.map(f64::from)),
+        ("sell_offset_abs", pool.sell_offset_abs),
+    ]
+    .into_iter()
+    .find(|(_, value)| value.is_some_and(|v| v != 0.0));
+    if let Some((field, _)) = nonzero_spread {
+        anyhow::bail!(
+            "pools[{idx}].feed_sides quotes the feed's own bid and ask, so {field} must be 0 \
+             (it only switches the side on)"
+        );
+    }
+    let conflict = [
+        ("twap_window_secs", pool.twap_window().is_some()),
+        ("lean_enabled", pool.lean_mode() == LeanMode::Live),
+        (
+            "limit_taker_enabled",
+            pool.limit_taker_enabled.unwrap_or(false),
+        ),
+        ("closer_pool", pool.closer_enabled()),
+    ]
+    .into_iter()
+    .find_map(|(field, on)| on.then_some(field));
+    match conflict {
+        Some(field) => anyhow::bail!(
+            "pools[{idx}].feed_sides quotes the feed's own bid and ask; {field} would price \
+             this pool another way. Remove it"
+        ),
+        None => Ok(()),
+    }
+}
+
 fn spread_from(bps: Option<u32>, abs: Option<f64>) -> Option<Spread> {
     match (bps, abs) {
         (Some(b), _) => Some(Spread::Bps(b)),
@@ -1907,6 +1953,7 @@ impl Config {
         }
         self.price_guard.validate()?;
         self.validate_allowed_takers()?;
+        self.validate_feed_sides()?;
         self.validate_rfq()?;
         Ok(())
     }
@@ -1929,6 +1976,38 @@ impl Config {
              wallet can fill. Set book_enabled = false (the default) or remove allowed_takers"
         );
         Ok(())
+    }
+
+    /// `feed_sides` pools quote exactly the feed's bid and ask, so nothing
+    /// else may move a price on them:
+    ///
+    /// - the public ladder (`book_enabled`): it prices off pool spreads and
+    ///   never reads the feed's sides;
+    /// - modules: the spread policy rewrites spreads, and the inventory curve
+    ///   and profit unwind move the quote, all bot-wide;
+    /// - on the pool, a non-zero spread, TWAP (moves the centre), the lean
+    ///   (moves the spreads), and the limit-order taker and closer legs, which
+    ///   price off pool spreads around the tick's mid, not the feed's sides.
+    fn validate_feed_sides(&self) -> anyhow::Result<()> {
+        let sided: Vec<usize> = (0..self.pools.len())
+            .filter(|&idx| self.pools[idx].feed_sides)
+            .collect();
+        let Some(&first) = sided.first() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            !self.book_enabled,
+            "pools[{first}].feed_sides quotes the feed's own bid and ask over RFQ; \
+             the public ladder can't. Set book_enabled = false"
+        );
+        anyhow::ensure!(
+            !self.modules_enabled,
+            "pools[{first}].feed_sides quotes the feed's own bid and ask; modules \
+             would reprice it. Set modules_enabled = false"
+        );
+        sided
+            .into_iter()
+            .try_for_each(|idx| feed_sides_pool_conflicts(&self.pools[idx], idx))
     }
 
     /// RFQ cross-field rules. All of them are scoped to configs that actually
@@ -2713,6 +2792,84 @@ mod tests {
         ttl_secs = 120
         refresh_threshold_bps = 10
     "#;
+
+    /// A pool quoting the feed's own sides: zero spreads switch both sides on.
+    fn feed_sides_pool() -> String {
+        LEAN_POOL_BASE
+            .replace(
+                "buy_offset_bps = 1",
+                "buy_offset_bps = 0\nfeed_sides = true",
+            )
+            .replace("sell_offset_bps = 1", "sell_offset_bps = 0")
+    }
+
+    #[test]
+    fn feed_sides_is_off_by_default_and_loads_with_zero_spreads() {
+        assert!(!Config::from_toml(LEAN_POOL_BASE).unwrap().pools[0].feed_sides);
+        let cfg = Config::from_toml(&feed_sides_pool()).expect("zero spreads, nothing else");
+        assert!(cfg.pools[0].feed_sides);
+        assert_eq!(cfg.pools[0].buy_spread(), Some(Spread::Bps(0)));
+    }
+
+    #[test]
+    fn feed_sides_refuses_everything_else_that_prices_the_pool() {
+        let refused = |toml: String, field: &str| {
+            let err = format!("{:#}", Config::from_toml(&toml).unwrap_err());
+            assert!(
+                err.contains("feed_sides") && err.contains(field),
+                "{field}: {err}"
+            );
+        };
+        let base = feed_sides_pool();
+        refused(
+            base.replace("buy_offset_bps = 0", "buy_offset_bps = 5"),
+            "buy_offset_bps",
+        );
+        refused(
+            base.replace("sell_offset_bps = 0", "sell_offset_bps = 5"),
+            "sell_offset_bps",
+        );
+        refused(
+            base.replace("sell_offset_bps = 0", "sell_offset_abs = 0.5"),
+            "sell_offset_abs",
+        );
+        let on_pool =
+            |line: &str| base.replace("ttl_secs = 120", &format!("ttl_secs = 120\n{line}"));
+        refused(on_pool("twap_window_secs = 60"), "twap_window_secs");
+        refused(
+            on_pool("lean_enabled = true\nlean_floor_bps = 5"),
+            "lean_enabled",
+        );
+        refused(on_pool("limit_taker_enabled = true"), "limit_taker_enabled");
+        refused(
+            on_pool(
+                "closer_pool = \"0x0000000000000000000000000000000000000009\"\n\
+                 floor_ray = \"1\"\nbuffer_ray = \"2\"\nwindow_secs = 60",
+            ),
+            "closer_pool",
+        );
+        let at_root = |line: &str| {
+            base.replace(
+                "tick_interval_secs = 5",
+                &format!("tick_interval_secs = 5\n{line}"),
+            )
+        };
+        refused(at_root("book_enabled = true"), "book_enabled");
+        // Modules carry their own load-time rules that fire first on this
+        // fixture (they need RFQ on), so ask the feed_sides rule directly.
+        let modules: Config = toml::from_str(&at_root("modules_enabled = true")).unwrap();
+        let err = format!("{:#}", modules.validate_feed_sides().unwrap_err());
+        assert!(err.contains("modules_enabled"), "{err}");
+
+        // Shadow lean only logs, and a zero abs spread is a zero spread.
+        Config::from_toml(&on_pool("lean_shadow = true\nlean_floor_bps = 5"))
+            .expect("shadow lean prices nothing");
+        Config::from_toml(&base.replace("sell_offset_bps = 0", "sell_offset_abs = 0.0"))
+            .expect("a zero abs spread");
+        // None of it applies to a pool that doesn't quote the feed's sides.
+        Config::from_toml(&at_root("book_enabled = true").replace("feed_sides = true", ""))
+            .expect("the ladder on an ordinary pool");
+    }
 
     #[test]
     fn refresh_threshold_defaults_to_requoting_every_tick() {

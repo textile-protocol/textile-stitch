@@ -53,6 +53,7 @@ fn book() -> CorridorBook {
         feed_url: "http://localhost/price".into(),
         staleness_secs: 10,
         curve: None,
+        feed_sides: false,
     }
 }
 #[test]

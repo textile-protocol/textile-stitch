@@ -238,6 +238,13 @@ fn pool_params(cfg: &Config, pool: &PoolConfig) -> Vec<(ParamKey, Param)> {
             SECONDS,
             Some(rfq_staleness_secs_for_pool(&cfg.feed, pool).to_string()),
         ),
+        // Only while on: turning it on is a change from unset, and every
+        // other pool's reading stays exactly what it was.
+        entry(
+            "feed_sides",
+            BOOL,
+            pool.feed_sides.then(|| "true".to_string()),
+        ),
     ]
 }
 
@@ -530,6 +537,22 @@ mod tests {
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!(changes[0].key.name, "rfq.allowed_takers");
         assert_eq!(changes[0].unit, "addresses");
+    }
+
+    #[test]
+    fn quoting_the_feeds_sides_is_one_change_on_the_pool() {
+        let before = params_of(ZARU).unwrap();
+        assert_eq!(value(&before, POOL, "feed_sides"), None);
+        let after = params_of(&ZARU.replacen(
+            "buy_offset_bps = 40",
+            "buy_offset_bps = 40\nfeed_sides = true",
+            1,
+        ))
+        .unwrap();
+        let changes = diff(&before, &after);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].key.name, "feed_sides");
+        assert_eq!(changes[0].after.as_deref(), Some("true"));
     }
 
     #[test]

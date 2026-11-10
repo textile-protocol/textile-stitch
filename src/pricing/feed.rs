@@ -35,6 +35,19 @@ pub struct Quote {
     /// module must not take a corridor dark.
     #[serde(default, deserialize_with = "lenient_reference")]
     pub reference: Option<ReferenceBook>,
+    /// The source's own bid and ask, in the same units as `price` (debt per
+    /// collateral). Only a pool with `feed_sides = true` quotes them (see
+    /// [`crate::config::PoolConfig::feed_sides`]); every other pool ignores
+    /// them. Textile's OTC feed serves both, with `price` their midpoint.
+    ///
+    /// Strict, unlike `reference`: [`parse_quote`] fails the fetch unless both
+    /// are absent, or both are finite and positive with
+    /// `bid <= price <= ask`. A half-present or crossed pair is a broken
+    /// source, and a feed_sides pool would otherwise quote off it.
+    #[serde(default)]
+    pub bid: Option<f64>,
+    #[serde(default)]
+    pub ask: Option<f64>,
 }
 
 fn lenient_reference<'de, D: serde::Deserializer<'de>>(
@@ -69,6 +82,36 @@ impl Quote {
         } = self.reference?;
         (mid.is_finite() && mid > 0.0 && half.is_finite() && half > 0.0).then_some((mid, half))
     }
+
+    /// The feed's `(bid, ask)`, when it served a usable pair around `price`.
+    /// [`parse_quote`] already refuses anything else; checking again here
+    /// keeps a hand-built quote to the same rule.
+    pub fn sides(&self) -> Option<(f64, f64)> {
+        let (bid, ask) = self.bid.zip(self.ask)?;
+        sides_bracket(bid, self.price, ask).then_some((bid, ask))
+    }
+}
+
+/// Both sides finite and positive, and `bid <= price <= ask`. A pair equal to
+/// the price is a zero-width book, which is valid.
+fn sides_bracket(bid: f64, price: f64, ask: f64) -> bool {
+    [bid, price, ask].iter().all(|v| v.is_finite() && *v > 0.0) && bid <= price && price <= ask
+}
+
+/// The rule [`Quote::bid`] documents, on the quote a basis produced.
+fn check_sides(quote: &Quote) -> anyhow::Result<()> {
+    match (quote.bid, quote.ask) {
+        (None, None) => Ok(()),
+        (Some(bid), Some(ask)) => {
+            anyhow::ensure!(
+                sides_bracket(bid, quote.price, ask),
+                "feed bid ({bid}) and ask ({ask}) must be positive and bracket the price ({})",
+                quote.price
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("feed bid and ask must both be present or both absent"),
+    }
 }
 
 /// Which of a feed's prices the bot quotes around.
@@ -90,7 +133,18 @@ pub enum PriceBasis {
 /// book) is shared. Anything there but a finite positive number fails the
 /// fetch: falling back to `price` would put back the adjustment this basis
 /// exists to leave out.
+///
+/// A `bid`/`ask` pair that is half-present, non-positive or doesn't bracket
+/// the resulting price also fails the fetch (see [`Quote::bid`]).
 pub fn parse_quote(body: &str, basis: PriceBasis) -> anyhow::Result<Quote> {
+    let quote = basis_quote(body, basis)?;
+    check_sides(&quote)?;
+    Ok(quote)
+}
+
+/// The quote `basis` reads off the body, before the bid/ask check: that has
+/// to run on the price the bot will actually quote around.
+fn basis_quote(body: &str, basis: PriceBasis) -> anyhow::Result<Quote> {
     let quote: Quote = serde_json::from_str(body)?;
     if basis == PriceBasis::Served {
         return Ok(quote);
@@ -211,6 +265,54 @@ mod tests {
     }
 
     #[test]
+    fn the_feeds_own_sides_are_read_when_both_bracket_the_price() {
+        let body = r#"{"price":0.000650,"bid":0.000645,"ask":0.000655,"timestamp":1754388000}"#;
+        let q = parse_quote(body, PriceBasis::Served).unwrap();
+        assert_eq!((q.bid, q.ask), (Some(0.000645), Some(0.000655)));
+        assert_eq!(q.sides(), Some((0.000645, 0.000655)));
+        // A zero-width book is still a book.
+        let flat = r#"{"price":0.00065,"bid":0.00065,"ask":0.00065,"timestamp":1754388000}"#;
+        assert!(parse_quote(flat, PriceBasis::Served).is_ok());
+        // Absent on both sides: every feed that never sends them.
+        let plain = parse_quote(
+            r#"{"price":0.00065,"timestamp":1754388000}"#,
+            PriceBasis::Served,
+        )
+        .unwrap();
+        assert_eq!((plain.bid, plain.ask, plain.sides()), (None, None, None));
+    }
+
+    #[test]
+    fn a_half_present_crossed_or_non_positive_pair_fails_the_fetch() {
+        for sides in [
+            r#""bid":0.000645"#,
+            r#""ask":0.000655"#,
+            r#""bid":0.000655,"ask":0.000645"#,
+            r#""bid":0.000651,"ask":0.000655"#,
+            r#""bid":0.000645,"ask":0.000649"#,
+            r#""bid":0,"ask":0.000655"#,
+            r#""bid":-0.000645,"ask":0.000655"#,
+            r#""bid":"0.000645","ask":0.000655"#,
+            r#""bid":0.000645,"ask":null"#,
+        ] {
+            let body = format!(r#"{{"price":0.000650,{sides},"timestamp":1754388000}}"#);
+            assert!(
+                parse_quote(&body, PriceBasis::Served).is_err(),
+                "{sides} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sides_must_bracket_the_price_the_basis_quotes_around() {
+        // On the unadjusted basis the bot quotes around `unadjustedPrice`, so
+        // that is the price the pair has to bracket.
+        let body = r#"{"price":0.000650,"unadjustedPrice":0.000660,"bid":0.000645,"ask":0.000655,"timestamp":1754388000}"#;
+        assert!(parse_quote(body, PriceBasis::Served).is_ok());
+        assert!(parse_quote(body, PriceBasis::Unadjusted).is_err());
+    }
+
+    #[test]
     fn degraded_is_read_when_present() {
         let held = parse(r#"{"price":0.00065,"timestamp":1754388000,"degraded":true}"#).unwrap();
         assert!(held.degraded);
@@ -229,6 +331,8 @@ mod tests {
                 timestamp: 1_754_388_000,
                 degraded: false,
                 reference: None,
+                bid: None,
+                ask: None,
             }
         );
         // /price adds metadata next to the quote; it is ignored, not refused.

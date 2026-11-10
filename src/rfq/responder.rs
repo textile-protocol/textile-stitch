@@ -47,6 +47,10 @@ pub struct CorridorBook {
     /// [`crate::modules::config::CurveConfig`]). `None` takes exactly the flat
     /// path this file had before the curve existed.
     pub curve: Option<BookCurve>,
+    /// Quote the feed's own bid and ask (`feed_sides` on the pool). The
+    /// spreads above only say which sides are on; [`feed_sides_book`]
+    /// replaces them per print.
+    pub feed_sides: bool,
 }
 
 /// A corridor's inventory curve as the quote path reads it.
@@ -240,11 +244,44 @@ pub fn book_from_pool(
         sell_capacity_collateral: pool.rfq_sell_capacity_collateral()?,
         staleness_secs,
         curve: None,
+        feed_sides: pool.feed_sides,
         feed_url: pool
             .feed_url
             .clone()
             .unwrap_or_else(|| default_feed_url.to_string()),
     }))
+}
+
+/// The book a print quotes from. A pool without `feed_sides` is unchanged.
+/// A `feed_sides` pool gets each configured side's spread set so that
+/// [`bid_price`] and [`ask_price`] at the feed's `price` land on the feed's
+/// own `bid` and `ask`:
+///
+/// - bid: `Abs(1/bid - 1/price)`, since `bid_price(m, Abs(d)) = 1/(1/m + d)`;
+/// - ask: `Abs(1/price - 1/ask)`, since `ask_price(m, Abs(d)) = 1/(1/m - d)`.
+///
+/// Both are >= 0 because the feed guarantees `bid <= price <= ask` and IEEE
+/// division is monotonic, so no clamp is needed. The
+/// quote path has to price at that same `price` for this to hold, which is why
+/// config refuses TWAP, the lean and modules on these pools. A side without a
+/// spread stays off.
+///
+/// `None` when the pool is `feed_sides` and the print has no usable pair:
+/// firm quotes reject it as a stale feed and the levels skip the tick.
+pub fn feed_sides_book(
+    book: &CorridorBook,
+    quote: &crate::pricing::feed::Quote,
+) -> Option<CorridorBook> {
+    if !book.feed_sides {
+        return Some(book.clone());
+    }
+    let (bid, ask) = quote.sides()?;
+    let mid = quote.price;
+    Some(CorridorBook {
+        buy_spread: book.buy_spread.map(|_| Spread::Abs(1.0 / bid - 1.0 / mid)),
+        sell_spread: book.sell_spread.map(|_| Spread::Abs(1.0 / mid - 1.0 / ask)),
+        ..book.clone()
+    })
 }
 
 /// A priced firm quote, before signing. `bid` is the maker's side: true when
@@ -1393,6 +1430,7 @@ mod tests {
             feed_url: "http://feed".into(),
             staleness_secs: 240,
             curve: None,
+            feed_sides: false,
         }
     }
 
@@ -1499,6 +1537,120 @@ mod tests {
             max_expires_at: "2026-08-05T10:02:00.000Z".into(),
             fee_bps: 1,
         }
+    }
+
+    fn sided_quote(price: f64, bid: f64, ask: f64) -> crate::pricing::feed::Quote {
+        crate::pricing::feed::Quote {
+            price,
+            timestamp: 1_754_388_000,
+            degraded: false,
+            reference: None,
+            bid: Some(bid),
+            ask: Some(ask),
+        }
+    }
+
+    fn sided_book() -> CorridorBook {
+        CorridorBook {
+            buy_spread: Some(Spread::Bps(0)),
+            sell_spread: Some(Spread::Bps(0)),
+            feed_sides: true,
+            ..book()
+        }
+    }
+
+    #[test]
+    fn feed_sides_reproduce_the_feeds_bid_and_ask() {
+        // cNGN-sized prices, a ~1.0 pair, and a zero-width book.
+        for (mid, bid, ask) in [
+            (0.000_650, 0.000_645, 0.000_656),
+            (0.000_649_871_3, 0.000_644_102_9, 0.000_655_731_1),
+            (1.0, 0.99, 1.012),
+            (0.000_65, 0.000_65, 0.000_65),
+        ] {
+            let quote = sided_quote(mid, bid, ask);
+            let sided = feed_sides_book(&sided_book(), &quote).unwrap();
+            let quoted_bid = bid_price(mid, sided.buy_spread.unwrap());
+            let quoted_ask = ask_price(mid, sided.sell_spread.unwrap());
+            assert!(
+                (quoted_bid / bid - 1.0).abs() < 1e-12,
+                "{quoted_bid} vs {bid}"
+            );
+            assert!(
+                (quoted_ask / ask - 1.0).abs() < 1e-12,
+                "{quoted_ask} vs {ask}"
+            );
+        }
+    }
+
+    #[test]
+    fn feed_sides_firm_quotes_price_at_the_feeds_sides_both_ways() {
+        // Through `decide_quote` at the feed's price, for each side and both
+        // exactness modes: the plan is the one priced straight at the feed's
+        // bid or ask.
+        let (mid, bid, ask) = (0.000_650, 0.000_645, 0.000_656);
+        let sided = feed_sides_book(&sided_book(), &sided_quote(mid, bid, ask)).unwrap();
+        let at = |req: &QuoteRequestFrame, maker_bids: bool, price: f64| {
+            quote_at_price(
+                &sided_book(),
+                req,
+                maker_bids,
+                price,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                &funded_inv(),
+            )
+            .unwrap()
+        };
+        // Taker sells cNGN (maker bids): exact-input, then exact-output.
+        let mut sells = request(COLLATERAL, DEBT);
+        sells.sell_amount = Some("4000000000".into());
+        let mut wants_debt = request(COLLATERAL, DEBT);
+        wants_debt.buy_amount = Some("2000000".into());
+        // Taker buys cNGN (maker asks): exact-input, then exact-output.
+        let mut pays = request(DEBT, COLLATERAL);
+        pays.sell_amount = Some("2000000".into());
+        let mut wants_coll = request(DEBT, COLLATERAL);
+        wants_coll.buy_amount = Some("4000000000".into());
+        for (req, maker_bids, price) in [
+            (&sells, true, bid),
+            (&wants_debt, true, bid),
+            (&pays, false, ask),
+            (&wants_coll, false, ask),
+        ] {
+            let plan = decide(&sided, req, mid, U256::ZERO, U256::ZERO).unwrap();
+            assert_eq!(plan, at(req, maker_bids, price));
+        }
+    }
+
+    #[test]
+    fn feed_sides_keep_a_side_without_a_spread_off() {
+        let one_sided = CorridorBook {
+            sell_spread: None,
+            ..sided_book()
+        };
+        let sided = feed_sides_book(&one_sided, &sided_quote(1.0, 0.99, 1.01)).unwrap();
+        assert!(sided.buy_spread.is_some());
+        assert_eq!(sided.sell_spread, None);
+    }
+
+    #[test]
+    fn a_feed_sides_book_has_nothing_to_quote_from_a_print_without_sides() {
+        let plain = crate::pricing::feed::Quote {
+            bid: None,
+            ask: None,
+            ..sided_quote(1.0, 0.99, 1.01)
+        };
+        assert!(feed_sides_book(&sided_book(), &plain).is_none());
+        // Any other pool ignores the sides, present or not.
+        assert_eq!(
+            feed_sides_book(&book(), &sided_quote(1.0, 0.5, 2.0))
+                .unwrap()
+                .buy_spread,
+            book().buy_spread
+        );
     }
 
     #[test]

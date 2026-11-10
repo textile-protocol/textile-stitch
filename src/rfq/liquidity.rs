@@ -1757,6 +1757,7 @@ mod tests {
             feed_url: String::new(),
             staleness_secs: 10,
             curve: None,
+            feed_sides: false,
         };
         let capped = cap_settlement_side(&book, settlement, U256::from(9u8));
         assert_eq!(

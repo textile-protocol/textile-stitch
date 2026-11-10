@@ -2048,6 +2048,11 @@ impl Engine {
             Err(Unusable::Degraded) => return reject(RejectReason::DegradedFeed),
             Err(Unusable::Stale | Unusable::BadPrice) => return reject(RejectReason::StaleFeed),
         }
+        // A pool that quotes the feed's own bid and ask has nothing to quote
+        // from a print without them: as good as no print.
+        if book.feed_sides && quote.sides().is_none() {
+            return reject(RejectReason::StaleFeed);
+        }
 
         // Deadline first: a request whose maxExpiresAt is unreadable or
         // already past can never yield a valid order, so it fails before any
@@ -2484,6 +2489,7 @@ impl Engine {
             plan.bid,
             &book,
             self.price_guard.max_loss_bps,
+            Some(&quote),
         ) {
             warn!(rfq_id = %req.rfq_id, ?reason, "the reference price changed while signing; signature withheld");
             return reject(reason);
@@ -4629,6 +4635,7 @@ mod tests {
                 feed_url: "http://feed".into(),
                 staleness_secs: 240,
                 curve: None,
+                feed_sides: false,
             }],
             configured: Vec::new(),
             allowed_takers: None,
@@ -5010,6 +5017,8 @@ mod tests {
                 timestamp: unix_now(),
                 degraded: false,
                 reference: None,
+                bid: None,
+                ask: None,
             },
         );
         prices
@@ -5112,6 +5121,70 @@ mod tests {
         assert!(!engine.reservations.is_empty());
     }
 
+    /// A pool quoting the feed's own sides, both switched on by zero spreads.
+    fn feed_sides_engine() -> Engine {
+        let mut engine = test_engine();
+        engine.books[0].buy_spread = Some(Spread::Bps(0));
+        engine.books[0].sell_spread = Some(Spread::Bps(0));
+        engine.books[0].feed_sides = true;
+        engine
+    }
+
+    fn sided_prices(bid: f64, ask: f64) -> PriceCache {
+        let prices = PriceCache::default();
+        prices.set(
+            "http://feed".into(),
+            Quote {
+                price: 1.0,
+                timestamp: unix_now(),
+                degraded: false,
+                reference: None,
+                bid: Some(bid),
+                ask: Some(ask),
+            },
+        );
+        prices
+    }
+
+    #[tokio::test]
+    async fn a_feed_sides_pool_quotes_the_feeds_bid_end_to_end() {
+        // The feed's 0.99 bid at a 1.0 mid is exactly a 100 bps bid, so a
+        // plain engine with that spread is the independent answer.
+        let MakerFrame::QuoteResponse(sided) = feed_sides_engine()
+            .respond(exact_input_request("rfq_sided"), &sided_prices(0.99, 1.01))
+            .await
+        else {
+            panic!("a feed_sides pool with a sided print must quote");
+        };
+        let mut plain = test_engine();
+        plain.books[0].buy_spread = Some(Spread::Bps(100));
+        let MakerFrame::QuoteResponse(spread) = plain
+            .respond(exact_input_request("rfq_plain"), &fresh_prices())
+            .await
+        else {
+            panic!("the plain engine must quote");
+        };
+        assert_eq!(sided.sell_amount, spread.sell_amount);
+        assert_eq!(sided.buy_amount, spread.buy_amount);
+    }
+
+    #[tokio::test]
+    async fn a_feed_sides_pool_reads_a_print_without_sides_as_stale() {
+        let mut engine = feed_sides_engine();
+        let reply = engine
+            .respond(exact_input_request("rfq_unsided"), &fresh_prices())
+            .await;
+        let MakerFrame::QuoteReject(rejected) = reply else {
+            panic!("no sides, no quote: {reply:?}");
+        };
+        assert_eq!(rejected.reason, RejectReason::StaleFeed);
+        assert!(engine.reservations.is_empty());
+        // The levels go through the same book, so they skip the tick too.
+        let unsided = fresh_prices().get("http://feed").unwrap();
+        let book = engine.books[0].clone();
+        assert!(engine.module_book(&book, &unsided, unix_now()).is_none());
+    }
+
     /// `fresh_prices`, but the feed also publishes the reference book the
     /// quote curve anchors on, as the cNGN `/price` endpoint now serves it.
     fn fresh_prices_with_reference() -> PriceCache {
@@ -5126,6 +5199,8 @@ mod tests {
                     mid: 1.0,
                     half_range_bps: 9.4,
                 }),
+                bid: None,
+                ask: None,
             },
         );
         prices
@@ -5841,6 +5916,7 @@ mod tests {
             feed_url: "http://feed".into(),
             staleness_secs: 240,
             curve: None,
+            feed_sides: false,
         }
     }
 
@@ -5917,6 +5993,8 @@ mod tests {
                 timestamp: unix_now(),
                 degraded: false,
                 reference: None,
+                bid: None,
+                ask: None,
             },
         );
         assert!(cache.get("http://feed").is_some());
@@ -5930,6 +6008,8 @@ mod tests {
                     timestamp: unix_now() - 1,
                     degraded: false,
                     reference: None,
+                    bid: None,
+                    ask: None,
                 },
                 unix_now(),
             );
@@ -5954,6 +6034,8 @@ mod tests {
                 timestamp: unix_now(),
                 degraded: false,
                 reference: None,
+                bid: None,
+                ask: None,
             }),
         );
         assert_eq!(cache.get("http://feed").unwrap().price, 2.0);
@@ -5973,6 +6055,7 @@ mod tests {
             feed_url: "http://feed".into(),
             staleness_secs: 240,
             curve: None,
+            feed_sides: false,
         }
     }
 
@@ -6536,6 +6619,10 @@ mod tests {
     async fn a_live_curve_keeps_recall_levels_and_quotes_separate_from_liquid_inventory() {
         let mut engine = curve_engine(crate::modules::Mode::Live);
         let dir = temp_dir("curve-recall");
+        // Price first, clock second: a print stamped after `now_ms` reads as
+        // dated ahead of the bot and publishes no levels, which a second
+        // boundary between the two reads used to trigger.
+        let prices = fresh_prices_with_reference();
         let now = unix_now();
         let now_ms = unix_now_ms();
         let config = crate::perps::PerpsConfig {
@@ -6588,7 +6675,6 @@ mod tests {
         )
         .unwrap();
         engine.recall = Some(crate::perps::recall::Runtime::load(&config, &dir, now).unwrap());
-        let prices = fresh_prices_with_reference();
         let MakerFrame::Levels(levels) = engine.level_frames(&prices, now_ms)[0].clone() else {
             panic!("expected levels");
         };
@@ -6835,6 +6921,8 @@ mod tests {
                 timestamp: unix_now().saturating_sub(3_600),
                 degraded: false,
                 reference: None,
+                bid: None,
+                ask: None,
             },
         );
         let reply = engine.respond(exact_input_request("rfq_2"), &stale).await;
@@ -7348,6 +7436,8 @@ mod tests {
                     mid: 1.001,
                     half_range_bps: 9.4,
                 }),
+                bid: None,
+                ask: None,
             },
         );
         let _ = engine.level_frames(&prices, unix_now_ms());

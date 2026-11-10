@@ -175,6 +175,8 @@ mod tests {
             timestamp,
             degraded,
             reference: None,
+            bid: None,
+            ask: None,
         }
     }
 

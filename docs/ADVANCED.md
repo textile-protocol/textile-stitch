@@ -58,6 +58,48 @@ skip the pool for the tick. RFQ publishes no levels and rejects quote requests
 their decisions. Quoting resumes on the first live print. A print that is both
 degraded and older than the window is reported as stale.
 
+#### Feeds that set their own bid and ask
+
+A feed can also send the source's own `bid` and `ask`, in the same units as
+`price` (debt per collateral). Both or neither: a body with one of them, a
+non-positive one, or a pair that doesn't satisfy `bid <= price <= ask` fails
+the fetch, which RFQ treats as a stale feed.
+
+```json
+{ "price": 0.000650, "bid": 0.000645, "ask": 0.000655, "timestamp": 1760000000 }
+```
+
+Pools ignore them unless they set `feed_sides = true`. Such a pool quotes the
+feed's bid and ask over RFQ exactly, instead of spreads around `price`, and
+treats a print without them as stale (no levels, `stale_feed` on requests).
+The spread keys still switch each side on, so set them to 0:
+
+```toml
+[[pools]]
+feed_url = "https://api.textilecredit.com/price?otc=<key>&pair=cngn-usdt"
+feed_sides = true
+buy_offset_bps = 0
+sell_offset_bps = 0
+# sizes as usual: buy_total_liquidity_debt, sell_total_liquidity_collateral, ...
+```
+
+Nothing else may move the price on that pool, so the config refuses to load
+with a non-zero spread, `twap_window_secs`, `lean_enabled`,
+`limit_taker_enabled` or a closer on it, or with `book_enabled = true` or
+`modules_enabled = true` on the bot. The price guard still applies: the jump
+guard tracks `price` (1,000 bps by default) and the order band checks every
+signed quote against it.
+
+Textile's OTC desk feed is `/price?otc=<key>&pair=cngn-usdt` (the feed's admin
+page shows the full URL to paste). It answers
+`{ pair, chainId, price, bid, ask, timestamp, source: "otc", otc, revision }`,
+with `price` the midpoint of the desk's two prices, and 503 while the feed is
+stale, switched off or not set yet. Keep `pair=cngn-usdt` in the URL: Stitch
+reads the pair to pick the RFQ freshness window, and cNGN gets 240 s. Without
+it the window falls to 60 s and the bot goes dark between the reference
+samples. Set `[feed].staleness_secs` to at least 240 too, since the RFQ window
+can't be wider than it.
+
 ### Spreads
 
 Each side needs one spread, either relative (basis points) or absolute (soft per

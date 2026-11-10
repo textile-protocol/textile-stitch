@@ -358,6 +358,11 @@ impl Engine {
             base_sell_bps,
         })
     }
+    /// The book firm quotes and levels price from: the module policy's
+    /// spreads, then a `feed_sides` pool's spreads from the print
+    /// ([`super::responder::feed_sides_book`]), then the liquidity cap. The
+    /// feed's sides go last so nothing can reprice them; config refuses
+    /// modules on such a pool anyway, so the policy step leaves it alone.
     pub(super) fn module_book(
         &self,
         book: &CorridorBook,
@@ -365,9 +370,10 @@ impl Engine {
         now: u64,
     ) -> Option<CorridorBook> {
         let Some(modules) = &self.modules else {
-            return Some(book.clone());
+            return super::responder::feed_sides_book(book, quote);
         };
         self.policy_book(modules, book, quote, now)
+            .and_then(|b| super::responder::feed_sides_book(&b, quote))
             .map(|b| self.liquidity_capped(modules, b, now))
     }
     /// While a liquidity cap is in force, no quote may promise settlement
@@ -687,12 +693,16 @@ impl Engine {
                 b.collateral == pending.order.input_token && b.debt == pending.order.output_token
             })
             .map(|book| {
+                // No pricing print kept here: config refuses modules on a
+                // `feed_sides` pool, and the guard withholds such an order
+                // if one ever reaches this path.
                 super::guard::recheck_after_signing(
                     prices,
                     &pending.order,
                     false,
                     book,
                     self.price_guard.max_loss_bps,
+                    None,
                 )
             });
         match band {

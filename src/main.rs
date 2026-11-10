@@ -1487,6 +1487,8 @@ mod tests {
             timestamp,
             degraded: false,
             reference: None,
+            bid: None,
+            ask: None,
         }
     }
 

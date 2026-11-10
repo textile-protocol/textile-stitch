@@ -219,6 +219,8 @@ mod tests {
             timestamp,
             degraded: false,
             reference: None,
+            bid: None,
+            ask: None,
         }
     }
 
@@ -368,6 +370,8 @@ mod tests {
                 timestamp: if stale { 1 } else { now },
                 degraded,
                 reference: None,
+                bid: None,
+                ask: None,
             };
             tick.admit(poll(now), URL, bad.clone(), now);
             assert_eq!(rfq.get(URL), Some(bad));
