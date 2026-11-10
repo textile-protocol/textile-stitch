@@ -1,4 +1,4 @@
-// Narrowing the fleet list: live or not, chain, vault, and free text.
+// Narrowing the fleet list: live or not, chain, vault or not, and free text.
 //
 // The filter lives in the URL (`?live=…&chain=…&vault=…&q=…`) so opening a bot
 // and pressing back lands on the same narrowed list, and a filtered view can be
@@ -12,20 +12,19 @@ import type { Bot } from './types'
 /** Which side of "is it quoting" to show. `all` is both. */
 export type LiveFilter = 'all' | 'live' | 'not-live'
 
-/** The vault option for bots whose capital sits in the operator wallet. */
-export const NO_VAULT = 'none'
+/** Whether the bot quotes from an OperatorVault. `all` is both. */
+export type VaultFilter = 'all' | 'linked' | 'unlinked'
 
 export interface FleetFilter {
   live: LiveFilter
   /** Chain id as a string, or '' for every chain. */
   chain: string
-  /** `chainId:vaultAddress` (lowercase), NO_VAULT, or '' for any. */
-  vault: string
+  vault: VaultFilter
   /** Free text, matched against name, signer address and corridor currencies. */
   query: string
 }
 
-export const EMPTY_FILTER: FleetFilter = { live: 'all', chain: '', vault: '', query: '' }
+export const EMPTY_FILTER: FleetFilter = { live: 'all', chain: '', vault: 'all', query: '' }
 
 export interface FilterOption {
   value: string
@@ -41,23 +40,16 @@ export function isLive(bot: Bot): boolean {
   return botStatus(bot.state, bot.status, bot.config?.venue) === 'live'
 }
 
-/** The vault key a bot files under. Chain-qualified: the same address on two
- * chains is two vaults. */
-export function vaultKey(bot: Bot): string {
-  const config = bot.config
-  if (!config?.vaultAddress) return NO_VAULT
-  return `${config.chainId}:${config.vaultAddress.toLowerCase()}`
+/** Linked to a vault: `[vault]` is set, so the bot quotes the vault's money
+ * rather than its own wallet's. A bot with no config has no vault. */
+export function hasVault(bot: Bot): boolean {
+  return !!bot.config?.vaultAddress
 }
 
 function networkName(bot: Bot): string | null {
   const config = bot.config
   if (!config) return null
   return config.networkLabel ?? `chain ${config.chainId}`
-}
-
-/** `0x1234…abcd`, enough to tell vaults apart in a dropdown. */
-export function shortAddress(address: string): string {
-  return address.length > 12 ? `${address.slice(0, 6)}…${address.slice(-4)}` : address
 }
 
 /** Everything the search box looks at, lowercased. Pairs are split into their
@@ -97,8 +89,9 @@ function matchesChain(bot: Bot, chain: string): boolean {
   return chain === '' || String(bot.config?.chainId ?? '') === chain
 }
 
-function matchesVault(bot: Bot, vault: string): boolean {
-  return vault === '' || vaultKey(bot) === vault
+function matchesVault(bot: Bot, vault: VaultFilter): boolean {
+  if (vault === 'all') return true
+  return hasVault(bot) === (vault === 'linked')
 }
 
 /** Every filter applied, the rest skipped. Order is kept. */
@@ -126,7 +119,10 @@ export function effectiveFilter(filter: FleetFilter, botCount: number): FleetFil
 
 export function isFiltered(filter: FleetFilter): boolean {
   return (
-    filter.live !== 'all' || filter.chain !== '' || filter.vault !== '' || filter.query.trim() !== ''
+    filter.live !== 'all' ||
+    filter.chain !== '' ||
+    filter.vault !== 'all' ||
+    filter.query.trim() !== ''
   )
 }
 
@@ -149,21 +145,10 @@ export function chainOptions(bots: readonly Bot[]): FilterOption[] {
     .sort((a, b) => a.label.localeCompare(b.label))
 }
 
-/** One option per vault, plus the operator wallet when any bot quotes from it.
- * Vaults read as a short address and their chain; the wallet option goes first. */
-export function vaultOptions(bots: readonly Bot[]): FilterOption[] {
-  const counts = countBy(bots, vaultKey)
-  const labels = new Map(
-    bots
-      .filter((b) => vaultKey(b) !== NO_VAULT)
-      .map((b) => [vaultKey(b), `${shortAddress(b.config!.vaultAddress!)} on ${networkName(b)}`]),
-  )
-  const vaults = [...counts]
-    .filter(([value]) => value !== NO_VAULT)
-    .map(([value, count]) => ({ value, label: labels.get(value) ?? value, count }))
-    .sort((a, b) => a.label.localeCompare(b.label))
-  const wallet = counts.get(NO_VAULT)
-  return wallet ? [{ value: NO_VAULT, label: 'No vault (operator wallet)', count: wallet }, ...vaults] : vaults
+/** How many bots each vault option would show. */
+export function vaultCounts(bots: readonly Bot[]): Record<VaultFilter, number> {
+  const linked = bots.filter(hasVault).length
+  return { all: bots.length, linked, unlinked: bots.length - linked }
 }
 
 /** How many bots each live option would show. */
@@ -173,14 +158,20 @@ export function liveCounts(bots: readonly Bot[]): Record<LiveFilter, number> {
 }
 
 const LIVE_VALUES: readonly LiveFilter[] = ['all', 'live', 'not-live']
+const VAULT_VALUES: readonly VaultFilter[] = ['all', 'linked', 'unlinked']
+
+/** `value` when it is one of `values`, else `fallback`. */
+function oneOf<T extends string>(values: readonly T[], value: string | null, fallback: T): T {
+  return (values as readonly string[]).includes(value ?? '') ? (value as T) : fallback
+}
 
 /** The filter in the URL. Anything unknown reads as unset. */
 export function readFilter(params: URLSearchParams): FleetFilter {
-  const live = params.get('live') ?? 'all'
+  // `vault` used to hold one vault's address; an old link like that reads as all.
   return {
-    live: (LIVE_VALUES as readonly string[]).includes(live) ? (live as LiveFilter) : 'all',
+    live: oneOf(LIVE_VALUES, params.get('live'), 'all'),
     chain: params.get('chain') ?? '',
-    vault: params.get('vault') ?? '',
+    vault: oneOf(VAULT_VALUES, params.get('vault'), 'all'),
     query: params.get('q') ?? '',
   }
 }
@@ -191,7 +182,7 @@ export function writeFilter(filter: FleetFilter): URLSearchParams {
   const entries: [string, string][] = [
     ['live', filter.live === 'all' ? '' : filter.live],
     ['chain', filter.chain],
-    ['vault', filter.vault],
+    ['vault', filter.vault === 'all' ? '' : filter.vault],
     ['q', filter.query],
   ]
   return new URLSearchParams(entries.filter(([, v]) => v !== ''))

@@ -4,13 +4,33 @@ import {
   type FilterOption,
   type FleetFilter,
   type LiveFilter,
+  type VaultFilter,
 } from '../fleetFilter'
 
-const LIVE_OPTIONS: readonly { value: LiveFilter; label: string; dot: string | null }[] = [
-  { value: 'all', label: 'All', dot: null },
+interface SegmentOption<T extends string> {
+  value: T
+  label: string
+  /** Shown below `sm` instead of `label`, when the full one won't fit a phone. */
+  short?: string
+  dot?: string
+}
+
+const LIVE_OPTIONS: readonly SegmentOption<LiveFilter>[] = [
+  { value: 'all', label: 'All' },
   { value: 'live', label: 'Live', dot: 'bg-success' },
   { value: 'not-live', label: 'Not live', dot: 'bg-faint' },
 ]
+
+const VAULT_OPTIONS: readonly SegmentOption<VaultFilter>[] = [
+  { value: 'all', label: 'All' },
+  { value: 'linked', label: 'With vault', short: 'Vault' },
+  { value: 'unlinked', label: 'Without vault', short: 'No vault' },
+]
+
+const VAULT_CHIP: Record<Exclude<VaultFilter, 'all'>, string> = {
+  linked: 'With vault',
+  unlinked: 'Without vault',
+}
 
 /** Same height for every control on the bar, so the row reads as one piece. */
 const CONTROL_H = 'h-9'
@@ -27,32 +47,33 @@ interface Chip {
  * that is closed any of them in force show as chips, so a narrowed list never
  * hides why it is narrowed.
  *
- * A dropdown with a single choice filters nothing, so chain and vault only
- * appear once the fleet spans more than one of them, and Filters only when one
- * of them does.
+ * A choice that can't narrow anything isn't offered: chain only shows once the
+ * fleet spans two chains, vault only once some bots have one and some don't,
+ * and Filters only when one of them shows.
  */
 export default function FleetFilters({
   filter,
   onChange,
   liveCounts,
   chains,
-  vaults,
+  vaultCounts,
 }: {
   filter: FleetFilter
   onChange: (filter: FleetFilter) => void
   liveCounts: Record<LiveFilter, number>
   chains: FilterOption[]
-  vaults: FilterOption[]
+  vaultCounts: Record<VaultFilter, number>
 }) {
   const set = (patch: Partial<FleetFilter>) => onChange({ ...filter, ...patch })
   const [open, setOpen] = useState(false)
   const panelId = useId()
 
   const chainChoices = withPicked(chains, filter.chain)
-  const vaultChoices = withPicked(vaults, filter.vault)
   const showChain = chainChoices.length > 1
-  const showVault = vaultChoices.length > 1
-  const advancedActive = (filter.chain !== '' ? 1 : 0) + (filter.vault !== '' ? 1 : 0)
+  // Kept on screen while picked, so a link from a mixed fleet can be undone.
+  const showVault =
+    (vaultCounts.linked > 0 && vaultCounts.unlinked > 0) || filter.vault !== 'all'
+  const advancedActive = (filter.chain !== '' ? 1 : 0) + (filter.vault !== 'all' ? 1 : 0)
 
   const chips: Chip[] = [
     filter.chain !== '' && {
@@ -60,10 +81,10 @@ export default function FleetFilters({
       label: `Chain: ${labelOf(chainChoices, filter.chain)}`,
       clear: () => set({ chain: '' }),
     },
-    filter.vault !== '' && {
+    filter.vault !== 'all' && {
       key: 'vault',
-      label: `Vault: ${labelOf(vaultChoices, filter.vault)}`,
-      clear: () => set({ vault: '' }),
+      label: VAULT_CHIP[filter.vault],
+      clear: () => set({ vault: 'all' }),
     },
   ].filter((c): c is Chip => !!c)
 
@@ -74,10 +95,13 @@ export default function FleetFilters({
           Filters, left to right. */}
       <div className="flex flex-wrap items-center gap-2">
         <SearchBox value={filter.query} onChange={(query) => set({ query })} />
-        <LiveSwitch
+        <Segmented
+          label="Live"
+          options={LIVE_OPTIONS}
           value={filter.live}
           counts={liveCounts}
           onChange={(live) => set({ live })}
+          className="order-3 basis-full sm:order-2 sm:basis-auto"
         />
         {(showChain || showVault) && (
           <button
@@ -116,6 +140,7 @@ export default function FleetFilters({
             {showChain && (
               <PanelField label="Chain">
                 <FilterSelect
+                  label="Chain"
                   value={filter.chain}
                   onChange={(chain) => set({ chain })}
                   all="All chains"
@@ -125,11 +150,13 @@ export default function FleetFilters({
             )}
             {showVault && (
               <PanelField label="Vault">
-                <FilterSelect
+                <Segmented
+                  label="Vault"
+                  options={VAULT_OPTIONS}
                   value={filter.vault}
+                  counts={vaultCounts}
                   onChange={(vault) => set({ vault })}
-                  all="All vaults"
-                  options={vaultChoices}
+                  stretch
                 />
               </PanelField>
             )}
@@ -137,7 +164,7 @@ export default function FleetFilters({
           <div className="mt-3.5 flex items-center justify-between gap-3 border-t border-line-soft pt-3 text-sm">
             <button
               type="button"
-              onClick={() => set({ chain: '', vault: '' })}
+              onClick={() => set({ chain: '', vault: 'all' })}
               disabled={advancedActive === 0}
               className="font-bold text-muted hover:text-ink disabled:cursor-default disabled:opacity-40 disabled:hover:text-muted"
             >
@@ -259,32 +286,44 @@ function SearchBox({ value, onChange }: { value: string; onChange: (v: string) =
   )
 }
 
-/** All, Live, Not live: one radio group, so "neither" can't be picked. Fills
- * the row on a phone, sits at its own width beside the search on a desktop. */
-function LiveSwitch({
+/**
+ * A small set of exclusive choices with a count on each: one radio group, so
+ * "none of them" can't be picked. On the bar it fills the row on a phone and
+ * sits at its own width from `sm` up; `stretch` keeps the segments equal at
+ * every width, for the Filters panel.
+ */
+function Segmented<T extends string>({
+  label,
+  options,
   value,
   counts,
   onChange,
+  stretch = false,
+  className = '',
 }: {
-  value: LiveFilter
-  counts: Record<LiveFilter, number>
-  onChange: (value: LiveFilter) => void
+  label: string
+  options: readonly SegmentOption<T>[]
+  value: T
+  counts: Record<T, number>
+  onChange: (value: T) => void
+  stretch?: boolean
+  className?: string
 }) {
   const name = useId()
   return (
     <div
       role="radiogroup"
-      aria-label="Live"
-      className={`${CONTROL_H} order-3 flex min-w-0 basis-full rounded-lg bg-active p-0.5 sm:order-2 sm:basis-auto`}
+      aria-label={label}
+      className={`${CONTROL_H} flex min-w-0 rounded-lg bg-active p-0.5 ${className}`}
     >
-      {LIVE_OPTIONS.map((option) => {
+      {options.map((option) => {
         const active = value === option.value
         return (
           <label
             key={option.value}
-            className={`inline-flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md px-2.5 text-sm font-bold whitespace-nowrap transition has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent sm:flex-none sm:px-3 ${
-              active ? 'bg-surface text-ink shadow-sm ring-1 ring-line-soft' : 'text-muted hover:text-ink'
-            }`}
+            className={`inline-flex min-w-0 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md px-2.5 text-sm font-bold whitespace-nowrap transition has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent ${
+              stretch ? '' : 'sm:flex-none sm:px-3'
+            } ${active ? 'bg-surface text-ink shadow-sm ring-1 ring-line-soft' : 'text-muted hover:text-ink'}`}
           >
             <input
               type="radio"
@@ -295,7 +334,14 @@ function LiveSwitch({
               className="sr-only"
             />
             {option.dot && <span aria-hidden className={`size-1.5 rounded-full ${option.dot}`} />}
-            {option.label}
+            {option.short ? (
+              <>
+                <span className="sm:hidden">{option.short}</span>
+                <span className="hidden sm:inline">{option.label}</span>
+              </>
+            ) : (
+              option.label
+            )}
             <span
               className={`text-xs font-normal tabular-nums ${active ? 'text-muted' : 'text-faint'}`}
             >
@@ -308,24 +354,28 @@ function LiveSwitch({
   )
 }
 
+/** A caption over one panel control. A div, not a <label>: the vault field is a
+ * radio group, and each control names itself with aria-label. */
 function PanelField({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <label className="block min-w-0">
+    <div className="min-w-0">
       <span className="mb-1.5 block text-[11px] font-bold tracking-wider text-faint uppercase">
         {label}
       </span>
       {children}
-    </label>
+    </div>
   )
 }
 
 /** A native select (so phones get their own picker) dressed to match the bar. */
 function FilterSelect({
+  label,
   value,
   onChange,
   all,
   options,
 }: {
+  label: string
   value: string
   onChange: (value: string) => void
   all: string
@@ -334,6 +384,7 @@ function FilterSelect({
   return (
     <span className="relative block">
       <select
+        aria-label={label}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className={`${CONTROL_H} w-full cursor-pointer appearance-none truncate rounded-lg border bg-canvas pr-9 pl-3 text-sm text-ink transition focus:border-accent focus:ring-3 focus:ring-accent/15 focus:outline-none ${

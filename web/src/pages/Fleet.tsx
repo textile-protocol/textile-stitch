@@ -35,7 +35,7 @@ import {
   isFiltered,
   liveCounts,
   readFilter,
-  vaultOptions,
+  vaultCounts,
   writeFilter,
   type FleetFilter,
 } from '../fleetFilter'
@@ -222,7 +222,7 @@ export default function Fleet() {
               onChange={setFilter}
               liveCounts={liveCounts(data.bots)}
               chains={chainOptions(data.bots)}
-              vaults={vaultOptions(data.bots)}
+              vaultCounts={vaultCounts(data.bots)}
             />
           )}
           {shown.length === 0 ? (

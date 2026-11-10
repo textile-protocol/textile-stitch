@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
   EMPTY_FILTER,
-  NO_VAULT,
   chainOptions,
   effectiveFilter,
   filterFleet,
@@ -9,7 +8,7 @@ import {
   liveCounts,
   matchesQuery,
   readFilter,
-  vaultOptions,
+  vaultCounts,
   writeFilter,
   type FleetFilter,
 } from './fleetFilter'
@@ -98,20 +97,25 @@ describe('filterFleet: chain and vault', () => {
     expect(names(filterFleet(fleet, with_({ chain: '42220' })))).toEqual(['celo-vault'])
   })
 
-  it('treats the same address on two chains as two vaults', () => {
-    expect(names(filterFleet(fleet, with_({ vault: `8453:${VAULT.toLowerCase()}` })))).toEqual([
+  it('with vault keeps every bot linked to one, on any chain', () => {
+    expect(names(filterFleet(fleet, with_({ vault: 'linked' })))).toEqual([
       'base-vault',
+      'celo-vault',
     ])
   })
 
-  it('no vault means the operator wallet funds it', () => {
-    expect(names(filterFleet(fleet, with_({ vault: NO_VAULT })))).toEqual(['base-wallet', 'bare'])
+  it('without vault keeps the rest, a bot with no config included', () => {
+    expect(names(filterFleet(fleet, with_({ vault: 'unlinked' })))).toEqual(['base-wallet', 'bare'])
   })
 
   it('combines filters', () => {
-    expect(names(filterFleet(fleet, with_({ chain: '8453', vault: NO_VAULT })))).toEqual([
+    expect(names(filterFleet(fleet, with_({ chain: '8453', vault: 'unlinked' })))).toEqual([
       'base-wallet',
     ])
+  })
+
+  it('counts each vault option', () => {
+    expect(vaultCounts(fleet)).toEqual({ all: 4, linked: 2, unlinked: 2 })
   })
 
   it('lists chains by name with counts, skipping bots with no config', () => {
@@ -124,20 +128,6 @@ describe('filterFleet: chain and vault', () => {
   it('falls back to the chain id when the network has no name', () => {
     expect(chainOptions([bot('x', { chainId: 999, networkLabel: null })])).toEqual([
       { value: '999', label: 'chain 999', count: 1 },
-    ])
-  })
-
-  it('lists the operator wallet first, then each vault with its chain', () => {
-    expect(vaultOptions(fleet)).toEqual([
-      { value: NO_VAULT, label: 'No vault (operator wallet)', count: 2 },
-      { value: `8453:${VAULT.toLowerCase()}`, label: '0xAbCd…1234 on Base', count: 1 },
-      { value: `42220:${VAULT.toLowerCase()}`, label: '0xAbCd…1234 on Celo', count: 1 },
-    ])
-  })
-
-  it('leaves out the wallet option when every bot has a vault', () => {
-    expect(vaultOptions([bot('v', { vaultAddress: VAULT })]).map((o) => o.value)).toEqual([
-      `8453:${VAULT.toLowerCase()}`,
     ])
   })
 })
@@ -182,7 +172,7 @@ describe('URL round trip', () => {
   })
 
   it('reads back what it wrote', () => {
-    const f: FleetFilter = { live: 'not-live', chain: '8453', vault: NO_VAULT, query: 'cngn' }
+    const f: FleetFilter = { live: 'not-live', chain: '8453', vault: 'unlinked', query: 'cngn' }
     expect(readFilter(writeFilter(f))).toEqual(f)
     expect(isFiltered(f)).toBe(true)
   })
@@ -190,10 +180,14 @@ describe('URL round trip', () => {
   it('reads an unknown live value as both', () => {
     expect(readFilter(new URLSearchParams('live=maybe')).live).toBe('all')
   })
+
+  it('reads an old single-vault link as all, rather than filtering on nothing', () => {
+    expect(readFilter(new URLSearchParams(`vault=8453:${VAULT.toLowerCase()}`)).vault).toBe('all')
+  })
 })
 
 describe('effectiveFilter', () => {
-  const f: FleetFilter = { live: 'live', chain: '8453', vault: NO_VAULT, query: 'x' }
+  const f: FleetFilter = { live: 'live', chain: '8453', vault: 'unlinked', query: 'x' }
 
   it('ignores the filter for a lone bot, so it never hides behind a hidden bar', () => {
     expect(effectiveFilter(f, 1)).toEqual(EMPTY_FILTER)
