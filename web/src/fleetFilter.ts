@@ -187,3 +187,32 @@ export function writeFilter(filter: FleetFilter): URLSearchParams {
   ]
   return new URLSearchParams(entries.filter(([, v]) => v !== ''))
 }
+
+/** The URL params that name a filter, as opposed to the search text. */
+const FILTER_PARAMS = ['live', 'chain', 'vault'] as const
+
+/**
+ * The part of a filter kept between visits, as a query string: live, chain
+ * and vault. The search text isn't kept: a search is a one-off, and an old
+ * one coming back would quietly hide bots on the next visit.
+ */
+export function savedForm(filter: FleetFilter): string {
+  return writeFilter({ ...filter, query: '' }).toString()
+}
+
+/** Whether the URL names a filter of its own (a bookmark, a shared link, or
+ * this tab's history), rather than leaving it to the saved one. */
+export function hasFilterParams(params: URLSearchParams): boolean {
+  return FILTER_PARAMS.some((key) => params.has(key))
+}
+
+/**
+ * The filter to show: the URL's when it names one, else the one saved by the
+ * last change, in this tab or another. The search text always comes from the
+ * URL. `saved` is `savedForm`'s output, or null when nothing was saved.
+ */
+export function resolveFilter(params: URLSearchParams, saved: string | null): FleetFilter {
+  const fromUrl = readFilter(params)
+  if (hasFilterParams(params)) return fromUrl
+  return { ...readFilter(new URLSearchParams(saved ?? '')), query: fromUrl.query }
+}

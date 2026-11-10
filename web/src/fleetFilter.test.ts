@@ -8,6 +8,8 @@ import {
   liveCounts,
   matchesQuery,
   readFilter,
+  resolveFilter,
+  savedForm,
   vaultCounts,
   writeFilter,
   type FleetFilter,
@@ -200,5 +202,41 @@ describe('effectiveFilter', () => {
 
   it('applies it from two bots up', () => {
     expect(effectiveFilter(f, 2)).toBe(f)
+  })
+})
+
+describe('saved filter', () => {
+  const saved = savedForm({ live: 'live', chain: '8453', vault: 'linked', query: 'cngn' })
+  const params = (s: string) => new URLSearchParams(s)
+
+  it('keeps live, chain and vault, not the search text', () => {
+    expect(saved).toBe('live=live&chain=8453&vault=linked')
+    expect(savedForm(EMPTY_FILTER)).toBe('')
+  })
+
+  it('comes back on a visit whose URL names no filter', () => {
+    expect(resolveFilter(params(''), saved)).toEqual({
+      live: 'live',
+      chain: '8453',
+      vault: 'linked',
+      query: '',
+    })
+  })
+
+  it('keeps the search text from the URL when it does', () => {
+    expect(resolveFilter(params('q=lagos'), saved).query).toBe('lagos')
+    expect(resolveFilter(params('q=lagos'), saved).live).toBe('live')
+  })
+
+  it('gives way to a URL that names a filter of its own', () => {
+    expect(resolveFilter(params('vault=unlinked'), saved)).toEqual({
+      ...EMPTY_FILTER,
+      vault: 'unlinked',
+    })
+  })
+
+  it('reads nothing saved, or junk, as no filter', () => {
+    expect(resolveFilter(params(''), null)).toEqual(EMPTY_FILTER)
+    expect(resolveFilter(params(''), 'live=maybe&vault=0xabc')).toEqual(EMPTY_FILTER)
   })
 })

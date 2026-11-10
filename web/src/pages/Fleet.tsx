@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { botLabel, botPath } from '../botRoutes'
-import { Link, useLocation, useSearchParams } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 import { ApiError, api } from '../api'
 import { pageVisibility, poll } from '../poll'
 import {
@@ -34,12 +34,10 @@ import {
   filterFleet,
   isFiltered,
   liveCounts,
-  readFilter,
   vaultCounts,
-  writeFilter,
-  type FleetFilter,
 } from '../fleetFilter'
 import FleetFilters from '../components/FleetFilters'
+import { useFleetFilter } from '../useFleetFilter'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
@@ -71,11 +69,8 @@ export default function Fleet() {
   const [settled, setSettled] = useState<ReadonlySet<string>>(new Set())
   const [capped, setCapped] = useState(false)
   const [balancesHidden, toggleBalances] = useBalancesHidden()
-  // The filter is the URL, so back from a bot returns to the same narrowed list.
-  // `replace`, so typing in the search box doesn't stack a history entry a key.
-  const [params, setParams] = useSearchParams()
-  const filter = readFilter(params)
-  const setFilter = (next: FleetFilter) => setParams(writeFilter(next), { replace: true })
+  // The filter is the URL, saved between visits and tabs (see useFleetFilter).
+  const [filter, setFilter] = useFleetFilter()
 
   const load = useCallback(async () => {
     try {

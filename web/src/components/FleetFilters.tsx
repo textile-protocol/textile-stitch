@@ -228,6 +228,19 @@ function labelOf(options: FilterOption[], value: string): string {
 /** Free text. `/` jumps to it from anywhere on the page, Escape empties it. */
 function SearchBox({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const ref = useRef<HTMLInputElement>(null)
+  // What the box shows. `value` comes back through the URL, which can lag a
+  // fast typist by a keystroke or two; rendering it directly reset the box to
+  // that older text and dropped letters. So the box keeps its own text while
+  // focused and only takes `value` when the change came from elsewhere (Clear
+  // all, another tab), which is never while someone is typing in it.
+  const [draft, setDraft] = useState(value)
+  useEffect(() => {
+    if (document.activeElement !== ref.current) setDraft(value)
+  }, [value])
+  const change = (next: string) => {
+    setDraft(next)
+    onChange(next)
+  }
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
@@ -251,12 +264,12 @@ function SearchBox({ value, onChange }: { value: string; onChange: (v: string) =
         enterKeyHint="search"
         autoComplete="off"
         spellCheck={false}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
+        value={draft}
+        onChange={(e) => change(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Escape' && value !== '') {
+          if (e.key === 'Escape' && draft !== '') {
             e.preventDefault()
-            onChange('')
+            change('')
           }
         }}
         placeholder="Name, signer or currency"
@@ -264,11 +277,11 @@ function SearchBox({ value, onChange }: { value: string; onChange: (v: string) =
         className={`${CONTROL_H} w-full rounded-lg border border-line bg-surface pr-9 pl-9 text-sm text-ink transition placeholder:text-faint focus:border-accent focus:ring-3 focus:ring-accent/15 focus:outline-none [&::-webkit-search-cancel-button]:appearance-none`}
       />
       <span className="absolute inset-y-0 right-2 flex items-center">
-        {value !== '' ? (
+        {draft !== '' ? (
           <button
             type="button"
             onClick={() => {
-              onChange('')
+              change('')
               ref.current?.focus()
             }}
             aria-label="Clear search"
