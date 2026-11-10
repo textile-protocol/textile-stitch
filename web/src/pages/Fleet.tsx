@@ -12,6 +12,7 @@ import {
   Loading,
   StatePill,
   Tag,
+  VaultButton,
 } from '../components/ui'
 import { formatUsd } from '../format'
 import {
@@ -355,23 +356,6 @@ function BotRow({
         </div>
       )}
     </Card>
-  )
-}
-
-/** Opens the bot's vault on the Textile app. Accent-tinted so it reads as a
- * link, not one of the row's grey status tags. `relative z-10` lifts it over
- * the row's stretched link so the click lands here, not on the bot. */
-function VaultButton({ href }: { href: string }) {
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noreferrer"
-      title="Open this vault on Textile"
-      className="relative z-10 rounded-md bg-accent-tint px-1.5 py-0.5 text-xs font-bold text-accent no-underline hover:bg-accent hover:text-on-accent"
-    >
-      vault ↗
-    </a>
   )
 }
 

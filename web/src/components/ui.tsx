@@ -140,6 +140,24 @@ export function Tag({ children }: { children: ReactNode }) {
   )
 }
 
+/** Opens a bot's vault on the Textile app, from the fleet row and the bot's
+ * page alike. Accent-tinted so it reads as a link, not one of the grey status
+ * tags. `relative z-10` lifts it over a fleet row's stretched link so the
+ * click lands here, not on the bot. */
+export function VaultButton({ href }: { href: string }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      title="Open this vault on Textile"
+      className="relative z-10 rounded-md bg-accent-tint px-1.5 py-0.5 text-xs font-bold text-accent no-underline hover:bg-accent hover:text-on-accent"
+    >
+      vault ↗
+    </a>
+  )
+}
+
 /** A bot's warnings. Blocking ones read as errors, the rest as advisories. */
 export function Warnings({ warnings }: { warnings: WarningBody[] }) {
   if (warnings.length === 0) return null

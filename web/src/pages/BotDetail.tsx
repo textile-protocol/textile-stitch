@@ -15,6 +15,7 @@ import {
   Loading,
   StatePill,
   Tag,
+  VaultButton,
   Warnings,
 } from '../components/ui'
 import BotSwitcher from '../components/BotSwitcher'
@@ -35,7 +36,7 @@ import VersionRollback from '../components/VersionRollback'
 import { Disclosure } from '../components/ModuleControls'
 import PrivateBalance, { Dots } from '../components/PrivateBalance'
 import { useBalancesHidden } from '../balancePrivacy'
-import { dashboardWallet, fundsFromVault } from '../capital'
+import { dashboardWallet, fundsFromVault, textileVaultUrl } from '../capital'
 import { imageLabel, shortAddress, shortImage, formatUsd, hostOf } from '../format'
 import { totalUsd, unpricedSymbols, useFunding } from '../funding'
 import { confirmRemovePlan } from '../removeBot'
@@ -205,6 +206,7 @@ export default function BotDetail() {
   // Approve would grant permission on tokens it never spends — so the allowance
   // card, the handoff banner and the Approve action all stay hidden.
   const vaultFunded = fundsFromVault(bot.config)
+  const vaultUrl = textileVaultUrl(bot.config)
 
   return (
     <div className="space-y-4">
@@ -298,7 +300,7 @@ export default function BotDetail() {
           <div className="mt-1 flex flex-wrap items-center gap-3 text-sm">
             {vaultFunded ? (
               <>
-                <Tag>vault</Tag>
+                {vaultUrl && <VaultButton href={vaultUrl} />}
                 <AddressLink
                   address={bot.config?.vaultAddress ?? ''}
                   explorerUrl={bot.config?.vaultExplorerUrl ?? null}
