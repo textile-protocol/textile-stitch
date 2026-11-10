@@ -30,6 +30,31 @@ The one-screen config reference lives in
 | `operator_address` | the EVM address the key controls. The panel's Verify fills it in |
 | `AWS_KMS_CREDENTIALS_FILE` (env) | an AWS credentials file. Not needed when the bot runs on AWS with a role |
 
+## The quick way
+
+`scripts/aws-kms-signer.sh` does steps 1 and 2 in one go with the AWS CLI. It
+creates the key, an IAM user that can only sign with it and that user's access
+key, waits until the access key can sign, then puts the key ARN, access key ID
+and secret on the clipboard one at a time for the panel's form. Run it once per
+bot, with credentials that can create KMS keys and IAM users:
+
+```bash
+scripts/aws-kms-signer.sh --region eu-west-1 [--profile admin] my-bot
+```
+
+It names everything after the bot (`alias/stitch-operator-my-bot`, IAM user
+`stitch-operator-my-bot`), prints the operator address the key controls, and
+removes what it created if any step fails before you have the secret.
+`--save <file>` also writes the access key as an owner-only credentials file,
+for a bot you run by hand. Without a clipboard, `--save` is required: the secret
+is never printed.
+
+Unlike a key made in the console, its key policy lets only that IAM user sign.
+The account keeps every other permission, so admins can still manage and delete
+the key, but an IAM grant of `kms:Sign` elsewhere in the account doesn't reach
+it. To have something else sign with it later (say, an instance role), add that
+principal to the key policy.
+
 ## 1. Create the key
 
 Create it in the region the bot will run in, since every quote waits on a round
