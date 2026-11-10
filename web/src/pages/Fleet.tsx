@@ -14,7 +14,7 @@ import {
   Tag,
   VaultButton,
 } from '../components/ui'
-import { formatUsd } from '../format'
+import { formatUsd, shortImage } from '../format'
 import {
   arrangeFleet,
   rankFleet,
@@ -39,6 +39,10 @@ import {
 } from '../fleetFilter'
 import FleetFilters from '../components/FleetFilters'
 import { useFleetFilter } from '../useFleetFilter'
+import UpdateAllSheet from '../components/UpdateAllSheet'
+import FleetUpdateProgress from '../components/FleetUpdateProgress'
+import { planFleetUpdate, runActive, type StepStatus } from '../fleetUpdate'
+import { fleetUpdate, useFleetUpdate } from '../useFleetUpdate'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
@@ -72,6 +76,8 @@ export default function Fleet() {
   const [balancesHidden, toggleBalances] = useBalancesHidden()
   // The filter is the URL, saved between visits and tabs (see useFleetFilter).
   const [filter, setFilter] = useFleetFilter()
+  const run = useFleetUpdate()
+  const [sheetOpen, setSheetOpen] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -94,6 +100,12 @@ export default function Fleet() {
     void loadUpdates()
     return poll(load, POLL_MS, { immediate: true })
   }, [load, loadUpdates])
+
+  // A finished run moved bots, so what's behind has changed.
+  const runFinished = run !== null && !runActive(run)
+  useEffect(() => {
+    if (runFinished) void loadUpdates()
+  }, [runFinished, loadUpdates])
 
   const botNames = (data?.bots ?? [])
     .filter((b) => b.config)
@@ -169,6 +181,10 @@ export default function Fleet() {
   const behind = new Set(
     (updates?.bots ?? []).filter((b) => b.updateAvailable).map((b) => b.name),
   )
+  // Same order as the list below, so the run goes down the page.
+  const plan = planFleetUpdate(arrangeFleet(data.bots, order), updates)
+  const updatable = plan.ready.length
+  const stepOf = new Map((run?.steps ?? []).map((s) => [s.name, s.status]))
 
   const total = data.bots.length
   // One bot has nothing to narrow: no bar, and no filter from the URL either.
@@ -191,11 +207,36 @@ export default function Fleet() {
 
       {error && <Banner tone="danger" onDismiss={() => setError(null)}>{error}</Banner>}
       {note && <Banner tone="info" onDismiss={() => setNote(null)}>{note}</Banner>}
-      {behind.size > 0 && (
-        <Banner tone="info">
-          {behind.size} {behind.size === 1 ? 'bot has' : 'bots have'} a stitch image update
-          available. Open a bot and click Update.
-        </Banner>
+      {run ? (
+        <FleetUpdateProgress
+          run={run}
+          onStop={fleetUpdate.stop}
+          onDismiss={fleetUpdate.dismiss}
+        />
+      ) : (
+        behind.size > 0 && (
+          <div className="flex flex-wrap items-center gap-3 rounded-lg bg-hover px-3 py-2 text-sm">
+            <span className="flex-1">
+              {behind.size} {behind.size === 1 ? 'bot is' : 'bots are'} behind the latest
+              stitch image ({shortImage(updates?.bot.targetImage ?? null)}).
+            </span>
+            {updatable > 0 && (
+              // Secondary on purpose: Add corridor stays the page's one primary action.
+              <Button onClick={() => setSheetOpen(true)}>
+                Update {updatable === 1 ? 'bot' : 'all'}…
+              </Button>
+            )}
+          </div>
+        )
+      )}
+      {updates && (
+        <UpdateAllSheet
+          open={sheetOpen}
+          plan={plan}
+          target={updates.bot.targetImage}
+          onClose={() => setSheetOpen(false)}
+          onStart={(picked) => fleetUpdate.start(updates.bot.targetImage, picked)}
+        />
       )}
 
       {/* The first-time screen. It sits under a button labelled Add corridor,
@@ -247,6 +288,7 @@ export default function Fleet() {
                     updateAvailable={
                       behind.has(bot.name) && !bot.canMigrate && bot.layout !== 'flat-files'
                     }
+                    updateStep={stepOf.get(bot.name)}
                   />
                 </li>
               ))}
@@ -264,6 +306,7 @@ function BotRow({
   balancesHidden,
   onToggleBalances,
   updateAvailable,
+  updateStep,
 }: {
   bot: Bot
   /** The capital's worth, undefined while unread. */
@@ -271,6 +314,8 @@ function BotRow({
   balancesHidden: boolean
   onToggleBalances: () => void
   updateAvailable: boolean
+  /** Where this bot is in an Update all run, if it's in one. */
+  updateStep?: StepStatus
 }) {
   const blocking = bot.warnings.filter((w) => w.blocksEditing)
   const advisory = bot.warnings.filter((w) => !w.blocksEditing)
@@ -301,7 +346,13 @@ function BotRow({
             )}
             <StatePill state={bot.state} status={bot.status} venue={bot.config?.venue} />
             {vaultUrl && <VaultButton href={vaultUrl} />}
-            {updateAvailable && <Tag>update available</Tag>}
+            {updateStep === 'updating' || updateStep === 'checking' ? (
+              <Tag>updating…</Tag>
+            ) : updateStep === 'done' ? (
+              <Tag>updated</Tag>
+            ) : (
+              updateAvailable && <Tag>update available</Tag>
+            )}
             {!bot.container && <Tag>no container</Tag>}
           </div>
           {/* One chip per corridor, so three corridors read as three pairs and

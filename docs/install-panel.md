@@ -479,6 +479,7 @@ it; the compose export is there for when you want to go back.
 | Dry run | same, with `--dry-run` | Dry run button |
 | Logs | `docker compose logs -f bot1` | live tail with level colouring |
 | Upgrade a bot | edit the image tag, `up -d` | **Update** when a newer digest is available (pulls `STITCH_PANEL_BOT_IMAGE` and recreates that bot). **Recreate** rebuilds on the configured image for recovery, keeping a pinned bot's own build. |
+| Upgrade every bot | edit each tag, `up -d` | **Update all…** on the Fleet page when bots are behind. It updates them one at a time, waits for each to stay up, and lists any that didn't at the end. Pinned and flat-layout bots are left as they are. Keep the tab open until it finishes. |
 | Downgrade a bot | edit the image tag back, `up -d` | **Tools → Roll back** — pick one of the last 10 published builds |
 | Upgrade the panel | `docker compose pull && up -d` | **Update panel** in the header when a newer `textile-stitch-panel` digest is published |
 
