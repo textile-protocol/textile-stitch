@@ -95,6 +95,15 @@ export interface Bot {
   withdrawBlockedReason: string | null
   /** The bot to stop first: this one, or a sibling quoting from the wallet. */
   withdrawBlockedBy: string | null
+  /**
+   * Whether the vault's shares on the signing key can be sent right now.
+   * Looser than `canWithdraw`: the shares aren't what the bot quotes, so only
+   * a process that could spend the same nonce blocks it. False without a vault.
+   */
+  canWithdrawShares: boolean
+  withdrawSharesBlockedReason: string | null
+  /** The bot to stop first, when the block is one: a sender on the same key. */
+  withdrawSharesBlockedBy: string | null
   config: ConfigBody | null
   warnings: WarningBody[]
 }
@@ -447,8 +456,12 @@ export interface Allowances {
 // the two can never disagree. Chain, feed and price failures are fields, never
 // status codes: the step keeps rendering and keeps polling.
 
-/** `stable` is a pool's debt token (USDT, USDC…); `soft` is its collateral. */
-export type FundingRole = 'stable' | 'soft'
+/**
+ * `stable` is a pool's debt token (USDT, USDC…); `soft` is its collateral.
+ * `share` is the vault's own share token on the signer wallet, only ever in
+ * `walletTokens`: the fees a vault mints to a fee recipient that is this key.
+ */
+export type FundingRole = 'stable' | 'soft' | 'share'
 
 export interface FundingToken {
   role: FundingRole
@@ -462,8 +475,11 @@ export interface FundingToken {
   balanceText: string | null
   /** USDT per 1 token. Stable tokens are pinned at 1. Null when nothing is known. */
   price: number | null
-  /** `fixed` for the stable side, `feed` when the pool's feed answered. */
-  priceSource: 'fixed' | 'feed' | null
+  /**
+   * `fixed` for the stable side, `feed` when the pool's feed answered, `nav`
+   * for vault shares valued at the vault's last settled NAV.
+   */
+  priceSource: 'fixed' | 'feed' | 'nav' | null
   /** Why `price` is null, in the panel's words. */
   priceError: string | null
   /**
@@ -567,6 +583,10 @@ export interface Funding {
    * like `tokens` (same feeds, other address) and never approved for anything.
    */
   walletTokens: FundingToken[] | null
+  /** The vault's operator admin, where fee shares usually go. Null without a vault. */
+  vaultOwner: string | null
+  /** Where the vault mints the operator's fees, as shares. Null without a vault. */
+  vaultFeeRecipient: string | null
   gas: FundingGas
   gate: FundingGate
   /** First chain error, or why there is no operator address. Null when reads worked. */

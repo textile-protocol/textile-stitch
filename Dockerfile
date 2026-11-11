@@ -35,7 +35,9 @@ LABEL com.textile.stitch.rfq-reservations="token"
 # than the panel: without this it can only find out by running the container and
 # reading `unknown argument: <verb>` out of the log tail, which looks like the
 # operation failed when it never started.
-LABEL com.textile.stitch.commands="approve,dry-run,withdraw,register"
+# `withdraw-shares` isn't a verb of its own: it says `withdraw` takes the vault's
+# share token (`--token shares`), which older binaries refuse.
+LABEL com.textile.stitch.commands="approve,dry-run,withdraw,register,withdraw-shares"
 
 COPY --from=builder /src/target/release/stitch /usr/local/bin/stitch
 COPY deploy/container-entrypoint.sh /usr/local/bin/stitch-container-entrypoint

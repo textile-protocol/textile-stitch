@@ -231,7 +231,8 @@ fn print_help() {
          approve           Approve the config's input tokens to Permit2, then exit.\n                      \
          Required before going live; uses a max allowance unless --exact.\n    \
          withdraw          Move tokens out of the bot's wallet, then exit. Takes\n                      \
-         --token <address|native> --amount <number|all> --to <address>.\n    \
+         --token <address|native|shares> --amount <number|all> --to <address>.\n                      \
+         `shares` is the vault's share token on a vault bot (fees).\n    \
          connect           Register this wallet with Textile and write the maker\n                      \
          credential, then exit. Required before an RFQ bot can quote.\n    \
          register          Optional: mint this bot's ERC-8004 agent identity on its\n                      \
@@ -392,8 +393,9 @@ async fn run_approve(config_path: String, dry_run: bool, exact: bool) -> anyhow:
 /// `stitch withdraw`: move tokens out of the bot's wallet and exit. Signs with
 /// the config's signer, same as quoting does. The panel's Funds tab runs this
 /// as a one-shot; it also works from a shell. A vault bot's signer wallet is
-/// still a wallet (gas, dust, a mistaken transfer): this moves what *it*
-/// holds, never the vault's capital, which leaves by the vault's own redeem.
+/// still a wallet (gas, dust, a mistaken transfer, and the vault shares its fees
+/// are minted as when it is the fee recipient): this moves what *it* holds,
+/// never the vault's capital, which leaves by the vault's own redeem.
 async fn run_withdraw(
     config_path: String,
     token: String,

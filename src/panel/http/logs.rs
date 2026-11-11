@@ -331,6 +331,57 @@ pub fn withdraw_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a withdraw of `token` moves the vault's share token, not one of the
+/// wallet's own corridor tokens. `token` is what the withdraw route was given:
+/// the vault's address, or the binary's `shares` word.
+pub fn is_share_withdraw(bot: &Bot, token: &str) -> bool {
+    let Some(vault) = bot.config.as_ref().and_then(|c| c.vault_address.as_deref()) else {
+        return false;
+    };
+    let token = token.trim();
+    token.eq_ignore_ascii_case(crate::chain::withdraw::SHARES) || token.eq_ignore_ascii_case(vault)
+}
+
+/// Whether sending the vault's shares off the signing key can run right now.
+///
+/// Looser than [`withdraw_check`]. The shares are the key's own (fees minted to
+/// it as fee recipient), not what the bot quotes: a vault bot's quotes draw on
+/// the vault's balances, which a share transfer doesn't touch. So a live
+/// maker-only bot keeps running. What still matters is the nonce, the same as
+/// for an approval: this bot or a sibling on the key with a broadcasting leg
+/// could sign the same nonce, and one of the two transactions would be lost.
+pub fn share_withdraw_check(bot: &Bot, fleet: &Fleet) -> anyhow::Result<()> {
+    signer_can_broadcast(bot, "withdraw")?;
+    if bot
+        .config
+        .as_ref()
+        .and_then(|c| c.vault_address.as_ref())
+        .is_none()
+    {
+        anyhow::bail!(
+            "{} doesn't quote from a vault, so it has no vault shares.",
+            bot.name
+        );
+    }
+    if can_transact(bot) {
+        anyhow::bail!(
+            "{} is {} with a leg that sends transactions from this wallet. A share transfer now \
+             could pick the same nonce, and one of the two transactions would be lost. Stop {} \
+             first.",
+            bot.name,
+            bot.state.as_str(),
+            bot.name
+        );
+    }
+    no_live_sibling_on_the_wallet(bot, fleet)
+}
+
+/// The bot to stop before a share withdraw can run, when there is one. The
+/// same bots an approval waits on.
+pub fn share_withdraw_blocked_by(bot: &Bot, fleet: &Fleet) -> Option<String> {
+    approve_blocked_by(bot, fleet)
+}
+
 /// The one-shot verb a bot's image has to declare before the panel launches it.
 ///
 /// `approve` and `dry-run` are older than the label that answers this, so every
@@ -341,6 +392,19 @@ fn declared_verb_needed(which: &OneShot) -> Option<&'static str> {
         OneShot::Withdraw { .. } | OneShot::Register { .. } => Some(which.as_str()),
         OneShot::Approve | OneShot::DryRun => None,
     }
+}
+
+/// What an image's commands label lists when its `withdraw` takes the vault's
+/// share token. Not a verb: older binaries have `withdraw` but refuse `shares`.
+pub const SHARES_CAPABILITY: &str = "withdraw-shares";
+
+/// Why a bot can't send its vault shares yet: its image's `withdraw` predates them.
+pub fn stale_shares_image_reason(bot: &str) -> String {
+    format!(
+        "{bot} runs a stitch image whose withdraw can't move vault shares yet, so the run would \
+         refuse the token without touching the wallet. Use Update on this bot to move it to a \
+         current image, then try again."
+    )
 }
 
 /// Why a bot can't run `verb` yet, in the operator's terms.
@@ -367,7 +431,11 @@ async fn require_declared_verb(
     bot: &Bot,
     which: &OneShot,
 ) -> Result<(), ApiError> {
-    let Some(verb) = declared_verb_needed(which) else {
+    let shares = matches!(which, OneShot::Withdraw { token, .. } if is_share_withdraw(bot, token));
+    let Some(verb) = (match shares {
+        true => Some(SHARES_CAPABILITY),
+        false => declared_verb_needed(which),
+    }) else {
         return Ok(());
     };
     // The process runtime runs this panel's own binary, so the verb is whatever
@@ -396,7 +464,10 @@ async fn require_declared_verb(
     if crate::panel::naming::image_declares_command(&labels, verb) {
         return Ok(());
     }
-    Err(ApiError::conflict(stale_image_reason(&bot.name, verb)))
+    Err(ApiError::conflict(match shares {
+        true => stale_shares_image_reason(&bot.name),
+        false => stale_image_reason(&bot.name, verb),
+    }))
 }
 
 /// The bot to stop before a withdraw can run, when there is one.
@@ -603,7 +674,8 @@ pub async fn approve(
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WithdrawBody {
-    /// An ERC-20 address the bot's corridors trade, or `native` for the gas coin.
+    /// An ERC-20 address the bot's corridors trade, `native` for the gas coin,
+    /// or on a vault bot the vault's address (or `shares`) for its share token.
     pub token: String,
     /// A plain decimal in the token's own units, or `all`.
     pub amount: String,
@@ -630,10 +702,12 @@ pub async fn withdraw(
         )));
     }
     let token = body.token.trim();
-    if !token.eq_ignore_ascii_case("native") && token.parse::<alloy_primitives::Address>().is_err()
-    {
+    let word = token.eq_ignore_ascii_case("native")
+        || token.eq_ignore_ascii_case(crate::chain::withdraw::SHARES);
+    if !word && token.parse::<alloy_primitives::Address>().is_err() {
         return Err(ApiError::bad_request(
-            "token must be a token address the bot trades, or `native` for gas",
+            "token must be a token address the bot trades, `native` for gas, or `shares` for \
+             the vault's shares",
         ));
     }
     let amount = body.amount.trim();
@@ -754,7 +828,10 @@ pub(super) async fn one_shot(
     // `bot` is rebound to the read the claim was taken against.
     let (bot, claim, start_hold) = if which.broadcasts() {
         let (config_guard, bot) = super::bots::lock_config(name, &state).await?;
-        let check = match which {
+        let check = match &which {
+            OneShot::Withdraw { token, .. } if is_share_withdraw(&bot, token) => {
+                share_withdraw_check
+            }
             OneShot::Withdraw { .. } => withdraw_check,
             // A mint takes a nonce and nothing else, like an approval. The
             // signer half of `approve_check` would word a refusal around
@@ -1296,6 +1373,114 @@ mod tests {
         let (status, text) = h.post_json("/api/bots/bot-b/withdraw", body).await;
         assert_eq!(status, StatusCode::CONFLICT, "{text}");
         assert!(text.contains("Stop bot-a first"), "{text}");
+        assert!(h.docker.one_shot_specs().is_empty(), "nothing must run");
+    }
+
+    const VAULT: &str = "0x00000000000000000000000000000000000fa017";
+
+    /// A maker-only bot quoting from `VAULT`, on an image whose withdraw
+    /// moves vault shares.
+    fn seed_vault(h: &Harness, name: &str, state: ContainerState) {
+        seed_in_state(h, name, state);
+        let toml = h.root.join(name).join("stitch.toml");
+        let current = std::fs::read_to_string(&toml).unwrap();
+        let current = current.replace("book_enabled = true", "book_enabled = false");
+        std::fs::write(
+            &toml,
+            format!("{current}\n[vault]\naddress = \"{VAULT}\"\n"),
+        )
+        .unwrap();
+        declare_share_commands(h);
+    }
+
+    /// Label the shared test image the way a current Dockerfile does. Seeding
+    /// another bot resets it to the older list.
+    fn declare_share_commands(h: &Harness) {
+        h.docker.set_image_label(
+            "ghcr.io/textile-protocol/textile-stitch:latest",
+            crate::panel::naming::LABEL_COMMANDS,
+            "approve,dry-run,withdraw,register,withdraw-shares",
+        );
+    }
+
+    fn share_body() -> serde_json::Value {
+        serde_json::json!({
+            "token": VAULT,
+            "amount": "all",
+            "to": "0x000000000000000000000000000000000000dEaD",
+        })
+    }
+
+    /// Fee shares aren't what a vault bot quotes, so sending them doesn't need
+    /// it stopped, unlike the wallet's corridor tokens.
+    #[tokio::test]
+    async fn vault_shares_go_out_beside_a_live_maker_only_bot() {
+        let h = harness("withdraw-shares-live");
+        seed_vault(&h, "bot-a", ContainerState::Running);
+        h.docker.set_one_shot_exit(0);
+
+        let (_, body) = h.get("/api/bots/bot-a").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canWithdrawShares"], true, "{body}");
+        assert!(v["withdrawSharesBlockedBy"].is_null(), "{body}");
+        // Its corridor-token withdraw still waits for a stop.
+        assert_eq!(v["canWithdraw"], false, "{body}");
+
+        let (status, body) = h.post_json("/api/bots/bot-a/withdraw", share_body()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let shots = h.docker.one_shot_specs();
+        let cmd = shots
+            .last()
+            .expect("a one-shot ran")
+            .cmd
+            .clone()
+            .unwrap_or_default();
+        assert!(cmd.windows(2).any(|w| w == ["--token", VAULT]), "{cmd:?}");
+    }
+
+    /// The nonce still matters: a process on the key that broadcasts could
+    /// sign the same one, and one of the two transactions would be lost.
+    #[tokio::test]
+    async fn vault_shares_wait_for_a_broadcasting_bot_on_the_same_key() {
+        let h = harness("withdraw-shares-nonce");
+        seed_vault(&h, "bot-a", ContainerState::Exited);
+        seed_transacting(&h, "bot-b", ContainerState::Running);
+        declare_share_commands(&h);
+
+        let (_, body) = h.get("/api/bots/bot-a").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canWithdrawShares"], false, "{body}");
+        assert_eq!(v["withdrawSharesBlockedBy"], "bot-b", "{body}");
+
+        let (status, body) = h.post_json("/api/bots/bot-a/withdraw", share_body()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Stop bot-b first"), "{body}");
+        assert!(h.docker.one_shot_specs().is_empty(), "nothing must run");
+    }
+
+    /// An image whose withdraw predates vault shares would refuse the token.
+    /// Say so up front, with Update as the fix and nothing to stop.
+    #[tokio::test]
+    async fn vault_shares_need_an_image_that_knows_them() {
+        let h = harness("withdraw-shares-old-image");
+        seed_vault(&h, "bot-a", ContainerState::Exited);
+        declare_commands(&h, "ghcr.io/textile-protocol/textile-stitch:latest");
+
+        let (_, body) = h.get("/api/bots/bot-a").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canWithdrawShares"], false, "{body}");
+        assert!(v["withdrawSharesBlockedBy"].is_null(), "{body}");
+        assert!(
+            v["withdrawSharesBlockedReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Update"),
+            "{body}"
+        );
+
+        let (status, body) = h.post_json("/api/bots/bot-a/withdraw", share_body()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("Update"), "{body}");
         assert!(h.docker.one_shot_specs().is_empty(), "nothing must run");
     }
 

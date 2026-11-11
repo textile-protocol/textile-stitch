@@ -73,6 +73,13 @@ pub struct BotBody {
     pub can_withdraw: bool,
     pub withdraw_blocked_reason: Option<String>,
     pub withdraw_blocked_by: Option<String>,
+    /// Whether the vault's shares on the signing key can be sent right now.
+    /// Looser than `canWithdraw`: shares aren't what the bot quotes, so only a
+    /// process that could spend the same nonce blocks it. Always false on a bot
+    /// without a vault.
+    pub can_withdraw_shares: bool,
+    pub withdraw_shares_blocked_reason: Option<String>,
+    pub withdraw_shares_blocked_by: Option<String>,
     pub config: Option<ConfigBody>,
     pub warnings: Vec<WarningBody>,
 }
@@ -165,6 +172,7 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
     // blocks an approval just as much as this one being live does.
     let approve_check = super::logs::approve_check(bot, fleet);
     let withdraw_check = super::logs::withdraw_check(bot, fleet);
+    let shares_check = super::logs::share_withdraw_check(bot, fleet);
     BotBody {
         name: bot.name.clone(),
         display_name: label_dir(bot).and_then(|dir| crate::panel::label::read_display_name(&dir)),
@@ -188,6 +196,9 @@ pub fn to_body(bot: &Bot, state: &AppState, fleet: &Fleet) -> BotBody {
         can_withdraw: withdraw_check.is_ok(),
         withdraw_blocked_reason: withdraw_check.err().map(|e| format!("{e:#}")),
         withdraw_blocked_by: super::logs::withdraw_blocked_by(bot, fleet),
+        can_withdraw_shares: shares_check.is_ok(),
+        withdraw_shares_blocked_reason: shares_check.err().map(|e| format!("{e:#}")),
+        withdraw_shares_blocked_by: super::logs::share_withdraw_blocked_by(bot, fleet),
         config: bot.config.as_ref().map(ConfigBody::from),
         warnings: bot.warnings.iter().map(WarningBody::from).collect(),
     }
@@ -206,6 +217,20 @@ async fn with_version(mut body: BotBody, bot: &Bot, state: &AppState, wait: bool
             body.withdraw_blocked_by = None;
         }
     }
+    if body.can_withdraw_shares {
+        if let Some(reason) = stale_image_for(
+            state,
+            bot,
+            logs::SHARES_CAPABILITY,
+            logs::stale_shares_image_reason(&bot.name),
+        )
+        .await
+        {
+            body.can_withdraw_shares = false;
+            body.withdraw_shares_blocked_reason = Some(reason);
+            body.withdraw_shares_blocked_by = None;
+        }
+    }
     body
 }
 
@@ -216,13 +241,28 @@ async fn with_version(mut body: BotBody, bot: &Bot, state: &AppState, wait: bool
 /// the only evidence: an inspect that fails says nothing either way, so leave
 /// the gate alone and let the run answer.
 async fn stale_withdraw_image(state: &AppState, bot: &Bot) -> Option<String> {
+    stale_image_for(
+        state,
+        bot,
+        "withdraw",
+        logs::stale_image_reason(&bot.name, "withdraw"),
+    )
+    .await
+}
+
+/// `reason`, when the bot's image doesn't list `command` in its commands label.
+async fn stale_image_for(
+    state: &AppState,
+    bot: &Bot,
+    command: &str,
+    reason: String,
+) -> Option<String> {
     if state.cfg.runtime != PanelRuntime::Docker {
         return None;
     }
     let image = provision::image_of(bot, &state.cfg);
     let labels = state.docker.local_image_labels(&image).await.ok()?;
-    (!crate::panel::naming::image_declares_command(&labels, "withdraw"))
-        .then(|| logs::stale_image_reason(&bot.name, "withdraw"))
+    (!crate::panel::naming::image_declares_command(&labels, command)).then_some(reason)
 }
 
 async fn running_version(state: &AppState, bot: &Bot, wait: bool) -> Option<String> {

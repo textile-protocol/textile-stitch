@@ -325,6 +325,32 @@ native_reserve = 10
 `stitch withdraw --token 0x471E… --amount all` keeps the reserve too. Use
 `--token native --amount all` to empty the wallet completely.
 
+### Vault fees on the signing key
+
+An OperatorVault pays its management and performance fees by minting new
+vault shares to its fee recipient, not by sending tokens. If the bot's own key
+is the fee recipient, the fees pile up there as shares. The panel shows them on
+the Funds tab under the signer wallet, valued at the vault's last settled NAV,
+and Remove won't delete a key that holds them.
+
+Send them to the vault owner, then redeem from there like any depositor:
+
+```bash
+stitch withdraw --config stitch.toml --token shares --amount all --to 0x<owner>
+```
+
+`--token` also takes the vault's address. In the panel, pick the vault shares in
+the Withdraw form and use **Vault owner** to fill in the destination. This works
+with every signer that can send a transaction, AWS and Google Cloud KMS
+included. The bot doesn't have to stop: the shares aren't what it quotes, so
+only another process sending from the same key (a taker or closer leg, or a
+live liquidity schedule) has to stop first, so the two don't pick the same
+nonce.
+
+To stop fees landing on the key at all, have the vault owner call
+`setFeeRecipient(<owner>)` on the vault. It pays out what's accrued to the old
+recipient first, so send those last shares on afterwards.
+
 ### Liquidity And Order Sizing
 
 Stitch can post one order per side or a ladder of smaller orders:

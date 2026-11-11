@@ -24,10 +24,11 @@ function allTokens(funding: Funding): FundingToken[] {
 }
 
 /**
- * What the signer wallet still holds of the corridor tokens, when the capital
- * sits in a vault. Empty without one, and empty when the wallet is clean —
- * which is the normal state: a vault maker's money is the vault's, and only a
- * mistaken transfer puts a corridor token on the signing key.
+ * What the signer wallet still holds of the corridor tokens and the vault's
+ * shares, when the capital sits in a vault. Empty without one, and empty when
+ * the wallet is clean — which is the normal state: a vault maker's money is the
+ * vault's, only a mistaken transfer puts a corridor token on the signing key,
+ * and shares only land there when the key is the vault's fee recipient.
  */
 export function walletDust(funding: Funding | null): FundingToken[] {
   return (funding?.walletTokens ?? []).filter(
@@ -38,9 +39,13 @@ export function walletDust(funding: Funding | null): FundingToken[] {
 /** One priced or unpriced holding: a token row or the gas coin. */
 type Holding = Pick<FundingToken, 'symbol' | 'balance' | 'usd'>
 
-/** Everything the read produced: both addresses' tokens and the signer's gas. */
+/**
+ * Everything the read produced: both addresses' tokens and the signer's gas.
+ * Less the vault shares on the key: they are a claim on the vault's inventory,
+ * which `tokens` already counts, so adding them would count that money twice.
+ */
 function everything(funding: Funding): Holding[] {
-  return [...allTokens(funding), funding.gas]
+  return [...allTokens(funding).filter((t) => t.role !== 'share'), funding.gas]
 }
 
 /**

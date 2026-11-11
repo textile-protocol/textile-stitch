@@ -14,10 +14,10 @@ import type { Funding, FundingToken } from '../../types'
 
 /** Stable side first, so the order matches the pair's name (`cNGN / USDT`
  * reads soft-first, but the money an operator sends first is the dollar). */
+const ROLE_ORDER: Record<FundingToken['role'], number> = { stable: 0, soft: 1, share: 2 }
+
 export function orderTokens(tokens: FundingToken[]): FundingToken[] {
-  return [...tokens].sort((a, b) =>
-    a.role === b.role ? 0 : a.role === 'stable' ? -1 : 1,
-  )
+  return [...tokens].sort((a, b) => ROLE_ORDER[a.role] - ROLE_ORDER[b.role])
 }
 
 /** The same order, for the rows the bot quotes against. */
@@ -122,6 +122,9 @@ export function TokenRow({
     <li className="grid grid-cols-[1fr_auto] items-center gap-3 px-3 py-2.5">
       <div className="min-w-0">
         <span className="text-sm font-bold text-ink">{t.symbol}</span>
+        {t.role === 'share' && (
+          <p className="text-xs text-faint">Vault shares, valued at the last settled NAV</p>
+        )}
         {t.price === null && t.balance !== null && t.balance !== '0' && (
           <p className="text-xs text-warning">{fund.priceError(t.symbol, t.priceError)}</p>
         )}

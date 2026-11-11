@@ -34,6 +34,21 @@ describe('capitalUsd', () => {
     expect(totalUsd(f)).toBe(1258)
   })
 
+  it('leaves fee shares on the key out of the totals: the vault already counts that money', () => {
+    const shares = { ...token('tvUSDT', 55), role: 'share' } as FundingToken
+    const f = funding({
+      source: 'vault',
+      tokens: [token('USDT', 1000)],
+      walletTokens: [token('USDT', 3), shares],
+      gasUsd: 5,
+      gasBalance: '1',
+    })
+    expect(totalUsd(f)).toBe(1008)
+    expect(capitalUsd(f)).toBe(1000)
+    const unpriced = { ...token('tvUSDT', null), role: 'share' } as FundingToken
+    expect(unpricedSymbols(funding({ source: 'vault', tokens: [], walletTokens: [unpriced] }))).toEqual([])
+  })
+
   it('reads null when the vault could not be priced, not the gas on the key', () => {
     const f = funding({
       source: 'vault',

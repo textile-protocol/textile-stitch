@@ -15,6 +15,16 @@
 //! would refuse it for lack of gas and the operator would read that as
 //! "withdraw is broken".
 //!
+//! On a vault bot it also moves the vault's own share token out of the signing
+//! key, named by `[vault].address` or the word `shares`. The key ends up holding
+//! shares when it is the vault's fee recipient: management and performance fees
+//! are minted to that address as shares, and redeeming them is the vault's
+//! ordinary redeem flow, which the owner runs better from a Safe than from a hot
+//! key. So this sends them on, as a plain ERC-20 `transfer`. Moving shares doesn't
+//! change what the vault quotes, so unlike the wallet's corridor tokens it doesn't
+//! need the bot stopped; the panel only waits for the nonce (see
+//! `crate::panel::http::logs`).
+//!
 //! A corridor token that IS the gas coin (CELO's GoldToken on Celo, matched by
 //! address in [`crate::chain::gas_reserve`]) is sent as the gas coin: a value
 //! transfer, the same coins. `all` of it keeps back the gas reserve, or the
@@ -23,7 +33,7 @@
 //! `native`.
 use std::time::Duration;
 
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{keccak256, Address, Bytes, U256};
 use anyhow::{bail, Context};
 use tracing::info;
 
@@ -59,31 +69,52 @@ fn known_token_decimals(cfg: &Config, wanted: Address) -> Option<u8> {
     })
 }
 
+/// The `--token` word for the vault's share token on a vault bot.
+pub const SHARES: &str = "shares";
+
 /// What a `--token` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Asset {
     /// A corridor token, moved by ERC-20 `transfer`.
     Erc20 { token: Address, decimals: u8 },
+    /// The vault's share token, also an ERC-20 `transfer`. Its decimals come
+    /// from the vault (they match the settlement asset), not from the config.
+    Shares { vault: Address },
     /// The gas coin, moved by value transfer. `all` leaves at least `keep`
     /// wei behind; the transfer's fee is paid out of it when it covers it.
     Gas { keep: U256 },
 }
 
-/// Resolve `--token`: `native`, the gas coin's ERC-20 address (routed as the
-/// gas coin, keeping the gas reserve on `all`), or a corridor token whose
-/// decimals `decimals_of` knows.
+/// The vault this bot quotes from, when `[vault]` names a valid one.
+fn configured_vault(cfg: &Config) -> Option<Address> {
+    cfg.vault.as_ref()?.address.trim().parse().ok()
+}
+
+/// Resolve `--token`: `native`, the vault's shares (`shares` or the vault's
+/// address, only when `vault` is set), the gas coin's ERC-20 address (routed
+/// as the gas coin, keeping the gas reserve on `all`), or a corridor token
+/// whose decimals `decimals_of` knows.
 fn resolve_asset(
     token: &str,
     gas_reserve: &GasReserve,
+    vault: Option<Address>,
     decimals_of: impl Fn(Address) -> Option<u8>,
 ) -> anyhow::Result<Asset> {
     let token = token.trim();
     if token.eq_ignore_ascii_case("native") {
         return Ok(Asset::Gas { keep: U256::ZERO });
     }
-    let addr: Address = token
-        .parse()
-        .with_context(|| format!("--token {token:?} is not an address (or `native`)"))?;
+    if token.eq_ignore_ascii_case(SHARES) {
+        return vault
+            .map(|vault| Asset::Shares { vault })
+            .ok_or_else(|| anyhow::anyhow!("`shares` needs a [vault] in the config"));
+    }
+    let addr: Address = token.parse().with_context(|| {
+        format!("--token {token:?} is not an address (or `native`, or `shares` on a vault bot)")
+    })?;
+    if vault == Some(addr) {
+        return Ok(Asset::Shares { vault: addr });
+    }
     if gas_reserve.covers(addr) {
         return Ok(Asset::Gas {
             keep: gas_reserve.amount(),
@@ -91,14 +122,29 @@ fn resolve_asset(
     }
     let decimals = decimals_of(addr).ok_or_else(|| {
         anyhow::anyhow!(
-            "{addr} is not a token this bot's corridors trade; withdraw only moves those \
-             (and `native` for gas)"
+            "{addr} is not a token this bot's corridors trade; withdraw only moves those, \
+             `native` for gas, and on a vault bot the vault's shares"
         )
     })?;
     Ok(Asset::Erc20 {
         token: addr,
         decimals,
     })
+}
+
+/// The vault share token's `decimals()`. Read rather than assumed: the shares
+/// track the settlement asset's decimals, and a wrong guess would scale the
+/// operator's amount by a power of ten.
+async fn share_decimals(wallet: &Wallet, vault: Address) -> anyhow::Result<u8> {
+    let data = Bytes::from(keccak256(b"decimals()")[..4].to_vec());
+    let raw = wallet
+        .read_uint(vault, &data)
+        .await
+        .with_context(|| format!("reading decimals() on the vault {vault}"))?;
+    u8::try_from(raw)
+        .ok()
+        .filter(|d| *d <= 36)
+        .ok_or_else(|| anyhow::anyhow!("the vault {vault} reports {raw} decimals"))
 }
 
 /// `all` of the gas coin: the balance less the transfer's fee or `keep`,
@@ -168,17 +214,22 @@ pub async fn plan_withdraw(
         bail!("that is the bot's own wallet; nothing to move");
     }
 
-    let asset = resolve_asset(token, &cfg.gas_reserve(), |addr| {
+    let asset = resolve_asset(token, &cfg.gas_reserve(), configured_vault(cfg), |addr| {
         known_token_decimals(cfg, addr)
     })?;
     let (token_addr, symbol, decimals) = match asset {
         Asset::Erc20 { token, decimals } => (Some(token), token.to_string(), decimals),
+        Asset::Shares { vault } => (
+            Some(vault),
+            format!("vault shares ({vault})"),
+            share_decimals(wallet, vault).await?,
+        ),
         Asset::Gas { .. } => (None, "native".to_string(), 18u8),
     };
 
     let amount = if amount.trim().eq_ignore_ascii_case("all") {
         match asset {
-            Asset::Erc20 { token, .. } => {
+            Asset::Erc20 { token, .. } | Asset::Shares { vault: token } => {
                 let data = Bytes::from(encode_balance_of(wallet.address()));
                 wallet
                     .read_uint(token, &data)
@@ -276,7 +327,7 @@ mod tests {
         let reserve = GasReserve::for_chain(42220);
         for spelled in [CELO.to_string(), format!("{CELO:#x}")] {
             assert_eq!(
-                resolve_asset(&spelled, &reserve, celo_corridor).unwrap(),
+                resolve_asset(&spelled, &reserve, None, celo_corridor).unwrap(),
                 Asset::Gas {
                     keep: reserve.amount()
                 },
@@ -284,7 +335,7 @@ mod tests {
             );
         }
         assert_eq!(
-            resolve_asset(" NATIVE ", &reserve, celo_corridor).unwrap(),
+            resolve_asset(" NATIVE ", &reserve, None, celo_corridor).unwrap(),
             Asset::Gas { keep: U256::ZERO }
         );
     }
@@ -293,7 +344,7 @@ mod tests {
     fn other_tokens_and_other_chains_stay_erc20_transfers() {
         let reserve = GasReserve::for_chain(42220);
         assert_eq!(
-            resolve_asset(&USDT.to_string(), &reserve, celo_corridor).unwrap(),
+            resolve_asset(&USDT.to_string(), &reserve, None, celo_corridor).unwrap(),
             Asset::Erc20 {
                 token: USDT,
                 decimals: 6
@@ -304,6 +355,7 @@ mod tests {
             resolve_asset(
                 &CELO.to_string(),
                 &GasReserve::for_chain(8453),
+                None,
                 celo_corridor
             )
             .unwrap(),
@@ -313,7 +365,42 @@ mod tests {
             }
         );
         let stranger = "0x000000000000000000000000000000000000CE10";
-        assert!(resolve_asset(stranger, &reserve, celo_corridor).is_err());
+        assert!(resolve_asset(stranger, &reserve, None, celo_corridor).is_err());
+    }
+
+    const VAULT: Address = alloy_primitives::address!("00000000000000000000000000000000000Fa017");
+
+    #[test]
+    fn a_vault_bot_names_its_shares_by_word_or_by_the_vaults_address() {
+        let reserve = GasReserve::for_chain(42220);
+        for spelled in [
+            "shares".to_string(),
+            " SHARES ".to_string(),
+            VAULT.to_string(),
+        ] {
+            assert_eq!(
+                resolve_asset(&spelled, &reserve, Some(VAULT), celo_corridor).unwrap(),
+                Asset::Shares { vault: VAULT },
+                "{spelled}"
+            );
+        }
+        // Corridor tokens and gas resolve as before on a vault bot.
+        assert_eq!(
+            resolve_asset(&USDT.to_string(), &reserve, Some(VAULT), celo_corridor).unwrap(),
+            Asset::Erc20 {
+                token: USDT,
+                decimals: 6
+            }
+        );
+    }
+
+    #[test]
+    fn shares_are_refused_without_a_vault() {
+        let reserve = GasReserve::for_chain(42220);
+        let err = resolve_asset("shares", &reserve, None, celo_corridor).unwrap_err();
+        assert!(format!("{err:#}").contains("[vault]"), "{err:#}");
+        // Without a vault, the vault's address is just an unknown token.
+        assert!(resolve_asset(&VAULT.to_string(), &reserve, None, celo_corridor).is_err());
     }
 
     #[test]

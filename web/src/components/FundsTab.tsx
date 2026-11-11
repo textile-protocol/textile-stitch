@@ -19,9 +19,17 @@
 //
 // The Withdraw form is collapsed until opened, on every bot. It stays on a
 // vault maker, titled and framed as the signing key's: the vault's money is
-// not reachable from here (it leaves by the vault's own redeem flow), but the key's own gas and anything sent to it by mistake
-// are, and a withdraw is the only way to either. Hiding the card would make
-// them unreachable and Remove would delete the key with them.
+// not reachable from here (it leaves by the vault's own redeem flow), but the
+// key's own gas and anything sent to it by mistake are, and a withdraw is the
+// only way to either. Hiding the card would make them unreachable and Remove
+// would delete the key with them.
+//
+// The same goes for vault shares on the key: when the key is the vault's fee
+// recipient, its fees are minted to it as shares. Those go out through the
+// same form, under a looser rule (`canWithdrawShares`): they aren't what the
+// bot quotes, so a running maker-only bot can stay up, and only another sender
+// on the key's nonce blocks it. The form offers the vault owner as the
+// destination, since that's where the redeem is best run from.
 //
 // This is also where the wizard lands a freshly live bot.
 
@@ -137,9 +145,9 @@ export default function FundsTab({
       {vaulted ? (
         <Disclosure title="Withdraw from the signer wallet">
           <p className="mb-4 text-sm text-muted">
-            Only what the signing key holds: its gas, and anything sent to it by
-            mistake. The vault&rsquo;s money is not reachable from here — it leaves by
-            the vault&rsquo;s own redeem flow.
+            Only what the signing key holds: its gas, vault shares from fees paid to
+            it, and anything sent to it by mistake. The vault&rsquo;s money is not
+            reachable from here — it leaves by the vault&rsquo;s own redeem flow.
           </p>
           {withdraw}
         </Disclosure>
@@ -176,32 +184,62 @@ function SignerWallet({
         ))}
         <GasRow funding={funding} pill={false} privacy={privacy} />
       </ul>
-      {dust.length > 0 && (
+      {dust.some((t) => t.role !== 'share') && (
         <p className="mt-2 text-xs text-warning">
           Corridor tokens on the signing key are not traded — the bot quotes against
           the vault. Withdraw them below.
         </p>
       )}
+      <FeeNote funding={funding} holdsShares={dust.some((t) => t.role === 'share')} />
     </div>
   )
 }
 
-type Choice = { key: string; label: string; balanceText: string | null; decimals: number }
+/**
+ * Where the vault's fees land, when that is this key. Fees are minted as
+ * shares to the fee recipient; on a hot key they're best sent to the owner,
+ * who redeems them from there.
+ */
+function FeeNote({ funding, holdsShares }: { funding: Funding; holdsShares: boolean }) {
+  const own = funding.operatorAddress?.toLowerCase()
+  const feesHere = own !== undefined && funding.vaultFeeRecipient?.toLowerCase() === own
+  if (!holdsShares && !feesHere) return null
+  return (
+    <p className="mt-2 text-xs text-muted">
+      {feesHere
+        ? 'This key is the vault’s fee recipient, so management and performance fees are minted to it as vault shares.'
+        : 'The vault shares here are fees the vault minted to this key.'}{' '}
+      {holdsShares
+        ? 'Send them to the vault owner below and redeem them there. The bot can keep running.'
+        : 'None have accrued yet.'}
+    </p>
+  )
+}
 
-/** The tokens the wallet can send: each corridor token, then the gas coin. */
+type Choice = { key: string; label: string; balanceText: string | null; decimals: number; shares: boolean }
+
+/**
+ * The tokens the wallet can send: each corridor token, the vault's shares when
+ * the key holds some, then the gas coin. A zero share balance isn't offered:
+ * most vaults pay fees to the owner, and an empty row would only confuse.
+ */
 function choicesOf(rows: FundingToken[], funding: Funding): { tokens: Choice[]; native: Choice } {
   return {
-    tokens: orderTokens(rows).map((t) => ({
-      key: t.token,
-      label: t.symbol,
-      balanceText: t.balanceText,
-      decimals: t.decimals,
-    })),
+    tokens: orderTokens(rows)
+      .filter((t) => t.role !== 'share' || t.balance !== '0')
+      .map((t) => ({
+        key: t.token,
+        label: t.role === 'share' ? `${t.symbol} (vault shares)` : t.symbol,
+        balanceText: t.balanceText,
+        decimals: t.decimals,
+        shares: t.role === 'share',
+      })),
     native: {
       key: NATIVE,
       label: `${funding.gas.symbol} (gas)`,
       balanceText: funding.gas.balanceText,
       decimals: 18,
+      shares: false,
     },
   }
 }
@@ -262,9 +300,22 @@ function WithdrawForm({
   // something live on the wallet, and name the bot to stop; some (a signer that
   // can't broadcast, an image older than `withdraw`) have nothing to stop, so
   // the Stop button hangs off `withdrawBlockedBy`, not off the block itself.
-  const blocked = !bot.canWithdraw
-  const blockedBy = blocked ? bot.withdrawBlockedBy : null
+  // Shares have their own, looser answer: they aren't what the bot quotes, so
+  // only a sender on the same nonce blocks them.
+  const gate = chosen.shares
+    ? {
+        ok: bot.canWithdrawShares,
+        reason: bot.withdrawSharesBlockedReason,
+        by: bot.withdrawSharesBlockedBy,
+      }
+    : { ok: bot.canWithdraw, reason: bot.withdrawBlockedReason, by: bot.withdrawBlockedBy }
+  const blocked = !gate.ok
+  const blockedBy = blocked ? gate.by : null
   const formOk = (all || amountOk(amount, chosen.decimals)) && toOk && !blocked
+  // Fee shares are best redeemed from the owner's wallet, so offer it.
+  const owner = funding.vaultOwner
+  const offerOwner =
+    chosen.shares && owner !== null && owner.toLowerCase() !== own && to.trim().toLowerCase() !== owner.toLowerCase()
 
   // The bot's own address is never a destination: moving money to itself
   // is a no-op that costs gas, and it is the address most likely to be on
@@ -384,8 +435,10 @@ function WithdrawForm({
             {blockedBy !== null && (
               <strong>Stop {blockedBy === bot.name ? 'the bot' : blockedBy} first. </strong>
             )}
-            {bot.withdrawBlockedReason ??
-              'It has live quotes against this balance; withdrawing under them fails fills.'}
+            {gate.reason ??
+              (chosen.shares
+                ? 'Something on this key is sending transactions; a transfer now could take the same nonce.'
+                : 'It has live quotes against this balance; withdrawing under them fails fills.')}
           </p>
           {blockedBy !== null && (
             <div className="mt-2">
@@ -445,12 +498,19 @@ function WithdrawForm({
       </div>
 
       <Field label="To" hint={toHint}>
-        <Input
-          value={to}
-          placeholder="0x…"
-          spellCheck={false}
-          onChange={(e) => setTo(e.target.value)}
-        />
+        <div className="flex items-center gap-2">
+          <Input
+            value={to}
+            placeholder="0x…"
+            spellCheck={false}
+            onChange={(e) => setTo(e.target.value)}
+          />
+          {offerOwner && (
+            <Button className="shrink-0 whitespace-nowrap" onClick={() => setTo(owner)} title={owner}>
+              Vault owner
+            </Button>
+          )}
+        </div>
       </Field>
 
       <div className="flex flex-wrap items-center gap-3">

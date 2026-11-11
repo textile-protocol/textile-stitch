@@ -77,6 +77,22 @@ pub fn encode_operator_admin() -> Vec<u8> {
     encode_view("operatorAdmin()")
 }
 
+/// Where the operator's management and performance fees are minted, as vault
+/// shares. The operator admin changes it with `setFeeRecipient`.
+pub fn encode_fee_recipient() -> Vec<u8> {
+    encode_view("feeRecipient()")
+}
+
+/// Shares outstanding. With `lastSettledNav` it prices one share.
+pub fn encode_total_supply() -> Vec<u8> {
+    encode_view("totalSupply()")
+}
+
+/// The share token's decimals, which match the settlement asset's.
+pub fn encode_decimals() -> Vec<u8> {
+    encode_view("decimals()")
+}
+
 /// The yield adapter idle settlement is staked in. The zero address means the
 /// vault has none.
 pub fn encode_yield_adapter() -> Vec<u8> {

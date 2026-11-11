@@ -78,8 +78,10 @@ use crate::panel::native_price::{gas_symbol, gas_token, http_origin, GasToken, P
 use crate::pricing::feed::{HttpFeed, PriceFeed};
 use crate::pricing::tick::is_price_usable;
 use crate::protocol::vault::{
-    address_from_word, encode_corridor_asset, encode_liquid_settlement, encode_quotable_corridor,
-    encode_quotable_settlement, encode_settlement_asset, quotable_settlement_for_route,
+    address_from_word, encode_corridor_asset, encode_decimals, encode_fee_recipient,
+    encode_last_settled_nav, encode_liquid_settlement, encode_operator_admin,
+    encode_quotable_corridor, encode_quotable_settlement, encode_settlement_asset,
+    encode_total_supply, quotable_settlement_for_route,
 };
 use crate::setup;
 
@@ -147,7 +149,8 @@ const PRICE_BUDGET: Duration = Duration::from_secs(4);
 #[serde(rename_all = "camelCase")]
 pub struct FundingTokenBody {
     /// `"stable"` for a pool's debt token (USDT, USDC…), `"soft"` for its
-    /// collateral (cNGN, wBRL…).
+    /// collateral (cNGN, wBRL…). `"share"` for the vault's own share token on
+    /// the signer wallet, only ever in `walletTokens` (see [`share_row`]).
     pub role: &'static str,
     /// Ticker from the corridor's display name, else the token's own
     /// `symbol()`, else a shortened address.
@@ -163,7 +166,8 @@ pub struct FundingTokenBody {
     pub balance_text: Option<String>,
     /// Dollars per whole token. `1.0` for the stable side.
     pub price: Option<f64>,
-    /// `"fixed"` for the stable side, `"feed"` when the pool's feed answered.
+    /// `"fixed"` for the stable side, `"feed"` when the pool's feed answered,
+    /// `"nav"` for vault shares valued at the vault's last settled NAV.
     pub price_source: Option<&'static str>,
     /// Why `price` is null, in operator words.
     pub price_error: Option<String>,
@@ -273,6 +277,14 @@ pub struct FundingBody {
     /// Never priced differently from `tokens` — same plans, same feeds, other
     /// address — and never carries approvals: a vault maker has none.
     pub wallet_tokens: Option<Vec<FundingTokenBody>>,
+    /// The vault's operator admin, the usual place to send fee shares to.
+    /// `null` without a vault or when the read failed.
+    pub vault_owner: Option<String>,
+    /// Where the vault mints the operator's fees, as shares. When this is the
+    /// operator address, fees pile up on the signing key and the share row in
+    /// `walletTokens` is where they show. `null` without a vault or when the
+    /// read failed.
+    pub vault_fee_recipient: Option<String>,
     pub gas: FundingGasBody,
     pub gate: FundingGateBody,
     /// The first chain error, if any. Set once for the whole request: every
@@ -519,7 +531,9 @@ pub async fn read_funding(
     let ChainReads {
         tokens: reads,
         inventory,
+        settlement,
         dust,
+        shares,
         native: native_balance,
     } = chain_reads(&slots, &asks, &answers, vault, executor_routed);
     let native = native.ok().flatten();
@@ -563,6 +577,13 @@ pub async fn read_funding(
         })
         .collect();
 
+    // The shares are valued in the settlement asset, so they borrow its price.
+    let settlement_price = settlement
+        .and_then(|a| plans.iter().position(|p| p.address == a))
+        .map(|i| (&plans[i], &prices[i]));
+    let share_row = shares
+        .as_ref()
+        .map(|reads| share_row(reads, settlement_price, &mut capital_errors));
     let wallet_tokens = vault.map(|_| {
         plans
             .iter()
@@ -577,8 +598,12 @@ pub async fn read_funding(
                     &prices[i],
                 )
             })
+            .chain(share_row)
             .collect::<Vec<_>>()
     });
+    let hex = |a: Option<Address>| a.filter(|a| !a.is_zero()).map(|a| format!("{a:#x}"));
+    let vault_owner = hex(shares.as_ref().and_then(|s| s.owner));
+    let vault_fee_recipient = hex(shares.as_ref().and_then(|s| s.fee_recipient));
 
     let gas_balance = value_of(native_balance.as_ref(), &mut wallet_errors)
         .map(|b| gas_share(b, &gas_reserve, &plans));
@@ -652,6 +677,8 @@ pub async fn read_funding(
         permit2: cfg.permit2.clone(),
         tokens,
         wallet_tokens,
+        vault_owner,
+        vault_fee_recipient,
         gas,
         gate,
         read_error,
@@ -770,6 +797,95 @@ fn row_of(
     }
 }
 
+/// The signer wallet's vault shares as a token row.
+///
+/// The key holds shares when it is the vault's fee recipient: fees are minted
+/// as shares, not paid out. They are money the key controls, so they count for
+/// the remove gate and show beside the wallet's other balances, and a withdraw
+/// can send them on (see [`crate::chain::withdraw`]).
+///
+/// Every read here is a call on the vault, so a failure lands in
+/// `vault_errors` and, like the vault's other views, doesn't refuse a delete:
+/// a vault address that isn't one would otherwise trap the bot forever. The
+/// row then has no balance. The vault's other views only cost it its price.
+fn share_row(
+    reads: &ShareReads,
+    settlement: Option<(&TokenPlan, &PlanPrice)>,
+    vault_errors: &mut Vec<String>,
+) -> FundingTokenBody {
+    let decimals = value_of(Some(&reads.decimals), vault_errors)
+        .and_then(|d| u8::try_from(d).ok())
+        .filter(|d| *d <= 36);
+    let balance = value_of(Some(&reads.balance), vault_errors).filter(|_| decimals.is_some());
+    let decimals = decimals.unwrap_or(0);
+    let price = share_price(reads.supply, reads.nav, settlement.map(|(_, p)| p));
+    let usd = match (balance, price.price) {
+        (Some(b), Some(p)) => Some(units(b, decimals) * p),
+        _ => None,
+    };
+    FundingTokenBody {
+        role: "share",
+        symbol: reads
+            .symbol
+            .clone()
+            .unwrap_or_else(|| "vault shares".to_string()),
+        token: format!("{:#x}", reads.vault),
+        decimals,
+        balance: balance.map(|b| b.to_string()),
+        balance_text: balance.map(|b| format_units(b, decimals)),
+        price: price.price,
+        price_source: price.source,
+        price_error: price.error,
+        unpriceable: settlement.is_some_and(|(plan, _)| !plan.priced_in_usd),
+        usd,
+        funded: None,
+        approval_needed: false,
+        permit2_allowance: None,
+        approved: None,
+    }
+}
+
+/// Dollars per share: the vault's last settled NAV over its supply, times the
+/// settlement asset's dollar price. Shares and NAV share the settlement asset's
+/// decimals, so the ratio of atomic counts is settlement tokens per share.
+///
+/// The last settled NAV, not a live one: the vault only prices its inventory
+/// when an epoch settles. Close enough for a balance sheet; the redeem pays
+/// whatever the inventory is worth when it settles.
+fn share_price(
+    supply: Option<U256>,
+    nav: Option<U256>,
+    settlement: Option<&PlanPrice>,
+) -> PlanPrice {
+    let unpriced = |why: &str| PlanPrice {
+        price: None,
+        source: None,
+        error: Some(why.to_string()),
+    };
+    let Some(settlement) = settlement else {
+        return unpriced("the panel couldn't tell which of this bot's tokens the vault settles in");
+    };
+    let Some(per_settlement) = settlement.price else {
+        return PlanPrice {
+            price: None,
+            source: None,
+            error: settlement.error.clone(),
+        };
+    };
+    let (Some(supply), Some(nav)) = (supply, nav) else {
+        return unpriced("the vault's NAV couldn't be read");
+    };
+    if supply.is_zero() || nav.is_zero() {
+        return unpriced("the vault hasn't settled a NAV yet");
+    }
+    let per_share = units(nav, 0) / units(supply, 0);
+    PlanPrice {
+        price: Some(per_share * per_settlement),
+        source: Some("nav"),
+        error: None,
+    }
+}
+
 /// Every distinct token across the pools, stable side first per pool, with
 /// what the approval preflight commits to it.
 ///
@@ -865,7 +981,21 @@ struct Slots {
     /// The five views [`vault_inventory`] reads, in its order.
     inventory: Option<[usize; 5]>,
     dust: Vec<usize>,
+    /// The vault's share token as the signer wallet holds it, when both exist.
+    shares: Option<ShareSlots>,
     native: Option<usize>,
+}
+
+/// Where the share row's reads sit in the batch.
+struct ShareSlots {
+    vault: Address,
+    balance: usize,
+    symbol: usize,
+    decimals: usize,
+    supply: usize,
+    nav: usize,
+    owner: usize,
+    fee_recipient: usize,
 }
 
 /// Every chain question this screen has, as one list, and where each answer
@@ -913,11 +1043,25 @@ fn funding_asks(owners: &Owners, plans: &[TokenPlan]) -> (Vec<Ask>, Slots) {
             .map(|plan| push(balance_ask(plan.address, owner)))
             .collect(),
     };
+    let shares = owners.vault.zip(owners.dust).map(|(vault, owner)| {
+        let view = |data: Vec<u8>, what: &str| Ask::call(vault, data, format!("{what} on {vault}"));
+        ShareSlots {
+            vault,
+            balance: push(balance_ask(vault, owner)),
+            symbol: push(symbol_ask(vault)),
+            decimals: push(view(encode_decimals(), "decimals()").constant()),
+            supply: push(view(encode_total_supply(), "totalSupply()")),
+            nav: push(view(encode_last_settled_nav(), "lastSettledNav()")),
+            owner: push(view(encode_operator_admin(), "operatorAdmin()")),
+            fee_recipient: push(view(encode_fee_recipient(), "feeRecipient()")),
+        }
+    });
     let native = owners.gas.map(|owner| push(Ask::native(owner)));
     let slots = Slots {
         tokens,
         inventory,
         dust,
+        shares,
         native,
     };
     (asks, slots)
@@ -957,8 +1101,23 @@ fn known_vault_assets(constants: &ChainConstants, chain_id: u64, vault: Address)
 struct ChainReads {
     tokens: Vec<TokenRead>,
     inventory: Option<anyhow::Result<HashMap<String, U256>>>,
+    /// The vault's settlement asset, when `settlementAsset()` answered.
+    settlement: Option<Address>,
     dust: Vec<anyhow::Result<U256>>,
+    shares: Option<ShareReads>,
     native: Option<anyhow::Result<U256>>,
+}
+
+/// What came back for the signer wallet's vault shares.
+struct ShareReads {
+    vault: Address,
+    balance: anyhow::Result<U256>,
+    symbol: Option<String>,
+    decimals: anyhow::Result<U256>,
+    supply: Option<U256>,
+    nav: Option<U256>,
+    owner: Option<Address>,
+    fee_recipient: Option<Address>,
 }
 
 fn chain_reads(
@@ -988,7 +1147,25 @@ fn chain_reads(
         inventory: vault
             .zip(slots.inventory)
             .map(|(vault, slots)| vault_inventory(vault, slots.map(view), executor_routed)),
+        settlement: slots
+            .inventory
+            .and_then(|[settlement, ..]| view(settlement).ok())
+            .map(address_from_word)
+            .filter(|a| !a.is_zero()),
         dust: slots.dust.iter().map(|i| uint(*i)).collect(),
+        shares: slots.shares.as_ref().map(|s| ShareReads {
+            vault: s.vault,
+            balance: uint(s.balance),
+            symbol: answer(s.symbol)
+                .as_ref()
+                .ok()
+                .and_then(|out| decode_string_return(out)),
+            decimals: view(s.decimals),
+            supply: view(s.supply).ok(),
+            nav: view(s.nav).ok(),
+            owner: view(s.owner).ok().map(address_from_word),
+            fee_recipient: view(s.fee_recipient).ok().map(address_from_word),
+        }),
         native: slots.native.map(view),
     }
 }
@@ -1326,6 +1503,8 @@ mod tests {
     /// the trading capital, the key only signs for it.
     const VAULT: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
     const WALLET: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+    /// The vault's operator admin, a Safe in practice.
+    const WALLET_OWNER: &str = "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
 
     /// The chain's VaultOrderExecutor. Listed on a bot's `[vault]`, it is what
     /// makes the yield-adapter position quotable.
@@ -1351,12 +1530,30 @@ mod tests {
     /// views. `quotable` is the whole settlement position, `liquid` only the
     /// idle part; the gap is what `allocateIdle` put in the yield adapter.
     fn vault_views(chain: MockChain, quotable: u128, liquid: u128, corridor: u128) -> MockChain {
+        vault_share_views(
+            chain
+                .view_address(VAULT, "settlementAsset()", USDT)
+                .view_address(VAULT, "corridorAsset()", CNGN)
+                .view(VAULT, "quotableSettlement()", U256::from(quotable))
+                .view(VAULT, "liquidSettlement()", U256::from(liquid))
+                .view(VAULT, "quotableCorridor()", U256::from(corridor)),
+            0,
+            WALLET_OWNER,
+        )
+    }
+
+    /// The share-token views: a vault with 1,000 shares at a NAV of 1,100
+    /// USDT (1.10 a share), owned by `WALLET_OWNER`, paying fees to
+    /// `fee_recipient`, with `held` shares on the signer wallet.
+    fn vault_share_views(chain: MockChain, held: u128, fee_recipient: &str) -> MockChain {
         chain
-            .view_address(VAULT, "settlementAsset()", USDT)
-            .view_address(VAULT, "corridorAsset()", CNGN)
-            .view(VAULT, "quotableSettlement()", U256::from(quotable))
-            .view(VAULT, "liquidSettlement()", U256::from(liquid))
-            .view(VAULT, "quotableCorridor()", U256::from(corridor))
+            .balance_of(VAULT, WALLET, held)
+            .symbol(VAULT, "tvUSDT")
+            .view(VAULT, "decimals()", U256::from(6u8))
+            .view(VAULT, "totalSupply()", U256::from(1_000_000_000u64))
+            .view(VAULT, "lastSettledNav()", U256::from(1_100_000_000u64))
+            .view_address(VAULT, "operatorAdmin()", WALLET_OWNER)
+            .view_address(VAULT, "feeRecipient()", fee_recipient)
     }
 
     fn add_container(h: &Harness, name: &str) {
@@ -1664,9 +1861,9 @@ mod tests {
         assert_eq!(normalise(&first), normalise(&second));
         assert_eq!(
             after_first - after_second,
-            5,
-            "settlementAsset, corridorAsset, two balanceOf at the vault, and the \
-             endpoint's one chain check"
+            7,
+            "settlementAsset, corridorAsset, two balanceOf at the vault, the share token's \
+             symbol and decimals, and the endpoint's one chain check"
         );
     }
 
@@ -2008,6 +2205,58 @@ mod tests {
         // loses it, vault or no vault.
         let why = v["removeBlockedBy"].as_str().unwrap_or_default();
         assert!(why.contains("$41.60"), "{body}");
+    }
+
+    /// A key that is the vault's fee recipient collects its fees as shares.
+    /// They show on the signer wallet, priced at the last settled NAV, and
+    /// deleting the key would lose them.
+    #[tokio::test]
+    async fn fee_shares_on_the_key_show_priced_and_block_removal() {
+        let h = harness("funding-vault-shares");
+        let node = mock_rpc(
+            vault_views(
+                MockChain::on(CELO_CHAIN)
+                    .balance_of(USDT, VAULT, 25_000_000)
+                    .balance(CNGN, 0)
+                    .native(20_000_000_000_000_000_000),
+                25_000_000,
+                25_000_000,
+                0,
+            )
+            .balance_of(VAULT, WALLET, 50_000_000)
+            .view_address(VAULT, "feeRecipient()", WALLET),
+        )
+        .await;
+        let api = mock_api(200, 200, 0.00073).await;
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        attach_vault(&h, "bot-a", VAULT, None);
+
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert!(v["readError"].is_null(), "{body}");
+        let shares = v["walletTokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["role"] == "share")
+            .expect("a share row");
+        assert_eq!(shares["symbol"], "tvUSDT", "{body}");
+        assert_eq!(shares["token"], VAULT.to_lowercase());
+        assert_eq!(shares["balanceText"], "50", "{body}");
+        assert_eq!(shares["priceSource"], "nav");
+        assert!(
+            (shares["usd"].as_f64().unwrap() - 55.0).abs() < 1e-9,
+            "{body}"
+        );
+        assert_eq!(v["vaultOwner"], WALLET_OWNER.to_lowercase());
+        assert_eq!(v["vaultFeeRecipient"], WALLET.to_lowercase());
+        // The vault's own rows don't change: the shares are a claim on them,
+        // not more of them.
+        assert_eq!(token(&v, "USDT")["balanceText"], "25", "{body}");
+        let why = v["removeBlockedBy"].as_str().unwrap_or_default();
+        // $55 of shares and $1.60 of gas.
+        assert!(why.contains("$56.60"), "{body}");
     }
 
     #[tokio::test]
@@ -2478,6 +2727,35 @@ mod tests {
         let h = harness("funding-missing");
         let (status, body) = h.get("/api/bots/nope/funding").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[test]
+    fn a_share_is_the_settled_nav_over_supply_in_the_settlement_assets_dollars() {
+        let dollar = PlanPrice {
+            price: Some(1.0),
+            source: Some("fixed"),
+            error: None,
+        };
+        let n = |v: u64| Some(U256::from(v));
+        let priced = share_price(n(1_000), n(1_250), Some(&dollar));
+        assert_eq!(priced.price, Some(1.25));
+        assert_eq!(priced.source, Some("nav"));
+
+        // Nothing settled yet, or nothing outstanding: no price, not a zero.
+        assert_eq!(share_price(n(0), n(0), Some(&dollar)).price, None);
+        assert_eq!(share_price(n(1_000), n(0), Some(&dollar)).price, None);
+        assert_eq!(share_price(None, n(1), Some(&dollar)).price, None);
+
+        // The settlement asset's own missing price is the reason given.
+        let down = PlanPrice {
+            price: None,
+            source: None,
+            error: Some("feed down".to_string()),
+        };
+        let unpriced = share_price(n(1_000), n(1_000), Some(&down));
+        assert_eq!(unpriced.price, None);
+        assert_eq!(unpriced.error.as_deref(), Some("feed down"));
+        assert!(share_price(n(1_000), n(1_000), None).error.is_some());
     }
 
     #[test]
