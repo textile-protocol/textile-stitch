@@ -359,21 +359,25 @@ impl Engine {
             base_sell_bps,
         })
     }
-    /// The book firm quotes and levels price from: the module policy's
-    /// spreads, then a `feed_sides` pool's spreads from the print
-    /// ([`super::responder::feed_sides_book`]), then the liquidity cap. The
+    /// The book firm quotes and levels price from: an issuer's verified
+    /// spread in place of the configured offsets, when the corridor takes one
+    /// ([`super::responder::issuer_spread_book`]); then the module policy's
+    /// spreads on top; then a `feed_sides` pool's spreads from the print
+    /// ([`super::responder::feed_sides_book`]); then the liquidity cap. The
     /// feed's sides go after the policy so it can't reprice them; config
-    /// refuses modules on such a pool anyway, so the policy step leaves it
-    /// alone. The off-hours extra and size cap go last
+    /// refuses modules and issuer spreads on such a pool anyway. The
+    /// off-hours extra and size cap go last
     /// ([`super::responder::off_hours_book`]), so they widen and shrink
-    /// whatever the earlier steps chose; `None` when the print is one this
-    /// pool can't quote off-hours.
+    /// whatever the earlier steps chose, an issuer's spread included; `None`
+    /// when the print is one this pool can't quote off-hours.
     pub(super) fn module_book(
         &self,
         book: &CorridorBook,
         quote: &Quote,
         now: u64,
     ) -> Option<CorridorBook> {
+        let issuer = super::responder::issuer_spread_book(book, quote);
+        let book = issuer.as_ref().unwrap_or(book);
         let Some(modules) = &self.modules else {
             return super::responder::feed_sides_book(book, quote)
                 .and_then(|b| super::responder::off_hours_book(&b, quote, now).ok());

@@ -1,0 +1,59 @@
+{
+  "signer": {
+    "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+    "note": "Hardhat test account #0. Its key is public; never send it funds."
+  },
+  "cases": [
+    {
+      "name": "whole seconds",
+      "intent": {
+        "action": "spread",
+        "environment": "app.textilecredit.com",
+        "key": "idrx-usdt",
+        "chainId": 42220,
+        "buyBps": 25,
+        "sellBps": 30,
+        "revision": 12,
+        "nonce": "0x7d3a608bb850f47c2d77d6be73b8f93c94a80264b7bb3cc5c7d2fb54d07ef6b9",
+        "issuedAt": 1794474000000,
+        "expiresAt": 1794560400000
+      },
+      "message": "Textile feed switch\n\nAction: spread\nEnvironment: app.textilecredit.com\nSwitch: idrx-usdt\nChain: 42220\nBid: 25 bps below the price\nAsk: 30 bps above the price\nRevision: 12\nNonce: 0x7d3a608bb850f47c2d77d6be73b8f93c94a80264b7bb3cc5c7d2fb54d07ef6b9\nIssued: 2026-11-12T09:00:00.000Z\nExpires: 2026-11-13T09:00:00.000Z\n\nSigning this moves no funds. It sets the spread the bots behind this switch quote at, within limits each bot sets for itself.",
+      "signature": "0xe5cf0dd0b28efe427055673d5141f68e6c9b2ca2c4947864709f749c88eb1bde1dd362e12948773dc1f8020c3f8ce1374a4fdfc63c71346ce45740d17185f5641c"
+    },
+    {
+      "name": "milliseconds and zero offsets",
+      "intent": {
+        "action": "spread",
+        "environment": "app.textilecredit.com",
+        "key": "idrx-usdt",
+        "chainId": 42220,
+        "buyBps": 0,
+        "sellBps": 0,
+        "revision": 7,
+        "nonce": "0xcebc8882fecbec7fb80d2cf4b312bec018884c2d66667c67a90508214bd8bafc",
+        "issuedAt": 1794470400123,
+        "expiresAt": 1794472200009
+      },
+      "message": "Textile feed switch\n\nAction: spread\nEnvironment: app.textilecredit.com\nSwitch: idrx-usdt\nChain: 42220\nBid: 0 bps below the price\nAsk: 0 bps above the price\nRevision: 7\nNonce: 0xcebc8882fecbec7fb80d2cf4b312bec018884c2d66667c67a90508214bd8bafc\nIssued: 2026-11-12T08:00:00.123Z\nExpires: 2026-11-12T08:30:00.009Z\n\nSigning this moves no funds. It sets the spread the bots behind this switch quote at, within limits each bot sets for itself.",
+      "signature": "0xa2bbe52650ce356f98f765b3a21aa14c18e9e158b04bc7e1543c83f9adf78dd04c51466b4c5bbdb265a7f46801ea7841170fd838deb645b03750270a3c4296841b"
+    },
+    {
+      "name": "leap day, wide offsets",
+      "intent": {
+        "action": "spread",
+        "environment": "app.textilecredit.com",
+        "key": "idrx-usdt",
+        "chainId": 42220,
+        "buyBps": 9999,
+        "sellBps": 150,
+        "revision": 1234567,
+        "nonce": "0xa9c584056064687e149968cbab758a3376d22aedc6a55823d1b3ecbee81b8fb9",
+        "issuedAt": 1835481599999,
+        "expiresAt": 1835483400000
+      },
+      "message": "Textile feed switch\n\nAction: spread\nEnvironment: app.textilecredit.com\nSwitch: idrx-usdt\nChain: 42220\nBid: 9999 bps below the price\nAsk: 150 bps above the price\nRevision: 1234567\nNonce: 0xa9c584056064687e149968cbab758a3376d22aedc6a55823d1b3ecbee81b8fb9\nIssued: 2028-02-29T23:59:59.999Z\nExpires: 2028-03-01T00:30:00.000Z\n\nSigning this moves no funds. It sets the spread the bots behind this switch quote at, within limits each bot sets for itself.",
+      "signature": "0x3caa5cded71b7d9024b975066e0bf53036501d5efce8e069c2ee72caf47e8c27757ea2baa613c07cd66d0022448cc8115f1c9265390d5c8fa676d6accaf711d41c"
+    }
+  ]
+}

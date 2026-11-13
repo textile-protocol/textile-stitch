@@ -9,6 +9,7 @@ use anyhow::Context as _;
 use serde::Deserialize;
 
 use crate::net::http_client;
+use crate::pricing::issuer_spread::{lenient_slot, Gate, SpreadSlot};
 use crate::pricing::off_hours::{self, Session};
 use crate::pricing::tick::feed_age_secs;
 use crate::time::unix_now;
@@ -73,6 +74,12 @@ pub struct Quote {
         deserialize_with = "off_hours::lenient_string"
     )]
     pub market_source: Option<String>,
+    /// An issuer's spread on a Textile feed switch (`spread` on `/price`).
+    /// Only a feed read through an `[issuer_spread]` gate turns it into
+    /// [`SpreadSlot::Verified`]; anything else is never applied. Read
+    /// leniently, like `reference`. See [`crate::pricing::issuer_spread`].
+    #[serde(default, deserialize_with = "lenient_slot")]
+    pub spread: SpreadSlot,
 }
 
 fn lenient_reference<'de, D: serde::Deserializer<'de>>(
@@ -220,6 +227,7 @@ pub struct HttpFeed {
     /// The URL asks for off-hours prices (`offHours=1`, see
     /// [`crate::pricing::off_hours::feed_request_url`]).
     off_hours: bool,
+    spread_gate: Option<std::sync::Arc<Gate>>,
 }
 
 impl HttpFeed {
@@ -230,6 +238,17 @@ impl HttpFeed {
             url,
             client: http_client(),
             basis: PriceBasis::Served,
+            spread_gate: None,
+        }
+    }
+
+    /// Check every served issuer spread with `gate`, keeping only a verified
+    /// one on the quote. Without a gate a served spread stays unverified and
+    /// nothing applies it.
+    pub fn with_spread_gate(self, gate: Option<std::sync::Arc<Gate>>) -> Self {
+        Self {
+            spread_gate: gate,
+            ..self
         }
     }
 
@@ -255,8 +274,22 @@ impl PriceFeed for HttpFeed {
             "feed timestamp must be nonzero Unix seconds at or before the bot clock (zero future skew)"
         );
         check_session(&quote, self.off_hours)?;
-        Ok(quote)
+        let Some(gate) = &self.spread_gate else {
+            return Ok(quote);
+        };
+        // Every switch response counts, with or without a spread: a newer
+        // one without makes an older one's spread out of date.
+        let spread = gate.spread_for(&quote.spread, switch_revision(&body)).await;
+        Ok(Quote { spread, ..quote })
     }
+}
+
+/// The feed switch a `/price` response answered for and the switch revision
+/// it answered at (`feedSwitch` and `revision`), when it's a switch response.
+fn switch_revision(body: &str) -> Option<(String, u64)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let switch = value.get("feedSwitch")?.as_str()?.to_string();
+    Some((switch, value.get("revision")?.as_u64()?))
 }
 
 #[cfg(test)]
@@ -265,6 +298,22 @@ mod tests {
 
     fn parse(body: &str) -> serde_json::Result<Quote> {
         serde_json::from_str(body)
+    }
+
+    #[test]
+    fn reads_the_switch_and_revision_a_switch_response_answered_at() {
+        let body =
+            r#"{"price":16500,"timestamp":1754388000,"feedSwitch":"idrx-usdt","revision":14}"#;
+        assert_eq!(switch_revision(body), Some(("idrx-usdt".to_string(), 14)));
+        assert_eq!(
+            switch_revision(r#"{"price":1,"timestamp":1754388000,"revision":3}"#),
+            None,
+            "an OTC feed's revision is its own, not a switch's"
+        );
+        assert_eq!(
+            switch_revision(r#"{"price":1,"timestamp":1754388000}"#),
+            None
+        );
     }
 
     #[test]
@@ -436,6 +485,7 @@ mod tests {
                 price: 0.00065,
                 timestamp: 1_754_388_000,
                 degraded: false,
+                spread: Default::default(),
                 reference: None,
                 bid: None,
                 ask: None,

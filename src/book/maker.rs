@@ -211,14 +211,18 @@ pub struct TickCtx<'a> {
     pub max_loss_bps: u32,
 }
 
-/// Quoting state that lives across ticks: last posted price per side and the
-/// slot-nonce ledger.
+/// Quoting state that lives across ticks: last posted price and spread per
+/// side, and the slot-nonce ledger.
 pub struct QuoteState {
     pub last_quote: HashMap<String, (f64, u64)>,
     /// The off-hours policy each side's posted orders were built under,
     /// keyed like `last_quote`. A change reposts the side whatever the price
     /// did; see [`crate::pricing::off_hours::Policy`].
     pub last_policy: HashMap<String, crate::pricing::off_hours::Policy>,
+    /// The spread each side last posted at. An issuer can set or withdraw a
+    /// spread between ticks, and that change reposts the side at once,
+    /// whatever the price deadband says.
+    pub last_spread: HashMap<String, Spread>,
     pub next_nonce: u64,
     pub slot_nonces: HashMap<String, u64>,
     pub slot_inputs: HashMap<String, String>,
@@ -301,6 +305,30 @@ pub fn policy_changed(
     last.get(key_id).copied().unwrap_or(None) != now
 }
 
+/// Whether a side reposts this tick: its price crossed the deadband or its
+/// orders near their TTL ([`should_requote_now`]), or the spread it last
+/// posted at changed. The deadband is for a feed drifting; a spread an
+/// issuer just set or withdrew has to reach the book on the next tick even
+/// when it moves the price less than `refresh_threshold_bps`. Pure.
+fn requotes(
+    last: Option<(f64, u64)>,
+    last_spread: Option<Spread>,
+    price: f64,
+    spread: Spread,
+    pool: &PoolConfig,
+    now: u64,
+) -> bool {
+    last_spread.is_some_and(|posted| posted != spread)
+        || should_requote_now(
+            last,
+            price,
+            pool.refresh_threshold_bps,
+            now,
+            pool.ttl_secs,
+            pool.repost_lead_secs(),
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn quote_side(
     ctx: &TickCtx<'_>,
@@ -335,13 +363,13 @@ pub async fn quote_side(
     let label = side.label();
     let policy = crate::pricing::off_hours::policy(off_hours);
     if !policy_changed(&state.last_policy, &key_id, policy)
-        && !should_requote_now(
+        && !requotes(
             state.last_quote.get(&key_id).copied(),
+            state.last_spread.get(&key_id).copied(),
             price,
-            pool.refresh_threshold_bps,
+            spread,
+            pool,
             now,
-            pool.ttl_secs,
-            pool.repost_lead_secs(),
         )
     {
         return SideOutcome::held();
@@ -459,6 +487,7 @@ pub async fn quote_side(
         );
         info!(pair = %pair, orders = result.posted, "posted {label} ladder");
         state.last_policy.insert(key_id.clone(), policy);
+        state.last_spread.insert(key_id.clone(), spread);
         state.last_quote.insert(key_id, (price, now));
     }
     SideOutcome::Done {
@@ -742,6 +771,34 @@ mod tests {
 
     const DEBT: Address = Address::new([0xdd; 20]);
     const COLLATERAL: Address = Address::new([0xcc; 20]);
+
+    #[test]
+    fn a_changed_spread_reposts_inside_the_price_deadband() {
+        let pool = pool();
+        let posted = Some((1.0, 100));
+        // 5 bps of price move under a 10 bps deadband: held, same spread.
+        let held = requotes(
+            posted,
+            Some(Spread::Bps(25)),
+            1.0005,
+            Spread::Bps(25),
+            &pool,
+            101,
+        );
+        assert!(!held);
+        // The same move because an issuer's spread went from 25 to 30 bps,
+        // or was withdrawn back to the pool's own: reposted now.
+        assert!(requotes(
+            posted,
+            Some(Spread::Bps(25)),
+            1.0005,
+            Spread::Bps(30),
+            &pool,
+            101
+        ));
+        // Nothing posted yet always quotes.
+        assert!(requotes(None, None, 1.0, Spread::Bps(25), &pool, 101));
+    }
 
     fn draft(amounts: (U256, U256)) -> OrderDraft {
         OrderDraft {

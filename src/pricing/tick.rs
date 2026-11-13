@@ -181,6 +181,7 @@ mod tests {
             price,
             timestamp,
             degraded,
+            spread: Default::default(),
             reference: None,
             bid: None,
             ask: None,

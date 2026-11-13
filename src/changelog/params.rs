@@ -110,6 +110,7 @@ const BOOL: &str = "bool";
 const URL: &str = "url";
 const PRICE_OFFSET: &str = "price units (collateral per debt)";
 const ADDRESSES: &str = "addresses";
+const KEY: &str = "key";
 
 /// A list of addresses as one value: trimmed, lowercased, sorted and
 /// deduplicated, so reordering or recasing the list is not a change.
@@ -151,6 +152,28 @@ fn bot_params(cfg: &Config) -> Vec<(ParamKey, Param)> {
             "rfq_enabled",
             BOOL,
             Some(cfg.rfq.as_ref().is_some_and(|r| r.enabled).to_string()),
+        ),
+        // Whose signed spreads this bot takes, and from which feed switch:
+        // Textile compares the list with the switch's own signers.
+        bot_param(
+            "issuer_spread.switch",
+            KEY,
+            cfg.issuer_spread
+                .as_ref()
+                .map(|t| t.switch.trim().to_lowercase()),
+        ),
+        bot_param(
+            "issuer_spread.signers",
+            ADDRESSES,
+            cfg.issuer_spread.as_ref().map(|t| t.signer_list()),
+        ),
+        // While the inventory curve runs, the bot only takes an even spread.
+        bot_param(
+            "issuer_spread.even_only",
+            BOOL,
+            cfg.issuer_spread
+                .as_ref()
+                .map(|_| cfg.issuer_spread_even_only().to_string()),
         ),
         bot_param(
             "rfq.allowed_takers",
@@ -213,6 +236,16 @@ fn pool_params(cfg: &Config, pool: &PoolConfig) -> Vec<(ParamKey, Param)> {
             "sell_offset_abs",
             PRICE_OFFSET,
             pool.sell_offset_abs.map(|v| v.to_string()),
+        ),
+        entry(
+            "issuer_spread_min_bps",
+            BPS,
+            pool.issuer_spread_min_bps.map(|v| v.to_string()),
+        ),
+        entry(
+            "issuer_spread_max_bps",
+            BPS,
+            pool.issuer_spread_max_bps.map(|v| v.to_string()),
         ),
         entry(
             "buy_total_liquidity_debt",

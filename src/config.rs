@@ -8,6 +8,7 @@ use anyhow::Context;
 use serde::Deserialize;
 
 pub use crate::chain::rpc::MAX_RPC_FALLBACKS;
+use crate::pricing::issuer_spread::{applied, IssuerSpread, SpreadBounds, SPREAD_LIMIT_BPS};
 use crate::pricing::lean::{LeanMode, LeanParams, DEFAULT_BASE_BPS, DEFAULT_WIDE_BPS};
 use crate::pricing::quote::Spread;
 
@@ -126,11 +127,103 @@ pub struct Config {
     /// [`ChangeLogConfig`] and [`crate::changelog`].
     #[serde(default)]
     pub change_log: ChangeLogConfig,
+    /// Let an issuer set this bot's spreads from a Textile feed switch, by
+    /// signature. Off when absent: a served spread is then ignored. See
+    /// [`IssuerSpreadConfig`] and [`crate::pricing::issuer_spread`].
+    #[serde(default)]
+    pub issuer_spread: Option<IssuerSpreadConfig>,
     /// The bot's ERC-8004 agent identity, once `stitch register` has minted or
     /// linked one. See [`crate::chain::erc8004`].
     #[serde(default)]
     pub erc8004: Option<Erc8004Config>,
     pub pools: Vec<PoolConfig>,
+}
+
+/// The `[issuer_spread]` table: whose signed spreads this bot quotes at, and
+/// from which feed switch. Each pool that takes them also sets
+/// `issuer_spread_min_bps` and `issuer_spread_max_bps`; the rest ignore them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerSpreadConfig {
+    /// The feed switch's key, e.g. `idrx-usdt`. Pools that take its spread
+    /// read the switch's URL, which carries `feedSwitch=<switch>`.
+    pub switch: String,
+    /// The Textile app host the issuer signs for (`app.textilecredit.com`),
+    /// which keeps a staging signature off a production bot.
+    pub environment: String,
+    /// The wallets whose signature sets the spread, at most
+    /// [`MAX_ISSUER_SIGNERS`]. A contract wallet (a deployed Safe) answers
+    /// ERC-1271 on this bot's chain.
+    pub signers: Vec<IssuerSignerConfig>,
+}
+
+/// One wallet in `[issuer_spread].signers`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerSignerConfig {
+    pub address: String,
+    pub kind: IssuerSignerKind,
+}
+
+/// How a signer's signature is checked: recovery for a plain wallet
+/// (MetaMask, a Ledger, an MPC key), ERC-1271 for a contract wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IssuerSignerKind {
+    Eoa,
+    Contract,
+}
+
+/// Most wallets `[issuer_spread].signers` may list.
+pub const MAX_ISSUER_SIGNERS: usize = 10;
+
+impl IssuerSpreadConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.switch.trim().is_empty() && !self.environment.trim().is_empty(),
+            "[issuer_spread] needs a switch and an environment"
+        );
+        anyhow::ensure!(
+            (1..=MAX_ISSUER_SIGNERS).contains(&self.signers.len()),
+            "[issuer_spread].signers lists 1 to {MAX_ISSUER_SIGNERS} wallets"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for (idx, signer) in self.signers.iter().enumerate() {
+            let address = signer
+                .address
+                .trim()
+                .parse::<alloy_primitives::Address>()
+                .with_context(|| {
+                    format!("[issuer_spread].signers[{idx}].address is not an address")
+                })?;
+            anyhow::ensure!(
+                seen.insert(address),
+                "[issuer_spread].signers lists {address} twice"
+            );
+        }
+        Ok(())
+    }
+
+    /// The signers as the change log records them: lowercase addresses,
+    /// sorted, comma-separated, so Textile can compare them with its list.
+    pub fn signer_list(&self) -> String {
+        let mut addresses: Vec<String> = self
+            .signers
+            .iter()
+            .map(|s| s.address.trim().to_lowercase())
+            .collect();
+        addresses.sort();
+        addresses.join(",")
+    }
+}
+
+/// The `feedSwitch` a feed URL names, lowercased, if any.
+pub(crate) fn feed_switch_key(url: &str) -> Option<String> {
+    url::Url::parse(url.trim()).ok().and_then(|u| {
+        u.query_pairs()
+            .find(|(k, _)| k == "feedSwitch")
+            .map(|(_, v)| v.trim().to_lowercase())
+    })
 }
 
 /// The `[erc8004]` block. Written by `stitch register`; nothing reads it to
@@ -886,6 +979,13 @@ pub struct PoolConfig {
     /// per debt, e.g. cNGN/USDT) above the mid. Currency-agnostic.
     #[serde(default)]
     pub sell_offset_abs: Option<f64>,
+    /// With `[issuer_spread]`: the narrowest and widest offset, in bps, this
+    /// pool takes from the issuer, for each side. Both or neither. A spread
+    /// outside them is passed over and the pool quotes its own offsets.
+    #[serde(default)]
+    pub issuer_spread_min_bps: Option<u32>,
+    #[serde(default)]
+    pub issuer_spread_max_bps: Option<u32>,
     /// Collateral (cNGN) committed per ask, atomic units (uint256 as string).
     #[serde(default)]
     pub sell_order_size_collateral: Option<String>,
@@ -1125,6 +1225,38 @@ impl PoolConfig {
     /// The ask spread for this pool, however the operator expressed it.
     pub fn sell_spread(&self) -> Option<Spread> {
         spread_from(self.sell_offset_bps, self.sell_offset_abs)
+    }
+    /// The range this pool takes an issuer's spread in, when it opted in.
+    pub fn issuer_spread_bounds(&self) -> Option<SpreadBounds> {
+        Some(SpreadBounds {
+            min_bps: self.issuer_spread_min_bps?,
+            max_bps: self.issuer_spread_max_bps?,
+        })
+    }
+    /// This pool with an issuer's verified offsets in place of its own, when
+    /// it takes them and they sit in its bounds; otherwise the pool as
+    /// configured. A side the operator turned off stays off. `even_only`
+    /// ([`Config::issuer_spread_even_only`]) passes over an uneven spread, as
+    /// the RFQ book does, so both price from the same offsets. The ladder and
+    /// the taker leg price from the result.
+    pub fn with_issuer_spread(
+        &self,
+        spread: Option<IssuerSpread>,
+        even_only: bool,
+    ) -> std::borrow::Cow<'_, Self> {
+        let scope = format!(
+            "{}/{}",
+            self.collateral.to_lowercase(),
+            self.debt.to_lowercase()
+        );
+        match applied(&scope, self.issuer_spread_bounds(), even_only, spread) {
+            Some(spread) => std::borrow::Cow::Owned(Self {
+                buy_offset_bps: self.buy_spread().map(|_| spread.buy_bps),
+                sell_offset_bps: self.sell_spread().map(|_| spread.sell_bps),
+                ..self.clone()
+            }),
+            None => std::borrow::Cow::Borrowed(self),
+        }
     }
     /// True when the buy side is fully configured (a spread + a size).
     pub fn buy_enabled(&self) -> bool {
@@ -1444,6 +1576,14 @@ impl Config {
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    /// Whether an issuer spread must be even (buy = sell) to apply: while the
+    /// inventory curve runs, in Preview or Live, as the corridor book carries
+    /// it ([`crate::rfq`]'s `book_curve`). The curve prices one mid with one
+    /// spread, as it takes only an even configured one.
+    pub fn issuer_spread_even_only(&self) -> bool {
+        self.modules_enabled && self.modules.runs(crate::modules::Module::Curve)
     }
 
     /// Whether the inventory curve prices live quotes: modules on and the
@@ -2035,6 +2175,7 @@ impl Config {
         self.price_guard.validate()?;
         self.validate_allowed_takers()?;
         self.validate_feed_sides()?;
+        self.validate_issuer_spread()?;
         self.validate_rfq()?;
         Ok(())
     }
@@ -2089,6 +2230,71 @@ impl Config {
         sided
             .into_iter()
             .try_for_each(|idx| feed_sides_pool_conflicts(&self.pools[idx], idx))
+    }
+
+    /// `[issuer_spread]` and the pools that take it.
+    fn validate_issuer_spread(&self) -> anyhow::Result<()> {
+        let takers: Vec<usize> = (0..self.pools.len())
+            .filter(|&idx| {
+                let pool = &self.pools[idx];
+                pool.issuer_spread_min_bps.is_some() || pool.issuer_spread_max_bps.is_some()
+            })
+            .collect();
+        let Some(table) = &self.issuer_spread else {
+            return match takers.first() {
+                Some(idx) => anyhow::bail!(
+                    "pools[{idx}] sets issuer_spread bounds but there's no [issuer_spread] \
+                     table saying whose spreads to take"
+                ),
+                None => Ok(()),
+            };
+        };
+        table.validate()?;
+        takers
+            .into_iter()
+            .try_for_each(|idx| self.validate_issuer_spread_pool(table, idx))
+    }
+
+    fn validate_issuer_spread_pool(
+        &self,
+        table: &IssuerSpreadConfig,
+        idx: usize,
+    ) -> anyhow::Result<()> {
+        let pool = &self.pools[idx];
+        let Some(bounds) = pool.issuer_spread_bounds() else {
+            anyhow::bail!(
+                "pools[{idx}] needs both issuer_spread_min_bps and issuer_spread_max_bps"
+            );
+        };
+        anyhow::ensure!(
+            bounds.min_bps <= bounds.max_bps && bounds.max_bps < SPREAD_LIMIT_BPS,
+            "pools[{idx}].issuer_spread_max_bps must be at least issuer_spread_min_bps \
+             and below {SPREAD_LIMIT_BPS}"
+        );
+        let switch = table.switch.trim().to_lowercase();
+        let url = pool.feed_url.as_deref().unwrap_or(&self.feed.url);
+        anyhow::ensure!(
+            feed_switch_key(url).as_deref() == Some(switch.as_str()),
+            "pools[{idx}] takes the spread of switch {switch}, so its feed URL must carry \
+             feedSwitch={switch}"
+        );
+        anyhow::ensure!(
+            !feed_inverts(url),
+            "pools[{idx}] reads its feed inverted; the issuer's buy and sell offsets would \
+             land on the wrong sides"
+        );
+        anyhow::ensure!(
+            !pool.feed_sides,
+            "pools[{idx}].feed_sides quotes the feed's own bid and ask, which would replace \
+             the issuer's spread. Remove one of them"
+        );
+        let in_bps = |side: Option<Spread>| side.is_none_or(|s| matches!(s, Spread::Bps(_)));
+        anyhow::ensure!(
+            in_bps(pool.buy_spread()) && in_bps(pool.sell_spread()),
+            "pools[{idx}] takes an issuer spread in bps: set buy_offset_bps and \
+             sell_offset_bps, not the _abs offsets"
+        );
+        Ok(())
     }
 
     /// RFQ cross-field rules. All of them are scoped to configs that actually
@@ -4486,5 +4692,173 @@ mod tests {
             let err = Config::from_toml(&toml).expect_err(bad);
             assert!(err.to_string().contains("max_fee_per_gas_gwei"), "{err}");
         }
+    }
+
+    const SWITCH_URL: &str =
+        "https://api.textilecredit.com/price?chainId=8453&pair=idr-usdt&feedSwitch=idrx-usdt";
+    const ISSUER: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    /// One RFQ pool on the `idrx-usdt` switch taking its spread. `pool` lands
+    /// in the pool's table; `table` is the `[issuer_spread]` table.
+    fn issuer_spread_bot(pool: &str, table: &str) -> String {
+        rfq_only_with_signer(&format!("{pool}\n{table}"))
+    }
+
+    fn issuer_pool(min: u32, max: u32) -> String {
+        format!(
+            "feed_url = \"{SWITCH_URL}\"\nissuer_spread_min_bps = {min}\nissuer_spread_max_bps = {max}"
+        )
+    }
+
+    fn issuer_table(signers: &str) -> String {
+        format!(
+            "[issuer_spread]\nswitch = \"IDRX-USDT\"\nenvironment = \"app.textilecredit.com\"\n{signers}"
+        )
+    }
+
+    fn eoa(address: &str) -> String {
+        format!("[[issuer_spread.signers]]\naddress = \"{address}\"\nkind = \"eoa\"\n")
+    }
+
+    #[test]
+    fn issuer_spread_replaces_offsets_only_inside_the_pools_bounds() {
+        let cfg = Config::from_toml(&issuer_spread_bot(
+            &issuer_pool(10, 60),
+            &issuer_table(&eoa(ISSUER)),
+        ))
+        .unwrap();
+        let pool = &cfg.pools[0];
+        assert_eq!(
+            pool.issuer_spread_bounds(),
+            Some(SpreadBounds {
+                min_bps: 10,
+                max_bps: 60
+            })
+        );
+        let spread = |buy, sell| {
+            Some(IssuerSpread {
+                buy_bps: buy,
+                sell_bps: sell,
+                revision: 4,
+            })
+        };
+        let taken = pool.with_issuer_spread(spread(20, 30), false);
+        assert_eq!(taken.buy_spread(), Some(Spread::Bps(20)));
+        assert_eq!(taken.sell_spread(), Some(Spread::Bps(30)));
+        // Outside the bounds, or none at all: the pool as configured.
+        for passed in [spread(5, 30), spread(20, 61), None] {
+            let kept = pool.with_issuer_spread(passed, false);
+            assert!(matches!(kept, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(kept.buy_spread(), Some(Spread::Bps(150)));
+        }
+        // While the curve runs, only an even spread, as on the RFQ book.
+        let uneven = pool.with_issuer_spread(spread(20, 30), true);
+        assert!(matches!(uneven, std::borrow::Cow::Borrowed(_)));
+        let even = pool.with_issuer_spread(spread(25, 25), true);
+        assert_eq!(even.buy_spread(), Some(Spread::Bps(25)));
+    }
+
+    #[test]
+    fn issuer_spread_never_turns_on_a_side_the_operator_turned_off() {
+        let toml = issuer_spread_bot(&issuer_pool(10, 60), &issuer_table(&eoa(ISSUER)))
+            .replace("sell_offset_bps = 150\n", "");
+        let cfg = Config::from_toml(&toml).unwrap();
+        let spread = Some(IssuerSpread {
+            buy_bps: 20,
+            sell_bps: 30,
+            revision: 4,
+        });
+        let taken = cfg.pools[0].with_issuer_spread(spread, cfg.issuer_spread_even_only());
+        assert_eq!(taken.buy_spread(), Some(Spread::Bps(20)));
+        assert_eq!(taken.sell_spread(), None);
+    }
+
+    #[test]
+    fn issuer_spread_config_is_checked_at_load() {
+        let err = |toml: String, needle: &str| {
+            let e = Config::from_toml(&toml).expect_err(needle).to_string();
+            assert!(e.contains(needle), "{needle}: {e}");
+        };
+        // Bounds with no table saying whose spreads to take.
+        err(
+            issuer_spread_bot(&issuer_pool(10, 60), ""),
+            "no [issuer_spread]",
+        );
+        // A pool that doesn't read the switch.
+        err(
+            issuer_spread_bot(
+                "issuer_spread_min_bps = 10\nissuer_spread_max_bps = 60",
+                &issuer_table(&eoa(ISSUER)),
+            ),
+            "feedSwitch=idrx-usdt",
+        );
+        // Only one bound, an inverted range, a range the bid can't quote.
+        err(
+            issuer_spread_bot(
+                &format!("feed_url = \"{SWITCH_URL}\"\nissuer_spread_min_bps = 10"),
+                &issuer_table(&eoa(ISSUER)),
+            ),
+            "needs both",
+        );
+        err(
+            issuer_spread_bot(&issuer_pool(60, 10), &issuer_table(&eoa(ISSUER))),
+            "at least",
+        );
+        err(
+            issuer_spread_bot(&issuer_pool(10, 10_000), &issuer_table(&eoa(ISSUER))),
+            "below 10000",
+        );
+        // A reversed pool reads the switch inverted.
+        err(
+            issuer_spread_bot(
+                &issuer_pool(10, 60)
+                    .replace("feedSwitch=idrx-usdt", "feedSwitch=idrx-usdt&invert=1"),
+                &issuer_table(&eoa(ISSUER)),
+            ),
+            "inverted",
+        );
+        // Absolute offsets.
+        err(
+            issuer_spread_bot(&issuer_pool(10, 60), &issuer_table(&eoa(ISSUER)))
+                .replace("buy_offset_bps = 150", "buy_offset_abs = 2.0"),
+            "in bps",
+        );
+        // Signers: none, twice, not an address.
+        err(
+            issuer_spread_bot(&issuer_pool(10, 60), &issuer_table("signers = []")),
+            "1 to 10",
+        );
+        err(
+            issuer_spread_bot(
+                &issuer_pool(10, 60),
+                &issuer_table(&format!(
+                    "{}{}",
+                    eoa(ISSUER),
+                    eoa(&ISSUER.to_uppercase().replace("0X", "0x"))
+                )),
+            ),
+            "twice",
+        );
+        err(
+            issuer_spread_bot(&issuer_pool(10, 60), &issuer_table(&eoa("0x12"))),
+            "not an address",
+        );
+    }
+
+    #[test]
+    fn issuer_spread_signer_list_is_sorted_lowercase() {
+        let cfg = Config::from_toml(&issuer_spread_bot(
+            &issuer_pool(10, 60),
+            &issuer_table(&format!(
+                "{}{}",
+                eoa("0xB000000000000000000000000000000000000001"),
+                eoa("0xA000000000000000000000000000000000000002")
+            )),
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.issuer_spread.unwrap().signer_list(),
+            "0xa000000000000000000000000000000000000002,0xb000000000000000000000000000000000000001"
+        );
     }
 }

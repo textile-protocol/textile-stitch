@@ -207,29 +207,37 @@ impl FeedGuards {
     /// [`off_hours::covers`]): orders priced live must not post once the
     /// market has closed (a held print can carry the same price), and held
     /// orders must not post past `held_max_hours` or once the held extra has
-    /// grown past theirs.
+    /// grown past theirs. `priced_quote` is the print the batch was priced
+    /// from: an issuer spread set, changed or withdrawn while the signer
+    /// worked withholds it too, as on the RFQ path (`recheck_after_signing`),
+    /// since the band alone can't see a few bps of spread.
     async fn revalidate(
         &mut self,
         feed_url: &str,
         feed: &impl PriceFeed,
         config: Option<&off_hours::OffHoursConfig>,
         priced: Option<OffHours>,
+        priced_quote: &Quote,
     ) -> Option<f64> {
         self.fetched.remove(feed_url);
         let quote = self.fetch(feed_url, feed).await?;
         let now = unix_now();
         usable(&quote, now, self.staleness_secs).ok()?;
         let current = off_hours::assess(&quote, config, now).ok()?;
-        off_hours::covers(priced, current).then_some(quote.price)
+        (off_hours::covers(priced, current)
+            && quote.spread.offsets() == priced_quote.spread.offsets())
+        .then_some(quote.price)
     }
 
     /// Async work earlier in the pool may have let either loop supersede
-    /// its snapshot. Do not start another leg using that old price surface.
+    /// its snapshot. Do not start another leg using that old price surface,
+    /// price and issuer spread alike.
     fn is_current(&self, feed_url: &str, quote: &Quote) -> bool {
         let now = unix_now();
         self.prices.get(feed_url).is_some_and(|current| {
             current.price == quote.price
                 && current.session == quote.session
+                && current.spread.offsets() == quote.spread.offsets()
                 && usable(&current, now, self.staleness_secs).is_ok()
                 && usable(quote, now, self.staleness_secs).is_ok()
         })
@@ -896,14 +904,34 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // One feed per distinct URL — pools can point at different price sources
     // (a shared feed can't price cNGN, COPM, and KES at once). Falls back to the
     // bot-level `[feed]` when a pool sets no `feed_url`.
+    // `[issuer_spread]`: one gate checks every served spread for both loops,
+    // and keeps the highest accepted revision next to the config (not in a
+    // dry run). A state file it can't read stops the bot rather than let an
+    // older spread back in.
+    let spread_gate = cfg
+        .issuer_spread
+        .clone()
+        .map(|table| {
+            stitch_bot::pricing::issuer_spread::Gate::new(
+                table,
+                cfg.chain_id,
+                stitch_bot::chain::rpc::Rpc::new(cfg.rpc_endpoints()),
+                (!dry_run).then(|| std::path::Path::new(&config_path)),
+            )
+        })
+        .transpose()
+        .context("loading the [issuer_spread] state")?
+        .map(std::sync::Arc::new);
     let mut feeds: HashMap<String, HttpFeed> = HashMap::new();
     for pool in &cfg.pools {
         // `offHours=1` is appended for an off-hours pool, so it never shares
         // a fetch, cached print or jump guard with a plain pool.
         let url = pool.feed_request_url(&cfg.feed.url);
-        feeds
-            .entry(url.clone())
-            .or_insert_with(|| HttpFeed::new(&url).with_basis(cfg.price_basis()));
+        feeds.entry(url.clone()).or_insert_with(|| {
+            HttpFeed::new(&url)
+                .with_basis(cfg.price_basis())
+                .with_spread_gate(spread_gate.clone())
+        });
     }
     if cfg.curve_live() {
         info!(
@@ -1025,7 +1053,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             jump: cfg.price_guard.jump(),
             staleness_secs: cfg.feed.staleness_secs,
         },
-    );
+    )
+    .with_spread_gate(spread_gate.clone());
     let mut feed_guards = FeedGuards::new(prices.clone(), cfg.feed.staleness_secs);
 
     // RFQ responder: spawned only when `[rfq].enabled`. With the config
@@ -1098,6 +1127,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     let mut state = QuoteState {
         last_quote: HashMap::new(),
         last_policy: HashMap::new(),
+        last_spread: HashMap::new(),
         next_nonce,
         slot_nonces,
         slot_inputs,
@@ -1232,6 +1262,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                 }
             };
             log_session_change(&mut last_sessions, pool_idx, feed_url, &quote, off_hours);
+            // An issuer's verified spread, when this pool takes one, replaces
+            // its offsets for the ladder and the taker leg below. The RFQ
+            // books take the same spread in `Engine::module_book`.
+            let pool =
+                pool.with_issuer_spread(quote.spread.verified(), cfg.issuer_spread_even_only());
+            let pool: &PoolConfig = &pool;
             let (debt, collateral): (Address, Address) =
                 match (pool.debt.parse(), pool.collateral.parse()) {
                     (Ok(d), Ok(c)) => (d, c),
@@ -1342,7 +1378,13 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         guard,
                         off_hours,
                         now,
-                        feed_guards.revalidate(feed_url, feed, pool.off_hours.as_ref(), off_hours),
+                        feed_guards.revalidate(
+                            feed_url,
+                            feed,
+                            pool.off_hours.as_ref(),
+                            off_hours,
+                            &quote,
+                        ),
                     )
                     .await;
                     match outcome {
@@ -1570,6 +1612,7 @@ mod tests {
             price,
             timestamp,
             degraded: false,
+            spread: Default::default(),
             reference: None,
             bid: None,
             ask: None,
@@ -1640,6 +1683,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_issuer_spread_set_since_the_snapshot_stops_the_next_leg() {
+        use stitch_bot::pricing::issuer_spread::{IssuerSpread, SpreadSlot};
+        let now = unix_now();
+        let rfq = prices();
+        let tick = guards(rfq.clone());
+        rfq.admit(tokio::time::Instant::now(), "a", quote(1.0, now), now);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        rfq.admit(tokio::time::Instant::now(), "a", quote(1.0, now), now);
+        assert!(tick.is_current("a", &quote(1.0, now)));
+        // Same price, but the RFQ loop's read now carries an issuer spread:
+        // the taker and closer mustn't start on the tick's spread-less one.
+        let mut with_spread = quote(1.0, now);
+        with_spread.spread = SpreadSlot::Verified(IssuerSpread {
+            buy_bps: 25,
+            sell_bps: 30,
+            revision: 12,
+        });
+        rfq.admit(tokio::time::Instant::now(), "a", with_spread.clone(), now);
+        assert!(!tick.is_current("a", &quote(1.0, now)));
+        assert!(tick.is_current("a", &with_spread));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn rfq_and_tick_share_holds_recovery_and_cached_pool_reads() {
         let now = unix_now();
         let rfq = prices();
@@ -1696,7 +1762,8 @@ mod tests {
         assert_eq!(tick.fetch("a", &feed).await, Some(live.clone()));
         let cfg = off_hours_config();
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), None).await,
+            tick.revalidate("a", &feed, Some(&cfg), None, &quote(1.0, 0))
+                .await,
             Some(1.0)
         );
         // The market closes while the batch is signed: the held price is the
@@ -1707,11 +1774,16 @@ mod tests {
             ..live.clone()
         };
         *feed.0.write().unwrap() = Some(held.clone());
-        assert_eq!(tick.revalidate("a", &feed, Some(&cfg), None).await, None);
+        assert_eq!(
+            tick.revalidate("a", &feed, Some(&cfg), None, &quote(1.0, 0))
+                .await,
+            None
+        );
         assert!(!tick.is_current("a", &live));
         let priced = off_hours::assess(&held, Some(&cfg), now).unwrap();
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), priced).await,
+            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0))
+                .await,
             Some(1.0)
         );
         assert!(tick.is_current("a", &held));
@@ -1747,17 +1819,26 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(tick.fetch("a", &feed).await, Some(drafted.clone()));
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), priced).await,
+            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0))
+                .await,
             Some(1.0)
         );
         // Signing ran past held_max_hours: same session, same price, refused.
         let past = held_since(7_260);
         *feed.0.write().unwrap() = Some(past);
-        assert_eq!(tick.revalidate("a", &feed, Some(&cfg), priced).await, None);
+        assert_eq!(
+            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0))
+                .await,
+            None
+        );
         // An extra smaller than the one now required is refused too.
         let tighter = off_hours::assess(&held_since(60), Some(&cfg), now).unwrap();
         *feed.0.write().unwrap() = Some(drafted);
-        assert_eq!(tick.revalidate("a", &feed, Some(&cfg), tighter).await, None);
+        assert_eq!(
+            tick.revalidate("a", &feed, Some(&cfg), tighter, &quote(1.0, 0))
+                .await,
+            None
+        );
     }
 
     struct MutableFeed(std::sync::RwLock<Option<Quote>>);
@@ -1839,8 +1920,19 @@ mod tests {
         let now = unix_now();
         let mut degraded = quote(1.0, now);
         degraded.degraded = true;
+        // An issuer set a spread while the ladder (priced without one) was
+        // being signed: inside the band, so only the spread check refuses it.
+        let mut spread_set = quote(1.001, now);
+        spread_set.spread = stitch_bot::pricing::issuer_spread::SpreadSlot::Verified(
+            stitch_bot::pricing::issuer_spread::IssuerSpread {
+                buy_bps: 25,
+                sell_bps: 30,
+                revision: 12,
+            },
+        );
         for (name, next, expected) in [
             ("healthy", Some(quote(1.001, now)), 2),
+            ("issuer spread changed", Some(spread_set.clone()), 0),
             ("outside band", Some(quote(1.05, now)), 0),
             ("degraded", Some(degraded), 0),
             ("stale", Some(quote(1.0, now - 600)), 0),
@@ -1924,7 +2016,7 @@ mod tests {
                     1.0,
                     async {
                         guards
-                            .revalidate("feed", &feed, None, None)
+                            .revalidate("feed", &feed, None, None, &quote(1.0, now))
                             .await
                             .is_some_and(|spot| {
                                 drafts_within_band(Side::Ask, &pool, &drafts, spot, 100)

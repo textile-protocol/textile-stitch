@@ -49,6 +49,9 @@ pub struct PriceCache {
     feeds: Arc<Mutex<HashMap<String, FeedState>>>,
     config_dir: Option<PathBuf>,
     policy: FeedPolicy,
+    /// Checks issuer spreads for every feed both loops read
+    /// (`[issuer_spread]`); `None` when the bot takes none.
+    spread_gate: Option<Arc<super::issuer_spread::Gate>>,
 }
 
 impl PriceCache {
@@ -58,7 +61,21 @@ impl PriceCache {
             feeds: Arc::new(Mutex::new(HashMap::new())),
             config_dir: config_dir.map(Path::to_path_buf),
             policy,
+            spread_gate: None,
         }
+    }
+
+    /// Share `gate` with every feed built from this cache.
+    pub fn with_spread_gate(self, gate: Option<Arc<super::issuer_spread::Gate>>) -> Self {
+        Self {
+            spread_gate: gate,
+            ..self
+        }
+    }
+
+    /// The issuer spread gate feeds read through, if the bot takes spreads.
+    pub fn spread_gate(&self) -> Option<Arc<super::issuer_spread::Gate>> {
+        self.spread_gate.clone()
     }
 
     pub fn get(&self, url: &str) -> Option<Quote> {
@@ -218,6 +235,7 @@ mod tests {
             price,
             timestamp,
             degraded: false,
+            spread: Default::default(),
             reference: None,
             bid: None,
             ask: None,
@@ -372,6 +390,7 @@ mod tests {
                 price,
                 timestamp: if stale { 1 } else { now },
                 degraded,
+                spread: Default::default(),
                 reference: None,
                 bid: None,
                 ask: None,

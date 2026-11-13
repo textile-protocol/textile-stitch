@@ -3033,7 +3033,9 @@ fn on_feed_fetch(
 /// guard starts from the print it last trusted before a restart, when the
 /// config folder has one (see [`crate::pricing::anchor`]).
 async fn price_loop(url: String, basis: crate::pricing::feed::PriceBasis, cache: PriceCache) {
-    let feed = HttpFeed::new(&url).with_basis(basis);
+    let feed = HttpFeed::new(&url)
+        .with_basis(basis)
+        .with_spread_gate(cache.spread_gate());
     loop {
         let started = tokio::time::Instant::now();
         on_feed_fetch(started, &cache, &url, feed.fetch().await);
@@ -4657,6 +4659,7 @@ mod tests {
                 curve: None,
                 feed_sides: false,
                 off_hours: None,
+                issuer_spread: None,
             }],
             configured: Vec::new(),
             allowed_takers: None,
@@ -5037,6 +5040,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now(),
                 degraded: false,
+                spread: Default::default(),
                 reference: None,
                 bid: None,
                 ask: None,
@@ -5162,6 +5166,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now(),
                 degraded: false,
+                spread: Default::default(),
                 reference: None,
                 bid: Some(bid),
                 ask: Some(ask),
@@ -5222,6 +5227,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now(),
                 degraded: false,
+                spread: Default::default(),
                 reference: Some(crate::pricing::feed::ReferenceBook {
                     mid: 1.0,
                     half_range_bps: 9.4,
@@ -5948,6 +5954,7 @@ mod tests {
             curve: None,
             feed_sides: false,
             off_hours: None,
+            issuer_spread: None,
         }
     }
 
@@ -6023,6 +6030,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now(),
                 degraded: false,
+                spread: Default::default(),
                 reference: None,
                 bid: None,
                 ask: None,
@@ -6041,6 +6049,7 @@ mod tests {
                     price: 2.0,
                     timestamp: unix_now() - 1,
                     degraded: false,
+                    spread: Default::default(),
                     reference: None,
                     bid: None,
                     ask: None,
@@ -6070,6 +6079,7 @@ mod tests {
                 price: 2.0,
                 timestamp: unix_now(),
                 degraded: false,
+                spread: Default::default(),
                 reference: None,
                 bid: None,
                 ask: None,
@@ -6097,6 +6107,7 @@ mod tests {
             curve: None,
             feed_sides: false,
             off_hours: None,
+            issuer_spread: None,
         }
     }
 
@@ -6961,6 +6972,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now().saturating_sub(3_600),
                 degraded: false,
+                spread: Default::default(),
                 reference: None,
                 bid: None,
                 ask: None,
@@ -7476,6 +7488,7 @@ mod tests {
                 price: 1.0,
                 timestamp: unix_now(),
                 degraded: false,
+                spread: Default::default(),
                 reference: Some(crate::pricing::feed::ReferenceBook {
                     mid: 1.001,
                     half_range_bps: 9.4,

@@ -57,6 +57,10 @@ pub struct CorridorBook {
     /// The pool's off-hours block. `None` quotes a live print only, as
     /// before; see [`off_hours_book`].
     pub off_hours: Option<OffHoursConfig>,
+    /// The range this corridor takes an issuer's spread in
+    /// (`issuer_spread_*_bps` on the pool); `None` when it takes none. See
+    /// [`issuer_spread_book`].
+    pub issuer_spread: Option<crate::pricing::issuer_spread::SpreadBounds>,
 }
 
 /// A corridor's inventory curve as the quote path reads it.
@@ -252,6 +256,7 @@ pub fn book_from_pool(
         curve: None,
         feed_sides: pool.feed_sides,
         off_hours: pool.off_hours.clone(),
+        issuer_spread: pool.issuer_spread_bounds(),
         feed_url: pool.feed_request_url(default_feed_url),
     }))
 }
@@ -306,6 +311,28 @@ fn widened_book(book: &CorridorBook, mid: f64, off: OffHours) -> CorridorBook {
         sell_capacity_collateral: capped(book.sell_capacity_collateral, collateral_cap),
         ..book.clone()
     }
+}
+
+/// The book with an issuer's verified spread in place of the configured
+/// offsets, when this corridor takes one and the print carries one inside
+/// its bounds (see [`crate::pricing::issuer_spread`]). A side the operator
+/// turned off stays off; a curve corridor takes only an even spread, as it
+/// takes only an even configured one. `None` leaves the book as it is.
+pub fn issuer_spread_book(
+    book: &CorridorBook,
+    quote: &crate::pricing::feed::Quote,
+) -> Option<CorridorBook> {
+    let spread = crate::pricing::issuer_spread::applied(
+        &book.slug,
+        book.issuer_spread,
+        book.curve.is_some(),
+        quote.spread.verified(),
+    )?;
+    Some(CorridorBook {
+        buy_spread: book.buy_spread.map(|_| Spread::Bps(spread.buy_bps)),
+        sell_spread: book.sell_spread.map(|_| Spread::Bps(spread.sell_bps)),
+        ..book.clone()
+    })
 }
 
 /// The book a print quotes from. A pool without `feed_sides` is unchanged.
@@ -1489,6 +1516,7 @@ mod tests {
             curve: None,
             feed_sides: false,
             off_hours: None,
+            issuer_spread: None,
         }
     }
 
@@ -1602,6 +1630,7 @@ mod tests {
             price,
             timestamp: 1_754_388_000,
             degraded: false,
+            spread: Default::default(),
             reference: None,
             bid: Some(bid),
             ask: Some(ask),
@@ -1609,6 +1638,56 @@ mod tests {
             market_at: None,
             market_source: None,
         }
+    }
+
+    fn issuer_quote(buy: u32, sell: u32) -> crate::pricing::feed::Quote {
+        use crate::pricing::issuer_spread::{IssuerSpread, SpreadSlot};
+        crate::pricing::feed::Quote {
+            spread: SpreadSlot::Verified(IssuerSpread {
+                buy_bps: buy,
+                sell_bps: sell,
+                revision: 9,
+            }),
+            bid: None,
+            ask: None,
+            ..sided_quote(1.0, 1.0, 1.0)
+        }
+    }
+
+    #[test]
+    fn issuer_spread_book_takes_a_verified_spread_inside_the_corridors_bounds() {
+        use crate::pricing::issuer_spread::SpreadBounds;
+        let takes = CorridorBook {
+            issuer_spread: Some(SpreadBounds {
+                min_bps: 10,
+                max_bps: 80,
+            }),
+            ..book()
+        };
+        let got = issuer_spread_book(&takes, &issuer_quote(20, 35)).unwrap();
+        assert_eq!(
+            (got.buy_spread, got.sell_spread),
+            (Some(Spread::Bps(20)), Some(Spread::Bps(35)))
+        );
+        // Outside the bounds, or a corridor that takes none: unchanged.
+        assert!(issuer_spread_book(&takes, &issuer_quote(5, 35)).is_none());
+        assert!(issuer_spread_book(&book(), &issuer_quote(20, 35)).is_none());
+        // A served but unverified spread is never applied.
+        let unverified = crate::pricing::feed::Quote {
+            spread: Default::default(),
+            ..issuer_quote(20, 35)
+        };
+        assert!(issuer_spread_book(&takes, &unverified).is_none());
+        // A side the operator turned off stays off.
+        let one_sided = CorridorBook {
+            sell_spread: None,
+            ..takes
+        };
+        let got = issuer_spread_book(&one_sided, &issuer_quote(20, 35)).unwrap();
+        assert_eq!(
+            (got.buy_spread, got.sell_spread),
+            (Some(Spread::Bps(20)), None)
+        );
     }
 
     fn sided_book() -> CorridorBook {

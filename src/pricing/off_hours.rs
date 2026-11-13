@@ -421,6 +421,7 @@ mod tests {
             session,
             market_at,
             market_source: None,
+            spread: Default::default(),
         }
     }
 

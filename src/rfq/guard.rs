@@ -55,7 +55,8 @@ pub(super) fn order_refusal(
 /// `StaleFeed`; a degraded one is `DegradedFeed`; out of band is `Busy`.
 ///
 /// `priced` is the print the order was priced from, which a `feed_sides`
-/// pool needs: see [`feed_sides_refusal`]. `priced_at` is when it was
+/// pool needs ([`feed_sides_refusal`]), and so does a book that takes
+/// issuer spreads ([`issuer_spread_refusal`]). `priced_at` is when it was
 /// priced (Unix seconds), so its off-hours extra is the one the order was
 /// actually built with: see [`off_hours_refusal`].
 pub(super) fn recheck_after_signing(
@@ -78,6 +79,9 @@ pub(super) fn recheck_after_signing(
     if let Some(reason) =
         off_hours_refusal(book, priced, priced_at, &quote, crate::time::unix_now())
     {
+        return Err(reason);
+    }
+    if let Some(reason) = issuer_spread_refusal(book, priced, &quote) {
         return Err(reason);
     }
     match order_refusal(order, bid, book, &quote, max_loss_bps) {
@@ -142,6 +146,32 @@ fn off_hours_refusal(
     };
     let then = priced.and_then(|p| assess(p, config, priced_at).ok().flatten());
     (!covers(then, current)).then_some(RejectReason::Busy)
+}
+
+/// Whether an order priced at an issuer's spread may still go out after
+/// signing. An issuer can set a spread, or Textile withdraw one, while a slow
+/// signer works, and the band can't see it: it bounds the loss around the
+/// mid, and a spread change moves the order less than that. So the spread
+/// that applies to the print the cache holds now must be the one the order
+/// was priced at, none included (`Busy` if not). `None` on a book that takes
+/// no issuer spread, and when there's no pricing print to compare to: only
+/// the firm-quote path prices from the book's spreads, and it passes one.
+fn issuer_spread_refusal(
+    book: &CorridorBook,
+    priced: Option<&Quote>,
+    current: &Quote,
+) -> Option<RejectReason> {
+    let bounds = book.issuer_spread?;
+    let priced = priced?;
+    let applied = |quote: &Quote| {
+        crate::pricing::issuer_spread::applicable(
+            Some(bounds),
+            book.curve.is_some(),
+            quote.spread.verified(),
+        )
+        .map(|s| (s.buy_bps, s.sell_bps))
+    };
+    (applied(priced) != applied(current)).then_some(RejectReason::Busy)
 }
 
 /// The print a NAV attestation is judged against: the book's cached print,
@@ -237,6 +267,7 @@ mod tests {
             price,
             timestamp,
             degraded: false,
+            spread: Default::default(),
             reference: None,
             bid: None,
             ask: None,
@@ -367,6 +398,7 @@ mod tests {
             curve: None,
             feed_sides: false,
             off_hours: None,
+            issuer_spread: None,
         }
     }
 
@@ -459,6 +491,71 @@ mod tests {
             recheck(Some(quote(0.00065 * 0.8, now))),
             Err(RejectReason::Busy)
         );
+    }
+
+    #[test]
+    fn an_order_priced_at_an_issuer_spread_is_withheld_when_it_changed_while_signing() {
+        use crate::pricing::issuer_spread::{IssuerSpread, SpreadBounds, SpreadSlot};
+        let now = crate::time::unix_now();
+        let with = |spread: Option<(u32, u32, u64)>| Quote {
+            spread: spread.map_or(SpreadSlot::None, |(buy_bps, sell_bps, revision)| {
+                SpreadSlot::Verified(IssuerSpread {
+                    buy_bps,
+                    sell_bps,
+                    revision,
+                })
+            }),
+            ..quote(0.00065, now)
+        };
+        let takes = CorridorBook {
+            issuer_spread: Some(SpreadBounds {
+                min_bps: 10,
+                max_bps: 80,
+            }),
+            ..book(6, 18)
+        };
+        let order = built(1_000_000, U256::from(1_538_461_538_461_538_461_538u128));
+        let recheck = |book: &CorridorBook, now: Quote, priced: Option<&Quote>| {
+            let cache = PriceCache::new(None, JUMP);
+            cache.set(URL.to_string(), now);
+            recheck_after_signing(
+                &cache,
+                &order,
+                true,
+                book,
+                1_500,
+                priced,
+                crate::time::unix_now(),
+            )
+        };
+        let priced = with(Some((25, 30, 12)));
+
+        assert_eq!(recheck(&takes, priced.clone(), Some(&priced)), Ok(()));
+        // Set again at a later revision with the same offsets: still the price.
+        assert_eq!(
+            recheck(&takes, with(Some((25, 30, 14))), Some(&priced)),
+            Ok(())
+        );
+        // Changed, or withdrawn, while the signer worked: withheld.
+        assert_eq!(
+            recheck(&takes, with(Some((40, 30, 13))), Some(&priced)),
+            Err(RejectReason::Busy)
+        );
+        assert_eq!(
+            recheck(&takes, with(None), Some(&priced)),
+            Err(RejectReason::Busy)
+        );
+        // A spread outside the book's bounds never applied either way.
+        assert_eq!(
+            recheck(
+                &takes,
+                with(Some((90, 90, 13))),
+                Some(&with(Some((95, 95, 12))))
+            ),
+            Ok(())
+        );
+        // A book that takes no issuer spread doesn't care.
+        assert_eq!(recheck(&book(6, 18), with(None), Some(&priced)), Ok(()));
     }
 
     #[test]

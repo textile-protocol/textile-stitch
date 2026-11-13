@@ -72,6 +72,22 @@ staleness_secs = 900
 # [change_log]
 # ship = true
 
+# Let an issuer set this bot's spreads from a Textile feed switch, by
+# signature. The bot checks every spread itself: the signer must be listed
+# here, the signature must be theirs over the exact message, and the switch
+# revision may never go back. Each pool that takes it also sets
+# issuer_spread_min_bps and issuer_spread_max_bps, and reads the switch's
+# feed URL (…&feedSwitch=<switch>); anything outside those bounds, or any
+# spread that doesn't check out, leaves the pool on its own offsets. A
+# contract wallet must be a deployed Safe (or other ERC-1271 wallet) on this
+# chain.
+# [issuer_spread]
+# switch = "idrx-usdt"
+# environment = "app.textilecredit.com"
+# [[issuer_spread.signers]]
+# address = "0x…"
+# kind = "eoa"          # or "contract"
+
 # One block per corridor you serve. Add more [[pools]] for other pairs/chains.
 # Pairs with different prices (cNGN, COPM, …) MUST each set `feed_url` — one
 # shared feed can't price them all.

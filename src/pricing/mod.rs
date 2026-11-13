@@ -18,6 +18,7 @@ pub mod band;
 pub mod cache;
 pub mod curve;
 pub mod feed;
+pub mod issuer_spread;
 pub mod jump;
 pub mod lean;
 pub mod off_hours;

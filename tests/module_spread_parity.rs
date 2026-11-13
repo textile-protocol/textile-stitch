@@ -143,6 +143,7 @@ fn book(buy: Option<Spread>, sell: Option<Spread>) -> CorridorBook {
         curve: None,
         feed_sides: false,
         off_hours: None,
+        issuer_spread: None,
     }
 }
 

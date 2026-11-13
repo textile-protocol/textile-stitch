@@ -161,11 +161,13 @@ fn read(text: &str) -> Option<(ParamMap, u64)> {
 }
 
 /// The config hash the newest record in the journal left the file at.
+/// The config hash the journal last recorded. Runtime records (an accepted
+/// issuer spread) carry none and don't change the file, so they're skipped.
 fn last_recorded_hash(journal: &Journal) -> Result<Option<String>> {
     Ok(read_all(&journal.config_path)?
         .into_iter()
-        .next_back()
-        .and_then(|r| r.config_sha256_after))
+        .rev()
+        .find_map(|r| r.config_sha256_after))
 }
 
 /// Record whatever changed in `current` since the snapshot, then move the
@@ -510,6 +512,28 @@ mod tests {
             saved,
             "the snapshot is repaired"
         );
+    }
+
+    #[test]
+    fn a_runtime_record_after_the_save_does_not_hide_its_hash() {
+        let path = temp_config("heal-runtime", CONFIG);
+        record_startup(&path, CONFIG, 1).unwrap();
+        let saved = CONFIG.replace("buy_offset_bps = 40", "buy_offset_bps = 30");
+        let origin = panel_origin(Source::PanelSettings, "tailnet:ops@textile.example", "acme");
+        write_config_recorded(&path, &saved, &origin, 2, None).unwrap();
+        // An accepted issuer spread lands after the save, with no config hash.
+        let mut runtime = read_all(&path).unwrap().pop().unwrap();
+        runtime.id = crate::changelog::record::random_uuid();
+        runtime.config_sha256_before = None;
+        runtime.config_sha256_after = None;
+        // Its own journal handle, released before startup takes the lock.
+        append(&Journal::open(&path, None).unwrap(), &[runtime]).unwrap();
+        let snapshot = files::path(&path, LogFile::Snapshot);
+        std::fs::write(&snapshot, CONFIG).unwrap();
+        let before = read_all(&path).unwrap().len();
+
+        assert_eq!(record_startup(&path, &saved, 3).unwrap(), 0);
+        assert_eq!(read_all(&path).unwrap().len(), before);
     }
 
     #[test]
