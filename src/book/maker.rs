@@ -24,6 +24,7 @@ use crate::book::slots::{
     slot_nonce,
 };
 use crate::config::{parse_min_slice_debt, PoolConfig, DEFAULT_MAX_LADDER_ORDERS};
+use crate::pricing::off_hours::{widen_ask_price, widen_bid_price, OffHours};
 use crate::pricing::quote::{
     ask_price, bid_price, buy_amounts_at, collateral_for_debt_ceil_at, sell_amounts_at,
     SpotDeviationGuard, Spread,
@@ -91,6 +92,51 @@ impl Side {
             (Side::Bid, Some(g)) => g.clamp_bid(price),
             (Side::Ask, Some(g)) => g.clamp_ask(price),
             (_, None) => price,
+        }
+    }
+
+    /// The price with the off-hours extra applied: `extra_bps` of the price
+    /// itself further from mid (bid lower, ask higher), so a positive price
+    /// stays positive (see [`widen_bid_price`]). A live print (`None`)
+    /// passes the price through. `None` comes back only for a price that was
+    /// already not positive, live or not.
+    pub fn off_hours_price(self, price: f64, off_hours: Option<OffHours>) -> Option<f64> {
+        let Some(off) = off_hours else {
+            return Some(price);
+        };
+        match self {
+            Side::Bid => widen_bid_price(price, off.extra_bps),
+            Side::Ask => widen_ask_price(price, off.extra_bps),
+        }
+    }
+
+    /// Most of the side's input token the side may commit off-hours: the
+    /// debt cap itself on the bid, and on the ask the least collateral that
+    /// sells for at least the cap at the ask `price`. The ask ladder sizes in
+    /// debt by flooring that collateral back (`ask_ladder_sizes`), so a
+    /// floored collateral cap could come back one atomic short of the cap and,
+    /// with the cap at the minimum slice (allowed by config validation), size
+    /// to nothing. Rounded up the way the ladder's own floor is
+    /// ([`collateral_for_debt_ceil_at`]), it overshoots the cap by less than
+    /// one collateral atomic's worth of debt. `u128::MAX` when the print is live.
+    pub fn off_hours_input_cap(
+        self,
+        price: f64,
+        off_hours: Option<OffHours>,
+        pool: &PoolConfig,
+    ) -> u128 {
+        let Some(off) = off_hours else {
+            return u128::MAX;
+        };
+        match self {
+            Side::Bid => off.max_notional_debt,
+            Side::Ask => u128::try_from(collateral_for_debt_ceil_at(
+                price,
+                off.max_notional_debt,
+                pool.debt_decimals,
+                pool.collateral_decimals,
+            ))
+            .unwrap_or(u128::MAX),
         }
     }
 
@@ -169,6 +215,10 @@ pub struct TickCtx<'a> {
 /// slot-nonce ledger.
 pub struct QuoteState {
     pub last_quote: HashMap<String, (f64, u64)>,
+    /// The off-hours policy each side's posted orders were built under,
+    /// keyed like `last_quote`. A change reposts the side whatever the price
+    /// did; see [`crate::pricing::off_hours::Policy`].
+    pub last_policy: HashMap<String, crate::pricing::off_hours::Policy>,
     pub next_nonce: u64,
     pub slot_nonces: HashMap<String, u64>,
     pub slot_inputs: HashMap<String, String>,
@@ -238,6 +288,19 @@ pub fn drafts_within_band(
         })
 }
 
+/// Whether a side's posted orders were built under another off-hours policy
+/// than the one in force: entering or leaving off-hours, or a held extra that
+/// grew. Those orders carry the wrong spread or size even when the price is
+/// inside the refresh deadband, so the side reposts. A side with nothing
+/// recorded counts as live, the policy of every pool without the block. Pure.
+pub fn policy_changed(
+    last: &HashMap<String, crate::pricing::off_hours::Policy>,
+    key_id: &str,
+    now: crate::pricing::off_hours::Policy,
+) -> bool {
+    last.get(key_id).copied().unwrap_or(None) != now
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn quote_side(
     ctx: &TickCtx<'_>,
@@ -252,6 +315,7 @@ pub async fn quote_side(
     spot: f64,
     price_override: Option<f64>,
     guard: Option<SpotDeviationGuard>,
+    off_hours: Option<OffHours>,
     now: u64,
     post_sign_spot: impl std::future::Future<Output = Option<f64>>,
 ) -> SideOutcome {
@@ -260,20 +324,26 @@ pub async fn quote_side(
     let Some(spread) = side.spread(pool) else {
         return SideOutcome::held();
     };
-    let price = side.guarded_price(
+    let guarded = side.guarded_price(
         price_override.unwrap_or_else(|| side.price(mid, spread)),
         guard,
     );
+    let Some(price) = side.off_hours_price(guarded, off_hours) else {
+        return SideOutcome::held();
+    };
     let key_id = side.key_id(pair);
     let label = side.label();
-    if !should_requote_now(
-        state.last_quote.get(&key_id).copied(),
-        price,
-        pool.refresh_threshold_bps,
-        now,
-        pool.ttl_secs,
-        pool.repost_lead_secs(),
-    ) {
+    let policy = crate::pricing::off_hours::policy(off_hours);
+    if !policy_changed(&state.last_policy, &key_id, policy)
+        && !should_requote_now(
+            state.last_quote.get(&key_id).copied(),
+            price,
+            pool.refresh_threshold_bps,
+            now,
+            pool.ttl_secs,
+            pool.repost_lead_secs(),
+        )
+    {
         return SideOutcome::held();
     }
 
@@ -287,6 +357,7 @@ pub async fn quote_side(
         pair,
         side,
         price,
+        side.off_hours_input_cap(price, off_hours, pool),
         input_token,
         reusable_input,
     )
@@ -387,6 +458,7 @@ pub async fn quote_side(
             reusable_input,
         );
         info!(pair = %pair, orders = result.posted, "posted {label} ladder");
+        state.last_policy.insert(key_id.clone(), policy);
         state.last_quote.insert(key_id, (price, now));
     }
     SideOutcome::Done {
@@ -398,6 +470,7 @@ pub async fn quote_side(
 /// Order sizes for the side, in the side's input-sizing unit (debt slices for
 /// ladders on both sides; the configured input token amount for a single
 /// order). Empty when the side is unconfigured, unfunded, or misconfigured.
+/// `input_cap` bounds the side's total input (see [`Side::off_hours_input_cap`]).
 #[allow(clippy::too_many_arguments)]
 async fn side_sizes(
     ctx: &TickCtx<'_>,
@@ -406,6 +479,7 @@ async fn side_sizes(
     pair: &str,
     side: Side,
     price: f64,
+    input_cap: u128,
     input_token: Address,
     reusable_input: U256,
 ) -> Vec<u128> {
@@ -430,6 +504,7 @@ async fn side_sizes(
         else {
             return Vec::new();
         };
+        let funded_total = funded_total.min(input_cap);
         // Both ladders slice in debt units. The ask is configured in
         // collateral, so convert the funded collateral total to its debt
         // equivalent at the ask price first.
@@ -454,6 +529,7 @@ async fn side_sizes(
         match parse_input_liquidity(size_str, side.single_size_field_name()) {
             Ok(size) => capped_input(ctx, budgets, pair, side, size, input_token, reusable_input)
                 .await
+                .map(|size| size.min(input_cap))
                 .filter(|size| *size > 0)
                 .map(|size| vec![size])
                 .unwrap_or_default(),
@@ -894,6 +970,122 @@ mod tests {
         assert!(drafts
             .iter()
             .all(|draft| draft.output_amount >= U256::from(10_000_000u64)));
+    }
+
+    #[test]
+    fn a_side_reposts_when_its_off_hours_policy_changes() {
+        use crate::pricing::off_hours::{policy, Session};
+        let mut last = HashMap::new();
+        // Nothing recorded reads as live: a plain pool never trips this.
+        assert!(!policy_changed(&last, "buy:p", None));
+        let held = |extra| {
+            policy(Some(OffHours {
+                session: Session::Held,
+                market_age_secs: 0,
+                extra_bps: extra,
+                max_notional_debt: 5,
+            }))
+        };
+        assert!(policy_changed(&last, "buy:p", held(100)));
+        last.insert("buy:p".to_string(), None);
+        assert!(policy_changed(&last, "buy:p", held(100)));
+        last.insert("buy:p".to_string(), held(100));
+        assert!(!policy_changed(&last, "buy:p", held(100)));
+        // The held extra grew, or the market reopened.
+        assert!(policy_changed(&last, "buy:p", held(105)));
+        assert!(policy_changed(&last, "buy:p", None));
+    }
+
+    fn off_hours(extra_bps: u32, max_notional_debt: u128) -> Option<OffHours> {
+        Some(OffHours {
+            session: crate::pricing::off_hours::Session::Held,
+            market_age_secs: 3_600,
+            extra_bps,
+            max_notional_debt,
+        })
+    }
+
+    #[test]
+    fn off_hours_widens_both_ladder_sides_away_from_mid() {
+        let mid = 0.00025;
+        let spread = Spread::Bps(30);
+        let bid = Side::Bid.price(mid, spread);
+        let ask = Side::Ask.price(mid, spread);
+        // Live: unchanged.
+        assert_eq!(Side::Bid.off_hours_price(bid, None), Some(bid));
+        assert_eq!(Side::Ask.off_hours_price(ask, None), Some(ask));
+        // Off-hours: 70 bps of each side's own price further out.
+        let wide_bid = Side::Bid.off_hours_price(bid, off_hours(70, 1)).unwrap();
+        let wide_ask = Side::Ask.off_hours_price(ask, off_hours(70, 1)).unwrap();
+        assert!((wide_bid - bid * 0.993).abs() < 1e-15);
+        assert!((wide_ask - ask * 1.007).abs() < 1e-15);
+        assert!(wide_bid < bid && wide_ask > ask);
+        // A lean price is widened the same way.
+        let lean_bid = mid * 0.999;
+        assert!(
+            Side::Bid
+                .off_hours_price(lean_bid, off_hours(70, 1))
+                .unwrap()
+                < lean_bid
+        );
+    }
+
+    #[test]
+    fn a_wide_bid_with_a_large_held_extra_still_has_a_price() {
+        // 6,000 bps of spread and a 4,000 bps held extra: widened by the mid
+        // that was a bid of zero, the side posted nothing and its live-sized
+        // orders stayed up. By its own price it is 60% of the live bid.
+        let mid = 0.00025;
+        let bid = Side::Bid.price(mid, Spread::Bps(6_000));
+        let wide = Side::Bid.off_hours_price(bid, off_hours(4_000, 1)).unwrap();
+        assert!(wide > 0.0);
+        assert!((wide - bid * 0.6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn an_ask_capped_at_the_minimum_slice_still_posts_one_slice() {
+        // 6/6 decimals, a widened ask of 1.03 and the cap at the min slice:
+        // floored, the cap came back as 999,999,999 debt and sized to nothing.
+        let mut p = pool();
+        p.debt_decimals = 6;
+        p.collateral_decimals = 6;
+        let cap = 1_000_000_000u128;
+        let coll_cap = Side::Ask.off_hours_input_cap(1.03, off_hours(0, cap), &p);
+        assert_eq!(coll_cap, 970_873_787);
+        let sizes = ask_ladder_sizes(1.03, coll_cap, cap, 6, 6, 40).unwrap();
+        assert_eq!(sizes.len(), 1, "{sizes:?}");
+        assert!(sizes[0] >= cap && sizes[0] <= cap + 1);
+    }
+
+    #[test]
+    fn off_hours_caps_each_ladder_side_at_the_notional() {
+        let mut p = pool();
+        p.debt_decimals = 6;
+        p.collateral_decimals = 18;
+        let cap = 1_000_000_000u128; // 1,000 debt
+        let ask = 0.00025;
+        assert_eq!(Side::Bid.off_hours_input_cap(ask, None, &p), u128::MAX);
+        assert_eq!(
+            Side::Bid.off_hours_input_cap(ask, off_hours(0, cap), &p),
+            cap
+        );
+        // The ask is capped in collateral worth the cap at the ask price,
+        // rounded up so it never sells for less than the cap.
+        let coll_cap = Side::Ask.off_hours_input_cap(ask, off_hours(0, cap), &p);
+        let (_, debt_out) = sell_amounts_at(ask, coll_cap, 6, 18);
+        assert!(debt_out >= U256::from(cap));
+        assert!(debt_out <= U256::from(cap + 1));
+        // A funded ask ladder 100x the cap posts no more than the cap.
+        let sizes = ask_ladder_sizes(ask, coll_cap * 100, 10_000_000, 6, 18, 40)
+            .unwrap()
+            .into_iter()
+            .sum::<u128>();
+        let capped = ask_ladder_sizes(ask, (coll_cap * 100).min(coll_cap), 10_000_000, 6, 18, 40)
+            .unwrap()
+            .into_iter()
+            .sum::<u128>();
+        assert!(sizes > cap);
+        assert!(capped <= cap);
     }
 
     #[test]

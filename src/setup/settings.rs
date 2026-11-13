@@ -1703,6 +1703,20 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_save_keeps_the_off_hours_block() {
+        let block = "\n[pools.off_hours]\noffshore_extra_bps = 40\nheld_extra_bps = 60\n\
+                     held_extra_bps_per_hour = 10\nheld_max_extra_bps = 200\n\
+                     held_max_hours = 72\nmax_notional_debt = \"10000000000000000000000\"\n";
+        let src = format!("{TEMPLATE}{block}");
+        let mut view = read_settings(&src).unwrap();
+        view.buy.value = "7".into();
+        let out = apply_settings(&src, &patch_from(&view)).unwrap();
+        assert!(out.contains(block.trim()), "{out}");
+        let cfg = Config::from_toml(&out).unwrap();
+        assert!(cfg.pools[0].off_hours.is_some());
+    }
+
+    #[test]
     fn edits_all_four_fields_and_preserves_comments() {
         let mut view = read_settings(TEMPLATE).unwrap();
         view.rpc_url = "https://rpc.example.com/key".into();

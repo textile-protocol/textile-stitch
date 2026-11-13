@@ -82,6 +82,9 @@ debt = "0xusdc0000000000000000000000000000000000d7"        # USDC on Base (stabl
 debt_decimals = 6
 # feed_url = "https://your-feed.example/cngn-usdc"  # per-pool price (optional)
 # feed_sides = true  # quote the feed's own bid/ask over RFQ; spreads must be 0 (see docs/ADVANCED.md)
+# Off-hours quoting for a feed whose market has trading hours (e.g. COPM/USDT).
+# Off unless set; all six fields are required. See docs/ADVANCED.md.
+# off_hours = { offshore_extra_bps = 40, held_extra_bps = 60, held_extra_bps_per_hour = 10, held_max_extra_bps = 200, held_max_hours = 72, max_notional_debt = "5000000000" }
 
 # Two-sided market making. Each side is independent — set a spread + a size to
 # run it; omit a side to skip it. Express the spread however you prefer:

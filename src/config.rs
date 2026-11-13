@@ -32,6 +32,16 @@ pub const DEFAULT_REPOST_LEAD_SECS: u64 = 60;
 /// but immediately excluded from the live book and never fillable.
 pub const LIVE_ORDER_DEADLINE_MARGIN_SECS: u64 = 30;
 
+/// The longest `ttl_secs` a pool with an `[pools.off_hours]` block may use.
+/// A signed ladder order stays fillable on-chain until its deadline even
+/// after the venue supersedes it, so the TTL is what bounds how long an order
+/// can outlive the session it was priced for: the live ladder after the
+/// market closes, a held one past `held_max_hours`, a side the inventory lean
+/// pulled. Stitch posting a replacement only hides the old order from the
+/// book. Five minutes keeps that tail short against a market that has just
+/// closed or reopened.
+pub const OFF_HOURS_MAX_TTL_SECS: u64 = 300;
+
 /// Default cap on how far a TWAP-centered quote may post through the
 /// instantaneous feed, in bps (see `quote::SpotDeviationGuard`). Wide enough
 /// to keep selling into ordinary transient spikes (the strategy's win), tight
@@ -808,6 +818,13 @@ pub struct PoolConfig {
     /// centre or the spreads is refused too (see [`Config::validate`]).
     #[serde(default)]
     pub feed_sides: bool,
+    /// Off-hours quoting for a session-bound feed (`[pools.off_hours]`).
+    /// Absent, the default, keeps today's behaviour: the feed is requested
+    /// as written and an off-hours price is never quoted. Present, the feed
+    /// is requested with `offHours=1` and offshore or held prints are quoted
+    /// wider and smaller. See [`crate::pricing::off_hours`].
+    #[serde(default)]
+    pub off_hours: Option<crate::pricing::off_hours::OffHoursConfig>,
     /// Optional venue slug override. Unset is fine: when `[rfq].enabled` the
     /// pool is solicitable and the bot matches quote requests by tokens.
     /// Kept so existing configs that already set it still parse.
@@ -1046,7 +1063,57 @@ pub(crate) fn feed_inverts(url: &str) -> bool {
     })
 }
 
+/// The inventory curve and profit unwind price an RFQ ask above the flat
+/// spread, after the off-hours cap has been turned into collateral at that
+/// flat ask, so the order's debt leg could exceed `max_notional_debt`. Both
+/// run only on feeds that serve a reference book (cNGN today), never on a
+/// session-bound one, so the combination is refused rather than supported.
+fn refuse_off_hours_with(pool: &PoolConfig, module: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        pool.off_hours.is_none(),
+        "{module} can't run on a pool with an off_hours block: it prices quotes past the \
+         off-hours size cap. Turn one of them off"
+    );
+    Ok(())
+}
+
 impl PoolConfig {
+    /// The off-hours cap must fit at least one ladder slice on each side.
+    /// A cap below a side's `*_min_slice_debt` sizes that side's ladder to
+    /// nothing, and an empty ladder posts no batch, so nothing would replace
+    /// the live-sized orders still on the book. Stitch can't retire a side
+    /// without posting: the venue supersedes a slot only when a batch lands.
+    fn validate_off_hours_cap(
+        &self,
+        off_hours: &crate::pricing::off_hours::OffHoursConfig,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        let cap = off_hours.max_notional()?;
+        for (name, min) in [
+            ("buy_min_slice_debt", self.buy_min_slice_debt.as_deref()),
+            ("sell_min_slice_debt", self.sell_min_slice_debt.as_deref()),
+        ] {
+            let Some(min) = min.and_then(|m| m.trim().parse::<u128>().ok()) else {
+                continue;
+            };
+            anyhow::ensure!(
+                cap >= min,
+                "{field}.max_notional_debt ({cap}) must be at least {name} ({min}): a smaller \
+                 cap leaves that side no ladder slice off-hours, so its live orders stay up"
+            );
+        }
+        Ok(())
+    }
+
+    /// The URL this pool's feed is fetched from: its own `feed_url` or the
+    /// bot-level `default`, with `offHours=1` appended when the pool has an
+    /// `off_hours` block. Every reader of the pool's price uses this, so an
+    /// off-hours pool and a plain one on the same base URL keep separate
+    /// cache entries and jump guards.
+    pub fn feed_request_url(&self, default: &str) -> String {
+        let base = self.feed_url.as_deref().unwrap_or(default);
+        crate::pricing::off_hours::feed_request_url(base, self.off_hours.is_some())
+    }
     /// Seconds before expiry at which this side reposts, with the default applied.
     pub fn repost_lead_secs(&self) -> u64 {
         self.repost_lead_secs.unwrap_or(DEFAULT_REPOST_LEAD_SECS)
@@ -1480,6 +1547,7 @@ impl Config {
             return Ok(());
         }
         let pool = &self.pools[0];
+        refuse_off_hours_with(pool, "the inventory curve")?;
         // One curve serves both directions and sizes its endpoints in bps off
         // the all-in cost. Unequal spreads would give the two directions two
         // different curves, which reopens the round trip; an absolute spread
@@ -1539,6 +1607,7 @@ impl Config {
             return Ok(());
         }
         let pool = &self.pools[0];
+        refuse_off_hours_with(pool, "profit unwind")?;
         let spreads: Vec<Spread> = [pool.buy_spread(), pool.sell_spread()]
             .into_iter()
             .flatten()
@@ -1725,6 +1794,18 @@ impl Config {
         for (idx, pool) in self.pools.iter().enumerate() {
             if let Some(url) = &pool.feed_url {
                 assert_feed_url(url, &format!("pools[{idx}].feed_url"))?;
+            }
+            if let Some(off_hours) = &pool.off_hours {
+                let field = format!("pools[{idx}].off_hours");
+                off_hours.validate(&field)?;
+                pool.validate_off_hours_cap(off_hours, &field)?;
+                anyhow::ensure!(
+                    pool.ttl_secs <= OFF_HOURS_MAX_TTL_SECS,
+                    "pools[{idx}].ttl_secs ({}) must be at most {OFF_HOURS_MAX_TTL_SECS} with an \
+                     off_hours block: a signed order stays fillable until its deadline, so the \
+                     TTL is how long an order can outlive the session it was priced for",
+                    pool.ttl_secs
+                );
             }
             anyhow::ensure!(
                 pool.ttl_secs > LIVE_ORDER_DEADLINE_MARGIN_SECS,
@@ -2111,6 +2192,101 @@ mod tests {
             let err = format!("{:#}", Config::from_toml(&with(body)).unwrap_err());
             assert!(err.contains(needle), "{body}: {err}");
         }
+    }
+
+    /// The example with an off-hours block on its first pool.
+    fn with_off_hours(block: &str) -> String {
+        EXAMPLE.replacen(
+            "[[pools]]\n",
+            &format!("[[pools]]\noff_hours = {{ {block} }}\n"),
+            1,
+        )
+    }
+
+    const OFF_HOURS: &str = "offshore_extra_bps = 40, held_extra_bps = 60, \
+        held_extra_bps_per_hour = 10, held_max_extra_bps = 200, held_max_hours = 72, \
+        max_notional_debt = \"5000000000\"";
+
+    #[test]
+    fn off_hours_is_off_unless_the_block_is_present() {
+        let plain = Config::from_toml(EXAMPLE).unwrap();
+        assert!(plain.pools.iter().all(|p| p.off_hours.is_none()));
+        // Without the block the request URL is the configured one, byte for byte.
+        let pool = &plain.pools[0];
+        assert_eq!(
+            pool.feed_request_url(&plain.feed.url),
+            pool.feed_url.as_deref().unwrap_or(&plain.feed.url)
+        );
+
+        let on = Config::from_toml(&with_off_hours(OFF_HOURS)).unwrap();
+        let block = on.pools[0].off_hours.as_ref().unwrap();
+        assert_eq!(block.held_max_hours, 72.0);
+        assert_eq!(block.max_notional().unwrap(), 5_000_000_000);
+        assert_eq!(
+            on.pools[0].feed_request_url(&on.feed.url),
+            format!("{}?offHours=1", on.feed.url)
+        );
+        // The other pools are untouched.
+        assert!(on.pools[1..].iter().all(|p| p.off_hours.is_none()));
+    }
+
+    #[test]
+    fn an_incomplete_or_inconsistent_off_hours_block_is_refused() {
+        for (block, needle) in [
+            ("offshore_extra_bps = 40", "missing field"),
+            (
+                &OFF_HOURS.replace("held_max_extra_bps = 200", "held_max_extra_bps = 50") as &str,
+                "held_max_extra_bps",
+            ),
+            (
+                &OFF_HOURS.replace("held_max_hours = 72", "held_max_hours = 0"),
+                "held_max_hours",
+            ),
+            (
+                &OFF_HOURS.replace("\"5000000000\"", "\"max\""),
+                "max_notional_debt",
+            ),
+            (&format!("{OFF_HOURS}, typo_bps = 1"), "typo_bps"),
+            // The example's first pool slices at 10 USDC minimum.
+            (
+                &OFF_HOURS.replace("\"5000000000\"", "\"9999999\""),
+                "buy_min_slice_debt",
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                Config::from_toml(&with_off_hours(block)).unwrap_err()
+            );
+            assert!(err.contains(needle), "{block}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_off_hours_pool_keeps_its_ttl_short() {
+        // The example's first pool uses 120 s.
+        assert!(Config::from_toml(&with_off_hours(OFF_HOURS)).is_ok());
+        let long = with_off_hours(OFF_HOURS).replacen("ttl_secs = 120", "ttl_secs = 301", 1);
+        let err = format!("{:#}", Config::from_toml(&long).unwrap_err());
+        assert!(err.contains("ttl_secs (301) must be at most 300"), "{err}");
+        // Without the block a long TTL is the operator's call, as before.
+        let plain = EXAMPLE.replacen("ttl_secs = 120", "ttl_secs = 301", 1);
+        assert!(Config::from_toml(&plain).is_ok());
+    }
+
+    #[test]
+    fn off_hours_is_refused_beside_the_curve_and_profit_unwind() {
+        let block = "off_hours = { offshore_extra_bps = 40, held_extra_bps = 60, \
+            held_extra_bps_per_hour = 10, held_max_extra_bps = 200, held_max_hours = 72, \
+            max_notional_debt = \"1000000000000000000000000\" }\n";
+        let curve = curve_bot(block, false, "");
+        let err = format!("{:#}", Config::from_toml(&curve).unwrap_err());
+        assert!(err.contains("the inventory curve can't run"), "{err}");
+        let unwind = curve_bot(block, false, "[modules.profit_unwind]\nenabled = true\n")
+            .replace("[modules.curve]\nenabled = true\n", "");
+        let err = format!("{:#}", Config::from_toml(&unwind).unwrap_err());
+        assert!(err.contains("profit unwind can't run"), "{err}");
+        // The same bots load without the block.
+        assert!(Config::from_toml(&curve_bot("", false, "")).is_ok());
     }
 
     #[test]

@@ -103,6 +103,8 @@ pub fn pool_scope(pool: &PoolConfig) -> String {
 }
 
 const BPS: &str = "bps";
+const BPS_PER_HOUR: &str = "bps per hour";
+const HOURS: &str = "hours";
 const SECONDS: &str = "seconds";
 const BOOL: &str = "bool";
 const URL: &str = "url";
@@ -244,6 +246,55 @@ fn pool_params(cfg: &Config, pool: &PoolConfig) -> Vec<(ParamKey, Param)> {
             "feed_sides",
             BOOL,
             pool.feed_sides.then(|| "true".to_string()),
+        ),
+    ]
+    .into_iter()
+    .chain(
+        off_hours_params(pool, &debt_units)
+            .into_iter()
+            .map(|(name, unit, value)| entry(name, unit, value)),
+    )
+    .collect()
+}
+
+/// `off_hours.*`, each present only while the pool has the block, so adding
+/// or removing it records every field appearing or going away.
+fn off_hours_params<'a>(
+    pool: &PoolConfig,
+    debt_units: &'a str,
+) -> Vec<(&'static str, &'a str, Option<String>)> {
+    let o = pool.off_hours.as_ref();
+    let field = |read: fn(&crate::pricing::off_hours::OffHoursConfig) -> String| o.map(read);
+    vec![
+        (
+            "off_hours.offshore_extra_bps",
+            BPS,
+            field(|o| o.offshore_extra_bps.to_string()),
+        ),
+        (
+            "off_hours.held_extra_bps",
+            BPS,
+            field(|o| o.held_extra_bps.to_string()),
+        ),
+        (
+            "off_hours.held_extra_bps_per_hour",
+            BPS_PER_HOUR,
+            field(|o| o.held_extra_bps_per_hour.to_string()),
+        ),
+        (
+            "off_hours.held_max_extra_bps",
+            BPS,
+            field(|o| o.held_max_extra_bps.to_string()),
+        ),
+        (
+            "off_hours.held_max_hours",
+            HOURS,
+            field(|o| o.held_max_hours.to_string()),
+        ),
+        (
+            "off_hours.max_notional_debt",
+            debt_units,
+            field(|o| o.max_notional_debt.trim().to_string()),
         ),
     ]
 }
@@ -553,6 +604,33 @@ mod tests {
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!(changes[0].key.name, "feed_sides");
         assert_eq!(changes[0].after.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn adding_off_hours_records_each_field_appearing() {
+        let before = params_of(ZARU).unwrap();
+        let after = params_of(&ZARU.replacen(
+            "buy_offset_bps = 40",
+            "buy_offset_bps = 40\noff_hours = { offshore_extra_bps = 40, held_extra_bps = 60, \
+             held_extra_bps_per_hour = 10, held_max_extra_bps = 200, held_max_hours = 72.0, \
+             max_notional_debt = \"5000000000\" }",
+            1,
+        ))
+        .unwrap();
+        let changes = diff(&before, &after);
+        let names: Vec<&str> = changes.iter().map(|c| c.key.name.as_str()).collect();
+        assert_eq!(names.len(), 6, "{names:?}");
+        assert!(names.iter().all(|n| n.starts_with("off_hours.")));
+        assert!(changes.iter().all(|c| c.before.is_none()));
+        assert_eq!(
+            value(&after, POOL, "off_hours.held_max_hours").as_deref(),
+            Some("72")
+        );
+        // feed_url records the configured base, not the offHours=1 request.
+        assert_eq!(
+            value(&after, POOL, "feed_url"),
+            value(&before, POOL, "feed_url")
+        );
     }
 
     #[test]

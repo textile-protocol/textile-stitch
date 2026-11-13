@@ -12,6 +12,9 @@ use alloy_primitives::{Address, U256};
 
 use crate::config::{PoolConfig, RfqCapacity};
 use crate::pricing::curve::{self, Curve, CurveParams};
+use crate::pricing::off_hours::{
+    assess, widen_ask_spread, widen_bid_spread, OffHours, OffHoursConfig, Refusal,
+};
 use crate::pricing::quote::{ask_price, bid_price, Spread};
 use crate::pricing::tick::is_price_usable;
 use crate::pricing::unwind::{self, Lift};
@@ -51,6 +54,9 @@ pub struct CorridorBook {
     /// spreads above only say which sides are on; [`feed_sides_book`]
     /// replaces them per print.
     pub feed_sides: bool,
+    /// The pool's off-hours block. `None` quotes a live print only, as
+    /// before; see [`off_hours_book`].
+    pub off_hours: Option<OffHoursConfig>,
 }
 
 /// A corridor's inventory curve as the quote path reads it.
@@ -245,11 +251,61 @@ pub fn book_from_pool(
         staleness_secs,
         curve: None,
         feed_sides: pool.feed_sides,
-        feed_url: pool
-            .feed_url
-            .clone()
-            .unwrap_or_else(|| default_feed_url.to_string()),
+        off_hours: pool.off_hours.clone(),
+        feed_url: pool.feed_request_url(default_feed_url),
     }))
+}
+
+/// The book an off-hours print quotes from, after every other step has set
+/// its spreads and capacity. A live print returns the book unchanged. An
+/// offshore or held print on an off-hours pool widens both sides by the
+/// extra bps of their own price ([`widen_bid_spread`], [`widen_ask_spread`]:
+/// always away from mid, never to a bid of zero)
+/// and caps each side's capacity at `max_notional_debt`, the ask's in the
+/// collateral that sells for it at the widened ask. Any other print, or a
+/// held one past `held_max_hours`, is refused and the book quotes nothing.
+pub fn off_hours_book(
+    book: &CorridorBook,
+    quote: &crate::pricing::feed::Quote,
+    now: u64,
+) -> Result<CorridorBook, Refusal> {
+    Ok(match assess(quote, book.off_hours.as_ref(), now)? {
+        None => book.clone(),
+        Some(off) => widened_book(book, quote.price, off),
+    })
+}
+
+fn widened_book(book: &CorridorBook, mid: f64, off: OffHours) -> CorridorBook {
+    let buy_spread = book
+        .buy_spread
+        .and_then(|s| widen_bid_spread(s, mid, off.extra_bps));
+    let sell_spread = book
+        .sell_spread
+        .and_then(|s| widen_ask_spread(s, mid, off.extra_bps));
+    let debt_cap = U256::from(off.max_notional_debt);
+    let collateral_cap = sell_spread.map_or(U256::ZERO, |s| {
+        collateral_for_debt(
+            ask_price(mid, s),
+            debt_cap,
+            book.debt_decimals,
+            book.collateral_decimals,
+        )
+    });
+    let capped = |side: Option<RfqCapacity>, cap: U256| {
+        side.map(|c| {
+            RfqCapacity::Exact(match c {
+                RfqCapacity::Exact(n) => n.min(cap),
+                RfqCapacity::Wallet => cap,
+            })
+        })
+    };
+    CorridorBook {
+        buy_spread,
+        sell_spread,
+        buy_capacity_debt: capped(book.buy_capacity_debt, debt_cap),
+        sell_capacity_collateral: capped(book.sell_capacity_collateral, collateral_cap),
+        ..book.clone()
+    }
 }
 
 /// The book a print quotes from. A pool without `feed_sides` is unchanged.
@@ -1412,6 +1468,7 @@ fn stretch_rows(
 mod tests {
     use super::*;
     use crate::modules::Mode;
+    use crate::pricing::off_hours::Session;
 
     const COLLATERAL: &str = "0x0000000000000000000000000000000000000001";
     const DEBT: &str = "0x0000000000000000000000000000000000000002";
@@ -1431,6 +1488,7 @@ mod tests {
             staleness_secs: 240,
             curve: None,
             feed_sides: false,
+            off_hours: None,
         }
     }
 
@@ -1547,6 +1605,9 @@ mod tests {
             reference: None,
             bid: Some(bid),
             ask: Some(ask),
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }
     }
 
@@ -1670,6 +1731,145 @@ mod tests {
         assert_eq!(plan.buy_amount, plan.input);
         assert_eq!(plan.output_token, book().collateral);
         assert_eq!(plan.input_token, book().debt);
+    }
+
+    fn off_hours_config() -> OffHoursConfig {
+        OffHoursConfig {
+            offshore_extra_bps: 50,
+            held_extra_bps: 100,
+            held_extra_bps_per_hour: 10,
+            held_max_extra_bps: 300,
+            held_max_hours: 48.0,
+            max_notional_debt: "1000000000".into(),
+        }
+    }
+
+    fn session_quote(session: Session, market_at: u64) -> crate::pricing::feed::Quote {
+        crate::pricing::feed::Quote {
+            bid: None,
+            ask: None,
+            session,
+            market_at: Some(market_at),
+            ..sided_quote(1.0, 1.0, 1.0)
+        }
+    }
+
+    const OFF_HOURS_NOW: u64 = 1_754_388_000;
+
+    fn off_hours_pool_book() -> CorridorBook {
+        CorridorBook {
+            off_hours: Some(off_hours_config()),
+            ..book()
+        }
+    }
+
+    #[test]
+    fn a_live_print_leaves_every_book_as_configured() {
+        let live = session_quote(Session::Live, OFF_HOURS_NOW);
+        for b in [book(), off_hours_pool_book()] {
+            let out = off_hours_book(&b, &live, OFF_HOURS_NOW).unwrap();
+            assert_eq!(out.buy_spread, b.buy_spread);
+            assert_eq!(out.sell_spread, b.sell_spread);
+            assert_eq!(out.buy_capacity_debt, b.buy_capacity_debt);
+            assert_eq!(out.sell_capacity_collateral, b.sell_capacity_collateral);
+        }
+    }
+
+    #[test]
+    fn an_off_hours_print_widens_and_caps_the_rfq_book() {
+        // Held for 2h: 100 + 10 * 2 = 120 bps of each side's own price on
+        // top of the configured 200, rounded up to whole bps:
+        // (1 - 0.02)(1 - 0.012) = 1 - 0.03176 and (1 + 0.02)(1 + 0.012) = 1 + 0.03224.
+        let held = session_quote(Session::Held, OFF_HOURS_NOW - 7_200);
+        let out = off_hours_book(&off_hours_pool_book(), &held, OFF_HOURS_NOW).unwrap();
+        assert_eq!(out.buy_spread, Some(Spread::Bps(318)));
+        assert_eq!(out.sell_spread, Some(Spread::Bps(323)));
+        assert_eq!(
+            out.buy_capacity_debt,
+            Some(RfqCapacity::Exact(U256::from(1_000_000_000u64)))
+        );
+        // 1,000 debt at the widened ask (1.0323) in collateral, floored.
+        assert_eq!(
+            out.sell_capacity_collateral,
+            Some(RfqCapacity::Exact(U256::from(968_710_646u64)))
+        );
+        // Offshore: the flat 50, (1 - 0.02)(1 - 0.005) = 1 - 0.0249.
+        let offshore = session_quote(Session::Offshore, OFF_HOURS_NOW - 60);
+        let out = off_hours_book(&off_hours_pool_book(), &offshore, OFF_HOURS_NOW).unwrap();
+        assert_eq!(out.buy_spread, Some(Spread::Bps(249)));
+        // A wallet-sized side is capped too.
+        let wallet = CorridorBook {
+            buy_capacity_debt: Some(RfqCapacity::Wallet),
+            ..off_hours_pool_book()
+        };
+        let out = off_hours_book(&wallet, &offshore, OFF_HOURS_NOW).unwrap();
+        assert_eq!(
+            out.buy_capacity_debt,
+            Some(RfqCapacity::Exact(U256::from(1_000_000_000u64)))
+        );
+    }
+
+    #[test]
+    fn an_off_hours_print_is_refused_without_the_block_or_past_max_hours() {
+        let offshore = session_quote(Session::Offshore, OFF_HOURS_NOW - 60);
+        assert!(off_hours_book(&book(), &offshore, OFF_HOURS_NOW).is_err());
+        let stale_hold = session_quote(Session::Held, OFF_HOURS_NOW - 49 * 3_600);
+        assert!(off_hours_book(&off_hours_pool_book(), &stale_hold, OFF_HOURS_NOW).is_err());
+    }
+
+    #[test]
+    fn off_hours_firm_quotes_are_wider_and_no_larger_than_the_cap() {
+        let held = session_quote(Session::Held, OFF_HOURS_NOW);
+        let live_book = off_hours_pool_book();
+        let wide = off_hours_book(&live_book, &held, OFF_HOURS_NOW).unwrap();
+        // Taker sells collateral for 500 debt: the maker's bid.
+        let mut req = request(COLLATERAL, DEBT);
+        req.buy_amount = Some("500000000".into());
+        let live = decide(&live_book, &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        let off = decide(&wide, &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        assert!(live.bid && off.bid);
+        assert_eq!(off.input, live.input);
+        // Same debt paid, more collateral asked for: a lower bid.
+        assert!(off.output > live.output);
+        // Taker buys collateral with 500 debt: the maker's ask gives less.
+        let mut ask_req = request(DEBT, COLLATERAL);
+        ask_req.sell_amount = Some("500000000".into());
+        let live_ask = decide(&live_book, &ask_req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        let off_ask = decide(&wide, &ask_req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        assert!(off_ask.input < live_ask.input);
+        // Asked for 2,000 debt, live answers in full; off-hours answers with
+        // what the 1,000 debt cap leaves (responses are partial, not refused).
+        req.buy_amount = Some("2000000000".into());
+        let live_big = decide(&live_book, &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        let off_big = decide(&wide, &req, 1.0, U256::ZERO, U256::ZERO).unwrap();
+        assert_eq!(live_big.input, U256::from(2_000_000_000u64));
+        assert_eq!(off_big.input, U256::from(1_000_000_000u64));
+        // And nothing once the cap is reserved by an in-flight quote.
+        let cap = U256::from(1_000_000_000u64);
+        assert_eq!(
+            decide(&wide, &req, 1.0, cap, U256::ZERO),
+            Err(RejectReason::Inventory)
+        );
+    }
+
+    #[test]
+    fn off_hours_levels_are_wider_and_sum_to_at_most_the_cap() {
+        let held = session_quote(Session::Held, OFF_HOURS_NOW);
+        let live_book = off_hours_pool_book();
+        let wide = off_hours_book(&live_book, &held, OFF_HOURS_NOW).unwrap();
+        let as_of = || "2026-08-05T10:00:00.000Z".to_string();
+        let live = levels(&live_book, 1.0, U256::ZERO, U256::ZERO, as_of());
+        let off = levels(&wide, 1.0, U256::ZERO, U256::ZERO, as_of());
+        let rate = |l: &Level| l.rate_ray.parse::<U256>().unwrap();
+        let size = |l: &Level| l.size.parse::<U256>().unwrap();
+        assert!(rate(&off.bids[0]) < rate(&live.bids[0]));
+        assert!(rate(&off.asks[0]) > rate(&live.asks[0]));
+        let total = |ls: &[Level]| ls.iter().map(size).fold(U256::ZERO, |a, b| a + b);
+        // Level sizes are collateral. The bid's 1,000 debt buys at most
+        // 1,000 / 0.97 collateral; the ask's cap is 1,000 debt at 1.03.
+        assert!(total(&live.bids) > U256::from(1_100_000_000u64));
+        assert!(total(&off.bids) <= U256::from(1_030_928_000u64));
+        assert!(total(&off.asks) <= U256::from(970_873_787u64));
     }
 
     #[test]
@@ -1984,6 +2184,21 @@ mod tests {
             "sell side not configured"
         );
         assert_eq!(book.feed_url, "http://feed");
+        assert_eq!(book.off_hours, None);
+
+        // An off_hours block asks the feed for off-hours prices, so the book
+        // reads its own cache entry.
+        let toml = format!(
+            "{toml}\noff_hours = {{ offshore_extra_bps = 40, held_extra_bps = 60, \
+             held_extra_bps_per_hour = 10, held_max_extra_bps = 200, held_max_hours = 72, \
+             max_notional_debt = \"1000000000\" }}\n"
+        );
+        let cfg = crate::config::Config::from_toml(&toml).unwrap();
+        let book = book_from_pool(&cfg.pools[0], "http://feed?pair=copm-usdt", 240)
+            .unwrap()
+            .expect("book built");
+        assert_eq!(book.feed_url, "http://feed?pair=copm-usdt&offHours=1");
+        assert_eq!(book.off_hours, cfg.pools[0].off_hours);
     }
 
     #[test]

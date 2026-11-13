@@ -23,6 +23,9 @@ fn fetch_all(prices: &PriceCache, prints: &[(f64, u64)]) {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             }),
         );
     }
@@ -51,6 +54,9 @@ async fn startup_quotes_nothing_until_a_later_poll_confirms_the_first() {
         reference: None,
         bid: None,
         ask: None,
+        session: Default::default(),
+        market_at: None,
+        market_source: None,
     };
     on_feed_fetch(Instant::now(), &prices, URL, Ok(sample.clone()));
     tick.admit(Instant::now(), URL, sample.clone(), now);
@@ -92,6 +98,9 @@ async fn a_10x_or_decimal_shift_print_is_refused_not_quoted_and_publishes_no_lev
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             }),
         );
         assert_eq!(
@@ -113,6 +122,9 @@ async fn a_10x_or_decimal_shift_print_is_refused_not_quoted_and_publishes_no_lev
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             }),
         );
         assert_eq!(reason(&mut engine, &prices, "after").await, None);
@@ -138,6 +150,9 @@ async fn a_held_print_says_why_in_the_module_status() {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }),
     );
     assert!(engine.level_frames(&prices, unix_now_ms()).is_empty());
@@ -176,6 +191,9 @@ async fn a_held_print_refuses_nav_co_signing_before_any_chain_read() {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }),
     );
     assert!(matches!(
@@ -197,6 +215,9 @@ async fn a_held_print_refuses_nav_co_signing_before_any_chain_read() {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }),
     );
     assert!(matches!(
@@ -236,6 +257,9 @@ async fn cosign_while_signing(during: (f64, u64, bool)) -> MakerFrame {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             }),
         );
         custody.resume.add_permits(1);
@@ -290,6 +314,9 @@ fn a_failed_fetch_during_a_hold_shows_the_outage_not_the_jump() {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }),
     );
     assert!(prices.hold(URL).is_some());
@@ -373,6 +400,9 @@ fn third_prices() -> PriceCache {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         },
     );
     prices
@@ -484,6 +514,9 @@ async fn respond_while_signing(
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             }),
         );
         custody.resume.add_permits(1);
@@ -572,6 +605,9 @@ async fn a_tick_loop_hold_withholds_an_in_flight_rfq_signature_and_levels() {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             },
             unix_now(),
         );
@@ -596,6 +632,9 @@ async fn a_tick_loop_hold_withholds_an_in_flight_rfq_signature_and_levels() {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         },
         unix_now(),
     );

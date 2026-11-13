@@ -24,6 +24,7 @@ fn context() -> Context {
         price: 1.0,
         price_at: 100,
         price_degraded: false,
+        price_off_hours: false,
         balances_at: 100,
         staleness_secs: 10,
         settlement: u(40_000_000),
@@ -54,6 +55,7 @@ fn book() -> CorridorBook {
         staleness_secs: 10,
         curve: None,
         feed_sides: false,
+        off_hours: None,
     }
 }
 #[test]
@@ -439,6 +441,50 @@ fn higher_volatility_increases_the_inventory_bias_without_breaching_floors_or_ca
         evaluate(&cfg, &ctx, &spread_history())
     );
 }
+#[test]
+fn an_off_hours_price_quotes_but_never_rebalances() {
+    let mut cfg = config();
+    cfg.rebalance.enabled = true;
+    cfg.inventory.enabled = true;
+    let off = Context {
+        price_off_hours: true,
+        ..context()
+    };
+    let live = evaluate(&cfg, &context(), &[]);
+    let d = evaluate(&cfg, &off, &[]);
+    assert!(!live.rebalance_sell.is_zero());
+    assert!(d.rebalance_sell.is_zero());
+    assert!(!d.blocked, "quotes still go out, widened by the RFQ path");
+    assert_eq!((d.buy_bps, d.sell_bps), (live.buy_bps, live.sell_bps));
+    assert!(d.reasons.iter().any(|r| r.contains("Off-hours")));
+}
+
+#[tokio::test]
+async fn an_off_hours_print_never_enters_the_spread_window() {
+    let mut cfg = config();
+    cfg.spreads.enabled = true;
+    cfg.spreads.warmup_secs = 60;
+    let now = stitch_bot::time::unix_now();
+    let at = |t: u64, price: f64, off_hours: bool| Context {
+        now: t,
+        price_at: t,
+        balances_at: t,
+        price,
+        price_off_hours: off_hours,
+        ..context()
+    };
+    let dir =
+        std::env::temp_dir().join(format!("stitch-module-off-hours-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rt = runtime::Runtime::new(cfg.clone(), &dir, FEED).unwrap();
+    rt.decide(&at(now - 120, 1.0, false));
+    rt.decide(&at(now - 60, 1.5, true));
+    let last = rt.decide(&at(now, 1.0, false));
+    assert_eq!(last.volatility_bps, 0, "the off-hours print was sampled");
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn rebalance_limits_trade_to_nav_fraction_and_quotable_inventory() {
     let mut cfg = config();

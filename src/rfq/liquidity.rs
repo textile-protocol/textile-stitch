@@ -1758,6 +1758,7 @@ mod tests {
             staleness_secs: 10,
             curve: None,
             feed_sides: false,
+            off_hours: None,
         };
         let capped = cap_settlement_side(&book, settlement, U256::from(9u8));
         assert_eq!(

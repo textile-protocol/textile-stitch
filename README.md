@@ -464,6 +464,18 @@ RFQ window). Its spreads must be 0, and TWAP, the lean, the limit-order taker,
 the closer, modules and the public ladder are refused alongside it. See
 [Feeds that set their own bid and ask](docs/ADVANCED.md#feeds-that-set-their-own-bid-and-ask).
 
+### Quoting a session-bound feed off-hours
+
+A feed priced off a market with trading hours (COPM/USDT prices off SET-FX,
+Mon-Fri 08:00-13:00 Bogota) goes stale outside them, and Stitch stops quoting.
+A pool with a `[pools.off_hours]` block asks the feed for its off-hours price
+(`offHours=1`) and keeps quoting it with extra spread on both sides and a
+per-side size cap: `offshore_extra_bps`, `held_extra_bps`,
+`held_extra_bps_per_hour`, `held_max_extra_bps`, `held_max_hours` and
+`max_notional_debt`. It's off unless the block is there, and no shipped preset
+turns it on. See
+[Off-hours quoting](docs/ADVANCED.md#off-hours-quoting-session-bound-feeds).
+
 ## Security Notes
 
 - Keep `STITCH_PRIVATE_KEY` out of `stitch.toml`, shell history, and process

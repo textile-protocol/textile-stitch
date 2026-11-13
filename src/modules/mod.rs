@@ -57,6 +57,11 @@ pub struct Context {
     pub price_at: u64,
     /// The feed flagged `price` degraded: a held, clamped or fallback value.
     pub price_degraded: bool,
+    /// `price` is an off-hours print (offshore or held, see
+    /// [`crate::pricing::off_hours`]). Quotes still go out, widened and
+    /// capped by the RFQ path; the price never enters the volatility window
+    /// and spot rebalancing waits for a live price.
+    pub price_off_hours: bool,
     pub balances_at: u64,
     pub staleness_secs: u64,
     pub settlement: U256,
@@ -191,6 +196,11 @@ pub fn evaluate(config: &ModulesConfig, ctx: &Context, history: &[PricePoint]) -
         );
         d.rebalance_sell = proposal.sell;
         d.reasons.extend(proposal.reasons);
+        if ctx.price_off_hours && !d.rebalance_sell.is_zero() {
+            d.rebalance_sell = U256::ZERO;
+            d.reasons
+                .push("Off-hours price; spot rebalancing waits for a live price".into());
+        }
     }
     d
 }

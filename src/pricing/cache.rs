@@ -221,6 +221,9 @@ mod tests {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }
     }
 
@@ -372,6 +375,9 @@ mod tests {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             };
             tick.admit(poll(now), URL, bad.clone(), now);
             assert_eq!(rfq.get(URL), Some(bad));

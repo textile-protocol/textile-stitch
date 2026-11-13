@@ -343,6 +343,7 @@ impl Engine {
             price: quote.price,
             price_at: quote.timestamp,
             price_degraded: quote.degraded,
+            price_off_hours: !quote.session.is_live(),
             balances_at: balances.at,
             staleness_secs: book.staleness_secs,
             settlement: balances.settlement,
@@ -361,8 +362,12 @@ impl Engine {
     /// The book firm quotes and levels price from: the module policy's
     /// spreads, then a `feed_sides` pool's spreads from the print
     /// ([`super::responder::feed_sides_book`]), then the liquidity cap. The
-    /// feed's sides go last so nothing can reprice them; config refuses
-    /// modules on such a pool anyway, so the policy step leaves it alone.
+    /// feed's sides go after the policy so it can't reprice them; config
+    /// refuses modules on such a pool anyway, so the policy step leaves it
+    /// alone. The off-hours extra and size cap go last
+    /// ([`super::responder::off_hours_book`]), so they widen and shrink
+    /// whatever the earlier steps chose; `None` when the print is one this
+    /// pool can't quote off-hours.
     pub(super) fn module_book(
         &self,
         book: &CorridorBook,
@@ -370,11 +375,13 @@ impl Engine {
         now: u64,
     ) -> Option<CorridorBook> {
         let Some(modules) = &self.modules else {
-            return super::responder::feed_sides_book(book, quote);
+            return super::responder::feed_sides_book(book, quote)
+                .and_then(|b| super::responder::off_hours_book(&b, quote, now).ok());
         };
         self.policy_book(modules, book, quote, now)
             .and_then(|b| super::responder::feed_sides_book(&b, quote))
             .map(|b| self.liquidity_capped(modules, b, now))
+            .and_then(|b| super::responder::off_hours_book(&b, quote, now).ok())
     }
     /// While a liquidity cap is in force, no quote may promise settlement
     /// beyond it. Applies in every module mode that has a cap set,
@@ -703,6 +710,7 @@ impl Engine {
                     book,
                     self.price_guard.max_loss_bps,
                     None,
+                    crate::time::unix_now(),
                 )
             });
         match band {

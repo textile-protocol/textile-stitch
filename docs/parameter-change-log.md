@@ -19,6 +19,7 @@ Per pool (scope `pool:<collateral>/<debt>`, labelled with the corridor name):
 | `feed_url` | the pool's own feed, or the bot-level `[feed].url` it rides |
 | `rfq_staleness_secs` | the RFQ freshness window the responder enforces, after clamping |
 | `feed_sides` | bool, recorded only while on (the pool quotes the feed's own bid and ask) |
+| `off_hours.*` | each field of the pool's off-hours block (bps, bps per hour, hours, debt atomic units), recorded only while the block is present |
 
 Bot-wide (scope `bot`): `max_loss_bps`, `max_jump_bps`, `settle_secs`, `staleness_secs`, `rfq_enabled`, `rfq.allowed_takers` (one sorted, lowercased list), `book_enabled`, `modules_enabled`, `change_log.ship`, and every `modules.*` setting while modules are on, the inventory curve's (`modules.curve.*`) included.
 

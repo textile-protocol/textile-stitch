@@ -16,6 +16,7 @@ use alloy_primitives::U256;
 
 use crate::pricing::band::{level_within, order_vs_print_bps, order_within, price_wad, Order};
 use crate::pricing::feed::Quote;
+use crate::pricing::off_hours::{assess, covers};
 use crate::pricing::tick::{usable, Unusable};
 use crate::protocol::attest::{check_attestation, LiveVault, NavAttestation};
 use crate::protocol::types::OrderParams;
@@ -54,7 +55,9 @@ pub(super) fn order_refusal(
 /// `StaleFeed`; a degraded one is `DegradedFeed`; out of band is `Busy`.
 ///
 /// `priced` is the print the order was priced from, which a `feed_sides`
-/// pool needs: see [`feed_sides_refusal`].
+/// pool needs: see [`feed_sides_refusal`]. `priced_at` is when it was
+/// priced (Unix seconds), so its off-hours extra is the one the order was
+/// actually built with: see [`off_hours_refusal`].
 pub(super) fn recheck_after_signing(
     prices: &PriceCache,
     order: &OrderParams,
@@ -62,13 +65,19 @@ pub(super) fn recheck_after_signing(
     book: &CorridorBook,
     max_loss_bps: u32,
     priced: Option<&Quote>,
+    priced_at: u64,
 ) -> Result<(), RejectReason> {
     let quote = prices.get(&book.feed_url).ok_or(RejectReason::StaleFeed)?;
     usable(&quote, crate::time::unix_now(), book.staleness_secs).map_err(|why| match why {
-        Unusable::Degraded => RejectReason::DegradedFeed,
+        Unusable::Degraded | Unusable::UnknownSession => RejectReason::DegradedFeed,
         Unusable::Stale | Unusable::BadPrice => RejectReason::StaleFeed,
     })?;
     if let Some(reason) = feed_sides_refusal(book, bid, priced, &quote) {
+        return Err(reason);
+    }
+    if let Some(reason) =
+        off_hours_refusal(book, priced, priced_at, &quote, crate::time::unix_now())
+    {
         return Err(reason);
     }
     match order_refusal(order, bid, book, &quote, max_loss_bps) {
@@ -110,6 +119,31 @@ fn feed_sides_refusal(
     (!held).then_some(RejectReason::Busy)
 }
 
+/// Whether an order priced off `priced` at `priced_at` may still go out on
+/// the print the cache holds `now`, as far as off-hours goes. A print the
+/// pool can't quote any more (held past `held_max_hours`, say) is
+/// `DegradedFeed`, as a request on it would be. Otherwise the policy the
+/// order was built under must cover the one in force now (see
+/// [`covers`]), else `Busy`: a live-priced order has neither the extra nor
+/// the cap, and a held one signed across a step of the time-grown extra is
+/// too tight. The priced extra is assessed at `priced_at`, the same moment
+/// `module_book` widened the book with it, not at `now`.
+fn off_hours_refusal(
+    book: &CorridorBook,
+    priced: Option<&Quote>,
+    priced_at: u64,
+    current: &Quote,
+    now: u64,
+) -> Option<RejectReason> {
+    let config = book.off_hours.as_ref();
+    let current = match assess(current, config, now) {
+        Err(_) => return Some(RejectReason::DegradedFeed),
+        Ok(current) => current,
+    };
+    let then = priced.and_then(|p| assess(p, config, priced_at).ok().flatten());
+    (!covers(then, current)).then_some(RejectReason::Busy)
+}
+
 /// The print a NAV attestation is judged against: the book's cached print,
 /// through the same gate as a firm quote. No print, or a stale or invalid
 /// one, is `StaleFeed`; a degraded one is `DegradedFeed`. A print the jump
@@ -122,9 +156,14 @@ pub(super) fn attest_print(
         .get(&book.feed_url)
         .ok_or(AttestRejectReason::StaleFeed)?;
     usable(&quote, crate::time::unix_now(), book.staleness_secs).map_err(|why| match why {
-        Unusable::Degraded => AttestRejectReason::DegradedFeed,
+        Unusable::Degraded | Unusable::UnknownSession => AttestRejectReason::DegradedFeed,
         Unusable::Stale | Unusable::BadPrice => AttestRejectReason::StaleFeed,
     })?;
+    // NAV is only co-signed on a live market price. Off-hours a vault's NAV
+    // waits for the session, as it did when the feed simply went stale.
+    if !quote.session.is_live() {
+        return Err(AttestRejectReason::StaleFeed);
+    }
     Ok(quote)
 }
 
@@ -201,6 +240,9 @@ mod tests {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }
     }
 
@@ -324,6 +366,7 @@ mod tests {
             staleness_secs: 60,
             curve: None,
             feed_sides: false,
+            off_hours: None,
         }
     }
 
@@ -383,7 +426,15 @@ mod tests {
             if let Some(q) = cached {
                 cache.set(URL.to_string(), q);
             }
-            recheck_after_signing(&cache, &order, true, &book(6, 18), 1_500, None)
+            recheck_after_signing(
+                &cache,
+                &order,
+                true,
+                &book(6, 18),
+                1_500,
+                None,
+                crate::time::unix_now(),
+            )
         };
         assert_eq!(recheck(Some(quote(0.00065, now))), Ok(()));
         assert_eq!(recheck(None), Err(RejectReason::StaleFeed));
@@ -430,7 +481,15 @@ mod tests {
             if let Some(q) = now {
                 cache.set(URL.to_string(), q);
             }
-            recheck_after_signing(&cache, &order, bid, &sided_book, 1_500, priced)
+            recheck_after_signing(
+                &cache,
+                &order,
+                bid,
+                &sided_book,
+                1_500,
+                priced,
+                crate::time::unix_now(),
+            )
         };
 
         assert_eq!(recheck(true, Some(priced.clone()), Some(&priced)), Ok(()));
@@ -472,9 +531,155 @@ mod tests {
         let cache = PriceCache::new(None, JUMP);
         cache.set(URL.to_string(), quote(0.00065, crate::time::unix_now()));
         assert_eq!(
-            recheck_after_signing(&cache, &order, true, &book(6, 18), 1_500, None),
+            recheck_after_signing(
+                &cache,
+                &order,
+                true,
+                &book(6, 18),
+                1_500,
+                None,
+                crate::time::unix_now(),
+            ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_held_order_signed_across_a_step_of_the_held_extra_is_withheld() {
+        let now = crate::time::unix_now();
+        let held_book = CorridorBook {
+            off_hours: Some(crate::pricing::off_hours::OffHoursConfig {
+                offshore_extra_bps: 50,
+                held_extra_bps: 100,
+                held_extra_bps_per_hour: 36,
+                held_max_extra_bps: 1_000,
+                held_max_hours: 24.0,
+                max_notional_debt: "1000000000".into(),
+            }),
+            ..book(6, 18)
+        };
+        // Held for an hour: 136 bps now. 36 bps an hour is one bp every 100 s.
+        let held = Quote {
+            session: crate::pricing::off_hours::Session::Held,
+            market_at: Some(now - 3_600),
+            ..quote(0.00065, now)
+        };
+        let order = built(1_000_000, U256::from(1_538_461_538_461_538_461_538u128));
+        let cache = PriceCache::new(None, JUMP);
+        cache.set(URL.to_string(), held.clone());
+        let recheck = |priced_at| {
+            recheck_after_signing(
+                &cache,
+                &order,
+                true,
+                &held_book,
+                1_500,
+                Some(&held),
+                priced_at,
+            )
+        };
+        // Priced this second: the extra it was built with is the one in force.
+        assert_eq!(recheck(now), Ok(()));
+        // Priced 200 s ago, at 134 bps: two steps too tight to go out now.
+        assert_eq!(recheck(now - 200), Err(RejectReason::Busy));
+    }
+
+    #[test]
+    fn an_order_is_withheld_when_the_session_tightened_while_signing() {
+        let now = crate::time::unix_now();
+        let off_hours_book = CorridorBook {
+            off_hours: Some(crate::pricing::off_hours::OffHoursConfig {
+                offshore_extra_bps: 50,
+                held_extra_bps: 100,
+                held_extra_bps_per_hour: 0,
+                held_max_extra_bps: 100,
+                held_max_hours: 24.0,
+                max_notional_debt: "1000000000".into(),
+            }),
+            ..book(6, 18)
+        };
+        let print = |session| Quote {
+            session,
+            market_at: Some(now - 60),
+            ..quote(0.00065, now)
+        };
+        let order = built(1_000_000, U256::from(1_538_461_538_461_538_461_538u128));
+        let recheck = |b: &CorridorBook, priced: Quote, current: Quote| {
+            let cache = PriceCache::new(None, JUMP);
+            cache.set(URL.to_string(), current);
+            recheck_after_signing(&cache, &order, true, b, 1_500, Some(&priced), now)
+        };
+        use crate::pricing::off_hours::Session::{Held, Live, Offshore, Unknown};
+        // Same session, or one with a smaller extra: the order is at least
+        // as wide as the pool quotes now.
+        assert_eq!(recheck(&off_hours_book, print(Held), print(Held)), Ok(()));
+        assert_eq!(
+            recheck(&off_hours_book, print(Held), print(Offshore)),
+            Ok(())
+        );
+        assert_eq!(
+            recheck(&off_hours_book, print(Offshore), print(Live)),
+            Ok(())
+        );
+        // Priced live (no extra, no cap) and the market closed meanwhile.
+        assert_eq!(
+            recheck(&off_hours_book, print(Live), print(Held)),
+            Err(RejectReason::Busy)
+        );
+        assert_eq!(
+            recheck(&off_hours_book, print(Offshore), print(Held)),
+            Err(RejectReason::Busy)
+        );
+        // Even with no extra configured, a live-priced order lacks the cap.
+        let no_extra = CorridorBook {
+            off_hours: off_hours_book.off_hours.clone().map(|o| {
+                crate::pricing::off_hours::OffHoursConfig {
+                    offshore_extra_bps: 0,
+                    ..o
+                }
+            }),
+            ..book(6, 18)
+        };
+        assert_eq!(
+            recheck(&no_extra, print(Live), print(Offshore)),
+            Err(RejectReason::Busy)
+        );
+        // A print the pool can't quote at all.
+        assert_eq!(
+            recheck(&off_hours_book, print(Held), print(Unknown)),
+            Err(RejectReason::DegradedFeed)
+        );
+        assert_eq!(
+            recheck(&book(6, 18), print(Live), print(Offshore)),
+            Err(RejectReason::DegradedFeed)
+        );
+        // Plain pools on live prints are untouched.
+        assert_eq!(recheck(&book(6, 18), print(Live), print(Live)), Ok(()));
+    }
+
+    #[test]
+    fn nav_is_only_attested_on_a_live_price() {
+        let now = crate::time::unix_now();
+        let cache = PriceCache::new(None, JUMP);
+        cache.set(URL.to_string(), quote(0.00065, now));
+        assert!(attest_print(&cache, &book(6, 18)).is_ok());
+        for session in [
+            crate::pricing::off_hours::Session::Offshore,
+            crate::pricing::off_hours::Session::Held,
+        ] {
+            cache.set(
+                URL.to_string(),
+                Quote {
+                    session,
+                    market_at: Some(now),
+                    ..quote(0.00065, now)
+                },
+            );
+            assert!(matches!(
+                attest_print(&cache, &book(6, 18)),
+                Err(AttestRejectReason::StaleFeed)
+            ));
+        }
     }
 
     fn level(rate_ray: &str) -> Level {

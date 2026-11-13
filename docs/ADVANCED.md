@@ -58,6 +58,99 @@ skip the pool for the tick. RFQ publishes no levels and rejects quote requests
 their decisions. Quoting resumes on the first live print. A print that is both
 degraded and older than the window is reported as stale.
 
+#### Off-hours quoting (session-bound feeds)
+
+Some feeds price off a market that only trades in a session. Textile's
+COPM/USDT feed prices off Colombia's SET-FX spot market, which trades Mon-Fri
+08:00-13:00 Bogota. Outside that window the feed goes stale (503, or an old
+`timestamp`) and Stitch stops quoting the pool, which is the default and
+doesn't change.
+
+A pool can opt in to quoting the feed's off-hours fallback instead, wider and
+smaller, with an `off_hours` block:
+
+```toml
+[[pools]]
+feed_url = "https://api.textilecredit.com/price?pair=copm-usdt&chainId=42220"
+buy_offset_bps = 30
+sell_offset_bps = 30
+# sizes as usual ...
+
+[pools.off_hours]
+offshore_extra_bps = 40          # bps added to both sides while session = offshore
+held_extra_bps = 60              # bps added to both sides as soon as session = held
+held_extra_bps_per_hour = 10     # plus this per hour since marketAt while held
+held_max_extra_bps = 200         # the held extra never exceeds this
+held_max_hours = 72              # a price held longer than this isn't quoted
+max_notional_debt = "5000000000" # most each side commits off-hours, debt atomic units (5,000 USDT)
+```
+
+All six fields are required, and the block applies to the `[[pools]]` entry
+above it (or write it inline as `off_hours = { ... }` inside the pool).
+`held_max_extra_bps` must be at least `held_extra_bps`, every bps field is at
+most 5000, `held_max_hours` must be positive and `max_notional_debt` a
+positive atomic integer, at least the pool's `buy_min_slice_debt` and
+`sell_min_slice_debt`. A smaller cap would size that side's ladder to nothing,
+and with nothing to post, its live-sized orders would stay up until they
+expire.
+
+An off-hours pool's `ttl_secs` must be at most 300. A signed order stays
+fillable until its deadline even after a newer batch replaces it on the book,
+so the TTL is how long an order can outlive the session it was priced for:
+live orders after the close, held ones past `held_max_hours`. The inventory
+curve and profit unwind can't run on an off-hours pool; they price quotes past
+the off-hours size cap.
+
+With the block, Stitch requests the feed with `offHours=1` appended (`&` or `?`
+as the URL needs). The feed then labels each print with a `session`:
+
+```json
+{ "price": 0.000247, "timestamp": 1760000000, "session": "held",
+  "marketAt": 1759950000, "marketSource": "icap-setfx" }
+```
+
+- `live`: an onshore print. Quoted exactly as configured.
+- `offshore`: an offshore reference that has moved recently. Both sides get
+  `offshore_extra_bps` more spread.
+- `held`: nothing is moving, so the last market price is held. Both sides get
+  `held_extra_bps + held_extra_bps_per_hour × hours since marketAt`, capped
+  at `held_max_extra_bps`. Past `held_max_hours` the pool quotes nothing.
+
+The extra is in bps of the quote's own price and only ever moves it away from
+the mid: the bid becomes `bid × (1 − extra)` and the ask `ask × (1 + extra)`,
+on top of whatever the spread, lean, TWAP guard or modules already chose. With
+the extra capped at 5000 bps a bid never widens to zero, so a side that quoted
+live always has something to replace its live orders with off-hours. A bps
+spread is widened in bps, rounded up. While the session isn't live, each side also commits at most
+`max_notional_debt`: the ladder's total per side, and an RFQ side's capacity
+(the ask's in the collateral that sells for that much at the widened ask).
+RFQ answers a larger request with what's left under the cap.
+
+The other gates don't change. Staleness is still judged on `timestamp`, which
+is when the API served an off-hours print, and the jump guard still holds a
+print that jumps away from the last trusted one, including at the switch
+between the onshore and offshore prices. During session hours the API still
+answers 503 for a stale onshore print, so Stitch goes dark as before.
+
+Some things wait for a live price regardless: the limit-order taker and the
+closer (they fill on-chain and have no size the cap could bound), NAV
+co-signing for a vault, spot rebalancing, and the dynamic-spreads volatility
+window, which never samples an off-hours print.
+
+A pool without the block requests the feed exactly as written, so its price,
+cache entry and jump guard are separate from an off-hours pool's even on the
+same URL. If such a pool is ever served an `offshore` or `held` print, the
+fetch fails. A `session` value Stitch doesn't know is never quoted, on any
+pool. A missing `session` is `live`, which is every feed that isn't
+session-bound.
+
+The bot logs each session change for the pool (`off-hours price: quoting wider
+and smaller`, with the session, market age, source, extra and cap) and adds
+`session`, `market_age_hours` and `extra_bps` to the `tick` heartbeat while
+off-hours. When it refuses a print, the log line says why (no block, held too
+long, unknown session), and with modules on the panel's module status shows
+the same reason.
+
 #### Feeds that set their own bid and ask
 
 A feed can also send the source's own `bid` and `ask`, in the same units as

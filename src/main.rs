@@ -40,6 +40,7 @@ use stitch_bot::config::{Config, PoolConfig};
 use stitch_bot::pricing::cache::{FeedPolicy, PriceCache};
 use stitch_bot::pricing::feed::{HttpFeed, PriceFeed, Quote};
 use stitch_bot::pricing::lean::{LeanDecision, LeanMode, LeanParams, LeanState};
+use stitch_bot::pricing::off_hours::{self, OffHours, Session};
 use stitch_bot::pricing::quote::oracle_rate_ray;
 use stitch_bot::pricing::quote::{ask_price, bid_price, SpotDeviationGuard};
 use stitch_bot::pricing::tick::{usable, Unusable};
@@ -201,11 +202,25 @@ impl FeedGuards {
 
     /// Read again after signing. Admission uses the same live history as
     /// RFQ; any refusal is visible to both loops before the batch can post.
-    async fn revalidate(&mut self, feed_url: &str, feed: &impl PriceFeed) -> Option<f64> {
+    /// The off-hours policy is assessed again at post time and must be
+    /// covered by the one the drafts were `priced` under (see
+    /// [`off_hours::covers`]): orders priced live must not post once the
+    /// market has closed (a held print can carry the same price), and held
+    /// orders must not post past `held_max_hours` or once the held extra has
+    /// grown past theirs.
+    async fn revalidate(
+        &mut self,
+        feed_url: &str,
+        feed: &impl PriceFeed,
+        config: Option<&off_hours::OffHoursConfig>,
+        priced: Option<OffHours>,
+    ) -> Option<f64> {
         self.fetched.remove(feed_url);
         let quote = self.fetch(feed_url, feed).await?;
-        usable(&quote, unix_now(), self.staleness_secs).ok()?;
-        Some(quote.price)
+        let now = unix_now();
+        usable(&quote, now, self.staleness_secs).ok()?;
+        let current = off_hours::assess(&quote, config, now).ok()?;
+        off_hours::covers(priced, current).then_some(quote.price)
     }
 
     /// Async work earlier in the pool may have let either loop supersede
@@ -214,9 +229,38 @@ impl FeedGuards {
         let now = unix_now();
         self.prices.get(feed_url).is_some_and(|current| {
             current.price == quote.price
+                && current.session == quote.session
                 && usable(&current, now, self.staleness_secs).is_ok()
                 && usable(quote, now, self.staleness_secs).is_ok()
         })
+    }
+}
+
+/// Log when a pool's feed session changes (live, offshore, held), with the
+/// market age and extra spread now in effect. Quiet while it holds.
+fn log_session_change(
+    last: &mut HashMap<usize, Session>,
+    pool_idx: usize,
+    feed_url: &str,
+    quote: &Quote,
+    off_hours: Option<OffHours>,
+) {
+    if last.insert(pool_idx, quote.session) == Some(quote.session) {
+        return;
+    }
+    match off_hours {
+        Some(off) => info!(
+            feed = %feed_url,
+            session = off.session.label(),
+            market_age_hours = format!("{:.1}", off.market_age_hours()),
+            market_source = quote.market_source.as_deref().unwrap_or("unknown"),
+            extra_bps = off.extra_bps,
+            max_notional_debt = off.max_notional_debt,
+            "off-hours price: quoting wider and smaller"
+        ),
+        None => {
+            info!(feed = %feed_url, session = quote.session.label(), "live price: quoting as configured")
+        }
     }
 }
 
@@ -854,10 +898,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // bot-level `[feed]` when a pool sets no `feed_url`.
     let mut feeds: HashMap<String, HttpFeed> = HashMap::new();
     for pool in &cfg.pools {
-        let url = pool
-            .feed_url
-            .clone()
-            .unwrap_or_else(|| cfg.feed.url.clone());
+        // `offHours=1` is appended for an off-hours pool, so it never shares
+        // a fetch, cached print or jump guard with a plain pool.
+        let url = pool.feed_request_url(&cfg.feed.url);
         feeds
             .entry(url.clone())
             .or_insert_with(|| HttpFeed::new(&url).with_basis(cfg.price_basis()));
@@ -1020,6 +1063,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // side posts, and at least every HEARTBEAT_SECS otherwise, so "it's alive"
     // and "why a side is quiet" are always visible.
     let mut last_heartbeat: HashMap<String, u64> = HashMap::new();
+    // Per pool index: the feed session last quoted on, to log transitions.
+    let mut last_sessions: HashMap<usize, Session> = HashMap::new();
     const HEARTBEAT_SECS: u64 = 60;
     let slot_nonce_state_path = slot_nonce_state_path(&config_path, cfg.chain_id, maker);
     let initial_next_nonce = unix_now().saturating_mul(1000);
@@ -1052,6 +1097,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     // order nears its TTL (a flat market must still keep a live order).
     let mut state = QuoteState {
         last_quote: HashMap::new(),
+        last_policy: HashMap::new(),
         next_nonce,
         slot_nonces,
         slot_inputs,
@@ -1135,7 +1181,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
 
         'pools: for (pool_idx, pool) in cfg.pools.iter().enumerate() {
             // Each pool prices off its own feed (or the bot-level default).
-            let feed_url = pool.feed_url.as_deref().unwrap_or(cfg.feed.url.as_str());
+            let feed_url = pool.feed_request_url(&cfg.feed.url);
+            let feed_url = feed_url.as_str();
             let feed = feeds.get(feed_url).expect("feed built at startup");
             let Some(quote) = feed_guards.fetch(feed_url, feed).await else {
                 continue;
@@ -1169,7 +1216,22 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     warn!(feed = %feed_url, price = quote.price, "feed flagged the price degraded (held, clamped or fallback); skipping pool");
                     continue;
                 }
+                Err(Unusable::UnknownSession) => {
+                    warn!(feed = %feed_url, price = quote.price, "feed labelled the price with an unknown session; skipping pool");
+                    continue;
+                }
             }
+            // A session-bound feed's offshore or held print: quoted wider and
+            // smaller, and only by a pool with an off_hours block. A live
+            // print (every other feed) leaves everything below unchanged.
+            let off_hours = match off_hours::assess(&quote, pool.off_hours.as_ref(), now) {
+                Ok(off) => off,
+                Err(refusal) => {
+                    warn!(feed = %feed_url, session = quote.session.label(), "{}", refusal.describe());
+                    continue;
+                }
+            };
+            log_session_change(&mut last_sessions, pool_idx, feed_url, &quote, off_hours);
             let (debt, collateral): (Address, Address) =
                 match (pool.debt.parse(), pool.collateral.parse()) {
                     (Ok(d), Ok(c)) => (d, c),
@@ -1278,8 +1340,9 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         spot,
                         price_override,
                         guard,
+                        off_hours,
                         now,
-                        feed_guards.revalidate(feed_url, feed),
+                        feed_guards.revalidate(feed_url, feed, pool.off_hours.as_ref(), off_hours),
                     )
                     .await;
                     match outcome {
@@ -1307,14 +1370,33 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             let last = last_heartbeat.entry(pair.clone()).or_insert(0);
             if posted_bid + posted_ask > 0 || now.saturating_sub(*last) >= HEARTBEAT_SECS {
                 *last = now;
-                info!(
-                    pair = %pair,
-                    price = spot,
-                    mid,
-                    bids_posted = posted_bid,
-                    asks_posted = posted_ask,
-                    "tick"
-                );
+                match off_hours {
+                    None => info!(
+                        pair = %pair,
+                        price = spot,
+                        mid,
+                        bids_posted = posted_bid,
+                        asks_posted = posted_ask,
+                        "tick"
+                    ),
+                    Some(off) => info!(
+                        pair = %pair,
+                        price = spot,
+                        mid,
+                        bids_posted = posted_bid,
+                        asks_posted = posted_ask,
+                        session = off.session.label(),
+                        market_age_hours = format!("{:.1}", off.market_age_hours()),
+                        extra_bps = off.extra_bps,
+                        "tick"
+                    ),
+                }
+            }
+            // The taker and closer fill on-chain at this tick's price. Neither
+            // has a size the off-hours cap could bound, so both sit out until
+            // the session is live again; the book above is the off-hours quote.
+            if off_hours.is_some() {
+                continue 'pools;
             }
             // ----- Taker leg: fill users' resting limit orders that crossed our
             // own quote (a user ask at/below our bid, a user bid at/above our
@@ -1491,6 +1573,9 @@ mod tests {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }
     }
 
@@ -1597,6 +1682,82 @@ mod tests {
         rfq.admit(tokio::time::Instant::now(), "b", quote(10.0, now), now);
         assert_eq!(rfq.get("b"), Some(quote(10.0, now)));
         assert_eq!(rfq.get("a"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_change_at_the_same_price_stops_the_ladder_and_later_legs() {
+        let now = unix_now();
+        let rfq = prices();
+        let mut tick = guards(rfq.clone());
+        let live = quote(1.0, now);
+        let feed = MutableFeed(std::sync::RwLock::new(Some(live.clone())));
+        rfq.admit(tokio::time::Instant::now(), "a", live.clone(), now);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(tick.fetch("a", &feed).await, Some(live.clone()));
+        let cfg = off_hours_config();
+        assert_eq!(
+            tick.revalidate("a", &feed, Some(&cfg), None).await,
+            Some(1.0)
+        );
+        // The market closes while the batch is signed: the held price is the
+        // last market price, so only the session tells them apart.
+        let held = Quote {
+            session: Session::Held,
+            market_at: Some(now),
+            ..live.clone()
+        };
+        *feed.0.write().unwrap() = Some(held.clone());
+        assert_eq!(tick.revalidate("a", &feed, Some(&cfg), None).await, None);
+        assert!(!tick.is_current("a", &live));
+        let priced = off_hours::assess(&held, Some(&cfg), now).unwrap();
+        assert_eq!(
+            tick.revalidate("a", &feed, Some(&cfg), priced).await,
+            Some(1.0)
+        );
+        assert!(tick.is_current("a", &held));
+    }
+
+    fn off_hours_config() -> off_hours::OffHoursConfig {
+        off_hours::OffHoursConfig {
+            offshore_extra_bps: 50,
+            held_extra_bps: 100,
+            held_extra_bps_per_hour: 10,
+            held_max_extra_bps: 300,
+            held_max_hours: 2.0,
+            max_notional_debt: "1000000".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_ladder_is_reassessed_after_signing() {
+        let now = unix_now();
+        let rfq = prices();
+        let mut tick = guards(rfq.clone());
+        let cfg = off_hours_config();
+        let held_since = |secs: u64| Quote {
+            session: Session::Held,
+            market_at: Some(now - secs),
+            ..quote(1.0, now)
+        };
+        // Drafts built 1h59m into the hold, at its extra then.
+        let drafted = held_since(7_140);
+        let priced = off_hours::assess(&drafted, Some(&cfg), now).unwrap();
+        let feed = MutableFeed(std::sync::RwLock::new(Some(drafted.clone())));
+        rfq.admit(tokio::time::Instant::now(), "a", drafted.clone(), now);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(tick.fetch("a", &feed).await, Some(drafted.clone()));
+        assert_eq!(
+            tick.revalidate("a", &feed, Some(&cfg), priced).await,
+            Some(1.0)
+        );
+        // Signing ran past held_max_hours: same session, same price, refused.
+        let past = held_since(7_260);
+        *feed.0.write().unwrap() = Some(past);
+        assert_eq!(tick.revalidate("a", &feed, Some(&cfg), priced).await, None);
+        // An extra smaller than the one now required is refused too.
+        let tighter = off_hours::assess(&held_since(60), Some(&cfg), now).unwrap();
+        *feed.0.write().unwrap() = Some(drafted);
+        assert_eq!(tick.revalidate("a", &feed, Some(&cfg), tighter).await, None);
     }
 
     struct MutableFeed(std::sync::RwLock<Option<Quote>>);
@@ -1762,9 +1923,12 @@ mod tests {
                     "ask",
                     1.0,
                     async {
-                        guards.revalidate("feed", &feed).await.is_some_and(|spot| {
-                            drafts_within_band(Side::Ask, &pool, &drafts, spot, 100)
-                        })
+                        guards
+                            .revalidate("feed", &feed, None, None)
+                            .await
+                            .is_some_and(|spot| {
+                                drafts_within_band(Side::Ask, &pool, &drafts, spot, 100)
+                            })
                     }
                 ),
                 async {

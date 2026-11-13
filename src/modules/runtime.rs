@@ -555,9 +555,11 @@ impl Runtime {
         let mut state = self.state.lock().expect("module state poisoned");
         let history = &mut state.history;
         // A degraded print (held, clamped or fallback) isn't the market the
-        // window measures, so it never becomes a sample.
+        // window measures, so it never becomes a sample. Nor is an off-hours
+        // one: a held price restamped every poll would read as no movement.
         let sampled = context.price_at <= context.now
             && !context.price_degraded
+            && !context.price_off_hours
             && context.price.is_finite()
             && context.price > 0.0
             && history

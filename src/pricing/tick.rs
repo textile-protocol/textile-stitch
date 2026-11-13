@@ -4,6 +4,7 @@
 //! bid has moved enough to be worth re-signing.
 
 use crate::pricing::feed::Quote;
+use crate::pricing::off_hours::Session;
 
 /// Age of a nonzero Unix-seconds timestamp, or `None` for an invalid timestamp.
 /// Future skew is deliberately zero, matching the live module price policy.
@@ -41,6 +42,9 @@ pub enum Unusable {
     BadPrice,
     /// Fresh and well-formed, but the feed flagged it `degraded`.
     Degraded,
+    /// Fresh and well-formed, but labelled with a `session` this build
+    /// doesn't know (see [`crate::pricing::off_hours::Session`]).
+    UnknownSession,
 }
 
 /// The one gate every consumer puts a print through before trading on it:
@@ -59,6 +63,9 @@ pub fn usable(quote: &Quote, now: u64, staleness_secs: u64) -> Result<(), Unusab
     }
     if quote.degraded {
         return Err(Unusable::Degraded);
+    }
+    if quote.session == Session::Unknown {
+        return Err(Unusable::UnknownSession);
     }
     Ok(())
 }
@@ -177,6 +184,9 @@ mod tests {
             reference: None,
             bid: None,
             ask: None,
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
         }
     }
 
@@ -215,6 +225,27 @@ mod tests {
         assert_eq!(
             usable(&print(f64::NAN, now, false), now, 30),
             Err(Unusable::BadPrice)
+        );
+    }
+
+    #[test]
+    fn an_unknown_session_is_unusable_and_off_hours_sessions_pass_to_the_pool() {
+        let now = 1_800_000_000;
+        let with = |session| Quote {
+            session,
+            ..print(0.00025, now, false)
+        };
+        assert_eq!(
+            usable(&with(Session::Unknown), now, 30),
+            Err(Unusable::UnknownSession)
+        );
+        // Offshore and held are judged per pool by off_hours::assess.
+        assert_eq!(usable(&with(Session::Offshore), now, 30), Ok(()));
+        assert_eq!(usable(&with(Session::Held), now, 30), Ok(()));
+        // Age still comes first.
+        assert_eq!(
+            usable(&with(Session::Unknown), now + 31, 30),
+            Err(Unusable::Stale)
         );
     }
 

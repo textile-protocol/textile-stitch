@@ -221,6 +221,7 @@ mod tests {
             price: 1.0,
             price_at: 1000,
             price_degraded: false,
+            price_off_hours: false,
             balances_at: 1000,
             staleness_secs: 10,
             settlement: U256::from(400),

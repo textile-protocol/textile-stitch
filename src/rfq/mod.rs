@@ -67,6 +67,7 @@ use crate::chain::snapshot::{record, Publisher, RecordedRead};
 use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
+use crate::pricing::off_hours;
 use crate::pricing::tick::{usable, Unusable};
 use crate::protocol::attest::{
     check_attestation, check_window, price_wad, LiveVault, NavAttestation,
@@ -1843,6 +1844,12 @@ impl Engine {
                     }
                     return None;
                 }
+                if let Err(refusal) = off_hours::assess(&quote, book.off_hours.as_ref(), now_secs) {
+                    if let Some(modules) = &self.modules {
+                        modules.quote_status(QuoteState::StalePrice, &refusal.describe(), now_secs);
+                    }
+                    return None;
+                }
                 let effective = self.module_book(book, &quote, now_secs)?;
                 self.observe_unwind(book, &quote, now_secs);
                 let inputs = self.curve_inputs(book, &quote, now_secs);
@@ -2045,13 +2052,21 @@ impl Engine {
         // gate, so it must match the one the levels were published under.
         match usable(&quote, now_secs, book.staleness_secs) {
             Ok(()) => {}
-            Err(Unusable::Degraded) => return reject(RejectReason::DegradedFeed),
+            Err(Unusable::Degraded | Unusable::UnknownSession) => {
+                return reject(RejectReason::DegradedFeed)
+            }
             Err(Unusable::Stale | Unusable::BadPrice) => return reject(RejectReason::StaleFeed),
         }
         // A pool that quotes the feed's own bid and ask has nothing to quote
         // from a print without them: as good as no print.
         if book.feed_sides && quote.sides().is_none() {
             return reject(RejectReason::StaleFeed);
+        }
+        // An off-hours print this pool can't quote (no off_hours block, held
+        // too long). One it can is widened and capped in `module_book`.
+        if let Err(refusal) = off_hours::assess(&quote, book.off_hours.as_ref(), now_secs) {
+            warn!(rfq_id = %req.rfq_id, session = quote.session.label(), "{}", refusal.describe());
+            return reject(RejectReason::DegradedFeed);
         }
 
         // Deadline first: a request whose maxExpiresAt is unreadable or
@@ -2490,6 +2505,7 @@ impl Engine {
             &book,
             self.price_guard.max_loss_bps,
             Some(&quote),
+            now_secs,
         ) {
             warn!(rfq_id = %req.rfq_id, ?reason, "the reference price changed while signing; signature withheld");
             return reject(reason);
@@ -2951,6 +2967,9 @@ fn unusable_price_status(why: Unusable) -> &'static str {
         }
         Unusable::Degraded => {
             "The price feed flagged its price as degraded (a held, clamped or fallback value). Quoting is paused until it serves a live price again."
+        }
+        Unusable::UnknownSession => {
+            "The price feed labelled its price with a session this Stitch doesn't know. Quoting is paused until it serves a live price again."
         }
     }
 }
@@ -3517,6 +3536,7 @@ async fn read_vault_inventory(
 #[cfg(test)]
 mod tests {
     mod feed_freshness;
+    mod off_hours;
     mod price_guard;
 
     use super::wire::{QuoteExpiredFrame, QuoteResultFrame};
@@ -4636,6 +4656,7 @@ mod tests {
                 staleness_secs: 240,
                 curve: None,
                 feed_sides: false,
+                off_hours: None,
             }],
             configured: Vec::new(),
             allowed_takers: None,
@@ -5019,6 +5040,9 @@ mod tests {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             },
         );
         prices
@@ -5141,6 +5165,9 @@ mod tests {
                 reference: None,
                 bid: Some(bid),
                 ask: Some(ask),
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             },
         );
         prices
@@ -5201,6 +5228,9 @@ mod tests {
                 }),
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             },
         );
         prices
@@ -5917,6 +5947,7 @@ mod tests {
             staleness_secs: 240,
             curve: None,
             feed_sides: false,
+            off_hours: None,
         }
     }
 
@@ -5995,6 +6026,9 @@ mod tests {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             },
         );
         assert!(cache.get("http://feed").is_some());
@@ -6010,6 +6044,9 @@ mod tests {
                     reference: None,
                     bid: None,
                     ask: None,
+                    session: Default::default(),
+                    market_at: None,
+                    market_source: None,
                 },
                 unix_now(),
             );
@@ -6036,6 +6073,9 @@ mod tests {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             }),
         );
         assert_eq!(cache.get("http://feed").unwrap().price, 2.0);
@@ -6056,6 +6096,7 @@ mod tests {
             staleness_secs: 240,
             curve: None,
             feed_sides: false,
+            off_hours: None,
         }
     }
 
@@ -6923,6 +6964,9 @@ mod tests {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             },
         );
         let reply = engine.respond(exact_input_request("rfq_2"), &stale).await;
@@ -7438,6 +7482,9 @@ mod tests {
                 }),
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             },
         );
         let _ = engine.level_frames(&prices, unix_now_ms());

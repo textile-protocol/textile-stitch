@@ -20,6 +20,7 @@ pub mod curve;
 pub mod feed;
 pub mod jump;
 pub mod lean;
+pub mod off_hours;
 pub mod quote;
 pub mod tick;
 pub mod twap;

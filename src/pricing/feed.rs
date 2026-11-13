@@ -9,6 +9,7 @@ use anyhow::Context as _;
 use serde::Deserialize;
 
 use crate::net::http_client;
+use crate::pricing::off_hours::{self, Session};
 use crate::pricing::tick::feed_age_secs;
 use crate::time::unix_now;
 
@@ -48,6 +49,30 @@ pub struct Quote {
     pub bid: Option<f64>,
     #[serde(default)]
     pub ask: Option<f64>,
+    /// How live the price is, on a session-bound feed asked for its off-hours
+    /// fallback (`offHours=1`). Missing reads as live, which is every feed
+    /// that isn't session-bound and every request without the parameter. An
+    /// unknown value is kept as [`Session::Unknown`] and never quoted. See
+    /// [`crate::pricing::off_hours`].
+    #[serde(default, deserialize_with = "off_hours::lenient_session")]
+    pub session: Session,
+    /// Unix seconds of the last real market observation behind `price` (the
+    /// onshore print, or the last offshore value change). On an off-hours
+    /// print `timestamp` is when the API served it, so this is what the held
+    /// extra spread ages on. `None` when absent or malformed.
+    #[serde(
+        default,
+        rename = "marketAt",
+        deserialize_with = "off_hours::lenient_unix_secs"
+    )]
+    pub market_at: Option<u64>,
+    /// Where `price` came from (`icap-setfx`, `chainlink`). Informational.
+    #[serde(
+        default,
+        rename = "marketSource",
+        deserialize_with = "off_hours::lenient_string"
+    )]
+    pub market_source: Option<String>,
 }
 
 fn lenient_reference<'de, D: serde::Deserializer<'de>>(
@@ -162,6 +187,21 @@ fn basis_quote(body: &str, basis: PriceBasis) -> anyhow::Result<Quote> {
     }
 }
 
+/// An offshore or held print on a request that never asked for one
+/// (`asked_off_hours` false) fails the fetch: the pool behind it has no
+/// off-hours block to price it with, and caching it would let any reader of
+/// that URL quote it. Unknown sessions pass here and are refused per pool by
+/// [`crate::pricing::off_hours::assess`], which can name the reason.
+pub fn check_session(quote: &Quote, asked_off_hours: bool) -> anyhow::Result<()> {
+    let off_hours = matches!(quote.session, Session::Offshore | Session::Held);
+    anyhow::ensure!(
+        asked_off_hours || !off_hours,
+        "feed served an {} price to a request that did not ask for off-hours prices",
+        quote.session.label()
+    );
+    Ok(())
+}
+
 /// Implement this for a custom source; the bot only calls `fetch`.
 #[allow(async_fn_in_trait)]
 pub trait PriceFeed {
@@ -177,12 +217,17 @@ pub struct HttpFeed {
     url: String,
     client: reqwest::Client,
     basis: PriceBasis,
+    /// The URL asks for off-hours prices (`offHours=1`, see
+    /// [`crate::pricing::off_hours::feed_request_url`]).
+    off_hours: bool,
 }
 
 impl HttpFeed {
     pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
         Self {
-            url: url.into(),
+            off_hours: off_hours::requests_off_hours(&url),
+            url,
             client: http_client(),
             basis: PriceBasis::Served,
         }
@@ -209,6 +254,7 @@ impl PriceFeed for HttpFeed {
             feed_age_secs(quote.timestamp, unix_now()).is_some(),
             "feed timestamp must be nonzero Unix seconds at or before the bot clock (zero future skew)"
         );
+        check_session(&quote, self.off_hours)?;
         Ok(quote)
     }
 }
@@ -313,6 +359,66 @@ mod tests {
     }
 
     #[test]
+    fn the_session_is_read_leniently() {
+        let base = r#""price":0.00025,"timestamp":1754388000"#;
+        let session = |extra: &str| {
+            parse_quote(&format!("{{{base}{extra}}}"), PriceBasis::Served)
+                .unwrap()
+                .session
+        };
+        // Missing (every feed that isn't session-bound) and null are live.
+        assert_eq!(session(""), Session::Live);
+        assert_eq!(session(r#","session":null"#), Session::Live);
+        assert_eq!(session(r#","session":"live""#), Session::Live);
+        assert_eq!(session(r#","session":"offshore""#), Session::Offshore);
+        assert_eq!(session(r#","session":"held""#), Session::Held);
+        // Unknown values parse, and are refused per pool rather than failing
+        // the fetch.
+        for raw in [r#""closed""#, r#""HELD""#, "1", "true", "{}"] {
+            assert_eq!(
+                session(&format!(r#","session":{raw}"#)),
+                Session::Unknown,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn market_time_and_source_are_read_when_well_formed() {
+        let q = parse_quote(
+            r#"{"price":0.00025,"timestamp":1754388000,"session":"held","marketAt":1754380000,"marketSource":"icap-setfx"}"#,
+            PriceBasis::Served,
+        )
+        .unwrap();
+        assert_eq!(q.market_at, Some(1_754_380_000));
+        assert_eq!(q.market_source.as_deref(), Some("icap-setfx"));
+        for raw in [r#""1754380000""#, "-1", "0", "1.5", "null"] {
+            let body = format!(
+                r#"{{"price":0.00025,"timestamp":1754388000,"marketAt":{raw},"marketSource":7}}"#
+            );
+            let q = parse_quote(&body, PriceBasis::Served).unwrap();
+            assert_eq!((q.market_at, q.market_source), (None, None), "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_off_hours_session_is_refused_on_a_request_that_did_not_ask() {
+        let quote = |session: &str| {
+            parse_quote(
+                &format!(r#"{{"price":0.00025,"timestamp":1754388000,"session":"{session}"}}"#),
+                PriceBasis::Served,
+            )
+            .unwrap()
+        };
+        for session in ["offshore", "held"] {
+            assert!(check_session(&quote(session), false).is_err());
+            assert!(check_session(&quote(session), true).is_ok());
+        }
+        assert!(check_session(&quote("live"), false).is_ok());
+        assert!(check_session(&quote("closed"), false).is_ok());
+    }
+
+    #[test]
     fn degraded_is_read_when_present() {
         let held = parse(r#"{"price":0.00065,"timestamp":1754388000,"degraded":true}"#).unwrap();
         assert!(held.degraded);
@@ -333,6 +439,9 @@ mod tests {
                 reference: None,
                 bid: None,
                 ask: None,
+                session: Default::default(),
+                market_at: None,
+                market_source: None,
             }
         );
         // /price adds metadata next to the quote; it is ignored, not refused.
