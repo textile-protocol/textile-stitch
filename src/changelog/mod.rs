@@ -29,6 +29,7 @@ pub mod journal;
 pub mod params;
 pub mod record;
 pub mod ship;
+pub mod view;
 
 pub use journal::{record_startup, write_config_recorded, Recorded};
 pub use record::{ChangeRecord, Origin, Source, HOST_EDIT_ACTOR};

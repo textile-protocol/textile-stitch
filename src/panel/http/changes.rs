@@ -6,11 +6,21 @@
 //!
 //! The panel never ships records anywhere. They land in the bot's journal,
 //! and the bot ships them if its operator opted in.
+//!
+//! It also reads them back: [`list`] serves `GET /api/changes`, the Change
+//! log view on Fleet and on each bot's page.
 
 use std::path::Path;
 
+use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::{Deserialize, Serialize};
+
+use crate::changelog::view::{self, Entry};
 use crate::changelog::{self, Origin, Source};
 use crate::panel::auth::Identity;
+use crate::panel::inventory::Bot;
 
 use super::{ApiError, AppState};
 
@@ -130,6 +140,104 @@ pub fn with_warning(mut body: serde_json::Value, warning: Option<&str>) -> serde
         serde_json::Value::String(warning.to_string()),
     );
     body
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListQuery {
+    /// One bot's log. Without it, every bot's, merged.
+    pub bot: Option<String>,
+    /// `nextCursor` from the previous page.
+    pub before: Option<String>,
+}
+
+/// Where a bot's log stands, beside its records. Mirrors `ChangeLogBot` in
+/// `web/src/changeLog.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogBotBody {
+    name: String,
+    display_name: Option<String>,
+    /// `[change_log] ship` as configured now. Whether Textile has a given
+    /// record is that record's `acknowledged`, not this.
+    shipping: bool,
+    shipped_through: Option<String>,
+    refused: Vec<String>,
+    read_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListBody {
+    records: Vec<Entry>,
+    bots: Vec<LogBotBody>,
+    next_cursor: Option<String>,
+}
+
+/// `GET /api/changes?bot=&before=`: the parameter change log, newest first,
+/// a page of whole change sets at a time. Read-only, and nothing here talks
+/// to Textile. A bot whose log can't be read is listed with `readError`
+/// rather than failing the page for the rest of the fleet.
+pub async fn list(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, ApiError> {
+    let fleet = state.fleet().await?;
+    let bots: Vec<&Bot> = match q.bot.as_deref() {
+        Some(name) => vec![fleet
+            .get(name)
+            .map_err(|e| ApiError::not_found(format!("{e:#}")))?],
+        None => fleet.bots().iter().collect(),
+    };
+    let (bodies, entries): (Vec<LogBotBody>, Vec<Vec<Entry>>) =
+        bots.into_iter().map(read_bot).unzip();
+    let page = view::page(
+        entries.into_iter().flatten(),
+        q.before.as_deref(),
+        view::PAGE_SETS,
+    )
+    .map_err(ApiError::bad_request)?;
+    Ok(Json(ListBody {
+        records: page.entries,
+        bots: bodies,
+        next_cursor: page.next_cursor,
+    })
+    .into_response())
+}
+
+/// One bot's log and where it stands. Errors become `read_error`.
+fn read_bot(bot: &Bot) -> (LogBotBody, Vec<Entry>) {
+    let body = |shipping, log: Option<&view::BotLog>, read_error| LogBotBody {
+        name: bot.name.clone(),
+        display_name: super::bots::label_dir(bot)
+            .and_then(|dir| crate::panel::label::read_display_name(&dir)),
+        shipping,
+        shipped_through: log.and_then(|l| l.shipped_through.clone()),
+        refused: log.map(|l| l.refused.clone()).unwrap_or_default(),
+        read_error,
+    };
+    let Some(config_path) = bot.config_panel_path.as_deref() else {
+        let why = "the panel can't reach this bot's config, so it can't read the log beside it";
+        return (body(false, None, Some(why.to_string())), Vec::new());
+    };
+    let shipping = ships(config_path);
+    match view::read_bot(config_path, &bot.name) {
+        Ok(log) => {
+            let b = body(shipping, Some(&log), None);
+            (b, log.entries)
+        }
+        Err(e) => (body(shipping, None, Some(format!("{e:#}"))), Vec::new()),
+    }
+}
+
+/// `[change_log] ship` in the config as it is on disk. Read on its own rather
+/// than through the full config loader, so a config that fails validation
+/// for some other reason still shows its log as it should. Off when unreadable.
+fn ships(config_path: &Path) -> bool {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|t| t.get("change_log")?.get("ship")?.as_bool())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -569,5 +677,167 @@ mod route_tests {
         assert!(body.contains("hasn't received"), "{body}");
         assert!(path.exists());
         assert!(h.docker.exists("stitch-bot-a"));
+    }
+
+    /// A journal line as the bot writes it.
+    fn journal_line(id: &str, set: &str, at: &str) -> String {
+        let v = serde_json::json!({
+            "id": id,
+            "changeSetId": set,
+            "changedAt": at,
+            "source": "panel.settings",
+            "actor": "tailnet:ana@acme.io",
+            "chainId": 56,
+            "scope": "bot",
+            "parameter": "max_loss_bps",
+            "unit": "bps",
+            "before": "1500",
+            "after": "500",
+            "configSha256Before": "a",
+            "configSha256After": "b",
+        });
+        format!("{v}\n")
+    }
+
+    /// bot-a stopped shipping after Textile took its first record and refused
+    /// its second; bot-b ships and Textile has nothing yet.
+    fn two_bots(tag: &str) -> Harness {
+        let h = harness(tag);
+        seed(&h, "bot-a", "cngn-usdt-bsc");
+        seed(&h, "bot-b", "cngn-usdt-bsc");
+        let a = config_path(&h, "bot-a");
+        let first = journal_line("a1", "s1", "2026-11-13T10:00:00.000Z");
+        let second = journal_line("a2", "s2", "2026-11-13T11:00:00.000Z");
+        std::fs::write(
+            crate::changelog::files::path(&a, crate::changelog::files::LogFile::Journal),
+            format!("{first}{second}"),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::changelog::files::path(&a, crate::changelog::files::LogFile::Shipped),
+            first.len().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::changelog::files::path(&a, crate::changelog::files::LogFile::Refused),
+            "{\"id\":\"a2\",\"reason\":\"too big\"}\n",
+        )
+        .unwrap();
+        let b = config_path(&h, "bot-b");
+        let text = std::fs::read_to_string(&b).unwrap();
+        std::fs::write(&b, format!("{text}\n[change_log]\nship = true\n")).unwrap();
+        std::fs::write(
+            crate::changelog::files::path(&b, crate::changelog::files::LogFile::Journal),
+            journal_line("b1", "s3", "2026-11-13T12:00:00.000Z"),
+        )
+        .unwrap();
+        h
+    }
+
+    #[tokio::test]
+    async fn the_change_log_lists_every_bot_newest_first_with_what_textile_has() {
+        let h = two_bots("changes-list");
+        let (status, body) = h.get("/api/changes").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+
+        let records = v["records"].as_array().unwrap();
+        let summary: Vec<_> = records
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap(),
+                    r["bot"].as_str().unwrap(),
+                    r["acknowledged"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("b1", "bot-b", false),
+                ("a2", "bot-a", false),
+                ("a1", "bot-a", true)
+            ]
+        );
+
+        let bot = |name: &str| {
+            v["bots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let a = bot("bot-a");
+        assert_eq!(a["shipping"], false, "shipping is off now");
+        assert_eq!(
+            a["shippedThrough"], "2026-11-13T10:00:00.000Z",
+            "but Textile has the first record"
+        );
+        assert_eq!(a["refused"], serde_json::json!(["a2"]));
+        assert!(a["readError"].is_null());
+        let b = bot("bot-b");
+        assert_eq!(b["shipping"], true);
+        assert!(b["shippedThrough"].is_null());
+        assert!(v["nextCursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn one_bot_unknown_bots_and_bad_cursors() {
+        let h = two_bots("changes-filter");
+        let (status, body) = h.get("/api/changes?bot=bot-b").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["records"].as_array().unwrap().len(), 1);
+        assert_eq!(v["bots"].as_array().unwrap().len(), 1);
+
+        let (status, _) = h.get("/api/changes?bot=nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = h.get("/api/changes?before=yesterday").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_bot_with_no_journal_yet_is_listed_with_an_empty_log() {
+        let h = harness("changes-empty");
+        seed(&h, "bot-a", "cngn-usdt-bsc");
+        let journal = crate::changelog::files::path(
+            &config_path(&h, "bot-a"),
+            crate::changelog::files::LogFile::Journal,
+        );
+        let _ = std::fs::remove_file(journal);
+        let (status, body) = h.get("/api/changes").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["records"], serde_json::json!([]));
+        assert_eq!(v["bots"][0]["name"], "bot-a");
+        assert!(v["bots"][0]["readError"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_symlink_journal_is_a_read_error_not_someone_elses_file() {
+        let h = harness("changes-symlink");
+        seed(&h, "bot-a", "cngn-usdt-bsc");
+        let journal = crate::changelog::files::path(
+            &config_path(&h, "bot-a"),
+            crate::changelog::files::LogFile::Journal,
+        );
+        let _ = std::fs::remove_file(&journal);
+        let elsewhere = h.root.join("secret.jsonl");
+        std::fs::write(
+            &elsewhere,
+            journal_line("x", "s", "2026-11-13T10:00:00.000Z"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &journal).unwrap();
+
+        let (status, body) = h.get("/api/changes").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        assert_eq!(v["records"], serde_json::json!([]));
+        assert!(v["bots"][0]["readError"].is_string(), "{body}");
     }
 }

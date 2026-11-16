@@ -386,7 +386,9 @@ pub async fn deliver_owed(config_path: &Path) -> Result<usize> {
     Ok(delivered)
 }
 
-fn shipped_offset(config_path: &Path) -> u64 {
+/// The byte offset of the first journal line Textile hasn't acknowledged.
+/// Zero when nothing was ever shipped or the cursor can't be read.
+pub fn shipped_offset(config_path: &Path) -> u64 {
     files::read_text(&files::path(config_path, LogFile::Shipped))
         .ok()
         .flatten()

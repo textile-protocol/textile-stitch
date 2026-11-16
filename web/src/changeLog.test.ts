@@ -249,7 +249,24 @@ describe('summarize', () => {
       ],
       [],
     )
-    expect(summarize(sets, '2026-11-06T00:00:00.000Z')).toEqual({ sets: 2, hostEdits: 1, bots: 2 })
+    expect(summarize(sets, '2026-11-06T00:00:00.000Z', false)).toEqual({
+      sets: 2,
+      hostEdits: 1,
+      bots: 2,
+      complete: true,
+    })
+  })
+
+  it('is a floor while older pages could still hold changes from the window', () => {
+    const recent = groupChangeSets([record({ changeSetId: 'p' })], [])
+    const since = '2026-11-06T00:00:00.000Z'
+    expect(summarize(recent, since, true).complete).toBe(false)
+    expect(summarize(recent, since, false).complete).toBe(true)
+    const reachesBack = groupChangeSets(
+      [record({ changeSetId: 'p' }), record({ changeSetId: 'old', changedAt: '2026-10-01T00:00:00.000Z' })],
+      [],
+    )
+    expect(summarize(reachesBack, since, true).complete).toBe(true)
   })
 })
 

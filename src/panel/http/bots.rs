@@ -159,7 +159,7 @@ impl From<&Warning> for WarningBody {
 /// Where this bot's `panel.json` lives: its own directory. A flat-layout bot
 /// shares the bots root with every other flat bot, so a label there would name
 /// all of them at once; it gets none.
-fn label_dir(bot: &Bot) -> Option<std::path::PathBuf> {
+pub(super) fn label_dir(bot: &Bot) -> Option<std::path::PathBuf> {
     (bot.layout != Layout::FlatFiles)
         .then(|| bot.config_dir())
         .flatten()

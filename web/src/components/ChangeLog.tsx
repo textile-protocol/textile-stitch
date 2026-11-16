@@ -86,7 +86,7 @@ export default function ChangeLog({ bot }: { bot?: string }) {
   const refused = page.bots.filter((b) => b.refused.length > 0)
   const unreadable = page.bots.filter((b) => b.readError)
   const weekAgo = new Date(Date.now() - 7 * 86_400_000).toISOString()
-  const week = summarize(sets, weekAgo)
+  const week = summarize(sets, weekAgo, page.nextCursor !== null)
   const single = bot ? page.bots.find((b) => b.name === bot) : undefined
 
   return (
@@ -183,10 +183,15 @@ function FleetSummary({
   const everShipped = bots.some((b) => b.shippedThrough)
   return (
     <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border border-line-soft bg-surface px-4 py-3 text-sm">
-      <Stat value={week.sets} label={`${week.sets === 1 ? 'change' : 'changes'} in 7 days`} />
-      <Stat value={week.bots} label={`of ${bots.length} bots touched`} />
+      <Stat
+        value={week.sets}
+        floor={!week.complete}
+        label={`${week.sets === 1 ? 'change' : 'changes'} in 7 days`}
+      />
+      <Stat value={week.bots} floor={!week.complete} label={`of ${bots.length} bots touched`} />
       <Stat
         value={week.hostEdits}
+        floor={!week.complete}
         label={week.hostEdits === 1 ? 'edit on the host' : 'edits on the host'}
         tone={week.hostEdits > 0 ? 'text-warning' : undefined}
       />
@@ -201,10 +206,27 @@ function FleetSummary({
   )
 }
 
-function Stat({ value, label, tone }: { value: number; label: string; tone?: string }) {
+/** `floor`: older pages aren't loaded yet, so the count can only go up. */
+function Stat({
+  value,
+  label,
+  tone,
+  floor = false,
+}: {
+  value: number
+  label: string
+  tone?: string
+  floor?: boolean
+}) {
   return (
-    <span className="flex items-baseline gap-1.5">
-      <span className={`text-base font-bold tabular-nums ${tone ?? ''}`}>{value}</span>
+    <span
+      className="flex items-baseline gap-1.5"
+      title={floor ? 'At least this many. Load older changes for the full count.' : undefined}
+    >
+      <span className={`text-base font-bold tabular-nums ${tone ?? ''}`}>
+        {value}
+        {floor && '+'}
+      </span>
       <span className="text-muted">{label}</span>
     </span>
   )

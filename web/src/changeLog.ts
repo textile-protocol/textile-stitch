@@ -336,13 +336,19 @@ function shortHex(a: string): string {
   return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a
 }
 
-/** Counts for the summary line over the sets currently loaded. */
-export function summarize(sets: readonly ChangeSet[], since: string) {
+/**
+ * Counts for the summary line since `since`, over the sets loaded so far.
+ * `complete` is false while older pages could still hold sets from the
+ * window (there's a cursor and nothing loaded reaches back past `since`), so
+ * the counts are a floor and the UI says so.
+ */
+export function summarize(sets: readonly ChangeSet[], since: string, hasOlder: boolean) {
   const recent = sets.filter((s) => effectiveAt(s) >= since && sourceKind(s.source) !== 'baseline')
   return {
     sets: recent.length,
     hostEdits: recent.filter((s) => sourceKind(s.source) === 'host').length,
     bots: new Set(recent.map((s) => s.bot)).size,
+    complete: !hasOlder || sets.some((s) => effectiveAt(s) < since),
   }
 }
 
