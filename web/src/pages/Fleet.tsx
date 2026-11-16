@@ -38,6 +38,7 @@ import {
   vaultCounts,
 } from '../fleetFilter'
 import FleetFilters from '../components/FleetFilters'
+import FleetTabs from '../components/FleetTabs'
 import { useFleetFilter } from '../useFleetFilter'
 import UpdateAllSheet from '../components/UpdateAllSheet'
 import FleetUpdateProgress from '../components/FleetUpdateProgress'
@@ -196,14 +197,12 @@ export default function Fleet() {
   return (
     <div className="space-y-4">
       <div className="flex items-baseline justify-between gap-4">
-        <h1 className="text-xl font-bold">
-          {filtered && `${shown.length} of `}
-          {total} {total === 1 ? 'bot' : 'bots'}
-        </h1>
+        <h1 className="text-xl font-bold">Fleet</h1>
         <Link to="/add">
           <Button variant="primary">Add corridor</Button>
         </Link>
       </div>
+      <FleetTabs bots={filtered ? shown.length : total} />
 
       {error && <Banner tone="danger" onDismiss={() => setError(null)}>{error}</Banner>}
       {note && <Banner tone="info" onDismiss={() => setNote(null)}>{note}</Banner>}

@@ -1,7 +1,7 @@
 // Bot detail URL: `/bots/:name?tab=…`. Shared so the header switcher and the
 // page itself keep the same tab when jumping between bots.
 
-export const BOT_TABS = ['funds', 'settings', 'modules', 'dashboard', 'config', 'logs', 'tools'] as const
+export const BOT_TABS = ['funds', 'settings', 'modules', 'dashboard', 'config', 'logs', 'changes', 'tools'] as const
 export type BotTab = (typeof BOT_TABS)[number]
 
 export const TAB_LABEL: Record<BotTab, string> = {
@@ -11,6 +11,7 @@ export const TAB_LABEL: Record<BotTab, string> = {
   dashboard: 'Dashboard',
   config: 'Raw config',
   logs: 'Logs',
+  changes: 'Change log',
   tools: 'Tools',
 }
 

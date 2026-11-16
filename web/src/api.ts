@@ -1,4 +1,5 @@
 import type { ManualSale } from './manualSales'
+import type { ChangeLogPage } from './changeLog'
 import type { ModulesConfig, ModulesView } from './modules'
 // The one place that talks to the panel API.
 //
@@ -288,6 +289,13 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  /** The parameter change log, newest first: one bot's, or the whole fleet's. */
+  changes: (q: { bot?: string; before?: string } = {}) => {
+    const params = new URLSearchParams(
+      Object.entries(q).filter((e): e is [string, string] => !!e[1]),
+    )
+    return request<ChangeLogPage>(`/api/changes${params.size ? `?${params}` : ''}`)
+  },
   session: () => request<SessionInfo>('/api/session'),
   setPanelPassword: (password: string, confirmation: string) =>
     request<SessionInfo>(

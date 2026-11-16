@@ -10,6 +10,7 @@ import Login from './pages/Login'
 import Fleet from './pages/Fleet'
 import AddBot from './pages/AddBot'
 import BotDetail from './pages/BotDetail'
+import FleetChanges from './pages/FleetChanges'
 import { shortImage } from './format'
 import { panelUpdateBusy } from './panelUpdate'
 import type { SessionInfo, UpdatesStatus } from './types'
@@ -97,6 +98,7 @@ export default function App() {
         )}
         <Routes>
           <Route path="/" element={<Fleet />} />
+          <Route path="/changes" element={<FleetChanges />} />
           <Route path="/add" element={<AddBot rfqDefault={session.rfqDefault} />} />
           <Route path="/bots/:name" element={<BotDetailPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
@@ -159,7 +161,7 @@ function Header({
           <span className="truncate">Stitch</span>
         </Link>
         <nav className="flex shrink-0 items-center gap-1 text-sm">
-          <NavLink to="/" current={pathname === '/'}>
+          <NavLink to="/" current={pathname === '/' || pathname === '/changes'}>
             Fleet
           </NavLink>
         </nav>

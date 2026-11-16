@@ -27,6 +27,7 @@ import RawConfigEditor from '../components/RawConfigEditor'
 import SettingsForm from '../components/SettingsForm'
 import StitchDashboardEmbed from '../components/StitchDashboardEmbed'
 import FundsTab from '../components/FundsTab'
+import ChangeLog from '../components/ChangeLog'
 import DesktopSwitches from '../components/DesktopSwitches'
 import ReconnectTextile from '../components/ReconnectTextile'
 import AgentIdentity from '../components/AgentIdentity'
@@ -497,6 +498,8 @@ export default function BotDetail() {
           <LogViewer bot={bot.name} />
         </Card>
       )}
+
+      {tab === 'changes' && <ChangeLog bot={name} />}
 
       {tab === 'tools' && (
         <>
