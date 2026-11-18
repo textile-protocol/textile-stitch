@@ -110,4 +110,6 @@ The CSV has one row per parameter change, oldest first, every time in UTC, with 
 
 ## Retention
 
-Nothing prunes the log. In the API the four tables (`stitch_parameter_change`, `stitch_envelope`, `stitch_envelope_bound`, `stitch_approval`) refuse `UPDATE`, `DELETE` and `TRUNCATE` at the database level. On the host the journal is append-only. Keeping the database itself for the term plus two years is a backup and deletion-protection question for the infrastructure, not for this code.
+Client agreements for Textile-operated Stitches keep these records for the term of the agreement plus five years. The header comment in the migration that created the tables still says two years. It stays as it is because editing an applied migration changes its checksum, so this section is the reference.
+
+Nothing prunes the log. In the API the four tables (`stitch_parameter_change`, `stitch_envelope`, `stitch_envelope_bound`, `stitch_approval`) refuse `UPDATE`, `DELETE` and `TRUNCATE` at the database level. On the host the journal is append-only. Keeping the database itself for the term plus five years is a backup and deletion-protection question for the infrastructure, not for this code.
