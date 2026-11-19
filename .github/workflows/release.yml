@@ -430,7 +430,28 @@ jobs:
             gh release edit "$TAG" --prerelease --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
             gh release upload "$TAG" --clobber artifacts/*
           else
-            gh release create "$TAG" --target "$RELEASE_COMMIT" --prerelease --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+            # The sync that publishes a version pushes its tag together with
+            # main, so normally the tag is already here and the release only
+            # attaches to it. GITHUB_TOKEN has no `workflows` permission, and
+            # GitHub refuses (HTTP 403) a new ref from it whose workflow files
+            # differ from the default branch, which happens whenever main moved
+            # on with a workflow change during this ~25 minute build.
+            # `--verify-tag` makes sure this step never tries to create one.
+            # A missing tag is a 404, so key off the exit code: gh prints the
+            # error body to stdout.
+            if tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/refs/tags/${TAG}" --jq '.sha' 2>/dev/null)"; then
+              if [ "$tag_commit" != "$RELEASE_COMMIT" ]; then
+                echo "::error::Tag $TAG points at $tag_commit, but this run built $RELEASE_COMMIT. Refusing to attach these binaries to it."
+                exit 1
+              fi
+              gh release create "$TAG" --verify-tag --prerelease --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+            else
+              # No tag yet: a manual dispatch, or a version synced before the
+              # sync pushed tags. Creating it here works only while this
+              # commit's workflow files still match main's.
+              echo "Tag $TAG does not exist yet; creating it at $RELEASE_COMMIT."
+              gh release create "$TAG" --target "$RELEASE_COMMIT" --prerelease --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+            fi
           fi
       - name: Upload install-panel integrity checksums
         env:
