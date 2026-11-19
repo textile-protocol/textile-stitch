@@ -432,10 +432,26 @@ wallet is claimed for the whole swap, as for Start.
 If the broker can't say what the swap left behind (its reply was lost, or
 putting the old container back failed too), the panel stops the bot before
 releasing the wallet, and you start it again once you've checked it. The
-config isn't changed with the image. Build attestation is **not verified yet**:
-that check is a separate change, and until it lands the panel says so in its
-log and its reply. Once the stack pins the bot image (`stitch_image`, #2832),
-that variable only describes what the host booted with after a digest deploy.
+config isn't changed with the image. Once the stack pins the bot image
+(`stitch_image`, #2832), that variable only describes what the host booted with
+after a digest deploy.
+
+**Only attested digests.** Update and rollback both refuse a digest that has
+no valid GitHub build provenance attestation from
+`textile-protocol/textile-stitch`'s `container.yml`, run on `main` on a
+GitHub-hosted runner, for exactly that digest. That's the same thing
+`gh attestation verify` checks in
+[Checking an image was built by our CI](#checking-an-image-was-built-by-our-ci).
+The panel fetches the attestation from GHCR and checks it before claiming the
+wallet, then the broker checks it again before it touches the container. The
+broker's check is the one that counts, so a compromised panel can't skip it.
+A refusal says why (none published, the panel image's attestation, a
+self-hosted runner, another branch, a registry error) and leaves the bot as it
+was. A successful swap logs and replies with the workflow and commit that
+built the image. Images published before attestations started (19 November
+2026) have none, so you can't roll back to them from the panel.
+[production-access.md](production-access.md#image-attestations) has the
+details and what the host needs on the network.
 
 ### Access on a hosted host
 
@@ -899,6 +915,9 @@ that passes is one our CI built from `main`. Pin it as `PANEL_IMAGE` or
 `--bundle-from-oci` to read the attestation from GHCR instead of the GitHub
 API. Images published before attestations were added have none and fail the
 check, so pick a newer `sha-*` build.
+
+Hosted panels run this check themselves on every Update and Rollback (see
+[Hosted profile](#hosted-profile)); you don't need `gh` there.
 
 ## Hardening, once it works
 

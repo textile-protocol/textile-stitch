@@ -1,6 +1,6 @@
 [package]
 name = "stitch-bot"
-version = "0.1.386"
+version = "0.1.387"
 edition = "2021"
 description = "Stitch — Textile filler-network operator bot; quotes Swap via RFQ firm quotes and optionally fills resting limit orders."
 license = "AGPL-3.0-or-later"
@@ -44,6 +44,7 @@ panel = [
   "dep:argon2",
   "dep:subtle",
   "dep:tar",
+  "dep:sigstore-verify",
 ]
 [dependencies]
 tray-icon = { version = "0.19", optional = true }
@@ -106,6 +107,12 @@ argon2 = { version = "0.5.3", optional = true }
 subtle = { version = "2.6.1", default-features = false, optional = true }
 tar = { version = "0.4.46", default-features = false, optional = true }
 mime_guess = { version = "2.0.5", optional = true }
+# Hosted panel: the runtime broker verifies Stitch images' GitHub build
+# provenance (Sigstore bundles) offline before an image swap. sigstore org's
+# verifier; no default features, so no TUF client or network code. aws-lc-rs is
+# already in the graph through rustls/aws-config. See
+# docs/security-dependencies.md#sigstore-verify-for-hosted-image-attestations.
+sigstore-verify = { version = "0.16.0", default-features = false, features = ["aws-lc-rs"], optional = true }
 sha2 = "0.10.9"
 # AWS KMS signer. The official SDK rather than hand-rolled SigV4, because the
 # part worth not rewriting is the credential chain: env, profile, web identity

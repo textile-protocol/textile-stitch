@@ -9,9 +9,12 @@ name="stitch-hosted-$$"
 bot="$name-bot"
 other="$name-other"
 repo="ghcr.io/textile-protocol/textile-stitch"
-# The broker under test may move the bot onto public busybox digests, so the
-# real swap can run without a registry login. Production uses the ghcr repo.
-swap_repo="busybox"
+# The broker under test runs the production policy: bots only move onto bot
+# images with a valid build attestation. The swap target is a real published
+# bot digest whose bundle is checked in as a fixture (pulled anonymously from
+# GHCR; the bundle itself is passed to the broker, which has no network).
+fixtures="$(cd "$(dirname "$0")/.." && pwd)/src/panel/attestation/testdata"
+attested="$repo@sha256:8fd05fd7d0e9e4ecc028a92c69526bb34d15c7ece1cf8bf13b34bc370e3d871d"
 runtime_opts=()
 runtime_limits=(--pids-limit 128 --memory 256m)
 # Some CI sandboxes cannot create domain controllers. Validate resource-limit
@@ -27,13 +30,15 @@ cleanup() {
 trap cleanup EXIT
 chown 1000:1000 "$bots_dir"
 
+# `sleep` as the entrypoint, so the clone on the bot image (which has one too)
+# keeps running after the swap without a config or keys.
 docker run "${runtime_opts[@]}" -d --name "$bot" --network none -e KEEP=env --label keep=label \
-  -v "$bots_dir:/home/stitch/run" busybox:1.37 sleep 3600 >/dev/null
+  -v "$bots_dir:/home/stitch/run" --entrypoint sleep busybox:1.37 3600 >/dev/null
 docker run "${runtime_opts[@]}" -d --name "$other" --network none busybox:1.37 sleep 3600 >/dev/null
 docker volume create "$name-socket" >/dev/null
 docker run "${runtime_opts[@]}" -d --name "$name-broker" --network none --read-only --cap-drop ALL --cap-add CHOWN \
   --security-opt no-new-privileges "${runtime_limits[@]}" \
-  -e "STITCH_BROKER_BOTS=$bot" -e "STITCH_BROKER_IMAGE_REPOSITORY=$swap_repo" \
+  -e "STITCH_BROKER_BOTS=$bot" -e "STITCH_BROKER_IMAGE_REPOSITORY=$repo" \
   -v /var/run/docker.sock:/var/run/docker.sock -v "$name-socket:/run/stitch-broker" \
   "$STITCH_TEST_IMAGE" runtime-broker >/dev/null
 socket="$(docker volume inspect --format '{{.Mountpoint}}' "$name-socket")/control.sock"
@@ -69,13 +74,25 @@ for image in "$repo:latest" "$repo:sha-abc" "busybox:1.37" "ghcr.io/attacker/x@s
 done
 [ "$(docker inspect --format '{{.Config.Image}}' "$bot")" = busybox:1.37 ]
 
-# A real swap onto a digest keeps the name, env, labels and mounts, and leaves
-# no -next/-previous container behind.
-docker pull -q busybox:1.36 >/dev/null
-digest="$(docker image inspect --format '{{index .RepoDigests 0}}' busybox:1.36)"
-[[ "$digest" == busybox@sha256:* ]]
-[ "$(broker -X POST -H 'content-type: application/json' --data "{\"image\":\"$digest\"}" "http://broker/v1/bots/$bot/image")" = 204 ]
-[ "$(docker inspect --format '{{.Config.Image}}' "$bot")" = "$digest" ]
+swap() { # image, then zero or more bundle files
+  local image="$1"; shift
+  jq -n --arg image "$image" '{image: $image, attestations: [inputs | tojson]}' "$@" </dev/null > "$bots_dir/swap.json"
+  broker -X POST -H 'content-type: application/json' --data-binary "@$bots_dir/swap.json" "http://broker/v1/bots/$bot/image"
+}
+
+# A digest without a valid bot attestation is refused before Docker is asked:
+# none at all, the panel image's bundle, and a valid bundle for another digest.
+[ "$(swap "$attested")" = 403 ]
+[ "$(swap "$attested" "$fixtures/panel-d5fccbe8.sigstore.json")" = 403 ]
+[ "$(swap "$repo@sha256:$(printf 'b%.0s' {1..64})" "$fixtures/bot-8fd05fd7.sigstore.json")" = 403 ]
+[ "$(docker inspect --format '{{.Config.Image}}' "$bot")" = busybox:1.37 ]
+docker logs "$name-broker" 2>&1 | grep -q 'refused an unattested image'
+
+# A real swap onto the attested digest keeps the name, env, labels and mounts,
+# and leaves no -next/-previous container behind.
+[ "$(swap "$attested" "$fixtures/bot-8fd05fd7.sigstore.json")" = 204 ]
+[ "$(docker inspect --format '{{.Config.Image}}' "$bot")" = "$attested" ]
+docker logs "$name-broker" 2>&1 | grep 'verified the image' | grep -q 833f1809b9e77c6784e1625f38ead70fea5d24ea
 [ "$(docker inspect --format '{{.State.Running}}' "$bot")" = true ]
 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$bot" | grep -qx KEEP=env
 [ "$(docker inspect --format '{{index .Config.Labels "keep"}}' "$bot")" = label ]

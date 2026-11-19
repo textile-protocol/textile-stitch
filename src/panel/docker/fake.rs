@@ -139,6 +139,8 @@ struct FakeState {
     replace_error: Option<(String, Option<super::swap::SwapOutcome>)>,
     /// When set, `replace_image` waits here mid-swap until the test releases it.
     replace_gate: Option<ReplaceGate>,
+    /// The bundles each `replace_attested_image` carried, in call order.
+    attestations: Vec<Vec<String>>,
 }
 
 impl FakeDocker {
@@ -290,6 +292,11 @@ impl FakeDocker {
         self.state.lock().unwrap().one_shot_exit = code;
     }
 
+    /// The bundles each `replace_attested_image` call carried.
+    pub fn attestations_sent(&self) -> Vec<Vec<String>> {
+        self.state.lock().unwrap().attestations.clone()
+    }
+
     pub fn calls(&self) -> Vec<Call> {
         self.state.lock().unwrap().calls.clone()
     }
@@ -380,6 +387,22 @@ impl DockerApi for FakeDocker {
             .get(image)
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Records the bundles, then swaps like `replace_image`. Verifying them is
+    /// the broker's job and is tested there.
+    async fn replace_attested_image(
+        &self,
+        name: &str,
+        new_image: &str,
+        attestations: &[String],
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .attestations
+            .push(attestations.to_vec());
+        self.replace_image(name, new_image).await
     }
 
     async fn replace_image(&self, name: &str, new_image: &str) -> Result<()> {

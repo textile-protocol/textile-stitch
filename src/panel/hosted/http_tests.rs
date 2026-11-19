@@ -9,6 +9,8 @@ use tower::ServiceExt;
 
 use super::policy::{Rule, ROUTES};
 use super::{Envelope, HostedConfig, Profile, BREAK_GLASS_ORIGIN};
+use crate::panel::attestation::tests::fetch::fake_registry;
+use crate::panel::attestation::tests::{BOT_BUNDLE, BOT_DIGEST, PANEL_BUNDLE};
 use crate::panel::auth::SESSION_COOKIE;
 use crate::panel::docker::fake::{container, dir_layout_mounts, Call};
 use crate::panel::docker::ContainerState;
@@ -36,6 +38,7 @@ fn hosted(tag: &str) -> Harness {
         envelope: envelope(),
         broker_socket: "/nonexistent".into(),
         publish_bind: None,
+        attestation_registry: crate::panel::attestation::registry::GHCR.into(),
     });
     h.state.cfg = std::sync::Arc::new(cfg);
     h.app = router(h.state.clone());
@@ -203,9 +206,85 @@ async fn quoting_edits_stay_inside_the_envelope() {
     assert!(!h.root.join("bot-a").join(setup::RFQ_API_KEY_FILE).exists());
 }
 
+/// The real bot digest the attestation fixture covers.
+fn attested() -> String {
+    format!("{REPO}@{BOT_DIGEST}")
+}
+
+/// A hosted harness whose attestation registry is a local GHCR stand-in serving
+/// the real bot bundle for [`attested`].
+async fn hosted_attested(tag: &str) -> Harness {
+    hosted_with_registry(tag, fake_registry(BOT_DIGEST, BOT_BUNDLE, false).await)
+}
+
+fn hosted_with_registry(tag: &str, registry: String) -> Harness {
+    let mut h = hosted(tag);
+    let mut cfg = (*h.state.cfg).clone();
+    if let Profile::Hosted(hosted) = &mut cfg.profile {
+        hosted.attestation_registry = registry;
+    }
+    h.state.cfg = std::sync::Arc::new(cfg);
+    h.app = router(h.state.clone());
+    h
+}
+
+/// A digest with no attestation, with the wrong one, or with the registry
+/// unreachable is refused before the config lock, the wallet or the runtime are
+/// touched.
+#[tokio::test]
+async fn an_image_without_a_valid_attestation_is_refused_before_anything_moves() {
+    let unattested = format!("{REPO}@sha256:{}", "2".repeat(64));
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{addr}")
+    };
+    let cases = [
+        (
+            "no attestation published",
+            hosted_attested("hosted-att-none").await,
+            unattested.clone(),
+            "no build attestation found",
+        ),
+        (
+            "the panel image's attestation",
+            hosted_with_registry(
+                "hosted-att-panel",
+                fake_registry(BOT_DIGEST, PANEL_BUNDLE, false).await,
+            ),
+            attested(),
+            "identity",
+        ),
+        (
+            "registry unreachable",
+            hosted_with_registry("hosted-att-down", closed),
+            attested(),
+            "unreachable",
+        ),
+    ];
+    for (what, h, image, expect) in cases {
+        seed(&h, "bot-a", ContainerState::Running);
+        let (status, body) = send(
+            &h,
+            "POST",
+            "/api/bots/bot-a/image",
+            PUBLIC,
+            Some(json!({ "image": image })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+        assert!(body.contains(expect), "{what}: {body}");
+        assert!(mutating_calls(&h).is_empty(), "{what}");
+        assert!(h.docker.attestations_sent().is_empty(), "{what}");
+        let bot = h.state.bot("bot-a").await.unwrap();
+        assert!(h.state.wallet_locks.try_claim_for(&bot).is_some(), "{what}");
+    }
+}
+
 #[tokio::test]
 async fn update_and_rollback_take_only_a_digest() {
-    let h = hosted("hosted-image");
+    let h = hosted_attested("hosted-image").await;
     seed(&h, "bot-a", ContainerState::Running);
     let path = "/api/bots/bot-a/image";
     for image in [
@@ -218,10 +297,16 @@ async fn update_and_rollback_take_only_a_digest() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{image}: {body}");
     }
     assert!(mutating_calls(&h).is_empty());
-    let digest = format!("{REPO}@sha256:{}", "2".repeat(64));
+    let digest = attested();
     let (status, body) = send(&h, "POST", path, PUBLIC, Some(json!({ "image": digest }))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains("attestation was not checked"), "{body}");
+    assert!(body.contains("from commit 833f1809"), "{body}");
+    assert!(!body.contains("not checked"), "{body}");
+    assert_eq!(
+        h.docker.attestations_sent(),
+        vec![vec![BOT_BUNDLE.to_string()]],
+        "the broker gets the bundles to verify itself"
+    );
     assert!(h
         .docker
         .calls()
@@ -246,11 +331,11 @@ fn image_request(h: &Harness, image: &str) -> Request<Body> {
 #[tokio::test]
 async fn a_swap_holds_the_operator_wallet_so_a_launch_on_it_is_refused() {
     // bot-a and bot-b share TEST_KEY, so one operator wallet.
-    let h = hosted("hosted-image-claim");
+    let h = hosted_attested("hosted-image-claim").await;
     seed(&h, "bot-a", ContainerState::Running);
     seed(&h, "bot-b", ContainerState::Exited);
     let gate = h.docker.gate_replace();
-    let digest = format!("{REPO}@sha256:{}", "2".repeat(64));
+    let digest = attested();
     let swap = tokio::spawn(h.app.clone().oneshot(image_request(&h, &digest)));
     gate.entered.notified().await;
 
@@ -278,10 +363,10 @@ async fn a_swap_holds_the_operator_wallet_so_a_launch_on_it_is_refused() {
 async fn a_failed_swap_with_a_known_outcome_leaves_the_bot_alone() {
     use crate::panel::docker::swap::SwapOutcome;
     for outcome in [SwapOutcome::Unchanged, SwapOutcome::Restored] {
-        let h = hosted("hosted-image-known");
+        let h = hosted_attested("hosted-image-known").await;
         seed(&h, "bot-a", ContainerState::Running);
         h.docker.fail_replace("registry said no", Some(outcome));
-        let digest = format!("{REPO}@sha256:{}", "2".repeat(64));
+        let digest = attested();
         let (status, body) = send(
             &h,
             "POST",
@@ -305,11 +390,11 @@ async fn a_failed_swap_with_a_known_outcome_leaves_the_bot_alone() {
 
 #[tokio::test]
 async fn a_failed_swap_with_an_unknown_outcome_stops_the_bot_before_releasing_the_wallet() {
-    let h = hosted("hosted-image-unknown");
+    let h = hosted_attested("hosted-image-unknown").await;
     seed(&h, "bot-a", ContainerState::Running);
     h.docker
         .fail_replace("the runtime broker isn't answering", None);
-    let digest = format!("{REPO}@sha256:{}", "2".repeat(64));
+    let digest = attested();
     let (status, body) = send(
         &h,
         "POST",
@@ -330,9 +415,9 @@ async fn a_failed_swap_with_an_unknown_outcome_stops_the_bot_before_releasing_th
 
 #[tokio::test]
 async fn a_paused_bot_is_refused_a_swap_before_the_runtime_is_asked() {
-    let h = hosted("hosted-image-paused");
+    let h = hosted_attested("hosted-image-paused").await;
     seed(&h, "bot-a", ContainerState::Paused);
-    let digest = format!("{REPO}@sha256:{}", "2".repeat(64));
+    let digest = attested();
     let (status, body) = send(
         &h,
         "POST",
@@ -352,10 +437,10 @@ async fn a_paused_bot_is_refused_a_swap_before_the_runtime_is_asked() {
 
 #[tokio::test]
 async fn a_stopped_bot_swaps_without_claiming_its_wallet() {
-    let h = hosted("hosted-image-stopped");
+    let h = hosted_attested("hosted-image-stopped").await;
     seed(&h, "bot-a", ContainerState::Exited);
     let gate = h.docker.gate_replace();
-    let digest = format!("{REPO}@sha256:{}", "2".repeat(64));
+    let digest = attested();
     let swap = tokio::spawn(h.app.clone().oneshot(image_request(&h, &digest)));
     gate.entered.notified().await;
     let bot = h.state.bot("bot-a").await.unwrap();

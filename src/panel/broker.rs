@@ -17,7 +17,9 @@
 //! - read a bounded log tail, optionally followed
 //! - read the labels and repo digests of the image it runs
 //! - recreate it on another image, only as `<repository>@sha256:<digest>` in
-//!   the one repository `STITCH_BROKER_IMAGE_REPOSITORY` names
+//!   the one repository `STITCH_BROKER_IMAGE_REPOSITORY` names, and only with a
+//!   build provenance attestation for that digest from the mirror's bot
+//!   container workflow, verified here ([`super::attestation::verify_swap`])
 //!
 //! The socket is `0660 root:65532`; the panel container runs as a member of
 //! group 65532 and mounts the socket directory read-only.
@@ -155,6 +157,11 @@ pub enum Action {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageRequest {
     pub image: String,
+    /// Sigstore bundles for `image`, as GHCR serves them. The panel fetches them
+    /// (the broker has no network) and the broker verifies them; at least one
+    /// must pass or the swap is refused.
+    #[serde(default)]
+    pub attestations: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,6 +477,29 @@ async fn replace_image(
     // compromised panel process must not be able to pick a tag or a repository.
     check_digest_ref(&body.image, broker.policy.image_repository())
         .map_err(|e| ApiError::bad_request(e).into_response())?;
+    // Before anything about the container is touched. A refusal is a definite
+    // outcome: nothing was stopped.
+    let attested = super::attestation::verify_swap(
+        broker.policy.image_repository(),
+        &body.image,
+        &body.attestations,
+    )
+    .map_err(|error| {
+        tracing::warn!(container = %name, image = %body.image, %error, "broker refused an unattested image");
+        let reply = SwapErrorBody {
+            error,
+            outcome: Some(SwapOutcome::Unchanged),
+        };
+        (StatusCode::FORBIDDEN, Json(reply)).into_response()
+    })?;
+    tracing::info!(
+        container = %name,
+        digest = %attested.digest,
+        workflow = %attested.workflow,
+        commit = %attested.commit,
+        signed_at = %attested.signed_at,
+        "broker verified the image's build attestation"
+    );
     let _permit = broker.permit().map_err(IntoResponse::into_response)?;
     let container = broker
         .find(&name)
@@ -489,7 +519,7 @@ async fn replace_image(
             };
             (StatusCode::BAD_GATEWAY, Json(reply)).into_response()
         })?;
-    tracing::info!(container = %name, from = %previous, to = %body.image, "broker image swap");
+    tracing::info!(container = %name, from = %previous, to = %body.image, commit = %attested.commit, "broker image swap");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -534,6 +564,7 @@ mod tests {
         ContainerInfo, ContainerState, LogLine,
     };
     use super::*;
+    use crate::panel::attestation::tests::{BOT_BUNDLE, BOT_DIGEST, PANEL_BUNDLE, PANEL_DIGEST};
     use axum::{
         body::{to_bytes, Body},
         http::Request,
@@ -803,6 +834,7 @@ mod tests {
         ] {
             let body = serde_json::to_string(&ImageRequest {
                 image: image.clone(),
+                attestations: vec![BOT_BUNDLE.to_string()],
             })
             .unwrap();
             let (status, _) = send(&app, "POST", "/v1/bots/stitch-luno-a/image", Some(body)).await;
@@ -813,10 +845,83 @@ mod tests {
             .iter()
             .all(|c| !matches!(c, Call::ReplaceImage { .. })));
 
-        let body = serde_json::to_string(&ImageRequest { image: digest('b') }).unwrap();
-        let (status, _) = send(&app, "POST", "/v1/bots/stitch-luno-a/image", Some(body)).await;
+        let image = format!("{REPO}@{BOT_DIGEST}");
+        let (status, _) = swap(&app, &image, &[BOT_BUNDLE]).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(docker.calls().iter().any(|c| matches!(c, Call::ReplaceImage { name, new_image } if name == "stitch-luno-a" && *new_image == digest('b'))));
+        assert!(docker.calls().iter().any(|c| matches!(c, Call::ReplaceImage { name, new_image } if name == "stitch-luno-a" && *new_image == image)));
+    }
+
+    async fn swap(app: &Router, image: &str, bundles: &[&str]) -> (StatusCode, String) {
+        let body = serde_json::to_string(&ImageRequest {
+            image: image.to_string(),
+            attestations: bundles.iter().map(|b| b.to_string()).collect(),
+        })
+        .unwrap();
+        send(app, "POST", "/v1/bots/stitch-luno-a/image", Some(body)).await
+    }
+
+    /// The broker is the gate: whatever the panel sends (or leaves out), a digest
+    /// without a valid bot-workflow attestation never reaches the runtime, and the
+    /// refusal says nothing was touched so the panel releases the wallet cleanly.
+    #[tokio::test]
+    async fn image_swaps_need_a_valid_bot_attestation_for_the_exact_digest() {
+        let docker = Arc::new(FakeDocker::new());
+        docker.add_container(container('a', "stitch-luno-a"));
+        let app = app(docker.clone(), "stitch-luno-a");
+        let bot = format!("{REPO}@{BOT_DIGEST}");
+        let other = digest('b');
+        let cases: [(&str, &str, &[&str]); 5] = [
+            ("no attestation", &bot, &[]),
+            ("the panel image's attestation", &bot, &[PANEL_BUNDLE]),
+            ("another digest's attestation", &other, &[BOT_BUNDLE]),
+            ("a garbage bundle", &bot, &["{}"]),
+            (
+                "the panel image under the bot repository",
+                &format!("{REPO}@{PANEL_DIGEST}"),
+                &[PANEL_BUNDLE],
+            ),
+        ];
+        for (what, image, bundles) in cases {
+            let (status, body) = swap(&app, image, bundles).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+            let reply: SwapErrorBody = serde_json::from_str(&body).unwrap();
+            assert_eq!(reply.outcome, Some(SwapOutcome::Unchanged), "{what}");
+        }
+        // The fixture bundle is real, so a mixed list still passes on the good one.
+        let (status, _) = swap(&app, &bot, &[PANEL_BUNDLE, BOT_BUNDLE]).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let swaps = docker
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::ReplaceImage { .. }))
+            .count();
+        assert_eq!(swaps, 1);
+    }
+
+    #[tokio::test]
+    async fn a_broker_for_another_repository_refuses_every_swap() {
+        let docker = Arc::new(FakeDocker::new());
+        let mut c = container('a', "stitch-luno-a");
+        let panel_repo = "ghcr.io/textile-protocol/textile-stitch-panel";
+        c.image = format!("{panel_repo}@sha256:{}", "1".repeat(64));
+        docker.add_container(c);
+        let app = Broker::new(
+            docker.clone(),
+            Policy::new("stitch-luno-a", panel_repo).unwrap(),
+        )
+        .router();
+        let (status, body) = swap(
+            &app,
+            &format!("{panel_repo}@{PANEL_DIGEST}"),
+            &[PANEL_BUNDLE],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("no attestation policy"), "{body}");
+        assert!(docker
+            .calls()
+            .iter()
+            .all(|c| !matches!(c, Call::ReplaceImage { .. })));
     }
 
     #[tokio::test]

@@ -83,6 +83,10 @@ pub struct HostedConfig {
     /// The main listener stays on loopback for `tailscale serve`. Never a
     /// wildcard: `0.0.0.0` would also listen on the tailnet interface.
     pub publish_bind: Option<std::net::SocketAddr>,
+    /// Where image attestation bundles are fetched from. Always GHCR outside
+    /// tests, and deliberately not read from the environment. Whatever this
+    /// serves, the broker verifies it.
+    pub attestation_registry: String,
 }
 
 impl HostedConfig {
@@ -135,6 +139,7 @@ fn hosted_from(lookup: &impl Fn(&str) -> Option<String>) -> Result<HostedConfig>
         envelope,
         broker_socket,
         publish_bind,
+        attestation_registry: crate::panel::attestation::registry::GHCR.to_string(),
     })
 }
 

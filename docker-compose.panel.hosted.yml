@@ -16,7 +16,9 @@
 #                   directory must hold no keys (rfq-api.key included), and
 #                   reaches containers only through the broker.
 #   runtime-broker  the only holder of the Docker socket. No network. Answers a
-#                   fixed set of calls about the bots named in STITCH_BROKER_BOTS.
+#                   fixed set of calls about the bots named in STITCH_BROKER_BOTS,
+#                   and swaps a bot's image only after verifying its build
+#                   attestation (the panel fetches the bundle from GHCR).
 #
 # Keys stay where the host puts them: /run/stitch/<bot> (tmpfs), mounted
 # read-only into each bot by the bots' own compose file (#2832's layout).

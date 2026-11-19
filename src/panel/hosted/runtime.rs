@@ -167,6 +167,15 @@ impl DockerApi for BrokerDocker {
     }
 
     async fn replace_image(&self, name: &str, new_image: &str) -> Result<()> {
+        bail!("moving {name} to {new_image} needs its build attestation; the broker refuses a swap without one")
+    }
+
+    async fn replace_attested_image(
+        &self,
+        name: &str,
+        new_image: &str,
+        attestations: &[String],
+    ) -> Result<()> {
         // No `post`: a failed swap's reply says what it left behind, and that
         // has to reach the panel as a `SwapFailed`. A lost reply carries no
         // outcome, so the panel treats the bot as possibly live.
@@ -175,6 +184,7 @@ impl DockerApi for BrokerDocker {
             .post(format!("http://broker/v1/bots/{}/image", segment(name)))
             .json(&ImageRequest {
                 image: new_image.to_string(),
+                attestations: attestations.to_vec(),
             })
             .send()
             .await
@@ -356,6 +366,57 @@ mod tests {
             None,
         );
         assert!(one_shot.next().await.unwrap().is_err());
+        // A swap always carries its attestation; the bare form never reaches the
+        // socket.
+        let bare = docker.replace_image("x", "y").await.unwrap_err();
+        assert!(format!("{bare:#}").contains("needs its build attestation"));
+    }
+
+    /// The broker's attestation refusal reaches the panel as a definite
+    /// "nothing changed", so the panel releases the wallet without stopping the bot.
+    #[tokio::test]
+    async fn an_attestation_refusal_crosses_the_socket_as_unchanged() {
+        use crate::panel::broker::{Broker, Policy, DEFAULT_IMAGE_REPOSITORY};
+        use crate::panel::docker::fake::{container, FakeDocker};
+        use crate::panel::docker::swap::{swap_outcome, SwapOutcome};
+        use crate::panel::docker::ContainerState;
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let docker = std::sync::Arc::new(FakeDocker::new());
+        docker.add_container(container("stitch-luno-a", ContainerState::Running));
+        let policy = Policy::new("stitch-luno-a", DEFAULT_IMAGE_REPOSITORY).unwrap();
+        let app = Broker::new(docker, policy).router();
+        let image = format!("{DEFAULT_IMAGE_REPOSITORY}@sha256:{}", "b".repeat(64));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bots/stitch-luno-a/image")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "image": image }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let reply = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(status)
+                .body(bytes.to_vec())
+                .unwrap(),
+        );
+        let err = swap_reply(reply).await.unwrap_err();
+        assert_eq!(swap_outcome(&err), Some(SwapOutcome::Unchanged), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("no build attestation"),
+            "{err:#}"
+        );
     }
 
     /// The outcome a failed broker swap reports crosses the socket intact, and
@@ -370,7 +431,8 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
 
-        let image = format!("{DEFAULT_IMAGE_REPOSITORY}@sha256:{}", "b".repeat(64));
+        use crate::panel::attestation::tests::{BOT_BUNDLE, BOT_DIGEST};
+        let image = format!("{DEFAULT_IMAGE_REPOSITORY}@{BOT_DIGEST}");
         for outcome in [
             Some(SwapOutcome::Unchanged),
             Some(SwapOutcome::Restored),
@@ -388,7 +450,8 @@ mod tests {
                         .uri("/v1/bots/stitch-luno-a/image")
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            serde_json::json!({ "image": image }).to_string(),
+                            serde_json::json!({ "image": image, "attestations": [BOT_BUNDLE] })
+                                .to_string(),
                         ))
                         .unwrap(),
                 )

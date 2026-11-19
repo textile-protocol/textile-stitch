@@ -18,6 +18,7 @@
 //! operator's compose file. A generated (never round-tripped) compose export
 //! keeps that file a valid recovery artifact for Docker installs.
 
+pub mod attestation;
 pub mod auth;
 pub mod broker;
 pub mod compose;

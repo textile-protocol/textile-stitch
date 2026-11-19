@@ -7,17 +7,20 @@
 //! Tags (including `latest`) are refused here and again by the broker, because a
 //! tag can move after review and a digest can't.
 //!
-//! Attestation: not verified yet. [`verify_attestation`] is the seam the
-//! follow-up PR fills in (check the image's build provenance was signed by
-//! Textile's GitHub workflow before the swap). Until then the digest form and
-//! repository are all that is checked, and the panel says so in its log and its
-//! reply.
+//! Attestation: the image must carry a GitHub build provenance attestation
+//! from the mirror's bot container workflow (`container.yml` at `main`, on a
+//! GitHub-hosted runner) for exactly this digest. The panel fetches the bundles
+//! from GHCR and checks them first, so a bad digest is refused before the
+//! wallet is claimed, then hands them to the runtime broker, which verifies
+//! them again and is the check that counts: a compromised panel can't skip it.
+//! See [`crate::panel::attestation`].
 
 use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::panel::attestation::{self, registry::Registry, Verified};
 use crate::panel::broker::check_digest_ref;
 use crate::panel::docker::swap::swap_outcome;
 use crate::panel::http::bots::{claim_for_launch, settle_ambiguous_launch};
@@ -28,15 +31,23 @@ pub struct ImageBody {
     pub image: String,
 }
 
-/// Whether `image` may run on this host beyond its digest form.
-///
-/// TODO(stitch-attestation): verify the GitHub build attestation for `image`
-/// (issuer, workflow path, repository, digest) and refuse on any failure. Needs
-/// the attestation step in the container workflows first. Returns whether it
-/// actually verified anything, so callers can say so.
-pub async fn verify_attestation(image: &str) -> Result<bool, String> {
-    tracing::warn!(%image, "build attestation not verified: not implemented yet");
-    Ok(false)
+/// The verified attestation for `image` and the bundles the broker will check
+/// again. Any failure (none published, a registry or network error, a bundle
+/// that doesn't verify) refuses.
+pub async fn verify_attestation(
+    image: &str,
+    hosted: &crate::panel::hosted::HostedConfig,
+) -> Result<(Verified, Vec<String>), String> {
+    let (_, digest) = image
+        .split_once('@')
+        .ok_or_else(|| format!("{image} is not a digest reference"))?;
+    let registry = Registry::at(&hosted.attestation_registry)?;
+    let bundles = registry
+        .attestations(&hosted.image_repository, digest)
+        .await
+        .map_err(|e| format!("couldn't fetch the build attestation for {image}: {e}"))?;
+    let verified = attestation::verify_swap(&hosted.image_repository, image, &bundles)?;
+    Ok((verified, bundles))
 }
 
 pub async fn replace(
@@ -51,9 +62,13 @@ pub async fn replace(
     };
     let image = body.image.trim().to_string();
     check_digest_ref(&image, &hosted.image_repository).map_err(ApiError::bad_request)?;
-    let verified = verify_attestation(&image)
-        .await
-        .map_err(ApiError::bad_request)?;
+    let (attested, bundles) = verify_attestation(&image, hosted).await.map_err(|e| {
+        tracing::warn!(bot = %name, %image, error = %e, "hosted image refused: attestation");
+        ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            format!("{e}. Only images built by the textile-stitch container workflow from main can run here."),
+        )
+    })?;
 
     // Held across the swap so a settings save can't write the config the new
     // container is about to load, and so the wallet claimed below is the one the
@@ -91,7 +106,11 @@ pub async fn replace(
         )));
     };
     let previous = bot.image.clone().unwrap_or_default();
-    if let Err(e) = state.docker.replace_image(&container, &image).await {
+    if let Err(e) = state
+        .docker
+        .replace_attested_image(&container, &image, &bundles)
+        .await
+    {
         let err = ApiError::internal(&e);
         // A known outcome is definite: the old container never stopped, or it
         // is back and its start returned. Anything else (recovery failed, or the
@@ -103,18 +122,21 @@ pub async fn replace(
         });
     }
     drop(wallet);
-    tracing::info!(bot = %name, from = %previous, to = %image, attested = verified, "hosted image swap");
-    let note = if verified {
-        ""
-    } else {
-        " Build attestation was not checked: that verification isn't implemented yet."
-    };
+    tracing::info!(
+        bot = %name,
+        from = %previous,
+        to = %image,
+        workflow = %attested.workflow,
+        commit = %attested.commit,
+        "hosted image swap"
+    );
     crate::panel::http::bots::action_response(
         &state,
         &name,
         Some(format!(
-            "{name} moved from {previous} to {image}. Watch its logs: the config was not changed \
-             with the image.{note}"
+            "{name} moved from {previous} to {image}, built by {} from commit {}. Watch its logs: \
+             the config was not changed with the image.",
+            attested.workflow, attested.commit
         )),
     )
     .await

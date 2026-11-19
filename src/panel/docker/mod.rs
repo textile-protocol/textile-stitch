@@ -421,6 +421,22 @@ pub trait DockerApi: Send + Sync {
         anyhow::bail!("this runtime can't replace {name}'s image in place (asked for {new_image})")
     }
 
+    /// [`Self::replace_image`], carrying `attestations` (Sigstore bundles for
+    /// `new_image`) to a runtime that verifies them before it swaps. Only the
+    /// hosted runtime broker does: it refuses the swap unless one proves the
+    /// digest was built by the mirror's bot workflow. The default refuses.
+    async fn replace_attested_image(
+        &self,
+        name: &str,
+        new_image: &str,
+        attestations: &[String],
+    ) -> Result<()> {
+        let _ = attestations;
+        anyhow::bail!(
+            "this runtime doesn't verify image attestations (asked to move {name} to {new_image})"
+        )
+    }
+
     async fn create(&self, spec: &CreateSpec) -> Result<String>;
 
     async fn start(&self, name: &str) -> Result<()>;

@@ -80,6 +80,7 @@ mod tests {
             envelope: Envelope::default(),
             broker_socket: "/x".into(),
             publish_bind: None,
+            attestation_registry: crate::panel::attestation::registry::GHCR.into(),
         }
     }
 

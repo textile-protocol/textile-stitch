@@ -93,6 +93,9 @@ from:
   pinned by digest.
 - **Not done:** nothing in the stack installs or starts the hosted panel,
   writes its `.env` or its envelope file. That's a planned follow-up on #2832.
+- **Image attestations:** Update and Rollback only move a bot onto a digest
+  with a valid build provenance attestation, checked by the broker. See
+  [Image attestations](#image-attestations).
 
 Until that follow-up lands, bring the panel up by hand, and only on a host
 whose bot directories hold no credentials. The hosted panel mounts
@@ -165,3 +168,63 @@ local port 8420 reaches the login page and accepts a change; a forward on
 another local port is refused on change; `ss -ltn` on the host shows 8420 on
 `127.0.0.1` only; the panel container has no `/var/run/docker.sock` and no
 `/home/stitch/secrets`.
+
+### Image attestations
+
+On a hosted host, every bot image swap (Update and Rollback are the same call)
+needs a build provenance attestation for the exact digest. The runtime broker
+verifies it before it pulls or stops anything, and refuses on any failure.
+The policy is fixed in `src/panel/attestation/mod.rs`, not in config:
+
+- signed through Sigstore's public-good instance: the certificate chains to
+  the pinned Fulcio roots, its SCT and the Rekor inclusion proof, checkpoint
+  and signed entry timestamp verify against the pinned keys, and the
+  certificate was valid when Rekor logged it
+- certificate identity exactly
+  `https://github.com/textile-protocol/textile-stitch/.github/workflows/container.yml@refs/heads/main`,
+  issuer `https://token.actions.githubusercontent.com`, source repository
+  `textile-protocol/textile-stitch`, source ref `refs/heads/main`, runner
+  environment `github-hosted`
+- the signed statement is SLSA provenance v1 with one subject,
+  `ghcr.io/textile-protocol/textile-stitch` at the requested digest
+
+The panel image has its own identity (`container-panel.yml`, subject
+`textile-stitch-panel`), so its attestation never passes for a bot and the
+other way round. The broker only ever moves bots onto the bot image: if
+`STITCH_BOT_REPOSITORY` in `.env` names any other repository, every swap is
+refused. Leave it unset.
+
+The broker has no network, so it can't fetch anything. The panel downloads the
+bundles from GHCR (`ghcr.io`, through the OCI fallback tag `sha256-<hex>`,
+since GHCR has no referrers API) and passes them to the broker over the
+socket. That's safe because a bundle proves itself: a compromised panel can
+withhold one or send garbage, which refuses the swap, but it can't produce a
+valid one for an image our CI didn't build. Verification is offline: no TUF
+refresh, no Rekor lookup, no `api.github.com` and no token. The host needs
+outbound HTTPS to `ghcr.io:443` and `pkg-containers.githubusercontent.com:443`
+(where GHCR redirects blob downloads), the same two hosts the Docker daemon
+already uses to pull the image. If egress is restricted to those, swaps still
+work. If GHCR is unreachable, swaps are refused, which is the point.
+
+Both the panel and the broker log the verified workflow, commit and digest.
+To see why a swap was refused, read the broker's log:
+
+```sh
+docker logs stitch-runtime-broker 2>&1 | grep -E 'unattested|verified the image'
+```
+
+**Trust root.** The Sigstore trust root (`trusted_root.json`: Fulcio CAs,
+Rekor and CT log keys) is compiled into the panel image from
+`src/panel/attestation/sigstore_trusted_root.json`. It never updates at
+runtime. Sigstore rotates keys rarely and announces it; when it does, or when
+`sigstore/root-signing` publishes a new `targets/trusted_root.json`, refresh it
+with a reviewed PR: replace the file with the new one from that repo, check it
+byte for byte against the `trusted_root.json` target the TUF repository
+(`tuf-repo-cdn.sigstore.dev`) serves, run the attestation tests, and roll out
+the new panel image. Until a
+host gets the new image, attestations signed under keys it doesn't know are
+refused, so roll the panel before the old keys stop being used.
+
+Images published before attestations started (the mirror's first attested
+build was on 19 November 2026) have none, so rollback can only go back to
+digests built since then.
