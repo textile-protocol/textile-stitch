@@ -737,6 +737,55 @@ Read this before using it:
 - Desktop (process runtime) has no per-bot image, so there's nothing to roll
   back — install an earlier release from the menu bar instead.
 
+### Checking an image was built by our CI
+
+Every multi-arch image the `textile-stitch` repository publishes, bot and panel,
+gets a GitHub build provenance attestation on its manifest list digest. It's
+signed with the identity of the workflow that built it and stored in GHCR next
+to the image. `sha-<commit>`, `latest` and `main` all point at that same digest,
+so check the digest, not the tag.
+
+Resolve a tag to its digest first:
+
+```bash
+docker buildx imagetools inspect ghcr.io/textile-protocol/textile-stitch:sha-<commit> \
+  --format '{{json .Manifest.Digest}}'
+```
+
+Then verify it. For the bot image:
+
+```bash
+gh attestation verify oci://ghcr.io/textile-protocol/textile-stitch@sha256:<digest> \
+  --owner textile-protocol \
+  --signer-workflow textile-protocol/textile-stitch/.github/workflows/container.yml \
+  --source-ref refs/heads/main \
+  --deny-self-hosted-runners
+```
+
+For the panel image:
+
+```bash
+gh attestation verify oci://ghcr.io/textile-protocol/textile-stitch-panel@sha256:<digest> \
+  --owner textile-protocol \
+  --signer-workflow textile-protocol/textile-stitch/.github/workflows/container-panel.yml \
+  --source-ref refs/heads/main \
+  --deny-self-hosted-runners
+```
+
+`--owner` alone only proves some workflow in the `textile-protocol`
+organisation signed it. `--signer-workflow` narrows that to the container
+workflow of the public `textile-stitch` repository (`--repo
+textile-protocol/textile-stitch` in place of `--owner` works the same), and
+`--source-ref` rejects builds from a manual run on another branch. A digest
+that passes is one our CI built from `main`. Pin it as `PANEL_IMAGE` or
+`STITCH_PANEL_BOT_IMAGE` with `@sha256:<digest>`.
+
+`gh` has to be logged in (`gh auth login`, any account) and reach
+`api.github.com` and the Sigstore trust root over HTTPS. Add
+`--bundle-from-oci` to read the attestation from GHCR instead of the GitHub
+API. Images published before attestations were added have none and fail the
+check, so pick a newer `sha-*` build.
+
 ## Hardening, once it works
 
 - **Restrict the tailnet policy.** Assign a panel tag in the admin console or on

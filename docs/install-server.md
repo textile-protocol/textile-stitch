@@ -148,7 +148,9 @@ disk.
 
 - Dedicated operator wallet per bot. Fund only the inventory that bot may quote.
 - Keep SSH locked down (your IP `/32`, key auth). Never open 8420 publicly.
-- Prefer a pinned `sha-*` panel image in production.
+- Prefer a pinned `sha-*` panel image in production, and check its digest
+  was built by our CI first
+  ([how](install-panel.md#checking-an-image-was-built-by-our-ci)).
 - Secrets live in owner-only files and env — never commit keys or paste them
   into public tickets.
 - Review spreads, sizes, and Permit2 allowances before the first live start.

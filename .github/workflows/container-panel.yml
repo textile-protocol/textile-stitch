@@ -34,9 +34,9 @@ on:
 env:
   REGISTRY_IMAGE: ghcr.io/textile-protocol/textile-stitch-panel
 
+# Only read access by default. Each job asks for what it needs below.
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: container-panel-${{ github.ref }}
@@ -45,6 +45,9 @@ concurrency:
 jobs:
   build:
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -116,6 +119,13 @@ jobs:
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
+    # id-token and attestations are only for the build provenance attestation
+    # on the manifest list. The per-arch build jobs never get them.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
@@ -144,6 +154,7 @@ jobs:
             type=ref,event=branch
 
       - name: Create manifest list and push
+        id: manifest
         working-directory: ${{ runner.temp }}/digests
         run: |
           # Require both digests before tagging :latest — a partial publish would
@@ -164,6 +175,25 @@ jobs:
                 [ -f "$digest" ] || continue
                 printf '%s@sha256:%s ' "$REGISTRY_IMAGE" "$digest"
               done)
+          # Every tag this run pushed (sha-*, latest, the branch tag) has to
+          # resolve to one manifest list digest. That digest is the one the
+          # attestation below covers, so a tag that drifted would point at an
+          # image with no provenance.
+          digest=""
+          while IFS= read -r tag; do
+            tag_digest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            case "$tag_digest" in
+              sha256:*) ;;
+              *) echo "error: could not resolve the digest of $tag (got: ${tag_digest:-nothing})" >&2; exit 1 ;;
+            esac
+            if [ -z "$digest" ]; then
+              digest="$tag_digest"
+            elif [ "$tag_digest" != "$digest" ]; then
+              echo "error: $tag points at $tag_digest, expected $digest" >&2
+              exit 1
+            fi
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Verify multi-arch manifest
         run: |
@@ -183,3 +213,38 @@ jobs:
             exit 1
           fi
           echo "ok: ${REGISTRY_IMAGE}:${tag} includes linux/amd64 and linux/arm64"
+
+      # Signs a SLSA build provenance statement for the manifest list digest
+      # with this workflow's GitHub OIDC identity and pushes it to GHCR next to
+      # the image. Operators check it with `gh attestation verify` (see
+      # docs/install-panel.md). GitHub only stores attestations for public
+      # repositories on this organisation's plan, so a private copy of the
+      # repo skips it instead of failing the publish.
+      - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          {
+            echo "## ${REGISTRY_IMAGE}"
+            echo
+            echo '```'
+            echo "${REGISTRY_IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Tags:"
+            jq -r '.tags[] | "- " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON"
+            echo
+            echo "Verify:"
+            echo
+            echo '```'
+            echo "gh attestation verify oci://${REGISTRY_IMAGE}@${DIGEST} --owner ${GITHUB_REPOSITORY_OWNER} --signer-workflow ${GITHUB_WORKFLOW_REF%%@*} --source-ref ${GITHUB_REF} --deny-self-hosted-runners"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
