@@ -17,15 +17,17 @@
 //! are still reported for that screen; they just no longer hold the gate. Gas
 //! is priced by [`crate::panel::native_price`].
 //!
-//! Being a dollar is checked, not assumed. The pool's DEBT side is whatever
-//! the corridor quotes against, and Textile lists corridors whose debt token
-//! is not a dollar at all — `cNGN ↔ GD` on Celo prices in GoodDollar, worth
-//! about $0.00006. So the debt side counts at a dollar only when it is on
-//! [`DOLLAR_TOKENS`], and the soft side is valued off the pool's feed only
-//! then too: that feed reads DEBT per collateral, which is dollars per token
-//! exactly when the debt token is one. On any other pool both rows come back
-//! unpriced, `funded` is unknown, and the gate refuses — rather than certify a
-//! wallet holding a tenth of a cent and start a bot with nothing to quote.
+//! Being a dollar is checked, not assumed. Textile lists corridors whose debt
+//! token is not a dollar at all — `cNGN ↔ GD` on Celo prices in GoodDollar,
+//! worth about $0.00006 — and corridors whose dollar is the COLLATERAL
+//! (`USDT ↔ cNGN` on Ethereum quotes in cNGN). So a token counts at a dollar
+//! only when it is on [`DOLLAR_TOKENS`], on whichever side of its pool it
+//! sits, and the other side is valued off the pool's feed (DEBT per
+//! collateral): as read when the debt is the dollar, inverted when the
+//! collateral is (see [`PriceRule`]). On a pool with no dollar on either side
+//! both rows come back unpriced, `funded` is unknown, and the gate refuses —
+//! rather than certify a wallet holding a tenth of a cent and start a bot with
+//! nothing to quote.
 //!
 //! Approvals are NOT limited to the side that holds money, and the gas figure
 //! is sized accordingly. The bot's own preflight (`src/main.rs`) refuses to
@@ -164,15 +166,15 @@ pub struct FundingTokenBody {
     pub balance: Option<String>,
     /// The same balance in whole tokens, e.g. `"25"` or `"0.5"`.
     pub balance_text: Option<String>,
-    /// Dollars per whole token. `1.0` for the stable side.
+    /// Dollars per whole token. `1.0` for a token on [`DOLLAR_TOKENS`].
     pub price: Option<f64>,
-    /// `"fixed"` for the stable side, `"feed"` when the pool's feed answered,
+    /// `"fixed"` for a dollar token, `"feed"` when the pool's feed answered,
     /// `"nav"` for vault shares valued at the vault's last settled NAV.
     pub price_source: Option<&'static str>,
     /// Why `price` is null, in operator words.
     pub price_error: Option<String>,
     /// This token can never be valued in dollars on this bot, because the pool
-    /// it came from does not quote against a dollar stable.
+    /// it came from has a dollar stable on neither side.
     ///
     /// The per-row twin of [`FundingGateBody::unpriceable`], which can only
     /// speak for the whole bot. A bot with one dollar pool and one that is not
@@ -367,17 +369,49 @@ struct TokenPlan {
     key: String,
     role: &'static str,
     decimals: u8,
-    /// The feed that prices it (soft tokens only).
-    feed_url: Option<String>,
+    /// How its dollar price is found, from the pool that planned it.
+    price_rule: PriceRule,
     /// The ticker the corridor gives it, when it has one.
     ticker: Option<String>,
-    /// This pool quotes against a known dollar stable, so its rows can be
-    /// valued in dollars: the debt side at 1.0, the collateral side off the
-    /// feed. False leaves both rows unpriced.
-    priced_in_usd: bool,
     approval_needed: bool,
     required: U256,
     uses_max_liquidity: bool,
+}
+
+/// How a token's dollar price is found.
+///
+/// A pool's feed reads debt per collateral. That is a dollar price for the
+/// collateral when the debt token is a dollar, and the inverse of one for the
+/// debt token when the collateral is a dollar (`USDT ↔ cNGN` on Ethereum
+/// quotes cNGN per USDT). A pool with no dollar on either side has no dollar
+/// price at all.
+#[derive(Debug, Clone, PartialEq)]
+enum PriceRule {
+    /// On [`DOLLAR_TOKENS`]: 1.0, whichever side of its pool it sits on.
+    Dollar,
+    /// The collateral of a pool quoted in a dollar: the feed, as read.
+    Feed(String),
+    /// The debt of a pool whose collateral is a dollar: one over the feed.
+    InverseFeed(String),
+    /// Neither side of its pool is a dollar.
+    NotADollarPair,
+}
+
+impl PriceRule {
+    fn feed_url(&self) -> Option<&str> {
+        match self {
+            PriceRule::Feed(url) | PriceRule::InverseFeed(url) => Some(url),
+            PriceRule::Dollar | PriceRule::NotADollarPair => None,
+        }
+    }
+}
+
+impl TokenPlan {
+    /// Its pool has a dollar on one side, so this row can be valued in
+    /// dollars once the feed answers.
+    fn priced_in_usd(&self) -> bool {
+        self.price_rule != PriceRule::NotADollarPair
+    }
 }
 
 /// What came back from the chain for one token.
@@ -631,7 +665,7 @@ pub async fn read_funding(
 
     // Read off the plans, not off the rows: a row can also be unpriced because
     // a feed is down, which does clear by waiting. This one does not.
-    let unpriceable = !plans.is_empty() && plans.iter().all(|p| !p.priced_in_usd);
+    let unpriceable = !plans.is_empty() && plans.iter().all(|p| !p.priced_in_usd());
     let gate = gate_of(&tokens, &gas, min_gas, unpriceable);
     let network_label = cfg
         .pools
@@ -719,39 +753,33 @@ struct PlanPrice {
     error: Option<String>,
 }
 
-/// Price one plan off the feeds already fetched.
-///
-/// A pool that doesn't quote against a dollar can't be valued in dollars on
-/// either side: the feed reads debt per collateral, so it is only a dollar
-/// price when the debt token is a dollar.
+/// Price one plan off the feeds already fetched, by its [`PriceRule`].
 fn price_of(plan: &TokenPlan, feed_prices: &HashMap<String, Result<f64, String>>) -> PlanPrice {
     let unpriced = |why: String| PlanPrice {
         price: None,
         source: None,
         error: Some(why),
     };
-    if !plan.priced_in_usd {
-        return unpriced(NOT_A_DOLLAR_PAIR.to_string());
-    }
-    if plan.role == "stable" {
-        return PlanPrice {
+    let fed = |url: &str| match feed_prices.get(url) {
+        Some(Ok(p)) => Ok(*p),
+        Some(Err(e)) => Err(e.clone()),
+        None => Err("this pool has no price feed".to_string()),
+    };
+    let from_feed = |price: f64| PlanPrice {
+        price: Some(price),
+        source: Some("feed"),
+        error: None,
+    };
+    match &plan.price_rule {
+        PriceRule::NotADollarPair => unpriced(NOT_A_DOLLAR_PAIR.to_string()),
+        PriceRule::Dollar => PlanPrice {
             price: Some(1.0),
             source: Some("fixed"),
             error: None,
-        };
-    }
-    match plan
-        .feed_url
-        .as_deref()
-        .and_then(|url| feed_prices.get(url))
-    {
-        Some(Ok(p)) => PlanPrice {
-            price: Some(*p),
-            source: Some("feed"),
-            error: None,
         },
-        Some(Err(e)) => unpriced(e.clone()),
-        None => unpriced("this pool has no price feed".to_string()),
+        PriceRule::Feed(url) => fed(url).map_or_else(unpriced, from_feed),
+        // `is_price_usable` already refused a zero or negative feed price.
+        PriceRule::InverseFeed(url) => fed(url).map_or_else(unpriced, |p| from_feed(1.0 / p)),
     }
 }
 
@@ -781,7 +809,7 @@ fn row_of(
         price: price.price,
         price_source: price.source,
         price_error: price.error.clone(),
-        unpriceable: !plan.priced_in_usd,
+        unpriceable: !plan.priced_in_usd(),
         usd,
         funded: usd.map(|u| u >= FUND_MIN_TOKEN_USD),
         approval_needed: plan.approval_needed,
@@ -836,7 +864,7 @@ fn share_row(
         price: price.price,
         price_source: price.source,
         price_error: price.error,
-        unpriceable: settlement.is_some_and(|(plan, _)| !plan.priced_in_usd),
+        unpriceable: settlement.is_some_and(|(plan, _)| !plan.priced_in_usd()),
         usd,
         funded: None,
         approval_needed: false,
@@ -904,20 +932,18 @@ fn plan_tokens(cfg: &Config, vaulted: bool) -> Result<Vec<TokenPlan>, ApiError> 
             .feed_url
             .clone()
             .unwrap_or_else(|| cfg.feed.url.clone());
-        // Both rows of a pool are quoted in its debt token, so one question
-        // settles both: is that token a dollar?
         let debt = parse_token(&pool.debt, "stable")?;
-        let priced_in_usd = is_dollar_token(cfg.chain_id, &format!("{debt:#x}"));
-        for (raw, role, decimals, feed) in [
-            (&pool.debt, "stable", pool.debt_decimals, None),
+        let collateral = parse_token(&pool.collateral, "soft")?;
+        let rules = pool_price_rules(cfg.chain_id, collateral, debt, &feed_url);
+        for (address, role, decimals, price_rule) in [
+            (debt, "stable", pool.debt_decimals, rules.debt),
             (
-                &pool.collateral,
+                collateral,
                 "soft",
                 pool.collateral_decimals,
-                Some(feed_url.clone()),
+                rules.collateral,
             ),
         ] {
-            let address = parse_token(raw, role)?;
             let key = format!("{address:#x}");
             if plans.iter().any(|p| p.key == key) {
                 continue;
@@ -929,8 +955,7 @@ fn plan_tokens(cfg: &Config, vaulted: bool) -> Result<Vec<TokenPlan>, ApiError> 
                 key,
                 role,
                 decimals,
-                feed_url: feed,
-                priced_in_usd,
+                price_rule,
                 approval_needed: req.is_some(),
                 required: req.map(|r| r.required).unwrap_or(U256::ZERO),
                 uses_max_liquidity: req.map(|r| r.uses_max_liquidity).unwrap_or(false),
@@ -938,6 +963,41 @@ fn plan_tokens(cfg: &Config, vaulted: bool) -> Result<Vec<TokenPlan>, ApiError> 
         }
     }
     Ok(plans)
+}
+
+/// How each side of one pool is priced. The dollar is fixed at 1.0 on
+/// whichever side it sits, and the other side takes the feed (debt per
+/// collateral) the right way up. Both sides a dollar (USDC/USDT) needs no feed.
+struct PoolPriceRules {
+    collateral: PriceRule,
+    debt: PriceRule,
+}
+
+fn pool_price_rules(
+    chain_id: u64,
+    collateral: Address,
+    debt: Address,
+    feed_url: &str,
+) -> PoolPriceRules {
+    let is_dollar = |a: Address| is_dollar_token(chain_id, &format!("{a:#x}"));
+    match (is_dollar(collateral), is_dollar(debt)) {
+        (true, true) => PoolPriceRules {
+            collateral: PriceRule::Dollar,
+            debt: PriceRule::Dollar,
+        },
+        (false, true) => PoolPriceRules {
+            collateral: PriceRule::Feed(feed_url.to_string()),
+            debt: PriceRule::Dollar,
+        },
+        (true, false) => PoolPriceRules {
+            collateral: PriceRule::Dollar,
+            debt: PriceRule::InverseFeed(feed_url.to_string()),
+        },
+        (false, false) => PoolPriceRules {
+            collateral: PriceRule::NotADollarPair,
+            debt: PriceRule::NotADollarPair,
+        },
+    }
 }
 
 /// One of a pool's token addresses, or a 400 naming the side that is wrong.
@@ -1247,12 +1307,9 @@ pub(super) fn decode_string_return(out: &[u8]) -> Option<String> {
 async fn fetch_feed_prices(plans: &[TokenPlan]) -> HashMap<String, Result<f64, String>> {
     let mut urls: Vec<&str> = Vec::new();
     for plan in plans {
-        // A pool that doesn't quote against a dollar is unpriced whatever its
-        // feed says, so there is nothing to fetch for it.
-        if !plan.priced_in_usd {
-            continue;
-        }
-        if let Some(url) = plan.feed_url.as_deref() {
+        // Only a row priced off its pool's feed needs one: a dollar is fixed,
+        // and a pool with no dollar side is unpriced whatever its feed says.
+        if let Some(url) = plan.price_rule.feed_url() {
             if !urls.contains(&url) {
                 urls.push(url);
             }
@@ -2671,6 +2728,89 @@ mod tests {
         // with an explanation instead of polling a wallet that cannot clear it
         // and asking for money that would not help.
         assert_eq!(v["gate"]["unpriceable"], true, "{body}");
+    }
+
+    /// Textile lists `USDT ↔ cNGN` on Ethereum: the dollar is the pool's
+    /// COLLATERAL and cNGN its debt, so the feed reads cNGN per USDT. Valuing
+    /// off the debt side alone left a wallet of nothing but USDT reading
+    /// "+ unpriced USDT" with no dollar figure. The dollar is $1 on whichever
+    /// side it sits, and the other side is the feed inverted.
+    #[tokio::test]
+    async fn a_pool_whose_collateral_is_the_dollar_still_values_both_sides() {
+        let h = harness("funding-dollar-collateral");
+        let node = mock_rpc(
+            MockChain::on(CELO_CHAIN)
+                .balance(USDT, 70_000_000_000)
+                .balance(CNGN, 1_458_700_000)
+                .native(20_000_000_000_000_000_000)
+                .symbol(USDT, "USDT")
+                .symbol(CNGN, "cNGN"),
+        )
+        .await;
+        // cNGN per USDT, the way an inverted feed answers.
+        let api = mock_api(200, 200, 1458.7).await;
+        seed(&h, "bot-a", &node.url, &api.base, &feed_of(&api));
+        let path = h.root.join("bot-a").join("stitch.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(USDT, "SWAP")
+            .replace(CNGN, USDT)
+            .replace("SWAP", CNGN);
+        std::fs::write(&path, toml).unwrap();
+
+        let (status, body) = h.get("/api/bots/bot-a/funding").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = Harness::parse(&body);
+        let by_token = |address: &str| {
+            v["tokens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["token"] == address.to_lowercase())
+                .unwrap_or_else(|| panic!("no {address} row: {body}"))
+                .clone()
+        };
+        let usdt = by_token(USDT);
+        assert_eq!(
+            usdt["role"], "soft",
+            "USDT is this pool's collateral: {body}"
+        );
+        assert_eq!(usdt["price"], 1.0, "{body}");
+        assert_eq!(usdt["priceSource"], "fixed", "{body}");
+        assert_eq!(usdt["usd"], 70_000.0, "{body}");
+        assert_eq!(usdt["unpriceable"], false, "{body}");
+        let cngn = by_token(CNGN);
+        assert_eq!(cngn["priceSource"], "feed", "{body}");
+        let usd = cngn["usd"].as_f64().unwrap();
+        assert!(
+            (usd - 1.0).abs() < 1e-9,
+            "1458.7 cNGN at 1458.7 per dollar: {body}"
+        );
+        assert_eq!(cngn["unpriceable"], false, "{body}");
+        assert_eq!(v["gate"]["unpriceable"], false, "{body}");
+        assert_eq!(v["gate"]["needsSide"], false, "{body}");
+    }
+
+    /// A dollar is a dollar whichever pool listed it first. Tokens are planned
+    /// once per bot, so a USDT first seen as some pool's collateral must not
+    /// take a feed price (or none) when another pool quotes against it.
+    #[test]
+    fn a_dollar_token_prices_at_one_on_either_side_of_its_pool() {
+        let toml = include_str!("../../setup/templates/cngn-usdt-celo.toml");
+        let usdt = "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e";
+        let cngn = "0xF6829D7393dAe24509eb1E52eE8e572e2E271a4f";
+        let swapped = toml
+            .replace(usdt, "SWAP")
+            .replace(cngn, usdt)
+            .replace("SWAP", cngn);
+        let cfg = Config::from_toml(&swapped).unwrap();
+        let plans = plan_tokens(&cfg, true).unwrap();
+        let fed = HashMap::from([(cfg.feed.url.clone(), Ok::<f64, String>(1458.7))]);
+        let usdt_plan = plans.iter().find(|p| p.key == usdt.to_lowercase()).unwrap();
+        assert_eq!(price_of(usdt_plan, &fed).price, Some(1.0));
+        let cngn_plan = plans.iter().find(|p| p.key == cngn.to_lowercase()).unwrap();
+        let cngn_price = price_of(cngn_plan, &fed).price.unwrap();
+        assert!((cngn_price - 1.0 / 1458.7).abs() < 1e-12, "{cngn_price}");
     }
 
     /// The flag is about the pair, not about the wallet or the feed: a normal

@@ -483,7 +483,7 @@ export interface FundingToken {
   /** Why `price` is null, in the panel's words. */
   priceError: string | null
   /**
-   * This token's pool does not quote against a dollar stable, so no wallet
+   * Neither side of this token's pool is a dollar stable, so no wallet
    * balance and no feed can ever value it. The per-row twin of
    * `FundingGate.unpriceable`, which only speaks for the whole bot: a bot with
    * one dollar corridor and one without leaves that flag false while these rows
