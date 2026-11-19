@@ -175,9 +175,9 @@ export interface Settings {
   minSpreadBps: string
   /** Why this pool can't switch a side to an absolute spread, or null. */
   absoluteSpreadRefusal: string | null
-  /** Why this pool can't take a minimum spread (live lean, inventory
-   * balancing), or null. */
-  spreadFloorRefusal: string | null
+  /** What floors this pool's spreads instead of the minimum spread, or
+   * null when the minimum spread is the floor. */
+  spreadFloorOwner: 'lean' | 'inventory' | null
   takerEnabled: boolean
   poolIndex: number
   poolCount: number

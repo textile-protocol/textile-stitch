@@ -162,8 +162,9 @@ pub struct SettingsBody {
     pub min_spread_bps: String,
     /// Why this pool can't switch a side to an absolute spread, or null.
     pub absolute_spread_refusal: Option<String>,
-    /// Why this pool can't take a minimum spread, or null.
-    pub spread_floor_refusal: Option<String>,
+    /// `lean` or `inventory` when that sets the floor instead of the
+    /// minimum spread, or null.
+    pub spread_floor_owner: Option<crate::config::SpreadFloorOwner>,
     pub taker_enabled: bool,
     pub pool_index: usize,
     pub pool_count: usize,
@@ -227,7 +228,7 @@ impl SettingsBody {
             sell: SpreadBody::from(&v.sell),
             min_spread_bps: v.min_spread_bps.clone(),
             absolute_spread_refusal: v.absolute_spread_refusal.clone(),
-            spread_floor_refusal: v.spread_floor_refusal.clone(),
+            spread_floor_owner: v.spread_floor_owner,
             taker_enabled: v.taker_enabled,
             pool_index: v.pool_index,
             pool_count: v.pool_count,
@@ -3239,6 +3240,7 @@ mod tests {
         assert_eq!(settings["sell"], json!({ "kind": "abs", "value": "1" }));
         assert_eq!(settings["minSpreadBps"], "5");
         assert_eq!(settings["absoluteSpreadRefusal"], serde_json::Value::Null);
+        assert_eq!(settings["spreadFloorOwner"], serde_json::Value::Null);
     }
 
     #[tokio::test]

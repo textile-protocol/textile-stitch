@@ -1151,6 +1151,33 @@ fn feed_sides_pool_conflicts(pool: &PoolConfig, idx: usize) -> anyhow::Result<()
     }
 }
 
+/// What floors a pool's spreads when `min_spread_bps` can't
+/// ([`Config::spread_floor_owner`]). The panel names it to the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpreadFloorOwner {
+    /// Live lean, down to `lean_floor_bps`.
+    Lean,
+    /// Inventory balancing, down to `modules.inventory.spread_floor_bps`.
+    Inventory,
+}
+
+impl SpreadFloorOwner {
+    /// Why the pool floor is refused, for the config load error.
+    fn refusal(self) -> &'static str {
+        match self {
+            Self::Lean => {
+                "live lean quotes the ladder and the taker leg at its own prices, down to \
+                 lean_floor_bps. Set that floor instead."
+            }
+            Self::Inventory => {
+                "inventory balancing narrows spreads down to its own floor \
+                 (modules.inventory.spread_floor_bps). Set that floor instead."
+            }
+        }
+    }
+}
+
 fn spread_from(bps: Option<u32>, abs: Option<f64>, min_bps: Option<u32>) -> Option<Spread> {
     match (bps, abs) {
         (Some(b), _) => Some(Spread::Bps(b)),
@@ -1777,25 +1804,28 @@ impl Config {
         Some(reason.to_string())
     }
 
-    /// Why pool `idx` can't take `min_spread_bps`, or `None` when it can.
-    /// The floor holds where a side prices through `bid_price`/`ask_price`;
-    /// these two narrow a spread on purpose after that, each down to its own
-    /// floor, so a minimum set here would show in the panel and not hold.
-    pub fn spread_floor_refusal(&self, idx: usize) -> Option<String> {
+    /// What floors pool `idx`'s spreads in place of `min_spread_bps`, or
+    /// `None` when `min_spread_bps` is the floor. The pool floor holds where a
+    /// side prices through `bid_price`/`ask_price`; live lean and inventory
+    /// balancing narrow a spread on purpose after that, each down to a floor
+    /// of its own, so a pool floor there would show and not hold.
+    pub fn spread_floor_owner(&self, idx: usize) -> Option<SpreadFloorOwner> {
         let pool = self.pools.get(idx)?;
-        let inventory = idx == 0
+        if pool.lean_mode() == LeanMode::Live {
+            Some(SpreadFloorOwner::Lean)
+        } else if idx == 0
             && self.modules_enabled
-            && self.modules.runs(crate::modules::Module::Inventory);
-        let reason = if pool.lean_mode() == LeanMode::Live {
-            "live lean quotes the ladder and the taker leg at its own prices, down to \
-             lean_floor_bps. Set that floor instead."
-        } else if inventory {
-            "inventory balancing narrows spreads down to its own spread floor \
-             (modules.inventory.spread_floor_bps). Set that floor instead."
+            // Live, not merely running: in Preview inventory balancing only
+            // records its decision and quotes go out at the base spreads
+            // (`ModulesConfig::live_quotes`), so the pool floor is the one
+            // that holds. Switching it to Live re-validates the config and
+            // refuses a pool floor then.
+            && self.modules.is_live(crate::modules::Module::Inventory)
+        {
+            Some(SpreadFloorOwner::Inventory)
         } else {
-            return None;
-        };
-        Some(reason.to_string())
+            None
+        }
     }
 
     /// What profit unwind needs, once modules are known to quote one
@@ -2050,8 +2080,11 @@ impl Config {
                 }
             }
             if let Some(min) = pool.min_spread_bps {
-                if let Some(reason) = self.spread_floor_refusal(idx) {
-                    anyhow::bail!("pools[{idx}].min_spread_bps can't hold here: {reason}");
+                if let Some(owner) = self.spread_floor_owner(idx) {
+                    anyhow::bail!(
+                        "pools[{idx}].min_spread_bps can't hold here: {}",
+                        owner.refusal()
+                    );
                 }
                 let absolute = [pool.buy_spread(), pool.sell_spread()]
                     .into_iter()
@@ -3193,22 +3226,48 @@ mod tests {
             "{LEAN_POOL_BASE}lean_shadow = true\nlean_floor_bps = 3.0"
         ));
         let cfg = Config::from_toml(&shadow).expect("floor beside shadow lean");
-        assert_eq!(cfg.spread_floor_refusal(0), None);
-
-        let inventory = curve_bot(
-            "min_spread_bps = 5",
-            true,
-            "[modules.inventory]\nenabled = true\n",
-        )
-        .replace("[modules.curve]\nenabled = true\n", "")
-        .replace("sell_offset_bps = 150", "sell_offset_abs = 2.0");
-        let e = Config::from_toml(&inventory).expect_err("floor under inventory balancing");
-        assert!(format!("{e:#}").contains("inventory balancing"), "{e:#}");
-        let off = inventory.replace(
-            "[modules.inventory]\nenabled = true\n",
-            "[modules.inventory]\nenabled = false\n",
+        assert_eq!(cfg.spread_floor_owner(0), None);
+        assert_eq!(
+            Config::from_toml(&live.replace("min_spread_bps = 5", ""))
+                .unwrap()
+                .spread_floor_owner(0),
+            Some(SpreadFloorOwner::Lean)
         );
-        Config::from_toml(&off).expect("floor with inventory balancing off");
+
+        let inventory = |modules: &str| {
+            curve_bot("min_spread_bps = 5", true, modules)
+                .replace("[modules.curve]\nenabled = true\n", "")
+                .replace("sell_offset_bps = 150", "sell_offset_abs = 2.0")
+        };
+        let live = inventory("[modules.inventory]\nenabled = true\nmode = \"live\"\n");
+        let e = Config::from_toml(&live).expect_err("floor under live inventory balancing");
+        assert!(format!("{e:#}").contains("inventory balancing"), "{e:#}");
+        assert_eq!(
+            Config::from_toml(&live.replace("min_spread_bps = 5", ""))
+                .unwrap()
+                .spread_floor_owner(0),
+            Some(SpreadFloorOwner::Inventory)
+        );
+        // Preview (the default mode) only records: quotes go out at the base
+        // spreads, so the pool floor is the one that holds.
+        let preview = Config::from_toml(&inventory("[modules.inventory]\nenabled = true\n"))
+            .expect("floor beside inventory balancing in Preview");
+        assert!(!preview.modules.is_live(crate::modules::Module::Inventory));
+        assert_eq!(preview.spread_floor_owner(0), None);
+        Config::from_toml(&inventory("[modules.inventory]\nenabled = false\n"))
+            .expect("floor with inventory balancing off");
+    }
+
+    #[test]
+    fn the_floor_owner_reaches_the_panel_as_a_plain_word() {
+        assert_eq!(
+            serde_json::to_value(SpreadFloorOwner::Lean).unwrap(),
+            "lean"
+        );
+        assert_eq!(
+            serde_json::to_value(SpreadFloorOwner::Inventory).unwrap(),
+            "inventory"
+        );
     }
 
     #[test]

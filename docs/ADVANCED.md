@@ -226,9 +226,12 @@ at that many bps: below it, the side quotes at the floor instead. It only
 applies to absolute sides, and the bot refuses it on a pool that has none. Set
 it at or above the feed's measured error. The panel's Spreads card warns when
 an absolute side has no floor. The floor holds where Stitch prices the side
-from its spread, so it's refused with live lean and with inventory balancing:
-both narrow spreads on purpose, each down to its own floor (`lean_floor_bps`,
-`modules.inventory.spread_floor_bps`). Set that floor instead.
+from its spread, so it's refused with live lean and with inventory balancing in
+Live: both narrow spreads on purpose, each down to its own floor
+(`lean_floor_bps`, `modules.inventory.spread_floor_bps`). Set that floor
+instead. Inventory balancing in Preview only records its decision, so the pool
+floor still holds there; switching it to Live with a pool floor set is refused
+until you clear the floor.
 
 On a reversed pool (collateral USDT, feed with `invert=1`) collateral per debt
 is USDT per cNGN, so an absolute offset there is in dollars per local unit. The

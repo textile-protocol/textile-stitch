@@ -216,7 +216,7 @@ export default function SettingsForm({
         }
       >
         <div className="space-y-4">
-          <SpreadSides loaded={loaded} draft={draft} set={set} />
+          <SpreadSides botName={bot.name} loaded={loaded} draft={draft} set={set} />
           {loaded.bookEnabled && (
           <div className="grid gap-4 border-t border-line-soft pt-4 sm:grid-cols-2">
             <Field
@@ -530,10 +530,12 @@ function CorridorsCard({
  * floor in bps: a fixed offset gets thinner the weaker the collateral is.
  */
 function SpreadSides({
+  botName,
   loaded,
   draft,
   set,
 }: {
+  botName: string
   loaded: Settings
   draft: Settings
   set: <K extends keyof Settings>(key: K, value: Settings[K]) => void
@@ -554,7 +556,6 @@ function SpreadSides({
   const unit = absoluteUnit(label)
   const symbols = pairSymbols(label)
   const absolute = draft.buy.kind === 'abs' || draft.sell.kind === 'abs'
-  const floorRefusal = loaded.spreadFloorRefusal
   const units = (side: Side) => ({
     absLabel: unit,
     refusal: loaded.absoluteSpreadRefusal,
@@ -602,15 +603,14 @@ function SpreadSides({
           {unit}, from the pool's price feed.
         </p>
       )}
-      {absolute && (
+      {absolute && loaded.spreadFloorOwner && (
+        <FloorOwnerNote owner={loaded.spreadFloorOwner} botName={botName} />
+      )}
+      {absolute && !loaded.spreadFloorOwner && (
         <div className="grid gap-4 sm:grid-cols-2">
           <Field
             label="Minimum spread (bps)"
-            hint={
-              floorRefusal
-                ? `Not available on this pool: ${floorRefusal}`
-                : `A fixed offset gets thinner in bps as ${symbols?.collateral ?? 'the collateral'} weakens. Below this, an absolute side quotes at this many bps instead. Empty = no floor.`
-            }
+            hint={`A fixed offset gets thinner in bps as ${symbols?.collateral ?? 'the collateral'} weakens. Below this, an absolute side quotes at this many bps instead. Empty = no floor.`}
           >
             <Input
               type="number"
@@ -618,11 +618,11 @@ function SpreadSides({
               step={1}
               placeholder="e.g. 5"
               value={draft.minSpreadBps}
-              disabled={!loaded.editable || !!floorRefusal}
+              disabled={!loaded.editable}
               onChange={(e) => set('minSpreadBps', e.target.value)}
             />
           </Field>
-          {draft.minSpreadBps.trim() === '' && !floorRefusal && (
+          {draft.minSpreadBps.trim() === '' && (
             <div className="self-start sm:mt-6">
               <Banner tone="warning">
                 No floor set. An absolute spread has no lower limit in bps, so it
@@ -634,6 +634,36 @@ function SpreadSides({
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * Where an absolute side's floor is set when it isn't the minimum spread:
+ * live lean and inventory balancing narrow spreads after it, each down to a
+ * floor of its own, so that floor is the one that holds.
+ */
+function FloorOwnerNote({
+  owner,
+  botName,
+}: {
+  owner: 'lean' | 'inventory'
+  botName: string
+}) {
+  return (
+    <p className="text-xs text-faint">
+      {owner === 'inventory' ? (
+        <>
+          Inventory balancing sets this pool's floor: Minimum quote margin, under
+          Price adjustments in the{' '}
+          <Link to={botPath(botName, 'modules')} className="underline">
+            Modules tab
+          </Link>
+          .
+        </>
+      ) : (
+        <>Live lean sets this pool's floor: its Lean floor, under Experimental below.</>
+      )}
+    </p>
   )
 }
 

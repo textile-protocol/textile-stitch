@@ -103,9 +103,10 @@ pub struct SettingsView {
     /// Why this pool can't take an absolute spread, or `None` when it can
     /// ([`Config::absolute_spread_refusal`]).
     pub absolute_spread_refusal: Option<String>,
-    /// Why this pool can't take `min_spread_bps`, or `None` when it can
-    /// ([`Config::spread_floor_refusal`]).
-    pub spread_floor_refusal: Option<String>,
+    /// What floors this pool's spreads instead of `min_spread_bps` (live
+    /// lean, inventory balancing), or `None` when that field is the floor
+    /// ([`Config::spread_floor_owner`]).
+    pub spread_floor_owner: Option<crate::config::SpreadFloorOwner>,
     /// Whether the taker leg is on: fill users' resting limit orders when they
     /// cross the bot's own quote. The raw configured flag, not the spread-gated
     /// effective one, so a saved-but-spreadless value round-trips.
@@ -282,7 +283,7 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
         sell: spread_edit(pool.sell_offset_bps, pool.sell_offset_abs),
         min_spread_bps: opt_num(pool.min_spread_bps),
         absolute_spread_refusal: cfg.absolute_spread_refusal(pool_index),
-        spread_floor_refusal: cfg.spread_floor_refusal(pool_index),
+        spread_floor_owner: cfg.spread_floor_owner(pool_index),
         taker_enabled: pool.limit_taker_enabled.unwrap_or(false),
         pool_index,
         pool_count,
