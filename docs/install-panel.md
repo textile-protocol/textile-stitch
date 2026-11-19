@@ -145,7 +145,7 @@ irm https://raw.githubusercontent.com/textile-protocol/textile-stitch/main/insta
 |----------|---------|------|
 | `PANEL_MODE` | asked | `local` (password) or `server` (Tailscale). |
 | `PANEL_PASSWORD` | asked | Required for fresh installs. Existing identity-login servers can set it in the UI. |
-| `TS_AUTHKEY` | asked on server | Non-ephemeral Tailscale enrollment key; use a short expiration. |
+| `TS_AUTHKEY` | asked on first server enrollment | Short-lived, one-use, non-ephemeral key. Remove after enrollment; persist `tailscale-state`. |
 | `PANEL_BOTS_DIR` | `~/stitch-bots` / `/srv/stitch/bots` | Where bot configs live on the host. |
 | `PANEL_DIR` | `~/stitch-panel` | Where the compose file and `.env` go. |
 | `PANEL_IMAGE` | published `:latest` | Pin a `sha-*` tag or digest in production. |
@@ -193,13 +193,14 @@ Everything below runs from a checkout on the Docker host.
 3. **Write `.env`** next to `docker-compose.panel.yml` and keep it owner-only:
 
    ```bash
+   PANEL_MODE=server
    TS_AUTHKEY=tskey-auth-...
    PANEL_PASSWORD_HASH='$argon2id$v=19$m=19456,t=2,p=1$...'
    PANEL_BOTS_DIR=/srv/stitch/bots
    ```
 
-   Mint the non-ephemeral auth key in the Tailscale admin console. Use a short
-   expiration for enrollment credentials. Quote the hash: it contains `$`.
+   Mint a short-lived, one-use, non-ephemeral auth key in the Tailscale admin
+   console. Quote the hash: it contains `$`.
    Run `chmod 600 .env`.
 
 4. **Start it and sign in.**
@@ -211,6 +212,14 @@ Everything below runs from a checkout on the Docker host.
 
    Open `https://stitch-panel.<your-tailnet>.ts.net` from an allowed device and
    log in with the panel password.
+
+5. **Finish enrollment cleanup and access checks.** Follow
+   [production access](production-access.md): verify the enrolled node and
+   password login, revoke the enrollment key, remove `TS_AUTHKEY` from `.env`
+   and your shell, then recreate the sidecar and panel without deleting the
+   state volume. Confirm an unapproved user/device cannot connect. Keep
+   `PANEL_MODE=server` in `.env` so future installer runs retain server mode.
+   This also applies to unattended and agent-assisted installs.
 
 ### How the login works
 

@@ -116,6 +116,70 @@ shutil.copyfile(source / name, sys.argv[sys.argv.index('-o') + 1])
         self.assert_started(result, calls)
         self.assertIn('Set panel password', result.stdout)
 
+    def test_legacy_server_without_enrollment_key_keeps_browser_password_setup(self):
+        self.existing()
+        env_file = self.install / '.env'
+        env_file.write_text('PANEL_USERS=alice@example.com\n')
+        result, calls = self.run_installer(TS_AUTHKEY='', PANEL_MODE='local')
+        self.assert_started(result, calls)
+        self.assertIn('Set panel password', result.stdout)
+        self.assertIn('PANEL_MODE=server', env_file.read_text())
+        self.assertNotIn('TS_AUTHKEY=', env_file.read_text())
+        self.assertTrue((self.install / 'docker-compose.panel.yml').exists())
+        self.assertFalse((self.install / 'docker-compose.panel.local.yml').exists())
+
+    def test_server_mode_survives_enrollment_cleanup_and_repeated_installer_runs(self):
+        self.existing("'" + HASH + "'")
+        result, calls = self.run_installer()
+        self.assert_started(result, calls)
+        env_file = self.install / '.env'
+        # After migration, both the enrollment key and old identity allowlist
+        # can be removed. The persisted mode must still select server Compose.
+        env_file.write_text('\n'.join(
+            line for line in env_file.read_text().splitlines()
+            if not line.startswith(('TS_AUTHKEY=', 'PANEL_USERS='))
+        ) + '\n')
+        result, calls = self.run_installer(TS_AUTHKEY='', PANEL_MODE='local')
+        self.assert_started(result, calls)
+        self.assertEqual(env_file.read_text().count('PANEL_MODE=server'), 1)
+        self.assertFalse(any(call[0] == 'run' for call in calls))
+        self.assertFalse((self.install / 'docker-compose.panel.local.yml').exists())
+
+    def test_empty_saved_mode_is_replaced_without_corrupting_existing_credentials(self):
+        self.existing()
+        env_file = self.install / '.env'
+        # A manually edited file may end without a newline or have an empty
+        # mode. Record one usable mode without appending to the last value.
+        env_file.write_text("PANEL_MODE=\nPANEL_PASSWORD_HASH='" + HASH + "'")
+        shutil.copyfile(ROOT / 'docker-compose.panel.yml', self.install / 'docker-compose.panel.yml')
+        result, calls = self.run_installer(TS_AUTHKEY='')
+        self.assert_started(result, calls)
+        self.assertIn("PANEL_PASSWORD_HASH='" + HASH + "'", env_file.read_text().splitlines())
+        self.assertEqual(env_file.read_text().count('PANEL_MODE='), 1)
+        self.assertIn('PANEL_MODE=server', env_file.read_text())
+        self.assertFalse(any(call[0] == 'run' for call in calls))
+
+    def test_migrated_legacy_server_is_recognized_from_its_compose_file(self):
+        env_file = self.install / '.env'
+        env_file.write_text('PANEL_LEGACY_IDENTITY_AUTH=0\n')
+        env_file.chmod(0o600)
+        shutil.copyfile(ROOT / 'docker-compose.panel.yml', self.install / 'docker-compose.panel.yml')
+        saved = self.root / 'bots/.stitch-panel-password.json'
+        saved.parent.mkdir()
+        saved.write_text('saved by panel')
+        result, calls = self.run_installer(TS_AUTHKEY='')
+        self.assert_started(result, calls)
+        self.assertIn('Keeping the password saved in the panel UI', result.stdout)
+        self.assertIn('PANEL_MODE=server', env_file.read_text())
+        self.assertEqual(saved.read_text(), 'saved by panel')
+        self.assertFalse((self.install / 'docker-compose.panel.local.yml').exists())
+
+    def test_first_server_enrollment_still_requires_a_key(self):
+        result, calls = self.run_installer(TS_AUTHKEY='', PANEL_PASSWORD=PASSWORD)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('TS_AUTHKEY is not set', result.stderr)
+        self.assertFalse(any('up' in call for call in calls))
+
     def test_new_server_without_a_password_never_starts(self):
         result, calls = self.run_installer()
         self.assertNotEqual(result.returncode, 0)
@@ -175,7 +239,7 @@ shutil.copyfile(source / name, sys.argv[sys.argv.index('-o') + 1])
 
 @unittest.skipUnless(shutil.which('docker'), 'Docker Compose is needed to validate the deployment')
 class DeploymentTests(unittest.TestCase):
-    def config(self, password=HASH, legacy="0"):
+    def config(self, password=HASH, legacy="0", auth_key='tskey-auth-test'):
         with tempfile.TemporaryDirectory() as tmp:
             shutil.copyfile(ROOT / 'docker-compose.panel.yml', Path(tmp) / 'compose.yml')
             result = subprocess.run(
@@ -184,7 +248,7 @@ class DeploymentTests(unittest.TestCase):
                 env={
                     'PATH': os.environ['PATH'],
                     'HOME': tmp,
-                    'TS_AUTHKEY': 'tskey-auth-test',
+                    'TS_AUTHKEY': auth_key,
                     'TS_EXTRA_ARGS': '--ssh=true',
                     'TS_AUTH_ONCE': 'false',
                     'STITCH_PANEL_TRUST_IDENTITY_HEADER': '1',
@@ -196,6 +260,19 @@ class DeploymentTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=30,
             )
         return result
+
+    def test_enrolled_server_config_accepts_removed_enrollment_key(self):
+        for password, legacy in ((HASH, '0'), ('', '1')):
+            with self.subTest(legacy=legacy):
+                result = self.config(password=password, legacy=legacy, auth_key='')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = json.loads(result.stdout)
+                sidecar = config['services']['tailscale']
+                self.assertEqual(sidecar['environment']['TS_AUTHKEY'], '')
+                self.assertEqual(sidecar['environment']['TS_AUTH_ONCE'], 'true')
+                state = next(v for v in sidecar['volumes'] if v['target'] == '/var/lib/tailscale')
+                self.assertEqual(state['type'], 'volume')
+                self.assertIn(state['source'], config['volumes'])
 
     def test_explicit_legacy_mode_preserves_allowlisted_identity_for_ui_migration(self):
         result = self.config(password='', legacy='1')

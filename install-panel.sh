@@ -24,7 +24,8 @@
 #   - server         → Tailscale sidecar, no host port published
 #
 # Non-interactive: set PANEL_MODE=local|server plus the mode's credentials
-# (both: PANEL_PASSWORD; server also needs TS_AUTHKEY). Optionally set
+# (fresh installs: PANEL_PASSWORD; server enrollment also needs TS_AUTHKEY).
+# Existing server operators can set their password in the UI. Optionally set
 # PANEL_BOTS_DIR, PANEL_DIR, PANEL_IMAGE, STITCH_REF, STITCH_COMPOSE_SHA256,
 # STITCH_REQUIRE_PINNED.
 
@@ -407,15 +408,25 @@ if [ -f "$env_file" ]; then
   say "$env_file already exists; its settings are reused."
   say 'Delete it first if you want to be asked again.'
   reuse_env=yes
-  # Prefer PANEL_MODE from .env; fall back to inferring from TS_AUTHKEY.
+  # Enrollment keys are removed after joining. Preserve server mode independently
+  # of the key, including legacy installs that predate an explicit PANEL_MODE.
   _saved_mode="$(env_file_get "$env_file" PANEL_MODE)"
   if [ -n "$_saved_mode" ]; then
     compose_mode="$(normalize_mode "$_saved_mode")" ||
       die "existing PANEL_MODE in $env_file is not local/server (got '$_saved_mode')"
-  elif grep -q '^TS_AUTHKEY=' "$env_file" 2>/dev/null; then
+  elif grep -q '^TS_AUTHKEY=' "$env_file" 2>/dev/null ||
+       [ -n "$(env_file_get "$env_file" PANEL_USERS)" ] ||
+       { [ -f "$PANEL_DIR/docker-compose.panel.yml" ] && [ ! -f "$PANEL_DIR/docker-compose.panel.local.yml" ]; }; then
     compose_mode=server
   else
     compose_mode=local
+  fi
+  if [ -z "$_saved_mode" ]; then
+    tmp_env="$PANEL_DIR/.env.tmp.$$"
+    sed '/^PANEL_MODE=/d' "$env_file" >"$tmp_env"
+    printf '\nPANEL_MODE=%s\n' "$compose_mode" >>"$tmp_env"
+    mv "$tmp_env" "$env_file"
+    chmod 600 "$env_file"
   fi
   # Reload pins from .env before resolving defaults — otherwise a rerun with
   # empty env defaults PANEL_IMAGE to :latest, rewrites compose to main, and
@@ -490,9 +501,9 @@ if [ "$reuse_env" = no ] && [ "$compose_mode" = server ]; then
     say 'tailnet, terminates TLS, and proxies to the panel. Nothing is published on'
     say 'this host, because reaching the panel means reaching the Docker socket.'
     say ''
-    say 'Mint a key at https://login.tailscale.com/admin/settings/keys —'
-    say 'non-ephemeral, with a short expiration. The state volume keeps the node identity.'
   fi
+  say 'Use a short-lived, one-use, non-ephemeral enrollment key; persist tailscale-state.'
+  say 'After enrollment, revoke it and remove TS_AUTHKEY; see docs/production-access.md.'
   TS_AUTHKEY="$(need "${TS_AUTHKEY:-}" 'Tailscale auth key (not shown)' TS_AUTHKEY secret)"
   [ -n "$TS_AUTHKEY" ] || die 'a Tailscale auth key is required'
   case "$TS_AUTHKEY" in
@@ -740,5 +751,9 @@ say 'approve tokens, then start. The installer does not configure bots for you.'
 say ''
 say "Logs:    cd $PANEL_DIR && docker compose -f $COMPOSE_FILE logs -f panel"
 say "Stop:    cd $PANEL_DIR && docker compose -f $COMPOSE_FILE down"
+if [ "$compose_mode" = server ]; then
+  say 'Finish enrollment cleanup and device-policy checks before production use:'
+  say 'https://github.com/textile-protocol/textile-stitch/blob/main/docs/production-access.md'
+fi
 say 'Advanced setups (custom reverse proxy, building from source):'
 say 'https://github.com/textile-protocol/textile-stitch/blob/main/docs/install-panel.md'

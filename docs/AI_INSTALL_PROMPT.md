@@ -121,8 +121,8 @@ Install procedure:
 
      PANEL_MODE=server sh "$INSTALLER_PATH"
 
-   The installer prompts for a non-ephemeral Tailscale auth key and a panel
-   password (12+ characters). Mint keys at
+   The installer prompts for a short-lived, one-use, non-ephemeral Tailscale
+   auth key and a panel password (12+ characters). Mint keys at
    https://login.tailscale.com/admin/settings/keys. Collect secrets through a
    local hidden prompt, never in chat. Restrict the panel node’s TCP 443 to
    operators in the tailnet policy. Fresh installs require a password even over
@@ -142,7 +142,17 @@ Install procedure:
    Prefer opening my browser for me when you have a tool for that
    (`open`, `xdg-open`, or equivalent).
 
-After install — tell me this and stop:
+6. Server only: finish docs/production-access.md before declaring success.
+   Confirm BackendState=Running without printing credentials, revoke the
+   enrollment key in the Tailscale admin console, remove TS_AUTHKEY from .env
+   and the shell, retain PANEL_MODE=server, and recreate tailscale and panel
+   while preserving tailscale-state. Verify password login from an approved
+   device and denial from an unapproved user/device. For legacy installs,
+   complete Set panel password in the browser. If a step needs the owner,
+   state the pending step explicitly; do not describe the server as
+   production-ready yet.
+
+After install and server cleanup — tell me this and stop:
 - Stitch panel is up at <URL>.
 - Next steps are in the web UI, not in this chat:
   1. Add corridor

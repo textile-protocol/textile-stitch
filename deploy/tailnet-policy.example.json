@@ -1,0 +1,9 @@
+{
+  "groups": {"group:stitch-admins": ["admin@example.com"]},
+  "tagOwners": {"tag:stitch-panel": ["group:stitch-admins"]},
+  "grants": [{"src": ["group:stitch-admins"], "dst": ["tag:stitch-panel"], "ip": ["tcp:443"]}],
+  "tests": [
+    {"src": "admin@example.com", "accept": ["tag:stitch-panel:443"], "deny": ["tag:stitch-panel:22", "tag:stitch-panel:8420"]},
+    {"src": "unapproved@example.com", "deny": ["tag:stitch-panel:443"]}
+  ]
+}

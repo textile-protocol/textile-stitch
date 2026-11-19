@@ -67,8 +67,8 @@ sudo chown "$USER":"$USER" /srv/stitch/bots
 
 In the Tailscale admin console: **Settings → Keys → Generate auth key**.
 
-- Use a short expiration and leave **ephemeral** off. The state volume preserves
-  the node identity across restarts.
+- Make it **short-lived, one-use and non-ephemeral**. The persisted
+  `tailscale-state` volume keeps the enrolled identity across restarts.
 - Copy the key (`tskey-auth-…`). You will paste it into the installer once.
 
 Choose a panel password with at least 12 characters and keep it in your password
@@ -105,6 +105,12 @@ STITCH_REF="$TAG" \
 
 The installer writes an owner-only `.env`, starts the published panel image with
 a Tailscale sidecar, and prints the URL. No checkout, no compile.
+
+Before production use, finish the [enrollment cleanup and access checks](production-access.md):
+revoke the enrollment key, remove `TS_AUTHKEY` from `.env` and your shell,
+retain `PANEL_MODE=server`, recreate the sidecar and panel with the same state
+volume, and confirm allowed and denied device access. Use the same process for
+unattended installs.
 
 Re-running the installer reuses existing settings and a non-empty password
 hash. Older servers with an existing identity allowlist retain access and show a

@@ -6,13 +6,15 @@
 # `tailscale serve` — there is no published port on the host at all.
 #
 # Setup, once:
-#   1. Mint a non-ephemeral auth key in the Tailscale admin console and
+#   1. Mint a short-lived, one-use, non-ephemeral auth key in the Tailscale admin console and
 #      put it in .env as TS_AUTHKEY.
 #   2. Set PANEL_PASSWORD_HASH in .env (see docs/install-panel.md), and restrict
 #      tailnet access to the panel's TCP 443 to your operators.
 #   3. Create the bots root:  sudo mkdir -p /srv/stitch/bots
 #   4. docker compose -f docker-compose.panel.yml up -d --build
 #   5. Open https://stitch-panel.<your-tailnet>.ts.net
+#   6. Revoke/remove the enrollment key after verifying access; see
+#      docs/production-access.md. Keep the tailscale-state volume.
 #
 # Local computer (password on loopback): use docker-compose.panel.local.yml, or
 # install-panel.sh with PANEL_MODE=local. Don't publish the panel beyond
@@ -26,7 +28,8 @@ services:
     # https://stitch-panel.<tailnet>.ts.net once serve is up.
     hostname: stitch-panel
     environment:
-      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in .env — mint one in the Tailscale admin console}
+      # Required only for first enrollment or recovery after losing node state.
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
       TS_STATE_DIR: /var/lib/tailscale
       # Reuse persisted identity even after the enrollment key expires.
       TS_AUTH_ONCE: "true"
