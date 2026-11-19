@@ -236,6 +236,54 @@ shutil.copyfile(source / name, sys.argv[sys.argv.index('-o') + 1])
         self.assertTrue((self.install / 'docker-compose.panel.local.yml').exists())
         self.assertFalse((self.install / 'deploy').exists())
 
+    def assert_full_profile(self, calls):
+        # The installer only ever writes and starts the full-profile compose file.
+        self.assertTrue((self.install / 'docker-compose.panel.yml').exists())
+        self.assertFalse((self.install / 'docker-compose.panel.hosted.yml').exists())
+        up = [call for call in calls if 'up' in call]
+        self.assertTrue(up, calls)
+        for call in up:
+            self.assertIn('docker-compose.panel.yml', call)
+            self.assertNotIn('docker-compose.panel.hosted.yml', call)
+        env = (self.install / '.env').read_text()
+        self.assertNotIn('PROFILE', env)
+        self.assertNotIn('STITCH_PANEL_PROFILE', (self.install / 'docker-compose.panel.yml').read_text())
+
+    def test_existing_server_install_and_repeat_runs_stay_on_the_full_profile(self):
+        self.existing("'" + HASH + "'")
+        result, calls = self.run_installer()
+        self.assert_started(result, calls)
+        self.assert_full_profile(calls)
+        first = (self.install / '.env').read_text()
+        self.log.unlink()
+        result, calls = self.run_installer()
+        self.assert_started(result, calls)
+        self.assert_full_profile(calls)
+        self.assertEqual((self.install / '.env').read_text(), first)
+
+    def test_new_server_install_and_its_rerun_stay_on_the_full_profile(self):
+        result, calls = self.run_installer(PANEL_PASSWORD=PASSWORD)
+        self.assert_started(result, calls)
+        self.assert_full_profile(calls)
+        self.log.unlink()
+        result, calls = self.run_installer()
+        self.assert_started(result, calls)
+        self.assert_full_profile(calls)
+
+    def test_the_hosted_profile_is_never_installed_from_here(self):
+        for key in ('PANEL_PROFILE', 'STITCH_PANEL_PROFILE'):
+            result, calls = self.run_installer(PANEL_PASSWORD=PASSWORD, **{key: 'hosted'})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('hosted panels are built by Terraform', result.stderr)
+            self.assertFalse(any('up' in call for call in calls), calls)
+        self.existing("'" + HASH + "'")
+        with (self.install / '.env').open('a') as f:
+            f.write('STITCH_PANEL_PROFILE=hosted\n')
+        result, calls = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('hosted panels are built by Terraform', result.stderr)
+        self.assertFalse(any('up' in call for call in calls), calls)
+
 
 @unittest.skipUnless(shutil.which('docker'), 'Docker Compose is needed to validate the deployment')
 class DeploymentTests(unittest.TestCase):
@@ -301,6 +349,86 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(panel['network_mode'], 'service:tailscale')
         self.assertFalse(panel.get('ports'))
         self.assertFalse(sidecar.get('ports'))
+
+    def test_the_full_compose_file_never_selects_hosted(self):
+        # Even a host whose environment says hosted gets the full panel from
+        # docker-compose.panel.yml: the file doesn't pass the profile through.
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copyfile(ROOT / 'docker-compose.panel.yml', Path(tmp) / 'compose.yml')
+            result = subprocess.run(
+                ['docker', 'compose', '-f', str(Path(tmp) / 'compose.yml'), 'config', '--format', 'json'],
+                cwd=tmp,
+                env={'PATH': os.environ['PATH'], 'HOME': tmp, 'TS_AUTHKEY': 'k',
+                     'PANEL_PASSWORD_HASH': HASH, 'STITCH_PANEL_PROFILE': 'hosted',
+                     'PANEL_PROFILE': 'hosted'},
+                capture_output=True, text=True, timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        panel = json.loads(result.stdout)['services']['panel']
+        self.assertNotIn('STITCH_PANEL_PROFILE', panel['environment'])
+        self.assertIn('/var/run/docker.sock', [v['target'] for v in panel['volumes']])
+
+    def hosted_config(self, **overrides):
+        env = {
+            'PATH': os.environ['PATH'],
+            'PANEL_IMAGE': 'ghcr.io/textile-protocol/textile-stitch-panel@sha256:' + 'a' * 64,
+            'PANEL_PASSWORD_HASH': HASH,
+            'PANEL_PUBLIC_ORIGIN': 'https://stitch-panel.example.ts.net',
+            'PANEL_BOTS_DIR': '/home/ec2-user/stitch',
+            'STITCH_BROKER_BOTS': 'stitch-luno-a',
+            **overrides,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copyfile(ROOT / 'docker-compose.panel.hosted.yml', Path(tmp) / 'compose.yml')
+            env['HOME'] = tmp
+            return subprocess.run(
+                ['docker', 'compose', '-f', str(Path(tmp) / 'compose.yml'), 'config', '--format', 'json'],
+                cwd=tmp, env=env, capture_output=True, text=True, timeout=30,
+            )
+
+    def test_hosted_compose_publishes_on_host_loopback_only_and_keeps_docker_out_of_the_panel(self):
+        result = self.hosted_config()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        services = json.loads(result.stdout)['services']
+        sidecar, panel, broker = services['tailscale'], services['panel'], services['runtime-broker']
+        self.assertEqual(
+            [(p['host_ip'], p['published'], p['target']) for p in sidecar['ports']],
+            [('127.0.0.1', '8420', 8420)],
+        )
+        self.assertFalse(panel.get('ports'))
+        self.assertFalse(broker.get('ports'))
+        self.assertEqual(panel['network_mode'], 'service:tailscale')
+        self.assertEqual(broker['network_mode'], 'none')
+        env = panel['environment']
+        self.assertEqual(env['STITCH_PANEL_PROFILE'], 'hosted')
+        self.assertEqual(env['STITCH_PANEL_BIND'], '127.0.0.1:8420')
+        self.assertEqual(env['STITCH_PANEL_PUBLISH_BIND'], '192.168.254.250:8420')
+        self.assertEqual(env['STITCH_PANEL_TRUST_IDENTITY_HEADER'], '0')
+        self.assertNotIn('STITCH_PANEL_ALLOW_INSECURE_BIND', env)
+        panel_targets = [v['target'] for v in panel['volumes']]
+        self.assertNotIn('/var/run/docker.sock', panel_targets)
+        self.assertFalse(any(t.startswith(('/run/stitch/', '/home/stitch/secrets')) for t in panel_targets), panel_targets)
+        socket = next(v for v in panel['volumes'] if v['target'] == '/run/stitch-broker')
+        self.assertTrue(socket['read_only'])
+        self.assertTrue(panel['read_only'])
+        self.assertEqual(panel['cap_drop'], ['ALL'])
+        self.assertIn('/var/run/docker.sock', [v['target'] for v in broker['volumes']])
+        self.assertNotIn('0.0.0.0', result.stdout)
+
+    def test_the_break_glass_bridge_is_set_by_one_variable(self):
+        result = self.hosted_config(PANEL_PUBLISH_NET='172.30.9')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(result.stdout)
+        services = config['services']
+        self.assertEqual(services['panel']['environment']['STITCH_PANEL_PUBLISH_BIND'], '172.30.9.250:8420')
+        self.assertEqual(services['tailscale']['networks']['publish']['ipv4_address'], '172.30.9.250')
+        subnets = [c['subnet'] for c in config['networks']['publish']['ipam']['config']]
+        self.assertEqual(subnets, ['172.30.9.248/29'])
+
+    def test_hosted_compose_requires_a_pinned_image_and_its_settings(self):
+        for missing in ('PANEL_IMAGE', 'PANEL_PASSWORD_HASH', 'PANEL_PUBLIC_ORIGIN', 'PANEL_BOTS_DIR', 'STITCH_BROKER_BOTS'):
+            result = self.hosted_config(**{missing: ''})
+            self.assertNotEqual(result.returncode, 0, missing)
 
 
 class TailscalePolicyTests(unittest.TestCase):

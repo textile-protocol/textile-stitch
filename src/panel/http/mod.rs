@@ -285,6 +285,12 @@ pub fn router(state: AppState) -> Router {
         // routes. Identity-header auth is attached by the proxy independently of
         // cookies, so `SameSite` doesn't cover it and this does.
         .layer(axum::middleware::from_fn(same_origin_only))
+        // Hosted only (a no-op otherwise): Host and Origin must be the tailnet
+        // HTTPS origin or the break-glass localhost forward.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::panel::hosted::origin::enforce,
+        ))
         .with_state(state)
 }
 
@@ -305,7 +311,7 @@ fn public_routes() -> Router<AppState> {
 }
 
 fn protected_routes(state: &AppState) -> Router<AppState> {
-    Router::new()
+    let routes = Router::new()
         .route("/api/panel/password", post(session::set_password))
         .route("/api/corridors", get(wizard::corridors))
         .route("/api/feed/mid", get(wizard::feed_mid))
@@ -400,11 +406,25 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/bots/{name}/identity/link", post(identity::link))
         .route("/api/compose-export", get(bots::compose_export))
         .route("/api/updates", get(updates::status))
-        .route("/api/panel/update", post(updates::update_panel))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            require_auth,
-        ))
+        .route("/api/panel/update", post(updates::update_panel));
+    // The hosted profile adds digest Update/Rollback and refuses every route its
+    // policy table doesn't allow. The full profile gets neither.
+    let routes = match state.cfg.profile.hosted() {
+        Some(_) => routes
+            .route(
+                "/api/bots/{name}/image",
+                post(crate::panel::hosted::image::replace),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::panel::hosted::policy::enforce,
+            )),
+        None => routes,
+    };
+    routes.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        require_auth,
+    ))
 }
 
 /// Liveness only. Says nothing about the fleet and needs no credential, so a

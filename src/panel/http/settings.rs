@@ -654,6 +654,31 @@ fn refuse_book_off_that_kills_the_last_leg(
     ))
 }
 
+/// Hosted panels: the save may change quoting fields only, inside the agreed
+/// envelope, and never the RFQ key file. Judged on what the edited file would
+/// say, not on which fields the request sent.
+fn refuse_outside_hosted_envelope(
+    hosted: &crate::panel::hosted::HostedConfig,
+    body: &SettingsUpdate,
+    current: &setup::SettingsView,
+    edited: &str,
+    pool: usize,
+) -> Result<(), ApiError> {
+    if body
+        .rfq_api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty())
+    {
+        return Err(ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "a hosted panel never writes key files; the RFQ key is managed by the host",
+        ));
+    }
+    let after = setup::read_settings_at(edited, pool).map_err(ApiError::bad_request)?;
+    crate::panel::hosted::envelope::check(current, &after, &hosted.envelope)
+        .map_err(|reason| ApiError::new(axum::http::StatusCode::FORBIDDEN, reason))
+}
+
 pub async fn update(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
@@ -686,6 +711,9 @@ pub async fn update(
     // "edited config is not valid" alone doesn't name the field that failed.
     let edited = setup::apply_settings(&current_toml, &patch)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if let Some(hosted) = state.cfg.profile.hosted() {
+        refuse_outside_hosted_envelope(hosted, &body, &current, &edited, pool)?;
+    }
     refuse_book_on_without_a_postable_side(&patch, &edited)?;
     let incoming_rfq_key = body
         .rfq_api_key

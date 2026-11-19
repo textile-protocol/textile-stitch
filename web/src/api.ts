@@ -449,6 +449,16 @@ export const api = {
   /** Pull the panel bot image and recreate this bot on it. */
   updateBot: (name: string) => act(name, 'update'),
 
+  /**
+   * Hosted panels only: recreate this bot on one exact image, given as
+   * `<repository>@sha256:<digest>`. Update and rollback are both this call.
+   */
+  deployDigest: (name: string, image: string) =>
+    request<ActionResult>(
+      `/api/bots/${encodeURIComponent(name)}/image`,
+      json({ image })
+    ),
+
   /** The published builds this bot could be rolled back to, newest first. */
   botVersions: (name: string) =>
     request<BotVersions>(`/api/bots/${encodeURIComponent(name)}/versions`),

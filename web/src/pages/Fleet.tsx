@@ -45,6 +45,7 @@ import FleetUpdateProgress from '../components/FleetUpdateProgress'
 import { planFleetUpdate, runActive, type StepStatus } from '../fleetUpdate'
 import { fleetUpdate, useFleetUpdate } from '../useFleetUpdate'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
+import { useProfile } from '../profile'
 
 /** How often the list refreshes itself, so a bot that dies is visible without a reload. */
 const POLL_MS = 5000
@@ -79,6 +80,9 @@ export default function Fleet() {
   const [filter, setFilter] = useFleetFilter()
   const run = useFleetUpdate()
   const [sheetOpen, setSheetOpen] = useState(false)
+  // Hosted: no Add corridor and no Update all. Bots are added by the host's
+  // administrators and move only to a digest, one bot at a time.
+  const hosted = useProfile() === 'hosted'
 
   const load = useCallback(async () => {
     try {
@@ -90,12 +94,13 @@ export default function Fleet() {
   }, [])
 
   const loadUpdates = useCallback(async () => {
+    if (hosted) return
     try {
       setUpdates(await api.updates())
     } catch {
       setUpdates(null)
     }
-  }, [])
+  }, [hosted])
 
   useEffect(() => {
     void loadUpdates()
@@ -198,9 +203,11 @@ export default function Fleet() {
     <div className="space-y-4">
       <div className="flex items-baseline justify-between gap-4">
         <h1 className="text-xl font-bold">Fleet</h1>
-        <Link to="/add">
-          <Button variant="primary">Add corridor</Button>
-        </Link>
+        {!hosted && (
+          <Link to="/add">
+            <Button variant="primary">Add corridor</Button>
+          </Link>
+        )}
       </div>
       <FleetTabs bots={filtered ? shown.length : total} />
 
@@ -241,7 +248,11 @@ export default function Fleet() {
       {/* The first-time screen. It sits under a button labelled Add corridor,
           and the operator has never heard the word bot, so it leads with what
           that button does rather than with what is missing. */}
-      {data.bots.length === 0 ? (
+      {data.bots.length === 0 && hosted ? (
+        <Empty title="No bots on this host yet">
+          <p>Bots on a hosted panel are added by the host&rsquo;s administrators.</p>
+        </Empty>
+      ) : data.bots.length === 0 ? (
         <Empty title="Nothing running here yet">
           <p>
             Add a corridor to set up your first bot. Or point{' '}

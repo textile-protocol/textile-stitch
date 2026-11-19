@@ -383,7 +383,7 @@ struct ActionBody {
     message: Option<String>,
 }
 
-async fn action_response(
+pub(crate) async fn action_response(
     state: &AppState,
     name: &str,
     message: Option<String>,

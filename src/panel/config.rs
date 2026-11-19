@@ -147,6 +147,10 @@ pub struct PanelConfig {
     /// `None` so no suite depends on the network; the gas price then falls back
     /// to a deliberately low built-in figure.
     pub coingecko_api_url: Option<String>,
+    /// Full Fleet (every install today) or the restricted hosted profile. Only
+    /// `STITCH_PANEL_PROFILE=hosted` selects hosted; see
+    /// [`crate::panel::hosted::profile_from`].
+    pub profile: crate::panel::hosted::Profile,
 }
 
 impl PanelConfig {
@@ -171,6 +175,8 @@ impl PanelConfig {
         check_bind_address(bind.ip(), insecure)?;
 
         let (auth, trust_identity_header) = startup_auth(&bots_dir)?;
+        let profile = crate::panel::hosted::profile_from(|k| std::env::var(k).ok())?;
+        crate::panel::hosted::check_startup(&profile, runtime, &auth, trust_identity_header)?;
         if !trust_identity_header && auth.password_hash().is_none() {
             bail!(
                 "the panel is configured to authenticate by tailnet login, but nothing has \
@@ -203,6 +209,7 @@ impl PanelConfig {
             runtime,
             corridor_api_url: corridor_api_from_env()?,
             coingecko_api_url: coingecko_api_from_env()?,
+            profile,
         })
     }
 
@@ -259,6 +266,7 @@ impl PanelConfig {
             // the remote catalog point this at their own mock server.
             corridor_api_url: None,
             coingecko_api_url: None,
+            profile: crate::panel::hosted::Profile::Full,
         }
     }
 }

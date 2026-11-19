@@ -13,6 +13,7 @@ import BotDetail from './pages/BotDetail'
 import FleetChanges from './pages/FleetChanges'
 import { shortImage } from './format'
 import { panelUpdateBusy } from './panelUpdate'
+import { ProfileContext, allows, profileOf } from './profile'
 import type { SessionInfo, UpdatesStatus } from './types'
 
 /** Persisted so the operator's choice survives a reload. */
@@ -73,7 +74,9 @@ export default function App() {
     return <Login session={session} onSignedIn={() => void refresh()} />
   }
 
+  const profile = profileOf(session)
   return (
+    <ProfileContext.Provider value={profile}>
     <div className="min-h-screen">
       <Header
         session={session}
@@ -99,15 +102,26 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Fleet />} />
           <Route path="/changes" element={<FleetChanges />} />
-          <Route path="/add" element={<AddBot rfqDefault={session.rfqDefault} />} />
+          <Route
+            path="/add"
+            element={
+              allows(profile, 'addBot') ? (
+                <AddBot rfqDefault={session.rfqDefault} />
+              ) : (
+                <Navigate to="/" replace />
+              )
+            }
+          />
           <Route path="/bots/:name" element={<BotDetailPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
       <footer className="mx-auto max-w-[96rem] px-6 pb-8 text-xs text-faint">
         Stitch v{session.version} · <span className="font-mono">{session.configDir}</span>
+        {profile === 'hosted' && ' · hosted'}
       </footer>
     </div>
+    </ProfileContext.Provider>
   )
 }
 
@@ -132,6 +146,8 @@ function Header({
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
   const panelUpdate = usePanelUpdate()
   const panelBusy = panelUpdateBusy(panelUpdate.state)
+  // Hosted panels are updated by the host's Terraform, by digest.
+  const canSelfUpdate = allows(profileOf(session), 'panelUpdate')
 
   // Soft check on every navigation (and mount); forced registry refresh on a
   // timer so a parked tab still learns about a newer panel image.
@@ -145,13 +161,14 @@ function Header({
         if (!cancelled) setUpdates(null)
       }
     }
+    if (!canSelfUpdate) return
     void check(false)
     const timer = setInterval(() => void check(true), UPDATES_POLL_MS)
     return () => {
       cancelled = true
       clearInterval(timer)
     }
-  }, [pathname])
+  }, [pathname, canSelfUpdate])
 
   return (
     <header className="border-b border-line-soft bg-surface">
@@ -166,7 +183,7 @@ function Header({
           </NavLink>
         </nav>
         <div className="ml-auto flex shrink-0 items-center gap-1 sm:gap-2">
-          {updates?.panel.updateAvailable && (
+          {canSelfUpdate && updates?.panel.updateAvailable && (
             <Button
               variant="primary"
               busy={panelBusy}

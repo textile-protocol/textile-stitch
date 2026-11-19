@@ -6,10 +6,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { ApiError, api } from '../api'
 import type { Bot } from '../types'
+import { useAllows } from '../profile'
 
 const MAX = 40
 
-export default function RenameBot({ bot, onRenamed }: { bot: Bot; onRenamed: (bot: Bot) => void }) {
+/** Hosted panels refuse renames server-side; the control doesn't render there. */
+export default function RenameBot(props: { bot: Bot; onRenamed: (bot: Bot) => void }) {
+  return useAllows('renameBot') ? <RenameControl {...props} /> : null
+}
+
+function RenameControl({ bot, onRenamed }: { bot: Bot; onRenamed: (bot: Bot) => void }) {
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(bot.displayName ?? '')
   const [busy, setBusy] = useState(false)

@@ -319,6 +319,8 @@ export interface SessionInfo {
   configDir: string
   /** Always true. New bots start RFQ-only. */
   rfqDefault: boolean
+  /** `hosted` on a Terraform-built client host; older panels don't send it. */
+  profile?: 'full' | 'hosted'
 }
 
 export interface ActionResult {

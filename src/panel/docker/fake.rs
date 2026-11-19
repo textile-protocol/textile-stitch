@@ -38,6 +38,10 @@ pub enum Call {
         docker_socket: String,
     },
     Create(String),
+    ReplaceImage {
+        name: String,
+        new_image: String,
+    },
     Start(String),
     Stop {
         name: String,
@@ -130,6 +134,11 @@ struct FakeState {
     image_labels: HashMap<String, HashMap<String, String>>,
     /// When set, `schedule_image_swap` fails with this message.
     swap_error: Option<String>,
+    /// When set, the next `replace_image` fails with this, carrying the given
+    /// outcome (`None`: unknown, as when the broker's reply is lost).
+    replace_error: Option<(String, Option<super::swap::SwapOutcome>)>,
+    /// When set, `replace_image` waits here mid-swap until the test releases it.
+    replace_gate: Option<ReplaceGate>,
 }
 
 impl FakeDocker {
@@ -236,6 +245,19 @@ impl FakeDocker {
             .unwrap()
             .fresh_image_digests
             .insert(image.to_string(), digests);
+    }
+
+    /// Make the next `replace_image` fail, leaving the container as it was.
+    pub fn fail_replace(&self, message: &str, outcome: Option<super::swap::SwapOutcome>) {
+        self.state.lock().unwrap().replace_error = Some((message.to_string(), outcome));
+    }
+
+    /// Park every `replace_image` mid-swap. `entered` is notified when a swap is
+    /// in flight; notifying `release` lets it finish.
+    pub fn gate_replace(&self) -> ReplaceGate {
+        let gate = ReplaceGate::default();
+        self.state.lock().unwrap().replace_gate = Some(gate.clone());
+        gate
     }
 
     /// Make `schedule_image_swap` fail.
@@ -360,6 +382,34 @@ impl DockerApi for FakeDocker {
             .unwrap_or_default())
     }
 
+    async fn replace_image(&self, name: &str, new_image: &str) -> Result<()> {
+        let gate = self.state.lock().unwrap().replace_gate.clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        let mut st = self.state.lock().unwrap();
+        st.calls.push(Call::ReplaceImage {
+            name: name.to_string(),
+            new_image: new_image.to_string(),
+        });
+        if let Some((message, outcome)) = st.replace_error.take() {
+            let e = anyhow::anyhow!(message);
+            return Err(match outcome {
+                Some(outcome) => super::swap::failed(outcome, e),
+                None => e,
+            });
+        }
+        match st.containers.iter_mut().find(|c| c.name == name) {
+            Some(c) => {
+                c.image = new_image.to_string();
+                c.image_id = format!("sha256:{}", new_image.rsplit(':').next().unwrap_or(""));
+                Ok(())
+            }
+            None => bail!("No such container: {name}"),
+        }
+    }
+
     async fn schedule_image_swap(
         &self,
         name: &str,
@@ -465,7 +515,7 @@ impl DockerApi for FakeDocker {
             force,
         });
         let before = st.containers.len();
-        st.containers.retain(|c| c.name != name);
+        st.containers.retain(|c| c.name != name && c.id != name);
         if st.containers.len() == before {
             bail!("No such container: {name}");
         }
@@ -540,8 +590,19 @@ impl crate::panel::migrate::ContainerFiles for FakeDocker {
     }
 }
 
+/// See [`FakeDocker::gate_replace`].
+#[derive(Clone, Default)]
+pub struct ReplaceGate {
+    pub entered: std::sync::Arc<tokio::sync::Notify>,
+    pub release: std::sync::Arc<tokio::sync::Notify>,
+}
+
 fn set_state(st: &mut FakeState, name: &str, state: ContainerState, status: &str) -> Result<()> {
-    match st.containers.iter_mut().find(|c| c.name == name) {
+    match st
+        .containers
+        .iter_mut()
+        .find(|c| c.name == name || c.id == name)
+    {
         Some(c) => {
             c.state = state;
             c.status = status.to_string();

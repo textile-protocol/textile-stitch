@@ -68,3 +68,100 @@ A fully compromised HTTPS proxy can still steal passwords or session cookies.
 
 This repository cannot apply or verify your actual tailnet/identity-provider
 policy. Record the live checks in the deployment review.
+
+## Hosted profile
+
+This section covers hosts Textile runs for a client on the
+`packages/infra/terraform/stitch-bots` stack, with the panel running from
+`docker-compose.panel.hosted.yml` and `STITCH_PANEL_PROFILE=hosted`. Legacy
+and self-hosted installs are unaffected by it and must not switch to the
+hosted profile until their own migration. What the profile allows is in
+[install-panel.md](install-panel.md#hosted-profile).
+
+### What exists, and what you still do by hand
+
+The stack doesn't deploy the hosted panel yet. Here's where each piece comes
+from:
+
+- **#2777 (merged):** the stitch-bots stack gives the host its SSM instance
+  role, the `<prefix>-logged-shell` document and the `<prefix>-panel` port
+  document, which forwards to host port 8420 and nothing else.
+- **This PR:** the hosted profile and the runtime broker in the panel image,
+  and `docker-compose.panel.hosted.yml` with its `deploy/` files in this repo.
+- **#2832 (open):** bot keys come from Secrets Manager into tmpfs at
+  `/run/stitch/<bot>`, mounted read-only into each bot, and the bot image is
+  pinned by digest.
+- **Not done:** nothing in the stack installs or starts the hosted panel,
+  writes its `.env` or its envelope file. That's a planned follow-up on #2832.
+
+Until that follow-up lands, bring the panel up by hand, and only on a host
+whose bot directories hold no credentials. The hosted panel mounts
+`PANEL_BOTS_DIR` read-write, so it can read anything in them. #2832 moves the
+signer keys out to `/run/stitch/<bot>`. It doesn't move the RFQ maker key:
+`stitch connect` writes `rfq-api.key` next to `stitch.toml` by default. Put
+it in `/run/stitch/<bot>` too and point the bot at it with
+`STITCH_RFQ_API_KEY_FILE`; nothing automates that yet. Check with
+`find <bots dir> -name '*.key'`, which must print nothing.
+
+The read-write mount is also how the panel saves quoting settings, and the
+envelope is enforced by the panel's HTTP layer, not by the mount. So code
+running inside a compromised panel container could rewrite any `stitch.toml`
+it can reach, not just the quoting fields. Moving config writes behind the
+broker would close that; it isn't done. Over the logged SSM shell:
+
+1. Copy `docker-compose.panel.hosted.yml`, `deploy/panel-serve.json` and
+   `deploy/panel-tailscale.sh` from the reviewed commit into a root-owned
+   directory, for example `/opt/stitch-panel`.
+2. Write `/opt/stitch-panel/.env` (mode 0600) with `PANEL_IMAGE` pinned by
+   `@sha256:` digest, `PANEL_PASSWORD_HASH` (quoted, from
+   `stitch-panel hash-password`), `PANEL_PUBLIC_ORIGIN`, `PANEL_BOTS_DIR` (the
+   stack's bot directory), `STITCH_BROKER_BOTS` (the bot container names from
+   the stack's compose file, such as `stitch-bot-a`) and a one-use `TS_AUTHKEY`.
+   The compose file's header lists every variable.
+3. Write `envelope.json` next to it with the bounds agreed with the client,
+   shaped like `deploy/hosted-envelope.example.json`. Without it the panel
+   allows no quoting edits.
+4. `docker compose -f docker-compose.panel.hosted.yml up -d`, then do the
+   enrollment cleanup below and record the checks at the end of this section.
+
+**Daily: the tailnet.** The host joins a dedicated, hardened tailnet through
+the Tailscale sidecar (`stitch-panel-tailscale`), and `tailscale serve`
+proxies HTTPS on 443 to the panel on `127.0.0.1:8420` inside the sidecar's
+network namespace. Open `https://<hostname>.<tailnet>.ts.net` from an approved
+device, phone included, and sign in with the panel password. Set up the
+tailnet as in [Tailnet policy](#tailnet-policy) and enroll as in
+[Enrollment](#enrollment-without-a-persistent-reusable-key), with one
+difference: the hosted file is `docker-compose.panel.hosted.yml`, so recreate
+with
+
+```sh
+docker compose -f docker-compose.panel.hosted.yml up -d --force-recreate tailscale panel
+```
+
+**Break-glass: SSM.** The hosted compose file also publishes the panel on host
+loopback only: `127.0.0.1:8420:8420` on the sidecar, which owns the network
+namespace. Nothing off the box can reach it. The stitch-bots stack's
+`<prefix>-panel` Session Manager document (from #2777) forwards to exactly that
+port:
+
+```bash
+aws ssm start-session --target <instance-id> --document-name <prefix>-panel \
+  --parameters localPortNumber=8420
+```
+
+Then open `http://localhost:8420`. Use local port 8420: the panel accepts
+changes only from `http://localhost:8420` and from its `PANEL_PUBLIC_ORIGIN`
+(the tailnet HTTPS origin), and refuses any other `Host` or `Origin` with a
+403. A random local port shows the page but every change is refused.
+
+Both paths need the panel password. The hosted panel never trusts
+`Tailscale-User-Login`: with the loopback publish, any process on the host can
+reach the listener and could send that header, so the panel refuses to start
+if `STITCH_PANEL_TRUST_IDENTITY_HEADER` is set.
+
+Checks to record when bringing a host up: the tailnet URL works from an
+approved device and not from one outside the ops group; the SSM forward on
+local port 8420 reaches the login page and accepts a change; a forward on
+another local port is refused on change; `ss -ltn` on the host shows 8420 on
+`127.0.0.1` only; the panel container has no `/var/run/docker.sock` and no
+`/home/stitch/secrets`.

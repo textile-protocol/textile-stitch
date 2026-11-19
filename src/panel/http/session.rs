@@ -45,6 +45,9 @@ pub struct SessionBody {
     /// Fleet RFQ-default flag (`{bots_dir}/panel.toml`). New bots start RFQ-only
     /// and the add-bot copy mentions Connect.
     rfq_default: bool,
+    /// `"full"` or `"hosted"`. The UI hides what a hosted panel refuses; the
+    /// server refuses it either way.
+    profile: &'static str,
 }
 
 fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
@@ -60,6 +63,7 @@ fn session_body(state: &AppState, identity: Option<&Identity>) -> SessionBody {
         version: env!("CARGO_PKG_VERSION"),
         config_dir: state.cfg.host_bots_dir.display().to_string(),
         rfq_default: crate::config::rfq_default_flag_in_dir(&state.cfg.bots_dir),
+        profile: state.cfg.profile.as_str(),
     }
 }
 

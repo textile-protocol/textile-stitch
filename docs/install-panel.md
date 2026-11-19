@@ -353,6 +353,120 @@ If your proxy authenticates users and sets `Tailscale-User-Login` itself, add
 the tailnet allowlist. Only do that if your proxy strips the inbound header first
 *and* nothing can bypass the proxy to reach the panel's port directly.
 
+## Hosted profile
+
+This section is for hosts Textile runs for a client on the
+`packages/infra/terraform/stitch-bots` stack. That stack doesn't deploy the
+hosted panel yet: [production-access.md](production-access.md#hosted-profile)
+says what exists after which PR and the manual steps until then. If you
+installed Stitch with
+`install-panel.sh`, from a checkout, or with the desktop app, none of it
+applies to you and nothing about your install changes.
+
+**Legacy and self-hosted installs are unaffected.** The hosted profile is
+opt-in and only `STITCH_PANEL_PROFILE=hosted` selects it. An unset value, an
+empty value or `full` is the full Fleet you run today. `PANEL_MODE=server`,
+`TS_AUTHKEY`, the bind address and the image tag are never read as a hint.
+`install-panel.sh` never writes the setting and refuses to run if it sees it,
+and `docker-compose.panel.yml` doesn't pass it to the panel. Updating a legacy
+host to a panel image that contains this code leaves it on the full profile.
+Don't switch a legacy host to the hosted profile until its own migration.
+
+On a hosted host the panel runs from `docker-compose.panel.hosted.yml` as
+three services:
+
+- **tailscale**: the sidecar. `tailscale serve` terminates HTTPS on 443 and
+  proxies to the panel on `127.0.0.1:8420` inside its own network namespace.
+  That's the daily path, phone included.
+- **panel**: Fleet with the hosted profile. No Docker socket, and no key
+  files as long as the bot directories hold none (see below).
+  It runs as uid 1000 with a read-only root filesystem and no capabilities.
+- **runtime-broker**: the only process with the Docker socket. It has no
+  network, listens on a Unix socket the panel mounts read-only, and acts only
+  on the bot containers named in `STITCH_BROKER_BOTS`.
+
+Keys stay where the host puts them. With #2832's layout that's Secrets
+Manager into tmpfs at `/run/stitch/<bot>`, mounted read-only into each bot at
+`/home/stitch/secrets`. The panel never mounts that directory and never reads
+or writes `fireblocks-api.key`, `stitch.key` or `rfq-api.key` itself. But it
+mounts the bot directories read-write, and `rfq-api.key` lives there by
+default, so don't run the hosted panel until every key, the RFQ maker key
+included, is out of them
+([production-access.md](production-access.md#hosted-profile) has the check).
+The quoting envelope is enforced by the panel's HTTP layer, not the mount: a
+compromised panel process could still rewrite a bot's `stitch.toml`.
+
+### What Fleet does on a hosted host
+
+| Allowed | Refused (hidden in the UI and refused by the server) |
+|---|---|
+| Status, logs, change log, balances | Adding or removing a bot, renaming, adding or removing a corridor |
+| Start, stop, restart | Changing the signer or any key, RFQ Connect, agent identity |
+| Spreads, sizing, TTL, refresh threshold and tick interval, inside the envelope | RPCs, fallback RPCs, price feed, chain, vault |
+| Update or roll back a bot to an `@sha256` digest | Tags, including `latest`; Update all; Recreate; layout migration |
+| | Withdrawals, fee-share sends, approvals, dry runs |
+| | Raw config, compose export, panel self-update |
+
+Every route the panel registers is classified in
+`src/panel/hosted/policy.rs`. A route that isn't listed there is refused, so a
+route added later stays off hosted hosts until someone decides otherwise.
+
+**Quoting envelope.** The bounds agreed with the client live in a read-only
+JSON file (`STITCH_PANEL_ENVELOPE`), written by hand on the host until the
+stack writes it. A settings save may
+change only quoting fields, and each changed field needs a bound in that file.
+A field with no bound can't change, so a missing file means no quoting edits.
+Saves are recorded in the change log as usual. See
+`deploy/hosted-envelope.example.json` for the shape; the numbers in it are
+placeholders, not agreed values.
+
+**Updates by digest.** Tools has one form, Deploy digest, that takes
+`ghcr.io/textile-protocol/textile-stitch@sha256:<digest>`. The panel and the
+broker both refuse tags and other repositories. The broker pulls the digest,
+recreates the container with the same env, mounts, labels and network, and
+puts the old one back (started, if it was up) if any step after the pull
+fails. A paused bot is refused: start or stop it first. So is a swap whose
+scratch names (`<container>-next`, `<container>-previous`) are taken by
+anything other than a stopped leftover of the same bot. The bot's operator
+wallet is claimed for the whole swap, as for Start.
+If the broker can't say what the swap left behind (its reply was lost, or
+putting the old container back failed too), the panel stops the bot before
+releasing the wallet, and you start it again once you've checked it. The
+config isn't changed with the image. Build attestation is **not verified yet**:
+that check is a separate change, and until it lands the panel says so in its
+log and its reply. Once the stack pins the bot image (`stitch_image`, #2832),
+that variable only describes what the host booted with after a digest deploy.
+
+### Access on a hosted host
+
+Daily access is the tailnet HTTPS URL, `https://<hostname>.<tailnet>.ts.net`,
+with the panel password. The tailnet's policy should allow only TCP 443 to the
+panel node (`deploy/tailnet-policy.example.json`).
+
+Break-glass is the SSM `<prefix>-panel` port forward the stitch-bots stack
+has had since #2777. The hosted compose file publishes the panel on host loopback only,
+`127.0.0.1:8420:8420`, never `0.0.0.0`. Start the session with local port 8420
+and open `http://localhost:8420`:
+
+```bash
+aws ssm start-session --target <instance-id> --document-name <prefix>-panel \
+  --parameters localPortNumber=8420
+```
+
+Docker forwards that publish to the sidecar's address on its own bridge
+network, where the panel has a second listener. One variable sets that
+bridge: `PANEL_PUBLISH_NET` (default `192.168.254`) gives the subnet
+`<net>.248/29` and the address `<net>.250`. It must be a private range that
+doesn't overlap the VPC CIDR (the stitch-bots default is `10.90.0.0/16`) or
+anything else the host routes to; an overlap would send that traffic into the
+bridge instead.
+
+Use 8420 locally: the panel accepts changes only from
+`http://localhost:8420` and from its tailnet HTTPS origin, and refuses every
+other `Host` and `Origin`. The panel password is required on both paths. The
+hosted profile never trusts the `Tailscale-User-Login` header, because the
+loopback publish means any process on the host could send one.
+
 ## Adopting an existing compose fleet
 
 Nothing to migrate and nothing to restart. Point the panel at the directory

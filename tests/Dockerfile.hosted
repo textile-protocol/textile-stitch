@@ -1,0 +1,6 @@
+# Same runtime base as Dockerfile.panel; CI copies its checked debug binary.
+# Used by tests/hosted-runtime.sh for both the hosted panel and its broker.
+FROM gcr.io/distroless/cc-debian13
+ARG PANEL_BINARY=stitch-panel
+COPY --chmod=0755 ${PANEL_BINARY} /usr/local/bin/stitch-panel
+ENTRYPOINT ["/usr/local/bin/stitch-panel"]

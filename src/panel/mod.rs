@@ -19,12 +19,14 @@
 //! keeps that file a valid recovery artifact for Docker installs.
 
 pub mod auth;
+pub mod broker;
 pub mod compose;
 pub mod config;
 pub mod corridors;
 pub mod credentials;
 pub mod desktop;
 pub mod docker;
+pub mod hosted;
 pub mod http;
 pub mod inventory;
 pub mod label;

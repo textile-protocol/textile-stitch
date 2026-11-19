@@ -1,0 +1,151 @@
+# Stitch panel, hosted profile. For client hosts on the stitch-bots stack only
+# (packages/infra/terraform/stitch-bots). The stack doesn't install this file
+# yet; see docs/production-access.md#hosted-profile. Legacy and self-hosted
+# installs use docker-compose.panel.yml and must not switch to this file: see
+# docs/install-panel.md#hosted-profile.
+#
+# Three services:
+#
+#   tailscale       joins the client's tailnet and serves HTTPS on 443, proxied to
+#                   the panel on 127.0.0.1:8420 inside its own network namespace.
+#                   It also owns the host-loopback publish 127.0.0.1:8420 that the
+#                   SSM <prefix>-panel break-glass forward reaches. Never 0.0.0.0.
+#   panel           Fleet with STITCH_PANEL_PROFILE=hosted. No Docker socket. It
+#                   reads and writes bot configs (stitch.toml and the change log)
+#                   through a read-write mount of PANEL_BOTS_DIR, so that
+#                   directory must hold no keys (rfq-api.key included), and
+#                   reaches containers only through the broker.
+#   runtime-broker  the only holder of the Docker socket. No network. Answers a
+#                   fixed set of calls about the bots named in STITCH_BROKER_BOTS.
+#
+# Keys stay where the host puts them: /run/stitch/<bot> (tmpfs), mounted
+# read-only into each bot by the bots' own compose file (#2832's layout).
+# Nothing here mounts them. Don't run this on a host whose bot directories
+# still hold any key: see docs/production-access.md#hosted-profile.
+#
+# Every value comes from .env, written by hand until the stack writes it:
+#   PANEL_IMAGE             ghcr.io/textile-protocol/textile-stitch-panel@sha256:<digest>
+#   PANEL_PASSWORD_HASH     argon2id hash (quote it: it contains $)
+#   PANEL_PUBLIC_ORIGIN     https://<hostname>.<tailnet>.ts.net
+#   PANEL_BOTS_DIR          the host directory holding one folder per bot
+#   STITCH_BROKER_BOTS      exact bot container names, comma-separated
+#   TS_AUTHKEY              first enrollment only; remove it afterwards
+#   PANEL_PUBLISH_NET       optional, default 192.168.254: the first three octets
+#                           of the sidecar's break-glass bridge, <net>.248/29,
+#                           with the sidecar (and the panel's second listener)
+#                           at <net>.250. Must be private and must not overlap
+#                           the VPC CIDR or any network the host routes to.
+
+name: stitch-panel
+
+services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: stitch-panel-tailscale
+    hostname: ${PANEL_HOSTNAME:-stitch-panel}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_AUTH_ONCE: "true"
+      PATH: /opt/stitch/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_USERSPACE: "false"
+      TS_EXTRA_ARGS: --reset --ssh=false
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./deploy/panel-serve.json:/config/serve.json:ro
+      - ./deploy/panel-tailscale.sh:/opt/stitch/bin/tailscale:ro
+    devices:
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    # Break-glass. Host loopback only, so the SSM port forward can reach it and
+    # nothing off the box can. Docker forwards this to the sidecar's fixed
+    # address below, where the panel has its second listener.
+    ports:
+      - "127.0.0.1:8420:8420"
+    networks:
+      publish:
+        ipv4_address: ${PANEL_PUBLISH_NET:-192.168.254}.250
+    restart: unless-stopped
+
+  panel:
+    image: ${PANEL_IMAGE:?pin the panel image by digest, e.g. ghcr.io/textile-protocol/textile-stitch-panel@sha256:...}
+    container_name: stitch-panel
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+      - runtime-broker
+    # uid 1000 owns the bot directories (ec2-user on AL2023, and the bot image's
+    # stitch user). Group 65532 is the only group the broker socket admits.
+    user: "1000:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    tmpfs:
+      - /tmp:size=16m
+    environment:
+      RUST_LOG: info
+      STITCH_PANEL_PROFILE: hosted
+      # tailscale serve proxies to loopback in this namespace.
+      STITCH_PANEL_BIND: 127.0.0.1:8420
+      # The break-glass listener, on the sidecar's bridge address only.
+      STITCH_PANEL_PUBLISH_BIND: ${PANEL_PUBLISH_NET:-192.168.254}.250:8420
+      STITCH_PANEL_PUBLIC_ORIGIN: ${PANEL_PUBLIC_ORIGIN:?set the panel's https://<host>.<tailnet>.ts.net origin}
+      STITCH_PANEL_PASSWORD_HASH: ${PANEL_PASSWORD_HASH:?set PANEL_PASSWORD_HASH}
+      # Never trust Tailscale-User-Login here: the loopback publish means any
+      # process on the host can reach the listener.
+      STITCH_PANEL_TRUST_IDENTITY_HEADER: "0"
+      STITCH_PANEL_IDENTITY_PROXY_ONLY: "0"
+      STITCH_PANEL_BOTS_DIR: /data/bots
+      STITCH_PANEL_HOST_BOTS_DIR: ${PANEL_BOTS_DIR:?set PANEL_BOTS_DIR to the host's bot directory}
+      STITCH_PANEL_BOT_UID: "1000"
+      STITCH_PANEL_ENVELOPE: /etc/stitch-panel/envelope.json
+      STITCH_PANEL_IMAGE_REPOSITORY: ${STITCH_BOT_REPOSITORY:-ghcr.io/textile-protocol/textile-stitch}
+      # The wizard's corridor list and the gas-price fallback aren't used on
+      # hosted; keep the panel's outbound calls to the chain RPCs it reads.
+      STITCH_PANEL_CORRIDOR_API: "off"
+      STITCH_PANEL_COINGECKO_API: "off"
+    volumes:
+      - ${PANEL_BOTS_DIR}:/data/bots
+      - ${PANEL_ENVELOPE_FILE:-./envelope.json}:/etc/stitch-panel/envelope.json:ro
+      - broker-socket:/run/stitch-broker:ro
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  runtime-broker:
+    image: ${PANEL_IMAGE}
+    container_name: stitch-runtime-broker
+    command: ["runtime-broker"]
+    user: "0:0"
+    # No network at all. Its only interface is the Unix socket.
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    environment:
+      RUST_LOG: info
+      STITCH_BROKER_BOTS: ${STITCH_BROKER_BOTS:?list the bot container names, e.g. stitch-luno-a}
+      STITCH_BROKER_IMAGE_REPOSITORY: ${STITCH_BOT_REPOSITORY:-ghcr.io/textile-protocol/textile-stitch}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - broker-socket:/run/stitch-broker
+    restart: unless-stopped
+
+networks:
+  # The sidecar's own bridge, so its address is fixed and the panel can listen
+  # on exactly that address. Set by PANEL_PUBLISH_NET (see the header).
+  publish:
+    ipam:
+      config:
+        - subnet: ${PANEL_PUBLISH_NET:-192.168.254}.248/29
+
+volumes:
+  tailscale-state:
+  # Holds only the broker socket. Never bot configs or credentials.
+  broker-socket:

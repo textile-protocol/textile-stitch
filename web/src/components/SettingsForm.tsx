@@ -23,6 +23,7 @@ import {
   setFallback,
 } from '../rpcFallbacks'
 import { botPath } from '../botRoutes'
+import { useProfile } from '../profile'
 import { useFeedMid } from './wizard/useFeedMid'
 import {
   absoluteUnit,
@@ -75,6 +76,7 @@ export default function SettingsForm({
   const [loadError, setLoadError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const hosted = useProfile() === 'hosted'
   // A pool add, remove or switch is in flight in CorridorsCard. It renumbers
   // pools, so a Save that raced it would PATCH this pool index against whatever
   // corridor ends up at it — the removed pool's spreads landing on the pool
@@ -190,7 +192,7 @@ export default function SettingsForm({
       {/* Only while there is something to do here: not connected, waiting on
           Textile, or the old public-ladder mode to switch off. A seated bot
           says so in the state pill; Reconnect lives under Tools. */}
-      {loaded.rfqPanelUnlocked &&
+      {!hosted && loaded.rfqPanelUnlocked &&
         !(loaded.rfqEnabled && loaded.rfqApiKeySet && loaded.rfqMakerId.trim() !== '' && !loaded.bookEnabled) && (
         <RfqCard
           botName={bot.name}
@@ -258,6 +260,9 @@ export default function SettingsForm({
         </div>
       </Card>
 
+      {/* Hosted: RPCs, feed, vault, modules and the experimental switches are
+          the host administrators', so only quoting fields are shown. */}
+      {!hosted && (
       <Card title="Endpoints">
         <div className="space-y-4">
           <Field label="RPC URL" hint="Where the bot reads chain state and sends transactions.">
@@ -282,9 +287,12 @@ export default function SettingsForm({
         </div>
       </Card>
 
+      )}
+
       {/* TWAP and lean are not book-only: the taker leg prices its fills off
           the same center, deviation guard and lean decision, so these stay
           editable on an RFQ-only bot. */}
+      {!hosted && (
       <ExperimentalCard
         draft={draft}
         editable={loaded.editable}
@@ -331,6 +339,7 @@ export default function SettingsForm({
         )}
         <PerpsFeature key={bot.name} bot={bot} dirty={dirty} perps={perps} />
       </ExperimentalCard>
+      )}
 
 
       {error && <Banner tone="danger">{error}</Banner>}
@@ -389,6 +398,7 @@ function CorridorsCard({
   onSelectPool: (index: number) => void
   onPoolsChanged: (res: { settings: Settings; message: string }) => void
 }) {
+  const hosted = useProfile() === 'hosted'
   const [corridors, setCorridors] = useState<Corridor[] | null>(null)
   const [busy, setBusy] = useState<'remove' | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -494,7 +504,7 @@ function CorridorsCard({
           `rfq_corridor` answers nothing while the fleet page shows the bot
           healthy. The wizard does the enrolment itself, so this hands over to
           it rather than offering a second, quieter way to get it wrong. */}
-      {settings.editable && addable.length > 0 && (
+      {!hosted && settings.editable && addable.length > 0 && (
         <div className="mt-3">
           <Link
             to={`/add?bot=${encodeURIComponent(bot.name)}&chain=${chainId}`}
@@ -505,7 +515,7 @@ function CorridorsCard({
         </div>
       )}
 
-      {settings.editable && settings.poolCount > 1 && (
+      {!hosted && settings.editable && settings.poolCount > 1 && (
         <div className="mt-3">
           <Button
             variant="danger"
@@ -540,7 +550,9 @@ function SpreadSides({
   draft: Settings
   set: <K extends keyof Settings>(key: K, value: Settings[K]) => void
 }) {
-  const feed = useFeedMid(loaded.feedUrl)
+  const hosted = useProfile() === 'hosted'
+  // Hosted panels don't fetch feed URLs for a preview (the route is refused).
+  const feed = useFeedMid(hosted ? null : loaded.feedUrl)
   // An edited, unsaved feed is a different market: an absolute value
   // converted or previewed at the saved feed's mid would be wrong for it, and
   // whether the pool takes one can change with it (a reversed feed). So a
@@ -558,7 +570,9 @@ function SpreadSides({
   const absolute = draft.buy.kind === 'abs' || draft.sell.kind === 'abs'
   const units = (side: Side) => ({
     absLabel: unit,
-    refusal: loaded.absoluteSpreadRefusal,
+    refusal: hosted
+      ? 'A hosted panel quotes in basis points, inside the agreed envelope.'
+      : loaded.absoluteSpreadRefusal,
     pending: feedEdited
       ? `Save the new price feed before switching to ${unit}: the switch converts at its mid.`
       : null,

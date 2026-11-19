@@ -402,6 +402,23 @@ if [ -z "$PANEL_DIR" ]; then
 fi
 
 env_file="$PANEL_DIR/.env"
+
+# This installer only sets up the full panel. The hosted profile is built by
+# Terraform on client hosts (docs/install-panel.md#hosted-profile) and is never
+# selected here, by default or from an existing install's settings.
+refuse_hosted_profile() { # value where-it-came-from
+  case "$1" in
+    ''|full) ;;
+    *) die "$2 is '$1'. install-panel.sh installs the full panel only; hosted panels are built by Terraform (docs/install-panel.md#hosted-profile)." ;;
+  esac
+}
+refuse_hosted_profile "${PANEL_PROFILE:-}" PANEL_PROFILE
+refuse_hosted_profile "${STITCH_PANEL_PROFILE:-}" STITCH_PANEL_PROFILE
+if [ -f "$env_file" ]; then
+  refuse_hosted_profile "$(env_file_get "$env_file" PANEL_PROFILE)" "PANEL_PROFILE in $env_file"
+  refuse_hosted_profile "$(env_file_get "$env_file" STITCH_PANEL_PROFILE)" "STITCH_PANEL_PROFILE in $env_file"
+fi
+
 compose_mode=''
 if [ -f "$env_file" ]; then
   step 'Existing install found'

@@ -6,6 +6,8 @@
 //! either the Docker Engine API or local `stitch` child processes
 //! (`STITCH_PANEL_RUNTIME=process`); there is no database, because the
 //! container/process list plus the config directories already are the state.
+//! The opt-in hosted profile (`STITCH_PANEL_PROFILE=hosted`) drives bots through
+//! the separate `runtime-broker` subcommand instead and has no Docker socket.
 //!
 //! Reaching a Docker-backed panel means reaching the Docker socket. The desktop
 //! process runtime has no socket — it only supervises local bots. Either way the
@@ -13,6 +15,7 @@
 //! explicit override, and requires a credential on every API route. See
 //! [`stitch_bot::panel::config`] for the environment it reads.
 
+use std::future::IntoFuture;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -24,6 +27,8 @@ use stitch_bot::panel::{auth, AuthMode, PanelConfig, PanelRuntime};
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("hash-password") => hash_password(),
+        #[cfg(unix)]
+        Some("runtime-broker") => runtime_broker(),
         Some("--version" | "-V") => {
             println!("stitch-panel {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -44,7 +49,9 @@ const USAGE: &str = "\
 stitch-panel — Stitch web UI for a fleet of bots
 
 USAGE:
-    stitch-panel                 run Stitch
+    stitch-panel                 run Stitch (full Fleet unless STITCH_PANEL_PROFILE=hosted)
+    stitch-panel runtime-broker  fixed-policy Docker broker for the hosted profile
+                                 (Unix socket, no network)
     stitch-panel hash-password   read a password from the terminal and print its
                                  argon2 hash, for STITCH_PANEL_PASSWORD_HASH.
                                  Reads stdin instead when piped, for scripts.
@@ -55,6 +62,9 @@ environment authentication and disables identity-header login on every startup.
 
 Environment options:
 
+    STITCH_PANEL_PROFILE            unset/full (default) or hosted. Hosted is for
+                                    Terraform-built client hosts only; see
+                                    docs/install-panel.md#hosted-profile
     STITCH_PANEL_RUNTIME            docker (default) or process (desktop, no Docker)
     STITCH_PANEL_BIND               listen address        (default 127.0.0.1:8420)
     STITCH_PANEL_BOTS_DIR           config root as the panel sees it   (/data/bots)
@@ -151,9 +161,28 @@ async fn run(cfg: PanelConfig) -> Result<()> {
     let bind = cfg.bind;
     let runtime = cfg.runtime;
     let auth_summary = describe_auth(&cfg.auth, cfg.trust_identity_header);
+    let profile = cfg.profile.as_str();
 
-    let state = match runtime {
-        PanelRuntime::Docker => {
+    let state = match (
+        runtime,
+        cfg.profile.hosted().map(|h| h.broker_socket.clone()),
+    ) {
+        // Hosted: no Docker socket. The runtime broker is the only way to bots.
+        #[cfg(unix)]
+        (PanelRuntime::Docker, Some(socket)) => {
+            let broker = Arc::new(stitch_bot::panel::hosted::runtime::BrokerDocker::connect(
+                &socket,
+            )?);
+            broker.ping().await.with_context(|| {
+                format!(
+                    "couldn't reach the runtime broker at {}. The hosted compose file runs it as \
+                     the runtime-broker service and mounts its socket into the panel.",
+                    socket.display()
+                )
+            })?;
+            AppState::new(cfg, broker)
+        }
+        (PanelRuntime::Docker, _) => {
             let docker = Arc::new(BollardDocker::connect(&cfg.docker_socket)?);
             // Fail at startup rather than on the operator's first click: a panel that
             // can't reach the daemon can't do anything useful, and the cause is almost
@@ -168,7 +197,7 @@ async fn run(cfg: PanelConfig) -> Result<()> {
             })?;
             AppState::new(cfg, docker.clone()).with_container_files(docker)
         }
-        PanelRuntime::Process => {
+        (PanelRuntime::Process, _) => {
             let stitch_bin = ProcessRuntime::find_stitch_binary().with_context(|| {
                 "STITCH_PANEL_RUNTIME=process but no stitch binary was found. Set \
                  STITCH_PANEL_STITCH_BIN or place `stitch` next to stitch-panel."
@@ -188,20 +217,43 @@ async fn run(cfg: PanelConfig) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
+    // Hosted break-glass: the host's 127.0.0.1:8420 publish lands on the
+    // sidecar's bridge address, so the panel listens there too.
+    let publish_bind = state.cfg.profile.hosted().and_then(|h| h.publish_bind);
+    let publish = match publish_bind {
+        Some(addr) => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding the break-glass listener {addr}"))?,
+        ),
+        None => None,
+    };
 
     tracing::info!(
         %bind,
         bots,
         runtime = runtime.as_str(),
+        profile = profile,
         auth = %auth_summary,
         "stitch-panel {} is up",
         env!("CARGO_PKG_VERSION")
     );
 
-    axum::serve(listener, router(state))
+    let app = router(state);
+    let main = axum::serve(listener, app.clone())
         .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving the panel")
+        .into_future();
+    match publish {
+        None => main.await.context("serving the panel"),
+        Some(publish) => {
+            tracing::info!(bind = ?publish_bind, "break-glass listener is up");
+            let second = axum::serve(publish, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .into_future();
+            tokio::try_join!(main, second).context("serving the panel")?;
+            Ok(())
+        }
+    }
 }
 
 /// A one-line summary of how the panel authenticates, logged at startup so an
@@ -303,4 +355,14 @@ mod tests {
         };
         assert_eq!(describe_auth(&both, true), "2 tailnet login(s) + password");
     }
+}
+
+/// The hosted profile's runtime broker. Never initializes the panel itself.
+#[cfg(unix)]
+fn runtime_broker() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter("info").init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(stitch_bot::panel::broker::serve())
 }

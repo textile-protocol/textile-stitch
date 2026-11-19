@@ -22,7 +22,8 @@ use bollard::models::{
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder,
     ListContainersOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
-    RestartContainerOptionsBuilder, StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
+    RenameContainerOptionsBuilder, RestartContainerOptionsBuilder, StopContainerOptionsBuilder,
+    WaitContainerOptionsBuilder,
 };
 use bollard::Docker;
 use futures_util::{stream, StreamExt};
@@ -57,6 +58,14 @@ pub struct BollardDocker {
 }
 
 impl BollardDocker {
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let options = RenameContainerOptionsBuilder::default().name(to).build();
+        self.docker
+            .rename_container(from, options)
+            .await
+            .with_context(|| format!("renaming {from} to {to}"))
+    }
+
     /// Connect to the daemon over a local pipe (unix socket / Windows named pipe).
     pub fn connect(socket: &Path) -> Result<Self> {
         let path = socket
@@ -183,6 +192,10 @@ impl DockerApi for BollardDocker {
             Ok(info) => Ok(info.config.and_then(|c| c.labels).unwrap_or_default()),
             Err(_) => Ok(Default::default()),
         }
+    }
+
+    async fn replace_image(&self, name: &str, new_image: &str) -> Result<()> {
+        super::swap::swap_image(self, name, new_image).await
     }
 
     async fn schedule_image_swap(
@@ -984,5 +997,141 @@ mod tests {
         let archive = tar_of(&[("../../../etc/passwd", b"root:x:0:0")]);
         let files = extract_files(&archive).unwrap();
         assert_eq!(files[0].0, "passwd");
+    }
+}
+
+/// The daemon calls behind [`super::swap::swap_image`]. All by container id
+/// once the containers exist.
+#[async_trait]
+impl super::swap::SwapOps for BollardDocker {
+    type Template = ContainerCreateBody;
+
+    async fn pull(&self, image: &str) -> Result<()> {
+        self.require_fresh_image(image).await
+    }
+
+    async fn snapshot(&self, name: &str) -> Result<super::swap::Snapshot<ContainerCreateBody>> {
+        let inspect = self
+            .docker
+            .inspect_container(name, None)
+            .await
+            .with_context(|| format!("inspecting {name} before replacing its image"))?;
+        let id = inspect
+            .id
+            .clone()
+            .with_context(|| format!("the daemon reported no id for {name}"))?;
+        // No status reads as Unknown, which the swap refuses.
+        let state = inspect
+            .state
+            .as_ref()
+            .and_then(|s| s.status)
+            .map(|s| ContainerState::parse(&s.to_string()))
+            .unwrap_or(ContainerState::Unknown);
+        let config = inspect
+            .config
+            .context("the container has no Config, so it can't be cloned onto a new image")?;
+        let template = ContainerCreateBody {
+            env: config.env.clone(),
+            cmd: config.cmd.clone(),
+            entrypoint: config.entrypoint.clone(),
+            working_dir: config.working_dir.clone(),
+            user: config.user.clone(),
+            labels: config.labels.clone(),
+            exposed_ports: config.exposed_ports.clone(),
+            host_config: Some(inspect.host_config.unwrap_or_default()),
+            stop_timeout: config.stop_timeout.or(Some(STOP_GRACE_SECS)),
+            ..Default::default()
+        };
+        Ok(super::swap::Snapshot {
+            id,
+            state,
+            labels: config.labels.clone().unwrap_or_default(),
+            template,
+        })
+    }
+
+    async fn occupant(&self, name: &str) -> Result<Option<super::swap::Occupant>> {
+        let inspect = match self.docker.inspect_container(name, None).await {
+            Ok(inspect) => inspect,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("inspecting {name}"))),
+        };
+        let state = inspect
+            .state
+            .as_ref()
+            .and_then(|s| s.status)
+            .map(|s| ContainerState::parse(&s.to_string()))
+            .unwrap_or(ContainerState::Unknown);
+        let labels = inspect.config.and_then(|c| c.labels).unwrap_or_default();
+        Ok(Some(super::swap::Occupant { state, labels }))
+    }
+
+    async fn create(
+        &self,
+        name: &str,
+        template: &ContainerCreateBody,
+        image: &str,
+    ) -> Result<String> {
+        let body = ContainerCreateBody {
+            image: Some(image.to_string()),
+            ..template.clone()
+        };
+        let options = CreateContainerOptionsBuilder::default().name(name).build();
+        Ok(self
+            .docker
+            .create_container(Some(options), body)
+            .await
+            .with_context(|| format!("creating {name}"))?
+            .id)
+    }
+
+    async fn stop(&self, id: &str) -> Result<()> {
+        DockerApi::stop(self, id, STOP_GRACE_SECS).await
+    }
+
+    async fn start(&self, id: &str) -> Result<()> {
+        match self.docker.start_container(id, None).await {
+            // 304: already running, which is what recovery wants.
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("starting {id}"))),
+        }
+    }
+
+    async fn rename(&self, id: &str, to: &str) -> Result<()> {
+        BollardDocker::rename(self, id, to).await
+    }
+
+    async fn remove(&self, id_or_name: &str, force: bool) -> Result<()> {
+        let options = RemoveContainerOptionsBuilder::default()
+            .force(force)
+            .build();
+        match self
+            .docker
+            .remove_container(id_or_name, Some(options))
+            .await
+        {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("removing {id_or_name}"))),
+        }
+    }
+
+    async fn name_of(&self, id: &str) -> Result<String> {
+        let inspect = self
+            .docker
+            .inspect_container(id, None)
+            .await
+            .with_context(|| format!("inspecting {id}"))?;
+        let name = inspect
+            .name
+            .with_context(|| format!("the daemon reported no name for {id}"))?;
+        Ok(name.trim_start_matches('/').to_string())
     }
 }

@@ -82,6 +82,16 @@ jobs:
       - name: Run panel tests
         run: cargo test --features panel
 
+      - name: Build the hosted runtime test image
+        run: |
+          cargo build --locked --features panel --bin stitch-panel
+          mkdir -p target/hosted-image
+          cp target/debug/stitch-panel target/hosted-image/
+          docker build -f tests/Dockerfile.hosted -t stitch-hosted-test target/hosted-image
+
+      - name: Test the hosted profile Docker and Unix-socket boundary
+        run: sudo env STITCH_TEST_IMAGE=stitch-hosted-test bash tests/hosted-runtime.sh
+
       # stitch-desktop: tray-icon → GTK / libappindicator / libxdo; wry → WebKitGTK.
       - name: Install Linux desktop build deps
         run: |

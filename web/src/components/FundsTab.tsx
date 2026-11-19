@@ -61,6 +61,7 @@ const isDecimal = (s: string) => /^(\d+\.?\d*|\.\d+)$/.test(s.trim())
 
 export default function FundsTab({
   bot,
+  canWithdraw = true,
   funding,
   busy,
   onStop,
@@ -68,6 +69,8 @@ export default function FundsTab({
   onWithdrew,
 }: {
   bot: Bot
+  /** False on a hosted panel: withdrawals happen from the client's custody. */
+  canWithdraw?: boolean
   /** The wallet as the page last read it; the page polls and owns it. */
   funding: Funding | null
   /** Which lifecycle action the page is running, if any. */
@@ -142,7 +145,7 @@ export default function FundsTab({
           action, not something to scroll past under the balances each visit.
           It's a <details>, so the form stays mounted and a running withdraw
           keeps its output while closed. */}
-      {vaulted ? (
+      {!canWithdraw ? null : vaulted ? (
         <Disclosure title="Withdraw from the signer wallet">
           <p className="mb-4 text-sm text-muted">
             Only what the signing key holds: its gas, vault shares from fees paid to

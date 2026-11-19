@@ -33,8 +33,11 @@ import ReconnectTextile from '../components/ReconnectTextile'
 import AgentIdentity from '../components/AgentIdentity'
 import RfqOverrides from '../components/RfqOverrides'
 import RenameBot from '../components/RenameBot'
+import RemoveBotCard from '../components/RemoveBotCard'
 import VersionRollback from '../components/VersionRollback'
 import { Disclosure } from '../components/ModuleControls'
+import DigestDeploy from '../components/DigestDeploy'
+import { useProfile } from '../profile'
 import PrivateBalance, { Dots } from '../components/PrivateBalance'
 import { useBalancesHidden } from '../balancePrivacy'
 import { dashboardWallet, fundsFromVault, textileVaultUrl } from '../capital'
@@ -42,6 +45,9 @@ import { imageLabel, shortAddress, shortImage, formatUsd, hostOf } from '../form
 import { totalUsd, unpricedSymbols, useFunding } from '../funding'
 import { confirmRemovePlan } from '../removeBot'
 import type { Bot, ConfigBody, Funding, MigrationResult, UpdatesStatus } from '../types'
+
+/** Raw config and quote modules aren't editable on a hosted panel. */
+const HOSTED_HIDDEN_TABS: readonly BotTab[] = ['config', 'modules']
 
 export default function BotDetail() {
   const { name = '' } = useParams()
@@ -75,11 +81,17 @@ export default function BotDetail() {
     () => !!handoff?.needsPermit2,
   )
   const [busy, setBusy] = useState<string | null>(null)
+  // Hosted panels refuse these server-side; hide them so nobody tries.
+  const hosted = useProfile() === 'hosted'
   // After create, land on Tools so Approve allowances is the next obvious step.
   // Tab lives in `?tab=` so switching bots from the title keeps the same section.
   const fallbackTab: BotTab = handoff?.needsPermit2 ? 'tools' : 'funds'
   const requestedTab = parseBotTab(searchParams.get('tab'), fallbackTab)
-  const tab = requestedTab === 'modules' && bot && !visibleModules.length && !perps.loading ? fallbackTab : requestedTab
+  const hiddenTab = hosted && HOSTED_HIDDEN_TABS.includes(requestedTab)
+  const tab =
+    hiddenTab || (requestedTab === 'modules' && bot && !visibleModules.length && !perps.loading)
+      ? fallbackTab
+      : requestedTab
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
 
   useEffect(() => {
@@ -108,13 +120,16 @@ export default function BotDetail() {
   }, [name])
 
   const loadUpdates = useCallback(async () => {
+    // Hosted bots move only to a digest the operator names, so there is no
+    // registry check to show.
+    if (hosted) return
     try {
       setUpdates(await api.updates())
     } catch {
       // Offline registry checks are soft — don't drown the detail page.
       setUpdates(null)
     }
-  }, [])
+  }, [hosted])
 
   useEffect(() => {
     const signal = { cancelled: false }
@@ -371,7 +386,7 @@ export default function BotDetail() {
                 >
                   Restart
                 </Button>
-                {canUpdate && !bot.canMigrate && bot.layout !== 'flat-files' && (
+                {!hosted && canUpdate && !bot.canMigrate && bot.layout !== 'flat-files' && (
                   <Button
                     variant="primary"
                     busy={busy === 'update'}
@@ -382,6 +397,8 @@ export default function BotDetail() {
                   </Button>
                 )}
               </>
+            ) : hosted ? (
+              <Tag>no container</Tag>
             ) : (
               <>
                 <Tag>no container</Tag>
@@ -417,7 +434,7 @@ export default function BotDetail() {
         </Card>
       )}
 
-      <MigrationPrompt bot={bot} onMigrated={setBot} />
+      {!hosted && <MigrationPrompt bot={bot} onMigrated={setBot} />}
 
       {/*
         Five labels don't fit a phone width. Scroll horizontally in a clipped
@@ -431,7 +448,11 @@ export default function BotDetail() {
           className="flex flex-nowrap gap-x-0.5 overflow-x-auto overflow-y-hidden overscroll-x-contain [touch-action:pan-x_pan-y] border-b border-line-soft [scrollbar-width:none] [-ms-overflow-style:none] sm:gap-x-1 [&::-webkit-scrollbar]:hidden"
           aria-label="Bot sections"
         >
-          {BOT_TABS.filter((t) => t !== 'modules' || visibleModules.length > 0).map((t) => (
+          {BOT_TABS.filter(
+            (t) =>
+              (t !== 'modules' || visibleModules.length > 0) &&
+              !(hosted && HOSTED_HIDDEN_TABS.includes(t)),
+          ).map((t) => (
             <Link
               key={t}
               to={botPath(name, t)}
@@ -501,7 +522,19 @@ export default function BotDetail() {
 
       {tab === 'changes' && <ChangeLog bot={name} />}
 
-      {tab === 'tools' && (
+      {tab === 'tools' && hosted && (
+        <Card title="Update or roll back">
+          <DigestDeploy
+            bot={bot}
+            onDeployed={(message) => {
+              setNote(message)
+              void load()
+            }}
+          />
+        </Card>
+      )}
+
+      {tab === 'tools' && !hosted && (
         <>
           {/*
             Above the runs: what needs approving is the thing an operator came
@@ -582,14 +615,12 @@ export default function BotDetail() {
               only way to reach whatever the wallet holds. Below the floor it is a
               cleanup; above it, it is losing money with a confirm dialog in front.
             */}
-            <Card title={bot.container ? 'Remove this bot' : 'Delete this bot'}>
-              <RemoveBot
-                funding={funding}
-                hasContainer={!!bot.container}
-                busy={busy === 'remove'}
-                onRemove={() => void remove()}
-              />
-            </Card>
+            <RemoveBotCard
+              funding={funding}
+              hasContainer={!!bot.container}
+              busy={busy === 'remove'}
+              onRemove={() => void remove()}
+            />
           </DangerZone>
         </>
       )}
@@ -600,6 +631,7 @@ export default function BotDetail() {
       <div className={tab === 'funds' ? '' : 'hidden'}>
         <FundsTab
           bot={bot}
+          canWithdraw={!hosted}
           funding={funding}
           busy={busy}
           onStop={(target) => void act('stop', target)}
@@ -618,41 +650,6 @@ export default function BotDetail() {
           wallet={dashboardWallet(bot.config)}
         />
       )}
-    </div>
-  )
-}
-
-/**
- * The Remove button and the reason it may be disabled. The server decides
- * (`removeBlockedBy` comes with every wallet read, and the remove route
- * applies the same rule again before it deletes the key); this only shows the
- * answer before the click. While the wallet has not been read yet the button
- * stays live: a bot whose config the panel cannot read is one the route
- * deletes nothing for, and an unreadable wallet is refused by the route.
- */
-function RemoveBot({
-  funding,
-  hasContainer,
-  busy,
-  onRemove,
-}: {
-  funding: Funding | null
-  hasContainer: boolean
-  busy: boolean
-  onRemove: () => void
-}) {
-  const blocked = funding?.removeBlockedBy ?? null
-  return (
-    <div className="space-y-3">
-      <p className="text-sm text-muted">
-        {hasContainer
-          ? 'Deletes the container, the config and the private key. Gone from the fleet, and cannot be undone.'
-          : 'Deletes the config and the private key. Gone from the fleet, and cannot be undone.'}
-      </p>
-      {blocked && <Banner tone="warning">{blocked}</Banner>}
-      <Button variant="danger" busy={busy} disabled={blocked !== null} onClick={onRemove}>
-        {hasContainer ? 'Remove' : 'Delete'}
-      </Button>
     </div>
   )
 }

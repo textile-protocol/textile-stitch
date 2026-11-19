@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom'
 import { api } from '../api'
 import type { SessionInfo } from '../types'
 import ComposeExportLink from './ComposeExportLink'
+import { profileOf } from '../profile'
 
 const ITEM =
   'block w-full px-3 py-2 text-left text-sm text-ink hover:bg-hover disabled:opacity-60'
@@ -23,6 +24,8 @@ export default function OverflowMenu({
   onSignedOut: () => void
 }) {
   const [open, setOpen] = useState(false)
+  // Compose export and Add corridor are full-panel only.
+  const full = profileOf(session) === 'full'
   const rootRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const panelId = useId()
@@ -82,15 +85,19 @@ export default function OverflowMenu({
               <div className="my-1 border-t border-line-soft" />
             </>
           )}
-          <ComposeExportLink
-            className={ITEM}
-            title="A generated compose file for the whole fleet, for disaster recovery"
-          >
-            Export compose
-          </ComposeExportLink>
-          <Link to="/add" className={ITEM} onClick={() => setOpen(false)}>
-            Add corridor
-          </Link>
+          {full && (
+            <>
+              <ComposeExportLink
+                className={ITEM}
+                title="A generated compose file for the whole fleet, for disaster recovery"
+              >
+                Export compose
+              </ComposeExportLink>
+              <Link to="/add" className={ITEM} onClick={() => setOpen(false)}>
+                Add corridor
+              </Link>
+            </>
+          )}
           {session.passwordLogin && (
             <>
               <div className="my-1 border-t border-line-soft" />

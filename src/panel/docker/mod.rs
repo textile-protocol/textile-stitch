@@ -15,6 +15,7 @@
 //! exposed at all.
 
 pub mod fake;
+pub mod swap;
 
 #[cfg(feature = "panel")]
 mod bollard_api;
@@ -399,6 +400,26 @@ pub trait DockerApi: Send + Sync {
         new_image: &str,
         docker_socket: &std::path::Path,
     ) -> Result<()>;
+
+    /// Recreate the bot container `name` on `new_image`, keeping the rest of its
+    /// create config (env, binds, network, restart policy, labels) as the daemon
+    /// reports it. Hosted panels use this through the runtime broker for Update
+    /// and Rollback, because their bots are written by the host's compose file,
+    /// not by the panel's provisioning spec.
+    ///
+    /// The new image is pulled first, strictly, so a registry failure leaves the
+    /// old container untouched. A container that was running is stopped
+    /// gracefully, swapped, and started; if any step after that fails the old
+    /// container is put back under its name and started again. A container that
+    /// is neither up nor stopped (paused, removing) is refused before anything
+    /// changes, since its process could outlive the swap. A failure says
+    /// what it left behind through [`swap::swap_outcome`]; with no outcome in the
+    /// error, the caller must assume the bot may be live.
+    ///
+    /// Not every backend can do this: the default refuses.
+    async fn replace_image(&self, name: &str, new_image: &str) -> Result<()> {
+        anyhow::bail!("this runtime can't replace {name}'s image in place (asked for {new_image})")
+    }
 
     async fn create(&self, spec: &CreateSpec) -> Result<String>;
 
