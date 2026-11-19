@@ -157,7 +157,7 @@ impl PriceCache {
             // A lagging, out-of-line replica cannot replace the newer state
             // or release a hold seen by the other loop.
             Verdict::Held(Hold::Regressed) => {
-                debug!(feed = %url, price = print.price, "older reference price out of line; ignored");
+                debug!(feed = %crate::changelog::params::redact(url), price = print.price, "older reference price out of line; ignored");
             }
             Verdict::Held(hold) => {
                 log_hold(url, state.hold, &hold, &policy.jump);
@@ -192,26 +192,28 @@ fn log_hold(url: &str, before: Option<Hold>, hold: &Hold, jump: &JumpGuard) {
     let changed = before.as_ref().map(std::mem::discriminant) != Some(std::mem::discriminant(hold));
     let message = hold.describe(jump.settle_secs);
     match hold {
-        Hold::WarmingUp if changed => info!(feed = %url, "{message}"),
+        Hold::WarmingUp if changed => {
+            info!(feed = %crate::changelog::params::redact(url), "{message}")
+        }
         Hold::WarmingUp => {}
-        _ if changed => warn!(feed = %url, "{message}"),
-        _ => debug!(feed = %url, "{message}"),
+        _ if changed => warn!(feed = %crate::changelog::params::redact(url), "{message}"),
+        _ => debug!(feed = %crate::changelog::params::redact(url), "{message}"),
     }
 }
 
 fn log_release(url: &str, before: Option<Hold>, verdict: &Verdict, print: Print) {
     match (before, verdict) {
         (_, Verdict::Reanchored { from }) => warn!(
-            feed = %url,
+            feed = %crate::changelog::params::redact(url),
             from,
             to = print.price,
             "reference price held its new level; quoting off it"
         ),
         (Some(Hold::WarmingUp), _) => {
-            info!(feed = %url, price = print.price, "reference price confirmed; quoting")
+            info!(feed = %crate::changelog::params::redact(url), price = print.price, "reference price confirmed; quoting")
         }
         (Some(_), _) => {
-            info!(feed = %url, price = print.price, "reference price back in line; quoting")
+            info!(feed = %crate::changelog::params::redact(url), price = print.price, "reference price back in line; quoting")
         }
         (None, _) => {}
     }

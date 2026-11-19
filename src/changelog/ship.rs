@@ -520,6 +520,7 @@ mod tests {
             validation_contract: String::new(),
             instance_id: None,
             allowed_takers: None,
+            desk_feeds: Vec::new(),
         });
         let shipment = shipment_for(&cfg, &dir.join("stitch.toml"), None).unwrap();
         std::env::remove_var(format!("{var}_FILE"));

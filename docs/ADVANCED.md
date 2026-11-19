@@ -193,6 +193,10 @@ it the window falls to 60 s and the bot goes dark between the reference
 samples. Set `[feed].staleness_secs` to at least 240 too, since the RFQ window
 can't be wider than it.
 
+A `feed_sides` pool needs a wallet only the desk trades against (with
+`[rfq].allowed_takers`). To quote the desk from the same wallet as everyone
+else, use a desk feed instead: see [Desk feeds](#desk-feeds).
+
 ### Spreads
 
 Each side needs one spread, either relative (basis points) or absolute (collateral
@@ -1165,6 +1169,107 @@ key quotes everyone.
 
 The panel has no field for it. Settings saves keep the key as written, and the
 change log records it as `rfq.allowed_takers`.
+
+### Desk feeds
+
+An OTC desk can set its own bid and ask on a desk feed
+(`/price?otc=<key>&pair=cngn-usdt`) and trade with your wallet through a
+virtual account the API keeps for it on that feed. `[[rfq.desk_feeds]]` lets
+one bot quote the desk at the desk's price and everyone else at the pool
+price, from one wallet. Without it you'd run a second bot with
+`allowed_takers` and a `feed_sides` pool, on a wallet nobody else can use.
+
+```toml
+[[rfq.desk_feeds]]
+feed_url = "https://api.textilecredit.com/price?otc=<key>&pair=cngn-usdt"
+takers = ["0x1111111111111111111111111111111111111111"]
+# max_deviation_bps = 200                      # desk midpoint vs the pool's feed price
+# max_order_debt = "100000000000000000000000"  # per-trade ceiling, debt atomic units
+```
+
+Every answer from a shared desk feed, 200 or 503, carries a `desk` object:
+its status (`live`, `stale`, `unset` or `disabled`), chain, collateral and debt
+tokens, the desk's wallets, what its account holds on each side and its
+per-trade cap `maxOrderDebt`. Stitch polls the feed every second with the
+other feeds.
+
+A request is the desk's when its taker is in your `takers` and in the feed's
+`desk.takers`, on the pool whose collateral and debt token addresses and
+chain match the feed's `desk`. Everything else is quoted as before: other
+takers, and the desk's wallets on any other pool.
+
+**Price.** The bot builds the public quote as it always does. When the desk is
+`live`, its print has a bid and ask and is fresh (the same window a pool on
+that URL gets: 240 s for cNGN), and the middle of the desk's bid and ask is
+within `max_deviation_bps` (default 200) of the pool's own feed price, it also
+builds a flat quote at the desk's bid or ask: no curve, profit unwind,
+off-hours widening or modules. It sends whichever gives the taker more for
+what it pays. A tie goes to the public quote. The reply is never worse for the
+taker than the public one, so it can't sit past the levels the venue routed
+on. The desk print goes through the jump guard like any feed print, and the
+signed order still has to pass the price band against the pool's feed.
+
+**Caps.** Every quote to a desk wallet counts against the desk's account,
+whichever price it went out at, because every fill between your wallet and
+that wallet lands on the account. On a bid the bot pays debt: the payout plus
+what's already in flight on bids must fit `account.debt`. On an ask it pays
+collateral, and the same goes for `account.collateral`. In flight means a signed
+quote until a reading taken 120 s after its deadline (it may have filled right
+at the deadline without the bot seeing it, as a recall fill does), or, once the
+bot sees it fill, until a reading taken 120 s after that (the account shows a
+fill up to a minute late). That's judged
+on the reading, not the clock, so while the feed is down a fill keeps counting
+on top of the last account it read. The debt leg (what the bot pays on a
+bid, what it receives on an ask) must also be at most `maxOrderDebt` and, when
+you set it, `max_order_debt`. A quote over any cap is refused with `size`,
+never sized down. The debug log says which cap it hit.
+
+The in-flight list is saved to `rfq-desk-claims.json` next to `stitch.toml`
+before each desk quote goes out, so a restart doesn't forget a quote the desk
+can still fill. Claims are kept per desk (endpoint and `otc` key), so editing
+another parameter of the feed URL between restarts doesn't drop them. If the save fails the quote is withheld (`busy`). If a later update to the file
+fails (a fill, a release), desk quotes stop with `busy` until a save goes
+through; the bot retries every tick. If the file
+can't be read the RFQ responder won't start, as with `rfq-reservations.json`,
+and desk feeds don't run at all without a config directory to keep it in.
+
+**After signing.** A desk-priced quote is checked again the way a
+`feed_sides` quote is: the desk print must still be fresh and the side the bot
+quoted must not have moved against it. Everything that allowed the desk price
+must still hold on the current prints too: the desk `live`, its print sided,
+and its midpoint within `max_deviation_bps` of the pool's price as it is now.
+Every desk quote, desk-priced or not, has to fit the caps on the latest
+reading.
+
+The feed's `otc` key is a capability, so the change log records the URL with
+the key fingerprinted (`otc=REDACTED#…`), like an API key in a pool feed, and
+every log line that names a feed URL does the same. A failed fetch's error leaves the URL out.
+
+**Feed problems.** If the feed can't be reached, answers an error that isn't
+the feed's own (a 502 from a proxy, say), sends something unreadable, or
+answers 200 without a `desk` (or with one that doesn't parse), the bot keeps the last good `desk` for 300 s: caps from it, public price. After
+that the desk's wallets get `busy` on every pool until the feed is back (the
+bot can't tell which pair the desk trades without a reading). A wallet with no
+reading yet (right after start) gets `busy` too. Only a 404, meaning
+the feed was removed, turns those wallets into ordinary customers, with one
+warning in the log. A 200 that merely lost its `desk` doesn't: every fill with
+a desk wallet still lands on the desk's account.
+
+The config won't load with `book_enabled = true` (resting ladder orders can't
+tell a desk wallet from anyone else), a wallet listed under two desk feeds, two
+entries for the same desk (the same `otc` key on the same endpoint, however the
+URL is spelled: the bot keeps one in-flight count per desk), an empty or
+malformed `takers`, a `feed_url` without
+`pair=` or on remote `http://`, a `max_order_debt` that isn't a positive
+decimal, or a `max_deviation_bps` over 10000. With `allowed_takers` set, every
+desk wallet has to be on it. Unlike the rest of `[rfq]`, a misspelled key in a
+desk feed refuses to load, since it would otherwise drop a cap. As with
+`feed_sides`, keep `[feed].staleness_secs` at 240 or more.
+
+At startup the bot logs one `desk feed` line per feed with its pair and how
+many wallets it lists. The panel has no field for desk feeds: settings saves
+keep the block as written, and the change log records it as
+`rfq.desk_feeds`.
 
 ### Production cutover (ops)
 

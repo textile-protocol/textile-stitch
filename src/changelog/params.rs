@@ -111,6 +111,7 @@ const URL: &str = "url";
 const PRICE_OFFSET: &str = "price units (collateral per debt)";
 const ADDRESSES: &str = "addresses";
 const KEY: &str = "key";
+const DESK_FEEDS: &str = "desk feeds";
 
 /// A list of addresses as one value: trimmed, lowercased, sorted and
 /// deduplicated, so reordering or recasing the list is not a change.
@@ -121,6 +122,27 @@ fn address_list(raw: &[String]) -> String {
         .into_iter()
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Every desk feed as one value, one `url takers=… max_deviation_bps=…
+/// max_order_debt=…` entry per feed, sorted by URL. Unset caps read as
+/// what the bot runs with (the default deviation, no extra ceiling). `None`
+/// when there are none.
+fn desk_feed_list(feeds: &[crate::config::DeskFeedConfig]) -> Option<String> {
+    let entries: std::collections::BTreeSet<String> = feeds
+        .iter()
+        .map(|f| {
+            format!(
+                "{} takers={} max_deviation_bps={} max_order_debt={}",
+                redact(f.feed_url.trim()),
+                address_list(&f.takers),
+                f.max_deviation_bps
+                    .unwrap_or(crate::config::DEFAULT_DESK_MAX_DEVIATION_BPS),
+                f.max_order_debt.as_deref().map_or("feed", str::trim),
+            )
+        })
+        .collect();
+    (!entries.is_empty()).then(|| entries.into_iter().collect::<Vec<_>>().join("; "))
 }
 
 fn bot_param(name: &str, unit: &str, value: Option<String>) -> (ParamKey, Param) {
@@ -182,6 +204,11 @@ fn bot_params(cfg: &Config) -> Vec<(ParamKey, Param)> {
                 .as_ref()
                 .and_then(|r| r.allowed_takers.as_deref())
                 .map(address_list),
+        ),
+        bot_param(
+            "rfq.desk_feeds",
+            DESK_FEEDS,
+            cfg.rfq.as_ref().and_then(|r| desk_feed_list(&r.desk_feeds)),
         ),
         bot_param("book_enabled", BOOL, Some(cfg.book_enabled.to_string())),
         bot_param(
@@ -465,9 +492,16 @@ pub fn redact(value: &str) -> String {
     }
 }
 
+/// Query parameters that are a capability by their exact name: `otc` is an
+/// OTC desk feed's key, and whoever holds it can read the desk's prints,
+/// wallets and account. Exact, since a substring like `otc` turns up in
+/// unrelated names.
+const SECRET_QUERY_NAMES: [&str; 1] = ["otc"];
+
 fn is_secret_key(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     SECRET_QUERY_KEYS.iter().any(|s| lower.contains(s))
+        || SECRET_QUERY_NAMES.contains(&lower.as_str())
 }
 
 fn fingerprint(secret: &str) -> String {
@@ -629,6 +663,63 @@ mod tests {
     }
 
     #[test]
+    fn desk_feeds_are_one_tracked_value() {
+        let rfq = |feeds: &str| {
+            format!(
+                "{ZARU}\n[rfq]\nenabled = false\nurl = \"wss://x\"\nmaker_id = \"mk\"\n\
+                 validation_contract = \"0x00000000000000000000000000000000000000aa\"\n{feeds}"
+            )
+        };
+        let desk = |takers: &str, extra: &str| {
+            format!(
+                "[[rfq.desk_feeds]]\nfeed_url = \"https://api.x/price?otc=k&pair=cngn-usdt\"\n\
+                 takers = [{takers}]\n{extra}"
+            )
+        };
+        let none = params_of(&rfq("")).unwrap();
+        assert_eq!(value(&none, BOT_SCOPE, "rfq.desk_feeds"), None);
+
+        let one = params_of(&rfq(&desk(
+            "\"0x00000000000000000000000000000000000000CD\", \"0x00000000000000000000000000000000000000ab\"",
+            "",
+        )))
+        .unwrap();
+        // The feed's key is a capability: it never leaves the host.
+        assert_eq!(
+            value(&one, BOT_SCOPE, "rfq.desk_feeds").as_deref(),
+            Some(
+                "https://api.x/price?otc=REDACTED%238254c329&pair=cngn-usdt \
+                 takers=0x00000000000000000000000000000000000000ab,\
+                 0x00000000000000000000000000000000000000cd \
+                 max_deviation_bps=200 max_order_debt=feed"
+            )
+        );
+        let reordered = params_of(&rfq(&desk(
+            "\"0x00000000000000000000000000000000000000ab\", \"0x00000000000000000000000000000000000000cd\"",
+            "max_deviation_bps = 200\n",
+        )))
+        .unwrap();
+        assert!(
+            diff(&one, &reordered).is_empty(),
+            "the default is not a change"
+        );
+
+        let capped = params_of(&rfq(&desk(
+            "\"0x00000000000000000000000000000000000000ab\", \"0x00000000000000000000000000000000000000cd\"",
+            "max_order_debt = \"5000\"\n",
+        )))
+        .unwrap();
+        let changes = diff(&one, &capped);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].key.name, "rfq.desk_feeds");
+        assert!(changes[0]
+            .after
+            .as_deref()
+            .unwrap()
+            .ends_with("max_order_debt=5000"));
+    }
+
+    #[test]
     fn quoting_the_feeds_sides_is_one_change_on_the_pool() {
         let before = params_of(ZARU).unwrap();
         assert_eq!(value(&before, POOL, "feed_sides"), None);
@@ -755,5 +846,16 @@ mod tests {
         let userinfo = redact("https://user:hunter2@feed.example/price");
         assert!(!userinfo.contains("hunter2"), "{userinfo}");
         assert_eq!(redact("not a url"), "not a url");
+    }
+
+    #[test]
+    fn an_otc_desk_feed_key_is_fingerprinted_by_its_exact_name() {
+        // Same vector as the API's redactUrl test.
+        assert_eq!(
+            redact("https://api.textilecredit.com/price?otc=otc-0123abcd&pair=cngn-usdt"),
+            "https://api.textilecredit.com/price?otc=REDACTED%234286c33a&pair=cngn-usdt"
+        );
+        let unrelated = "https://rates.example/p?protocol=v2&hotc=1";
+        assert_eq!(redact(unrelated), unrelated);
     }
 }

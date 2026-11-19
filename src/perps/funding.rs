@@ -214,6 +214,7 @@ mod tests {
             validation_contract: format!("{}", Address::repeat_byte(2)),
             instance_id: None,
             allowed_takers: None,
+            desk_feeds: Vec::new(),
         });
         let p = PerpsConfig {
             assignment_id: "recall-test".into(),

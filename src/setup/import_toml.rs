@@ -200,6 +200,28 @@ ttl_secs = 60
     }
 
     #[test]
+    fn rfq_desk_feeds_are_imported_as_written() {
+        let raw = format!(
+            "{}\n[rfq]\nenabled = true\n\
+             url = \"wss://api.textilecredit.com/v2/maker/stream\"\n\
+             maker_id = \"clmaker0001\"\n\
+             validation_contract = \"0xBCA5E344077AaC751A1C548a45F28215bB7ec165\"\n\n\
+             [[rfq.desk_feeds]]\n\
+             feed_url = \"https://api.textilecredit.com/price?otc=desk&pair=cngn-usdt\"\n\
+             takers = [\"0x00000000000000000000000000000000000000ab\"]\n",
+            valid()
+        );
+        let out = validate_imported_toml(&raw).expect("a desk feed is not a secret");
+        let feeds = Config::from_toml(&out)
+            .unwrap()
+            .rfq
+            .unwrap()
+            .desk_feeds()
+            .unwrap();
+        assert_eq!(feeds.len(), 1);
+    }
+
+    #[test]
     fn a_signer_table_is_refused() {
         let err = validate_imported_toml(
             &(valid() + "\n[signer]\nbackend = \"local\"\nprivate_key = \"0xabc\"\n"),

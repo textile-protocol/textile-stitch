@@ -192,7 +192,7 @@ impl FeedGuards {
                     self.prices.admit(started, feed_url, quote, unix_now());
                 }
                 Err(e) => {
-                    warn!(feed = %feed_url, error = %e, "feed fetch failed; skipping its pools this tick");
+                    warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), error = %e, "feed fetch failed; skipping its pools this tick");
                     self.prices.invalidate(feed_url);
                 }
             }
@@ -258,7 +258,7 @@ fn log_session_change(
     }
     match off_hours {
         Some(off) => info!(
-            feed = %feed_url,
+            feed = %stitch_bot::changelog::params::redact(&feed_url),
             session = off.session.label(),
             market_age_hours = format!("{:.1}", off.market_age_hours()),
             market_source = quote.market_source.as_deref().unwrap_or("unknown"),
@@ -267,7 +267,7 @@ fn log_session_change(
             "off-hours price: quoting wider and smaller"
         ),
         None => {
-            info!(feed = %feed_url, session = quote.session.label(), "live price: quoting as configured")
+            info!(feed = %stitch_bot::changelog::params::redact(&feed_url), session = quote.session.label(), "live price: quoting as configured")
         }
     }
 }
@@ -1235,19 +1235,19 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             match usable(&quote, now, cfg.feed.staleness_secs) {
                 Ok(()) => {}
                 Err(Unusable::Stale) => {
-                    warn!(feed = %feed_url, feed_ts = quote.timestamp, now, "stale or invalid feed timestamp; skipping pool");
+                    warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), feed_ts = quote.timestamp, now, "stale or invalid feed timestamp; skipping pool");
                     continue;
                 }
                 Err(Unusable::BadPrice) => {
-                    warn!(feed = %feed_url, price = quote.price, "unusable feed price; skipping pool");
+                    warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), price = quote.price, "unusable feed price; skipping pool");
                     continue;
                 }
                 Err(Unusable::Degraded) => {
-                    warn!(feed = %feed_url, price = quote.price, "feed flagged the price degraded (held, clamped or fallback); skipping pool");
+                    warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), price = quote.price, "feed flagged the price degraded (held, clamped or fallback); skipping pool");
                     continue;
                 }
                 Err(Unusable::UnknownSession) => {
-                    warn!(feed = %feed_url, price = quote.price, "feed labelled the price with an unknown session; skipping pool");
+                    warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), price = quote.price, "feed labelled the price with an unknown session; skipping pool");
                     continue;
                 }
             }
@@ -1257,7 +1257,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             let off_hours = match off_hours::assess(&quote, pool.off_hours.as_ref(), now) {
                 Ok(off) => off,
                 Err(refusal) => {
-                    warn!(feed = %feed_url, session = quote.session.label(), "{}", refusal.describe());
+                    warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), session = quote.session.label(), "{}", refusal.describe());
                     continue;
                 }
             };

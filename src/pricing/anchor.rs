@@ -170,13 +170,13 @@ impl Anchor {
             Ok(kept) => {
                 if let OnDisk::Contradicted { observed_at } = kept {
                     if self.saved != Some(kept) {
-                        warn!(feed = %self.url, observed_at, price = trusted.price, "saved anchors disagree by more than max_jump_bps at one feed timestamp; a restart trusts neither until a newer print is saved")
+                        warn!(feed = %crate::changelog::params::redact(&self.url), observed_at, price = trusted.price, "saved anchors disagree by more than max_jump_bps at one feed timestamp; a restart trusts neither until a newer print is saved")
                     }
                 }
                 self.saved = Some(kept);
             }
             Err(e) => {
-                warn!(feed = %self.url, error = %format!("{e:#}"), "could not save the trusted reference price; the jump guard keeps it in memory only")
+                warn!(feed = %crate::changelog::params::redact(&self.url), error = %format!("{e:#}"), "could not save the trusted reference price; the jump guard keeps it in memory only")
             }
         }
     }

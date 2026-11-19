@@ -419,9 +419,130 @@ pub struct RfqConfig {
     /// through [`RfqConfig::allowed_takers`].
     #[serde(default)]
     pub allowed_takers: Option<Vec<String>>,
+    /// OTC desks this bot prices by taker (`[[rfq.desk_feeds]]`). Each names
+    /// a signed desk feed and the desk's wallets: a request from one of them
+    /// is priced off the desk's own bid and ask (when that beats the public
+    /// price) and capped by the desk's virtual account on the feed. Everyone
+    /// else is quoted as before. Read through [`RfqConfig::desk_feeds`].
+    #[serde(default)]
+    pub desk_feeds: Vec<DeskFeedConfig>,
+}
+
+/// One `[[rfq.desk_feeds]]` entry as written. Unknown keys are refused: a
+/// misspelt `max_order_debt` would otherwise drop a cap on money without a
+/// word.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DeskFeedConfig {
+    /// The desk's feed, `/price?otc=<key>&pair=<pair>`.
+    pub feed_url: String,
+    /// The desk's wallets. The bot treats a taker as the desk's only when it
+    /// is listed here AND in the feed's own `desk.takers`.
+    pub takers: Vec<String>,
+    /// How far the desk's midpoint may sit from the matching pool's own feed
+    /// price before the bot stops quoting the desk's sides, in bps.
+    #[serde(default)]
+    pub max_deviation_bps: Option<u32>,
+    /// A per-trade ceiling on the debt leg, atomic units, under the feed's
+    /// own `maxOrderDebt`.
+    #[serde(default)]
+    pub max_order_debt: Option<String>,
+}
+
+/// `max_deviation_bps` when a desk feed doesn't set it.
+pub const DEFAULT_DESK_MAX_DEVIATION_BPS: u32 = 200;
+
+/// A desk feed, parsed and checked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeskFeed {
+    pub feed_url: String,
+    pub takers: std::collections::BTreeSet<alloy_primitives::Address>,
+    pub max_deviation_bps: u32,
+    pub max_order_debt: Option<U256>,
+}
+
+impl DeskFeedConfig {
+    /// This entry parsed. `idx` names it in errors.
+    pub fn parse(&self, idx: usize) -> anyhow::Result<DeskFeed> {
+        let field = format!("[[rfq.desk_feeds]][{idx}]");
+        let raw_url = self.feed_url.trim();
+        assert_feed_url(raw_url, &format!("{field}.feed_url"))?;
+        // One spelling per desk: the feed URL is the desk's identity in the
+        // price cache and the in-flight ledger, so aliases of it (a fragment,
+        // reordered parameters) must not count as separate desks.
+        let feed_url = canonical_feed_url(raw_url);
+        anyhow::ensure!(
+            feed_pair(&feed_url).is_some_and(|p| !p.is_empty()),
+            "{field}.feed_url must name its pair (pair=...), got {:?}",
+            shown_feed_url(&feed_url)
+        );
+        anyhow::ensure!(
+            !self.takers.is_empty(),
+            "{field}.takers is empty; list the desk's wallets"
+        );
+        let takers = self
+            .takers
+            .iter()
+            .enumerate()
+            .map(|(t, entry)| parse_taker(entry, &format!("{field}.takers[{t}]")))
+            .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+        let max_deviation_bps = self
+            .max_deviation_bps
+            .unwrap_or(DEFAULT_DESK_MAX_DEVIATION_BPS);
+        anyhow::ensure!(
+            max_deviation_bps <= 10_000,
+            "{field}.max_deviation_bps is {max_deviation_bps}; at most 10000"
+        );
+        let max_order_debt = self
+            .max_order_debt
+            .as_deref()
+            .map(|raw| parse_atomic_cap(raw, &format!("{field}.max_order_debt")))
+            .transpose()?;
+        Ok(DeskFeed {
+            feed_url,
+            takers,
+            max_deviation_bps,
+            max_order_debt,
+        })
+    }
+}
+
+fn parse_taker(entry: &str, field: &str) -> anyhow::Result<alloy_primitives::Address> {
+    let taker = entry
+        .trim()
+        .parse::<alloy_primitives::Address>()
+        .with_context(|| format!("{field} is not a valid address: {entry:?}"))?;
+    anyhow::ensure!(!taker.is_zero(), "{field} is the zero address");
+    Ok(taker)
+}
+
+/// A positive whole number of atomic units, written in decimal.
+fn parse_atomic_cap(raw: &str, field: &str) -> anyhow::Result<U256> {
+    let raw = raw.trim();
+    anyhow::ensure!(
+        !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()),
+        "{field} must be a decimal amount in atomic units, got {raw:?}"
+    );
+    let cap = U256::from_str_radix(raw, 10)
+        .with_context(|| format!("{field} is out of range: {raw:?}"))?;
+    anyhow::ensure!(
+        !cap.is_zero(),
+        "{field} is zero; omit it to use the feed's cap"
+    );
+    Ok(cap)
 }
 
 impl RfqConfig {
+    /// Every `[[rfq.desk_feeds]]` entry, parsed. Rules that span entries or
+    /// the rest of the config live in `Config::validate_desk_feeds`.
+    pub fn desk_feeds(&self) -> anyhow::Result<Vec<DeskFeed>> {
+        self.desk_feeds
+            .iter()
+            .enumerate()
+            .map(|(idx, feed)| feed.parse(idx))
+            .collect()
+    }
+
     /// `allowed_takers` parsed and deduplicated. `Ok(None)` when the key is
     /// absent, which means every taker. An empty list, an unparseable entry
     /// or the zero address is an error naming the field.
@@ -653,6 +774,14 @@ pub fn rfq_staleness_secs_for_pool(feed: &FeedConfig, pool: &PoolConfig) -> u64 
         .min(RFQ_MAX_STALENESS_SECS)
 }
 
+/// The RFQ freshness window for a desk feed: what a pool with that
+/// `feed_url` and no `rfq_staleness_secs` of its own would get.
+pub fn desk_feed_staleness_secs(feed: &FeedConfig, feed_url: &str) -> u64 {
+    default_rfq_staleness_secs(feed_url)
+        .min(feed.staleness_secs)
+        .min(RFQ_MAX_STALENESS_SECS)
+}
+
 /// What a pool asks for, before the bot-level window and the ceiling clamp it.
 ///
 /// Split out because `[feed].staleness_secs` is a bot-wide floor — the ladder
@@ -738,7 +867,48 @@ fn default_rfq_staleness_secs(feed_url: &str) -> u64 {
 
 /// The `pair` query parameter of a feed URL, lowercased. `None` when the URL
 /// names no pair, which is every feed that is not Textile's `/price`.
-fn feed_pair(feed_url: &str) -> Option<String> {
+/// A feed URL in one spelling: no fragment (never sent), query parameters
+/// sorted. The same endpoint answers either way. Pure; returns the input
+/// trimmed when it doesn't parse (validation refuses it separately).
+pub fn canonical_feed_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Ok(mut url) = url::Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+    url.set_fragment(None);
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if pairs.is_empty() {
+        url.set_query(None);
+    } else {
+        pairs.sort();
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    url.to_string()
+}
+
+/// Which desk a desk feed URL reads: its endpoint and `otc` key when it has
+/// one, else the whole canonical URL. Two feeds with the same desk read one
+/// account, so they can't be two entries. Pure.
+pub fn desk_feed_identity(feed_url: &str) -> String {
+    let canonical = canonical_feed_url(feed_url);
+    let Ok(url) = url::Url::parse(&canonical) else {
+        return canonical;
+    };
+    match url.query_pairs().find(|(k, _)| k == "otc") {
+        Some((_, key)) => format!(
+            "{}://{}{}?otc={key}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            url.port().map(|p| format!(":{p}")).unwrap_or_default() + url.path()
+        ),
+        None => canonical,
+    }
+}
+
+pub fn feed_pair(feed_url: &str) -> Option<String> {
     let query = feed_url.split_once('?')?.1;
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
@@ -748,6 +918,21 @@ fn feed_pair(feed_url: &str) -> Option<String> {
 
 /// Price feed: `https://` anywhere, or `http://` only on loopback.
 /// A remote cleartext feed is a MITM'd mid (audit M-05).
+/// A feed URL as an error may show it: credentials and an `otc` key
+/// fingerprinted ([`crate::changelog::params::redact`]), or, when it doesn't
+/// even parse, everything from the query on dropped. Config errors reach the
+/// startup log and the panel, so they never carry a key.
+pub fn shown_feed_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if url::Url::parse(trimmed).is_ok() {
+        return crate::changelog::params::redact(trimmed);
+    }
+    match trimmed.split_once(['?', '#']) {
+        Some((head, _)) => format!("{head}?…"),
+        None => trimmed.to_string(),
+    }
+}
+
 pub fn assert_feed_url(raw: &str, field: &str) -> anyhow::Result<()> {
     assert_feed_url_with(raw, field, allow_cleartext_docker())
 }
@@ -755,15 +940,20 @@ pub fn assert_feed_url(raw: &str, field: &str) -> anyhow::Result<()> {
 /// As [`assert_rfq_stream_url_with`]: the escape hatch is an argument so tests
 /// never have to touch the process environment to exercise it.
 fn assert_feed_url_with(raw: &str, field: &str, allow_cleartext: bool) -> anyhow::Result<()> {
-    let parsed = url::Url::parse(raw.trim())
-        .with_context(|| format!("{field} must be a valid HTTP URL, got {raw:?}"))?;
+    let parsed = url::Url::parse(raw.trim()).with_context(|| {
+        format!(
+            "{field} must be a valid HTTP URL, got {:?}",
+            shown_feed_url(raw)
+        )
+    })?;
     anyhow::ensure!(parsed.host().is_some(), "{field} must include a host");
     match parsed.scheme() {
         "https" => Ok(()),
         "http" => {
             anyhow::ensure!(
                 host_is_loopback(parsed.host()) || allow_cleartext,
-                "{field} may use http:// only on localhost, got {raw:?}"
+                "{field} may use http:// only on localhost, got {:?}",
+                shown_feed_url(raw)
             );
             Ok(())
         }
@@ -2288,6 +2478,7 @@ impl Config {
         }
         self.price_guard.validate()?;
         self.validate_allowed_takers()?;
+        self.validate_desk_feeds()?;
         self.validate_feed_sides()?;
         self.validate_issuer_spread()?;
         self.validate_rfq()?;
@@ -2311,6 +2502,63 @@ impl Config {
             "[rfq].allowed_takers is set, but book_enabled = true rests public orders any \
              wallet can fill. Set book_enabled = false (the default) or remove allowed_takers"
         );
+        Ok(())
+    }
+
+    /// `[[rfq.desk_feeds]]` rules. Checked even while `[rfq]` is disabled,
+    /// like `allowed_takers`.
+    ///
+    /// - The public ladder (`book_enabled`) can't price by taker: its orders
+    ///   rest for any wallet to fill, desk wallets included, at the pool price
+    ///   and outside the desk's caps.
+    /// - A taker belongs to one desk. Two feeds claiming one wallet would put
+    ///   its fills on two accounts.
+    /// - One entry per desk: by [`desk_feed_identity`], so two spellings of
+    ///   one desk's URL, or the same `otc` key with other parameters, can't
+    ///   keep separate in-flight counts against one account.
+    /// - With `allowed_takers` set, every desk wallet must be on it, or the
+    ///   bot refuses it before the desk is ever read.
+    fn validate_desk_feeds(&self) -> anyhow::Result<()> {
+        let Some(rfq) = &self.rfq else { return Ok(()) };
+        let feeds = rfq.desk_feeds()?;
+        if feeds.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.book_enabled,
+            "[[rfq.desk_feeds]] prices desk wallets apart from everyone else, but \
+             book_enabled = true rests public orders any wallet can fill. Set \
+             book_enabled = false (the default) or remove the desk feeds"
+        );
+        let allowed = rfq.allowed_takers()?;
+        let mut owner: std::collections::BTreeMap<alloy_primitives::Address, usize> =
+            std::collections::BTreeMap::new();
+        for (idx, feed) in feeds.iter().enumerate() {
+            let desk = desk_feed_identity(&feed.feed_url);
+            if let Some(first) = feeds[..idx]
+                .iter()
+                .position(|f| desk_feed_identity(&f.feed_url) == desk)
+            {
+                anyhow::bail!(
+                    "[[rfq.desk_feeds]][{idx}] reads the same desk as [[rfq.desk_feeds]][{first}] (repeats the feed_url)"
+                );
+            }
+            for taker in &feed.takers {
+                if let Some(first) = owner.insert(*taker, idx) {
+                    anyhow::bail!(
+                        "{taker:#x} is a taker of both [[rfq.desk_feeds]][{first}] and \
+                         [[rfq.desk_feeds]][{idx}]; a wallet belongs to one desk"
+                    );
+                }
+                if let Some(list) = &allowed {
+                    anyhow::ensure!(
+                        list.contains(taker),
+                        "[[rfq.desk_feeds]][{idx}] lists {taker:#x}, which is not on \
+                         [rfq].allowed_takers, so the bot would never quote it"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4530,6 +4778,186 @@ mod tests {
         .map(|a| a.parse().unwrap())
         .collect();
         assert_eq!(set, expected);
+    }
+
+    const DESK_URL: &str = "https://api.textilecredit.com/price?otc=tradepal&pair=cngn-usdt";
+    const DESK_TAKER: &str = "0x00000000000000000000000000000000000000ab";
+
+    /// `RFQ_BLOCK` with one desk feed, `extra` lines appended to it.
+    fn desk_toml(extra: &str) -> String {
+        format!(
+            "{LEAN_POOL_BASE}\n{RFQ_BLOCK}\n[[rfq.desk_feeds]]\nfeed_url = \"{DESK_URL}\"\n\
+             takers = [\"{DESK_TAKER}\"]\n{extra}"
+        )
+    }
+
+    fn desk_err(toml: &str) -> String {
+        format!("{:#}", Config::from_toml(toml).unwrap_err())
+    }
+
+    #[test]
+    fn a_desk_feed_parses_with_its_defaults_and_its_caps() {
+        let cfg = Config::from_toml(&desk_toml("")).unwrap();
+        let feeds = cfg.rfq.as_ref().unwrap().desk_feeds().unwrap();
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0].feed_url, DESK_URL);
+        assert_eq!(feeds[0].takers.len(), 1);
+        assert_eq!(feeds[0].max_deviation_bps, DEFAULT_DESK_MAX_DEVIATION_BPS);
+        assert_eq!(feeds[0].max_order_debt, None);
+
+        let capped = Config::from_toml(&desk_toml(
+            "max_deviation_bps = 50\nmax_order_debt = \"100000000000000000000000\"\n",
+        ))
+        .unwrap();
+        let feed = &capped.rfq.unwrap().desk_feeds().unwrap()[0];
+        assert_eq!(feed.max_deviation_bps, 50);
+        assert_eq!(
+            feed.max_order_debt,
+            Some(U256::from(100_000u64) * U256::from(10u64).pow(U256::from(18u64)))
+        );
+
+        let none = Config::from_toml(&format!("{LEAN_POOL_BASE}\n{RFQ_BLOCK}")).unwrap();
+        assert!(none.rfq.unwrap().desk_feeds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_desk_feed_refuses_bad_takers_urls_and_caps() {
+        let with_takers = |list: &str| desk_toml("").replace(&format!("[\"{DESK_TAKER}\"]"), list);
+        assert!(desk_err(&with_takers("[]")).contains("takers is empty"));
+        assert!(desk_err(&with_takers("[\"0x12\"]")).contains("takers[0] is not a valid address"));
+        assert!(desk_err(&with_takers(
+            "[\"0x0000000000000000000000000000000000000000\"]"
+        ))
+        .contains("zero address"));
+
+        let with_url = |url: &str| desk_toml("").replace(DESK_URL, url);
+        assert!(
+            desk_err(&with_url("http://api.example/price?otc=k&pair=cngn-usdt"))
+                .contains("http:// only on localhost")
+        );
+        assert!(desk_err(&with_url("https://api.example/price?otc=k")).contains("pair="));
+        assert!(desk_err(&with_url("not a url")).contains("feed_url"));
+
+        assert!(desk_err(&desk_toml("max_order_debt = \"0\"\n")).contains("is zero"));
+        assert!(desk_err(&desk_toml("max_order_debt = \"1e24\"\n")).contains("decimal amount"));
+        assert!(desk_err(&desk_toml("max_deviation_bps = 10001\n")).contains("at most 10000"));
+        let typo = desk_err(&desk_toml("max_order_dept = \"1\"\n"));
+        assert!(typo.contains("max_order_dept"), "{typo}");
+        // Refused while RFQ is off too: the switch must not turn a bad list live.
+        let off = desk_toml("").replacen("enabled = true", "enabled = false", 1);
+        assert!(desk_err(&off.replace(&format!("[\"{DESK_TAKER}\"]"), "[]")).contains("takers"));
+    }
+
+    #[test]
+    fn a_rejected_feed_url_never_shows_its_key() {
+        let no_pair = DeskFeedConfig {
+            feed_url: "https://api.x/price?otc=otc-secret".into(),
+            takers: vec!["0x00000000000000000000000000000000000000ab".into()],
+            max_deviation_bps: None,
+            max_order_debt: None,
+        };
+        let err = format!("{:#}", no_pair.parse(0).unwrap_err());
+        assert!(err.contains("must name its pair"), "{err}");
+        assert!(!err.contains("otc-secret"), "{err}");
+        let remote = assert_feed_url_with("http://api.x/price?otc=otc-secret&pair=a-b", "f", false)
+            .unwrap_err();
+        assert!(!format!("{remote:#}").contains("otc-secret"), "{remote:#}");
+        let garbled = assert_feed_url_with("not a url?otc=otc-secret", "f", false).unwrap_err();
+        assert!(
+            !format!("{garbled:#}").contains("otc-secret"),
+            "{garbled:#}"
+        );
+    }
+
+    #[test]
+    fn a_desk_feed_has_one_spelling_and_one_entry_per_desk() {
+        let base = "https://api.x/price?otc=k1&pair=cngn-usdt";
+        assert_eq!(
+            canonical_feed_url("https://api.x/price?pair=cngn-usdt&otc=k1#x"),
+            base
+        );
+        assert_eq!(canonical_feed_url(base), base);
+        // Aliases of one desk: reordered, a fragment, an extra parameter.
+        for alias in [
+            "https://api.x/price?pair=cngn-usdt&otc=k1",
+            "https://api.x/price?otc=k1&pair=cngn-usdt#again",
+            "https://api.x/price?otc=k1&pair=cngn-usdt&v=2",
+        ] {
+            assert_eq!(
+                desk_feed_identity(alias),
+                desk_feed_identity(base),
+                "{alias}"
+            );
+        }
+        assert_ne!(
+            desk_feed_identity("https://api.x/price?otc=k2&pair=cngn-usdt"),
+            desk_feed_identity(base)
+        );
+    }
+
+    #[test]
+    fn desk_feeds_refuse_the_ladder_a_shared_wallet_and_a_repeated_feed() {
+        let ladder = desk_toml("").replace(
+            "tick_interval_secs = 5",
+            "tick_interval_secs = 5\nbook_enabled = true",
+        );
+        assert!(desk_err(&ladder).contains("book_enabled = true"));
+
+        let second = |url: &str, taker: &str| {
+            desk_toml(&format!(
+                "\n[[rfq.desk_feeds]]\nfeed_url = \"{url}\"\ntakers = [\"{taker}\"]\n"
+            ))
+        };
+        let other_url = "https://api.textilecredit.com/price?otc=other&pair=cngn-usdt";
+        let shared = desk_err(&second(other_url, DESK_TAKER));
+        assert!(shared.contains("a wallet belongs to one desk"), "{shared}");
+        let repeated = desk_err(&second(
+            DESK_URL,
+            "0x00000000000000000000000000000000000000cd",
+        ));
+        assert!(repeated.contains("repeats the feed_url"), "{repeated}");
+        // The same desk spelled differently is still the same desk.
+        for alias in [format!("{DESK_URL}#again"), format!("{DESK_URL}&v=2")] {
+            let err = desk_err(&second(
+                &alias,
+                "0x00000000000000000000000000000000000000cd",
+            ));
+            assert!(err.contains("reads the same desk"), "{alias}: {err}");
+        }
+        Config::from_toml(&second(
+            other_url,
+            "0x00000000000000000000000000000000000000cd",
+        ))
+        .expect("two desks, two wallets");
+    }
+
+    #[test]
+    fn desk_takers_must_be_on_the_allowlist_when_there_is_one() {
+        let listed = |taker: &str| {
+            desk_toml("").replace("[rfq]", &format!("[rfq]\nallowed_takers = [\"{taker}\"]"))
+        };
+        Config::from_toml(&listed(DESK_TAKER)).expect("desk wallet on the list");
+        let err = desk_err(&listed("0x00000000000000000000000000000000000000cd"));
+        assert!(err.contains("not on [rfq].allowed_takers"), "{err}");
+    }
+
+    #[test]
+    fn a_desk_feed_is_as_fresh_as_a_pool_on_the_same_url() {
+        let cfg = Config::from_toml(&desk_toml("")).unwrap();
+        let feed = FeedConfig {
+            staleness_secs: 900,
+            ..cfg.feed.clone()
+        };
+        assert_eq!(
+            desk_feed_staleness_secs(&feed, DESK_URL),
+            RFQ_MAX_STALENESS_SECS
+        );
+        assert_eq!(
+            desk_feed_staleness_secs(&feed, "https://api.example/price?pair=weth-usdt"),
+            RFQ_DEFAULT_STALENESS_SECS
+        );
+        // The ladder's window still bounds it, as it bounds a pool.
+        assert_eq!(desk_feed_staleness_secs(&cfg.feed, DESK_URL), 30);
     }
 
     #[test]

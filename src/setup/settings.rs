@@ -2579,6 +2579,49 @@ mod tests {
         assert_eq!(takers(&off), Some(1), "{off}");
     }
 
+    /// Desk feeds have no field in the panel either: every save keeps them.
+    #[test]
+    fn panel_saves_keep_the_desk_feeds() {
+        let src = format!(
+            "{}\nrfq_corridor = \"cngn-usdt\"\n\n[rfq]\nenabled = true\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\nmaker_id = \"mk_x\"\nvalidation_contract = \"0x00000000000000000000000000000000000000aa\"\n\n[[rfq.desk_feeds]]\nfeed_url = \"https://api.textilecredit.com/price?otc=desk&pair=cngn-usdt\"\ntakers = [\"0x00000000000000000000000000000000000000ab\"]\nmax_order_debt = \"100000000000000000000000\"\n",
+            TEMPLATE.trim_end()
+        );
+        let desks = |toml: &str| {
+            Config::from_toml(toml)
+                .unwrap()
+                .rfq
+                .unwrap()
+                .desk_feeds()
+                .unwrap()
+        };
+        let before = desks(&src);
+        assert_eq!(before.len(), 1);
+
+        let current = read_settings(&src).unwrap();
+        let spread_save = apply_settings(&src, &current.to_patch()).unwrap();
+        assert_eq!(spread_save, src);
+
+        let reconnect = apply_settings(
+            &src,
+            &rfq_connect_patch(
+                &current,
+                "wss://api.textilecredit.com/v2/maker/stream".into(),
+                "clmaker123".into(),
+                "0x00000000000000000000000000000000000000aa".into(),
+                "cngn-usdt-bsc".into(),
+                true,
+                true,
+            ),
+        )
+        .unwrap();
+        assert_eq!(desks(&reconnect), before, "{reconnect}");
+
+        let mut disable = current.to_patch();
+        disable.rfq_enabled = Some(false);
+        let off = apply_settings(&src, &disable).unwrap();
+        assert_eq!(desks(&off), before, "{off}");
+    }
+
     #[test]
     fn rfq_fields_round_trip_through_the_patch() {
         let mut patch = read_settings(TEMPLATE).unwrap().to_patch();

@@ -454,6 +454,21 @@ be combined with `book_enabled = true`. See
 allowed_takers = ["0x1111111111111111111111111111111111111111"]
 ```
 
+### Desk feeds
+
+An OTC desk that sets its own price on a desk feed can trade with your normal
+wallet. List the feed and the desk's wallets under `[[rfq.desk_feeds]]`: those
+wallets get the desk's bid or ask when it beats the pool price, every quote to
+them is capped by the desk's account on the feed, and everyone else is quoted
+as before. It can't be combined with `book_enabled = true`. See
+[Desk feeds](docs/ADVANCED.md#desk-feeds).
+
+```toml
+[[rfq.desk_feeds]]
+feed_url = "https://api.textilecredit.com/price?otc=<key>&pair=cngn-usdt"
+takers = ["0x1111111111111111111111111111111111111111"]
+```
+
 ### Quoting a feed's own bid and ask
 
 A feed may send `bid` and `ask` next to `price`. A pool with

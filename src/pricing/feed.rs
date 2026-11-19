@@ -260,14 +260,19 @@ impl HttpFeed {
 
 impl PriceFeed for HttpFeed {
     async fn fetch(&self) -> anyhow::Result<Quote> {
+        // Transport and status errors drop the URL: reqwest prints it, and a
+        // feed URL can carry an API key or a desk feed's `otc` key.
         let body = self
             .client
             .get(&self.url)
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?
             .text()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         let quote = parse_quote(&body, self.basis)?;
         anyhow::ensure!(
             feed_age_secs(quote.timestamp, unix_now()).is_some(),

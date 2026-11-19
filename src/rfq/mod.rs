@@ -32,6 +32,7 @@
 //! shrink the next ladder. Two channels pledging one balance means a fill can
 //! revert when both land at once, which beats halving the depth of both.
 
+mod desk;
 mod fills;
 mod guard;
 pub mod iso8601;
@@ -164,6 +165,9 @@ pub struct RfqRuntime {
     /// The exposed claims the balance loop reads fills for, and the fills it
     /// saw. Process-scoped like the loop; each session's engine shares it.
     fills: fills::FillWatch,
+    /// `[[rfq.desk_feeds]]`, their latest readings and the desk in-flight
+    /// ledger. Process-scoped, like `fills`.
+    desks: desk::Desks,
 }
 
 /// How old a wallet reading may be before a `max` side goes dark.
@@ -495,6 +499,43 @@ fn build_runtime(
         price_guard: cfg.price_guard,
         price_basis: cfg.price_basis(),
         fills: fills::FillWatch::default(),
+        desks: desk_runtime(cfg, rfq, config_dir)?,
+    })
+}
+
+/// The desk feeds as the responder runs them, with the in-flight ledger
+/// loaded from disk. An unreadable ledger refuses to start rather than
+/// forget what was promised to a desk.
+fn desk_runtime(
+    cfg: &Config,
+    rfq: &crate::config::RfqConfig,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<desk::Desks> {
+    let feeds: Vec<desk::DeskFeedRuntime> = rfq
+        .desk_feeds()?
+        .into_iter()
+        .map(|spec| desk::DeskFeedRuntime {
+            staleness_secs: crate::config::desk_feed_staleness_secs(&cfg.feed, &spec.feed_url),
+            spec,
+        })
+        .collect();
+    if feeds.is_empty() {
+        return Ok(desk::Desks::default());
+    }
+    let claims = match config_dir {
+        Some(dir) => desk::DeskClaims::load(dir.join(desk::DESK_CLAIMS_FILE), unix_now())
+            .context("desk claims ledger unreadable")?,
+        // A restart would forget every promise to a desk and let it past its
+        // account, so desk feeds don't run without a place to keep them.
+        None => anyhow::bail!(
+            "[[rfq.desk_feeds]] needs a config dir to keep its desk claims ({}) across restarts",
+            desk::DESK_CLAIMS_FILE
+        ),
+    };
+    Ok(desk::Desks {
+        feeds,
+        cache: desk::DeskCache::default(),
+        claims: Arc::new(Mutex::new(claims)),
     })
 }
 
@@ -812,11 +853,39 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
     // something else got there first.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut feed_urls: Vec<String> = rt.books.iter().map(|b| b.feed_url.clone()).collect();
+    // A desk feed's loop writes its print to the cache itself, so a pool on
+    // the same URL doesn't get a second writer.
+    let desk_urls: HashSet<&str> = rt
+        .desks
+        .feeds
+        .iter()
+        .map(|f| f.spec.feed_url.as_str())
+        .collect();
+    let mut feed_urls: Vec<String> = rt
+        .books
+        .iter()
+        .map(|b| b.feed_url.clone())
+        .filter(|url| !desk_urls.contains(url.as_str()))
+        .collect();
     feed_urls.sort();
     feed_urls.dedup();
     for url in feed_urls {
         tokio::spawn(price_loop(url, rt.price_basis, prices.clone()));
+    }
+    for feed in &rt.desks.feeds {
+        info!(
+            feed = %crate::changelog::params::redact(&feed.spec.feed_url),
+            pair = crate::config::feed_pair(&feed.spec.feed_url).unwrap_or_default(),
+            takers = feed.spec.takers.len(),
+            max_deviation_bps = feed.spec.max_deviation_bps,
+            "desk feed: its wallets are priced off the desk and capped by its account"
+        );
+        tokio::spawn(desk_loop(
+            feed.spec.feed_url.clone(),
+            rt.price_basis,
+            prices.clone(),
+            rt.desks.cache.clone(),
+        ));
     }
 
     // Every RFQ side (Exact cap or live wallet) refreshes funded amounts
@@ -1387,6 +1456,7 @@ async fn session_loop_inner(
         published_levels: HashMap::new(),
         level_slack_bps: level_slack_by_slug(&accepted),
         fills: rt.fills.clone(),
+        desks: rt.desks.clone(),
     };
     // Claims loaded from disk are exposed; their fills can be read at once.
     engine.publish_fill_watch(unix_now());
@@ -1620,6 +1690,8 @@ struct Engine {
     /// Shared with the balance loop: which claims it reads fills for, and
     /// the fills it saw (see [`fills`]).
     fills: fills::FillWatch,
+    /// Desk feeds and what's in flight to each desk (see [`desk`]).
+    desks: desk::Desks,
 }
 
 /// Each assigned corridor's `levelSlackBps`, by slug. A venue that predates the
@@ -1641,10 +1713,15 @@ impl Engine {
     fn release_fills(&mut self, now_secs: u64) {
         let spent = self.fills.take_spent();
         if !spent.is_empty() {
-            for rfq_id in self.reservations.release_filled(&spent) {
+            let filled = self.reservations.release_filled(&spent);
+            for rfq_id in &filled {
                 info!(rfq_id = %rfq_id, "quote filled on-chain; its reserved inventory is released");
             }
+            // A desk quote keeps counting for a while after its fill: the
+            // desk's account shows it up to a minute later.
+            self.desks.claims().mark_filled(&filled, now_secs);
         }
+        self.desks.claims().prune(now_secs);
         self.publish_fill_watch(now_secs);
     }
 
@@ -1921,10 +1998,12 @@ impl Engine {
                 match r.result.as_str() {
                     "selected" => {
                         self.reservations.mark_exposed(&r.rfq_id);
+                        self.desks.claims().mark_exposed(&r.rfq_id);
                         self.publish_fill_watch(unix_now());
                         info!(rfq_id = %r.rfq_id, result = %r.result, "quote result");
                     }
                     "no_quote" | "lost_price" | "invalid" | "late" => {
+                        self.desks.claims().release_unexposed(&r.rfq_id);
                         if self.reservations.release_unexposed(&r.rfq_id) || recall_released {
                             info!(
                                 rfq_id = %r.rfq_id,
@@ -1952,6 +2031,7 @@ impl Engine {
                 // This may precede selected during reconnect/replay. It still
                 // identifies a signature the taker can hold, not a revocation.
                 self.reservations.mark_exposed(&e.rfq_id);
+                self.desks.claims().mark_exposed(&e.rfq_id);
                 if let Some(recall) = &mut self.recall {
                     recall.mark_exposed(&e.rfq_id);
                 }
@@ -2042,6 +2122,15 @@ impl Engine {
             );
             return reject(RejectReason::Busy);
         }
+        // A desk's wallet on the desk's book is priced and capped by the desk
+        // feed; a desk the bot can't read refuses its wallets outright.
+        let desk = match self.desk_gate(taker, &book, unix_now()) {
+            desk::Gate::Busy(why) => {
+                debug!(rfq_id = %req.rfq_id, %taker, why, "desk taker refused");
+                return reject(RejectReason::Busy);
+            }
+            gate => gate,
+        };
 
         let now_ms = unix_now_ms();
         let now_secs = now_ms / 1_000;
@@ -2258,6 +2347,34 @@ impl Engine {
         if let (Some(modules), Some(note)) = (&self.modules, notes.unwind) {
             modules.unwind_quote(unwind_quote_status(&book, &plan, note, now_secs));
         }
+        // A desk's wallet gets the desk's own price when that beats the public
+        // one; a recall reply keeps its own pricing.
+        let mut desk_priced = None;
+        let plan = match (&desk, &recall_offer) {
+            (desk::Gate::Desk { feed, info, .. }, None) => {
+                match self.desk_plan(*feed, info, &book, &req, &quote, prices, now_secs) {
+                    Ok((desk_plan, desk_book, desk_quote))
+                        if desk::taker_prefers(&desk_plan, &plan) =>
+                    {
+                        debug!(
+                            rfq_id = %req.rfq_id,
+                            %taker,
+                            public = %plan.buy_amount,
+                            desk = %desk_plan.buy_amount,
+                            "desk price beats the public price; quoting the desk"
+                        );
+                        desk_priced = Some((desk_book, desk_quote));
+                        desk_plan
+                    }
+                    Ok(_) => plan,
+                    Err(why) => {
+                        debug!(rfq_id = %req.rfq_id, %taker, why, "desk price unusable; quoting public");
+                        plan
+                    }
+                }
+            }
+            _ => plan,
+        };
         // On a Live curve or a live profit unwind lift the levels and the
         // reply can price differently: the reply starts at the far end of
         // this side's outstanding quotes while the levels only catch up on
@@ -2332,6 +2449,25 @@ impl Engine {
         } else {
             plan
         };
+        if let desk::Gate::Desk {
+            feed,
+            info,
+            read_at,
+        } = &desk
+        {
+            if let Some(why) = self.desk_cap_refusal(*feed, info, &plan, *read_at) {
+                debug!(
+                    rfq_id = %req.rfq_id,
+                    %taker,
+                    ?why,
+                    bid = plan.bid,
+                    input = %plan.input,
+                    output = %plan.output,
+                    "desk quote is over the desk's cap; refusing it whole"
+                );
+                return reject(RejectReason::Size);
+            }
+        }
 
         if let Some(sale) = &manual_sale {
             let modules = self.modules.as_ref().expect("manual runtime");
@@ -2510,6 +2646,19 @@ impl Engine {
             warn!(rfq_id = %req.rfq_id, ?reason, "the reference price changed while signing; signature withheld");
             return reject(reason);
         }
+        if let Err(reason) = self.desk_holds_after_signing(
+            &desk,
+            desk_priced.as_ref(),
+            taker,
+            &book,
+            &order,
+            &plan,
+            prices,
+            now_secs,
+        ) {
+            warn!(rfq_id = %req.rfq_id, ?reason, "the desk feed moved while signing; signature withheld");
+            return reject(reason);
+        }
         if recall_offer.is_none() && !self.fits_liquidity_cap(&book, &plan, unix_now()) {
             warn!(rfq_id = %req.rfq_id, "the liquidity cap tightened while signing; signature withheld");
             return reject(RejectReason::Inventory);
@@ -2557,6 +2706,18 @@ impl Engine {
                 format!("{:#x}", plan.input_token),
                 nonce,
             );
+        }
+        if let desk::Gate::Desk { feed, .. } = &desk {
+            if let Err(e) = self.desks.claims().reserve(
+                &req.rfq_id,
+                &self.desks.feeds[*feed].spec.feed_url,
+                plan.bid,
+                plan.input,
+                deadline_secs,
+            ) {
+                error!(rfq_id = %req.rfq_id, error = %format!("{e:#}"), "desk quote withheld: its desk claim couldn't be saved");
+                return reject(RejectReason::Busy);
+            }
         }
         if self.modules.is_some() && self.reservations.flush().is_err() {
             error!("module-enabled quote withheld: reservation persistence failed");
@@ -3022,7 +3183,7 @@ fn on_feed_fetch(
             cache.admit(started, url, quote, unix_now());
         }
         Err(e) => {
-            debug!(feed = %url, error = %e, "rfq feed fetch failed");
+            debug!(feed = %crate::changelog::params::redact(url), error = %e, "rfq feed fetch failed");
             cache.invalidate(url);
         }
     }
@@ -3039,6 +3200,69 @@ async fn price_loop(url: String, basis: crate::pricing::feed::PriceBasis, cache:
     loop {
         let started = tokio::time::Instant::now();
         on_feed_fetch(started, &cache, &url, feed.fetch().await);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Apply one desk feed fetch: the desk reading to the desk cache, the print
+/// (a 200's) to the price cache through the jump guard, as a pool feed's.
+/// Anything without a usable print drops the cached one, so desk pricing
+/// fails closed to the public price. A failed fetch leaves the last desk
+/// reading in place; [`desk::gate`] stops trusting it after the grace period.
+fn on_desk_fetch(
+    started: tokio::time::Instant,
+    prices: &PriceCache,
+    desks: &desk::DeskCache,
+    url: &str,
+    fetched: crate::pricing::desk::DeskFetch,
+    now: u64,
+) {
+    use crate::pricing::desk::{DeskFetch, DeskReading};
+    match fetched {
+        DeskFetch::Answered { reading, quote } => {
+            match quote {
+                Ok(quote) => {
+                    prices.admit(started, url, quote, now);
+                }
+                Err(e) => {
+                    debug!(feed = %crate::changelog::params::redact(url), error = %e, "desk feed has no usable price");
+                    prices.invalidate(url);
+                }
+            }
+            let gone = reading == DeskReading::Gone;
+            let before = desks.record(url, reading.clone(), now);
+            if gone && before.as_ref() != Some(&reading) {
+                warn!(
+                    feed = %crate::changelog::params::redact(url),
+                    "desk feed is not found (404); its wallets are quoted as ordinary customers"
+                );
+            }
+        }
+        DeskFetch::Failed(e) => {
+            debug!(feed = %crate::changelog::params::redact(url), error = %e, "desk feed fetch failed");
+            prices.invalidate(url);
+        }
+    }
+}
+
+/// Poll one desk feed every second, with the other feeds.
+async fn desk_loop(
+    url: String,
+    basis: crate::pricing::feed::PriceBasis,
+    prices: PriceCache,
+    desks: desk::DeskCache,
+) {
+    let client = crate::net::http_client();
+    let asked_off_hours = off_hours::requests_off_hours(&url);
+    loop {
+        let started = tokio::time::Instant::now();
+        let fetched = match crate::pricing::desk::fetch(&client, &url).await {
+            Ok((status, body)) => {
+                crate::pricing::desk::classify(status, &body, basis, asked_off_hours, unix_now())
+            }
+            Err(e) => crate::pricing::desk::DeskFetch::Failed(format!("{e:#}")),
+        };
+        on_desk_fetch(started, &prices, &desks, &url, fetched, unix_now());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
@@ -3632,6 +3856,7 @@ mod tests {
         }
     }
     use crate::config::RfqCapacity;
+    use crate::pricing::desk::{DeskInfo, DeskReading, DeskStatus};
     use crate::pricing::quote::Spread;
     use crate::signer::{recover_address, LocalSigner};
     use crate::time::unix_now;
@@ -4701,6 +4926,7 @@ mod tests {
             published_levels: HashMap::new(),
             level_slack_bps: HashMap::new(),
             fills: fills::FillWatch::default(),
+            desks: desk::Desks::default(),
         }
     }
 
@@ -5215,6 +5441,745 @@ mod tests {
         let unsided = fresh_prices().get("http://feed").unwrap();
         let book = engine.books[0].clone();
         assert!(engine.module_book(&book, &unsided, unix_now()).is_none());
+    }
+
+    const DESK_URL: &str = "http://desk";
+    /// The taker `exact_input_request` sends.
+    const DESK_TAKER: &str = "0x0000000000000000000000000000000000000003";
+
+    fn desk_info(account_collateral: u64, account_debt: u64, max_order_debt: u64) -> DeskInfo {
+        DeskInfo {
+            status: DeskStatus::Live,
+            chain_id: 8453,
+            collateral: COLLATERAL.parse().unwrap(),
+            debt: DEBT.parse().unwrap(),
+            takers: [DESK_TAKER.parse().unwrap()].into_iter().collect(),
+            account_collateral: U256::from(account_collateral),
+            account_debt: U256::from(account_debt),
+            max_order_debt: U256::from(max_order_debt),
+        }
+    }
+
+    /// `test_engine` with one desk feed for `DESK_TAKER`, its latest reading
+    /// a live desk with room for everything.
+    fn desk_engine() -> Engine {
+        let mut engine = test_engine();
+        engine.desks = desk::Desks {
+            feeds: vec![desk::DeskFeedRuntime {
+                spec: crate::config::DeskFeed {
+                    feed_url: DESK_URL.into(),
+                    takers: [DESK_TAKER.parse().unwrap()].into_iter().collect(),
+                    max_deviation_bps: 200,
+                    max_order_debt: None,
+                },
+                staleness_secs: 240,
+            }],
+            ..Default::default()
+        };
+        let big = 1_000_000_000_000u64;
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(big, big, big)),
+            unix_now(),
+        );
+        engine
+    }
+
+    fn record_desk(engine: &Engine, reading: DeskReading, at: u64) {
+        engine.desks.cache.record(DESK_URL, reading, at);
+    }
+
+    fn desk_quote(bid: f64, ask: f64) -> Quote {
+        Quote {
+            price: (bid + ask) / 2.0,
+            timestamp: unix_now(),
+            degraded: false,
+            spread: Default::default(),
+            reference: None,
+            bid: Some(bid),
+            ask: Some(ask),
+            session: Default::default(),
+            market_at: None,
+            market_source: None,
+        }
+    }
+
+    /// The pool at 1.0 (`fresh_prices`) and the desk at `bid`/`ask`.
+    fn desk_prices(bid: f64, ask: f64) -> PriceCache {
+        let prices = fresh_prices();
+        prices.set(DESK_URL.into(), desk_quote(bid, ask));
+        prices
+    }
+
+    fn desk_held(engine: &Engine, bid: bool, at: u64) -> U256 {
+        engine.desks.claims().held(DESK_URL, bid, at)
+    }
+
+    /// What the pool quotes with its buy spread set to `bps`, everyone alike.
+    async fn plain_bid_at(bps: u32, rfq: &str) -> QuoteResponseFrame {
+        let mut plain = test_engine();
+        plain.books[0].buy_spread = Some(Spread::Bps(bps));
+        let MakerFrame::QuoteResponse(r) = plain
+            .respond(exact_input_request(rfq), &fresh_prices())
+            .await
+        else {
+            panic!("the plain engine must quote");
+        };
+        r
+    }
+
+    /// The taker sells debt for collateral: the bot pays collateral.
+    fn ask_request(rfq_id: &str) -> QuoteRequestFrame {
+        QuoteRequestFrame {
+            sell_token: DEBT.into(),
+            buy_token: COLLATERAL.into(),
+            ..exact_input_request(rfq_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_desk_wallet_gets_the_desks_bid_and_the_quote_is_held_against_its_account() {
+        let mut engine = desk_engine();
+        // The desk bids 0.995 at a 1.0 pool price: a 50 bps bid.
+        let MakerFrame::QuoteResponse(desk) = engine
+            .respond(exact_input_request("rfq_desk"), &desk_prices(0.995, 1.005))
+            .await
+        else {
+            panic!("a desk wallet with a live desk must be quoted");
+        };
+        let expected = plain_bid_at(50, "rfq_plain").await;
+        assert_eq!(desk.buy_amount, expected.buy_amount);
+        assert_eq!(desk.sell_amount, expected.sell_amount);
+        assert_eq!(
+            desk_held(&engine, true, unix_now()),
+            desk.buy_amount.parse::<U256>().unwrap()
+        );
+        assert_eq!(desk_held(&engine, false, unix_now()), U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn the_public_price_goes_out_when_it_is_better_for_the_desk() {
+        let mut engine = desk_engine();
+        // The desk bids 0.97, worse than the pool's 200 bps bid.
+        let MakerFrame::QuoteResponse(r) = engine
+            .respond(exact_input_request("rfq_pub"), &desk_prices(0.97, 1.03))
+            .await
+        else {
+            panic!("the public plan still quotes");
+        };
+        assert_eq!(
+            r.buy_amount,
+            plain_bid_at(200, "rfq_plain").await.buy_amount
+        );
+        assert_eq!(
+            desk_held(&engine, true, unix_now()),
+            r.buy_amount.parse::<U256>().unwrap(),
+            "a public-priced quote to the desk still counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_desk_price_far_from_the_pool_falls_back_to_public() {
+        // Mid 1.04: 400 bps off the pool, past the 200 bps guard, even though
+        // its 1.03 bid would pay the taker far more.
+        for (bid, ask) in [(1.03, 1.05), (0.95, 0.97)] {
+            let mut engine = desk_engine();
+            let MakerFrame::QuoteResponse(r) = engine
+                .respond(exact_input_request("rfq_far"), &desk_prices(bid, ask))
+                .await
+            else {
+                panic!("the public plan still quotes");
+            };
+            assert_eq!(
+                r.buy_amount,
+                plain_bid_at(200, "rfq_plain").await.buy_amount
+            );
+        }
+        // A desk that isn't live, or has no print, quotes public too.
+        let mut engine = desk_engine();
+        let stale = DeskInfo {
+            status: DeskStatus::Stale,
+            ..desk_info(u64::MAX, u64::MAX, u64::MAX)
+        };
+        record_desk(&engine, DeskReading::Shared(stale), unix_now());
+        let MakerFrame::QuoteResponse(r) = engine
+            .respond(exact_input_request("rfq_stale"), &desk_prices(0.995, 1.005))
+            .await
+        else {
+            panic!("a stale desk still gets the public price");
+        };
+        assert_eq!(
+            r.buy_amount,
+            plain_bid_at(200, "rfq_plain").await.buy_amount
+        );
+    }
+
+    async fn reject_reason(
+        engine: &mut Engine,
+        req: QuoteRequestFrame,
+        prices: &PriceCache,
+    ) -> RejectReason {
+        match engine.respond(req, prices).await {
+            MakerFrame::QuoteReject(r) => r.reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_side_is_refused_whole_past_the_desks_account() {
+        let prices = desk_prices(0.995, 1.005);
+        // The bid pays ~995 USDT (995e6 atomic); the account has 900.
+        let mut engine = desk_engine();
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(u64::MAX, 900_000_000, u64::MAX)),
+            unix_now(),
+        );
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_bid"), &prices).await,
+            RejectReason::Size
+        );
+        assert!(engine.reservations.is_empty() && engine.desks.claims().is_empty());
+        // The same account has room on the other side: the ask pays collateral.
+        assert!(matches!(
+            engine.respond(ask_request("rfq_ask"), &prices).await,
+            MakerFrame::QuoteResponse(_)
+        ));
+
+        let mut engine = desk_engine();
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(900_000_000, u64::MAX, u64::MAX)),
+            unix_now(),
+        );
+        assert_eq!(
+            reject_reason(&mut engine, ask_request("rfq_ask"), &prices).await,
+            RejectReason::Size
+        );
+        assert!(matches!(
+            engine
+                .respond(exact_input_request("rfq_bid"), &prices)
+                .await,
+            MakerFrame::QuoteResponse(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_debt_leg_is_held_to_max_order_debt_and_the_toml_ceiling() {
+        let prices = desk_prices(0.995, 1.005);
+        let mut engine = desk_engine();
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(u64::MAX, u64::MAX, 900_000_000)),
+            unix_now(),
+        );
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_feed_cap"), &prices).await,
+            RejectReason::Size
+        );
+        // On an ask the debt leg is what the taker pays in: 1000 USDT.
+        assert_eq!(
+            reject_reason(&mut engine, ask_request("rfq_ask_cap"), &prices).await,
+            RejectReason::Size
+        );
+
+        let mut engine = desk_engine();
+        engine.desks.feeds[0].spec.max_order_debt = Some(U256::from(900_000_000u64));
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_toml_cap"), &prices).await,
+            RejectReason::Size
+        );
+        engine.desks.feeds[0].spec.max_order_debt = Some(U256::from(2_000_000_000u64));
+        assert!(matches!(
+            engine
+                .respond(exact_input_request("rfq_under"), &prices)
+                .await,
+            MakerFrame::QuoteResponse(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_flight_quotes_and_recent_fills_count_against_the_account() {
+        let prices = desk_prices(0.995, 1.005);
+        let mut engine = desk_engine();
+        // Room for one ~995 bid, not two. Under the wallet's own 1500, so the
+        // desk cap is what refuses the second, not the pool sizing it down.
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(u64::MAX, 1_200_000_000, u64::MAX)),
+            unix_now(),
+        );
+        let MakerFrame::QuoteResponse(first) =
+            engine.respond(exact_input_request("rfq_1"), &prices).await
+        else {
+            panic!("the first quote fits");
+        };
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_2"), &prices).await,
+            RejectReason::Size,
+            "the signed first quote is still in flight"
+        );
+
+        // It wins and fills: the reservation goes, the desk claim holds.
+        engine
+            .dispatch(
+                VenueFrame::QuoteResult(QuoteResultFrame {
+                    rfq_id: "rfq_1".into(),
+                    result: "selected".into(),
+                }),
+                &prices,
+            )
+            .await;
+        let nonces = engine.reservations.watched_nonces(unix_now());
+        assert_eq!(nonces.len(), 1);
+        engine.fills.saw_spent(nonces);
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_3"), &prices).await,
+            RejectReason::Size,
+            "a fill keeps counting until the account can show it"
+        );
+        assert!(
+            engine.reservations.is_empty(),
+            "the fill released the wallet claim"
+        );
+        let now = unix_now();
+        let paid = first.buy_amount.parse::<U256>().unwrap();
+        assert_eq!(desk_held(&engine, true, now), paid);
+        assert_eq!(
+            desk_held(&engine, true, now + desk::FILL_HOLD_SECS - 1),
+            paid
+        );
+        // Two minutes on it's gone, though the order's deadline is later.
+        assert_eq!(
+            desk_held(&engine, true, now + desk::FILL_HOLD_SECS + 1),
+            U256::ZERO
+        );
+
+        // A losing quote releases its desk claim, as it does its reservation.
+        let mut engine = desk_engine();
+        assert!(matches!(
+            engine
+                .respond(exact_input_request("rfq_lost"), &prices)
+                .await,
+            MakerFrame::QuoteResponse(_)
+        ));
+        engine
+            .dispatch(
+                VenueFrame::QuoteResult(QuoteResultFrame {
+                    rfq_id: "rfq_lost".into(),
+                    result: "lost_price".into(),
+                }),
+                &prices,
+            )
+            .await;
+        assert!(engine.desks.claims().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_desk_feed_holds_its_last_desk_then_refuses_its_wallets() {
+        // No print (the feed is down), last desk 200 s ago: caps from it, public price.
+        let mut engine = desk_engine();
+        let big = 1_000_000_000_000u64;
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(big, big, big)),
+            unix_now() - 200,
+        );
+        let MakerFrame::QuoteResponse(r) = engine
+            .respond(exact_input_request("rfq_grace"), &fresh_prices())
+            .await
+        else {
+            panic!("inside the grace period the desk wallet is quoted");
+        };
+        assert_eq!(
+            r.buy_amount,
+            plain_bid_at(200, "rfq_plain").await.buy_amount
+        );
+        assert!(!engine.desks.claims().is_empty());
+
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(big, big, big)),
+            unix_now() - 301,
+        );
+        assert_eq!(
+            reject_reason(
+                &mut engine,
+                exact_input_request("rfq_late"),
+                &desk_prices(0.995, 1.005)
+            )
+            .await,
+            RejectReason::Busy
+        );
+        // Never read at all: refused too.
+        let mut engine = desk_engine();
+        engine.desks.cache = desk::DeskCache::default();
+        assert_eq!(
+            reject_reason(
+                &mut engine,
+                exact_input_request("rfq_never"),
+                &fresh_prices()
+            )
+            .await,
+            RejectReason::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_desk_feed_makes_its_wallet_an_ordinary_customer() {
+        let mut engine = desk_engine();
+        record_desk(&engine, DeskReading::Gone, unix_now());
+        let MakerFrame::QuoteResponse(r) = engine
+            .respond(exact_input_request("rfq_gone"), &desk_prices(0.995, 1.005))
+            .await
+        else {
+            panic!("a 404 desk wallet is quoted as anyone");
+        };
+        assert_eq!(
+            r.buy_amount,
+            plain_bid_at(200, "rfq_plain").await.buy_amount
+        );
+        assert!(engine.desks.claims().is_empty(), "no caps, no desk ledger");
+    }
+
+    #[tokio::test]
+    async fn a_taker_the_desk_feeds_do_not_name_is_untouched() {
+        let other = |rfq: &str| QuoteRequestFrame {
+            taker: OTHER.into(),
+            ..exact_input_request(rfq)
+        };
+        let mut engine = desk_engine();
+        // Even with the desk feed unreadable and the desk's own price better.
+        engine.desks.cache = desk::DeskCache::default();
+        let MakerFrame::QuoteResponse(r) = engine
+            .respond(other("rfq_other"), &desk_prices(0.995, 1.005))
+            .await
+        else {
+            panic!("an ordinary taker is quoted as before");
+        };
+        assert_eq!(
+            r.buy_amount,
+            plain_bid_at(200, "rfq_plain").await.buy_amount
+        );
+        assert!(engine.desks.claims().is_empty());
+    }
+
+    /// Signs with `inner`, but first swaps the desk print for `moved`, as a
+    /// price loop tick landing while a remote signer works.
+    struct DeskMovingSigner {
+        inner: DynSigner,
+        prices: PriceCache,
+        moved: Quote,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::signer::Signer for DeskMovingSigner {
+        async fn sign_digest(&self, digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
+            self.prices.set(DESK_URL.into(), self.moved.clone());
+            self.inner.sign_digest(digest).await
+        }
+
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_desk_priced_quote_is_withheld_when_the_desks_side_moves_while_signing() {
+        let cases = [
+            (desk_quote(0.994, 1.005), Some(RejectReason::Busy)),
+            (desk_quote(0.996, 1.005), None),
+            (
+                Quote {
+                    timestamp: unix_now() - 600,
+                    ..desk_quote(0.995, 1.005)
+                },
+                Some(RejectReason::StaleFeed),
+            ),
+        ];
+        for (moved, refused) in cases {
+            let prices = desk_prices(0.995, 1.005);
+            let mut engine = desk_engine();
+            engine.signer = Arc::new(DeskMovingSigner {
+                inner: engine.signer.clone(),
+                prices: prices.clone(),
+                moved: moved.clone(),
+            });
+            let reply = engine
+                .respond(exact_input_request("rfq_moved"), &prices)
+                .await;
+            match refused {
+                Some(reason) => {
+                    assert!(
+                        matches!(&reply, MakerFrame::QuoteReject(r) if r.reason == reason),
+                        "{moved:?}: {reply:?}"
+                    );
+                    assert!(engine.desks.claims().is_empty() && engine.reservations.is_empty());
+                }
+                None => assert!(matches!(reply, MakerFrame::QuoteResponse(_)), "{reply:?}"),
+            }
+        }
+    }
+
+    /// Signs with `inner`, but first moves the pool's own print to `moved`.
+    struct PoolMovingSigner {
+        inner: DynSigner,
+        prices: PriceCache,
+        moved: Quote,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::signer::Signer for PoolMovingSigner {
+        async fn sign_digest(&self, digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
+            self.prices.set("http://feed".into(), self.moved.clone());
+            self.inner.sign_digest(digest).await
+        }
+
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_desk_priced_quote_is_withheld_when_the_pool_moves_past_the_desks_deviation() {
+        // The desk sits at the pool's 1.0. While signing the pool moves 3%:
+        // well inside the 15% price guard, but past the desk's 200 bps.
+        for (pool_after, refused) in [(1.03, true), (1.01, false)] {
+            let prices = desk_prices(0.995, 1.005);
+            let mut engine = desk_engine();
+            let moved = Quote {
+                price: pool_after,
+                timestamp: unix_now(),
+                ..prices.get("http://feed").unwrap()
+            };
+            engine.signer = Arc::new(PoolMovingSigner {
+                inner: engine.signer.clone(),
+                prices: prices.clone(),
+                moved,
+            });
+            let reply = engine
+                .respond(exact_input_request("rfq_pool_moved"), &prices)
+                .await;
+            if refused {
+                assert!(
+                    matches!(&reply, MakerFrame::QuoteReject(r) if r.reason == RejectReason::Busy),
+                    "pool at {pool_after}: {reply:?}"
+                );
+                assert!(engine.desks.claims().is_empty() && engine.reservations.is_empty());
+            } else {
+                assert!(
+                    matches!(reply, MakerFrame::QuoteResponse(_)),
+                    "pool at {pool_after}: {reply:?}"
+                );
+            }
+        }
+    }
+
+    /// Signs with `inner`, but first records `reading` for the desk feed, as
+    /// a desk poll landing while a remote signer works.
+    struct DeskListingSigner {
+        inner: DynSigner,
+        cache: desk::DeskCache,
+        reading: DeskReading,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::signer::Signer for DeskListingSigner {
+        async fn sign_digest(&self, digest: alloy_primitives::B256) -> anyhow::Result<[u8; 65]> {
+            self.cache
+                .record(DESK_URL, self.reading.clone(), unix_now());
+            self.inner.sign_digest(digest).await
+        }
+
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_taker_the_desk_lists_while_signing_gets_no_uncapped_quote() {
+        let prices = desk_prices(0.995, 1.005);
+        let mut engine = desk_engine();
+        let big = 1_000_000_000_000u64;
+        // Priced as an ordinary customer: the feed doesn't list it yet.
+        record_desk(
+            &engine,
+            DeskReading::Shared(DeskInfo {
+                takers: Default::default(),
+                ..desk_info(big, big, big)
+            }),
+            unix_now(),
+        );
+        engine.signer = Arc::new(DeskListingSigner {
+            inner: engine.signer.clone(),
+            cache: engine.desks.cache.clone(),
+            reading: DeskReading::Shared(desk_info(big, big, big)),
+        });
+        let reply = engine
+            .respond(exact_input_request("rfq_listed"), &prices)
+            .await;
+        assert!(
+            matches!(&reply, MakerFrame::QuoteReject(r) if r.reason == RejectReason::Busy),
+            "{reply:?}"
+        );
+        assert!(engine.desks.claims().is_empty() && engine.reservations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fill_keeps_counting_while_the_desk_feed_is_down() {
+        let prices = desk_prices(0.995, 1.005);
+        let mut engine = desk_engine();
+        let now = unix_now();
+        // Room for one ~995 bid. The last reading is from before the fill,
+        // and the feed has been down since (inside the grace period).
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(u64::MAX, 1_200_000_000, u64::MAX)),
+            now - 250,
+        );
+        {
+            let mut claims = engine.desks.claims();
+            claims
+                .reserve(
+                    "rfq_filled",
+                    DESK_URL,
+                    true,
+                    U256::from(900_000_000u64),
+                    now - 200,
+                )
+                .unwrap();
+            claims.mark_filled(&["rfq_filled".into()], now - 130);
+        }
+        // By the clock its fill hold is over, but the account was read before
+        // the fill could show: the fill still counts.
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_next"), &prices).await,
+            RejectReason::Size
+        );
+        // A reading from after the hold shows the fill itself, and the claim
+        // stops counting on top of it.
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(u64::MAX, 1_200_000_000, u64::MAX)),
+            unix_now(),
+        );
+        assert!(matches!(
+            engine
+                .respond(exact_input_request("rfq_after"), &prices)
+                .await,
+            MakerFrame::QuoteResponse(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_200_without_a_desk_is_a_failed_read_not_an_ordinary_customer() {
+        use crate::pricing::desk::classify;
+        use crate::pricing::feed::PriceBasis;
+        let big = 1_000_000_000_000u64;
+        let bare = format!(
+            r#"{{"price":1.0,"bid":0.995,"ask":1.005,"timestamp":{}}}"#,
+            unix_now()
+        );
+        let fetch = |engine: &Engine, prices: &PriceCache| {
+            on_desk_fetch(
+                tokio::time::Instant::now(),
+                prices,
+                &engine.desks.cache,
+                DESK_URL,
+                classify(200, &bare, PriceBasis::Served, false, unix_now()),
+                unix_now(),
+            )
+        };
+
+        // Inside the grace period: the last good desk caps, the price is public.
+        let mut engine = desk_engine();
+        let last_good = DeskReading::Shared(desk_info(big, 900_000_000, big));
+        let at = unix_now() - 200;
+        record_desk(&engine, last_good.clone(), at);
+        let prices = desk_prices(0.995, 1.005);
+        fetch(&engine, &prices);
+        assert_eq!(engine.desks.cache.get(DESK_URL), Some((last_good, at)));
+        assert!(
+            prices.get(DESK_URL).is_none(),
+            "no desk price off a desk-less body"
+        );
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_capped"), &prices).await,
+            RejectReason::Size,
+            "still capped by the last good account"
+        );
+
+        // Past it: the desk's wallet is refused, not quoted uncapped.
+        let mut engine = desk_engine();
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(big, big, big)),
+            unix_now() - 301,
+        );
+        let prices = desk_prices(0.995, 1.005);
+        fetch(&engine, &prices);
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_late"), &prices).await,
+            RejectReason::Busy
+        );
+        // And with no reading at all, it never becomes a customer either.
+        let mut engine = desk_engine();
+        engine.desks.cache = desk::DeskCache::default();
+        let prices = fresh_prices();
+        fetch(&engine, &prices);
+        assert!(engine.desks.cache.get(DESK_URL).is_none());
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_never"), &prices).await,
+            RejectReason::Busy
+        );
+    }
+
+    #[test]
+    fn a_desk_fetch_updates_both_caches_and_a_failure_keeps_the_last_desk() {
+        use crate::pricing::desk::DeskFetch;
+        let prices = desk_prices(0.995, 1.005);
+        let desks = desk::DeskCache::default();
+        let live = DeskReading::Shared(desk_info(1, 2, 3));
+        on_desk_fetch(
+            tokio::time::Instant::now(),
+            &prices,
+            &desks,
+            DESK_URL,
+            DeskFetch::Answered {
+                reading: live.clone(),
+                quote: Err("HTTP 503".into()),
+            },
+            100,
+        );
+        assert_eq!(desks.get(DESK_URL), Some((live.clone(), 100)));
+        assert!(prices.get(DESK_URL).is_none(), "no price without a 200");
+
+        on_desk_fetch(
+            tokio::time::Instant::now(),
+            &prices,
+            &desks,
+            DESK_URL,
+            DeskFetch::Failed("connection refused".into()),
+            160,
+        );
+        assert_eq!(
+            desks.get(DESK_URL),
+            Some((live, 100)),
+            "the last good desk and its age"
+        );
+
+        on_desk_fetch(
+            tokio::time::Instant::now(),
+            &prices,
+            &desks,
+            DESK_URL,
+            DeskFetch::Answered {
+                reading: DeskReading::Gone,
+                quote: Err("feed not found".into()),
+            },
+            170,
+        );
+        assert_eq!(desks.get(DESK_URL), Some((DeskReading::Gone, 170)));
     }
 
     /// `fresh_prices`, but the feed also publishes the reference book the

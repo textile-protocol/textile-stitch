@@ -17,6 +17,7 @@ pub mod anchor;
 pub mod band;
 pub mod cache;
 pub mod curve;
+pub mod desk;
 pub mod feed;
 pub mod issuer_spread;
 pub mod jump;
