@@ -243,6 +243,7 @@ const PARAM_LABEL: Record<string, string> = {
   feed_url: 'Price feed',
   feed_sides: 'Quote feed bid/ask',
   rfq_staleness_secs: 'RFQ freshness',
+  min_spread_bps: 'Minimum spread',
   issuer_spread_min_bps: 'Issuer spread min',
   issuer_spread_max_bps: 'Issuer spread max',
   max_loss_bps: 'Price guard',

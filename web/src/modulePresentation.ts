@@ -328,7 +328,10 @@ export function corridorSpreadBps(
   const quoted = perDebt > 0 ? 1 / perDebt : 0
   const bps =
     side === 'buy' ? (1 - quoted / price) * 10000 : (quoted / price - 1) * 10000
-  return Math.ceil(Math.max(0, bps))
+  // A floored side prices at whichever is wider, as `Spread::AbsMin` does. An
+  // ask past the mid (quoted 0) stays unusable rather than taking the floor.
+  const floor = quoted > 0 ? (spread.min_bps ?? 0) : 0
+  return Math.ceil(Math.max(0, bps, floor))
 }
 
 /** Both corridor sides, or null when either can't be read in bps yet. */

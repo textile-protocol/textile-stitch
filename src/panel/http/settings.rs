@@ -158,6 +158,12 @@ pub struct SettingsBody {
     pub feed_url: String,
     pub buy: SpreadBody,
     pub sell: SpreadBody,
+    /// Floor on an absolute side, in bps. Empty for none.
+    pub min_spread_bps: String,
+    /// Why this pool can't switch a side to an absolute spread, or null.
+    pub absolute_spread_refusal: Option<String>,
+    /// Why this pool can't take a minimum spread, or null.
+    pub spread_floor_refusal: Option<String>,
     pub taker_enabled: bool,
     pub pool_index: usize,
     pub pool_count: usize,
@@ -219,6 +225,9 @@ impl SettingsBody {
             feed_url: v.feed_url.clone(),
             buy: SpreadBody::from(&v.buy),
             sell: SpreadBody::from(&v.sell),
+            min_spread_bps: v.min_spread_bps.clone(),
+            absolute_spread_refusal: v.absolute_spread_refusal.clone(),
+            spread_floor_refusal: v.spread_floor_refusal.clone(),
             taker_enabled: v.taker_enabled,
             pool_index: v.pool_index,
             pool_count: v.pool_count,
@@ -380,6 +389,9 @@ pub struct SettingsUpdate {
     pub buy: Option<SpreadBody>,
     #[serde(default)]
     pub sell: Option<SpreadBody>,
+    /// Empty removes the floor.
+    #[serde(default)]
+    pub min_spread_bps: Option<String>,
     #[serde(default)]
     pub taker_enabled: Option<bool>,
     #[serde(default)]
@@ -449,6 +461,9 @@ impl SettingsUpdate {
         }
         if let Some(v) = &self.sell {
             patch.sell = v.to_edit()?;
+        }
+        if let Some(v) = &self.min_spread_bps {
+            patch.min_spread_bps = Some(v.trim().to_string());
         }
         if let Some(v) = self.taker_enabled {
             patch.taker_enabled = v;
@@ -3203,6 +3218,106 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("percent"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn one_side_can_be_set_in_the_pools_own_rate_with_a_floor() {
+        let h = harness("settings-abs-floor");
+        seed(&h, "bot-a");
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({
+                    "buy": { "kind": "bps", "value": "5" },
+                    "sell": { "kind": "abs", "value": "1" },
+                    "minSpreadBps": "5",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let settings = &Harness::parse(&body)["settings"];
+        assert_eq!(settings["sell"], json!({ "kind": "abs", "value": "1" }));
+        assert_eq!(settings["minSpreadBps"], "5");
+        assert_eq!(settings["absoluteSpreadRefusal"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_reversed_pool_refuses_a_switch_to_an_absolute_spread() {
+        let h = harness("settings-abs-reversed");
+        seed(&h, "bot-a");
+        let path = h.root.join("bot-a/stitch.toml");
+        let (_, body) = h.get("/api/bots/bot-a/settings").await;
+        let feed = Harness::parse(&body)["feedUrl"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let reversed = format!("{}?invert=1", feed.split('?').next().unwrap());
+        let (status, body) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "feedUrl": reversed }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "sell": { "kind": "abs", "value": "1" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("reversed pool"), "{body}");
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("sell_offset_abs"));
+
+        // Nor in the same PATCH that reverses the feed.
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "feedUrl": feed, "sell": { "kind": "abs", "value": "1" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "forward again: {body}");
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "feedUrl": reversed, "sell": { "kind": "bps", "value": "5" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "back to bps and reversed: {body}");
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "feedUrl": feed, "buy": { "kind": "bps", "value": "5" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "forward: {body}");
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "feedUrl": reversed, "sell": { "kind": "abs", "value": "1" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("reversed pool"), "{body}");
+        let (status, _) = h
+            .patch_json("/api/bots/bot-a/settings", json!({ "feedUrl": reversed }))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A side that is absolute already keeps saving.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let line = raw
+            .lines()
+            .find(|l| l.trim_start().starts_with("sell_offset_bps"))
+            .unwrap()
+            .to_string();
+        std::fs::write(&path, raw.replace(&line, "sell_offset_abs = 0.0000015")).unwrap();
+        let (status, body) = h
+            .patch_json(
+                "/api/bots/bot-a/settings",
+                json!({ "sell": { "kind": "abs", "value": "0.000002" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]

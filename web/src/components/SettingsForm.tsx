@@ -1,7 +1,7 @@
 import { PerpsFeature } from './PerpsFeature'
 import type { PerpsState } from '../usePerps'
 
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { ApiError, api } from '../api'
 import {
@@ -23,6 +23,15 @@ import {
   setFallback,
 } from '../rpcFallbacks'
 import { botPath } from '../botRoutes'
+import { useFeedMid } from './wizard/useFeedMid'
+import {
+  absoluteUnit,
+  formatRate,
+  pairSymbols,
+  sideQuote,
+  switchUnit,
+  type Side,
+} from '../spreadUnits'
 import type {
   Bot,
   Corridor,
@@ -207,22 +216,7 @@ export default function SettingsForm({
         }
       >
         <div className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <SpreadField
-              label="Buy spread"
-              hint="How far below the mid the bot bids."
-              value={draft.buy}
-              disabled={!loaded.editable}
-              onChange={(v) => set('buy', v)}
-            />
-            <SpreadField
-              label="Sell spread"
-              hint="How far above the mid the bot asks."
-              value={draft.sell}
-              disabled={!loaded.editable}
-              onChange={(v) => set('sell', v)}
-            />
-          </div>
+          <SpreadSides loaded={loaded} draft={draft} set={set} />
           {loaded.bookEnabled && (
           <div className="grid gap-4 border-t border-line-soft pt-4 sm:grid-cols-2">
             <Field
@@ -529,6 +523,149 @@ function CorridorsCard({
   )
 }
 
+/**
+ * Both sides' spreads, each in bps or in the pool's own rate (cNGN per USDT),
+ * with what it quotes at the feed's mid right now. A unit switch converts the
+ * value at that mid, so the quote stays where it was. Absolute sides get a
+ * floor in bps: a fixed offset gets thinner the weaker the collateral is.
+ */
+function SpreadSides({
+  loaded,
+  draft,
+  set,
+}: {
+  loaded: Settings
+  draft: Settings
+  set: <K extends keyof Settings>(key: K, value: Settings[K]) => void
+}) {
+  const feed = useFeedMid(loaded.feedUrl)
+  // An edited, unsaved feed is a different market: an absolute value
+  // converted or previewed at the saved feed's mid would be wrong for it, and
+  // whether the pool takes one can change with it (a reversed feed). So a
+  // switch to absolute waits for the save, which the panel checks on the new
+  // config. Back to bps stays open: bps mean the same on any feed, so the
+  // side converts from what it quotes today, and a move to a reversed feed
+  // can take its absolute side back to bps in the same save.
+  const feedEdited = draft.feedUrl.trim() !== loaded.feedUrl.trim()
+  const savedMid = feed.status === 'ok' ? feed.mid.price : null
+  const mid = feedEdited ? null : savedMid
+  const label =
+    loaded.pools.find((p) => p.index === loaded.poolIndex)?.pair ?? ''
+  const unit = absoluteUnit(label)
+  const symbols = pairSymbols(label)
+  const absolute = draft.buy.kind === 'abs' || draft.sell.kind === 'abs'
+  const floorRefusal = loaded.spreadFloorRefusal
+  const units = (side: Side) => ({
+    absLabel: unit,
+    refusal: loaded.absoluteSpreadRefusal,
+    pending: feedEdited
+      ? `Save the new price feed before switching to ${unit}: the switch converts at its mid.`
+      : null,
+    onSwitch: () =>
+      set(side, switchUnit(side, draft[side], savedMid, draft.minSpreadBps)),
+  })
+  const preview = (side: Side) => (
+    <SpreadPreview
+      side={side}
+      spread={draft[side]}
+      mid={mid}
+      minSpreadBps={draft.minSpreadBps}
+      unit={unit}
+      collateral={symbols?.collateral ?? 'collateral'}
+    />
+  )
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <SpreadField
+          label="Buy spread"
+          hint="How far below the mid the bot bids."
+          value={draft.buy}
+          disabled={!loaded.editable}
+          onChange={(v) => set('buy', v)}
+          units={units('buy')}
+          preview={preview('buy')}
+        />
+        <SpreadField
+          label="Sell spread"
+          hint="How far above the mid the bot asks."
+          value={draft.sell}
+          disabled={!loaded.editable}
+          onChange={(v) => set('sell', v)}
+          units={units('sell')}
+          preview={preview('sell')}
+        />
+      </div>
+      {mid !== null && (
+        <p className="text-xs text-faint">
+          Mid now: <span className="tabular-nums text-muted">{formatRate(1 / mid)}</span>{' '}
+          {unit}, from the pool's price feed.
+        </p>
+      )}
+      {absolute && (
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field
+            label="Minimum spread (bps)"
+            hint={
+              floorRefusal
+                ? `Not available on this pool: ${floorRefusal}`
+                : `A fixed offset gets thinner in bps as ${symbols?.collateral ?? 'the collateral'} weakens. Below this, an absolute side quotes at this many bps instead. Empty = no floor.`
+            }
+          >
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              placeholder="e.g. 5"
+              value={draft.minSpreadBps}
+              disabled={!loaded.editable || !!floorRefusal}
+              onChange={(e) => set('minSpreadBps', e.target.value)}
+            />
+          </Field>
+          {draft.minSpreadBps.trim() === '' && !floorRefusal && (
+            <div className="self-start sm:mt-6">
+              <Banner tone="warning">
+                No floor set. An absolute spread has no lower limit in bps, so it
+                gets tighter every time {symbols?.collateral ?? 'the collateral'}{' '}
+                weakens.
+              </Banner>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** What one side quotes at the current mid, in the pool's rate and in bps. */
+function SpreadPreview({
+  side,
+  spread,
+  mid,
+  minSpreadBps,
+  unit,
+  collateral,
+}: {
+  side: Side
+  spread: Spread
+  mid: number | null
+  minSpreadBps: string
+  unit: string
+  collateral: string
+}) {
+  if (mid === null || spread.value.trim() === '') return null
+  const quote = sideQuote(side, spread, mid, minSpreadBps)
+  if (!quote) return <span className="text-warning">This spread doesn't price at the current mid.</span>
+  return (
+    <span className="tabular-nums">
+      {side === 'buy' ? 'Buys' : 'Sells'} {collateral} at{' '}
+      <span className="font-bold text-muted">{formatRate(quote.rate)}</span> {unit} ·{' '}
+      {quote.bps.toFixed(1)} bps {side === 'buy' ? 'below' : 'above'} mid
+      {quote.floored && ' (minimum spread)'}
+    </span>
+  )
+}
+
 // Exported so the add-bot wizard's Spread step is literally this field.
 export function SpreadField({
   label,
@@ -536,25 +673,101 @@ export function SpreadField({
   value,
   disabled,
   onChange,
+  units,
+  preview,
 }: {
   label: string
   hint: string
   value: Spread
   disabled: boolean
   onChange: (v: Spread) => void
+  /** The bps / absolute switch. Without it the field keeps its unit.
+   * `refusal` and `pending` each lock a switch to absolute; going back to
+   * bps is always open. */
+  units?: {
+    absLabel: string
+    refusal: string | null
+    pending: string | null
+    onSwitch: () => void
+  }
+  /** What the side quotes, under the input. */
+  preview?: ReactNode
 }) {
-  const unit = value.kind === 'bps' ? 'bps' : 'abs'
+  const name = useId()
+  const unit = value.kind === 'bps' ? 'bps' : (units?.absLabel ?? 'abs')
+  // A side that is absolute already can always go back to bps.
+  const reason =
+    value.kind === 'bps' ? (units?.pending ?? units?.refusal ?? null) : null
+  const locked = reason !== null
+  const input = (
+    <Input
+      value={value.value}
+      disabled={disabled}
+      inputMode="decimal"
+      aria-label={`${label} (${unit})`}
+      // "3" is the wizard's Normal quick pick, so the empty field and the
+      // chips suggest the same scale.
+      placeholder={value.kind === 'bps' ? '3' : units ? '1' : '0.0015'}
+      onChange={(e) => onChange({ ...value, value: e.target.value })}
+    />
+  )
+  if (!units) {
+    return (
+      <Field label={`${label} (${unit})`} hint={hint}>
+        {input}
+      </Field>
+    )
+  }
+  const options = [
+    { kind: 'bps' as const, label: 'bps' },
+    { kind: 'abs' as const, label: units.absLabel },
+  ]
   return (
-    <Field label={`${label} (${unit})`} hint={hint}>
-      <Input
-        value={value.value}
-        disabled={disabled}
-        // "3" is the wizard's Normal quick pick, so the empty field and the
-        // chips suggest the same scale.
-        placeholder={value.kind === 'bps' ? '3' : '0.0015'}
-        onChange={(e) => onChange({ ...value, value: e.target.value })}
-      />
-    </Field>
+    <div>
+      <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+        <span className="text-sm font-bold">{label}</span>
+        <div
+          role="radiogroup"
+          aria-label={`${label} unit`}
+          title={reason ?? undefined}
+          className="inline-flex rounded-lg bg-active p-0.5"
+        >
+          {options.map((option) => {
+            const active = value.kind === option.kind
+            const off = disabled || (option.kind === 'abs' && locked)
+            return (
+              <label
+                key={option.kind}
+                className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-bold transition has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent ${
+                  active
+                    ? 'bg-canvas text-ink shadow-sm ring-1 ring-line-soft'
+                    : off
+                      ? 'cursor-not-allowed text-faint opacity-60'
+                      : 'cursor-pointer text-muted hover:text-ink'
+                }`}
+              >
+                <input
+                  type="radio"
+                  name={name}
+                  value={option.kind}
+                  checked={active}
+                  disabled={off}
+                  onChange={() => !active && units.onSwitch()}
+                  className="sr-only"
+                />
+                {option.label}
+              </label>
+            )
+          })}
+        </div>
+      </div>
+      {input}
+      <span className="mt-1 block space-y-0.5 text-xs text-faint">
+        {preview && <span className="block">{preview}</span>}
+        <span className="block">{hint}</span>
+        {reason && <span className="block">{reason}</span>}
+      </span>
+    </div>
   )
 }
 
@@ -1609,6 +1822,7 @@ export function changedFields(
     'feedUrl',
     'buy',
     'sell',
+    'minSpreadBps',
     'takerEnabled',
     'ttlSecs',
     'refreshThresholdBps',

@@ -171,6 +171,13 @@ export interface Settings {
   feedUrl: string
   buy: Spread
   sell: Spread
+  /** Floor on an absolute side, in bps. Empty for none. */
+  minSpreadBps: string
+  /** Why this pool can't switch a side to an absolute spread, or null. */
+  absoluteSpreadRefusal: string | null
+  /** Why this pool can't take a minimum spread (live lean, inventory
+   * balancing), or null. */
+  spreadFloorRefusal: string | null
   takerEnabled: boolean
   poolIndex: number
   poolCount: number

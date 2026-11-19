@@ -186,6 +186,8 @@ export interface ModuleStatus {
 export interface CorridorSpread {
   kind: 'bps' | 'abs'
   value: number
+  /** The pool's `min_spread_bps` on an absolute side. Absent when unset. */
+  min_bps?: number
 }
 export interface ModulesView {
   config: ModulesConfig

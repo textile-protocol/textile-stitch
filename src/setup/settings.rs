@@ -98,6 +98,14 @@ pub struct SettingsView {
     pub feed_url: String,
     pub buy: SpreadEdit,
     pub sell: SpreadEdit,
+    /// The floor on an absolute side, in bps (`min_spread_bps`). Empty = none.
+    pub min_spread_bps: String,
+    /// Why this pool can't take an absolute spread, or `None` when it can
+    /// ([`Config::absolute_spread_refusal`]).
+    pub absolute_spread_refusal: Option<String>,
+    /// Why this pool can't take `min_spread_bps`, or `None` when it can
+    /// ([`Config::spread_floor_refusal`]).
+    pub spread_floor_refusal: Option<String>,
     /// Whether the taker leg is on: fill users' resting limit orders when they
     /// cross the bot's own quote. The raw configured flag, not the spread-gated
     /// effective one, so a saved-but-spreadless value round-trips.
@@ -171,6 +179,7 @@ impl SettingsView {
             feed_url: self.feed_url.clone(),
             buy: self.buy.clone(),
             sell: self.sell.clone(),
+            min_spread_bps: Some(self.min_spread_bps.clone()),
             taker_enabled: self.taker_enabled,
             buy_sizing: Some(self.buy_sizing.clone()),
             sell_sizing: Some(self.sell_sizing.clone()),
@@ -214,6 +223,9 @@ pub struct SettingsPatch {
     pub feed_url: String,
     pub buy: SpreadEdit,
     pub sell: SpreadEdit,
+    /// `None` leaves `min_spread_bps` alone; empty removes it. Removed anyway
+    /// when neither side is absolute after the save: it floors nothing else.
+    pub min_spread_bps: Option<String>,
     /// Whether the taker leg should be on for this pool.
     pub taker_enabled: bool,
     pub buy_sizing: Option<SideSizing>,
@@ -268,6 +280,9 @@ pub fn read_settings_at(toml_str: &str, pool_index: usize) -> Result<SettingsVie
             .unwrap_or_else(|| cfg.feed.url.clone()),
         buy: spread_edit(pool.buy_offset_bps, pool.buy_offset_abs),
         sell: spread_edit(pool.sell_offset_bps, pool.sell_offset_abs),
+        min_spread_bps: opt_num(pool.min_spread_bps),
+        absolute_spread_refusal: cfg.absolute_spread_refusal(pool_index),
+        spread_floor_refusal: cfg.spread_floor_refusal(pool_index),
         taker_enabled: pool.limit_taker_enabled.unwrap_or(false),
         pool_index,
         pool_count,
@@ -491,6 +506,7 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
     let pool = pool_mut(&mut doc, index)?;
     apply_spread(pool, "buy", &patch.buy)?;
     apply_spread(pool, "sell", &patch.sell)?;
+    apply_spread_floor(pool, patch.min_spread_bps.as_deref())?;
     apply_taker(pool, patch.taker_enabled);
     if let Some(sizing) = &patch.buy_sizing {
         apply_sizing(pool, Side::Buy, sizing)?;
@@ -546,8 +562,33 @@ pub fn apply_settings(toml_str: &str, patch: &SettingsPatch) -> Result<String> {
     // enforces the cross-field rules — TTL above the live-order deadline margin,
     // ladder caps, positive slices, TWAP/lean constraints — so they don't need
     // restating here.
-    Config::from_toml(&edited).context("the edited config is not valid")?;
+    let after = Config::from_toml(&edited).context("the edited config is not valid")?;
+    refuse_unfit_absolute(Config::from_toml(toml_str).ok().as_ref(), &after, index)?;
     Ok(edited)
+}
+
+/// Refuse a save that leaves pool `index` with an absolute side where the
+/// saved config can't take one ([`Config::absolute_spread_refusal`]), judged
+/// on the config as it will be written, so a feed edit in the same save (to a
+/// reversed `invert=1` feed) counts. A side that was already absolute on a
+/// pool that already refused it is left alone: the form never locks an
+/// existing config out of its own value.
+fn refuse_unfit_absolute(before: Option<&Config>, after: &Config, index: usize) -> Result<()> {
+    let Some(reason) = after.absolute_spread_refusal(index) else {
+        return Ok(());
+    };
+    let absolute = |pool: &crate::config::PoolConfig| {
+        [pool.buy_spread(), pool.sell_spread()]
+            .map(|side| side.is_some_and(|s| !matches!(s, crate::pricing::quote::Spread::Bps(_))))
+    };
+    let kept = before
+        .filter(|cfg| cfg.absolute_spread_refusal(index).is_some())
+        .and_then(|cfg| cfg.pools.get(index))
+        .map_or([false, false], absolute);
+    let now = after.pools.get(index).map_or([false, false], absolute);
+    let new = now.iter().zip(kept).any(|(&now, kept)| now && !kept);
+    anyhow::ensure!(!new, "{reason}");
+    Ok(())
 }
 
 /// Append one catalog corridor as a new `[[pools]]` entry on an existing bot.
@@ -1332,6 +1373,23 @@ fn apply_spread(pool: &mut Table, side: &str, edit: &SpreadEdit) -> Result<()> {
     Ok(())
 }
 
+/// Write `min_spread_bps`, then drop it if neither side is absolute any more:
+/// it floors only absolute spreads, and the loader refuses it on a bps-only
+/// pool, so switching the last absolute side to bps would otherwise fail the
+/// save.
+fn apply_spread_floor(pool: &mut Table, raw: Option<&str>) -> Result<()> {
+    if let Some(raw) = raw {
+        apply_optional_u32(pool, "min_spread_bps", raw, "minimum spread")?;
+    }
+    if !["buy_offset_abs", "sell_offset_abs"]
+        .iter()
+        .any(|key| pool.contains_key(key))
+    {
+        pool.remove("min_spread_bps");
+    }
+    Ok(())
+}
+
 /// Write the taker leg's on/off flag onto the pool. Mirrors the spread logic:
 /// enabling sets `limit_taker_enabled = true`; disabling removes the key so the
 /// file falls back to the opt-in default (off) rather than carrying an explicit
@@ -1753,6 +1811,122 @@ mod tests {
         let out = apply_settings(&src, &patch_from(&view)).unwrap();
         assert!(out.contains("buy_offset_abs = 0.0000025"));
         assert!(!out.contains("buy_offset_bps"));
+    }
+
+    #[test]
+    fn one_side_in_bps_and_the_other_in_cngn_per_usdt_with_a_floor() {
+        let mut view = read_settings(TEMPLATE).unwrap();
+        assert_eq!(view.absolute_spread_refusal, None);
+        view.buy = SpreadEdit {
+            kind: SpreadKind::Bps,
+            value: "5".into(),
+        };
+        view.sell = SpreadEdit {
+            kind: SpreadKind::Abs,
+            value: "1".into(),
+        };
+        view.min_spread_bps = "5".into();
+        let out = apply_settings(TEMPLATE, &patch_from(&view)).unwrap();
+        assert!(out.contains("sell_offset_abs = 1"), "{out}");
+        assert!(!out.contains("sell_offset_bps"));
+        assert!(out.contains("min_spread_bps = 5"));
+        let back = read_settings(&out).unwrap();
+        assert_eq!(back.buy.kind, SpreadKind::Bps);
+        assert_eq!(back.sell.kind, SpreadKind::Abs);
+        assert_eq!(back.min_spread_bps, "5");
+
+        // Back to bps on the last absolute side drops the floor with it.
+        let mut bps = back.clone();
+        bps.sell = SpreadEdit {
+            kind: SpreadKind::Bps,
+            value: "7".into(),
+        };
+        let out = apply_settings(&out, &patch_from(&bps)).unwrap();
+        assert!(!out.contains("min_spread_bps"), "{out}");
+        assert_eq!(read_settings(&out).unwrap().min_spread_bps, "");
+    }
+
+    /// The template with its feed reversed (`invert=1`).
+    fn reversed(src: &str) -> String {
+        let view = read_settings(src).unwrap();
+        let feed = format!("{}?invert=1", view.feed_url.split('?').next().unwrap());
+        apply_settings(
+            src,
+            &SettingsPatch {
+                feed_url: feed,
+                ..patch_from(&view)
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_save_is_judged_on_the_feed_it_saves_not_the_one_it_had() {
+        let abs = |value: &str| SpreadEdit {
+            kind: SpreadKind::Abs,
+            value: value.into(),
+        };
+        let view = read_settings(TEMPLATE).unwrap();
+        let feed = format!("{}?invert=1", view.feed_url.split('?').next().unwrap());
+        // Reversing the feed and switching to absolute in one save.
+        let err = apply_settings(
+            TEMPLATE,
+            &SettingsPatch {
+                feed_url: feed.clone(),
+                sell: abs("1"),
+                ..patch_from(&view)
+            },
+        )
+        .expect_err("absolute on a pool the save reverses");
+        assert!(format!("{err:#}").contains("reversed pool"), "{err:#}");
+
+        // Reversing the feed under a side that is absolute already.
+        let mut forward = view.clone();
+        forward.sell = abs("1");
+        let forward = apply_settings(TEMPLATE, &patch_from(&forward)).unwrap();
+        let err = apply_settings(
+            &forward,
+            &SettingsPatch {
+                feed_url: feed,
+                ..patch_from(&read_settings(&forward).unwrap())
+            },
+        )
+        .expect_err("reversing the feed under an absolute side");
+        assert!(format!("{err:#}").contains("reversed pool"), "{err:#}");
+    }
+
+    #[test]
+    fn a_reversed_pool_keeps_the_absolute_side_it_already_has() {
+        let line = TEMPLATE
+            .lines()
+            .find(|l| l.trim_start().starts_with("sell_offset_bps"))
+            .unwrap();
+        let src = reversed(TEMPLATE).replace(line, "sell_offset_abs = 0.0000015");
+        let mut view = read_settings(&src).unwrap();
+        view.sell.value = "0.000002".into();
+        apply_settings(&src, &patch_from(&view)).expect("an existing absolute side saves");
+        // Its other side still can't move onto one.
+        view.buy = SpreadEdit {
+            kind: SpreadKind::Abs,
+            value: "0.000001".into(),
+        };
+        let err = apply_settings(&src, &patch_from(&view)).expect_err("new absolute side");
+        assert!(format!("{err:#}").contains("reversed pool"), "{err:#}");
+    }
+
+    #[test]
+    fn a_reversed_pool_says_why_it_takes_no_absolute_spread() {
+        let view = read_settings(TEMPLATE).unwrap();
+        let reversed = apply_settings(
+            TEMPLATE,
+            &SettingsPatch {
+                feed_url: format!("{}?invert=1", view.feed_url.split('?').next().unwrap()),
+                ..patch_from(&view)
+            },
+        )
+        .unwrap();
+        let reason = read_settings(&reversed).unwrap().absolute_spread_refusal;
+        assert!(reason.is_some_and(|r| r.contains("reversed pool")));
     }
 
     #[test]

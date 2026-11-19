@@ -354,7 +354,8 @@ pub fn widen_ask_spread(spread: Spread, mid: f64, extra_bps: u32) -> Option<Spre
             Spread::Bps((grown - 10_000.0).ceil().min(f64::from(u32::MAX)) as u32)
         }
         // ask_price(mid, Abs(d)) = 1 / (1/mid - d)
-        Spread::Abs(_) => Spread::Abs(1.0 / mid - 1.0 / target),
+        // The target already sits at or past any floor, so plain Abs carries it.
+        Spread::Abs(_) | Spread::AbsMin { .. } => Spread::Abs(1.0 / mid - 1.0 / target),
     })
 }
 

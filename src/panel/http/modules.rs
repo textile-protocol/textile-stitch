@@ -37,18 +37,36 @@ fn revision(raw: &str) -> String {
 }
 /// One side of the corridor's spread as configured, before any module adjusts
 /// it. Bps as written; an absolute offset is in collateral per debt, which the
-/// panel can only turn into bps at a price.
+/// panel can only turn into bps at a price, and floored at `min_bps` when the
+/// pool sets `min_spread_bps`.
 #[derive(Serialize, Debug, PartialEq)]
-#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
-pub enum CorridorSpread {
-    Bps(u32),
-    Abs(f64),
+pub struct CorridorSpread {
+    /// `bps` or `abs`.
+    pub kind: &'static str,
+    pub value: serde_json::Number,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_bps: Option<u32>,
 }
 impl From<Spread> for CorridorSpread {
     fn from(s: Spread) -> Self {
+        // A non-finite offset never loads (config validation), so 0 is moot.
+        let abs = |d: f64| serde_json::Number::from_f64(d).unwrap_or_else(|| 0.into());
         match s {
-            Spread::Bps(b) => Self::Bps(b),
-            Spread::Abs(d) => Self::Abs(d),
+            Spread::Bps(b) => Self {
+                kind: "bps",
+                value: b.into(),
+                min_bps: None,
+            },
+            Spread::Abs(d) => Self {
+                kind: "abs",
+                value: abs(d),
+                min_bps: None,
+            },
+            Spread::AbsMin { abs: d, min_bps } => Self {
+                kind: "abs",
+                value: abs(d),
+                min_bps: Some(min_bps),
+            },
         }
     }
 }

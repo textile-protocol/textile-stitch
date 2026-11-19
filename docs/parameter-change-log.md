@@ -14,6 +14,7 @@ Per pool (scope `pool:<collateral>/<debt>`, labelled with the corridor name):
 |---|---|
 | `buy_offset_bps`, `sell_offset_bps` | bps |
 | `buy_offset_abs`, `sell_offset_abs` | price (collateral per debt) |
+| `min_spread_bps` | bps |
 | `buy_total_liquidity_debt`, `sell_total_liquidity_collateral` | token atomic units |
 | `buy_order_size_debt`, `sell_order_size_collateral` | token atomic units |
 | `feed_url` | the pool's own feed, or the bot-level `[feed].url` it rides |

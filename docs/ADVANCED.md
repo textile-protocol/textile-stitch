@@ -195,21 +195,46 @@ can't be wider than it.
 
 ### Spreads
 
-Each side needs one spread, either relative (basis points) or absolute (soft per
-stable):
+Each side needs one spread, either relative (basis points) or absolute (collateral
+per debt). The two sides don't have to use the same one:
 
 ```toml
 buy_offset_bps = 10        # 0.1% below the mid
 sell_offset_bps = 10       # 0.1% above the mid
-# or, absolute in soft-per-stable units (collateral per debt, e.g. cNGN/USDC),
+# or, absolute in collateral per debt (cNGN per USDC on a cNGN/USDC pool),
 # added to the bid and subtracted from the ask so the bid always buys cheaper
-# and the ask sells dearer. At a 1382 soft-per-stable mid, buy_offset_abs = 5
+# and the ask sells dearer. At a 1382 cNGN per USDC mid, buy_offset_abs = 5
 # bids at 1387 and sell_offset_abs = 5 asks at 1377.
 buy_offset_abs = 5.0
 sell_offset_abs = 5.0
 ```
 
 If both are set for a side, basis points win.
+
+A mixed pool, buying 5 bps under the mid and selling cNGN 1 per USDT above it:
+
+```toml
+buy_offset_bps = 5
+sell_offset_abs = 1.0
+min_spread_bps = 5         # never tighter than 5 bps
+```
+
+A fixed absolute offset is fewer bps the weaker the collateral gets: 1 cNGN per
+USDT is about 6.5 bps at 1530 and 3.3 bps at 3000, so a devaluation thins the
+margin when the feed is noisiest. `min_spread_bps` floors every absolute side
+at that many bps: below it, the side quotes at the floor instead. It only
+applies to absolute sides, and the bot refuses it on a pool that has none. Set
+it at or above the feed's measured error. The panel's Spreads card warns when
+an absolute side has no floor. The floor holds where Stitch prices the side
+from its spread, so it's refused with live lean and with inventory balancing:
+both narrow spreads on purpose, each down to its own floor (`lean_floor_bps`,
+`modules.inventory.spread_floor_bps`). Set that floor instead.
+
+On a reversed pool (collateral USDT, feed with `invert=1`) collateral per debt
+is USDT per cNGN, so an absolute offset there is in dollars per local unit. The
+panel only offers the absolute unit on forward pools. The inventory curve,
+profit unwind, issuer spreads and `feed_sides` all need bps (or zero) spreads
+and refuse absolute ones at load.
 
 ### TWAP Quoting (Smoothed Center)
 

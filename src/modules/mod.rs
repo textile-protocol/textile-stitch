@@ -225,17 +225,31 @@ fn ratio_bps(value: U256, total: U256) -> Option<u32> {
 
 pub fn base_spreads(book: &CorridorBook, price: f64) -> (Option<u32>, Option<u32>) {
     use crate::pricing::quote::Spread;
+    let buy_bps = |s| {
+        ((1.0 - bid_price(price, s) / price) * 10_000.0)
+            .max(0.0)
+            .ceil() as u32
+    };
+    let sell_bps = |s| {
+        ((ask_price(price, s) / price - 1.0) * 10_000.0)
+            .max(0.0)
+            .ceil() as u32
+    };
+    // A floor is whole bps already: taking it as a price and back would let
+    // float noise ceil it a bps wider. An ask past the mid (price 0) stays 0,
+    // as `ask_price` keeps it unusable rather than at the floor.
     let buy = book.buy_spread.map(|s| match s {
         Spread::Bps(b) => b,
-        Spread::Abs(_) => ((1.0 - bid_price(price, s) / price) * 10_000.0)
-            .max(0.0)
-            .ceil() as u32,
+        Spread::Abs(_) => buy_bps(s),
+        Spread::AbsMin { abs, min_bps } => buy_bps(Spread::Abs(abs)).max(min_bps),
     });
     let sell = book.sell_spread.map(|s| match s {
         Spread::Bps(b) => b,
-        Spread::Abs(_) => ((ask_price(price, s) / price - 1.0) * 10_000.0)
-            .max(0.0)
-            .ceil() as u32,
+        Spread::Abs(_) => sell_bps(s),
+        Spread::AbsMin { abs, min_bps } => match ask_price(price, Spread::Abs(abs)) {
+            a if a > 0.0 => sell_bps(Spread::Abs(abs)).max(min_bps),
+            _ => 0,
+        },
     });
     (buy, sell)
 }

@@ -950,8 +950,8 @@ pub struct PoolConfig {
     /// Bid spread as basis points below the mid.
     #[serde(default)]
     pub buy_offset_bps: Option<u32>,
-    /// Bid spread as an absolute amount in the soft-per-stable price (collateral
-    /// per debt, e.g. cNGN/USDT) below the mid. Currency-agnostic.
+    /// Bid spread as an absolute amount in collateral per debt below the mid:
+    /// cNGN per USDT on a forward pool, USDT per cNGN on a reversed one.
     #[serde(default)]
     pub buy_offset_abs: Option<f64>,
     /// Debt (USDT) committed per bid, atomic units (uint256 as string).
@@ -975,10 +975,16 @@ pub struct PoolConfig {
     /// Ask spread as basis points above the mid.
     #[serde(default)]
     pub sell_offset_bps: Option<u32>,
-    /// Ask spread as an absolute amount in the soft-per-stable price (collateral
-    /// per debt, e.g. cNGN/USDT) above the mid. Currency-agnostic.
+    /// Ask spread as an absolute amount in collateral per debt above the mid:
+    /// cNGN per USDT on a forward pool, USDT per cNGN on a reversed one.
     #[serde(default)]
     pub sell_offset_abs: Option<f64>,
+    /// The narrowest an absolute side (`buy_offset_abs` / `sell_offset_abs`)
+    /// may price, in bps off the mid. A fixed absolute offset is fewer bps the
+    /// weaker the collateral gets, so below this the side quotes at this many
+    /// bps instead. Only valid with an absolute side; bps sides ignore it.
+    #[serde(default)]
+    pub min_spread_bps: Option<u32>,
     /// With `[issuer_spread]`: the narrowest and widest offset, in bps, this
     /// pool takes from the issuer, for each side. Both or neither. A spread
     /// outside them is passed over and the pool quotes its own offsets.
@@ -1132,6 +1138,7 @@ fn feed_sides_pool_conflicts(pool: &PoolConfig, idx: usize) -> anyhow::Result<()
             pool.limit_taker_enabled.unwrap_or(false),
         ),
         ("closer_pool", pool.closer_enabled()),
+        ("min_spread_bps", pool.min_spread_bps.is_some()),
     ]
     .into_iter()
     .find_map(|(field, on)| on.then_some(field));
@@ -1144,10 +1151,10 @@ fn feed_sides_pool_conflicts(pool: &PoolConfig, idx: usize) -> anyhow::Result<()
     }
 }
 
-fn spread_from(bps: Option<u32>, abs: Option<f64>) -> Option<Spread> {
+fn spread_from(bps: Option<u32>, abs: Option<f64>, min_bps: Option<u32>) -> Option<Spread> {
     match (bps, abs) {
         (Some(b), _) => Some(Spread::Bps(b)),
-        (None, Some(d)) => Some(Spread::Abs(d)),
+        (None, Some(d)) => Some(Spread::absolute(d, min_bps)),
         (None, None) => None,
     }
 }
@@ -1220,11 +1227,19 @@ impl PoolConfig {
     }
     /// The bid spread for this pool, however the operator expressed it.
     pub fn buy_spread(&self) -> Option<Spread> {
-        spread_from(self.buy_offset_bps, self.buy_offset_abs)
+        spread_from(
+            self.buy_offset_bps,
+            self.buy_offset_abs,
+            self.min_spread_bps,
+        )
     }
     /// The ask spread for this pool, however the operator expressed it.
     pub fn sell_spread(&self) -> Option<Spread> {
-        spread_from(self.sell_offset_bps, self.sell_offset_abs)
+        spread_from(
+            self.sell_offset_bps,
+            self.sell_offset_abs,
+            self.min_spread_bps,
+        )
     }
     /// The range this pool takes an issuer's spread in, when it opted in.
     pub fn issuer_spread_bounds(&self) -> Option<SpreadBounds> {
@@ -1736,6 +1751,53 @@ impl Config {
         Ok(())
     }
 
+    /// Why pool `idx` can't take an absolute spread, in operator words, or
+    /// `None` when it can. The panel greys its unit toggle out with this. Most
+    /// of these are load errors with an absolute side ([`Self::validate`]);
+    /// a reversed pool loads fine, but there the offset is in dollars per
+    /// local unit, which nobody means when they type "1".
+    pub fn absolute_spread_refusal(&self, idx: usize) -> Option<String> {
+        use crate::modules::Module;
+        let pool = self.pools.get(idx)?;
+        let modules = |module| idx == 0 && self.modules_enabled && self.modules.runs(module);
+        let reason = if pool.feed_sides {
+            "This pool quotes the feed's own bid and ask, so it has no spread to set."
+        } else if feed_inverts(pool.feed_url.as_deref().unwrap_or(&self.feed.url)) {
+            "This is a reversed pool: an absolute offset here is in dollars per local unit, \
+             not local currency per dollar. Use bps."
+        } else if pool.issuer_spread_bounds().is_some() {
+            "This pool takes the issuer's spread, which is set in bps."
+        } else if modules(Module::Curve) {
+            "The inventory curve sizes its ends in bps, so it needs bps spreads."
+        } else if modules(Module::ProfitUnwind) {
+            "Profit unwind sizes its round-trip limit off a bps spread."
+        } else {
+            return None;
+        };
+        Some(reason.to_string())
+    }
+
+    /// Why pool `idx` can't take `min_spread_bps`, or `None` when it can.
+    /// The floor holds where a side prices through `bid_price`/`ask_price`;
+    /// these two narrow a spread on purpose after that, each down to its own
+    /// floor, so a minimum set here would show in the panel and not hold.
+    pub fn spread_floor_refusal(&self, idx: usize) -> Option<String> {
+        let pool = self.pools.get(idx)?;
+        let inventory = idx == 0
+            && self.modules_enabled
+            && self.modules.runs(crate::modules::Module::Inventory);
+        let reason = if pool.lean_mode() == LeanMode::Live {
+            "live lean quotes the ladder and the taker leg at its own prices, down to \
+             lean_floor_bps. Set that floor instead."
+        } else if inventory {
+            "inventory balancing narrows spreads down to its own spread floor \
+             (modules.inventory.spread_floor_bps). Set that floor instead."
+        } else {
+            return None;
+        };
+        Some(reason.to_string())
+    }
+
     /// What profit unwind needs, once modules are known to quote one
     /// corridor. It lifts both sides by the same bps, and its advisory
     /// round-trip limit is a multiple of the spread
@@ -1986,6 +2048,25 @@ impl Config {
                         "pools[{idx}].{field} must be a finite, non-negative number, got {value}"
                     );
                 }
+            }
+            if let Some(min) = pool.min_spread_bps {
+                if let Some(reason) = self.spread_floor_refusal(idx) {
+                    anyhow::bail!("pools[{idx}].min_spread_bps can't hold here: {reason}");
+                }
+                let absolute = [pool.buy_spread(), pool.sell_spread()]
+                    .into_iter()
+                    .flatten()
+                    .any(|sp| matches!(sp, Spread::AbsMin { .. }));
+                anyhow::ensure!(
+                    absolute,
+                    "pools[{idx}].min_spread_bps floors an absolute spread, and neither side \
+                     uses one (buy_offset_abs / sell_offset_abs). Remove it"
+                );
+                anyhow::ensure!(
+                    min > 0 && min < 10_000,
+                    "pools[{idx}].min_spread_bps {min} must be between 1 and 9999; at 10000 \
+                     the bid floor is zero"
+                );
             }
             // Zero batch limits are configured-but-inert: `.take(0)` yields an
             // empty batch every tick, so the leg reads as on and never acts.
@@ -3028,6 +3109,143 @@ mod tests {
         );
         let err = Config::from_toml(&toml).expect_err("attacker host must be refused");
         assert!(format!("{err:#}").contains("evil.example"), "{err:#}");
+    }
+
+    /// Sells cNGN 1 per USDT off the mid and buys it 5 bps off.
+    const MIXED_POOL: &str = r#"
+            chain_id = 8453
+            rpc_url = "http://x"
+            indexer_url = "http://x"
+            permit2 = "0x0000000000000000000000000000000000000000"
+            reactor = "0x0000000000000000000000000000000000000000"
+            tick_interval_secs = 5
+            [feed]
+            url = "https://x"
+            staleness_secs = 30
+            [[pools]]
+            collateral = "0x0000000000000000000000000000000000000001"
+            collateral_decimals = 18
+            debt = "0x0000000000000000000000000000000000000002"
+            debt_decimals = 6
+            buy_offset_bps = 5
+            buy_order_size_debt = "10000000"
+            sell_offset_abs = 1.0
+            sell_order_size_collateral = "10000000000000000000000"
+            ttl_secs = 60
+            refresh_threshold_bps = 10
+        "#;
+
+    #[test]
+    fn a_floor_applies_to_the_absolute_side_only() {
+        let cfg = Config::from_toml(&MIXED_POOL.replace(
+            "sell_offset_abs = 1.0",
+            "sell_offset_abs = 1.0\n            min_spread_bps = 5",
+        ))
+        .expect("config parses");
+        let pool = &cfg.pools[0];
+        assert_eq!(pool.buy_spread(), Some(Spread::Bps(5)));
+        assert_eq!(
+            pool.sell_spread(),
+            Some(Spread::AbsMin {
+                abs: 1.0,
+                min_bps: 5
+            })
+        );
+        let plain = Config::from_toml(MIXED_POOL).unwrap();
+        assert_eq!(plain.pools[0].sell_spread(), Some(Spread::Abs(1.0)));
+    }
+
+    #[test]
+    fn a_floor_needs_an_absolute_side_and_a_usable_value() {
+        let err = |toml: String, needle: &str| {
+            let e = Config::from_toml(&toml).expect_err(needle);
+            assert!(format!("{e:#}").contains(needle), "{e:#}");
+        };
+        let bps_only = MIXED_POOL.replace("sell_offset_abs = 1.0", "sell_offset_bps = 5");
+        err(
+            bps_only.replace("ttl_secs = 60", "ttl_secs = 60\nmin_spread_bps = 5"),
+            "neither side uses one",
+        );
+        for bad in [0, 10_000] {
+            err(
+                MIXED_POOL.replace(
+                    "ttl_secs = 60",
+                    &format!("ttl_secs = 60\nmin_spread_bps = {bad}"),
+                ),
+                "between 1 and 9999",
+            );
+        }
+    }
+
+    #[test]
+    fn a_floor_is_refused_where_lean_or_inventory_narrows_the_spread() {
+        let floored = |toml: &str| {
+            format!("{toml}\nmin_spread_bps = 5")
+                .replace("sell_offset_bps = 1\n", "sell_offset_abs = 0.5\n")
+        };
+        let live = floored(&format!(
+            "{LEAN_POOL_BASE}lean_enabled = true\nlean_floor_bps = 3.0"
+        ));
+        let e = Config::from_toml(&live).expect_err("floor under live lean");
+        assert!(format!("{e:#}").contains("live lean"), "{e:#}");
+        // Shadow lean only logs, so the floor still holds.
+        let shadow = floored(&format!(
+            "{LEAN_POOL_BASE}lean_shadow = true\nlean_floor_bps = 3.0"
+        ));
+        let cfg = Config::from_toml(&shadow).expect("floor beside shadow lean");
+        assert_eq!(cfg.spread_floor_refusal(0), None);
+
+        let inventory = curve_bot(
+            "min_spread_bps = 5",
+            true,
+            "[modules.inventory]\nenabled = true\n",
+        )
+        .replace("[modules.curve]\nenabled = true\n", "")
+        .replace("sell_offset_bps = 150", "sell_offset_abs = 2.0");
+        let e = Config::from_toml(&inventory).expect_err("floor under inventory balancing");
+        assert!(format!("{e:#}").contains("inventory balancing"), "{e:#}");
+        let off = inventory.replace(
+            "[modules.inventory]\nenabled = true\n",
+            "[modules.inventory]\nenabled = false\n",
+        );
+        Config::from_toml(&off).expect("floor with inventory balancing off");
+    }
+
+    #[test]
+    fn feed_sides_refuses_a_floor() {
+        let pool = feed_sides_pool().replace(
+            "sell_offset_bps = 0",
+            "sell_offset_abs = 0.0\nmin_spread_bps = 5",
+        );
+        let e = Config::from_toml(&pool).expect_err("floor on feed_sides");
+        assert!(format!("{e:#}").contains("min_spread_bps"), "{e:#}");
+    }
+
+    #[test]
+    fn a_forward_pool_takes_an_absolute_spread_and_a_reversed_one_does_not() {
+        let cfg = Config::from_toml(MIXED_POOL).unwrap();
+        assert_eq!(cfg.absolute_spread_refusal(0), None);
+        assert_eq!(cfg.absolute_spread_refusal(1), None);
+        let reversed = Config::from_toml(
+            &MIXED_POOL.replace("url = \"https://x\"", "url = \"https://x/price?invert=1\""),
+        )
+        .unwrap();
+        let reason = reversed.absolute_spread_refusal(0).expect("reversed pool");
+        assert!(reason.contains("reversed pool"), "{reason}");
+    }
+
+    #[test]
+    fn modules_and_the_issuer_spread_refuse_an_absolute_spread() {
+        let curve = Config::from_toml(&curve_bot("", false, "")).unwrap();
+        let reason = curve.absolute_spread_refusal(0).expect("curve");
+        assert!(reason.contains("inventory curve"), "{reason}");
+        let issuer = Config::from_toml(&issuer_spread_bot(
+            &issuer_pool(10, 60),
+            &issuer_table(&eoa(ISSUER)),
+        ))
+        .unwrap();
+        let reason = issuer.absolute_spread_refusal(0).expect("issuer spread");
+        assert!(reason.contains("issuer"), "{reason}");
     }
 
     #[test]

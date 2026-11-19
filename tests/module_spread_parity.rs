@@ -110,12 +110,23 @@ fn share(rng: &mut Rng, c: &ModulesConfig) -> u32 {
 }
 
 /// One corridor side: off, bps, or an absolute offset in corridor per
-/// settlement token, sized against the price so it lands on real bps.
+/// settlement token, sized against the price so it lands on real bps, half of
+/// them floored at a `min_spread_bps`.
 fn spread(rng: &mut Rng, price: f64, max_bps: u32, max_abs_share: f64) -> Option<Spread> {
     match rng.range(1, 100) {
         1..=15 => None,
         16..=75 => Some(Spread::Bps(rng.bps(150, max_bps))),
-        _ => Some(Spread::Abs(rng.unit() * max_abs_share / price)),
+        _ => {
+            let abs = rng.unit() * max_abs_share / price;
+            Some(if rng.chance(50) {
+                Spread::AbsMin {
+                    abs,
+                    min_bps: rng.bps(150, 2_000).max(1),
+                }
+            } else {
+                Spread::Abs(abs)
+            })
+        }
     }
 }
 
@@ -124,6 +135,9 @@ fn spread_json(s: Option<Spread>) -> serde_json::Value {
         None => serde_json::Value::Null,
         Some(Spread::Bps(b)) => serde_json::json!({"kind": "bps", "value": b}),
         Some(Spread::Abs(d)) => serde_json::json!({"kind": "abs", "value": d}),
+        Some(Spread::AbsMin { abs, min_bps }) => {
+            serde_json::json!({"kind": "abs", "value": abs, "min_bps": min_bps})
+        }
     }
 }
 
@@ -176,7 +190,9 @@ fn context(share: u32, base: (Option<u32>, Option<u32>)) -> Context {
 fn bps(s: Option<Spread>) -> Option<u32> {
     s.map(|s| match s {
         Spread::Bps(b) => b,
-        Spread::Abs(_) => unreachable!("modules always hand RFQ whole bps"),
+        Spread::Abs(_) | Spread::AbsMin { .. } => {
+            unreachable!("modules always hand RFQ whole bps")
+        }
     })
 }
 

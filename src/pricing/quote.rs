@@ -3,8 +3,9 @@
 //! Pricing. The operator runs a two-sided book around the feed mid: a bid (buy
 //! collateral below mid — "buy low") and an ask (sell collateral above mid —
 //! "sell high"). The spread on each side is the operator's own strategy,
-//! expressed however they prefer — relative basis points, or an absolute amount
-//! in the soft-per-stable price (e.g. cNGN/USDT, COPM/USDT). See [`Spread`].
+//! expressed however they prefer, and each side its own way: relative basis
+//! points, or an absolute amount in collateral per debt (cNGN per USDT on a
+//! forward pool). See [`Spread`].
 //!
 //! Atomic math is integer/U256; only the price (a small-magnitude float) is
 //! scaled to an integer, so amounts stay exact for any token decimals.
@@ -29,11 +30,26 @@ pub enum Spread {
     /// Relative, in basis points off the mid. Orientation-independent: `Bps(50)`
     /// is 0.5% either way.
     Bps(u32),
-    /// Absolute, in the soft-per-stable price — collateral per debt (e.g. cNGN
-    /// per USDT, COPM per USDT), the readable "local currency per dollar".
-    /// Applied so the bid always buys cheaper and the ask always sells dearer,
-    /// regardless of how the feed is quoted. Currency-agnostic.
+    /// Absolute, in collateral per debt: cNGN per USDT on a forward pool, the
+    /// readable "local currency per dollar"; USDT per cNGN on a reversed one
+    /// (USDT collateral). Applied so the bid always buys cheaper and the ask
+    /// always sells dearer, regardless of how the feed is quoted.
     Abs(f64),
+    /// [`Spread::Abs`] with a floor in bps. A fixed absolute offset is fewer
+    /// bps the further the collateral weakens (1 cNGN per USDT is 6.5 bps at
+    /// 1530, 3.3 bps at 3000), so the side prices at whichever of the two is
+    /// further from the mid. `min_bps` is the pool's `min_spread_bps`.
+    AbsMin { abs: f64, min_bps: u32 },
+}
+
+impl Spread {
+    /// `abs` as configured, floored at `min_bps` when the pool sets one.
+    pub fn absolute(abs: f64, min_bps: Option<u32>) -> Self {
+        match min_bps {
+            Some(min_bps) => Self::AbsMin { abs, min_bps },
+            None => Self::Abs(abs),
+        }
+    }
 }
 
 /// Bid price (USDT per cNGN) for buying collateral *below* the mid — buy low.
@@ -48,6 +64,11 @@ pub fn bid_price(mid: f64, spread: Spread) -> f64 {
             } else {
                 0.0
             }
+        }
+        // The lower bid is the wider one. `min` would pass a NaN through on
+        // either argument; both are finite for a positive finite mid.
+        Spread::AbsMin { abs, min_bps } => {
+            bid_price(mid, Spread::Abs(abs)).min(bid_price(mid, Spread::Bps(min_bps)))
         }
     }
 }
@@ -64,6 +85,13 @@ pub fn ask_price(mid: f64, spread: Spread) -> f64 {
                 0.0
             }
         }
+        // The higher ask is the wider one, except that an absolute offset at
+        // or past the mid's own collateral-per-debt prices to 0 (unusable),
+        // which the floor must not turn into a usable price.
+        Spread::AbsMin { abs, min_bps } => match ask_price(mid, Spread::Abs(abs)) {
+            a if a > 0.0 => a.max(ask_price(mid, Spread::Bps(min_bps))),
+            unusable => unusable,
+        },
     }
 }
 
@@ -266,6 +294,38 @@ mod tests {
         assert!(bid < mid && mid < ask);
         assert!((bid - 1.0 / 1384.0).abs() < 1e-15);
         assert!((ask - 1.0 / 1380.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn an_absolute_spread_prices_at_its_floor_once_the_collateral_weakens() {
+        // 1 cNGN per USDT: about 6.5 bps at 1530, about 3.3 bps at 3000.
+        let floored = Spread::absolute(1.0, Some(5));
+        let strong = 1.0 / 1530.0;
+        assert_eq!(
+            bid_price(strong, floored),
+            bid_price(strong, Spread::Abs(1.0))
+        );
+        assert_eq!(
+            ask_price(strong, floored),
+            ask_price(strong, Spread::Abs(1.0))
+        );
+        let weak = 1.0 / 3000.0;
+        assert_eq!(bid_price(weak, floored), bid_price(weak, Spread::Bps(5)));
+        assert_eq!(ask_price(weak, floored), ask_price(weak, Spread::Bps(5)));
+        assert!(bid_price(weak, floored) < bid_price(weak, Spread::Abs(1.0)));
+        assert!(ask_price(weak, floored) > ask_price(weak, Spread::Abs(1.0)));
+    }
+
+    #[test]
+    fn a_floor_never_revives_an_ask_past_the_mid() {
+        // 2 USDT per cNGN off a 1.5 mid is no ask at all; the floor keeps it so.
+        let floored = Spread::absolute(2.0, Some(5));
+        assert_eq!(ask_price(1.0 / 1.5, floored), 0.0);
+    }
+
+    #[test]
+    fn no_floor_is_the_plain_absolute_spread() {
+        assert_eq!(Spread::absolute(1.0, None), Spread::Abs(1.0));
     }
 
     #[test]

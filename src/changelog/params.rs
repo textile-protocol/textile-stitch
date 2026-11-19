@@ -238,6 +238,11 @@ fn pool_params(cfg: &Config, pool: &PoolConfig) -> Vec<(ParamKey, Param)> {
             pool.sell_offset_abs.map(|v| v.to_string()),
         ),
         entry(
+            "min_spread_bps",
+            BPS,
+            pool.min_spread_bps.map(|v| v.to_string()),
+        ),
+        entry(
             "issuer_spread_min_bps",
             BPS,
             pool.issuer_spread_min_bps.map(|v| v.to_string()),

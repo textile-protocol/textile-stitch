@@ -105,9 +105,9 @@ debt_decimals = 6
 # Two-sided market making. Each side is independent — set a spread + a size to
 # run it; omit a side to skip it. Express the spread however you prefer:
 #   *_offset_bps  — relative, in basis points off the mid
-#   *_offset_abs  — absolute, in the soft-per-stable price (collateral per debt,
-#                   e.g. cNGN/USDT, COPM/USDT — currency-agnostic)
-# Set one per side; if both are set, bps wins.
+#   *_offset_abs  — absolute, in collateral per debt (cNGN per USDC here;
+#                   on a reversed pool with USDC collateral, USDC per cNGN)
+# Set one per side; if both are set, bps wins. The sides can differ.
 
 # Buy low: bid below the mid, paying USDC for cNGN.
 buy_offset_bps = 150                # 1.5% below the mid   (or: buy_offset_abs = 2.0)
@@ -117,7 +117,8 @@ buy_max_orders = 40
 
 # Sell high: ask above the mid, selling cNGN for USDC. Needs cNGN inventory +
 # a Permit2 approval on cNGN.
-sell_offset_abs = 2.0                       # 2 soft/stable above the mid (or: sell_offset_bps = 150)
+sell_offset_abs = 2.0                       # 2 cNGN per USDC above the mid (or: sell_offset_bps = 150)
+min_spread_bps = 10                         # an absolute side never prices tighter than 10 bps
 sell_total_liquidity_collateral = "max"        # quote all currently funded cNGN
 sell_min_slice_debt = "10000000"                # 10 USDC-equivalent smallest slice
 sell_max_orders = 40

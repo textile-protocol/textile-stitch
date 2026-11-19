@@ -129,6 +129,16 @@ describe('interactive illustrations match strategy rounding', () => {
 })
 
 describe('the simulated spread starts from the corridor spread', () => {
+  it('floors an absolute side at its minimum spread, as the bot does', () => {
+    // 10 per 1,000 is 100 bps; a 150 bps floor wins, a 50 bps one doesn't.
+    expect(
+      corridorSpreadBps({ kind: 'abs', value: 10, min_bps: 150 }, 'buy', 0.001)
+    ).toBe(150)
+    expect(
+      corridorSpreadBps({ kind: 'abs', value: 10, min_bps: 50 }, 'buy', 0.001)
+    ).toBe(100)
+  })
+
   it('reads bps as set and converts an absolute offset at the price, rounding up', () => {
     expect(
       corridorSpreadBps({ kind: 'bps', value: 35 }, 'buy', undefined)
