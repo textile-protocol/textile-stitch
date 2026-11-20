@@ -415,6 +415,30 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('/var/run/docker.sock', [v['target'] for v in broker['volumes']])
         self.assertNotIn('0.0.0.0', result.stdout)
 
+    def test_hosted_panel_mounts_no_bot_directory_and_the_broker_owns_it(self):
+        result = self.hosted_config()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        services = json.loads(result.stdout)['services']
+        panel, broker = services['panel'], services['runtime-broker']
+        bots_dir = '/home/ec2-user/stitch'
+        # No bind of the host's bot directory (or anything under it) into the panel.
+        for volume in panel['volumes']:
+            source = volume.get('source') or ''
+            self.assertFalse(source == bots_dir or source.startswith(bots_dir + '/'), volume)
+            self.assertNotEqual(volume['target'], '/data/bots', volume)
+        # Its /data/bots is a private tmpfs the broker fills.
+        self.assertTrue(any(t.startswith('/data/bots:') for t in panel.get('tmpfs', [])), panel.get('tmpfs'))
+        # The broker has the bot directories, the envelope read-only, and the
+        # settings that point its config routes at them.
+        mounts = {v['target']: v for v in broker['volumes']}
+        self.assertEqual(mounts['/data/bots']['source'], bots_dir)
+        self.assertTrue(mounts['/etc/stitch-broker/envelope.json']['read_only'])
+        env = broker['environment']
+        self.assertEqual(env['STITCH_BROKER_HOST_BOTS_DIR'], bots_dir)
+        self.assertEqual(env['STITCH_BROKER_BOTS_DIR'], '/data/bots')
+        self.assertEqual(env['STITCH_BROKER_ENVELOPE'], '/etc/stitch-broker/envelope.json')
+        self.assertEqual(panel['environment']['STITCH_PANEL_HOST_BOTS_DIR'], bots_dir)
+
     def test_the_break_glass_bridge_is_set_by_one_variable(self):
         result = self.hosted_config(PANEL_PUBLISH_NET='172.30.9')
         self.assertEqual(result.returncode, 0, result.stderr)

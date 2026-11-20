@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 
 use crate::panel::broker::{ImageRequest, SwapErrorBody, WireContainer, WireImage, WireLogLine};
+use crate::panel::broker_config::{WireBotFiles, WireQuotingSave, WireSaved};
 use crate::panel::docker::swap::failed;
 use crate::panel::docker::{
     ContainerInfo, CreateSpec, DockerApi, Keepalive, LogLine, LogOptions, LogSource, LogStream,
@@ -127,6 +128,40 @@ async fn swap_reply(response: reqwest::Response) -> Result<()> {
                 .unwrap_or_else(|| "no detail".into());
             bail!("the runtime broker refused ({status}): {message}")
         }
+    }
+}
+
+#[async_trait]
+impl crate::panel::hosted::mirror::ConfigStore for BrokerDocker {
+    async fn configs(&self) -> Result<Vec<WireBotFiles>> {
+        self.get_json("/v1/configs").await
+    }
+
+    async fn save(&self, container: &str, save: &WireQuotingSave) -> Result<WireSaved> {
+        let response = self
+            .client
+            .post(format!(
+                "http://broker/v1/bots/{}/settings",
+                segment(container)
+            ))
+            .json(save)
+            .send()
+            .await
+            .context("the runtime broker isn't answering")?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response.json().await?);
+        }
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        Err(crate::panel::hosted::mirror::StoreRefused {
+            status: status.as_u16(),
+            message: body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("no detail")
+                .to_string(),
+        }
+        .into())
     }
 }
 

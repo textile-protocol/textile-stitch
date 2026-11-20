@@ -14,6 +14,7 @@
 //! the response says exactly that — the alternative is an operator staring at a
 //! "saved" toast while the bot keeps quoting the old spread.
 
+use crate::panel::broker_config::QuotingEdit;
 use std::path::PathBuf;
 
 use axum::extract::{Path as UrlPath, Query, State};
@@ -264,8 +265,12 @@ impl SettingsBody {
     }
 }
 
+/// Whether a maker key is saved for this bot: the file beside the config, or
+/// on a hosted panel the broker's yes/no for it (see `hosted::mirror`).
 fn rfq_key_is_set(config_path: &std::path::Path) -> bool {
-    config_path.parent().is_some_and(setup::rfq_api_key_is_set)
+    config_path.parent().is_some_and(|dir| {
+        setup::rfq_api_key_is_set(dir) || crate::panel::hosted::mirror::maker_key_reported(dir)
+    })
 }
 
 fn rfq_surface(toml: &str, bots_dir: &std::path::Path) -> (bool, bool) {
@@ -442,6 +447,79 @@ pub struct SettingsUpdate {
 }
 
 impl SettingsUpdate {
+    /// Hosted: URLs reach the client masked, so a form that sends one back
+    /// unedited means "leave it", and is dropped here rather than written. Any
+    /// other URL carrying the mask is refused, so the mask never lands in a
+    /// config. (RPC and feed edits are refused on hosted anyway; this keeps an
+    /// unedited form from tripping that refusal.)
+    fn without_masked_urls(mut self, current: &SettingsView) -> Result<Self, ApiError> {
+        use crate::panel::hosted::redact::{carries_mask, is_echo};
+        let keep = |sent: Option<String>, stored: &str| -> Result<Option<String>, ApiError> {
+            match sent {
+                Some(v) if is_echo(&v, stored) => Ok(None),
+                Some(v) if carries_mask(&v) => Err(ApiError::bad_request(
+                    "a URL with a masked part can't be saved; the host's administrators manage \
+                     RPC and feed URLs"
+                        .to_string(),
+                )),
+                other => Ok(other),
+            }
+        };
+        self.rpc_url = keep(self.rpc_url.take(), &current.rpc_url)?;
+        self.feed_url = keep(self.feed_url.take(), &current.feed_url)?;
+        self.rfq_url = keep(self.rfq_url.take(), &current.rfq_url)?;
+        self.rpc_fallback_urls = match self.rpc_fallback_urls.take() {
+            Some(sent)
+                if sent.len() == current.rpc_fallback_urls.len()
+                    && sent
+                        .iter()
+                        .zip(&current.rpc_fallback_urls)
+                        .all(|(s, c)| is_echo(s, c)) =>
+            {
+                None
+            }
+            Some(sent) if sent.iter().any(|s| carries_mask(s)) => {
+                return Err(ApiError::bad_request(
+                    "a URL with a masked part can't be saved; the host's administrators manage \
+                     RPC and feed URLs"
+                        .to_string(),
+                ))
+            }
+            other => other,
+        };
+        Ok(self)
+    }
+
+    /// The quoting edit a hosted panel sends the broker: only the fields this
+    /// request named, with the values `patch` resolved for them. A field the
+    /// request left out stays `None`, so the broker keeps what the host file
+    /// says rather than a value copied from the panel's possibly older copy.
+    fn quoting_edit(&self, patch: &SettingsPatch) -> QuotingEdit {
+        use crate::panel::broker_config::{WireSizing, WireSpread};
+        QuotingEdit {
+            pool: patch.pool_index,
+            collateral: self.collateral.clone(),
+            debt: self.debt.clone(),
+            buy: self.buy.as_ref().map(|_| WireSpread::from(&patch.buy)),
+            sell: self.sell.as_ref().map(|_| WireSpread::from(&patch.sell)),
+            min_spread_bps: self
+                .min_spread_bps
+                .as_ref()
+                .and(patch.min_spread_bps.clone()),
+            buy_sizing: self
+                .buy_sizing
+                .as_ref()
+                .and(patch.buy_sizing.as_ref().map(WireSizing::from)),
+            sell_sizing: self
+                .sell_sizing
+                .as_ref()
+                .and(patch.sell_sizing.as_ref().map(WireSizing::from)),
+            ttl_secs: self.ttl_secs.and(patch.ttl_secs),
+            refresh_threshold_bps: self.refresh_threshold_bps.and(patch.refresh_threshold_bps),
+            tick_interval_secs: self.tick_interval_secs.and(patch.tick_interval_secs),
+        }
+    }
+
     /// Fold the update onto the config as it is now.
     fn onto(&self, current: &SettingsView) -> Result<SettingsPatch, ApiError> {
         let mut patch = current.to_patch();
@@ -705,15 +783,25 @@ pub async fn update(
         body.debt.as_deref(),
     )?;
     let current = setup::read_settings_at(&current_toml, pool).map_err(ApiError::bad_request)?;
+    let body = match state.cfg.profile.hosted() {
+        Some(_) => body.without_masked_urls(&current)?,
+        None => body,
+    };
     let patch = body.onto(&current)?;
     // `apply_settings` re-validates through the real loader, so an invalid value
     // fails here and nothing is written. Use the full anyhow chain — the outer
     // "edited config is not valid" alone doesn't name the field that failed.
     let edited = setup::apply_settings(&current_toml, &patch)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    if let Some(hosted) = state.cfg.profile.hosted() {
-        refuse_outside_hosted_envelope(hosted, &body, &current, &edited, pool)?;
-    }
+    // Hosted: checked here for a clear answer, and again by the broker, which
+    // is the one that writes.
+    let hosted_edit = match state.cfg.profile.hosted() {
+        Some(hosted) => {
+            refuse_outside_hosted_envelope(hosted, &body, &current, &edited, pool)?;
+            Some(body.quoting_edit(&patch))
+        }
+        None => None,
+    };
     refuse_book_on_without_a_postable_side(&patch, &edited)?;
     let incoming_rfq_key = body
         .rfq_api_key
@@ -755,7 +843,18 @@ pub async fn update(
     }
 
     let origin = changes::origin(&identity, Source::PanelSettings, &bot.name);
-    save_and_restart(&state, &bot, &path, &edited, &origin, pool, None).await
+    save_and_restart_inner(
+        &state,
+        &bot,
+        &path,
+        &edited,
+        &origin,
+        pool,
+        None,
+        false,
+        hosted_edit.as_ref(),
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -890,7 +989,7 @@ pub async fn add_pool(
 /// an index can land on a corridor the operator never opened — writing one
 /// pair's spreads onto another. Single-pool bots can't be renumbered into
 /// (removing the last pool is refused), so they may still omit the pair.
-fn confirm_pool_identity(
+pub(crate) fn confirm_pool_identity(
     toml_str: &str,
     pool: usize,
     collateral: Option<&str>,
@@ -1400,6 +1499,72 @@ pub(super) async fn save_and_restart_with(
     extra: Option<serde_json::Value>,
     needs_clean_restart: bool,
 ) -> Result<Response, ApiError> {
+    save_and_restart_inner(
+        state,
+        bot,
+        path,
+        toml,
+        origin,
+        pool,
+        extra,
+        needs_clean_restart,
+        None,
+    )
+    .await
+}
+
+/// Write a save's config: directly on a full panel, through the runtime broker on
+/// a hosted one, which only takes a quoting edit and re-checks it against the
+/// envelope itself. Any other config write on a hosted panel is refused.
+async fn commit_config(
+    state: &AppState,
+    bot: &Bot,
+    path: &std::path::Path,
+    toml: &str,
+    origin: &Origin,
+    hosted_edit: Option<&QuotingEdit>,
+) -> Result<Option<String>, ApiError> {
+    let Some(store) = &state.config_store else {
+        return changes::write_config(state, path, toml, origin);
+    };
+    let edit = hosted_edit.ok_or_else(|| {
+        ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            changes::HOSTED_WRITE_REFUSED,
+        )
+    })?;
+    let container = bot.require_container().map_err(ApiError::conflict)?;
+    let save = crate::panel::broker_config::WireQuotingSave {
+        edit: edit.clone(),
+        actor: origin.actor.clone(),
+        bot: bot.name.clone(),
+    };
+    let saved = store
+        .save(container, &save)
+        .await
+        .map_err(|e| crate::panel::hosted::mirror::api_error(&e))?;
+    crate::panel::hosted::mirror::write_bot(&state.cfg.bots_dir, &saved.files)
+        .map_err(|e| ApiError::internal(&e))?;
+    if saved.files.files.get("stitch.toml").map(String::as_str) != Some(toml) {
+        // The panel's copy was behind the host file. The broker applied the
+        // edit to the file on disk, which is what the bot will load.
+        tracing::warn!(bot = %bot.name, "the broker's saved config differs from the panel's preview");
+    }
+    Ok(saved.warning)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn save_and_restart_inner(
+    state: &AppState,
+    bot: &Bot,
+    path: &std::path::Path,
+    toml: &str,
+    origin: &Origin,
+    pool: usize,
+    extra: Option<serde_json::Value>,
+    needs_clean_restart: bool,
+    hosted_edit: Option<&QuotingEdit>,
+) -> Result<Response, ApiError> {
     // Re-discover the bot *under the config lock the caller holds*, before anything
     // else. `bot` was read by the handler before it took that lock, so two overlapping
     // saves for one running bot both start from the same pre-lock snapshot: if the first
@@ -1515,7 +1680,8 @@ pub(super) async fn save_and_restart_with(
     // is nothing to guard; `None` — busy — is handled by `restart_after_save`.
     let old_claim = state.wallet_locks.try_claim_for(&pre_save);
 
-    let change_log_warning = changes::write_config(state, path, toml, origin)?;
+    let change_log_warning =
+        commit_config(state, &pre_save, path, toml, origin, hosted_edit).await?;
     tracing::info!(bot = %pre_save.name, path = %path.display(), "config saved");
 
     // Re-discover again from disk before deciding anything about the restart: `pre_save`

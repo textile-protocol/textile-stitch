@@ -65,6 +65,10 @@ pub struct AppState {
     /// `Option` because it isn't part of [`DockerApi`], and a backend that can't
     /// do it should still serve every other route.
     pub files: Option<Arc<dyn ContainerFiles>>,
+    /// Hosted only: where bot configs come from and quoting saves go, since a
+    /// hosted panel mounts no bot directory. `None` on a full panel, which reads
+    /// and writes its bots directory directly.
+    pub config_store: Option<Arc<dyn crate::panel::hosted::mirror::ConfigStore>>,
     pub sessions: Arc<Sessions>,
     /// UI migration takes effect immediately; the mounted file restores it on boot.
     pub migrated_password: Arc<std::sync::RwLock<Option<String>>>,
@@ -103,6 +107,7 @@ impl AppState {
             native_prices,
             docker,
             files: None,
+            config_store: None,
             sessions: Arc::new(Sessions::new()),
             migrated_password: Arc::new(std::sync::RwLock::new(None)),
             password_setup_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -128,6 +133,14 @@ impl AppState {
         cfg
     }
 
+    pub fn with_config_store(
+        mut self,
+        store: Arc<dyn crate::panel::hosted::mirror::ConfigStore>,
+    ) -> Self {
+        self.config_store = Some(store);
+        self
+    }
+
     pub fn with_container_files(mut self, files: Arc<dyn ContainerFiles>) -> Self {
         self.files = Some(files);
         self
@@ -149,6 +162,18 @@ impl AppState {
             };
             ApiError::new(StatusCode::BAD_GATEWAY, detail)
         })?;
+        // Hosted: the bots directory is the panel's own copy, refilled from the
+        // broker first (see `hosted::mirror`).
+        if let Some(store) = &self.config_store {
+            crate::panel::hosted::mirror::refresh(store.as_ref(), &self.cfg.bots_dir)
+                .await
+                .map_err(|e| {
+                    ApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("couldn't read bot configs from the runtime broker: {e:#}"),
+                    )
+                })?;
+        }
         Ok(inventory::discover(&containers, &self.cfg))
     }
 
@@ -418,6 +443,10 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
             .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 crate::panel::hosted::policy::enforce,
+            ))
+            // Outermost, so refusals and errors are masked too.
+            .route_layer(axum::middleware::from_fn(
+                crate::panel::hosted::redact::mask_responses,
             )),
         None => routes,
     };

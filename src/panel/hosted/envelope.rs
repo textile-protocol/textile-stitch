@@ -398,14 +398,82 @@ mod tests {
         assert_eq!(Envelope::parse("{}").unwrap(), Envelope::default());
     }
 
+    /// Every quoting field, set to `value` (a number of the field's unit).
+    fn edits(value: &str) -> Vec<(&'static str, SettingsView)> {
+        let before = view();
+        let with = |f: &dyn Fn(&mut SettingsView)| {
+            let mut v = before.clone();
+            f(&mut v);
+            v
+        };
+        let n: u64 = value.parse().unwrap();
+        let spread = SpreadEdit {
+            kind: SpreadKind::Bps,
+            value: value.into(),
+        };
+        vec![
+            ("buy spread", with(&|v| v.buy = spread.clone())),
+            ("sell spread", with(&|v| v.sell = spread.clone())),
+            ("min spread", with(&|v| v.min_spread_bps = value.into())),
+            ("ttl", with(&|v| v.ttl_secs = n)),
+            ("refresh", with(&|v| v.refresh_threshold_bps = n as u32)),
+            ("tick", with(&|v| v.tick_interval_secs = n)),
+            (
+                "order size",
+                with(&|v| v.buy_sizing.order_size = value.into()),
+            ),
+            (
+                "liquidity",
+                with(&|v| v.sell_sizing.total_liquidity = value.into()),
+            ),
+            (
+                "min slice",
+                with(&|v| v.buy_sizing.min_slice_debt = value.into()),
+            ),
+            (
+                "max orders",
+                with(&|v| v.sell_sizing.max_orders = value.into()),
+            ),
+        ]
+    }
+
     #[test]
-    fn the_shipped_example_parses_and_allows_nothing_until_filled_in() {
+    fn the_shipped_example_parses_and_refuses_every_edit_until_filled_in() {
         let example =
             Envelope::parse(include_str!("../../../deploy/hosted-envelope.example.json")).unwrap();
+        assert_eq!(example, Envelope::default(), "the example sets no bound");
+        let before = view();
+        for value in ["0", "1", "42", "120"] {
+            for (field, after) in edits(value) {
+                if after == before {
+                    continue;
+                }
+                let refused = check(&before, &after, &example);
+                assert!(refused.is_err(), "{field} = {value} got through");
+                assert!(refused.unwrap_err().contains("no bound"), "{field}");
+            }
+        }
+        // Each field really is changed by at least one of those values.
+        for (field, _) in edits("0") {
+            assert!(
+                ["0", "1", "42", "120"]
+                    .iter()
+                    .any(|v| edits(v).into_iter().any(|(f, a)| f == field && a != before)),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_width_bounds_at_zero_still_let_a_field_go_to_zero() {
+        // Why the example no longer ships 0/0 placeholders: they are real
+        // bounds, and they allow exactly 0.
+        let zero = Envelope::parse(r#"{"ttl_secs": {"min": 0, "max": 0}}"#).unwrap();
         let before = view();
         let mut after = before.clone();
-        after.ttl_secs = before.ttl_secs + 1;
-        assert!(check(&before, &after, &example).is_err());
+        after.ttl_secs = 0;
+        assert_ne!(before.ttl_secs, 0);
+        assert!(check(&before, &after, &zero).is_ok());
     }
 
     #[test]

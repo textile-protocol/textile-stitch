@@ -93,6 +93,28 @@ pub fn read(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     }
 }
 
+/// The whole file, or `None` when it doesn't exist, refusing with
+/// [`std::io::ErrorKind::FileTooLarge`] once more than `max` bytes come off
+/// the opened handle. The cap holds even if the file grows or is swapped
+/// after a size check on its path.
+pub fn read_at_most(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    match open_regular(path, OpenOptions::new().read(true)) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    format!("{} is larger than {max} bytes", path.display()),
+                ));
+            }
+            Ok(Some(bytes))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The whole file as text, or `None` when it doesn't exist.
 pub fn read_text(path: &Path) -> std::io::Result<Option<String>> {
     read(path)?

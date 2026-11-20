@@ -1,6 +1,8 @@
 # Stitch panel, hosted profile. For client hosts on the stitch-bots stack only
-# (packages/infra/terraform/stitch-bots). The stack doesn't install this file
-# yet; see docs/production-access.md#hosted-profile. Legacy and self-hosted
+# (packages/infra/terraform/stitch-bots), which installs it as committed in
+# /opt/stitch-panel with hosted_panel_enabled (its README, "Hosted panel"). Its
+# plan and the host's start script refuse this file if the panel service ever
+# mounts PANEL_BOTS_DIR, anything above it or /run/stitch. Legacy and self-hosted
 # installs use docker-compose.panel.yml and must not switch to this file: see
 # docs/install-panel.md#hosted-profile.
 #
@@ -10,26 +12,32 @@
 #                   the panel on 127.0.0.1:8420 inside its own network namespace.
 #                   It also owns the host-loopback publish 127.0.0.1:8420 that the
 #                   SSM <prefix>-panel break-glass forward reaches. Never 0.0.0.0.
-#   panel           Fleet with STITCH_PANEL_PROFILE=hosted. No Docker socket. It
-#                   reads and writes bot configs (stitch.toml and the change log)
-#                   through a read-write mount of PANEL_BOTS_DIR, so that
-#                   directory must hold no keys (rfq-api.key included), and
-#                   reaches containers only through the broker.
-#   runtime-broker  the only holder of the Docker socket. No network. Answers a
-#                   fixed set of calls about the bots named in STITCH_BROKER_BOTS,
-#                   and swaps a bot's image only after verifying its build
+#   panel           Fleet with STITCH_PANEL_PROFILE=hosted. No Docker socket and no
+#                   bot directory: /data/bots is a private tmpfs the broker fills
+#                   with each enrolled bot's stitch.toml and change log, nothing
+#                   else. It reaches containers and saves quoting edits only
+#                   through the broker.
+#   runtime-broker  the only holder of the Docker socket and the only service that
+#                   mounts PANEL_BOTS_DIR. No network. Answers a fixed set of calls
+#                   about the bots named in STITCH_BROKER_BOTS, including a
+#                   quoting edit it re-checks against the envelope file, and
+#                   swaps a bot's image only after verifying its build
 #                   attestation (the panel fetches the bundle from GHCR).
 #
 # Keys stay where the host puts them: /run/stitch/<bot> (tmpfs), mounted
 # read-only into each bot by the bots' own compose file (#2832's layout).
-# Nothing here mounts them. Don't run this on a host whose bot directories
-# still hold any key: see docs/production-access.md#hosted-profile.
+# Nothing here mounts them. The broker mounts the bot directories but only ever
+# reads stitch.toml and the change-log files out of them.
 #
-# Every value comes from .env, written by hand until the stack writes it:
+# Every value comes from env files: the stack writes the non-secret ones and its
+# unit fetches PANEL_PASSWORD_HASH and TS_AUTHKEY from Secrets Manager into tmpfs.
+# Without the stack, write them by hand (docs/production-access.md#hosted-profile):
 #   PANEL_IMAGE             ghcr.io/textile-protocol/textile-stitch-panel@sha256:<digest>
 #   PANEL_PASSWORD_HASH     argon2id hash (quote it: it contains $)
 #   PANEL_PUBLIC_ORIGIN     https://<hostname>.<tailnet>.ts.net
-#   PANEL_BOTS_DIR          the host directory holding one folder per bot
+#   PANEL_BOTS_DIR          the host directory holding one folder per bot and
+#                           nothing else (the stack's ~/stitch/bots), never the
+#                           bots' compose project above it
 #   STITCH_BROKER_BOTS      exact bot container names, comma-separated
 #   TS_AUTHKEY              first enrollment only; remove it afterwards
 #   PANEL_PUBLISH_NET       optional, default 192.168.254: the first three octets
@@ -88,6 +96,8 @@ services:
     mem_limit: 512m
     tmpfs:
       - /tmp:size=16m
+      # The panel's copy of bot configs. Never the host's bot directories.
+      - /data/bots:size=64m,uid=1000,gid=1000,mode=0700
     environment:
       RUST_LOG: info
       STITCH_PANEL_PROFILE: hosted
@@ -111,7 +121,6 @@ services:
       STITCH_PANEL_CORRIDOR_API: "off"
       STITCH_PANEL_COINGECKO_API: "off"
     volumes:
-      - ${PANEL_BOTS_DIR}:/data/bots
       - ${PANEL_ENVELOPE_FILE:-./envelope.json}:/etc/stitch-panel/envelope.json:ro
       - broker-socket:/run/stitch-broker:ro
     restart: unless-stopped
@@ -126,7 +135,10 @@ services:
     network_mode: none
     read_only: true
     cap_drop: [ALL]
-    cap_add: [CHOWN]
+    # CHOWN hands files it writes to the bot's uid; DAC_OVERRIDE lets root write
+    # into bot directories owned by uid 1000. Neither adds anything to what the
+    # Docker socket already gives this service.
+    cap_add: [CHOWN, DAC_OVERRIDE]
     security_opt: [no-new-privileges:true]
     pids_limit: 128
     mem_limit: 256m
@@ -134,9 +146,17 @@ services:
       RUST_LOG: info
       STITCH_BROKER_BOTS: ${STITCH_BROKER_BOTS:?list the bot container names, e.g. stitch-luno-a}
       STITCH_BROKER_IMAGE_REPOSITORY: ${STITCH_BOT_REPOSITORY:-ghcr.io/textile-protocol/textile-stitch}
+      # Bot configs: served as stitch.toml and change log only, written only as
+      # a quoting edit inside this envelope. See src/panel/broker_config.rs.
+      STITCH_BROKER_BOTS_DIR: /data/bots
+      STITCH_BROKER_HOST_BOTS_DIR: ${PANEL_BOTS_DIR:?set PANEL_BOTS_DIR to the host's bot directory}
+      STITCH_BROKER_ENVELOPE: /etc/stitch-broker/envelope.json
+      STITCH_BROKER_BOT_UID: "1000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - broker-socket:/run/stitch-broker
+      - ${PANEL_BOTS_DIR}:/data/bots
+      - ${PANEL_ENVELOPE_FILE:-./envelope.json}:/etc/stitch-broker/envelope.json:ro
     restart: unless-stopped
 
 networks:

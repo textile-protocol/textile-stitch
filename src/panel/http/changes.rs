@@ -63,12 +63,24 @@ pub fn as_rollback(origin: &Origin) -> Origin {
 /// the save happened, and the bot will record it as a host edit when it next
 /// starts. Files the log creates are handed to the bot's uid as they're
 /// opened, or the bot couldn't append to its own journal.
+/// Why a hosted panel refuses to write a config itself.
+pub const HOSTED_WRITE_REFUSED: &str = "a hosted panel has no access to bot directories; it \
+     changes a bot's config only through the runtime broker's quoting edit";
+
 pub fn write_config(
     state: &AppState,
     path: &Path,
     toml: &str,
     origin: &Origin,
 ) -> Result<Option<String>, ApiError> {
+    // A hosted panel's bots directory is a copy (see `hosted::mirror`): a write
+    // here would change nothing the bot loads. Its saves go through the broker.
+    if state.config_store.is_some() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            HOSTED_WRITE_REFUSED,
+        ));
+    }
     let recorded = changelog::write_config_recorded(
         path,
         toml,
@@ -89,6 +101,9 @@ pub fn record_written(
     after: &str,
     origin: &Origin,
 ) -> Option<String> {
+    if state.config_store.is_some() {
+        return Some(HOSTED_WRITE_REFUSED.to_string());
+    }
     let recorded =
         changelog::journal::Journal::open(path, Some(state.cfg.bot_uid)).and_then(|journal| {
             changelog::journal::record(&journal, before, after, origin, crate::time::unix_now_ms())

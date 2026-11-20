@@ -272,10 +272,42 @@ pub fn write_config_recorded(
     now_ms: u64,
     owner: Option<u32>,
 ) -> Result<Recorded> {
+    write_recorded(config_path, None, next, origin, now_ms, owner)
+        .map(|written| written.expect("an unconditional write always writes"))
+}
+
+/// [`write_config_recorded`], but only if the config still reads `expected`
+/// once the change-log lock is held. `Ok(None)`: it didn't, and nothing was
+/// written. For a writer that built `next` from `expected` outside the lock
+/// (the runtime broker), so a change that landed in between isn't overwritten.
+/// Another lock holder can't slip in; a hand edit that skips the lock can
+/// only land in the gap between this read and the rename.
+pub fn write_config_recorded_if_unchanged(
+    config_path: &Path,
+    expected: &str,
+    next: &str,
+    origin: &Origin,
+    now_ms: u64,
+    owner: Option<u32>,
+) -> Result<Option<Recorded>> {
+    write_recorded(config_path, Some(expected), next, origin, now_ms, owner)
+}
+
+fn write_recorded(
+    config_path: &Path,
+    expected: Option<&str>,
+    next: &str,
+    origin: &Origin,
+    now_ms: u64,
+    owner: Option<u32>,
+) -> Result<Option<Recorded>> {
     // Lock first, then read: a hand edit landing between the two would
     // otherwise be compared against a stale copy and recorded wrong.
     let journal = Journal::open(config_path, owner);
     let current = std::fs::read_to_string(config_path).ok();
+    if expected.is_some_and(|e| current.as_deref() != Some(e)) {
+        return Ok(None);
+    }
     let prepared = journal.and_then(|journal| {
         let caught_up = match &current {
             Some(text) => catch_up(
@@ -295,7 +327,7 @@ pub fn write_config_recorded(
     let outcome = prepared.and_then(|(journal, caught_up)| {
         record(&journal, current.as_deref(), next, origin, now_ms).map(|n| (n, caught_up))
     });
-    Ok(match outcome {
+    Ok(Some(match outcome {
         Ok((records, caught_up)) => Recorded {
             records,
             caught_up,
@@ -315,7 +347,7 @@ pub fn write_config_recorded(
                 )),
             }
         }
-    })
+    }))
 }
 
 /// Catch the change log up with the config the bot is about to run, and
@@ -476,6 +508,27 @@ mod tests {
 
         // And the bot starting on that file has nothing left to record.
         assert_eq!(record_startup(&path, &saved, 6_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_conditional_save_writes_nothing_when_the_file_moved_on() {
+        let path = temp_config("cas", CONFIG);
+        let origin = panel_origin(Source::PanelSettings, "panel password (shared)", "acme");
+        let host_edit = CONFIG.replace("buy_offset_bps = 40", "buy_offset_bps = 55");
+        std::fs::write(&path, &host_edit).unwrap();
+        let stale = CONFIG;
+        let next = stale.replace("buy_offset_bps = 40", "buy_offset_bps = 30");
+        let outcome =
+            write_config_recorded_if_unchanged(&path, stale, &next, &origin, 1, None).unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), host_edit);
+        assert!(read_all(&path).unwrap_or_default().is_empty());
+
+        let next = host_edit.replace("buy_offset_bps = 55", "buy_offset_bps = 30");
+        let outcome =
+            write_config_recorded_if_unchanged(&path, &host_edit, &next, &origin, 2, None).unwrap();
+        assert!(outcome.is_some_and(|r| r.records > 0));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), next);
     }
 
     #[test]

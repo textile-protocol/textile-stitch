@@ -357,12 +357,12 @@ the tailnet allowlist. Only do that if your proxy strips the inbound header firs
 
 This section is for hosts Textile runs for a client on the
 `packages/infra/terraform/stitch-bots` stack, which deploys it with
-`hosted_panel_enabled` (its README, "Hosted panel") once #3091 stops the panel
-container mounting the bot folders; until then its plan refuses. [production-access.md](production-access.md#hosted-profile)
-says what exists after which PR and the manual steps until then. If you
-installed Stitch with
-`install-panel.sh`, from a checkout, or with the desktop app, none of it
-applies to you and nothing about your install changes.
+`hosted_panel_enabled` (its README, "Hosted panel"). There the bot folders
+live in `~/stitch/bots/<bot>` and `PANEL_BOTS_DIR` is `~/stitch/bots`.
+[production-access.md](production-access.md#hosted-profile) says what exists
+after which PR and the manual steps on a stack without it. If you installed
+Stitch with `install-panel.sh`, from a checkout, or with the desktop app, none
+of it applies to you and nothing about your install changes.
 
 **Legacy and self-hosted installs are unaffected.** The hosted profile is
 opt-in and only `STITCH_PANEL_PROFILE=hosted` selects it. An unset value, an
@@ -379,23 +379,52 @@ three services:
 - **tailscale**: the sidecar. `tailscale serve` terminates HTTPS on 443 and
   proxies to the panel on `127.0.0.1:8420` inside its own network namespace.
   That's the daily path, phone included.
-- **panel**: Fleet with the hosted profile. No Docker socket, and no key
-  files as long as the bot directories hold none (see below).
-  It runs as uid 1000 with a read-only root filesystem and no capabilities.
-- **runtime-broker**: the only process with the Docker socket. It has no
-  network, listens on a Unix socket the panel mounts read-only, and acts only
-  on the bot containers named in `STITCH_BROKER_BOTS`.
+- **panel**: Fleet with the hosted profile. No Docker socket and no bot
+  directory. It runs as uid 1000 with a read-only root filesystem and no
+  capabilities.
+- **runtime-broker**: the only process with the Docker socket and the only one
+  that mounts the bot directories. It has no network, listens on a Unix socket
+  the panel mounts read-only, and acts only on the bot containers named in
+  `STITCH_BROKER_BOTS`.
 
-Keys stay where the host puts them. With #2832's layout that's Secrets
-Manager into tmpfs at `/run/stitch/<bot>`, mounted read-only into each bot at
-`/home/stitch/secrets`. The panel never mounts that directory and never reads
-or writes `fireblocks-api.key`, `stitch.key` or `rfq-api.key` itself. But it
-mounts the bot directories read-write, and `rfq-api.key` lives there by
-default, so don't run the hosted panel until every key, the RFQ maker key
-included, is out of them
-([production-access.md](production-access.md#hosted-profile) has the check).
-The quoting envelope is enforced by the panel's HTTP layer, not the mount: a
-compromised panel process could still rewrite a bot's `stitch.toml`.
+What the panel can reach: the broker's socket, the read-only envelope file, and
+its own `/data/bots`, a private tmpfs. Before each fleet read the broker refills
+that tmpfs with each enrolled bot's `stitch.toml` and change-log files
+(`change-log.jsonl`, `.snapshot`, `.shipped`, `.refused`), and nothing else. What
+it can't reach: the host's bot directories, `rfq-api.key`, `stitch.key`,
+`fireblocks-api.key` or any other file in them, and `/run/stitch/<bot>`, where
+#2832's layout puts the signer keys. One fleet read carries at most 24 MiB of
+files, counted as they're read: configs first, then change logs. Once the
+change logs together pass that, the bots that don't fit are served without
+theirs (the panel logs why). Configs are a few KB, so only an outsized one can
+push a bot out entirely. The broker takes no file name or path from
+the panel, refuses symlinked directories and configs, and serves only bots
+whose run directory sits under the host bots directory.
+
+The only change the panel can make to a config is a quoting edit, sent to the
+broker as the envelope's fields and nothing else. The broker applies it to the
+file on disk, checks the result against its own read-only copy of the
+envelope (the same check the panel runs, so a compromised panel can't skip
+it), writes it atomically and records it in the change log, as the panel's own
+saves do on a full install. The edit carries only the fields the save named.
+If the file changed while the broker was applying it (a host edit, another
+save), nothing is written and the edit is applied again to the new file, so
+the other change is kept.
+
+Whether a bot has an RFQ maker key comes from the broker as a yes or no: it
+checks `rfq-api.key` in the bot's directory (a regular, non-blank file, not a
+link) and tells the panel only that. The key, its size and its contents never
+leave the broker. That's what the connected pill, the settings form and the
+Start check use, so an RFQ-only bot with a key starts, and one without is
+refused with "Connect this bot to Textile...". A key the bot gets some other
+way (`STITCH_RFQ_API_KEY_FILE` pointing into `/run/stitch/<bot>`) isn't
+visible to the broker, so that bot reads as not connected. Actions that use
+the key, such as listing manual sales, still don't work from a hosted panel.
+
+One thing a hosted panel can't see, because it lives in a file it never gets:
+a hot wallet's address (derived from `stitch.key`). So use signers whose
+config names the operator address (Fireblocks, MPCVault, Turnkey, KMS); a
+hot-wallet bot shows no wallet, and the panel's wallet checks can't cover it.
 
 ### What Fleet does on a hosted host
 
@@ -412,14 +441,46 @@ Every route the panel registers is classified in
 `src/panel/hosted/policy.rs`. A route that isn't listed there is refused, so a
 route added later stays off hosted hosts until someone decides otherwise.
 
+**URLs are shown masked.** RPC, fallback RPC and feed URLs often carry a
+provider key, so a hosted panel masks it everywhere it returns a URL: every
+JSON response (settings, change log, the errors a funding or allowance read
+returns when an RPC or feed fails) and each line of the log tail. It doesn't
+guess where the key is: only the scheme, host and port stay, and the userinfo,
+path, query and fragment together become one `/REDACTED`, so
+`https://mainnet.infura.io/v3/<key>` shows as
+`https://mainnet.infura.io/REDACTED`. A URL with nothing after its host shows
+as it is. A save that sends a masked URL back unedited keeps the stored one,
+and any other value with `REDACTED` in it is refused, so the mask never ends up
+in a config. A full panel shows URLs as they are.
+
 **Quoting envelope.** The bounds agreed with the client live in a read-only
-JSON file (`STITCH_PANEL_ENVELOPE`), which the stack writes from
-`panel_envelope_json`. A settings save may
+JSON file, mounted into the panel (`STITCH_PANEL_ENVELOPE`) and into the broker
+(`STITCH_BROKER_ENVELOPE`), which is the check that decides. The stack writes it
+from `panel_envelope_json`; on a host without the stack, write it by hand. A
+settings save may
 change only quoting fields, and each changed field needs a bound in that file.
 A field with no bound can't change, so a missing file means no quoting edits.
-Saves are recorded in the change log as usual. See
-`deploy/hosted-envelope.example.json` for the shape; the numbers in it are
-placeholders, not agreed values.
+Saves are recorded in the change log as usual.
+
+`deploy/hosted-envelope.example.json` is `{}`, the same default the stack
+renders: no bounds, so no edits, until the agreed values go in. Don't fill it
+with zeros as placeholders. A bound is real, so `{"min": 0, "max": 0}` lets a
+field be set to 0. Each field is optional, and its unit is in its name. Sizing
+amounts are atomic units, as strings:
+
+```text
+{
+  "spread_bps":            { "min": <bps>, "max": <bps> },
+  "min_spread_bps":        { "min": <bps>, "max": <bps> },
+  "ttl_secs":              { "min": <secs>, "max": <secs> },
+  "refresh_threshold_bps": { "min": <bps>, "max": <bps> },
+  "tick_interval_secs":    { "min": <secs>, "max": <secs> },
+  "max_orders":            { "min": <count>, "max": <count> },
+  "order_size":            { "min": "<atomic>", "max": "<atomic>" },
+  "total_liquidity":       { "min": "<atomic>", "max": "<atomic>" },
+  "min_slice_debt":        { "min": "<atomic>", "max": "<atomic>" }
+}
+```
 
 **Updates by digest.** Tools has one form, Deploy digest, that takes
 `ghcr.io/textile-protocol/textile-stitch@sha256:<digest>`. The panel and the

@@ -21,6 +21,7 @@
 pub mod attestation;
 pub mod auth;
 pub mod broker;
+pub mod broker_config;
 pub mod compose;
 pub mod config;
 pub mod corridors;

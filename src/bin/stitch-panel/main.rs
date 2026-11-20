@@ -180,7 +180,7 @@ async fn run(cfg: PanelConfig) -> Result<()> {
                     socket.display()
                 )
             })?;
-            AppState::new(cfg, broker)
+            AppState::new(cfg, broker.clone()).with_config_store(broker)
         }
         (PanelRuntime::Docker, _) => {
             let docker = Arc::new(BollardDocker::connect(&cfg.docker_socket)?);

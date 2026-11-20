@@ -24,8 +24,10 @@ pub mod envelope;
 #[cfg(test)]
 mod http_tests;
 pub mod image;
+pub mod mirror;
 pub mod origin;
 pub mod policy;
+pub mod redact;
 #[cfg(unix)]
 pub mod runtime;
 

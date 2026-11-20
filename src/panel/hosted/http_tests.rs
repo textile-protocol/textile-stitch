@@ -29,9 +29,34 @@ fn envelope() -> Envelope {
     .unwrap()
 }
 
+/// A hosted panel wired like the compose file: its bots directory is a private
+/// copy, refilled from an in-process broker that owns the real one (`h.root`).
 fn hosted(tag: &str) -> Harness {
+    hosted_with_broker_envelope(tag, envelope())
+}
+
+/// Same, with the broker holding `broker_envelope` while the panel keeps the
+/// usual one. They're the same file in production; differing here shows which
+/// check decides.
+fn hosted_with_broker_envelope(tag: &str, broker_envelope: Envelope) -> Harness {
     let mut h = harness(tag);
     let mut cfg = (*h.state.cfg).clone();
+    cfg.bots_dir = crate::panel::http::testkit::temp_root(&format!("{tag}-copy"));
+    cfg.host_bots_dir = h.root.clone();
+    let policy =
+        crate::panel::broker::Policy::new("stitch-bot-a,stitch-bot-b,stitch-bot-c", REPO).unwrap();
+    let broker = crate::panel::broker::Broker::new(h.docker.clone(), policy).with_config(
+        crate::panel::broker_config::ConfigPolicy {
+            host_root: h.root.clone(),
+            root: h.root.clone(),
+            envelope: broker_envelope,
+            // SAFETY: getuid has no preconditions and can't fail.
+            bot_uid: unsafe { libc::getuid() },
+        },
+    );
+    h.state.config_store = Some(std::sync::Arc::new(crate::panel::broker::InProcessBroker(
+        broker.router(),
+    )));
     cfg.profile = Profile::Hosted(HostedConfig {
         public_origin: PUBLIC.into(),
         image_repository: REPO.into(),
@@ -45,10 +70,24 @@ fn hosted(tag: &str) -> Harness {
     h
 }
 
+/// The signer hosted bots use: custody that names its operator address in the
+/// config, with no key file in the bot directory (#2832's layout).
+const FIREBLOCKS: &str = r#"
+[signer]
+provider = "fireblocks"
+vault_account_id = "0"
+operator_address = "0x6b8499a0e002d3ece3fdbb320a127c9f0f4d4fe5"
+"#;
+
 fn seed(h: &Harness, name: &str, state: ContainerState) {
     let corridor = setup::find_corridor("cngn-usdt-bsc").unwrap();
     setup::write_config(h.root.join(name), corridor, TEST_KEY).unwrap();
-    keep_book_on(&h.root.join(name).join("stitch.toml"));
+    let toml = h.root.join(name).join("stitch.toml");
+    let text = std::fs::read_to_string(&toml).unwrap();
+    assert!(!text.contains("[signer]"), "{text}");
+    std::fs::write(&toml, format!("{text}\n{FIREBLOCKS}")).unwrap();
+    std::fs::remove_file(h.root.join(name).join("stitch.key")).unwrap();
+    keep_book_on(&toml);
     let mut c = container(&format!("stitch-{name}"), state);
     c.image = format!("{REPO}@sha256:{}", "1".repeat(64));
     c.labels.insert(LABEL_BOT.to_string(), name.to_string());
@@ -280,6 +319,494 @@ async fn an_image_without_a_valid_attestation_is_refused_before_anything_moves()
         let bot = h.state.bot("bot-a").await.unwrap();
         assert!(h.state.wallet_locks.try_claim_for(&bot).is_some(), "{what}");
     }
+}
+
+#[tokio::test]
+async fn a_hosted_settings_save_is_written_by_the_broker_and_logged() {
+    let h = hosted("hosted-save-broker");
+    seed(&h, "bot-a", ContainerState::Exited);
+    let (status, body) = send(
+        &h,
+        "PATCH",
+        "/api/bots/bot-a/settings",
+        PUBLIC,
+        Some(json!({"buy": {"kind": "bps", "value": "42"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The host's file changed, and the change log beside it says the panel did it.
+    let host_file = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+    assert_eq!(
+        setup::read_settings_at(&host_file, 0).unwrap().buy.value,
+        "42"
+    );
+    let journal = std::fs::read_to_string(h.root.join("bot-a/change-log.jsonl")).unwrap();
+    let record = journal
+        .lines()
+        .find(|l| l.contains("\"source\":\"panel.settings\""))
+        .unwrap_or_else(|| panic!("{journal}"));
+    assert!(
+        record.contains("buy_offset_bps") && record.contains("bot-a"),
+        "{record}"
+    );
+    // The panel's copy follows, and the change log view reads it.
+    let copy = h.state.cfg.bots_dir.join("bot-a/stitch.toml");
+    assert_ne!(copy, h.root.join("bot-a/stitch.toml"));
+    assert_eq!(std::fs::read_to_string(copy).unwrap(), host_file);
+    let (status, body) = send(&h, "GET", "/api/changes?bot=bot-a", PUBLIC, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("buy_offset_bps"), "{body}");
+}
+
+/// Forwards to the real broker, but moves the host file's sell spread to 77
+/// just before a save reaches it: a host edit landing between the panel's
+/// read and the broker's write.
+struct HostEditsFirst {
+    inner: std::sync::Arc<dyn super::mirror::ConfigStore>,
+    host: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl super::mirror::ConfigStore for HostEditsFirst {
+    async fn configs(&self) -> anyhow::Result<Vec<crate::panel::broker_config::WireBotFiles>> {
+        self.inner.configs().await
+    }
+
+    async fn save(
+        &self,
+        container: &str,
+        save: &crate::panel::broker_config::WireQuotingSave,
+    ) -> anyhow::Result<crate::panel::broker_config::WireSaved> {
+        let text = std::fs::read_to_string(&self.host).unwrap();
+        let mut patch = setup::read_settings_at(&text, 0).unwrap().to_patch();
+        patch.sell.value = "77".into();
+        std::fs::write(&self.host, setup::apply_settings(&text, &patch).unwrap()).unwrap();
+        self.inner.save(container, save).await
+    }
+}
+
+#[tokio::test]
+async fn a_partial_hosted_save_leaves_fields_it_did_not_name_as_the_host_has_them() {
+    let mut h = hosted("hosted-partial-save");
+    seed(&h, "bot-a", ContainerState::Exited);
+    let host = h.root.join("bot-a/stitch.toml");
+    let before = setup::read_settings_at(&std::fs::read_to_string(&host).unwrap(), 0).unwrap();
+    assert_ne!(before.sell.value, "77");
+    h.state.config_store = Some(std::sync::Arc::new(HostEditsFirst {
+        inner: h.state.config_store.clone().unwrap(),
+        host: host.clone(),
+    }));
+    h.app = router(h.state.clone());
+
+    let (status, body) = send(
+        &h,
+        "PATCH",
+        "/api/bots/bot-a/settings",
+        PUBLIC,
+        Some(json!({"ttlSecs": 120})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = setup::read_settings_at(&std::fs::read_to_string(&host).unwrap(), 0).unwrap();
+    assert_eq!(after.ttl_secs, 120);
+    assert_eq!(
+        after.sell.value, "77",
+        "a TTL-only save put the panel's older spread back"
+    );
+    assert_eq!(after.buy, before.buy);
+    assert_eq!(after.buy_sizing, before.buy_sizing);
+}
+
+#[tokio::test]
+async fn the_broker_refuses_what_its_envelope_refuses_even_when_the_panel_allows_it() {
+    // A panel whose own check would pass (spreads 5 to 300 bps) against a broker
+    // that allows no spread edits: the broker's answer stands, nothing is written.
+    let h = hosted_with_broker_envelope("hosted-broker-decides", Envelope::default());
+    seed(&h, "bot-a", ContainerState::Exited);
+    let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+    let (status, body) = send(
+        &h,
+        "PATCH",
+        "/api/bots/bot-a/settings",
+        PUBLIC,
+        Some(json!({"buy": {"kind": "bps", "value": "42"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("envelope"), "{body}");
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn the_panel_copy_holds_only_the_config_and_its_change_log() {
+    let h = hosted("hosted-copy");
+    seed(&h, "bot-a", ContainerState::Running);
+    let dir = h.root.join("bot-a");
+    std::fs::write(dir.join(setup::RFQ_API_KEY_FILE), "tx_live_secret").unwrap();
+    std::fs::write(dir.join("stitch.key"), TEST_KEY).unwrap();
+    std::fs::write(dir.join("fireblocks-api.key"), "fb-secret").unwrap();
+    let (status, body) = send(&h, "GET", "/api/bots", PUBLIC, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let copied: Vec<String> = std::fs::read_dir(h.state.cfg.bots_dir.join("bot-a"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(copied.contains(&"stitch.toml".to_string()), "{copied:?}");
+    // Plus the mirror's own maker-key marker, which holds no key.
+    assert!(copied.contains(&super::mirror::MAKER_KEY_MARKER.to_string()));
+    for name in &copied {
+        assert!(
+            crate::panel::broker_config::ALLOWED_FILES.contains(&name.as_str())
+                || name == super::mirror::MAKER_KEY_MARKER,
+            "{name} reached the panel"
+        );
+        let text = std::fs::read_to_string(h.state.cfg.bots_dir.join("bot-a").join(name)).unwrap();
+        assert!(
+            !text.contains("tx_live_secret") && !text.contains("fb-secret"),
+            "{name}"
+        );
+    }
+    assert!(!body.contains("tx_live_secret") && !body.contains("fb-secret"));
+}
+
+#[tokio::test]
+async fn a_hosted_panel_never_writes_a_config_itself() {
+    let h = hosted("hosted-no-direct-write");
+    seed(&h, "bot-a", ContainerState::Exited);
+    let path = h.state.cfg.bots_dir.join("bot-a/stitch.toml");
+    let origin = crate::changelog::Origin {
+        source: crate::changelog::Source::PanelSettings,
+        actor: "x".into(),
+        bot: Some("bot-a".into()),
+    };
+    let err =
+        crate::panel::http::changes::write_config(&h.state, &path, "x = 1", &origin).unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+    assert!(
+        crate::panel::http::changes::record_written(&h.state, &path, None, "x", &origin).is_some()
+    );
+}
+
+/// An RFQ-only bot (the catalog default): no ladder, `[rfq]` on, and so only
+/// startable with a maker key beside its config.
+fn seed_rfq_only(h: &Harness, name: &str, key: Option<&str>) {
+    seed(h, name, ContainerState::Exited);
+    let dir = h.root.join(name);
+    let toml = dir.join("stitch.toml");
+    let text = std::fs::read_to_string(&toml)
+        .unwrap()
+        .replace("book_enabled = true", "book_enabled = false");
+    std::fs::write(
+        &toml,
+        text + "\n[rfq]\nenabled = true\nurl = \"wss://api.textilecredit.com/v2/maker/stream\"\n\
+                maker_id = \"mk_test\"\n\
+                validation_contract = \"0x00000000000000000000000000000000000000aa\"\n",
+    )
+    .unwrap();
+    if let Some(key) = key {
+        setup::write_rfq_api_key(&dir, key).unwrap();
+    }
+}
+
+fn started(h: &Harness) -> bool {
+    h.docker.calls().iter().any(|c| matches!(c, Call::Start(_)))
+}
+
+#[tokio::test]
+async fn an_rfq_only_bot_with_a_maker_key_starts_on_a_hosted_panel() {
+    let h = hosted("hosted-rfq-key");
+    seed_rfq_only(&h, "bot-a", Some("tx_live_hosted_maker_secret"));
+    let (status, fleet) = send(&h, "GET", "/api/bots", PUBLIC, None).await;
+    assert_eq!(status, StatusCode::OK, "{fleet}");
+    let (status, settings) = send(&h, "GET", "/api/bots/bot-a/settings", PUBLIC, None).await;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    assert!(settings.contains("\"rfqApiKeySet\":true"), "{settings}");
+    let (status, body) = send(&h, "POST", "/api/bots/bot-a/start", PUBLIC, Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(started(&h));
+    for text in [&fleet, &settings, &body] {
+        assert!(!text.contains("tx_live_hosted_maker_secret"), "{text}");
+    }
+    // Neither the key nor anything holding it reached the panel's copy.
+    let copy = h.state.cfg.bots_dir.join("bot-a");
+    assert!(!copy.join(setup::RFQ_API_KEY_FILE).exists());
+    for entry in std::fs::read_dir(&copy).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default();
+        assert!(!text.contains("tx_live_hosted_maker_secret"));
+    }
+}
+
+#[tokio::test]
+async fn an_rfq_only_bot_without_a_maker_key_is_refused_start_on_a_hosted_panel() {
+    let h = hosted("hosted-rfq-nokey");
+    seed_rfq_only(&h, "bot-a", None);
+    let (status, body) = send(&h, "POST", "/api/bots/bot-a/start", PUBLIC, Some(json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Connect this bot to Textile"), "{body}");
+    assert!(!started(&h));
+    let (_, settings) = send(&h, "GET", "/api/bots/bot-a/settings", PUBLIC, None).await;
+    assert!(settings.contains("\"rfqApiKeySet\":false"), "{settings}");
+}
+
+const KEYED_RPC: &str = "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161";
+const KEYED_FALLBACK: &str =
+    "https://ops:hunter2@bsc-mainnet.core.chainstack.com/3c6e0b8a9c15224a8228b9a98ca1531d";
+// The feed carries a digit-free key in its path as well as one in its query.
+const KEYED_FEED: &str =
+    "https://feed.example/v1/abcdefghijklmnopqrstuvwxyzABCDEF/price?pair=cngn-usdt&apikey=sk_live_feed_secret";
+const SECRETS: [&str; 5] = [
+    "9aa3d95b3bc440fa88ea12eaa4456161",
+    "hunter2",
+    "3c6e0b8a9c15224a8228b9a98ca1531d",
+    "sk_live_feed_secret",
+    "abcdefghijklmnopqrstuvwxyzABCDEF",
+];
+
+/// Point `name`'s config at provider URLs that carry keys, the way a host
+/// administrator would.
+fn use_keyed_urls(root: &std::path::Path, name: &str) {
+    let toml = root.join(name).join("stitch.toml");
+    let text = std::fs::read_to_string(&toml).unwrap();
+    let mut patch = setup::read_settings_at(&text, 0).unwrap().to_patch();
+    patch.rpc_url = KEYED_RPC.into();
+    patch.rpc_fallback_urls = Some(vec![KEYED_FALLBACK.into()]);
+    patch.feed_url = KEYED_FEED.into();
+    std::fs::write(&toml, setup::apply_settings(&text, &patch).unwrap()).unwrap();
+}
+
+fn no_secret_in(text: &str) {
+    for secret in SECRETS {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+}
+
+#[tokio::test]
+async fn hosted_settings_show_urls_with_their_keys_masked() {
+    let h = hosted("hosted-masked-urls");
+    seed(&h, "bot-a", ContainerState::Exited);
+    use_keyed_urls(&h.root, "bot-a");
+    let (status, body) = send(&h, "GET", "/api/bots/bot-a/settings", PUBLIC, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    no_secret_in(&body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["rpcUrl"], "https://mainnet.infura.io/REDACTED");
+    assert_eq!(
+        v["rpcFallbackUrls"][0],
+        "https://bsc-mainnet.core.chainstack.com/REDACTED"
+    );
+    assert_eq!(v["feedUrl"], "https://feed.example/REDACTED");
+}
+
+#[tokio::test]
+async fn a_hosted_save_that_sends_masked_urls_back_keeps_the_stored_ones() {
+    let h = hosted("hosted-masked-roundtrip");
+    seed(&h, "bot-a", ContainerState::Exited);
+    use_keyed_urls(&h.root, "bot-a");
+    let (_, shown) = send(&h, "GET", "/api/bots/bot-a/settings", PUBLIC, None).await;
+    let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+    // The whole form back, masked URLs untouched, with one spread edit.
+    let (status, body) = send(
+        &h,
+        "PATCH",
+        "/api/bots/bot-a/settings",
+        PUBLIC,
+        Some(json!({
+            "rpcUrl": shown["rpcUrl"],
+            "rpcFallbackUrls": shown["rpcFallbackUrls"],
+            "feedUrl": shown["feedUrl"],
+            "buy": {"kind": "bps", "value": "42"},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    no_secret_in(&body);
+    let host = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+    assert!(!host.contains(crate::panel::hosted::redact::MASK), "{host}");
+    let after = setup::read_settings_at(&host, 0).unwrap();
+    assert_eq!(after.rpc_url, KEYED_RPC);
+    assert_eq!(after.rpc_fallback_urls, vec![KEYED_FALLBACK.to_string()]);
+    assert_eq!(after.feed_url, KEYED_FEED);
+    assert_eq!(after.buy.value, "42");
+}
+
+#[tokio::test]
+async fn a_hosted_save_of_an_edited_masked_url_is_refused_and_writes_nothing() {
+    let h = hosted("hosted-masked-edit");
+    seed(&h, "bot-a", ContainerState::Exited);
+    use_keyed_urls(&h.root, "bot-a");
+    let before = std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap();
+    for body in [
+        json!({"rpcUrl": "https://other.infura.io/REDACTED"}),
+        // Another field's mask is no echo of this one.
+        json!({"rpcUrl": "https://feed.example/REDACTED"}),
+        json!({"rpcFallbackUrls": ["https://REDACTED@x.example/"]}),
+        json!({"feedUrl": "https://feed.example/v1/price?apikey=REDACTED&pair=x"}),
+    ] {
+        let (status, text) =
+            send(&h, "PATCH", "/api/bots/bot-a/settings", PUBLIC, Some(body)).await;
+        assert!(status.is_client_error(), "{status}: {text}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn the_hosted_change_log_masks_urls_in_its_values() {
+    let h = hosted("hosted-masked-changes");
+    seed(&h, "bot-a", ContainerState::Exited);
+    // A first save so the log has a baseline, then the host moves the feed
+    // onto a path-keyed URL, which the next save catches up as a host edit.
+    for value in ["41", "42"] {
+        if value == "42" {
+            let toml = h.root.join("bot-a/stitch.toml");
+            let text = std::fs::read_to_string(&toml).unwrap();
+            let mut patch = setup::read_settings_at(&text, 0).unwrap().to_patch();
+            patch.feed_url =
+                "https://feed.example/v1/3c6e0b8a9c15224a8228b9a98ca1531d/price".into();
+            std::fs::write(&toml, setup::apply_settings(&text, &patch).unwrap()).unwrap();
+        }
+        let (status, body) = send(
+            &h,
+            "PATCH",
+            "/api/bots/bot-a/settings",
+            PUBLIC,
+            Some(json!({"buy": {"kind": "bps", "value": value}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = send(&h, "GET", "/api/changes?bot=bot-a", PUBLIC, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("feed_url"), "{body}");
+    assert!(body.contains("https://feed.example/REDACTED"), "{body}");
+    no_secret_in(&body);
+}
+
+/// Point the bot's RPC at a keyed URL nothing answers on, so status reads
+/// fail with errors that name it.
+fn use_dead_keyed_rpc(root: &std::path::Path, name: &str) -> String {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let rpc = format!("http://127.0.0.1:{port}/v3/9aa3d95b3bc440fa88ea12eaa4456161");
+    let toml = root.join(name).join("stitch.toml");
+    let text = std::fs::read_to_string(&toml).unwrap();
+    let mut patch = setup::read_settings_at(&text, 0).unwrap().to_patch();
+    patch.rpc_url = rpc.clone();
+    patch.feed_url = "http://127.0.0.1:9/v1/3c6e0b8a9c15224a8228b9a98ca1531d/price".into();
+    std::fs::write(&toml, setup::apply_settings(&text, &patch).unwrap()).unwrap();
+    rpc
+}
+
+#[tokio::test]
+async fn hosted_status_errors_mask_the_urls_they_name() {
+    for route in ["/api/bots/bot-a/funding", "/api/bots/bot-a/allowances"] {
+        // The full panel names the URL in its error: that's what's at stake.
+        let full = harness("full-status-urls");
+        seed(&full, "bot-a", ContainerState::Exited);
+        use_dead_keyed_rpc(&full.root, "bot-a");
+        let (_, raw) = full.get(route).await;
+        assert!(
+            raw.contains("9aa3d95b3bc440fa88ea12eaa4456161")
+                || raw.contains("3c6e0b8a9c15224a8228b9a98ca1531d"),
+            "{route} names no URL on the full profile, so this test proves nothing: {raw}"
+        );
+
+        let h = hosted("hosted-status-urls");
+        seed(&h, "bot-a", ContainerState::Exited);
+        use_dead_keyed_rpc(&h.root, "bot-a");
+        let (_, body) = send(&h, "GET", route, PUBLIC, None).await;
+        no_secret_in(&body);
+        assert!(
+            body.contains("127.0.0.1"),
+            "{route}: the host stays: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_hosted_json_response_is_masked() {
+    use axum::routing::get;
+    let keyed = "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161";
+    let app = axum::Router::new()
+        .route(
+            "/err",
+            get(move || async move {
+                crate::panel::http::ApiError::bad_request(format!("the RPC at {keyed} failed"))
+            }),
+        )
+        .route(
+            "/plain",
+            get(|| async { "not json: https://x/9aa3d95b3bc440fa88ea12eaa4456161" }),
+        )
+        .route_layer(axum::middleware::from_fn(super::redact::mask_responses));
+    let call = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let res = app
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+    let (status, body) = call("/err").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.contains("https://mainnet.infura.io/REDACTED"),
+        "{body}"
+    );
+    no_secret_in(&body);
+    // Only JSON is rewritten; text bodies are none of the panel's API.
+    let (_, body) = call("/plain").await;
+    assert!(body.contains("9aa3d95b3bc440fa88ea12eaa4456161"));
+}
+
+#[tokio::test]
+async fn the_hosted_log_tail_masks_urls_in_each_line() {
+    let line =
+        "WARN rpc error at https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161: timeout";
+    let h = hosted("hosted-log-urls");
+    seed(&h, "bot-a", ContainerState::Running);
+    h.docker
+        .set_log_lines(vec![crate::panel::docker::fake::out(line)]);
+    let (status, body) = send(&h, "GET", "/api/bots/bot-a/logs?follow=false", PUBLIC, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("https://mainnet.infura.io/REDACTED"),
+        "{body}"
+    );
+    no_secret_in(&body);
+    // A full panel tails the line as the bot printed it.
+    let full = harness("full-log-urls");
+    seed(&full, "bot-a", ContainerState::Running);
+    full.docker
+        .set_log_lines(vec![crate::panel::docker::fake::out(line)]);
+    let (_, raw) = full.get("/api/bots/bot-a/logs?follow=false").await;
+    assert!(raw.contains("9aa3d95b3bc440fa88ea12eaa4456161"), "{raw}");
+}
+
+#[tokio::test]
+async fn a_full_panel_still_shows_urls_as_they_are() {
+    let h = harness("full-urls");
+    seed(&h, "bot-a", ContainerState::Exited);
+    use_keyed_urls(&h.root, "bot-a");
+    let (status, body) = h.get("/api/bots/bot-a/settings").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["rpcUrl"], KEYED_RPC);
+    assert_eq!(v["rpcFallbackUrls"][0], KEYED_FALLBACK);
+    assert_eq!(v["feedUrl"], KEYED_FEED);
 }
 
 #[tokio::test]

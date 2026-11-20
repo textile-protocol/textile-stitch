@@ -867,23 +867,29 @@ pub fn rfq_key_reaches_bot(
     runtime: PanelRuntime,
 ) -> bool {
     let key_env = crate::config::RFQ_API_KEY_ENV;
+    // A hosted panel's copy holds no key; the broker's yes/no stands in for
+    // the sibling file (see `hosted::mirror`). Never true on a full panel.
+    let reported = path
+        .parent()
+        .is_some_and(crate::panel::hosted::mirror::maker_key_reported);
     cfg.rfq.is_some()
-        && crate::rfq::api_key_configured(key_env, path.parent(), |name| match runtime {
-            // `bot_container_spec` hands the container an explicitly built env
-            // list: it neither sources the bot's stitch.env nor inherits the
-            // panel's own environment. So for Docker the sibling rfq-api.key
-            // (mounted into the run dir, and what `with_rfq_key_env` keys off)
-            // is the only credential that reaches the child — counting env vars
-            // here would green-light a Start that then can't quote.
-            PanelRuntime::Docker => None,
-            // The process runtime applies the bot's stitch.env to the child and
-            // the child inherits the panel's environment. A key present in
-            // stitch.env wins even when blank: `apply_env_file` sets it either
-            // way, so an explicit blank *overrides* the inherited variable and
-            // the child sees nothing.
-            PanelRuntime::Process => crate::panel::provision::env_assignment(path, name)
-                .or_else(|| std::env::var(name).ok()),
-        })
+        && (reported
+            || crate::rfq::api_key_configured(key_env, path.parent(), |name| match runtime {
+                // `bot_container_spec` hands the container an explicitly built env
+                // list: it neither sources the bot's stitch.env nor inherits the
+                // panel's own environment. So for Docker the sibling rfq-api.key
+                // (mounted into the run dir, and what `with_rfq_key_env` keys off)
+                // is the only credential that reaches the child — counting env vars
+                // here would green-light a Start that then can't quote.
+                PanelRuntime::Docker => None,
+                // The process runtime applies the bot's stitch.env to the child and
+                // the child inherits the panel's environment. A key present in
+                // stitch.env wins even when blank: `apply_env_file` sets it either
+                // way, so an explicit blank *overrides* the inherited variable and
+                // the child sees nothing.
+                PanelRuntime::Process => crate::panel::provision::env_assignment(path, name)
+                    .or_else(|| std::env::var(name).ok()),
+            }))
 }
 
 /// See [`VenueSeat`]. The credential lives beside the config, in the same

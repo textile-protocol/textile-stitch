@@ -23,6 +23,7 @@
 //!
 //! The socket is `0660 root:65532`; the panel container runs as a member of
 //! group 65532 and mounts the socket directory read-only.
+use super::broker_config::{self, ConfigPolicy, WireQuotingSave, WireSaved};
 use super::docker::swap::{swap_outcome, SwapOutcome};
 use super::docker::{
     ContainerInfo, ContainerState, DockerApi, LogOptions, LogSource, MountInfo, STOP_GRACE_SECS,
@@ -99,6 +100,11 @@ pub struct Broker {
     docker: Arc<dyn DockerApi>,
     policy: Arc<Policy>,
     actions: Arc<tokio::sync::Semaphore>,
+    /// One `/v1/configs` read at a time; see [`configs`].
+    reads: Arc<tokio::sync::Semaphore>,
+    /// Bot config access. `None` when the broker has no bots directory, which
+    /// refuses both config routes.
+    config: Option<Arc<ConfigPolicy>>,
 }
 
 /// What the broker will act on. Built once at startup from the environment and
@@ -307,12 +313,31 @@ impl Broker {
             docker,
             policy: Arc::new(policy),
             actions: Arc::new(tokio::sync::Semaphore::new(1)),
+            reads: Arc::new(tokio::sync::Semaphore::new(1)),
+            config: None,
         }
+    }
+
+    /// Serve bot configs from the directory `config` describes.
+    pub fn with_config(mut self, config: ConfigPolicy) -> Self {
+        self.config = Some(Arc::new(config));
+        self
+    }
+
+    fn config_policy(&self) -> Result<&ConfigPolicy, ApiError> {
+        self.config.as_deref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this broker has no bots directory configured",
+            )
+        })
     }
 
     pub fn router(self) -> Router {
         Router::new()
             .route("/v1/bots", get(list))
+            .route("/v1/configs", get(configs))
+            .route("/v1/bots/{name}/settings", post(save_settings))
             .route("/v1/bots/{name}/logs", get(logs))
             .route("/v1/bots/{name}/image", get(image_info).post(replace_image))
             .route("/v1/bots/{name}/{action}", post(act))
@@ -366,6 +391,57 @@ async fn list(State(broker): State<Broker>) -> Result<Json<Vec<WireContainer>>, 
             .map(WireContainer::from)
             .collect(),
     ))
+}
+
+/// `stitch.toml` and the change log of every enrolled bot, and nothing else.
+/// See [`super::broker_config`].
+async fn configs(
+    State(broker): State<Broker>,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], String), ApiError> {
+    let policy = broker.config_policy()?.clone();
+    let containers = broker.enrolled().await?;
+    // One fleet read in memory at a time, so concurrent reads can't multiply
+    // MAX_REPLY_BYTES past the broker's memory limit. Serialized before the
+    // permit goes, which drops the files themselves.
+    let _reading = broker
+        .reads
+        .acquire()
+        .await
+        .map_err(|e| ApiError::internal(&anyhow::anyhow!(e)))?;
+    let body = tokio::task::spawn_blocking(move || {
+        serde_json::to_string(&broker_config::read_fleet_files(&policy, &containers))
+    })
+    .await
+    .map_err(|e| ApiError::internal(&anyhow::anyhow!(e)))?
+    .map_err(|e| ApiError::internal(&anyhow::anyhow!(e)))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    ))
+}
+
+/// A quoting edit, re-checked against the envelope here. See
+/// [`broker_config::save_quoting`].
+async fn save_settings(
+    State(broker): State<Broker>,
+    Path(name): Path<String>,
+    Json(save): Json<WireQuotingSave>,
+) -> Result<Json<WireSaved>, ApiError> {
+    let policy = broker.config_policy()?.clone();
+    let container = broker.find(&name).await?;
+    let now = crate::time::unix_now_ms();
+    let saved = tokio::task::spawn_blocking(move || {
+        broker_config::save_quoting(&policy, &container, &save, now)
+    })
+    .await
+    .map_err(|e| ApiError::internal(&anyhow::anyhow!(e)))?;
+    match &saved {
+        Ok(_) => tracing::info!(container = %name, "broker quoting save"),
+        Err(e) => {
+            tracing::warn!(container = %name, status = %e.status, error = %e.message, "broker quoting save refused")
+        }
+    }
+    saved.map(Json)
 }
 
 async fn act(
@@ -525,6 +601,44 @@ async fn replace_image(
 
 /// Unix socket only. The broker owns its directory; the panel mounts it read-only.
 #[cfg(unix)]
+/// Config access from the environment, or `None` when `STITCH_BROKER_HOST_BOTS_DIR`
+/// isn't set. The envelope file is optional: missing means no quoting edits.
+fn config_policy_from_env() -> Result<Option<ConfigPolicy>> {
+    let Some(host_root) = std::env::var_os("STITCH_BROKER_HOST_BOTS_DIR").filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    let root = std::env::var_os("STITCH_BROKER_BOTS_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data/bots"));
+    let envelope = match std::env::var_os("STITCH_BROKER_ENVELOPE").filter(|v| !v.is_empty()) {
+        None => super::hosted::envelope::Envelope::default(),
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(text) => super::hosted::envelope::Envelope::parse(&text).map_err(|e| {
+                anyhow::anyhow!(
+                    "STITCH_BROKER_ENVELOPE {}: {e:#}",
+                    PathBuf::from(&path).display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                super::hosted::envelope::Envelope::default()
+            }
+            Err(e) => bail!("reading STITCH_BROKER_ENVELOPE: {e}"),
+        },
+    };
+    let bot_uid = match std::env::var("STITCH_BROKER_BOT_UID") {
+        Ok(v) if !v.trim().is_empty() => v.trim().parse()?,
+        _ => 1000,
+    };
+    Ok(Some(ConfigPolicy {
+        host_root: PathBuf::from(host_root),
+        root,
+        envelope,
+        bot_uid,
+    }))
+}
+
 pub async fn serve() -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let docker = Arc::new(super::docker::BollardDocker::connect(
@@ -537,7 +651,13 @@ pub async fn serve() -> Result<()> {
             .unwrap_or_else(|_| DEFAULT_IMAGE_REPOSITORY.to_string()),
     )?;
     tracing::info!(bots = ?policy.names, repository = %policy.image_repository, "runtime broker policy");
-    let broker = Broker::new(docker, policy);
+    let broker = match config_policy_from_env()? {
+        Some(config) => {
+            tracing::info!(root = %config.root.display(), host_root = %config.host_root.display(), "broker serves bot configs");
+            Broker::new(docker, policy).with_config(config)
+        }
+        None => Broker::new(docker, policy),
+    };
     let socket = std::path::Path::new(SOCKET_PATH);
     std::fs::create_dir_all(socket.parent().unwrap())?;
     match std::fs::symlink_metadata(socket) {
@@ -555,6 +675,62 @@ pub async fn serve() -> Result<()> {
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
     axum::serve(listener, broker.router()).await?;
     Ok(())
+}
+
+/// The broker's config routes as a [`ConfigStore`], called in-process. Lets
+/// the hosted panel's tests go through the real broker handlers.
+#[cfg(test)]
+pub struct InProcessBroker(pub Router);
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::panel::hosted::mirror::ConfigStore for InProcessBroker {
+    async fn configs(&self) -> Result<Vec<broker_config::WireBotFiles>> {
+        let (status, body) = self.call("GET", "/v1/configs", None).await;
+        anyhow::ensure!(status.is_success(), "configs: {status} {body}");
+        Ok(serde_json::from_str(&body)?)
+    }
+
+    async fn save(&self, container: &str, save: &WireQuotingSave) -> Result<WireSaved> {
+        let (status, body) = self
+            .call(
+                "POST",
+                &format!("/v1/bots/{container}/settings"),
+                Some(serde_json::to_string(save)?),
+            )
+            .await;
+        if status.is_success() {
+            return Ok(serde_json::from_str(&body)?);
+        }
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+            .unwrap_or(body);
+        Err(crate::panel::hosted::mirror::StoreRefused {
+            status: status.as_u16(),
+            message,
+        }
+        .into())
+    }
+}
+
+#[cfg(test)]
+impl InProcessBroker {
+    async fn call(&self, method: &str, uri: &str, body: Option<String>) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap();
+        let response = self.0.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
 }
 
 #[cfg(test)]
@@ -820,6 +996,104 @@ mod tests {
                 Some(ContainerState::Running)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn config_routes_serve_enrolled_bots_only_and_take_only_quoting_fields() {
+        let root =
+            std::env::temp_dir().join(format!("stitch-broker-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let corridor = crate::setup::find_corridor("cngn-usdt-bsc").unwrap();
+        for dir in ["bot-a", "bot-b"] {
+            crate::setup::write_config(
+                root.join(dir),
+                corridor,
+                crate::panel::http::testkit::TEST_KEY,
+            )
+            .unwrap();
+        }
+        let docker = Arc::new(FakeDocker::new());
+        for (id, name, dir) in [
+            ('a', "stitch-luno-a", "bot-a"),
+            ('b', "stitch-other", "bot-b"),
+        ] {
+            let mut c = container(id, name);
+            c.mounts = crate::panel::docker::fake::dir_layout_mounts(
+                &root.join(dir).display().to_string(),
+            );
+            docker.add_container(c);
+        }
+        // No bots directory configured: both routes refuse.
+        let bare = app(docker.clone(), "stitch-luno-a");
+        assert_eq!(
+            send(&bare, "GET", "/v1/configs", None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let config = ConfigPolicy {
+            host_root: root.clone(),
+            root: root.clone(),
+            envelope: crate::panel::hosted::envelope::Envelope::parse(
+                r#"{"spread_bps": {"min": 5, "max": 300}}"#,
+            )
+            .unwrap(),
+            // SAFETY: getuid has no preconditions and can't fail.
+            bot_uid: unsafe { libc::getuid() },
+        };
+        let app = Broker::new(docker, Policy::new("stitch-luno-a", REPO).unwrap())
+            .with_config(config)
+            .router();
+        let (status, body) = send(&app, "GET", "/v1/configs", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let files: Vec<broker_config::WireBotFiles> = serde_json::from_str(&body).unwrap();
+        assert_eq!(files.len(), 1, "only the enrolled bot: {body}");
+        assert_eq!(files[0].container, "stitch-luno-a");
+        assert!(!body.contains("stitch.key"), "{body}");
+
+        let edit = |extra: &str| {
+            format!(
+                r#"{{"edit":{{"pool":0,"buy":{{"abs":false,"value":"42"}}{extra}}},"actor":"a","bot":"luno-a"}}"#
+            )
+        };
+        // Not enrolled.
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/bots/stitch-other/settings",
+            Some(edit("")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // A field outside the quoting set doesn't parse.
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/bots/stitch-luno-a/settings",
+            Some(edit(r#","rpc_url":"https://attacker""#)),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}");
+        // Out of bounds.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/bots/stitch-luno-a/settings",
+            Some(edit("").replace("\"42\"", "\"900\"")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        // In bounds: written and logged.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/bots/stitch-luno-a/settings",
+            Some(edit("")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved: WireSaved = serde_json::from_str(&body).unwrap();
+        assert!(saved.files.files["change-log.jsonl"].contains("panel.settings"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

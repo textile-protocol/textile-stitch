@@ -181,12 +181,27 @@ pub async fn tail(
             .unwrap_or(LogOptions::default().tail)
             .min(MAX_TAIL),
     };
-    let stream = state.docker.logs(&container, opts).map(|item| {
+    // Hosted: a bot's log can print its RPC or feed URL; mask each line.
+    let hosted = state.cfg.profile.hosted().is_some();
+    let stream = state.docker.logs(&container, opts).map(move |item| {
         Ok::<Event, Infallible>(match item {
-            Ok(line) => json_event("line", &LineBody::from(line)),
+            Ok(line) => {
+                let mut body = LineBody::from(line);
+                if hosted {
+                    body.text = crate::panel::hosted::redact::urls_in_text(&body.text);
+                }
+                json_event("line", &body)
+            }
             // A broken log stream is itself news. Send it as an error event rather
             // than closing silently, so the UI can say why the tail stopped.
-            Err(e) => json_event("error", &serde_json::json!({ "message": format!("{e:#}") })),
+            Err(e) => {
+                let message = format!("{e:#}");
+                let message = match hosted {
+                    true => crate::panel::hosted::redact::urls_in_text(&message),
+                    false => message,
+                };
+                json_event("error", &serde_json::json!({ "message": message }))
+            }
         })
     });
 

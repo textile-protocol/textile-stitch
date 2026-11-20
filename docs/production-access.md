@@ -80,9 +80,8 @@ hosted profile until their own migration. What the profile allows is in
 
 ### What exists, and what you still do by hand
 
-The stack deploys the hosted panel when `hosted_panel_enabled` is on, but
-refuses to while this compose file still mounts `PANEL_BOTS_DIR` into the
-panel container: that waits for #3091. Here's where each piece comes from:
+The stack deploys the hosted panel when `hosted_panel_enabled` is on. Here's
+where each piece comes from:
 
 - **#2777 (merged):** the stitch-bots stack gives the host its SSM instance
   role, the `<prefix>-logged-shell` document and the `<prefix>-panel` port
@@ -98,42 +97,40 @@ panel container: that waits for #3091. Here's where each piece comes from:
   `stitch-panel.service`. The auth key and password hash come from Secrets
   Manager, never Terraform. Its plan, and the start script on the host, refuse
   a compose file whose panel service mounts the bot folders, anything above
-  them or `/run/stitch`, so it fails until #3091 moves that mount to the
-  broker. With the panel on, the bot folders live in `~/stitch/bots/<bot>`, so
-  `PANEL_BOTS_DIR` holds them and nothing else. See the stack's README,
-  "Hosted panel". The tailnet, its policy and the key itself are still yours.
+  them or `/run/stitch`. This file passes: only the broker mounts
+  `PANEL_BOTS_DIR` (#3091). With the panel on, the bot folders live in
+  `~/stitch/bots/<bot>`, so `PANEL_BOTS_DIR` holds them and nothing else. See
+  the stack's README, "Hosted panel". The tailnet, its policy and the key
+  itself are still yours.
 - **Image attestations:** Update and Rollback only move a bot onto a digest
   with a valid build provenance attestation, checked by the broker. See
   [Image attestations](#image-attestations).
 
-Until #3091 lands, or on a stack without `hosted_panel_enabled`, bring the
-panel up by hand as below, and only on a host whose bot directories hold no
-credentials. The
-hosted panel mounts `PANEL_BOTS_DIR` read-write, so it can read anything in them. #2832 moves the
-signer keys out to `/run/stitch/<bot>`. It doesn't move the RFQ maker key:
-`stitch connect` writes `rfq-api.key` next to `stitch.toml` by default. Put
-it in `/run/stitch/<bot>` too and point the bot at it with
-`STITCH_RFQ_API_KEY_FILE`; nothing automates that yet. Check with
-`find <bots dir> -name '*.key'`, which must print nothing.
-
-The read-write mount is also how the panel saves quoting settings, and the
-envelope is enforced by the panel's HTTP layer, not by the mount. So code
-running inside a compromised panel container could rewrite any `stitch.toml`
-it can reach, not just the quoting fields. Moving config writes behind the
-broker would close that; it isn't done. Over the logged SSM shell:
+On a stack without `hosted_panel_enabled`, bring the panel up by hand. The
+panel mounts no bot directory: the runtime broker mounts `PANEL_BOTS_DIR`,
+hands the panel only each enrolled bot's `stitch.toml` and change log, and
+takes quoting edits it re-checks against the envelope itself. A key left beside
+a config (`rfq-api.key` is there by default) never reaches the panel, though
+moving it to `/run/stitch/<bot>` with `STITCH_RFQ_API_KEY_FILE` still keeps it
+off the broker's mount. What the panel can and can't reach is in
+[install-panel.md](install-panel.md#hosted-profile). Over the logged SSM shell:
 
 1. Copy `docker-compose.panel.hosted.yml`, `deploy/panel-serve.json` and
    `deploy/panel-tailscale.sh` from the reviewed commit into a root-owned
    directory, for example `/opt/stitch-panel`.
 2. Write `/opt/stitch-panel/.env` (mode 0600) with `PANEL_IMAGE` pinned by
    `@sha256:` digest, `PANEL_PASSWORD_HASH` (quoted, from
-   `stitch-panel hash-password`), `PANEL_PUBLIC_ORIGIN`, `PANEL_BOTS_DIR` (the
-   stack's bot directory), `STITCH_BROKER_BOTS` (the bot container names from
-   the stack's compose file, such as `stitch-bot-a`) and a one-use `TS_AUTHKEY`.
+   `stitch-panel hash-password`), `PANEL_PUBLIC_ORIGIN`, `PANEL_BOTS_DIR` (a
+   directory holding bot folders and nothing else, like `~/stitch/bots`; never
+   `~/stitch`, which holds the bots' compose file), `STITCH_BROKER_BOTS` (the
+   bot container names from the stack's compose file, such as `stitch-bot-a`)
+   and a one-use `TS_AUTHKEY`.
    The compose file's header lists every variable.
 3. Write `envelope.json` next to it with the bounds agreed with the client,
-   shaped like `deploy/hosted-envelope.example.json`. Without it the panel
-   allows no quoting edits.
+   in the shape [install-panel.md](install-panel.md#hosted-profile) shows.
+   The panel and the broker both mount it read-only. Without it, or with `{}`
+   (what `deploy/hosted-envelope.example.json` holds), no quoting edits are
+   allowed.
 4. `docker compose -f docker-compose.panel.hosted.yml up -d`, then do the
    enrollment cleanup below and record the checks at the end of this section.
 
@@ -176,8 +173,11 @@ Checks to record when bringing a host up: the tailnet URL works from an
 approved device and not from one outside the ops group; the SSM forward on
 local port 8420 reaches the login page and accepts a change; a forward on
 another local port is refused on change; `ss -ltn` on the host shows 8420 on
-`127.0.0.1` only; the panel container has no `/var/run/docker.sock` and no
-`/home/stitch/secrets`.
+`127.0.0.1` only; the panel container has no `/var/run/docker.sock`, no
+`/home/stitch/secrets` and no bind mount of the bot directories
+(`docker inspect stitch-panel` lists only the envelope file and the broker
+socket volume); a quoting save from the panel shows up in the bot's
+`change-log.jsonl` on the host.
 
 ### Image attestations
 

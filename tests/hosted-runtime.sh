@@ -22,24 +22,35 @@ runtime_limits=(--pids-limit 128 --memory 256m)
 if [ "${STITCH_TEST_SKIP_LIMITS:-0}" = 1 ]; then runtime_limits=(); fi
 if [ -n "${STITCH_TEST_CGROUP_PARENT:-}" ]; then runtime_opts+=(--cgroup-parent "$STITCH_TEST_CGROUP_PARENT"); fi
 bots_dir="$(mktemp -d)"
+# Swap request bodies live outside the directory the broker mounts.
+scratch="$(mktemp -d)"
 cleanup() {
   docker rm -f "$name-panel" "$name-broker" "$bot" "$other" >/dev/null 2>&1 || true
   docker volume rm "$name-socket" >/dev/null 2>&1 || true
-  rm -rf "$bots_dir"
+  rm -rf "$bots_dir" "$scratch"
 }
 trap cleanup EXIT
-chown 1000:1000 "$bots_dir"
+# One bot directory with a config and the key files a host might leave beside
+# it. Only the config may ever leave the broker.
+mkdir -p "$bots_dir/bot"
+printf 'marker = "hosted-runtime-config"\n' >"$bots_dir/bot/stitch.toml"
+printf 'tx_live_hosted_runtime_secret' >"$bots_dir/bot/rfq-api.key"
+printf 'hosted-runtime-key-secret' >"$bots_dir/bot/stitch.key"
+chown -R 1000:1000 "$bots_dir"
 
 # `sleep` as the entrypoint, so the clone on the bot image (which has one too)
 # keeps running after the swap without a config or keys.
 docker run "${runtime_opts[@]}" -d --name "$bot" --network none -e KEEP=env --label keep=label \
-  -v "$bots_dir:/home/stitch/run" --entrypoint sleep busybox:1.37 3600 >/dev/null
+  -v "$bots_dir/bot:/home/stitch/run" --entrypoint sleep busybox:1.37 3600 >/dev/null
 docker run "${runtime_opts[@]}" -d --name "$other" --network none busybox:1.37 sleep 3600 >/dev/null
 docker volume create "$name-socket" >/dev/null
-docker run "${runtime_opts[@]}" -d --name "$name-broker" --network none --read-only --cap-drop ALL --cap-add CHOWN \
+docker run "${runtime_opts[@]}" -d --name "$name-broker" --network none --read-only --cap-drop ALL \
+  --cap-add CHOWN --cap-add DAC_OVERRIDE \
   --security-opt no-new-privileges "${runtime_limits[@]}" \
   -e "STITCH_BROKER_BOTS=$bot" -e "STITCH_BROKER_IMAGE_REPOSITORY=$repo" \
+  -e "STITCH_BROKER_HOST_BOTS_DIR=$bots_dir" -e STITCH_BROKER_BOTS_DIR=/data/bots \
   -v /var/run/docker.sock:/var/run/docker.sock -v "$name-socket:/run/stitch-broker" \
+  -v "$bots_dir:/data/bots" \
   "$STITCH_TEST_IMAGE" runtime-broker >/dev/null
 socket="$(docker volume inspect --format '{{.Mountpoint}}' "$name-socket")/control.sock"
 for _ in {1..50}; do
@@ -53,6 +64,17 @@ broker() { curl -sS -o /dev/null -w '%{http_code}' --unix-socket "$socket" "$@";
 # Inventory: the enrolled name only, and no env.
 body="$(curl -fsS --unix-socket "$socket" http://broker/v1/bots)"
 [[ "$body" == *"\"$bot\""* && "$body" != *"$other"* && "$body" != *'"env"'* ]]
+
+# Configs: the enrolled bot's stitch.toml, and never a key file beside it.
+body="$(curl -fsS --unix-socket "$socket" http://broker/v1/configs)"
+[[ "$body" == *hosted-runtime-config* && "$body" == *'"dir":"bot"'* ]]
+[[ "$body" != *hosted_runtime_secret* && "$body" != *hosted-runtime-key-secret* && "$body" != *rfq-api.key* ]]
+# The maker key beside it is reported as present, and only as that.
+[[ "$body" == *'"rfq_api_key":true'* ]]
+# A quoting save with a field outside the set doesn't parse.
+code="$(broker -X POST -H 'content-type: application/json' \
+  --data '{"edit":{"pool":0,"rpc_url":"https://attacker"},"actor":"a","bot":"b"}' "http://broker/v1/bots/$bot/settings")"
+[[ "$code" = 4* ]]
 
 # Lifecycle, with Restart refusing to start a stopped bot.
 for action in stop start restart; do
@@ -76,8 +98,8 @@ done
 
 swap() { # image, then zero or more bundle files
   local image="$1"; shift
-  jq -n --arg image "$image" '{image: $image, attestations: [inputs | tojson]}' "$@" </dev/null > "$bots_dir/swap.json"
-  broker -X POST -H 'content-type: application/json' --data-binary "@$bots_dir/swap.json" "http://broker/v1/bots/$bot/image"
+  jq -n --arg image "$image" '{image: $image, attestations: [inputs | tojson]}' "$@" </dev/null > "$scratch/swap.json"
+  broker -X POST -H 'content-type: application/json' --data-binary "@$scratch/swap.json" "http://broker/v1/bots/$bot/image"
 }
 
 # A digest without a valid bot attestation is refused before Docker is asked:
@@ -117,11 +139,15 @@ hash="$(printf '%s\n' "$password" | docker run --rm -i "$STITCH_TEST_IMAGE" hash
 docker run "${runtime_opts[@]}" -d --name "$name-panel" --network none --user 1000:65532 --read-only --cap-drop ALL \
   --security-opt no-new-privileges "${runtime_limits[@]}" \
   -e STITCH_PANEL_PROFILE=hosted -e STITCH_PANEL_PUBLIC_ORIGIN=https://stitch-panel.example.ts.net \
-  -e "STITCH_PANEL_PASSWORD_HASH=$hash" -e STITCH_PANEL_HOST_BOTS_DIR=/srv/bots \
+  -e "STITCH_PANEL_PASSWORD_HASH=$hash" -e "STITCH_PANEL_HOST_BOTS_DIR=$bots_dir" \
   -e STITCH_PANEL_CORRIDOR_API=off -e STITCH_PANEL_COINGECKO_API=off \
-  -v "$bots_dir:/data/bots" -v "$name-socket:/run/stitch-broker:ro" \
+  --tmpfs /data/bots:uid=1000,gid=1000,mode=0700 -v "$name-socket:/run/stitch-broker:ro" \
   "$STITCH_TEST_IMAGE" >/dev/null
 panel_pid="$(docker inspect --format '{{.State.Pid}}' "$name-panel")"
+# The panel has no bind mount of any bot directory.
+if docker inspect --format '{{range .Mounts}}{{.Source}}{{println}}{{end}}' "$name-panel" | grep -qF "$bots_dir"; then
+  echo "the hosted panel has a bind mount of the bots directory" >&2; exit 1
+fi
 panel() { nsenter -t "$panel_pid" -n curl -sS "$@"; }
 for _ in {1..50}; do
   if panel -o /dev/null -H 'Host: localhost:8420' http://127.0.0.1:8420/api/health 2>/dev/null; then break; fi
@@ -141,6 +167,9 @@ cookie="$(panel -D - -o /dev/null "${local_host[@]}" -H 'Origin: http://localhos
 [ -n "$cookie" ]
 authed=("${local_host[@]}" -H "Cookie: $cookie" -H 'Origin: http://localhost:8420')
 [ "$(code "${authed[@]}" http://127.0.0.1:8420/api/bots)" = 200 ]
+# Its fleet comes from the broker's copy of the config, with no key in it.
+fleet="$(panel "${authed[@]}" http://127.0.0.1:8420/api/bots)"
+[[ "$fleet" != *hosted_runtime_secret* && "$fleet" != *hosted-runtime-key-secret* ]]
 # Refused by the hosted policy.
 for route in /api/bots/x/withdraw /api/wallets/generate /api/panel/update /api/bots /api/bots/x/approve; do
   [ "$(code "${authed[@]}" -X POST -H 'content-type: application/json' --data '{}' "http://127.0.0.1:8420$route")" = 403 ]

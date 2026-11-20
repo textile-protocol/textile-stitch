@@ -1,11 +1,1 @@
-{
-  "spread_bps": { "min": 0, "max": 0 },
-  "min_spread_bps": { "min": 0, "max": 0 },
-  "ttl_secs": { "min": 0, "max": 0 },
-  "refresh_threshold_bps": { "min": 0, "max": 0 },
-  "tick_interval_secs": { "min": 0, "max": 0 },
-  "max_orders": { "min": 0, "max": 0 },
-  "order_size": { "min": "0", "max": "0" },
-  "total_liquidity": { "min": "0", "max": "0" },
-  "min_slice_debt": { "min": "0", "max": "0" }
-}
+{}
