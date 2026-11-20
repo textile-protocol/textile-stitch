@@ -1015,6 +1015,12 @@ async fn run(rt: RfqRuntime, prices: PriceCache) {
                     // Taken over before the session was even accepted — same
                     // duplicate-identity story, so say the same thing.
                     log_supersede(supersedes, &rt.maker_id, &e);
+                } else if let Some(retry_after) = session::rate_limited(&e) {
+                    warn!(
+                        retry_after_secs = retry_after.map(|d| d.as_secs()),
+                        "RFQ venue rate-limited this IP address (429); waiting before reconnecting. \
+                         Bots sharing one address share the venue's limit"
+                    );
                 } else {
                     warn!(error = %format!("{e:#}"), "RFQ connect/auth failed");
                 }
@@ -1090,33 +1096,52 @@ fn log_supersede(count: u32, maker_id: &str, err: &anyhow::Error) {
 /// Two different failures wear the same shape here. A venue that is genuinely
 /// down wants exponential backoff, so a fleet of bots doesn't hammer it back
 /// into the ground. A venue that is *moving* — a deploy handing sockets from
-/// the outgoing task to the warm incoming one — wants no delay at all: the
+/// the outgoing task to the warm incoming one — wants almost no delay: the
 /// replacement is already accepting, and every second spent sleeping is a
 /// second the corridor reports no makers for no reason. Backing off through a
 /// deploy is most of what used to make one cost minutes.
 ///
+/// Every delay is jittered. A deploy resets every bot's socket in the same
+/// instant, and bots on one host share one address that the venue rate-limits,
+/// so retrying on the same beat lands them all in the same window. A 429 waits
+/// at least as long as the venue's `Retry-After`.
+///
 /// The fast lane is bounded in attempts rather than time, because the thing it
 /// is riding out is "the ALB handed me the wrong one of N tasks", which is a
-/// couple of retries, not a wait.
+/// handful of retries spread over the new task's warm-up, not a wait.
 struct Backoff {
     secs: u64,
     fast_attempts: u32,
+    /// What the venue's last 429 asked for, consumed by the next delay.
+    retry_after: Option<std::time::Duration>,
 }
 
-/// Immediate retries allowed after a handover before normal backoff resumes.
-/// Generous for a two-task overlap; still finite, so a venue stuck refusing
-/// every socket can't be spun on forever.
+/// Fast retries allowed after a handover before normal backoff resumes.
+/// Finite, so a venue stuck refusing every socket can't be spun on forever.
 const HANDOVER_FAST_RETRIES: u32 = 20;
 
-/// Pause between fast-lane retries. Long enough not to spin, short enough that
-/// a handover is invisible next to a WebSocket handshake.
+/// First fast-lane pause. Long enough not to spin, short enough that a
+/// handover is invisible next to a WebSocket handshake.
 const HANDOVER_RETRY_MS: u64 = 250;
+
+/// Fast-lane pauses double up to this. Twenty retries then cover about half a
+/// minute of a replacement task that isn't the engine yet, instead of five
+/// seconds, without ever leaving the bot more than two seconds late.
+const HANDOVER_RETRY_MAX_MS: u64 = 2_000;
+
+/// Normal backoff ceiling.
+const BACKOFF_MAX_SECS: u64 = 30;
+
+/// Longest `Retry-After` honoured. A venue asking for more is treated as asking
+/// for this; the bot should not sit out for an hour on one header.
+const RETRY_AFTER_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl Default for Backoff {
     fn default() -> Self {
         Self {
             secs: 1,
             fast_attempts: 0,
+            retry_after: None,
         }
     }
 }
@@ -1126,26 +1151,54 @@ impl Backoff {
     fn reset(&mut self) {
         self.secs = 1;
         self.fast_attempts = 0;
+        self.retry_after = None;
     }
 
     /// Record why the last attempt ended, opening or closing the fast lane.
     fn note(&mut self, err: &anyhow::Error) {
         if session::is_handover(err) {
             self.fast_attempts = self.fast_attempts.saturating_add(1);
+            self.retry_after = None;
         } else {
             self.fast_attempts = 0;
+            self.retry_after = session::rate_limited(err)
+                .flatten()
+                .map(|wait| wait.min(RETRY_AFTER_MAX));
         }
     }
 
     /// How long to wait before the next attempt, advancing the backoff.
     fn next_delay(&mut self) -> std::time::Duration {
-        if self.fast_attempts > 0 && self.fast_attempts <= HANDOVER_FAST_RETRIES {
-            return std::time::Duration::from_millis(HANDOVER_RETRY_MS);
-        }
-        let delay = std::time::Duration::from_secs(self.secs);
-        self.secs = (self.secs * 2).min(30);
-        delay
+        self.next_delay_with(rand::random::<f64>())
     }
+
+    /// [`Self::next_delay`] with the jitter draw passed in, `jitter` in
+    /// `[0, 1)`. Zero gives the undithered schedule.
+    ///
+    /// Backoff delays shrink by up to half (`d/2 < delay <= d`), so a fleet
+    /// that failed together spreads out without anyone waiting longer than the
+    /// schedule says. A `Retry-After` is a floor, so its jitter only adds, by
+    /// up to a quarter.
+    fn next_delay_with(&mut self, jitter: f64) -> std::time::Duration {
+        let jitter = jitter.clamp(0.0, 1.0);
+        if self.fast_attempts > 0 && self.fast_attempts <= HANDOVER_FAST_RETRIES {
+            let doublings = (self.fast_attempts - 1).min(16);
+            let base = (HANDOVER_RETRY_MS << doublings).min(HANDOVER_RETRY_MAX_MS);
+            return shrink_by_jitter(std::time::Duration::from_millis(base), jitter);
+        }
+        let base = std::time::Duration::from_secs(self.secs);
+        self.secs = (self.secs * 2).min(BACKOFF_MAX_SECS);
+        let backoff = shrink_by_jitter(base, jitter);
+        match self.retry_after.take() {
+            Some(wait) => backoff.max(wait + wait.mul_f64(jitter / 4.0)),
+            None => backoff,
+        }
+    }
+}
+
+/// `d` less up to half of it.
+fn shrink_by_jitter(d: std::time::Duration, jitter: f64) -> std::time::Duration {
+    d - d.mul_f64(jitter / 2.0)
 }
 
 /// Venue caps post-auth inbound frames at 40/s. Reconnect replay can
@@ -4690,50 +4743,135 @@ mod tests {
             b.note(&anyhow::anyhow!(
                 "venue closed the session: 4001 superseded"
             ));
-            delays.push(b.next_delay().as_secs());
+            delays.push(b.next_delay_with(0.0).as_secs());
         }
         assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30]);
     }
 
+    const MS: fn(u64) -> std::time::Duration = std::time::Duration::from_millis;
+    const SECS: fn(u64) -> std::time::Duration = std::time::Duration::from_secs;
+
+    fn rate_limited(retry_after: Option<u64>) -> anyhow::Error {
+        anyhow::Error::new(session::VenueRateLimited {
+            retry_after: retry_after.map(SECS),
+        })
+        .context("connecting to venue")
+    }
+
     #[test]
-    fn a_handover_retries_immediately_while_a_failure_backs_off() {
+    fn a_handover_retries_quickly_while_a_failure_backs_off() {
         let mut b = Backoff::default();
 
-        // A deploy handover: no sleeping. This is the whole point — the warm
-        // replacement is already accepting sockets.
+        // A deploy handover: barely any sleeping. The warm replacement is
+        // already accepting sockets.
         b.note(&handover(4006));
-        assert_eq!(b.next_delay(), std::time::Duration::from_millis(250));
+        assert_eq!(b.next_delay_with(0.0), MS(250));
         b.note(&handover(4005));
-        assert_eq!(b.next_delay(), std::time::Duration::from_millis(250));
+        assert_eq!(b.next_delay_with(0.0), MS(500));
 
         // A real outage goes back to exponential, and the handover retries it
         // just made must not have eaten the budget.
         b.note(&anyhow::anyhow!("503"));
-        assert_eq!(b.next_delay(), std::time::Duration::from_secs(1));
+        assert_eq!(b.next_delay_with(0.0), SECS(1));
         b.note(&anyhow::anyhow!("503"));
-        assert_eq!(b.next_delay(), std::time::Duration::from_secs(2));
+        assert_eq!(b.next_delay_with(0.0), SECS(2));
     }
 
     #[test]
-    fn the_fast_lane_is_finite() {
+    fn the_fast_lane_spreads_out_and_is_finite() {
         let mut b = Backoff::default();
+        let mut delays = Vec::new();
         for _ in 0..HANDOVER_FAST_RETRIES {
             b.note(&handover(4005));
-            assert_eq!(b.next_delay(), std::time::Duration::from_millis(250));
+            delays.push(b.next_delay_with(0.0));
         }
+        assert_eq!(
+            &delays[..5],
+            &[MS(250), MS(500), MS(1_000), MS(2_000), MS(2_000)]
+        );
+        assert!(delays.iter().all(|d| *d <= MS(HANDOVER_RETRY_MAX_MS)));
+        // About half a minute of a replacement that isn't the engine yet.
+        let covered: std::time::Duration = delays.iter().sum();
+        assert!(covered >= SECS(30), "fast lane only covers {covered:?}");
+
         // A venue refusing every socket must not be spun on forever.
         b.note(&handover(4005));
-        assert_eq!(b.next_delay(), std::time::Duration::from_secs(1));
+        assert_eq!(b.next_delay_with(0.0), SECS(1));
     }
 
     #[test]
     fn a_session_that_ran_clears_both_lanes() {
         let mut b = Backoff::default();
         b.note(&anyhow::anyhow!("503"));
-        let _ = b.next_delay();
-        let _ = b.next_delay();
+        let _ = b.next_delay_with(0.0);
+        let _ = b.next_delay_with(0.0);
         b.reset();
-        assert_eq!(b.next_delay(), std::time::Duration::from_secs(1));
+        assert_eq!(b.next_delay_with(0.0), SECS(1));
+    }
+
+    #[test]
+    fn jitter_only_ever_shortens_a_backoff_and_by_at_most_half() {
+        for jitter in [0.0, 0.25, 0.5, 0.999] {
+            let mut b = Backoff::default();
+            b.note(&anyhow::anyhow!("503"));
+            let _ = b.next_delay_with(0.0); // 1s
+            b.note(&anyhow::anyhow!("503"));
+            let _ = b.next_delay_with(0.0); // 2s
+            b.note(&anyhow::anyhow!("503"));
+            let delay = b.next_delay_with(jitter); // 4s, jittered
+            assert!(delay > SECS(2) && delay <= SECS(4), "{jitter}: {delay:?}");
+
+            let mut fast = Backoff::default();
+            fast.note(&handover(4005));
+            let delay = fast.next_delay_with(jitter);
+            assert!(delay > MS(125) && delay <= MS(250), "{jitter}: {delay:?}");
+        }
+        // Two bots that failed together with different draws come back apart.
+        let (mut a, mut b) = (Backoff::default(), Backoff::default());
+        a.note(&handover(4005));
+        b.note(&handover(4005));
+        assert_ne!(a.next_delay_with(0.1), b.next_delay_with(0.9));
+    }
+
+    #[test]
+    fn a_429_waits_out_the_venues_retry_after() {
+        // The log this came from: 429s at 2s, 4s, 8s, 16s into a 60s window,
+        // every one of them refused again.
+        let mut b = Backoff::default();
+        b.note(&rate_limited(Some(53)));
+        let delay = b.next_delay_with(0.0);
+        assert_eq!(delay, SECS(53));
+        let jittered = {
+            let mut b = Backoff::default();
+            b.note(&rate_limited(Some(53)));
+            b.next_delay_with(0.999)
+        };
+        assert!(jittered >= SECS(53) && jittered < SECS(67), "{jittered:?}");
+
+        // The floor is used once; the next failure is back on the schedule,
+        // which kept advancing underneath it.
+        b.note(&anyhow::anyhow!("503"));
+        assert_eq!(b.next_delay_with(0.0), SECS(2));
+    }
+
+    #[test]
+    fn a_429_never_shortens_the_backoff_and_a_huge_retry_after_is_capped() {
+        let mut b = Backoff::default();
+        for _ in 0..6 {
+            b.note(&anyhow::anyhow!("503"));
+            let _ = b.next_delay_with(0.0);
+        }
+        b.note(&rate_limited(Some(1)));
+        assert_eq!(b.next_delay_with(0.0), SECS(30));
+
+        let mut b = Backoff::default();
+        b.note(&rate_limited(Some(86_400)));
+        assert_eq!(b.next_delay_with(0.0), RETRY_AFTER_MAX);
+
+        // No usable header: plain backoff.
+        let mut b = Backoff::default();
+        b.note(&rate_limited(None));
+        assert_eq!(b.next_delay_with(0.0), SECS(1));
     }
 
     /// A signer that takes longer than any reply budget, for pinning the

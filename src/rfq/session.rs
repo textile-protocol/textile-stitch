@@ -70,6 +70,55 @@ pub struct VenueSuperseded {
     pub reason: String,
 }
 
+/// The venue answered the WebSocket upgrade with 429 Too Many Requests.
+///
+/// The venue rate-limits upgrades per client address, and every bot on one host
+/// shares that address. Typed so the reconnect loop waits for the `Retry-After`
+/// the venue sent instead of retrying into the same window and pushing the
+/// whole host's count further over.
+#[derive(Debug, thiserror::Error)]
+#[error("venue rate-limited this connection (429), retry after {retry_after:?}")]
+pub struct VenueRateLimited {
+    pub retry_after: Option<std::time::Duration>,
+}
+
+/// `Retry-After` in its delay-seconds form. The HTTP-date form is not something
+/// the venue sends, and guessing a clock offset for it would be worse than
+/// falling back to the normal backoff.
+fn retry_after_secs(value: &str) -> Option<std::time::Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
+/// Turn a failed upgrade into [`VenueRateLimited`] when it was a 429, and leave
+/// everything else as it was.
+fn classify_connect_error(err: tokio_tungstenite::tungstenite::Error) -> anyhow::Error {
+    use tokio_tungstenite::tungstenite::http::StatusCode;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    match err {
+        WsError::Http(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(retry_after_secs);
+            anyhow::Error::new(VenueRateLimited { retry_after })
+        }
+        other => anyhow::Error::new(other),
+    }
+}
+
+/// How long the venue asked us to wait, if this failure was a rate limit.
+/// `Some(None)` is a 429 with no usable `Retry-After`.
+pub fn rate_limited(err: &anyhow::Error) -> Option<Option<std::time::Duration>> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<VenueRateLimited>())
+        .map(|limited| limited.retry_after)
+}
+
 /// Does this close frame mean "reconnect now" rather than "go away"?
 ///
 /// Two shapes, same policy: the task is wrong (4005/4006), or our seat list is
@@ -156,6 +205,7 @@ async fn handshake(
 
     let (mut stream, _) = connect_async(request)
         .await
+        .map_err(classify_connect_error)
         .context("connecting to venue")?;
 
     // The venue speaks first: wait for the challenge, ignoring anything else.
@@ -271,5 +321,69 @@ mod tests {
                 "0xabcdef0000000000000000000000000000000001".to_string(),
             ])
         );
+    }
+
+    fn http_error(status: u16, retry_after: Option<&str>) -> tokio_tungstenite::tungstenite::Error {
+        let mut builder = tokio_tungstenite::tungstenite::http::Response::builder().status(status);
+        if let Some(value) = retry_after {
+            builder = builder.header("Retry-After", value);
+        }
+        tokio_tungstenite::tungstenite::Error::Http(builder.body(None).unwrap())
+    }
+
+    #[test]
+    fn a_429_carries_the_venues_retry_after() {
+        let err =
+            classify_connect_error(http_error(429, Some("45"))).context("connecting to venue");
+        assert_eq!(
+            rate_limited(&err),
+            Some(Some(std::time::Duration::from_secs(45)))
+        );
+    }
+
+    #[test]
+    fn a_429_without_a_usable_retry_after_is_still_a_rate_limit() {
+        let missing = classify_connect_error(http_error(429, None));
+        assert_eq!(rate_limited(&missing), Some(None));
+        let dated = classify_connect_error(http_error(429, Some("Fri, 20 Nov 2026 13:46:37 GMT")));
+        assert_eq!(rate_limited(&dated), Some(None));
+    }
+
+    /// Over a real socket: the venue's throttle answers the upgrade with a
+    /// plain HTTP 429 before any WebSocket exists.
+    #[tokio::test]
+    async fn a_venue_429_on_the_upgrade_is_read_as_a_rate_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 37\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let err = connect_async(format!("ws://127.0.0.1:{port}/v2/maker/stream"))
+            .await
+            .map(|_| ())
+            .map_err(classify_connect_error)
+            .context("connecting to venue")
+            .unwrap_err();
+        assert_eq!(
+            rate_limited(&err),
+            Some(Some(std::time::Duration::from_secs(37)))
+        );
+    }
+
+    #[test]
+    fn other_upgrade_failures_are_not_a_rate_limit() {
+        let err = classify_connect_error(http_error(503, Some("5")));
+        assert_eq!(rate_limited(&err), None);
+        assert!(format!("{err:#}").contains("503"));
     }
 }
