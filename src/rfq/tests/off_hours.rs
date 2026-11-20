@@ -34,6 +34,8 @@ fn prices(session: Session) -> PriceCache {
             session,
             market_at: Some(now - 600),
             market_source: Some("icap-setfx".into()),
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
             spread: Default::default(),
         },
     );

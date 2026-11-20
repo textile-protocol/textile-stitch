@@ -24,6 +24,7 @@ fn context() -> Context {
         price: 1.0,
         price_at: 100,
         price_degraded: false,
+        price_clamped: false,
         price_off_hours: false,
         balances_at: 100,
         staleness_secs: 10,
@@ -57,6 +58,7 @@ fn book() -> CorridorBook {
         feed_sides: false,
         off_hours: None,
         issuer_spread: None,
+        clamped_extra_bps: 10,
     }
 }
 #[test]
@@ -482,6 +484,50 @@ async fn an_off_hours_print_never_enters_the_spread_window() {
     rt.decide(&at(now - 60, 1.5, true));
     let last = rt.decide(&at(now, 1.0, false));
     assert_eq!(last.volatility_bps, 0, "the off-hours print was sampled");
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_clamped_price_quotes_but_never_rebalances() {
+    let mut cfg = config();
+    cfg.rebalance.enabled = true;
+    cfg.inventory.enabled = true;
+    let clamped = Context {
+        price_clamped: true,
+        ..context()
+    };
+    let live = evaluate(&cfg, &context(), &[]);
+    let d = evaluate(&cfg, &clamped, &[]);
+    assert!(!live.rebalance_sell.is_zero());
+    assert!(d.rebalance_sell.is_zero());
+    assert!(!d.blocked, "quotes still go out, widened by the RFQ path");
+    assert_eq!((d.buy_bps, d.sell_bps), (live.buy_bps, live.sell_bps));
+    assert!(d.reasons.iter().any(|r| r.contains("Clamped")));
+}
+
+#[tokio::test]
+async fn a_clamped_print_never_enters_the_spread_window() {
+    let mut cfg = config();
+    cfg.spreads.enabled = true;
+    cfg.spreads.warmup_secs = 60;
+    let now = stitch_bot::time::unix_now();
+    let at = |t: u64, price: f64, clamped: bool| Context {
+        now: t,
+        price_at: t,
+        balances_at: t,
+        price,
+        price_clamped: clamped,
+        ..context()
+    };
+    let dir = std::env::temp_dir().join(format!("stitch-module-clamped-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rt = runtime::Runtime::new(cfg.clone(), &dir, FEED).unwrap();
+    rt.decide(&at(now - 120, 1.0, false));
+    let middle = rt.decide(&at(now - 60, 1.5, true));
+    let last = rt.decide(&at(now, 1.0, false));
+    assert!(!middle.blocked, "a clamped print still quotes");
+    assert_eq!(last.volatility_bps, 0, "the clamped print was sampled");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let _ = std::fs::remove_dir_all(dir);
 }

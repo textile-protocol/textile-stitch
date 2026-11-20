@@ -15,9 +15,10 @@
 use alloy_primitives::U256;
 
 use crate::pricing::band::{level_within, order_vs_print_bps, order_within, price_wad, Order};
+use crate::pricing::clamped;
 use crate::pricing::feed::Quote;
 use crate::pricing::off_hours::{assess, covers};
-use crate::pricing::tick::{usable, Unusable};
+use crate::pricing::tick::{quotable, usable, Unusable};
 use crate::protocol::attest::{check_attestation, LiveVault, NavAttestation};
 use crate::protocol::types::OrderParams;
 
@@ -52,7 +53,9 @@ pub(super) fn order_refusal(
 /// new print, for the feed to flag it `degraded`, or for the jump guard to
 /// pull the feed, so a signature is only sent if it still passes the gates
 /// `respond` applied before signing: no print, or a stale or invalid one, is
-/// `StaleFeed`; a degraded one is `DegradedFeed`; out of band is `Busy`.
+/// `StaleFeed`; a degraded one that isn't a quotable clamp is `DegradedFeed`;
+/// out of band is `Busy`. A clamped one also has to be covered by the clamp
+/// extra the order was priced with: see [`clamp_refusal`].
 ///
 /// `priced` is the print the order was priced from, which a `feed_sides`
 /// pool needs ([`feed_sides_refusal`]), and so does a book that takes
@@ -69,10 +72,13 @@ pub(super) fn recheck_after_signing(
     priced_at: u64,
 ) -> Result<(), RejectReason> {
     let quote = prices.get(&book.feed_url).ok_or(RejectReason::StaleFeed)?;
-    usable(&quote, crate::time::unix_now(), book.staleness_secs).map_err(|why| match why {
+    quotable(&quote, crate::time::unix_now(), book.staleness_secs).map_err(|why| match why {
         Unusable::Degraded | Unusable::UnknownSession => RejectReason::DegradedFeed,
         Unusable::Stale | Unusable::BadPrice => RejectReason::StaleFeed,
     })?;
+    if let Some(reason) = clamp_refusal(book, priced, &quote) {
+        return Err(reason);
+    }
     if let Some(reason) = feed_sides_refusal(book, bid, priced, &quote) {
         return Err(reason);
     }
@@ -121,6 +127,26 @@ fn feed_sides_refusal(
         ask_now <= ask_then
     };
     (!held).then_some(RejectReason::Busy)
+}
+
+/// Whether an order priced off `priced` may still go out on the print the
+/// cache holds now, as far as a move clamp goes. The clamp extra the order
+/// was priced with must cover the one the current print requires
+/// ([`clamped::covers`]), else `Busy`: a live-priced order is too tight once
+/// the feed clamps, and a clamped one once the gap has outgrown its extra.
+/// With no pricing print (a module rebalance, which never prices off a
+/// clamp), a clamped print is `DegradedFeed`, as the strict gate would say.
+fn clamp_refusal(
+    book: &CorridorBook,
+    priced: Option<&Quote>,
+    current: &Quote,
+) -> Option<RejectReason> {
+    let extra = |quote: &Quote| clamped::pool_extra_bps(quote, book.clamped_extra_bps);
+    let now = extra(current);
+    let Some(priced) = priced else {
+        return now.is_some().then_some(RejectReason::DegradedFeed);
+    };
+    (!clamped::covers(extra(priced), now)).then_some(RejectReason::Busy)
 }
 
 /// Whether an order priced off `priced` at `priced_at` may still go out on
@@ -175,8 +201,10 @@ fn issuer_spread_refusal(
 }
 
 /// The print a NAV attestation is judged against: the book's cached print,
-/// through the same gate as a firm quote. No print, or a stale or invalid
-/// one, is `StaleFeed`; a degraded one is `DegradedFeed`. A print the jump
+/// through the strict gate ([`usable`]). No print, or a stale or invalid
+/// one, is `StaleFeed`; a degraded one, clamped included, is `DegradedFeed`:
+/// NAV marks the vault's inventory at the price itself, so a clamped print
+/// quoted wider elsewhere is still not one to vouch for. A print the jump
 /// guard holds is not cached, so it is `StaleFeed` too.
 pub(super) fn attest_print(
     prices: &PriceCache,
@@ -274,6 +302,8 @@ mod tests {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }
     }
 
@@ -384,6 +414,7 @@ mod tests {
 
     fn book(debt_decimals: u8, collateral_decimals: u8) -> CorridorBook {
         CorridorBook {
+            clamped_extra_bps: crate::pricing::clamped::DEFAULT_EXTRA_BPS,
             slug: "c".into(),
             collateral: alloy_primitives::Address::repeat_byte(1),
             debt: alloy_primitives::Address::repeat_byte(2),
@@ -491,6 +522,88 @@ mod tests {
             recheck(Some(quote(0.00065 * 0.8, now))),
             Err(RejectReason::Busy)
         );
+    }
+
+    #[test]
+    fn a_clamp_while_signing_withholds_orders_priced_narrower_than_it_needs() {
+        use crate::pricing::clamped::DegradedReason;
+        let now = crate::time::unix_now();
+        let clamped = |gap: Option<f64>| Quote {
+            degraded: true,
+            degraded_reason: DegradedReason::Clamped,
+            clamp_gap_bps: gap,
+            ..quote(0.00065, now)
+        };
+        let live = quote(0.00065, now);
+        let order = built(1_000_000, U256::from(1_538_461_538_461_538_461_538u128));
+        let b = CorridorBook {
+            clamped_extra_bps: 10,
+            ..book(6, 18)
+        };
+        let recheck = |current: Quote, priced: Option<&Quote>| {
+            let cache = PriceCache::new(None, JUMP);
+            cache.set(URL.to_string(), current);
+            recheck_after_signing(&cache, &order, true, &b, 1_500, priced, now)
+        };
+        // Priced live, the feed clamps while signing: too tight to send.
+        assert_eq!(
+            recheck(clamped(Some(4.0)), Some(&live)),
+            Err(RejectReason::Busy)
+        );
+        // Priced on the clamp, still clamped by as much or less: sent.
+        assert_eq!(recheck(clamped(Some(4.0)), Some(&clamped(None))), Ok(()));
+        assert_eq!(
+            recheck(clamped(Some(9.5)), Some(&clamped(Some(4.0)))),
+            Ok(())
+        );
+        // The gap outgrew the extra it was priced with: withheld.
+        assert_eq!(
+            recheck(clamped(Some(14.2)), Some(&clamped(Some(4.0)))),
+            Err(RejectReason::Busy)
+        );
+        // Back to live: a wider order is fine.
+        assert_eq!(recheck(live.clone(), Some(&clamped(Some(4.0)))), Ok(()));
+        // No pricing print (a module rebalance): a clamp reads as degraded.
+        assert_eq!(
+            recheck(clamped(Some(4.0)), None),
+            Err(RejectReason::DegradedFeed)
+        );
+        // A freeze while signing is degraded whatever it was priced on.
+        assert_eq!(
+            recheck(
+                Quote {
+                    degraded_reason: DegradedReason::Held,
+                    ..clamped(None)
+                },
+                Some(&clamped(None))
+            ),
+            Err(RejectReason::DegradedFeed)
+        );
+    }
+
+    #[test]
+    fn a_clamped_print_goes_through_the_jump_guard_and_a_held_one_does_not() {
+        use crate::pricing::clamped::DegradedReason;
+        let with = |price: f64, t: u64, reason: DegradedReason| Quote {
+            degraded: true,
+            degraded_reason: reason,
+            clamp_gap_bps: Some(4.0),
+            ..quote(price, t)
+        };
+        let cache = PriceCache::new(None, JUMP);
+        feed(&cache, &[(0.5, 100), (0.5, 101)]);
+        // A quotable clamp is judged like a live print: a 10x one is held.
+        admit(&cache, URL, with(5.0, 102, DegradedReason::Clamped));
+        assert!(cache.get(URL).is_none(), "readers see no price");
+        assert!(matches!(cache.hold(URL), Some(Hold::Jumped { .. })));
+        // An in-line one is cached and becomes the reference.
+        admit(&cache, URL, with(0.5005, 103, DegradedReason::Clamped));
+        assert_eq!(cache.get(URL).map(|q| q.price), Some(0.5005));
+        assert_eq!(cache.hold(URL), None);
+        // A held print is cached for the readers to refuse, unjudged.
+        admit(&cache, URL, with(5.0, 104, DegradedReason::Held));
+        assert_eq!(cache.get(URL).map(|q| q.price), Some(5.0));
+        assert_eq!(cache.hold(URL), None);
     }
 
     #[test]

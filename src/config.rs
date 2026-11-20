@@ -1108,6 +1108,15 @@ pub struct PoolConfig {
     /// wider and smaller. See [`crate::pricing::off_hours`].
     #[serde(default)]
     pub off_hours: Option<crate::pricing::off_hours::OffHoursConfig>,
+    /// Extra bps on both sides while the feed serves a move-clamped price
+    /// (`"degraded": true` with `"degradedReason": "clamped"`, Textile's cNGN
+    /// center held back to its per-sample move budget). The ladder, RFQ levels
+    /// and RFQ firm quotes keep quoting, this much wider, and at least as wide
+    /// as the feed's `clampGapBps`; the taker and closer sit the print out.
+    /// Defaults to [`crate::pricing::clamped::DEFAULT_EXTRA_BPS`]. A feed that
+    /// never sends the reason is unaffected. See [`crate::pricing::clamped`].
+    #[serde(default)]
+    pub clamped_extra_bps: Option<u32>,
     /// Optional venue slug override. Unset is fine: when `[rfq].enabled` the
     /// pool is solicitable and the bot matches quote requests by tokens.
     /// Kept so existing configs that already set it still parse.
@@ -1441,6 +1450,11 @@ impl PoolConfig {
     /// Seconds before expiry at which this side reposts, with the default applied.
     pub fn repost_lead_secs(&self) -> u64 {
         self.repost_lead_secs.unwrap_or(DEFAULT_REPOST_LEAD_SECS)
+    }
+    /// Extra bps on a clamped print, with the default applied.
+    pub fn clamped_extra_bps(&self) -> u32 {
+        self.clamped_extra_bps
+            .unwrap_or(crate::pricing::clamped::DEFAULT_EXTRA_BPS)
     }
     /// The bid spread for this pool, however the operator expressed it.
     pub fn buy_spread(&self) -> Option<Spread> {
@@ -2217,6 +2231,13 @@ impl Config {
             if let Some(url) = &pool.feed_url {
                 assert_feed_url(url, &format!("pools[{idx}].feed_url"))?;
             }
+            if let Some(extra) = pool.clamped_extra_bps {
+                let max = crate::pricing::clamped::MAX_EXTRA_BPS;
+                anyhow::ensure!(
+                    extra <= max,
+                    "pools[{idx}].clamped_extra_bps must be at most {max}, got {extra}"
+                );
+            }
             if let Some(off_hours) = &pool.off_hours {
                 let field = format!("pools[{idx}].off_hours");
                 off_hours.validate(&field)?;
@@ -2769,6 +2790,30 @@ mod tests {
             &format!("[[pools]]\noff_hours = {{ {block} }}\n"),
             1,
         )
+    }
+
+    #[test]
+    fn the_clamp_extra_defaults_and_is_bounded() {
+        let plain = Config::from_toml(EXAMPLE).unwrap();
+        assert!(plain.pools.iter().all(|p| p.clamped_extra_bps.is_none()));
+        assert_eq!(
+            plain.pools[0].clamped_extra_bps(),
+            crate::pricing::clamped::DEFAULT_EXTRA_BPS
+        );
+        let set = |raw: &str| {
+            Config::from_toml(&EXAMPLE.replacen(
+                "[[pools]]\n",
+                &format!("[[pools]]\nclamped_extra_bps = {raw}\n"),
+                1,
+            ))
+        };
+        assert_eq!(set("25").unwrap().pools[0].clamped_extra_bps(), 25);
+        // Zero widens by the feed's gap alone.
+        assert_eq!(set("0").unwrap().pools[0].clamped_extra_bps(), 0);
+        assert_eq!(set("5000").unwrap().pools[0].clamped_extra_bps(), 5_000);
+        let err = set("5001").unwrap_err().to_string();
+        assert!(err.contains("pools[0].clamped_extra_bps"), "{err}");
+        assert!(set("-1").is_err());
     }
 
     const OFF_HOURS: &str = "offshore_extra_bps = 40, held_extra_bps = 60, \

@@ -61,6 +61,9 @@ pub struct CorridorBook {
     /// (`issuer_spread_*_bps` on the pool); `None` when it takes none. See
     /// [`issuer_spread_book`].
     pub issuer_spread: Option<crate::pricing::issuer_spread::SpreadBounds>,
+    /// Extra bps on both sides of a move-clamped print (`clamped_extra_bps`
+    /// on the pool, default applied); see [`clamped_book`].
+    pub clamped_extra_bps: u32,
 }
 
 /// A corridor's inventory curve as the quote path reads it.
@@ -257,6 +260,7 @@ pub fn book_from_pool(
         feed_sides: pool.feed_sides,
         off_hours: pool.off_hours.clone(),
         issuer_spread: pool.issuer_spread_bounds(),
+        clamped_extra_bps: pool.clamped_extra_bps(),
         feed_url: pool.feed_request_url(default_feed_url),
     }))
 }
@@ -311,6 +315,38 @@ fn widened_book(book: &CorridorBook, mid: f64, off: OffHours) -> CorridorBook {
         sell_capacity_collateral: capped(book.sell_capacity_collateral, collateral_cap),
         ..book.clone()
     }
+}
+
+/// The book a move-clamped print quotes from, after every other step has set
+/// its spreads and capacity. A live print returns the book unchanged. A
+/// clamped one (see [`crate::pricing::clamped`]) widens both sides by the
+/// book's clamp extra, floored by the feed's `clampGapBps`, of their own
+/// price, the same way [`off_hours_book`] widens ([`widen_bid_spread`],
+/// [`widen_ask_spread`]), and leaves capacity alone: a clamp bounds how far
+/// the price moved, not how much the market can take.
+///
+/// Levels and firm quotes both get here through `module_book` with the same
+/// print, so the venue never sees levels tighter than the firm quote it
+/// would get. `None` for any other degraded print; the gates turn those away
+/// before this, so that only guards a caller that skipped them.
+pub fn clamped_book(
+    book: &CorridorBook,
+    quote: &crate::pricing::feed::Quote,
+) -> Option<CorridorBook> {
+    let Some(clamped) = crate::pricing::clamped::classify(quote).ok()? else {
+        return Some(book.clone());
+    };
+    let extra = crate::pricing::clamped::extra_bps(clamped, book.clamped_extra_bps);
+    let mid = quote.price;
+    Some(CorridorBook {
+        buy_spread: book
+            .buy_spread
+            .and_then(|s| widen_bid_spread(s, mid, extra)),
+        sell_spread: book
+            .sell_spread
+            .and_then(|s| widen_ask_spread(s, mid, extra)),
+        ..book.clone()
+    })
 }
 
 /// The book with an issuer's verified spread in place of the configured
@@ -1502,6 +1538,7 @@ mod tests {
 
     fn book() -> CorridorBook {
         CorridorBook {
+            clamped_extra_bps: crate::pricing::clamped::DEFAULT_EXTRA_BPS,
             slug: "cngn-usdc".into(),
             collateral: COLLATERAL.parse().unwrap(),
             debt: DEBT.parse().unwrap(),
@@ -1637,6 +1674,8 @@ mod tests {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }
     }
 

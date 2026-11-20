@@ -158,6 +158,7 @@ fn book(buy: Option<Spread>, sell: Option<Spread>) -> CorridorBook {
         feed_sides: false,
         off_hours: None,
         issuer_spread: None,
+        clamped_extra_bps: 10,
     }
 }
 
@@ -170,6 +171,7 @@ fn context(share: u32, base: (Option<u32>, Option<u32>)) -> Context {
         price: 1.0,
         price_at: NOW,
         price_degraded: false,
+        price_clamped: false,
         price_off_hours: false,
         balances_at: NOW,
         staleness_secs: 10,

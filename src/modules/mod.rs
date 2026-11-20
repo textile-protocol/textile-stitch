@@ -55,8 +55,15 @@ pub struct Context {
     pub now: u64,
     pub price: f64,
     pub price_at: u64,
-    /// The feed flagged `price` degraded: a held, clamped or fallback value.
+    /// The feed flagged `price` degraded and it isn't a quotable clamp: a
+    /// held or fallback value, or one without a reason this build knows.
+    /// Blocks every module decision.
     pub price_degraded: bool,
+    /// `price` is a move-clamped print (see [`crate::pricing::clamped`]).
+    /// Quotes still go out, widened by the RFQ path; like an off-hours
+    /// print it never enters the volatility window, spot rebalancing waits
+    /// for a live price, and manual sales are refused.
+    pub price_clamped: bool,
     /// `price` is an off-hours print (offshore or held, see
     /// [`crate::pricing::off_hours`]). Quotes still go out, widened and
     /// capped by the RFQ path; the price never enters the volatility window
@@ -120,7 +127,7 @@ pub fn evaluate(config: &ModulesConfig, ctx: &Context, history: &[PricePoint]) -
     if ctx.price_degraded {
         return blocked(
             d,
-            "Reference price is degraded (held, clamped or fallback); waiting for a live price",
+            "Reference price is degraded (held or fallback); waiting for a live price",
         );
     }
     let c_value = math::debt_for_collateral(
@@ -200,6 +207,11 @@ pub fn evaluate(config: &ModulesConfig, ctx: &Context, history: &[PricePoint]) -
             d.rebalance_sell = U256::ZERO;
             d.reasons
                 .push("Off-hours price; spot rebalancing waits for a live price".into());
+        }
+        if ctx.price_clamped && !d.rebalance_sell.is_zero() {
+            d.rebalance_sell = U256::ZERO;
+            d.reasons
+                .push("Clamped price; spot rebalancing waits for a live price".into());
         }
     }
     d

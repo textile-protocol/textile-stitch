@@ -312,6 +312,11 @@ fn pool_params(cfg: &Config, pool: &PoolConfig) -> Vec<(ParamKey, Param)> {
             BOOL,
             pool.feed_sides.then(|| "true".to_string()),
         ),
+        entry(
+            "clamped_extra_bps",
+            BPS,
+            pool.clamped_extra_bps.map(|v| v.to_string()),
+        ),
     ]
     .into_iter()
     .chain(

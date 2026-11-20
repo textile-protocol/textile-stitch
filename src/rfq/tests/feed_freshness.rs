@@ -70,6 +70,8 @@ async fn invalid_http_timestamps_clear_the_cache_and_cannot_fall_back() {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         assert!(!engine.level_frames(&prices, unix_now_ms()).is_empty());
@@ -152,6 +154,8 @@ async fn fresh_http_seconds_preserve_price_and_timestamp_and_failure_clears_them
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }
     );
     assert!(!is_stale(fetched.timestamp, now, 0));
@@ -243,6 +247,8 @@ async fn rfq_rechecks_held_timestamps_with_modules_off_shadow_live_and_rebalance
                     session: Default::default(),
                     market_at: None,
                     market_source: None,
+                    degraded_reason: Default::default(),
+                    clamp_gap_bps: None,
                 },
             );
             assert!(
@@ -299,6 +305,8 @@ fn rfq_levels_obey_exact_age_and_future_boundaries_after_clock_changes() {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         assert_eq!(
@@ -319,6 +327,8 @@ fn rfq_levels_obey_exact_age_and_future_boundaries_after_clock_changes() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         },
     );
     assert!(!engine.level_frames(&prices, now * 1_000).is_empty());
@@ -376,6 +386,8 @@ fn print(degraded: bool) -> PriceCache {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         },
     );
     prices
@@ -423,6 +435,8 @@ async fn a_degraded_print_older_than_the_window_reports_stale() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         },
     );
     let reply = engine
@@ -580,6 +594,8 @@ async fn nav_cosign_rejects_invalid_feed_before_rpc_and_signs_valid_seconds() {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         let reply = engine.cosign(req.clone(), &prices).await;
@@ -608,6 +624,8 @@ async fn nav_cosign_rejects_invalid_feed_before_rpc_and_signs_valid_seconds() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         },
     );
     let reply = engine.cosign(req.clone(), &prices).await;
@@ -713,6 +731,8 @@ async fn nav_cosign_refuses_a_degraded_print_before_any_rpc_read() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         },
     );
     let reply = engine.cosign(req.clone(), &prices).await;
@@ -741,6 +761,8 @@ async fn nav_cosign_refuses_a_degraded_print_before_any_rpc_read() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         },
     );
     assert!(matches!(

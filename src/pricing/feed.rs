@@ -3,12 +3,16 @@
 //! The price feed — a tiny interface any source can satisfy, plus one HTTP
 //! reference adapter. The feed only has to return a current price and a
 //! timestamp; operators point it at whatever source they trust. A feed may
-//! also flag a print `degraded`, and Stitch then quotes nothing off it.
+//! also flag a print `degraded`, and Stitch then quotes nothing off it,
+//! unless the feed says the print is only move-clamped (`degradedReason:
+//! "clamped"`), which maker-side quoting quotes wider (see
+//! [`crate::pricing::clamped`]).
 
 use anyhow::Context as _;
 use serde::Deserialize;
 
 use crate::net::http_client;
+use crate::pricing::clamped::{self, DegradedReason};
 use crate::pricing::issuer_spread::{lenient_slot, Gate, SpreadSlot};
 use crate::pricing::off_hours::{self, Session};
 use crate::pricing::tick::feed_age_secs;
@@ -27,6 +31,27 @@ pub struct Quote {
     /// unaffected. Only a boolean is accepted: anything else fails the fetch.
     #[serde(default)]
     pub degraded: bool,
+    /// Why the print is `degraded` (`degradedReason` on `/price`). Only
+    /// [`DegradedReason::Clamped`] makes a degraded print quotable, and only
+    /// for maker-side quoting; see [`crate::pricing::clamped`]. Read leniently:
+    /// missing is [`DegradedReason::Missing`], an unknown value
+    /// [`DegradedReason::Unknown`], and both keep a degraded print dark.
+    #[serde(
+        default,
+        rename = "degradedReason",
+        deserialize_with = "clamped::lenient_reason"
+    )]
+    pub degraded_reason: DegradedReason,
+    /// With a clamped reason: how far the clamp held the price back from the
+    /// market, in bps (`clampGapBps`). A clamped print widens by at least
+    /// this. `None` when absent; a malformed value reads as NaN, which
+    /// [`crate::pricing::clamped::classify`] refuses.
+    #[serde(
+        default,
+        rename = "clampGapBps",
+        deserialize_with = "clamped::lenient_gap"
+    )]
+    pub clamp_gap_bps: Option<f64>,
     /// The reference book the inventory curve anchors on (`reference` on
     /// `/price`). Absent on every feed that doesn't publish one, which is all
     /// of them except Textile's cNGN corridors; a curve corridor without it
@@ -497,6 +522,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             }
         );
         // /price adds metadata next to the quote; it is ignored, not refused.

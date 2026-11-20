@@ -288,7 +288,8 @@ You need:
 - RPC access for the target chain;
 - Textile indexer URL;
 - a price feed endpoint returning fresh `{ "price": ..., "timestamp": ... }`,
-  optionally with `"degraded": true` to pause quoting (see
+  optionally with `"degraded": true` to pause quoting, or to quote wider when
+  it adds `"degradedReason": "clamped"` (see
   [Price Feed](docs/ADVANCED.md#price-feed));
 - the Permit2 and reactor addresses for the target chain;
 - funded token balances for the sides you enable;
@@ -349,7 +350,9 @@ also checks held samples: age equal to its configured staleness limit is accepte
 and age above it is rejected. The ladder uses `staleness_secs`; RFQ and NAV
 retain their existing per-pool RFQ age limits. This rule applies with modules
 off, shadow or live, and before any TWAP fallback. The same decisions refuse a
-fresh print the feed flags `"degraded": true`.
+fresh print the feed flags `"degraded": true`, except that the ladder, RFQ
+levels and firm quotes quote a merely move-clamped one wider (see
+[Move-clamped prices](docs/ADVANCED.md#move-clamped-prices)).
 
 Amounts are atomic token units (e.g. 50,000 of a 6-decimal token is
 `50000000000`). The default `*_total_liquidity_*` value is `"max"`, which quotes
@@ -490,6 +493,16 @@ per-side size cap: `offshore_extra_bps`, `held_extra_bps`,
 `max_notional_debt`. It's off unless the block is there, and no shipped preset
 turns it on. See
 [Off-hours quoting](docs/ADVANCED.md#off-hours-quoting-session-bound-feeds).
+
+### Quoting a move-clamped price
+
+Textile's cNGN feed flags a center it held to its per-minute move budget with
+`"degradedReason": "clamped"` and `clampGapBps`. Stitch keeps the ladder, RFQ
+levels and firm quotes up through it, both sides wider by `clamped_extra_bps`
+(per pool, default 10) or the feed's gap, whichever is larger. The taker,
+closer, NAV co-signing and rebalancing wait for a live price, and held or
+fallback prices still take the pool dark. See
+[Move-clamped prices](docs/ADVANCED.md#move-clamped-prices).
 
 ## Security Notes
 

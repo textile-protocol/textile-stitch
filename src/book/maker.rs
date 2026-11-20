@@ -110,6 +110,20 @@ impl Side {
         }
     }
 
+    /// The price with a clamped print's extra applied, the same way as the
+    /// off-hours extra ([`Self::off_hours_price`]): `extra_bps` of the price
+    /// itself further from mid. `None` (a live print) passes the price
+    /// through; `None` comes back only for a price that wasn't positive.
+    pub fn clamped_price(self, price: f64, clamp_extra: Option<u32>) -> Option<f64> {
+        let Some(extra_bps) = clamp_extra else {
+            return Some(price);
+        };
+        match self {
+            Side::Bid => widen_bid_price(price, extra_bps),
+            Side::Ask => widen_ask_price(price, extra_bps),
+        }
+    }
+
     /// Most of the side's input token the side may commit off-hours: the
     /// debt cap itself on the bid, and on the ask the least collateral that
     /// sells for at least the cap at the ask `price`. The ask ladder sizes in
@@ -215,10 +229,10 @@ pub struct TickCtx<'a> {
 /// side, and the slot-nonce ledger.
 pub struct QuoteState {
     pub last_quote: HashMap<String, (f64, u64)>,
-    /// The off-hours policy each side's posted orders were built under,
-    /// keyed like `last_quote`. A change reposts the side whatever the price
-    /// did; see [`crate::pricing::off_hours::Policy`].
-    pub last_policy: HashMap<String, crate::pricing::off_hours::Policy>,
+    /// The off-hours policy and clamp extra each side's posted orders were
+    /// built under, keyed like `last_quote`. A change reposts the side
+    /// whatever the price did; see [`SidePolicy`].
+    pub last_policy: HashMap<String, SidePolicy>,
     /// The spread each side last posted at. An issuer can set or withdraw a
     /// spread between ticks, and that change reposts the side at once,
     /// whatever the price deadband says.
@@ -292,17 +306,19 @@ pub fn drafts_within_band(
         })
 }
 
-/// Whether a side's posted orders were built under another off-hours policy
-/// than the one in force: entering or leaving off-hours, or a held extra that
-/// grew. Those orders carry the wrong spread or size even when the price is
-/// inside the refresh deadband, so the side reposts. A side with nothing
-/// recorded counts as live, the policy of every pool without the block. Pure.
-pub fn policy_changed(
-    last: &HashMap<String, crate::pricing::off_hours::Policy>,
-    key_id: &str,
-    now: crate::pricing::off_hours::Policy,
-) -> bool {
-    last.get(key_id).copied().unwrap_or(None) != now
+/// What shapes a side's posted orders besides the price: the off-hours
+/// policy ([`crate::pricing::off_hours::Policy`]) and the clamp extra (`None`
+/// off a live print, see [`crate::pricing::clamped`]).
+pub type SidePolicy = (crate::pricing::off_hours::Policy, Option<u32>);
+
+/// Whether a side's posted orders were built under another policy than the
+/// one in force: entering or leaving off-hours, a held extra that grew, or a
+/// clamp starting, ending or changing its extra. Those orders carry the wrong
+/// spread or size even when the price is inside the refresh deadband, so the
+/// side reposts. A side with nothing recorded counts as live, the policy of
+/// every pool without the block on a feed that isn't clamped. Pure.
+pub fn policy_changed(last: &HashMap<String, SidePolicy>, key_id: &str, now: SidePolicy) -> bool {
+    last.get(key_id).copied().unwrap_or_default() != now
 }
 
 /// Whether a side reposts this tick: its price crossed the deadband or its
@@ -344,6 +360,7 @@ pub async fn quote_side(
     price_override: Option<f64>,
     guard: Option<SpotDeviationGuard>,
     off_hours: Option<OffHours>,
+    clamp_extra: Option<u32>,
     now: u64,
     post_sign_spot: impl std::future::Future<Output = Option<f64>>,
 ) -> SideOutcome {
@@ -356,12 +373,15 @@ pub async fn quote_side(
         price_override.unwrap_or_else(|| side.price(mid, spread)),
         guard,
     );
-    let Some(price) = side.off_hours_price(guarded, off_hours) else {
+    let Some(price) = side
+        .off_hours_price(guarded, off_hours)
+        .and_then(|p| side.clamped_price(p, clamp_extra))
+    else {
         return SideOutcome::held();
     };
     let key_id = side.key_id(pair);
     let label = side.label();
-    let policy = crate::pricing::off_hours::policy(off_hours);
+    let policy = (crate::pricing::off_hours::policy(off_hours), clamp_extra);
     if !policy_changed(&state.last_policy, &key_id, policy)
         && !requotes(
             state.last_quote.get(&key_id).copied(),
@@ -1034,23 +1054,56 @@ mod tests {
         use crate::pricing::off_hours::{policy, Session};
         let mut last = HashMap::new();
         // Nothing recorded reads as live: a plain pool never trips this.
-        assert!(!policy_changed(&last, "buy:p", None));
+        assert!(!policy_changed(&last, "buy:p", (None, None)));
         let held = |extra| {
-            policy(Some(OffHours {
-                session: Session::Held,
-                market_age_secs: 0,
-                extra_bps: extra,
-                max_notional_debt: 5,
-            }))
+            (
+                policy(Some(OffHours {
+                    session: Session::Held,
+                    market_age_secs: 0,
+                    extra_bps: extra,
+                    max_notional_debt: 5,
+                })),
+                None,
+            )
         };
         assert!(policy_changed(&last, "buy:p", held(100)));
-        last.insert("buy:p".to_string(), None);
+        last.insert("buy:p".to_string(), (None, None));
         assert!(policy_changed(&last, "buy:p", held(100)));
         last.insert("buy:p".to_string(), held(100));
         assert!(!policy_changed(&last, "buy:p", held(100)));
         // The held extra grew, or the market reopened.
         assert!(policy_changed(&last, "buy:p", held(105)));
-        assert!(policy_changed(&last, "buy:p", None));
+        assert!(policy_changed(&last, "buy:p", (None, None)));
+    }
+
+    #[test]
+    fn a_side_reposts_when_the_feed_clamps_unclamps_or_the_extra_changes() {
+        let mut last = HashMap::new();
+        // Orders posted off a live print must not sit through a clamp at
+        // their live spread, nor stay wide once the feed is live again.
+        assert!(policy_changed(&last, "sell:p", (None, Some(10))));
+        last.insert("sell:p".to_string(), (None, Some(10)));
+        assert!(!policy_changed(&last, "sell:p", (None, Some(10))));
+        assert!(policy_changed(&last, "sell:p", (None, Some(15))));
+        assert!(policy_changed(&last, "sell:p", (None, None)));
+    }
+
+    #[test]
+    fn a_clamped_print_widens_both_ladder_sides_away_from_mid() {
+        let (bid, ask) = (0.000690, 0.000698);
+        assert_eq!(Side::Bid.clamped_price(bid, None), Some(bid));
+        assert_eq!(Side::Ask.clamped_price(ask, None), Some(ask));
+        let wide_bid = Side::Bid.clamped_price(bid, Some(10)).unwrap();
+        let wide_ask = Side::Ask.clamped_price(ask, Some(10)).unwrap();
+        assert!((wide_bid - bid * 0.999).abs() < 1e-15, "{wide_bid}");
+        assert!((wide_ask - ask * 1.001).abs() < 1e-15, "{wide_ask}");
+        // Off-hours and clamp extras compound when both apply.
+        let both = Side::Bid
+            .off_hours_price(bid, off_hours(70, 1))
+            .and_then(|p| Side::Bid.clamped_price(p, Some(10)))
+            .unwrap();
+        assert!(both < wide_bid);
+        assert_eq!(Side::Bid.clamped_price(0.0, Some(10)), None);
     }
 
     fn off_hours(extra_bps: u32, max_notional_debt: u128) -> Option<OffHours> {

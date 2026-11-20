@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use super::anchor::Anchor;
 use super::feed::Quote;
 use super::jump::{observe, Hold, JumpGuard, Print, PrintHistory, Verdict};
-use super::tick::usable;
+use super::tick::quotable;
 
 /// One admission policy for every producer. Freshness is the widest window
 /// of any consumer on these feeds; readers still check their own windows.
@@ -43,7 +43,10 @@ struct FeedState {
 
 /// Cloneable handle to the process's guarded prices. An unusable quote is
 /// retained so consumers can distinguish degraded from stale; it never
-/// moves the jump history. A held print or failed fetch leaves no quote.
+/// moves the jump history. A move-clamped print is quotable (see
+/// [`crate::pricing::clamped`]), so it goes through the jump guard like a
+/// live one and moves the history. A held print or failed fetch leaves no
+/// quote.
 #[derive(Clone)]
 pub struct PriceCache {
     feeds: Arc<Mutex<HashMap<String, FeedState>>>,
@@ -112,7 +115,7 @@ impl PriceCache {
             state.anchor = Some(anchor);
             state.history = history;
         }
-        if usable(&quote, now, policy.staleness_secs).is_err() {
+        if quotable(&quote, now, policy.staleness_secs).is_err() {
             state.quote = Some(quote);
             state.hold = None;
             return state.history;
@@ -244,6 +247,8 @@ mod tests {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }
     }
 
@@ -399,6 +404,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             };
             tick.admit(poll(now), URL, bad.clone(), now);
             assert_eq!(rfq.get(URL), Some(bad));

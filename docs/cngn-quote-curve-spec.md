@@ -495,8 +495,11 @@ checks the reference itself: if the reference mid or buy is more than 1%
 off the raw mid only by the half-range on a `buy`/`sell` alignment and, in Preview, the manual
 adjustments (at most ±1 NGN, about 7 bps), so 1% is a bad value, not a market.
 
-**Stale or degraded feed.** Unchanged: the existing `usable()` gate refuses the corridor
-outright. This is a different condition from a missing half-range, and must stay different.
+**Stale or degraded feed.** The maker-side gate (`quotable()`) refuses the corridor outright on
+a stale print and on a held or fallback one. This is a different condition from a missing
+half-range, and must stay different. The one degraded print it passes is a move-clamped center
+(`degradedReason: "clamped"`): `/price` serves it without `reference`, so a curve corridor
+answers flat at its configured spread widened for the clamp, until the next unclamped sample.
 
 ## 10. The anchor is the raw Bybit mid
 

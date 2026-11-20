@@ -707,6 +707,7 @@ mod tests {
 
     fn book() -> CorridorBook {
         CorridorBook {
+            clamped_extra_bps: crate::pricing::clamped::DEFAULT_EXTRA_BPS,
             slug: "cngn-usdt".into(),
             collateral: Address::repeat_byte(0xc1),
             debt: Address::repeat_byte(0xd1),
@@ -819,6 +820,8 @@ mod tests {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
             spread: Default::default(),
         }
     }

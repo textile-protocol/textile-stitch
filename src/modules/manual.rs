@@ -101,6 +101,12 @@ impl Sale {
             cfg.is_live(Module::Rebalance) && cfg.rebalance.method == RebalanceMethod::Manual,
             "Manual sales require enabled live spot rebalancing"
         );
+        // A manual sale trades at the reference price itself, so a clamped
+        // print (quoted wider by the RFQ path) isn't one it can sell at.
+        ensure!(
+            !ctx.price_clamped,
+            "Reference price is clamped; manual sales wait for a live price"
+        );
         // Share the live module's freshness and NAV gates, without requiring a
         // volatility warmup merely to compute the manual sale limit.
         let mut policy = cfg.clone();
@@ -221,6 +227,7 @@ mod tests {
             price: 1.0,
             price_at: 1000,
             price_degraded: false,
+            price_clamped: false,
             price_off_hours: false,
             balances_at: 1000,
             staleness_secs: 10,
@@ -266,6 +273,10 @@ mod tests {
             },
             Context {
                 price_degraded: true,
+                ..ctx
+            },
+            Context {
+                price_clamped: true,
                 ..ctx
             },
             Context {

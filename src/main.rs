@@ -38,12 +38,13 @@ use stitch_bot::closer::runner::{close_pool_once, CloseOutcome, CloserPool};
 use stitch_bot::closer::strategy::{PoolParams, StrategyConfig};
 use stitch_bot::config::{Config, PoolConfig};
 use stitch_bot::pricing::cache::{FeedPolicy, PriceCache};
+use stitch_bot::pricing::clamped;
 use stitch_bot::pricing::feed::{HttpFeed, PriceFeed, Quote};
 use stitch_bot::pricing::lean::{LeanDecision, LeanMode, LeanParams, LeanState};
 use stitch_bot::pricing::off_hours::{self, OffHours, Session};
 use stitch_bot::pricing::quote::oracle_rate_ray;
 use stitch_bot::pricing::quote::{ask_price, bid_price, SpotDeviationGuard};
-use stitch_bot::pricing::tick::{usable, Unusable};
+use stitch_bot::pricing::tick::{quotable, usable, Unusable};
 use stitch_bot::pricing::twap::Twap;
 use stitch_bot::setup;
 use stitch_bot::signer::{address_from_signing_key, build_signer};
@@ -211,6 +212,13 @@ impl FeedGuards {
     /// from: an issuer spread set, changed or withdrawn while the signer
     /// worked withholds it too, as on the RFQ path (`recheck_after_signing`),
     /// since the band alone can't see a few bps of spread.
+    ///
+    /// A move-clamped print passes the maker-side gate ([`quotable`]) here
+    /// too, and the clamp extra the batch was priced with (`priced_clamp`,
+    /// `None` off a live print) must cover the one the print requires now
+    /// ([`clamped::covers`]): live-priced orders don't post once the feed
+    /// clamps, nor do clamped ones once the gap has grown past their extra.
+    #[allow(clippy::too_many_arguments)]
     async fn revalidate(
         &mut self,
         feed_url: &str,
@@ -218,20 +226,27 @@ impl FeedGuards {
         config: Option<&off_hours::OffHoursConfig>,
         priced: Option<OffHours>,
         priced_quote: &Quote,
+        clamped_extra_bps: u32,
+        priced_clamp: Option<u32>,
     ) -> Option<f64> {
         self.fetched.remove(feed_url);
         let quote = self.fetch(feed_url, feed).await?;
         let now = unix_now();
-        usable(&quote, now, self.staleness_secs).ok()?;
+        let clamp_now = quotable(&quote, now, self.staleness_secs)
+            .ok()?
+            .map(|c| clamped::extra_bps(c, clamped_extra_bps));
         let current = off_hours::assess(&quote, config, now).ok()?;
         (off_hours::covers(priced, current)
+            && clamped::covers(priced_clamp, clamp_now)
             && quote.spread.offsets() == priced_quote.spread.offsets())
         .then_some(quote.price)
     }
 
     /// Async work earlier in the pool may have let either loop supersede
     /// its snapshot. Do not start another leg using that old price surface,
-    /// price and issuer spread alike.
+    /// price and issuer spread alike. The strict gate ([`usable`]): this
+    /// guards the taker and closer, which never act on a degraded print,
+    /// clamped included.
     fn is_current(&self, feed_url: &str, quote: &Quote) -> bool {
         let now = unix_now();
         self.prices.get(feed_url).is_some_and(|current| {
@@ -268,6 +283,32 @@ fn log_session_change(
         ),
         None => {
             info!(feed = %stitch_bot::changelog::params::redact(&feed_url), session = quote.session.label(), "live price: quoting as configured")
+        }
+    }
+}
+
+/// Log when a pool starts or stops quoting a move-clamped print, with the
+/// extra in effect. Quiet while it holds, and while the feed is live.
+fn log_clamp_change(
+    last: &mut HashMap<usize, Option<u32>>,
+    pool_idx: usize,
+    feed_url: &str,
+    quote: &Quote,
+    clamp_extra: Option<u32>,
+) {
+    let before = last.insert(pool_idx, clamp_extra).flatten();
+    if before == clamp_extra {
+        return;
+    }
+    match clamp_extra {
+        Some(extra_bps) => info!(
+            feed = %stitch_bot::changelog::params::redact(feed_url),
+            extra_bps,
+            gap_bps = quote.clamp_gap_bps.unwrap_or(0.0),
+            "feed price is move-clamped: quoting wider; taker and closer sit it out"
+        ),
+        None => {
+            info!(feed = %stitch_bot::changelog::params::redact(feed_url), "feed price is no longer clamped: quoting as configured")
         }
     }
 }
@@ -1094,6 +1135,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
     let mut last_heartbeat: HashMap<String, u64> = HashMap::new();
     // Per pool index: the feed session last quoted on, to log transitions.
     let mut last_sessions: HashMap<usize, Session> = HashMap::new();
+    let mut last_clamps: HashMap<usize, Option<u32>> = HashMap::new();
     const HEARTBEAT_SECS: u64 = 60;
     let slot_nonce_state_path = slot_nonce_state_path(&config_path, cfg.chain_id, maker);
     let initial_next_nonce = unix_now().saturating_mul(1000);
@@ -1231,9 +1273,12 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             // one: go dark for the pool instead of letting the maker, taker,
             // closer — or a TWAP carrying an old valid sample — keep quoting
             // through it. Skipping before `observe` also keeps the print out
-            // of the TWAP.
-            match usable(&quote, now, cfg.feed.staleness_secs) {
-                Ok(()) => {}
+            // of the TWAP. The one degraded print the ladder quotes is a
+            // move-clamped one (see `pricing::clamped`): `clamped` carries
+            // it, the book below widens for it, and the taker and closer sit
+            // it out.
+            let clamped = match quotable(&quote, now, cfg.feed.staleness_secs) {
+                Ok(clamped) => clamped,
                 Err(Unusable::Stale) => {
                     warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), feed_ts = quote.timestamp, now, "stale or invalid feed timestamp; skipping pool");
                     continue;
@@ -1243,14 +1288,14 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                     continue;
                 }
                 Err(Unusable::Degraded) => {
-                    warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), price = quote.price, "feed flagged the price degraded (held, clamped or fallback); skipping pool");
+                    warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), price = quote.price, reason = quote.degraded_reason.label(), "feed flagged the price degraded (held, fallback or no quotable reason); skipping pool");
                     continue;
                 }
                 Err(Unusable::UnknownSession) => {
                     warn!(feed = %stitch_bot::changelog::params::redact(&feed_url), price = quote.price, "feed labelled the price with an unknown session; skipping pool");
                     continue;
                 }
-            }
+            };
             // A session-bound feed's offshore or held print: quoted wider and
             // smaller, and only by a pool with an off_hours block. A live
             // print (every other feed) leaves everything below unchanged.
@@ -1268,6 +1313,10 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             let pool =
                 pool.with_issuer_spread(quote.spread.verified(), cfg.issuer_spread_even_only());
             let pool: &PoolConfig = &pool;
+            // A clamped print widens both sides by the pool's extra, floored
+            // by the feed's gap. `None` on a live print.
+            let clamp_extra = clamped.map(|c| clamped::extra_bps(c, pool.clamped_extra_bps()));
+            log_clamp_change(&mut last_clamps, pool_idx, feed_url, &quote, clamp_extra);
             let (debt, collateral): (Address, Address) =
                 match (pool.debt.parse(), pool.collateral.parse()) {
                     (Ok(d), Ok(c)) => (d, c),
@@ -1377,6 +1426,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         price_override,
                         guard,
                         off_hours,
+                        clamp_extra,
                         now,
                         feed_guards.revalidate(
                             feed_url,
@@ -1384,6 +1434,8 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                             pool.off_hours.as_ref(),
                             off_hours,
                             &quote,
+                            pool.clamped_extra_bps(),
+                            clamp_extra,
                         ),
                     )
                     .await;
@@ -1419,6 +1471,7 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
                         mid,
                         bids_posted = posted_bid,
                         asks_posted = posted_ask,
+                        clamp_extra_bps = clamp_extra.unwrap_or(0),
                         "tick"
                     ),
                     Some(off) => info!(
@@ -1437,7 +1490,10 @@ async fn run(config_path: String, dry_run: bool) -> anyhow::Result<()> {
             // The taker and closer fill on-chain at this tick's price. Neither
             // has a size the off-hours cap could bound, so both sit out until
             // the session is live again; the book above is the off-hours quote.
-            if off_hours.is_some() {
+            // The same goes for a move-clamped print: they act on the price
+            // itself, not around it, so they wait for a live one. (`is_current`
+            // below refuses any degraded print too; this says so up front.)
+            if off_hours.is_some() || clamp_extra.is_some() {
                 continue 'pools;
             }
             // ----- Taker leg: fill users' resting limit orders that crossed our
@@ -1619,6 +1675,8 @@ mod tests {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }
     }
 
@@ -1762,7 +1820,7 @@ mod tests {
         assert_eq!(tick.fetch("a", &feed).await, Some(live.clone()));
         let cfg = off_hours_config();
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), None, &quote(1.0, 0))
+            tick.revalidate("a", &feed, Some(&cfg), None, &quote(1.0, 0), 10, None)
                 .await,
             Some(1.0)
         );
@@ -1775,14 +1833,14 @@ mod tests {
         };
         *feed.0.write().unwrap() = Some(held.clone());
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), None, &quote(1.0, 0))
+            tick.revalidate("a", &feed, Some(&cfg), None, &quote(1.0, 0), 10, None)
                 .await,
             None
         );
         assert!(!tick.is_current("a", &live));
         let priced = off_hours::assess(&held, Some(&cfg), now).unwrap();
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0))
+            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0), 10, None)
                 .await,
             Some(1.0)
         );
@@ -1819,7 +1877,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(tick.fetch("a", &feed).await, Some(drafted.clone()));
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0))
+            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0), 10, None)
                 .await,
             Some(1.0)
         );
@@ -1827,7 +1885,7 @@ mod tests {
         let past = held_since(7_260);
         *feed.0.write().unwrap() = Some(past);
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0))
+            tick.revalidate("a", &feed, Some(&cfg), priced, &quote(1.0, 0), 10, None)
                 .await,
             None
         );
@@ -1835,10 +1893,63 @@ mod tests {
         let tighter = off_hours::assess(&held_since(60), Some(&cfg), now).unwrap();
         *feed.0.write().unwrap() = Some(drafted);
         assert_eq!(
-            tick.revalidate("a", &feed, Some(&cfg), tighter, &quote(1.0, 0))
+            tick.revalidate("a", &feed, Some(&cfg), tighter, &quote(1.0, 0), 10, None)
                 .await,
             None
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clamp_while_signing_withholds_a_batch_priced_narrower() {
+        use stitch_bot::pricing::clamped::DegradedReason;
+        let now = unix_now();
+        let rfq = prices();
+        let mut tick = guards(rfq.clone());
+        let live = quote(1.0, now);
+        let clamped = |gap: f64| Quote {
+            degraded: true,
+            degraded_reason: DegradedReason::Clamped,
+            clamp_gap_bps: Some(gap),
+            ..live.clone()
+        };
+        let feed = MutableFeed(std::sync::RwLock::new(Some(live.clone())));
+        rfq.admit(tokio::time::Instant::now(), "a", live.clone(), now);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(tick.fetch("a", &feed).await, Some(live.clone()));
+        async fn revalidate(
+            tick: &mut FeedGuards,
+            feed: &MutableFeed,
+            priced: &Quote,
+            priced_clamp: Option<u32>,
+        ) -> Option<f64> {
+            tick.revalidate("a", feed, None, None, priced, 10, priced_clamp)
+                .await
+        }
+        // Priced live, still live.
+        assert_eq!(revalidate(&mut tick, &feed, &live, None).await, Some(1.0));
+        // The feed clamps while the live-priced batch is signed: withheld.
+        *feed.0.write().unwrap() = Some(clamped(4.0));
+        assert_eq!(revalidate(&mut tick, &feed, &live, None).await, None);
+        // A batch priced on the clamp posts.
+        assert_eq!(
+            revalidate(&mut tick, &feed, &live, Some(10)).await,
+            Some(1.0)
+        );
+        // ...until the gap outgrows the extra it was priced with.
+        *feed.0.write().unwrap() = Some(clamped(12.5));
+        assert_eq!(revalidate(&mut tick, &feed, &live, Some(10)).await, None);
+        assert_eq!(
+            revalidate(&mut tick, &feed, &live, Some(13)).await,
+            Some(1.0)
+        );
+        // A freeze is never posted through.
+        *feed.0.write().unwrap() = Some(Quote {
+            degraded_reason: DegradedReason::Held,
+            ..clamped(0.0)
+        });
+        assert_eq!(revalidate(&mut tick, &feed, &live, Some(50)).await, None);
+        // The taker and closer gate refuses a clamped print outright.
+        assert!(!tick.is_current("a", &clamped(4.0)));
     }
 
     struct MutableFeed(std::sync::RwLock<Option<Quote>>);
@@ -2016,7 +2127,7 @@ mod tests {
                     1.0,
                     async {
                         guards
-                            .revalidate("feed", &feed, None, None, &quote(1.0, now))
+                            .revalidate("feed", &feed, None, None, &quote(1.0, now), 10, None)
                             .await
                             .is_some_and(|spot| {
                                 drafts_within_band(Side::Ask, &pool, &drafts, spot, 100)

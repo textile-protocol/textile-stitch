@@ -199,12 +199,14 @@ impl Engine {
     /// Fold this tick's naira balance into profit unwind's cost basis and
     /// refresh its snapshot when due, saving it when it moved. The feed price,
     /// not the reference mid, values the naira: the bot marks cNGN off its own
-    /// feed.
+    /// feed. Only a live price marks it: a move-clamped one is quoted (wider)
+    /// but never marked, like any degraded print, and a balance that moved
+    /// meanwhile folds in at the next live one.
     pub(super) fn observe_unwind(&self, book: &CorridorBook, quote: &Quote, now: u64) {
         let Some(unwind) = &self.unwind else {
             return;
         };
-        if !(quote.price.is_finite() && quote.price > 0.0) {
+        if !(quote.price.is_finite() && quote.price > 0.0) || quote.degraded {
             return;
         }
         let Some(holdings) = self.share_holdings(book, now) else {
@@ -342,7 +344,10 @@ impl Engine {
             now,
             price: quote.price,
             price_at: quote.timestamp,
-            price_degraded: quote.degraded,
+            // A clamped print is quoted (wider, by `module_book`), so it
+            // doesn't block the policy; it's flagged on its own instead.
+            price_degraded: crate::pricing::clamped::classify(quote).is_err(),
+            price_clamped: matches!(crate::pricing::clamped::classify(quote), Ok(Some(_))),
             price_off_hours: !quote.session.is_live(),
             balances_at: balances.at,
             staleness_secs: book.staleness_secs,
@@ -369,7 +374,9 @@ impl Engine {
     /// off-hours extra and size cap go last
     /// ([`super::responder::off_hours_book`]), so they widen and shrink
     /// whatever the earlier steps chose, an issuer's spread included; `None`
-    /// when the print is one this pool can't quote off-hours.
+    /// when the print is one this pool can't quote off-hours. A move-clamped
+    /// print's extra goes on after that ([`super::responder::clamped_book`]),
+    /// so the levels and firm quotes both widen from the same print.
     pub(super) fn module_book(
         &self,
         book: &CorridorBook,
@@ -380,12 +387,14 @@ impl Engine {
         let book = issuer.as_ref().unwrap_or(book);
         let Some(modules) = &self.modules else {
             return super::responder::feed_sides_book(book, quote)
-                .and_then(|b| super::responder::off_hours_book(&b, quote, now).ok());
+                .and_then(|b| super::responder::off_hours_book(&b, quote, now).ok())
+                .and_then(|b| super::responder::clamped_book(&b, quote));
         };
         self.policy_book(modules, book, quote, now)
             .and_then(|b| super::responder::feed_sides_book(&b, quote))
             .map(|b| self.liquidity_capped(modules, b, now))
             .and_then(|b| super::responder::off_hours_book(&b, quote, now).ok())
+            .and_then(|b| super::responder::clamped_book(&b, quote))
     }
     /// While a liquidity cap is in force, no quote may promise settlement
     /// beyond it. Applies in every module mode that has a cap set,

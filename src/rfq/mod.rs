@@ -69,7 +69,7 @@ use crate::closer::executor::{encode_allowance, encode_balance_of};
 use crate::config::{rfq_staleness_secs_for_pool, Config};
 use crate::pricing::feed::{HttpFeed, PriceFeed, Quote};
 use crate::pricing::off_hours;
-use crate::pricing::tick::{usable, Unusable};
+use crate::pricing::tick::{quotable, Unusable};
 use crate::protocol::attest::{
     check_attestation, check_window, price_wad, LiveVault, NavAttestation,
 };
@@ -1852,10 +1852,12 @@ impl Engine {
             .reserved_paying(&format!("{token:#x}"), slugs, bid, now_secs)
     }
 
-    /// Levels for every corridor whose feed print passes [`usable`]. A
+    /// Levels for every corridor whose feed print passes [`quotable`]. A
     /// stale, degraded or missing print publishes nothing — the venue's >5 s
     /// gap rule takes the corridor dark, so it stops routing RFQs that
-    /// [`Self::respond`] would refuse anyway.
+    /// [`Self::respond`] would refuse anyway. A move-clamped print publishes
+    /// levels widened by `module_book`, the same book a firm quote on that
+    /// print prices from.
     fn level_frames(&mut self, prices: &PriceCache, now_ms: u64) -> Vec<MakerFrame> {
         use crate::modules::runtime::QuoteState;
         self.sync_vault_epoch();
@@ -1915,7 +1917,7 @@ impl Engine {
                     }
                     return None;
                 };
-                if let Err(why) = usable(&quote, now_secs, book.staleness_secs) {
+                if let Err(why) = quotable(&quote, now_secs, book.staleness_secs) {
                     if let Some(modules) = &self.modules {
                         modules.quote_status(QuoteState::StalePrice, unusable_price_status(why), now_secs);
                     }
@@ -2138,9 +2140,10 @@ impl Engine {
             return reject(RejectReason::StaleFeed);
         };
         // The book's own window, not the runtime's: this is the firm-quote
-        // gate, so it must match the one the levels were published under.
-        match usable(&quote, now_secs, book.staleness_secs) {
-            Ok(()) => {}
+        // gate, so it must match the one the levels were published under. A
+        // move-clamped print passes, and `module_book` widens it below.
+        match quotable(&quote, now_secs, book.staleness_secs) {
+            Ok(_) => {}
             Err(Unusable::Degraded | Unusable::UnknownSession) => {
                 return reject(RejectReason::DegradedFeed)
             }
@@ -3127,7 +3130,7 @@ fn unusable_price_status(why: Unusable) -> &'static str {
             "Reference price is stale, future-dated or invalid. Check the price feed."
         }
         Unusable::Degraded => {
-            "The price feed flagged its price as degraded (a held, clamped or fallback value). Quoting is paused until it serves a live price again."
+            "The price feed flagged its price as degraded (a held or fallback value). Quoting is paused until it serves a live price again. A price that is only clamped is quoted, wider."
         }
         Unusable::UnknownSession => {
             "The price feed labelled its price with a session this Stitch doesn't know. Quoting is paused until it serves a live price again."
@@ -3761,6 +3764,7 @@ async fn read_vault_inventory(
 
 #[cfg(test)]
 mod tests {
+    mod clamped;
     mod feed_freshness;
     mod off_hours;
     mod price_guard;
@@ -4870,6 +4874,7 @@ mod tests {
         Engine {
             recall: None,
             books: vec![CorridorBook {
+                clamped_extra_bps: crate::pricing::clamped::DEFAULT_EXTRA_BPS,
                 slug: "cngn-usdc".into(),
                 collateral: COLLATERAL.parse().unwrap(),
                 debt: DEBT.parse().unwrap(),
@@ -5273,6 +5278,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         prices
@@ -5399,6 +5406,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         prices
@@ -5501,6 +5510,8 @@ mod tests {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }
     }
 
@@ -6202,6 +6213,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         prices
@@ -6534,6 +6547,35 @@ mod tests {
                 .unwrap(),
             t
         );
+    }
+
+    /// A move-clamped print is quoted, wider, but profit unwind never marks
+    /// its basis at it: the first mark waits for a live print.
+    #[test]
+    fn a_clamped_print_never_marks_the_unwind_basis() {
+        use crate::modules::Mode;
+        let prices = fresh_prices_with_reference();
+        let live = prices.get("http://feed").unwrap();
+        let clamped = Quote {
+            degraded: true,
+            degraded_reason: crate::pricing::clamped::DegradedReason::Clamped,
+            clamp_gap_bps: Some(4.0),
+            ..live.clone()
+        };
+        let mut engine = curve_engine(Mode::Live);
+        let book = engine.books[0].clone();
+        let now = unix_now();
+        engine.unwind = Some(modules::Unwind::with_tracker(
+            unwind_params(2.0),
+            true,
+            "cngn-usdc",
+            foreign_unwind_tracker(9.0),
+        ));
+        let before = engine.unwind.as_ref().unwrap().tracker("cngn-usdc");
+        engine.observe_unwind(&book, &clamped, now);
+        assert_eq!(engine.unwind.as_ref().unwrap().tracker("cngn-usdc"), before);
+        engine.observe_unwind(&book, &live, now);
+        assert_ne!(engine.unwind.as_ref().unwrap().tracker("cngn-usdc"), before);
     }
 
     /// The levels a Live curve publishes come off the same curve as its firm
@@ -6905,6 +6947,7 @@ mod tests {
 
     fn off_pair_book() -> CorridorBook {
         CorridorBook {
+            clamped_extra_bps: crate::pricing::clamped::DEFAULT_EXTRA_BPS,
             slug: "other-usdc".into(),
             collateral: OTHER.parse().unwrap(),
             debt: DEBT.parse().unwrap(),
@@ -7002,6 +7045,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         assert!(cache.get("http://feed").is_some());
@@ -7021,6 +7066,8 @@ mod tests {
                     session: Default::default(),
                     market_at: None,
                     market_source: None,
+                    degraded_reason: Default::default(),
+                    clamp_gap_bps: None,
                 },
                 unix_now(),
             );
@@ -7051,6 +7098,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             }),
         );
         assert_eq!(cache.get("http://feed").unwrap().price, 2.0);
@@ -7058,6 +7107,7 @@ mod tests {
 
     fn test_book() -> CorridorBook {
         CorridorBook {
+            clamped_extra_bps: crate::pricing::clamped::DEFAULT_EXTRA_BPS,
             slug: String::new(),
             collateral: COLLATERAL.parse().unwrap(),
             debt: DEBT.parse().unwrap(),
@@ -7944,6 +7994,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         let reply = engine.respond(exact_input_request("rfq_2"), &stale).await;
@@ -8463,6 +8515,8 @@ mod tests {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
         );
         let _ = engine.level_frames(&prices, unix_now_ms());

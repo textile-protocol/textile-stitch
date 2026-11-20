@@ -42,21 +42,61 @@ Check:
 A feed can also send `"degraded": true` to say the price is protected rather
 than live. Textile's `/price` does this on the cNGN corridors when it serves a
 frozen or move-clamped center, or falls back to raw Monierate because it has no
-sample at all:
+sample at all, and says which in `degradedReason`:
 
 ```json
-{ "price": 0.000724, "timestamp": 1760000000, "degraded": true }
+{ "price": 0.000724, "timestamp": 1760000000, "degraded": true, "degradedReason": "held" }
 ```
 
-The field is optional. Leave it out, as the market-rate corridors on `/price`
-do, and nothing changes. A value other than `true` or `false` fails the fetch.
+The fields are optional. Leave them out, as the market-rate corridors on
+`/price` do, and nothing changes. A `degraded` value other than `true` or
+`false` fails the fetch.
 
-If the feed is stale or degraded, Stitch stops trading that pool rather than
-pricing off an old or held number. The ladder, limit-order taker and closer
-skip the pool for the tick. RFQ publishes no levels and rejects quote requests
-(`stale_feed` or `degraded_feed`), NAV co-signing refuses, and modules block
-their decisions. Quoting resumes on the first live print. A print that is both
-degraded and older than the window is reported as stale.
+If the feed is stale, or degraded for any reason other than `clamped`, Stitch
+stops trading that pool rather than pricing off an old or held number. The
+ladder, limit-order taker and closer skip the pool for the tick. RFQ publishes
+no levels and rejects quote requests (`stale_feed` or `degraded_feed`), NAV
+co-signing refuses, and modules block their decisions. Quoting resumes on the
+first live print. A print that is both degraded and older than the window is
+reported as stale. `degradedReason` values are `clamped`, `held` and
+`fallback`; a degraded print without one (an older API), or with a value this
+build doesn't know, counts as held.
+
+#### Move-clamped prices
+
+Textile's cNGN center may only move so far per sample (a minute). When the
+market moves further, `/price` serves the center moved by that budget and flags
+it `"degraded": true, "degradedReason": "clamped"`, with `clampGapBps`, how far
+the clamp held it back from the market:
+
+```json
+{ "price": 0.000694, "timestamp": 1760000000, "degraded": true, "degradedReason": "clamped", "clampGapBps": 4.56 }
+```
+
+On a normal morning that happens several times in a few minutes, and each
+lasts until the next sample. Stitch keeps quoting a clamped print instead of
+going dark: the ladder, RFQ levels and RFQ firm quotes widen both sides by
+`clamped_extra_bps` (per pool, default 10) of their own price, or by
+`clampGapBps` rounded up when that's larger. Levels and firm quotes widen from
+the same print, so the venue never routes to a level tighter than the reply.
+
+```toml
+[[pools]]
+# ...
+clamped_extra_bps = 10 # 0 widens by the feed's gap alone; at most 5000
+```
+
+The default is about one sample's whole move budget on cNGN (1.33 NGN, ~9 bps
+at 1,440 NGN per USDT), so the market can move one more budget the same way
+before the next sample lands. Everything that acts on the price itself rather
+than quoting around it still sits a clamped print out: the limit-order taker
+and the closer skip the pool for the tick, NAV co-signing refuses
+(`degraded_feed`), spot rebalancing and manual sales wait for a live price, the
+dynamic-spread window never samples it and profit unwind never marks its basis
+at it. A signed order that was priced live doesn't go out once the feed
+clamps, and one priced on a clamp doesn't once the gap has grown past its
+extra. A `clampGapBps` that isn't a number between 0 and 500 keeps the pool
+dark. The jump guard judges a clamped print like a live one.
 
 #### Off-hours quoting (session-bound feeds)
 

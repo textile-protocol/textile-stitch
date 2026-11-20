@@ -1745,6 +1745,7 @@ mod tests {
     fn the_cap_bounds_only_the_side_paying_settlement() {
         let settlement = address!("0000000000000000000000000000000000000002");
         let book = CorridorBook {
+            clamped_extra_bps: crate::pricing::clamped::DEFAULT_EXTRA_BPS,
             slug: "c".into(),
             collateral: address!("0000000000000000000000000000000000000001"),
             debt: settlement,

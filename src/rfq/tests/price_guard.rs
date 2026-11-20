@@ -27,6 +27,8 @@ fn fetch_all(prices: &PriceCache, prints: &[(f64, u64)]) {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             }),
         );
     }
@@ -59,6 +61,8 @@ async fn startup_quotes_nothing_until_a_later_poll_confirms_the_first() {
         session: Default::default(),
         market_at: None,
         market_source: None,
+        degraded_reason: Default::default(),
+        clamp_gap_bps: None,
     };
     on_feed_fetch(Instant::now(), &prices, URL, Ok(sample.clone()));
     tick.admit(Instant::now(), URL, sample.clone(), now);
@@ -104,6 +108,8 @@ async fn a_10x_or_decimal_shift_print_is_refused_not_quoted_and_publishes_no_lev
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             }),
         );
         assert_eq!(
@@ -129,6 +135,8 @@ async fn a_10x_or_decimal_shift_print_is_refused_not_quoted_and_publishes_no_lev
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             }),
         );
         assert_eq!(reason(&mut engine, &prices, "after").await, None);
@@ -158,6 +166,8 @@ async fn a_held_print_says_why_in_the_module_status() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }),
     );
     assert!(engine.level_frames(&prices, unix_now_ms()).is_empty());
@@ -200,6 +210,8 @@ async fn a_held_print_refuses_nav_co_signing_before_any_chain_read() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }),
     );
     assert!(matches!(
@@ -225,6 +237,8 @@ async fn a_held_print_refuses_nav_co_signing_before_any_chain_read() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }),
     );
     assert!(matches!(
@@ -268,6 +282,8 @@ async fn cosign_while_signing(during: (f64, u64, bool)) -> MakerFrame {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             }),
         );
         custody.resume.add_permits(1);
@@ -326,6 +342,8 @@ fn a_failed_fetch_during_a_hold_shows_the_outage_not_the_jump() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }),
     );
     assert!(prices.hold(URL).is_some());
@@ -413,6 +431,8 @@ fn third_prices() -> PriceCache {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         },
     );
     prices
@@ -528,6 +548,8 @@ async fn respond_while_signing(
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             }),
         );
         custody.resume.add_permits(1);
@@ -620,6 +642,8 @@ async fn a_tick_loop_hold_withholds_an_in_flight_rfq_signature_and_levels() {
                 session: Default::default(),
                 market_at: None,
                 market_source: None,
+                degraded_reason: Default::default(),
+                clamp_gap_bps: None,
             },
             unix_now(),
         );
@@ -648,6 +672,8 @@ async fn a_tick_loop_hold_withholds_an_in_flight_rfq_signature_and_levels() {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         },
         unix_now(),
     );

@@ -559,6 +559,7 @@ impl Runtime {
         // one: a held price restamped every poll would read as no movement.
         let sampled = context.price_at <= context.now
             && !context.price_degraded
+            && !context.price_clamped
             && !context.price_off_hours
             && context.price.is_finite()
             && context.price > 0.0

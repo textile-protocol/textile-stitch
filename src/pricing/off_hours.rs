@@ -422,6 +422,8 @@ mod tests {
             session,
             market_at,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
             spread: Default::default(),
         }
     }

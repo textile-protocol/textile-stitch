@@ -3,6 +3,7 @@
 //! Pure tick-loop decisions: when a feed print is unfit to quote, and when the
 //! bid has moved enough to be worth re-signing.
 
+use crate::pricing::clamped::{self, Clamped};
 use crate::pricing::feed::Quote;
 use crate::pricing::off_hours::Session;
 
@@ -40,16 +41,19 @@ pub enum Unusable {
     Stale,
     /// Zero, negative, NaN or infinite.
     BadPrice,
-    /// Fresh and well-formed, but the feed flagged it `degraded`.
+    /// Fresh and well-formed, but the feed flagged it `degraded`. Through
+    /// [`quotable`], a degraded print other than a usable clamp.
     Degraded,
     /// Fresh and well-formed, but labelled with a `session` this build
     /// doesn't know (see [`crate::pricing::off_hours::Session`]).
     UnknownSession,
 }
 
-/// The one gate every consumer puts a print through before trading on it:
-/// the ladder, taker and closer legs, RFQ levels and firm quotes, and NAV
-/// co-signing. `staleness_secs` is the consumer's own window.
+/// The strict gate: what a consumer that acts on the price itself puts a
+/// print through. The taker and closer legs, NAV co-signing, desk feeds,
+/// spot rebalancing and every post-trade recheck of those. Any `degraded`
+/// print is refused, clamped or not. `staleness_secs` is the consumer's own
+/// window.
 ///
 /// Age is checked first, so a held print that has also aged out reports
 /// `Stale`, the same order Warp uses. `Degraded` is left for a current print
@@ -68,6 +72,26 @@ pub fn usable(quote: &Quote, now: u64, staleness_secs: u64) -> Result<(), Unusab
         return Err(Unusable::UnknownSession);
     }
     Ok(())
+}
+
+/// The maker-side gate: what the ladder, RFQ levels and RFQ firm quotes put
+/// a print through. The same checks in the same order as [`usable`], except
+/// that a degraded print the feed says is only move-clamped passes as
+/// `Ok(Some(_))`, to be quoted wider (see [`crate::pricing::clamped`]). A
+/// held, fallback, reasonless or unknown-reason degraded print is still
+/// `Degraded`. `Ok(None)` is a live print.
+pub fn quotable(quote: &Quote, now: u64, staleness_secs: u64) -> Result<Option<Clamped>, Unusable> {
+    if is_stale(quote.timestamp, now, staleness_secs) {
+        return Err(Unusable::Stale);
+    }
+    if !is_price_usable(quote.price) {
+        return Err(Unusable::BadPrice);
+    }
+    let clamped = clamped::classify(quote).map_err(|()| Unusable::Degraded)?;
+    if quote.session == Session::Unknown {
+        return Err(Unusable::UnknownSession);
+    }
+    Ok(clamped)
 }
 
 /// True if we should sign a fresh order: no prior bid, or the bid moved at
@@ -188,6 +212,8 @@ mod tests {
             session: Default::default(),
             market_at: None,
             market_source: None,
+            degraded_reason: Default::default(),
+            clamp_gap_bps: None,
         }
     }
 
@@ -226,6 +252,94 @@ mod tests {
         assert_eq!(
             usable(&print(f64::NAN, now, false), now, 30),
             Err(Unusable::BadPrice)
+        );
+    }
+
+    fn degraded_for(reason: &str, gap: Option<&str>) -> Quote {
+        let now = 1_800_000_000;
+        let gap = gap.map_or(String::new(), |g| format!(r#","clampGapBps":{g}"#));
+        serde_json::from_str(&format!(
+            r#"{{"price":0.000694,"timestamp":{},"degraded":true,"degradedReason":{reason}{gap}}}"#,
+            now - 10
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_clamped_print_is_quotable_but_never_usable() {
+        let now = 1_800_000_000;
+        let clamped = degraded_for(r#""clamped""#, Some("4.56"));
+        assert_eq!(
+            quotable(&clamped, now, 30),
+            Ok(Some(Clamped { gap_bps: 4.56 }))
+        );
+        // The taker, closer and NAV co-signing still refuse it.
+        assert_eq!(usable(&clamped, now, 30), Err(Unusable::Degraded));
+        // Without a gap it is still quotable, on the configured extra alone.
+        assert_eq!(
+            quotable(&degraded_for(r#""clamped""#, None), now, 30),
+            Ok(Some(Clamped { gap_bps: 0.0 }))
+        );
+        // A live print passes both, and carries no clamp.
+        assert_eq!(
+            quotable(&print(0.00065, now - 10, false), now, 30),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn held_fallback_missing_and_unknown_reasons_stay_dark() {
+        let now = 1_800_000_000;
+        for reason in [r#""held""#, r#""fallback""#, "null", r#""paused""#, "7"] {
+            let quote = degraded_for(reason, None);
+            assert_eq!(
+                quotable(&quote, now, 30),
+                Err(Unusable::Degraded),
+                "{reason}"
+            );
+            assert_eq!(usable(&quote, now, 30), Err(Unusable::Degraded), "{reason}");
+        }
+        // Today's API: degraded with no reason at all.
+        assert_eq!(
+            quotable(&print(0.00065, now - 10, true), now, 30),
+            Err(Unusable::Degraded)
+        );
+        // A clamped print whose gap is malformed or out of range.
+        for gap in ["-0.5", "501", r#""4.5""#] {
+            assert_eq!(
+                quotable(&degraded_for(r#""clamped""#, Some(gap)), now, 30),
+                Err(Unusable::Degraded),
+                "{gap}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clamped_print_is_still_judged_on_age_price_and_session_first() {
+        let now = 1_800_000_000;
+        let clamped = degraded_for(r#""clamped""#, Some("4.56"));
+        assert_eq!(quotable(&clamped, now + 21, 30), Err(Unusable::Stale));
+        assert_eq!(
+            quotable(
+                &Quote {
+                    price: 0.0,
+                    ..clamped.clone()
+                },
+                now,
+                30
+            ),
+            Err(Unusable::BadPrice)
+        );
+        assert_eq!(
+            quotable(
+                &Quote {
+                    session: Session::Unknown,
+                    ..clamped
+                },
+                now,
+                30
+            ),
+            Err(Unusable::UnknownSession)
         );
     }
 
