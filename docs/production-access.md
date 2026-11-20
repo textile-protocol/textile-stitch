@@ -80,26 +80,36 @@ hosted profile until their own migration. What the profile allows is in
 
 ### What exists, and what you still do by hand
 
-The stack doesn't deploy the hosted panel yet. Here's where each piece comes
-from:
+The stack deploys the hosted panel when `hosted_panel_enabled` is on, but
+refuses to while this compose file still mounts `PANEL_BOTS_DIR` into the
+panel container: that waits for #3091. Here's where each piece comes from:
 
 - **#2777 (merged):** the stitch-bots stack gives the host its SSM instance
   role, the `<prefix>-logged-shell` document and the `<prefix>-panel` port
   document, which forwards to host port 8420 and nothing else.
-- **This PR:** the hosted profile and the runtime broker in the panel image,
+- **#2778 (merged):** the hosted profile and the runtime broker in the panel image,
   and `docker-compose.panel.hosted.yml` with its `deploy/` files in this repo.
-- **#2832 (open):** bot keys come from Secrets Manager into tmpfs at
+- **#2832 (merged):** bot keys come from Secrets Manager into tmpfs at
   `/run/stitch/<bot>`, mounted read-only into each bot, and the bot image is
   pinned by digest.
-- **Not done:** nothing in the stack installs or starts the hosted panel,
-  writes its `.env` or its envelope file. That's a planned follow-up on #2832.
+- **`hosted_panel_enabled` (stitch-bots stack):** installs this compose file
+  and its `deploy/` files in `/opt/stitch-panel`, writes the `.env` values, the
+  envelope and a digest pin for the Tailscale image, and runs it from
+  `stitch-panel.service`. The auth key and password hash come from Secrets
+  Manager, never Terraform. Its plan, and the start script on the host, refuse
+  a compose file whose panel service mounts the bot folders, anything above
+  them or `/run/stitch`, so it fails until #3091 moves that mount to the
+  broker. With the panel on, the bot folders live in `~/stitch/bots/<bot>`, so
+  `PANEL_BOTS_DIR` holds them and nothing else. See the stack's README,
+  "Hosted panel". The tailnet, its policy and the key itself are still yours.
 - **Image attestations:** Update and Rollback only move a bot onto a digest
   with a valid build provenance attestation, checked by the broker. See
   [Image attestations](#image-attestations).
 
-Until that follow-up lands, bring the panel up by hand, and only on a host
-whose bot directories hold no credentials. The hosted panel mounts
-`PANEL_BOTS_DIR` read-write, so it can read anything in them. #2832 moves the
+Until #3091 lands, or on a stack without `hosted_panel_enabled`, bring the
+panel up by hand as below, and only on a host whose bot directories hold no
+credentials. The
+hosted panel mounts `PANEL_BOTS_DIR` read-write, so it can read anything in them. #2832 moves the
 signer keys out to `/run/stitch/<bot>`. It doesn't move the RFQ maker key:
 `stitch connect` writes `rfq-api.key` next to `stitch.toml` by default. Put
 it in `/run/stitch/<bot>` too and point the bot at it with

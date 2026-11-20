@@ -356,8 +356,9 @@ the tailnet allowlist. Only do that if your proxy strips the inbound header firs
 ## Hosted profile
 
 This section is for hosts Textile runs for a client on the
-`packages/infra/terraform/stitch-bots` stack. That stack doesn't deploy the
-hosted panel yet: [production-access.md](production-access.md#hosted-profile)
+`packages/infra/terraform/stitch-bots` stack, which deploys it with
+`hosted_panel_enabled` (its README, "Hosted panel") once #3091 stops the panel
+container mounting the bot folders; until then its plan refuses. [production-access.md](production-access.md#hosted-profile)
 says what exists after which PR and the manual steps until then. If you
 installed Stitch with
 `install-panel.sh`, from a checkout, or with the desktop app, none of it
@@ -412,8 +413,8 @@ Every route the panel registers is classified in
 route added later stays off hosted hosts until someone decides otherwise.
 
 **Quoting envelope.** The bounds agreed with the client live in a read-only
-JSON file (`STITCH_PANEL_ENVELOPE`), written by hand on the host until the
-stack writes it. A settings save may
+JSON file (`STITCH_PANEL_ENVELOPE`), which the stack writes from
+`panel_envelope_json`. A settings save may
 change only quoting fields, and each changed field needs a bound in that file.
 A field with no bound can't change, so a missing file means no quoting edits.
 Saves are recorded in the change log as usual. See
