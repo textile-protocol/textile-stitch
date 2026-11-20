@@ -547,6 +547,7 @@ pub fn save_quoting(
             &origin,
             now_ms,
             Some(policy.bot_uid),
+            MAX_FILE_BYTES,
         )
         .map_err(|e| ApiError::internal(&e))?;
         let Some(recorded) = written else {
@@ -871,6 +872,50 @@ mod tests {
             saved.files.files.get("stitch.toml"),
             Some(&std::fs::read_to_string(h.root.join("bot-a/stitch.toml")).unwrap())
         );
+    }
+
+    /// A save reads the config, the snapshot and the journal again under the
+    /// change-log lock. Those reads hold the same cap as every other broker
+    /// read: an outsized change-log file costs the save its record (a
+    /// warning), not the broker its memory.
+    #[test]
+    fn a_save_holds_the_size_cap_on_the_change_log_files() {
+        for name in ["change-log.snapshot", "change-log.jsonl"] {
+            let h = host(&format!("save-cap-{name}"), ENVELOPE);
+            let big = h.root.join("bot-a").join(name);
+            let line = "#".repeat(1023) + "\n";
+            std::fs::write(&big, line.repeat(MAX_FILE_BYTES as usize / 1024 + 1)).unwrap();
+            let size = std::fs::metadata(&big).unwrap().len();
+            assert!(size > MAX_FILE_BYTES);
+            let spread = if current(&h).buy.value == "42" {
+                "43"
+            } else {
+                "42"
+            };
+            let saved = save_quoting(
+                &h.policy,
+                &h.bot,
+                &save(QuotingEdit {
+                    buy: Some(WireSpread {
+                        abs: false,
+                        value: spread.into(),
+                    }),
+                    ..Default::default()
+                }),
+                1_700_000_000_000,
+            )
+            .unwrap();
+            assert_eq!(
+                current(&h).buy.value,
+                spread,
+                "{name}: the save still lands"
+            );
+            let warning = saved
+                .warning
+                .unwrap_or_else(|| panic!("{name}: no warning"));
+            assert!(warning.contains("larger than"), "{name}: {warning}");
+            assert_eq!(std::fs::metadata(&big).unwrap().len(), size, "{name}");
+        }
     }
 
     #[test]

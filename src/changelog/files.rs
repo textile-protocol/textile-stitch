@@ -117,12 +117,17 @@ pub fn read_at_most(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
 
 /// The whole file as text, or `None` when it doesn't exist.
 pub fn read_text(path: &Path) -> std::io::Result<Option<String>> {
-    read(path)?
-        .map(|bytes| {
-            String::from_utf8(bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })
-        .transpose()
+    read(path)?.map(utf8).transpose()
+}
+
+/// [`read_text`] through [`read_at_most`]: refuses with
+/// [`std::io::ErrorKind::FileTooLarge`] past `max` bytes.
+pub fn read_text_at_most(path: &Path, max: u64) -> std::io::Result<Option<String>> {
+    read_at_most(path, max)?.map(utf8).transpose()
+}
+
+fn utf8(bytes: Vec<u8>) -> std::io::Result<String> {
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Open without following a link (`O_NOFOLLOW`) or blocking on a FIFO

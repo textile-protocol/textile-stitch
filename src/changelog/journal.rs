@@ -31,6 +31,10 @@ pub struct Journal {
     /// The uid files this journal creates are handed to: the bot's, when a
     /// root panel is the one writing. `None` leaves ownership alone.
     owner: Option<u32>,
+    /// Most bytes one read of the snapshot or the journal may take. Unbounded
+    /// for the bot and the panel; the runtime broker, which reads files a bot
+    /// controls, sets its per-file cap ([`Journal::with_read_cap`]).
+    read_cap: Option<u64>,
     _lock: std::fs::File,
 }
 
@@ -46,8 +50,18 @@ impl Journal {
         Ok(Self {
             config_path: config_path.to_path_buf(),
             owner,
+            read_cap: None,
             _lock: lock,
         })
+    }
+
+    /// Refuse a snapshot or journal read past `cap` bytes, counted off the
+    /// opened handle, so a file that grew or was swapped can't exceed it.
+    pub fn with_read_cap(self, cap: u64) -> Self {
+        Self {
+            read_cap: Some(cap),
+            ..self
+        }
     }
 
     fn file(&self, file: LogFile) -> PathBuf {
@@ -58,7 +72,14 @@ impl Journal {
 /// The config as of the last record, or `None` before the first one.
 pub fn read_snapshot(journal: &Journal) -> Result<Option<String>> {
     let path = journal.file(LogFile::Snapshot);
-    files::read_text(&path).with_context(|| format!("reading {}", path.display()))
+    read_text_capped(&path, journal.read_cap).with_context(|| format!("reading {}", path.display()))
+}
+
+fn read_text_capped(path: &Path, cap: Option<u64>) -> std::io::Result<Option<String>> {
+    match cap {
+        None => files::read_text(path),
+        Some(max) => files::read_text_at_most(path, max),
+    }
 }
 
 /// Staged and renamed into place by the same writer as `stitch.toml`, which
@@ -92,8 +113,13 @@ pub fn append(journal: &Journal, records: &[ChangeRecord]) -> Result<()> {
 /// Every complete record in a bot's journal, oldest first. Unreadable lines
 /// are skipped; see [`super::ship::pending`] for why one can exist.
 pub fn read_all(config_path: &Path) -> Result<Vec<ChangeRecord>> {
+    read_all_capped(config_path, None)
+}
+
+/// [`read_all`], refusing a journal past `cap` bytes.
+fn read_all_capped(config_path: &Path, cap: Option<u64>) -> Result<Vec<ChangeRecord>> {
     let path = files::path(config_path, LogFile::Journal);
-    let text = files::read_text(&path)
+    let text = read_text_capped(&path, cap)
         .with_context(|| format!("reading {}", path.display()))?
         .unwrap_or_default();
     Ok(text
@@ -164,7 +190,7 @@ fn read(text: &str) -> Option<(ParamMap, u64)> {
 /// The config hash the journal last recorded. Runtime records (an accepted
 /// issuer spread) carry none and don't change the file, so they're skipped.
 fn last_recorded_hash(journal: &Journal) -> Result<Option<String>> {
-    Ok(read_all(&journal.config_path)?
+    Ok(read_all_capped(&journal.config_path, journal.read_cap)?
         .into_iter()
         .rev()
         .find_map(|r| r.config_sha256_after))
@@ -272,7 +298,7 @@ pub fn write_config_recorded(
     now_ms: u64,
     owner: Option<u32>,
 ) -> Result<Recorded> {
-    write_recorded(config_path, None, next, origin, now_ms, owner)
+    write_recorded(config_path, None, next, origin, now_ms, owner, None)
         .map(|written| written.expect("an unconditional write always writes"))
 }
 
@@ -282,6 +308,12 @@ pub fn write_config_recorded(
 /// (the runtime broker), so a change that landed in between isn't overwritten.
 /// Another lock holder can't slip in; a hand edit that skips the lock can
 /// only land in the gap between this read and the rename.
+///
+/// Every read under the lock (the config, the snapshot, the journal) takes at
+/// most `read_cap` bytes off the opened file, which is also opened without
+/// following a link and must be a regular, singly linked file. A config that
+/// fails that reads as changed (`Ok(None)`); a snapshot or journal that fails
+/// it costs this save its record, returned as [`Recorded::warning`].
 pub fn write_config_recorded_if_unchanged(
     config_path: &Path,
     expected: &str,
@@ -289,8 +321,17 @@ pub fn write_config_recorded_if_unchanged(
     origin: &Origin,
     now_ms: u64,
     owner: Option<u32>,
+    read_cap: u64,
 ) -> Result<Option<Recorded>> {
-    write_recorded(config_path, Some(expected), next, origin, now_ms, owner)
+    write_recorded(
+        config_path,
+        Some(expected),
+        next,
+        origin,
+        now_ms,
+        owner,
+        Some(read_cap),
+    )
 }
 
 fn write_recorded(
@@ -300,11 +341,18 @@ fn write_recorded(
     origin: &Origin,
     now_ms: u64,
     owner: Option<u32>,
+    read_cap: Option<u64>,
 ) -> Result<Option<Recorded>> {
     // Lock first, then read: a hand edit landing between the two would
     // otherwise be compared against a stale copy and recorded wrong.
-    let journal = Journal::open(config_path, owner);
-    let current = std::fs::read_to_string(config_path).ok();
+    let journal = Journal::open(config_path, owner).map(|j| match read_cap {
+        Some(cap) => j.with_read_cap(cap),
+        None => j,
+    });
+    let current = match read_cap {
+        None => std::fs::read_to_string(config_path).ok(),
+        Some(cap) => files::read_text_at_most(config_path, cap).ok().flatten(),
+    };
     if expected.is_some_and(|e| current.as_deref() != Some(e)) {
         return Ok(None);
     }
@@ -519,16 +567,36 @@ mod tests {
         let stale = CONFIG;
         let next = stale.replace("buy_offset_bps = 40", "buy_offset_bps = 30");
         let outcome =
-            write_config_recorded_if_unchanged(&path, stale, &next, &origin, 1, None).unwrap();
+            write_config_recorded_if_unchanged(&path, stale, &next, &origin, 1, None, CAP).unwrap();
         assert!(outcome.is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), host_edit);
         assert!(read_all(&path).unwrap_or_default().is_empty());
 
         let next = host_edit.replace("buy_offset_bps = 55", "buy_offset_bps = 30");
         let outcome =
-            write_config_recorded_if_unchanged(&path, &host_edit, &next, &origin, 2, None).unwrap();
+            write_config_recorded_if_unchanged(&path, &host_edit, &next, &origin, 2, None, CAP)
+                .unwrap();
         assert!(outcome.is_some_and(|r| r.records > 0));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), next);
+    }
+
+    const CAP: u64 = 1 << 20;
+
+    /// The config is read again under the lock with the caller's cap, off the
+    /// opened handle: one that outgrew it reads as moved on, and nothing is
+    /// written or recorded.
+    #[test]
+    fn a_conditional_save_holds_its_read_cap_on_the_config() {
+        let path = temp_config("cas-cap", CONFIG);
+        let origin = panel_origin(Source::PanelSettings, "panel password (shared)", "acme");
+        let next = CONFIG.replace("buy_offset_bps = 40", "buy_offset_bps = 30");
+        let cap = CONFIG.len() as u64 - 1;
+        let outcome =
+            write_config_recorded_if_unchanged(&path, CONFIG, &next, &origin, 1, None, cap)
+                .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CONFIG);
+        assert!(read_all(&path).unwrap_or_default().is_empty());
     }
 
     #[test]
