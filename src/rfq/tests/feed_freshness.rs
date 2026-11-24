@@ -645,6 +645,77 @@ async fn nav_cosign_rejects_invalid_feed_before_rpc_and_signs_valid_seconds() {
     server.abort();
 }
 
+/// A reversed pool (settlement as collateral, `invert=1` feed) is the vault's
+/// pair upside down. Vault connect and quoting accept it, so co-signing has to
+/// too, marking the corridor asset at the reciprocal of the print.
+#[tokio::test]
+async fn nav_cosign_reads_a_reversed_book_at_the_reciprocal() {
+    let (mut engine, req) = nav_engine_and_request();
+    let reversed: Vec<_> = engine
+        .configured
+        .iter()
+        .cloned()
+        .map(|b| CorridorBook {
+            collateral: b.debt,
+            debt: b.collateral,
+            collateral_decimals: b.debt_decimals,
+            debt_decimals: b.collateral_decimals,
+            ..b
+        })
+        .collect();
+    engine.books.clear();
+    engine.configured = reversed;
+    let (url, reads, server) = nav_rpc().await;
+    engine.rpc = Rpc::new(&url);
+    let print = |price: f64| Quote {
+        price,
+        timestamp: unix_now(),
+        degraded: false,
+        spread: Default::default(),
+        reference: None,
+        bid: None,
+        ask: None,
+        session: Default::default(),
+        market_at: None,
+        market_source: None,
+        degraded_reason: Default::default(),
+        clamp_gap_bps: None,
+    };
+    let prices = PriceCache::default();
+
+    // The forward figure on a reversed book is 1/1.5 per unit off: refused on price.
+    prices.set("http://feed".into(), print(1.5));
+    let reply = engine.cosign(req.clone(), &prices).await;
+    assert!(
+        matches!(
+            reply,
+            MakerFrame::AttestReject(AttestRejectFrame {
+                reason: AttestRejectReason::Price,
+                ..
+            })
+        ),
+        "{reply:?}"
+    );
+
+    // The attestation prices the corridor asset at 1.5; the reversed feed says 1/1.5.
+    prices.set("http://feed".into(), print(1.0 / 1.5));
+    let reply = engine.cosign(req.clone(), &prices).await;
+    let MakerFrame::AttestResponse(reply) = reply else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(reads.load(Ordering::SeqCst), 12);
+    let signature: [u8; 65] = alloy_primitives::hex::decode(reply.signature)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let payload = nav_attestation_payload(&NavAttestation::parse(&req.attestation).unwrap());
+    assert_eq!(
+        recover_address(payload.digest(), &signature).unwrap(),
+        engine.signer.address()
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn invalid_http_fetch_cannot_reuse_fresh_cache_for_nav_and_recovers_on_valid_fetch() {
     let now = unix_now();

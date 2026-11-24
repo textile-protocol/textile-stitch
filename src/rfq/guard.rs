@@ -12,7 +12,7 @@
 //! before it is signed, and on each published level, so the venue is not
 //! routed to a level the firm path would refuse.
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 
 use crate::pricing::band::{level_within, order_vs_print_bps, order_within, price_wad, Order};
 use crate::pricing::clamped;
@@ -225,6 +225,53 @@ pub(super) fn attest_print(
     Ok(quote)
 }
 
+/// Which way round a configured book holds the vault's pair.
+///
+/// A book's feed is debt per collateral. The attestation prices the corridor
+/// asset in settlement, so on a `Forward` book (settlement as debt) the print
+/// is the mark as is. A `Reversed` book (settlement as collateral, read off an
+/// `invert=1` feed) holds the same market upside down, and its print is the
+/// reciprocal. Both are the vault's pair: connect and quoting take either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BookSide {
+    Forward,
+    Reversed,
+}
+
+/// The configured book on the vault's pair, and which way round it holds it.
+/// A forward book wins when a bot runs both.
+pub(super) fn vault_book(
+    books: &[CorridorBook],
+    settlement: Address,
+    corridor: Address,
+) -> Option<(&CorridorBook, BookSide)> {
+    let forward = books
+        .iter()
+        .find(|b| b.debt == settlement && b.collateral == corridor)
+        .map(|b| (b, BookSide::Forward));
+    forward.or_else(|| {
+        books
+            .iter()
+            .find(|b| b.debt == corridor && b.collateral == settlement)
+            .map(|b| (b, BookSide::Reversed))
+    })
+}
+
+/// The bot's own mark for an attestation: settlement per corridor asset, from
+/// a print [`attest_print`] accepts. That print is positive and finite, so its
+/// reciprocal is too.
+pub(super) fn attest_mark(
+    prices: &PriceCache,
+    book: &CorridorBook,
+    side: BookSide,
+) -> Result<f64, AttestRejectReason> {
+    let quote = attest_print(prices, book)?;
+    Ok(match side {
+        BookSide::Forward => quote.price,
+        BookSide::Reversed => 1.0 / quote.price,
+    })
+}
+
 /// Judge a co-signed attestation again against what the cache holds now,
 /// with the vault figures read before signing. The vault reads and a slow
 /// signer give the price loop time to admit a new print, the feed time to
@@ -233,11 +280,12 @@ pub(super) fn attest_print(
 pub(super) fn recheck_attestation_after_signing(
     prices: &PriceCache,
     book: &CorridorBook,
+    side: BookSide,
     att: &NavAttestation,
     live: &LiveVault,
 ) -> Result<(), AttestRejectReason> {
-    let quote = attest_print(prices, book)?;
-    check_attestation(att, live, crate::protocol::attest::price_wad(quote.price))
+    let mark = attest_mark(prices, book, side)?;
+    check_attestation(att, live, crate::protocol::attest::price_wad(mark))
 }
 
 /// Drop the levels the firm path would refuse. Pure.

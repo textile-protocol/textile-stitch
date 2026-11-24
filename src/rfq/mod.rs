@@ -3044,27 +3044,31 @@ impl Engine {
             return reject(reason);
         }
 
-        // Our own mark for the corridor leg: the book on exactly the vault's
-        // pair, oriented the way the attestation prices it (settlement per
-        // corridor is debt per collateral). From every configured pool, not
-        // just the ones the venue seats this session on: the feed loops run
-        // for all of them, and a vault whose corridor the venue unassigned
-        // still has epochs to settle.
+        // Our own mark for the corridor leg, settlement per corridor asset,
+        // from the book on the vault's pair in either orientation (see
+        // `guard::BookSide`). From every configured pool, not just the ones
+        // the venue seats this session on: the feed loops run for all of
+        // them, and a vault whose corridor the venue unassigned still has
+        // epochs to settle.
         let policy = self.vault_policy.read().ok().and_then(|p| *p);
         let Some(policy) = policy else {
             return reject(AttestRejectReason::Busy);
         };
-        let Some(book) = self
-            .configured
-            .iter()
-            .find(|b| b.debt == policy.settlement && b.collateral == policy.corridor)
+        let Some((book, side)) =
+            guard::vault_book(&self.configured, policy.settlement, policy.corridor)
         else {
+            warn!(
+                request_id = %req.request_id,
+                settlement = %policy.settlement,
+                corridor = %policy.corridor,
+                "no configured pool trades this vault's pair; not co-signing"
+            );
             return reject(AttestRejectReason::StaleFeed);
         };
         // A degraded print is one the source itself doesn't stand behind.
         // Warp won't attest off one, and the second key won't vouch with one.
-        let quote = match guard::attest_print(prices, book) {
-            Ok(quote) => quote,
+        let own_price = match guard::attest_mark(prices, book, side) {
+            Ok(mark) => mark,
             Err(reason) => return reject(reason),
         };
 
@@ -3124,7 +3128,7 @@ impl Engine {
             settlement_decimals,
             corridor_decimals,
         };
-        if let Err(reason) = check_attestation(&att, &live, price_wad(quote.price)) {
+        if let Err(reason) = check_attestation(&att, &live, price_wad(own_price)) {
             info!(
                 request_id = %req.request_id,
                 epoch = %req.epoch_id,
@@ -3132,7 +3136,7 @@ impl Engine {
                 version = att.version(),
                 nav = %att.nav_or_derived(&live),
                 attested_price = %att.corridor_asset_price,
-                own_price = quote.price,
+                own_price,
                 "refused to co-sign attestation"
             );
             return reject(reason);
@@ -3154,7 +3158,9 @@ impl Engine {
                 return reject(AttestRejectReason::Busy);
             }
         };
-        if let Err(reason) = guard::recheck_attestation_after_signing(prices, book, &att, &live) {
+        if let Err(reason) =
+            guard::recheck_attestation_after_signing(prices, book, side, &att, &live)
+        {
             warn!(request_id = %req.request_id, ?reason, "the reference price changed while co-signing; signature withheld");
             return reject(reason);
         }
