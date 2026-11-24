@@ -3,7 +3,10 @@
 # Only disposable test containers are enrolled; no production bots, keys,
 # chains, Tailscale or AWS are touched. Needs root for nsenter and the volume
 # mountpoint (CI runs it with sudo).
-set -euo pipefail
+set -Eeuo pipefail
+# Every check below is a silent test, so name the one that failed; without this
+# a failure is just an exit code in CI.
+trap 'echo "hosted-runtime.sh: check failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 : "${STITCH_TEST_IMAGE:?Build the panel image from this branch and set STITCH_TEST_IMAGE}"
 name="stitch-hosted-$$"
 bot="$name-bot"
@@ -60,6 +63,11 @@ done
 [ -S "$socket" ] || { docker logs "$name-broker"; exit 1; }
 
 broker() { curl -sS -o /dev/null -w '%{http_code}' --unix-socket "$socket" "$@"; }
+# Never `producer | grep -q` under pipefail: grep quits on its first match and
+# a producer still streaming (docker logs writes one frame per log line) is
+# killed by SIGPIPE, so the pipeline fails with 141 on a check that passed.
+# Capture first, then grep the capture.
+broker_logs() { docker logs "$name-broker" 2>&1; }
 
 # Inventory: the enrolled name only, and no env.
 body="$(curl -fsS --unix-socket "$socket" http://broker/v1/bots)"
@@ -108,15 +116,15 @@ swap() { # image, then zero or more bundle files
 [ "$(swap "$attested" "$fixtures/panel-d5fccbe8.sigstore.json")" = 403 ]
 [ "$(swap "$repo@sha256:$(printf 'b%.0s' {1..64})" "$fixtures/bot-8fd05fd7.sigstore.json")" = 403 ]
 [ "$(docker inspect --format '{{.Config.Image}}' "$bot")" = busybox:1.37 ]
-docker logs "$name-broker" 2>&1 | grep -q 'refused an unattested image'
+grep -q 'refused an unattested image' <<<"$(broker_logs)"
 
 # A real swap onto the attested digest keeps the name, env, labels and mounts,
 # and leaves no -next/-previous container behind.
 [ "$(swap "$attested" "$fixtures/bot-8fd05fd7.sigstore.json")" = 204 ]
 [ "$(docker inspect --format '{{.Config.Image}}' "$bot")" = "$attested" ]
-docker logs "$name-broker" 2>&1 | grep 'verified the image' | grep -q 833f1809b9e77c6784e1625f38ead70fea5d24ea
+[[ "$(grep 'verified the image' <<<"$(broker_logs)")" == *833f1809b9e77c6784e1625f38ead70fea5d24ea* ]]
 [ "$(docker inspect --format '{{.State.Running}}' "$bot")" = true ]
-docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$bot" | grep -qx KEEP=env
+grep -qx KEEP=env <<<"$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$bot")"
 [ "$(docker inspect --format '{{index .Config.Labels "keep"}}' "$bot")" = label ]
 [ "$(docker inspect --format '{{range .Mounts}}{{.Destination}}{{end}}' "$bot")" = /home/stitch/run ]
 [ -z "$(docker ps -aq --filter "name=^$bot-(next|previous)\$")" ]
@@ -145,7 +153,7 @@ docker run "${runtime_opts[@]}" -d --name "$name-panel" --network none --user 10
   "$STITCH_TEST_IMAGE" >/dev/null
 panel_pid="$(docker inspect --format '{{.State.Pid}}' "$name-panel")"
 # The panel has no bind mount of any bot directory.
-if docker inspect --format '{{range .Mounts}}{{.Source}}{{println}}{{end}}' "$name-panel" | grep -qF "$bots_dir"; then
+if grep -qF "$bots_dir" <<<"$(docker inspect --format '{{range .Mounts}}{{.Source}}{{println}}{{end}}' "$name-panel")"; then
   echo "the hosted panel has a bind mount of the bots directory" >&2; exit 1
 fi
 panel() { nsenter -t "$panel_pid" -n curl -sS "$@"; }
@@ -156,7 +164,7 @@ done
 code() { panel -o /dev/null -w '%{http_code}' "$@"; }
 local_host=(-H 'Host: localhost:8420')
 [ "$(code "${local_host[@]}" http://127.0.0.1:8420/api/session)" = 200 ]
-panel "${local_host[@]}" http://127.0.0.1:8420/api/session | grep -q '"profile":"hosted"'
+grep -q '"profile":"hosted"' <<<"$(panel "${local_host[@]}" http://127.0.0.1:8420/api/session)"
 # DNS rebinding / wrong host.
 [ "$(code -H 'Host: attacker.example' http://127.0.0.1:8420/api/session)" = 403 ]
 # No identity-header shortcut.
