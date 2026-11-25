@@ -599,10 +599,9 @@ async fn replace_image(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Unix socket only. The broker owns its directory; the panel mounts it read-only.
-#[cfg(unix)]
 /// Config access from the environment, or `None` when `STITCH_BROKER_HOST_BOTS_DIR`
 /// isn't set. The envelope file is optional: missing means no quoting edits.
+#[cfg(unix)]
 fn config_policy_from_env() -> Result<Option<ConfigPolicy>> {
     let Some(host_root) = std::env::var_os("STITCH_BROKER_HOST_BOTS_DIR").filter(|v| !v.is_empty())
     else {
@@ -639,6 +638,8 @@ fn config_policy_from_env() -> Result<Option<ConfigPolicy>> {
     }))
 }
 
+/// Unix socket only. The broker owns its directory; the panel mounts it read-only.
+#[cfg(unix)]
 pub async fn serve() -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let docker = Arc::new(super::docker::BollardDocker::connect(
