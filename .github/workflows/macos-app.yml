@@ -176,11 +176,16 @@ jobs:
           TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
+          # GitHub's release API answers the odd 5xx; every call here is safe to repeat.
+          retry() { n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "::notice::attempt $n failed; retrying in $((n * 15))s" >&2; sleep $((n * 15)); n=$((n + 1)); done; }
           (cd dist && shasum -a 256 Stitch.dmg > Stitch.dmg.sha256)
-          gh release upload "$TAG" dist/Stitch.dmg dist/Stitch.dmg.sha256 --clobber
+          retry gh release upload "$TAG" dist/Stitch.dmg dist/Stitch.dmg.sha256 --clobber
 
       # cargo-dist builds the release body's download table before this workflow
       # uploads Stitch.dmg, so add a row for it. Idempotent (skips if present).
+      # Cosmetic: the DMG is already attached, so if GitHub still refuses the edit
+      # after retries this warns and lets the promotion below run. A failed row
+      # once left a finished release stuck as a pre-release, so no operator got it.
       - name: Add Stitch.dmg to the release download table
         if: ${{ github.event_name == 'release' || inputs.tag != '' }}
         env:
@@ -188,9 +193,14 @@ jobs:
           TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
+          # GitHub's release API answers the odd 5xx; every call here is safe to repeat.
+          retry() { n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "::notice::attempt $n failed; retrying in $((n * 15))s" >&2; sleep $((n * 15)); n=$((n + 1)); done; }
           base="https://github.com/${{ github.repository }}/releases/download/$TAG"
           row="| [Stitch.dmg]($base/Stitch.dmg) | Universal macOS app | [checksum]($base/Stitch.dmg.sha256) |"
-          body="$(gh release view "$TAG" --json body --jq .body)"
+          if ! body="$(retry gh release view "$TAG" --json body --jq .body)"; then
+            echo "::warning::Couldn't read the $TAG release notes; Stitch.dmg is attached but not listed in the download table."
+            exit 0
+          fi
           if printf '%s' "$body" | grep -qF "Stitch.dmg"; then
             echo "Release notes already list Stitch.dmg; nothing to do."
             exit 0
@@ -204,7 +214,9 @@ jobs:
             END { if (!inserted) { print ""; print "### Desktop app (macOS)"; print ""; print row } }
           ')"
           printf '%s' "$updated" > "$RUNNER_TEMP/notes.md"
-          gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          if ! retry gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"; then
+            echo "::warning::Couldn't add Stitch.dmg to the $TAG download table; the DMG is attached, add the row by hand."
+          fi
 
       # release.yml creates the release flagged as a pre-release and dispatches
       # this build with promote=true, so /releases/latest keeps resolving to the
@@ -222,7 +234,9 @@ jobs:
           TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
-          gh release edit "$TAG" --prerelease=false --latest=true
+          # GitHub's release API answers the odd 5xx; every call here is safe to repeat.
+          retry() { n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "::notice::attempt $n failed; retrying in $((n * 15))s" >&2; sleep $((n * 15)); n=$((n + 1)); done; }
+          retry gh release edit "$TAG" --prerelease=false --latest=true
           echo "Promoted $TAG to the latest release with Stitch.dmg attached."
 
       - name: Upload Stitch.dmg as a workflow artifact
