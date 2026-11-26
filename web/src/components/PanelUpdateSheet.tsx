@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { type FleetUpdatePlan, defaultSelection } from '../fleetUpdate'
+import { type FleetUpdatePlan, type UpdateCandidate, defaultSelection } from '../fleetUpdate'
 import { Button, Spinner } from './ui'
 import { CandidateRow } from './UpdateAllSheet'
 
@@ -10,12 +10,12 @@ export type BotsSection =
   | { state: 'ready'; plan: FleetUpdatePlan }
 
 /**
- * The confirm step for Update. Fleet (the panel) always goes first, and the
- * operator is assumed to want every bot that's behind updated after it: one
- * "Stitch bots" switch, on by default, with the per-bot list folded away
- * for whoever wants to leave one out. What's ticked here is exactly what the
- * new panel is asked to update, and it updates only those still behind when
- * it's back. `bots` is null where bulk bot updates aren't offered.
+ * The confirm step for Update, in the order things happen: the bots first,
+ * one at a time, then Fleet UI (the panel itself). The operator is assumed to
+ * want every bot that's behind updated: one "Stitch bots" switch, on by
+ * default, with the per-bot list folded away for whoever wants to leave one
+ * out. What's ticked here is exactly what the run updates. `bots` is null
+ * where bulk bot updates aren't offered.
  *
  * The copy is for operators who think in trades and balances: no images,
  * containers or registries.
@@ -37,7 +37,8 @@ export default function PanelUpdateSheet({
   /** A password session doesn't survive the panel's restart. */
   signsOut: boolean
   onClose: () => void
-  onStart: (bots: string[]) => void
+  /** The ticked bots, in run order; empty for Fleet UI alone. */
+  onStart: (picked: UpdateCandidate[]) => void
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const plan = bots?.state === 'ready' ? bots.plan : null
@@ -93,7 +94,9 @@ export default function PanelUpdateSheet({
       <header className="border-line-soft flex items-start justify-between gap-4 border-b px-5 py-4">
         <div>
           <h2 className="text-base font-bold">Update Stitch Fleet</h2>
-          <p className="text-muted mt-0.5 text-sm">Fleet updates first, then your bots.</p>
+          <p className="text-muted mt-0.5 text-sm">
+            {bots ? 'Your bots first, then Fleet UI.' : 'Your bots keep trading while it updates.'}
+          </p>
         </div>
         <button
           type="button"
@@ -106,15 +109,6 @@ export default function PanelUpdateSheet({
       </header>
 
       <div className="max-h-[65vh] space-y-3 overflow-y-auto px-5 py-4">
-        <Stage
-          n={1}
-          title="Fleet UI"
-          aside={`v${version} → ${imageTag(panelTarget)}`}
-          asideTitle={panelTarget}
-        >
-          Takes a minute or two. Your bots keep trading, and this page comes back by itself.
-        </Stage>
-
         {bots && (
           <BotsStage
             bots={bots}
@@ -125,15 +119,27 @@ export default function PanelUpdateSheet({
             count={chosen.length}
           />
         )}
+
+        <Stage
+          n={bots ? 2 : 1}
+          title="Fleet UI"
+          aside={`v${version} → ${imageTag(panelTarget)}`}
+          asideTitle={panelTarget}
+        >
+          {chosen.length > 0
+            ? 'Updates once your bots are done. Takes a few seconds: your bots keep trading, and this page comes back by itself.'
+            : 'Takes a few seconds. Your bots keep trading, and this page comes back by itself.'}
+        </Stage>
       </div>
 
       <footer className="border-line-soft flex flex-wrap items-center justify-between gap-3 border-t px-5 py-4">
         <p className="text-muted max-w-xs text-xs">
           {chosen.length > 0
-            ? signsOut
-              ? "You'll sign in again after the restart, then your bots update. Keep this tab open until they're done."
-              : "Keep this tab open until it's done. If a bot has trouble, the others still update."
-            : 'Your bots stay on their current version. You can update them later.'}
+            ? "Keep this tab open until it's done. If a bot doesn't come back up, Fleet UI waits so you can fix it first." +
+              (signsOut ? " You'll sign in again at the end." : '')
+            : signsOut
+              ? "Your bots stay on their current version. You'll sign in again after the restart."
+              : 'Your bots stay on their current version. You can update them later.'}
         </p>
         <div className="ml-auto flex gap-2">
           <Button onClick={close}>Cancel</Button>
@@ -141,13 +147,13 @@ export default function PanelUpdateSheet({
             variant="primary"
             disabled={loading}
             onClick={() => {
-              onStart(chosen.map((c) => c.name))
+              onStart(chosen)
               close()
             }}
           >
             {chosen.length > 0
-              ? `Update Fleet and ${chosen.length} ${chosen.length === 1 ? 'bot' : 'bots'}`
-              : 'Update Fleet'}
+              ? `Update ${chosen.length} ${chosen.length === 1 ? 'bot' : 'bots'} and Fleet UI`
+              : 'Update Fleet UI'}
           </Button>
         </div>
       </footer>
@@ -189,7 +195,7 @@ function BotsStage({
 }) {
   if (bots.state === 'loading') {
     return (
-      <Stage n={2} title="Stitch bots" muted>
+      <Stage n={1} title="Stitch bots" muted>
         <span className="inline-flex items-center gap-2">
           <Spinner /> Checking which bots need an update…
         </span>
@@ -198,9 +204,9 @@ function BotsStage({
   }
   if (bots.state === 'error') {
     return (
-      <Stage n={2} title="Stitch bots" muted>
+      <Stage n={1} title="Stitch bots" muted>
         <span title={bots.error}>
-          We couldn&rsquo;t load your bots, so only Fleet will update. You can update them
+          We couldn&rsquo;t load your bots, so only Fleet UI will update. You can update them
           afterwards with Update all.
         </span>
       </Stage>
@@ -210,7 +216,7 @@ function BotsStage({
   const total = plan.ready.length
   if (total === 0) {
     return (
-      <Stage n={2} title="Stitch bots" muted aside={plan.skipped.length > 0 ? undefined : 'Up to date'}>
+      <Stage n={1} title="Stitch bots" muted aside={plan.skipped.length > 0 ? undefined : 'Up to date'}>
         {plan.skipped.length > 0
           ? "The bots that need an update can't be updated from here."
           : 'All your bots are on the latest version.'}
@@ -222,7 +228,7 @@ function BotsStage({
   return (
     <section className="border-line-soft rounded-lg border">
       <div className="flex items-start gap-3 px-4 py-3">
-        <StageNumber n={2} muted={!withBots} />
+        <StageNumber n={1} muted={!withBots} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-3">
             <span className="text-sm font-bold">
@@ -234,8 +240,8 @@ function BotsStage({
             {!withBots
               ? 'Your bots stay on their current version.'
               : count === total
-                ? `${allBots(total)} once Fleet is back, one at a time. Each pauses trading for a few seconds.`
-                : `${count} of ${total} bots update once Fleet is back, one at a time. Each pauses trading for a few seconds.`}
+                ? `${allBots(total)} one at a time. Each pauses trading for a few seconds and has to come back up before the next.`
+                : `${count} of ${total} bots update one at a time. Each pauses trading for a few seconds and has to come back up before the next.`}
           </p>
         </div>
       </div>

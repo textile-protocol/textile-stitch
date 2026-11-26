@@ -4,7 +4,6 @@ import {
   defaultSelection,
   finishRun,
   healthVerdict,
-  isPinnedImage,
   nextQueued,
   planFleetUpdate,
   runActive,
@@ -71,21 +70,6 @@ function candidate(name: string, wantsUp = true): UpdateCandidate {
   return { name, label: name, image: LATEST, version: null, wantsUp }
 }
 
-describe('isPinnedImage', () => {
-  it('matches the server: sha-* tags, digest refs and bare ids are pins', () => {
-    expect(isPinnedImage(PIN)).toBe(true)
-    expect(isPinnedImage('ghcr.io/textile-protocol/textile-stitch@sha256:abc')).toBe(true)
-    expect(isPinnedImage('sha256:ce1d74')).toBe(true)
-  })
-
-  it('treats mutable tags, a missing tag and no image as unpinned', () => {
-    expect(isPinnedImage(LATEST)).toBe(false)
-    expect(isPinnedImage('ghcr.io/textile-protocol/textile-stitch:canary')).toBe(false)
-    expect(isPinnedImage('localhost:5000/stitch')).toBe(false)
-    expect(isPinnedImage(null)).toBe(false)
-  })
-})
-
 describe('wantsToBeUp', () => {
   it('counts restarting and paused bots as meant to be up', () => {
     const up: BotState[] = ['running', 'restarting', 'paused']
@@ -114,12 +98,18 @@ describe('planFleetUpdate', () => {
     expect(plan.ready).toEqual([])
   })
 
-  it('leaves a pinned bot pinned, with a reason, even when it is behind', () => {
-    const plan = planFleetUpdate([bot('p', { image: PIN }), bot('a')], updates(['p', 'a']))
-    expect(plan.ready.map((c) => c.name)).toEqual(['a'])
-    expect(plan.skipped).toHaveLength(1)
-    expect(plan.skipped[0]?.name).toBe('p')
-    expect(plan.skipped[0]?.reason).toMatch(/earlier version on purpose/)
+  it('updates a bot installed on a pinned build like any other, ticked by default', () => {
+    // sha-* tags and digests are how compose files and the stitch-bots
+    // Terraform install bots; a pin isn't a sign of a rollback.
+    const bots = [
+      bot('p', { image: PIN }),
+      bot('d', { image: 'ghcr.io/textile-protocol/textile-stitch:sha-14cd877@sha256:abc' }),
+      bot('a'),
+    ]
+    const plan = planFleetUpdate(bots, updates(['p', 'd', 'a']))
+    expect(plan.ready.map((c) => c.name)).toEqual(['p', 'd', 'a'])
+    expect(plan.skipped).toEqual([])
+    expect(defaultSelection(plan)).toEqual(['p', 'd', 'a'])
   })
 
   it('skips the bots the single-bot Update would refuse, saying why', () => {

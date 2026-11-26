@@ -5,9 +5,14 @@
 // wallet claim. Updating the fleet is that call in a loop, run by the page, so
 // nothing about what a single update is allowed to do changes here.
 //
-// One at a time on purpose. A release that crash-loops on startup should cost
-// one bot's quoting, not the whole fleet's, so the run stops at the first bot
-// that doesn't come back up and leaves the rest where they were.
+// One at a time on purpose: only one bot is ever between its old and new
+// container, and each has to stay up before the next one starts.
+//
+// A bot on a `sha-*` tag or a digest is updated like any other. A pin usually
+// means the bot was installed from one exact build (a compose file or the
+// stitch-bots Terraform require one), not that someone rolled it back, and
+// the panel keeps no record of rollbacks to tell the two apart. Update moves a
+// pin to the channel's latest build, same as the bot's own Update button.
 
 import { botLabel } from './botRoutes'
 import type { Bot, BotState, UpdatesStatus } from './types'
@@ -32,17 +37,8 @@ export interface UpdateSkip {
 export interface FleetUpdatePlan {
   /** Ticked by default. */
   ready: UpdateCandidate[]
-  /** Behind, but left as they are: pinned on purpose, or the update would be refused. */
+  /** Behind, but the single-bot update would refuse them, so they're left as they are. */
   skipped: UpdateSkip[]
-}
-
-/** Same rule as the server's `is_pin_image_ref`: sha-* tags, digests, bare ids. */
-export function isPinnedImage(image: string | null): boolean {
-  if (!image) return false
-  if (image.includes('@') || image.startsWith('sha256:')) return true
-  const lastSlash = image.lastIndexOf('/')
-  const tag = image.slice(lastSlash + 1).split(':')[1] ?? ''
-  return tag.startsWith('sha-')
 }
 
 /** Docker states where the operator means the bot to be up. Mirrors `wants_to_be_up`. */
@@ -70,14 +66,10 @@ export function planFleetUpdate(bots: Bot[], updates: UpdatesStatus | null): Fle
 }
 
 /**
- * Why Update all leaves a behind bot alone. A pin is usually a rollback, and a
- * fleet-wide action shouldn't undo one; the bot's own Update button still can.
- * The rest are the refusals the single-bot endpoint makes, said up front.
+ * Why Update all leaves a behind bot alone: the refusals the single-bot
+ * endpoint would make, said up front so the operator knows what to do.
  */
 function skipReason(bot: Bot): string | null {
-  if (isPinnedImage(bot.image)) {
-    return 'Kept on an earlier version on purpose, usually after a rollback. Update it from its own page.'
-  }
   if (bot.canMigrate || bot.layout === 'flat-files') {
     return 'Needs a one-time migration first. Open it and click Migrate.'
   }

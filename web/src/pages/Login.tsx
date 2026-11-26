@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { ApiError, api } from './../api'
 import { Banner, Button, Card, Field, Input } from '../components/ui'
 import type { SessionInfo } from '../types'
-import { afterPanel } from '../usePanelUpdate'
+import { afterPanel, updateOutcome } from '../usePanelUpdate'
 
 /**
  * The sign-in screen.
@@ -22,9 +22,10 @@ export default function Login({
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // A panel update with bots ticked ends here for a password session: the
-  // restart dropped it. Say what signing in will pick up.
+  // A Fleet UI update ends here for a password session: the restart dropped
+  // it. Say so, and, after an older page's update, what signing in picks up.
   const [waiting] = useState(afterPanel.pending)
+  const [justUpdated] = useState(updateOutcome.pending)
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -48,11 +49,18 @@ export default function Login({
           Stitch
         </h1>
 
-        {waiting > 0 && (
+        {waiting > 0 ? (
           <Banner tone="info">
             Stitch Fleet restarted to finish its update. Sign in again and your{' '}
             {waiting === 1 ? 'bot updates' : `${waiting} bots update`} right after.
           </Banner>
+        ) : (
+          justUpdated && (
+            <Banner tone="info">
+              Stitch Fleet restarted to finish its update. Sign in again to continue. Your bots
+              kept trading.
+            </Banner>
+          )
         )}
 
         {session.passwordLogin ? (

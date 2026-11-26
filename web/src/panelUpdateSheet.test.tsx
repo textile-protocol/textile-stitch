@@ -29,16 +29,24 @@ function render(bots: BotsSection | null, signsOut = false): string {
 }
 
 describe('PanelUpdateSheet', () => {
-  it('updates every bot by default and folds the list away', () => {
+  it('puts the bots first, every one on by default, with the list folded away', () => {
     const html = render({ state: 'ready', plan })
-    expect(html).toContain('>Fleet UI<')
-    expect(html).toContain('>Stitch bots<')
-    expect(html).toContain('Update Fleet and 2 bots')
-    expect(html).toContain('Both bots update once Fleet is back')
+    // Cards in the order things happen.
+    expect(html.indexOf('>Stitch bots<')).toBeLessThan(html.indexOf('>Fleet UI<'))
+    expect(html).toContain('Your bots first, then Fleet UI.')
+    expect(html).toContain('Update 2 bots and Fleet UI')
+    expect(html).toContain('Both bots update one at a time')
     expect(html).toContain('aria-checked="true"')
     // The per-bot list is there, inside a <details> that starts closed.
     expect(html).toMatch(/<details(?![^>]*\sopen)[^>]*>.*Choose bots.*2 of 2 selected/s)
     expect(html).toContain('Not updated (1)')
+  })
+
+  it("says Fleet UI takes seconds and waits for a bot that didn't come back", () => {
+    const html = render({ state: 'ready', plan })
+    expect(html).toContain('Updates once your bots are done. Takes a few seconds')
+    expect(html).not.toMatch(/minute/)
+    expect(html).toContain('Fleet UI waits so you can fix it first')
   })
 
   it('never says panel, image or container to the operator', () => {
@@ -46,19 +54,20 @@ describe('PanelUpdateSheet', () => {
     expect(html).not.toMatch(/panel|image|container|registry/i)
   })
 
-  it('offers Fleet alone when bulk bot updates are off', () => {
+  it('offers Fleet UI alone when bulk bot updates are off', () => {
     const html = render(null)
-    expect(html).toContain('>Update Fleet<')
+    expect(html).toContain('>Update Fleet UI<')
+    expect(html).toContain('Takes a few seconds.')
     expect(html).not.toContain('Stitch bots')
   })
 
   it("holds the button until it knows what's behind", () => {
     const html = render({ state: 'loading' })
     expect(html).toContain('Checking which bots need an update')
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Update Fleet</)
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Update Fleet UI</)
   })
 
-  it('warns a password session that it signs back in', () => {
-    expect(render({ state: 'ready', plan }, true)).toContain('sign in again after the restart')
+  it('tells a password session it signs in again at the end', () => {
+    expect(render({ state: 'ready', plan }, true)).toContain('sign in again at the end')
   })
 })

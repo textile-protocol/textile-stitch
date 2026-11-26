@@ -153,6 +153,11 @@ const runner = createFleetUpdateRunner({
 
 export const fleetUpdate = {
   start: (target: string, picked: UpdateCandidate[]) => void runner.start(target, picked),
+  /** Start a run and resolve with how it ended. */
+  run: async (target: string, picked: UpdateCandidate[]): Promise<FleetUpdateRun | null> => {
+    await runner.start(target, picked)
+    return runner.get()
+  },
   stop: runner.stop,
   dismiss: runner.dismiss,
 }

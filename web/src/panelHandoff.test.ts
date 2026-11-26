@@ -100,7 +100,7 @@ describe('planAfterPanel', () => {
     expect(plan.kind === 'run' && plan.picked.map((c) => c.name)).toEqual(['a'])
   })
 
-  it('leaves out ticked bots that are current, gone, pinned or on the flat layout', () => {
+  it('leaves out ticked bots that are current, gone or on the flat layout', () => {
     const fleet = [
       bot('current'),
       bot('pinned', { image: PIN }),
@@ -112,7 +112,7 @@ describe('planAfterPanel', () => {
       fleet,
       updates(['pinned', 'flat', 'ok']),
     )
-    expect(plan.kind === 'run' && plan.picked.map((c) => c.name)).toEqual(['ok'])
+    expect(plan.kind === 'run' && plan.picked.map((c) => c.name)).toEqual(['pinned', 'ok'])
   })
 
   it("doesn't touch bots when the panel still reports itself behind", () => {

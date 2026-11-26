@@ -1,40 +1,42 @@
-// The panel's self-update and the bots it takes along, kept outside any page.
+// Stitch Fleet's update, kept outside any page: the bots first, then Fleet UI
+// (the panel itself), then what happened. See panelUpdate.ts for why bots go
+// first.
 //
-// Two stores, one for each side of the restart:
-// - The updater runs on the old panel. It arms the swap, leaves the bots the
-//   operator ticked in a note (see panelHandoff.ts), waits for the panel to
-//   drop out and come back, and reloads the page.
-// - The handover runs on the new panel, once per page load, after sign-in. It
-//   takes the note, asks the new panel what's behind, and hands the bots that
-//   are still ready to the Update all runner.
-// Both live at module level like the Update all run, so moving between pages
+// Four stores:
+// - The upgrade runs the ticked bots through the Update all runner and, once
+//   every one came back, starts the Fleet UI update. If one didn't, or the
+//   operator stopped the run, Fleet UI waits for them to say go.
+// - The updater arms the Fleet UI restart, waits for it to drop out and come
+//   back (or sign us out), and reloads the page onto the new version.
+// - The outcome runs on the page that loads after, once per page load, and
+//   says how it ended. It only displays; nothing acts on its note.
+// - The handover is the older flow, Fleet UI first and bots after the reload,
+//   which pages from v0.1.399 and v0.1.400 still start. It takes the bots they
+//   leave behind and runs them, so an update started there finishes here.
+// All live at module level like the Update all run, so moving between pages
 // doesn't lose them. Tests build their own with fakes.
 
 import { useSyncExternalStore } from 'react'
 import { ApiError, api } from './api'
-import type { UpdateCandidate } from './fleetUpdate'
+import { type FleetUpdateRun, type UpdateCandidate, runActive, runCounts } from './fleetUpdate'
+import { HANDOFF_KEY, decodeHandoff, planAfterPanel } from './panelHandoff'
 import {
-  HANDOFF_KEY,
-  decodeHandoff,
-  encodeHandoff,
-  planAfterPanel,
-} from './panelHandoff'
-import type { AfterPanel, PanelUpdate } from './panelUpdate'
+  type AfterPanel,
+  type FleetOutcome,
+  type FleetUpgrade,
+  type PanelUpdate,
+  panelUpdateBusy,
+} from './panelUpdate'
 import type { Bot, UpdatesStatus } from './types'
+import { OUTCOME_KEY, decodeOutcome, encodeOutcome } from './updateOutcome'
 import { fleetUpdate } from './useFleetUpdate'
 
 const POLL_MS = 2000
 const POLL_ATTEMPTS = 60
 /** How long a healthy answer counts as "not restarted yet" rather than "back". */
 const GRACE_MS = 8_000
-/**
- * The same, when bots are waiting on the new panel. Reloading onto the old
- * panel would make the handover refuse the bots, so wait longer for the drop
- * or the new version before trusting an answer that looks unchanged.
- */
-const GRACE_WITH_BOTS_MS = 30_000
 
-/** The slice of Storage the note needs. */
+/** The slice of Storage the notes need. */
 export interface KeyValueStore {
   getItem: (key: string) => string | null
   setItem: (key: string, value: string) => void
@@ -65,32 +67,43 @@ function message(e: unknown): string {
   return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e)
 }
 
+/** What the session route says about the Fleet UI answering now. */
+export interface Ping {
+  version: string
+  authenticated: boolean
+}
+
 export interface UpdaterDeps {
-  /** POST /api/panel/update. Resolves once the swap is armed. */
+  /** POST /api/panel/update. Resolves once the restart is armed. */
   updatePanel: () => Promise<unknown>
-  /** The version the panel answering now reports. Throws while it's down. */
-  ping: () => Promise<string>
+  /** The Fleet UI answering now. Throws while it's down. */
+  ping: () => Promise<Ping>
   reload: () => void
-  /** Where the note goes. Null when the browser won't give us sessionStorage. */
+  /** Where the outcome note goes. Null when the browser won't give us sessionStorage. */
   storage: KeyValueStore | null
   sleep: (ms: number) => Promise<void>
   now: () => number
   pollMs?: number
   pollAttempts?: number
   graceMs?: number
-  graceWithBotsMs?: number
 }
 
 export interface UpdateRequest {
-  /** Bots to update on the new panel, in run order. Empty for the panel alone. */
-  bots: string[]
-  /** This panel's version, so the new page can say what it moved from. */
+  /** This Fleet UI's version, so the next page can say what it moved from. */
   from: string
+  /** Bots this flow updated first; 0 for Fleet UI alone. */
+  bots: number
+  /** Of the bots it tried, those that didn't come back up. */
+  failed: number
+  /** A password session, which the restart signs out. */
+  signsOut: boolean
 }
 
 export interface PanelUpdater {
   /** Resolves when the page reloads or the update ends without one. */
   start: (req: UpdateRequest) => Promise<void>
+  /** True from the download until the reload, while the old page should hold still. */
+  inFlight: () => boolean
   dismiss: () => void
   get: () => PanelUpdate
   subscribe: (listener: Listener) => () => void
@@ -100,76 +113,73 @@ export function createPanelUpdater(deps: UpdaterDeps): PanelUpdater {
   const state = store<PanelUpdate>({ phase: 'idle' })
   const pollMs = deps.pollMs ?? POLL_MS
   const attempts = deps.pollAttempts ?? POLL_ATTEMPTS
+  const grace = deps.graceMs ?? GRACE_MS
 
-  function leaveNote(req: UpdateRequest): number {
-    if (req.bots.length === 0) return 0
+  function leaveNote(req: UpdateRequest) {
     try {
       deps.storage?.setItem(
-        HANDOFF_KEY,
-        encodeHandoff({ bots: req.bots, from: req.from, at: deps.now() }),
+        OUTCOME_KEY,
+        encodeOutcome({ from: req.from, bots: req.bots, failed: req.failed, at: deps.now() }),
       )
-      return deps.storage ? req.bots.length : 0
     } catch {
-      // Quota or a locked-down browser. The panel still updates; the strip
-      // stops promising bot updates it can't hand over.
-      return 0
+      // Quota or a locked-down browser: the next page just won't say how it went.
     }
   }
 
-  /** Wait for the swap: the panel drops out, or answers with a new version. */
-  async function awaitSwap(bots: number, from: string) {
-    const grace = bots > 0 ? (deps.graceWithBotsMs ?? GRACE_WITH_BOTS_MS) : (deps.graceMs ?? GRACE_MS)
+  /**
+   * Wait for the restart and reload onto the new version: as soon as Fleet UI
+   * drops out and answers again, answers with a new version, or answers
+   * without our session. That last one is what a password session sees:
+   * sessions live in memory, so the new Fleet UI doesn't know ours. Reloading
+   * right then means the sign-in form only ever appears on the new page, and
+   * nothing reloads it while the operator types.
+   */
+  async function awaitRestart(req: UpdateRequest) {
+    const step = { bots: req.bots, signsOut: req.signsOut }
     const started = deps.now()
     let sawDown = false
     for (let i = 0; i < attempts; i++) {
       await deps.sleep(pollMs)
+      let ping: Ping
       try {
-        const version = await deps.ping()
-        // The helper sleeps ~2s then stop/rm/rename/start. Prefer seeing a
-        // failed poll (the restart gap) or the new version, but a quick swap
-        // can land between two polls on a release that kept its version, so
-        // after a grace a healthy answer counts as back.
-        const moved = sawDown || version !== from
-        if (!moved && deps.now() - started < grace) continue
-        // Soft API refreshes leave the browser on the old embedded SPA. The
-        // new container serves a fresh index.html (no-cache) and hashed
-        // assets, so reload to put version, shell and UI on the new image.
-        state.set({ phase: 'reloading', bots })
-        deps.reload()
-        return
+        ping = await deps.ping()
       } catch {
         sawDown = true
-        state.set({ phase: 'restarting', bots })
+        state.set({ phase: 'restarting', ...step })
+        continue
       }
+      // The helper sleeps ~2s then stop/rm/rename/start. A quick restart can
+      // land between two polls on a release that kept its version, so after
+      // a grace a healthy answer counts as back too.
+      const moved = sawDown || ping.version !== req.from || !ping.authenticated
+      if (!moved && deps.now() - started < grace) continue
+      // Soft API refreshes leave the browser on the old embedded SPA. The new
+      // container serves a fresh index.html (no-cache) and hashed assets, so
+      // reload to put version, shell and UI on the new build.
+      state.set({ phase: 'reloading', ...step })
+      deps.reload()
+      return
     }
-    state.set({ phase: 'slow', bots })
+    state.set({ phase: 'slow', ...step })
   }
 
   return {
     async start(req) {
       const phase = state.get().phase
       if (phase !== 'idle' && phase !== 'failed') return
-      const wanted = req.bots.length
-      if (wanted > 0 && !deps.storage) {
-        state.set({
-          phase: 'failed',
-          bots: 0,
-          error:
-            "This browser can't remember your bots while Fleet restarts. Turn off Stitch bots to update Fleet alone, then use Update all.",
-        })
-        return
-      }
-      state.set({ phase: 'pulling', bots: wanted })
+      const step = { bots: req.bots, signsOut: req.signsOut }
+      state.set({ phase: 'pulling', ...step })
       try {
         await deps.updatePanel()
       } catch (e) {
-        state.set({ phase: 'failed', error: message(e), bots: wanted })
+        state.set({ phase: 'failed', error: message(e), ...step })
         return
       }
-      const bots = leaveNote(req)
-      state.set({ phase: 'armed', bots })
-      await awaitSwap(bots, req.from)
+      leaveNote(req)
+      state.set({ phase: 'armed', ...step })
+      await awaitRestart(req)
     },
+    inFlight: () => panelUpdateBusy(state.get()),
     dismiss() {
       if (state.get().phase === 'failed') state.set({ phase: 'idle' })
     },
@@ -178,6 +188,148 @@ export function createPanelUpdater(deps: UpdaterDeps): PanelUpdater {
   }
 }
 
+export interface UpgradeDeps {
+  /** Run Update all on these bots and resolve with how it ended. */
+  runBots: (target: string, picked: UpdateCandidate[]) => Promise<FleetUpdateRun | null>
+  /** Start the Fleet UI update. */
+  updateFleetUi: (req: UpdateRequest) => Promise<void>
+}
+
+export interface UpgradeRequest {
+  /** The bot image the update check reported. */
+  target: string
+  /** Bots to update first, in run order. Empty for Fleet UI alone. */
+  picked: UpdateCandidate[]
+  from: string
+  signsOut: boolean
+}
+
+export interface FleetUpgrader {
+  start: (req: UpgradeRequest) => Promise<void>
+  /** After a hold: update Fleet UI anyway. */
+  resume: () => Promise<void>
+  dismiss: () => void
+  get: () => FleetUpgrade
+  subscribe: (listener: Listener) => () => void
+}
+
+export function createFleetUpgrade(deps: UpgradeDeps): FleetUpgrader {
+  const state = store<FleetUpgrade>({ phase: 'idle' })
+
+  return {
+    async start(req) {
+      const phase = state.get().phase
+      if (phase === 'bots') return
+      const { from, signsOut } = req
+      if (req.picked.length === 0) {
+        state.set({ phase: 'idle' })
+        await deps.updateFleetUi({ from, bots: 0, failed: 0, signsOut })
+        return
+      }
+      state.set({ phase: 'bots', from, signsOut })
+      const run = await deps.runBots(req.target, req.picked)
+      // Null or still going means another run owned the runner; leave it be.
+      if (!run || runActive(run)) {
+        state.set({ phase: 'idle' })
+        return
+      }
+      const c = runCounts(run)
+      if (run.phase === 'done' && c.failed === 0) {
+        state.set({ phase: 'idle' })
+        await deps.updateFleetUi({ from, bots: c.done, failed: 0, signsOut })
+        return
+      }
+      state.set({
+        phase: 'held',
+        from,
+        signsOut,
+        done: c.done,
+        failed: c.failed,
+        total: c.total,
+        stopped: run.phase === 'cancelled',
+      })
+    },
+    async resume() {
+      const held = state.get()
+      if (held.phase !== 'held') return
+      state.set({ phase: 'idle' })
+      await deps.updateFleetUi({
+        from: held.from,
+        bots: held.done,
+        failed: held.failed,
+        signsOut: held.signsOut,
+      })
+    },
+    dismiss() {
+      if (state.get().phase === 'held') state.set({ phase: 'idle' })
+    },
+    get: state.get,
+    subscribe: state.subscribe,
+  }
+}
+
+export interface OutcomeDeps {
+  storage: KeyValueStore | null
+  now: () => number
+  /** A fresh update check, for a restart that kept its version string. */
+  updates: () => Promise<UpdatesStatus>
+}
+
+export interface OutcomeReader {
+  /** Take the note and show it. Only the first call in a page load does anything. */
+  show: (version: string) => Promise<void>
+  /** Whether a current note is waiting, without taking it. */
+  pending: () => boolean
+  dismiss: () => void
+  get: () => FleetOutcome
+  subscribe: (listener: Listener) => () => void
+}
+
+export function createOutcome(deps: OutcomeDeps): OutcomeReader {
+  const state = store<FleetOutcome>({ phase: 'none' })
+  let shown = false
+
+  function read(take: boolean): string | null {
+    try {
+      const raw = deps.storage?.getItem(OUTCOME_KEY) ?? null
+      if (take) deps.storage?.removeItem(OUTCOME_KEY)
+      return raw
+    } catch {
+      return null
+    }
+  }
+
+  return {
+    async show(version) {
+      if (shown) return
+      shown = true
+      const note = decodeOutcome(read(true), deps.now())
+      if (!note) return
+      if (note.from !== version) {
+        state.set({ phase: 'updated', from: note.from, version, bots: note.bots, failed: note.failed })
+        return
+      }
+      // Same version string: either a re-release under the same number, or the
+      // restart didn't land. The update check tells them apart.
+      try {
+        const u = await deps.updates()
+        state.set(
+          u.panel.updateAvailable
+            ? { phase: 'not-moved', bots: note.bots }
+            : { phase: 'updated', from: note.from, version, bots: note.bots, failed: note.failed },
+        )
+      } catch {
+        // Can't tell how it went, so say nothing rather than guess.
+      }
+    },
+    pending: () => decodeOutcome(read(false), deps.now()) !== null,
+    dismiss: () => state.set({ phase: 'none' }),
+    get: state.get,
+    subscribe: state.subscribe,
+  }
+}
+
+/** The older flow; see the header. */
 export interface HandoverDeps {
   storage: KeyValueStore | null
   now: () => number
@@ -265,7 +417,7 @@ export function createHandover(deps: HandoverDeps): Handover {
 function sessionStore(): KeyValueStore | null {
   try {
     const s = window.sessionStorage
-    s.getItem(HANDOFF_KEY)
+    s.getItem(OUTCOME_KEY)
     return s
   } catch {
     return null
@@ -276,11 +428,25 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 const updater = createPanelUpdater({
   updatePanel: () => api.updatePanel(),
-  ping: async () => (await api.session()).version,
+  ping: async () => {
+    const s = await api.session()
+    return { version: s.version, authenticated: s.authenticated }
+  },
   reload: () => window.location.reload(),
   storage: sessionStore(),
   sleep,
   now: () => Date.now(),
+})
+
+const upgrade = createFleetUpgrade({
+  runBots: (target, picked) => fleetUpdate.run(target, picked),
+  updateFleetUi: (req) => updater.start(req),
+})
+
+const outcome = createOutcome({
+  storage: sessionStore(),
+  now: () => Date.now(),
+  updates: () => api.updates(true),
 })
 
 const handover = createHandover({
@@ -292,8 +458,21 @@ const handover = createHandover({
 })
 
 export const panelUpdate = {
-  start: (req: UpdateRequest) => void updater.start(req),
   dismiss: updater.dismiss,
+  /** The old page holds still while this is true: Fleet UI is about to reload it. */
+  inFlight: updater.inFlight,
+}
+
+export const fleetUpgrade = {
+  start: (req: UpgradeRequest) => void upgrade.start(req),
+  resume: () => void upgrade.resume(),
+  dismiss: upgrade.dismiss,
+}
+
+export const updateOutcome = {
+  show: (version: string) => void outcome.show(version),
+  pending: outcome.pending,
+  dismiss: outcome.dismiss,
 }
 
 export const afterPanel = {
@@ -304,6 +483,14 @@ export const afterPanel = {
 
 export function usePanelUpdate(): PanelUpdate {
   return useSyncExternalStore(updater.subscribe, updater.get)
+}
+
+export function useFleetUpgrade(): FleetUpgrade {
+  return useSyncExternalStore(upgrade.subscribe, upgrade.get)
+}
+
+export function useUpdateOutcome(): FleetOutcome {
+  return useSyncExternalStore(outcome.subscribe, outcome.get)
 }
 
 export function useAfterPanel(): AfterPanel {

@@ -21,7 +21,7 @@ const TITLE_TONES: Record<PanelUpdateView['tone'], string> = {
 }
 
 const ACTION =
-  'ml-8 shrink-0 self-start rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-bold hover:bg-hover sm:ml-0 sm:self-auto'
+  'shrink-0 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-bold hover:bg-hover'
 
 /**
  * Full-width strip under the header. Progress reads as a tinted band with the
@@ -32,10 +32,13 @@ export default function PanelUpdateStatus({
   view,
   showFleetLink,
   onDismiss,
+  onUpdateFleetUi,
 }: {
   view: PanelUpdateView | null
   showFleetLink: boolean
   onDismiss: () => void
+  /** Go on with Fleet UI after the bots were held. */
+  onUpdateFleetUi: () => void
 }) {
   if (!view) return null
 
@@ -57,15 +60,24 @@ export default function PanelUpdateStatus({
         {view.step !== null && (
           <Steps labels={view.steps} current={view.step} success={view.tone === 'success'} />
         )}
-        {view.action === 'reload' && (
-          <button type="button" onClick={() => window.location.reload()} className={ACTION}>
-            Reload now
-          </button>
-        )}
-        {view.action === 'fleet' && showFleetLink && (
-          <Link to="/" className={ACTION}>
-            View bots
-          </Link>
+        {view.actions.length > 0 && (
+          <div className="ml-8 flex shrink-0 flex-wrap gap-2 sm:ml-0">
+            {view.actions.includes('reload') && (
+              <button type="button" onClick={() => window.location.reload()} className={ACTION}>
+                Reload now
+              </button>
+            )}
+            {view.actions.includes('fleet') && showFleetLink && (
+              <Link to="/" className={ACTION}>
+                View bots
+              </Link>
+            )}
+            {view.actions.includes('fleet-ui') && (
+              <button type="button" onClick={onUpdateFleetUi} className={ACTION}>
+                Update Fleet UI
+              </button>
+            )}
+          </div>
         )}
         {view.dismissible && <Dismiss onClick={onDismiss} className="max-sm:hidden" />}
       </div>

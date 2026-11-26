@@ -45,7 +45,7 @@ import FleetUpdateProgress from '../components/FleetUpdateProgress'
 import { planFleetUpdate, runActive, type StepStatus } from '../fleetUpdate'
 import { fleetUpdate, useFleetUpdate } from '../useFleetUpdate'
 import { panelFlowBusy } from '../panelUpdate'
-import { useAfterPanel, usePanelUpdate } from '../usePanelUpdate'
+import { panelUpdate, useAfterPanel, useFleetUpgrade, usePanelUpdate } from '../usePanelUpdate'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 import { useProfile } from '../profile'
 
@@ -82,7 +82,7 @@ export default function Fleet() {
   const [filter, setFilter] = useFleetFilter()
   const run = useFleetUpdate()
   // The panel is being replaced, or is about to start a run of its own.
-  const panelFlow = panelFlowBusy(usePanelUpdate(), useAfterPanel())
+  const panelFlow = panelFlowBusy(usePanelUpdate(), useAfterPanel(), useFleetUpgrade())
   const [sheetOpen, setSheetOpen] = useState(false)
   // Hosted: no Add corridor and no Update all. Bots are added by the host's
   // administrators and move only to a digest, one bot at a time.
@@ -93,6 +93,9 @@ export default function Fleet() {
       setData(await api.fleet())
       setError(null)
     } catch (e) {
+      // Fleet UI is restarting: reads fail until the page reloads onto it,
+      // and the strip already says so. Keep the last list instead of a red banner.
+      if (panelUpdate.inFlight()) return
       setError(e instanceof ApiError ? e.message : String(e))
     }
   }, [])

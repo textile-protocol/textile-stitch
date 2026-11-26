@@ -1,37 +1,75 @@
-// What the header strip says while the panel updates itself, and the bots
-// after it when the operator ticked them.
+// What the header strip says while Stitch Fleet updates: the bots first, then
+// Fleet UI (the panel itself), then what happened, on the page that loads
+// after the restart.
 //
-// Operators see the panel as "Fleet" (Stitch Fleet), and most of them think
-// in trades and balances, not containers. So the copy never says panel,
-// image, container or registry, and it says what happens to their bots.
+// Operators see the panel as "Fleet UI", and most of them think in trades and
+// balances, not containers. So the copy never says panel, image, container or
+// registry, and it says what happens to their bots.
 //
-// The panel update is three things the operator waits through: the panel
-// pulls the new image, the container is swapped (this page loses its
-// connection), and the page reloads onto the new build. With bots ticked
-// there's a fourth: the page that loads on the new panel updates them, one at
-// a time. The first three happen on the old page (`PanelUpdate`), the fourth
-// on the new one (`AfterPanel`), and both show the same four steps so the
-// strip reads as one flow across the reload.
+// The order is bots first on purpose. The bots update one at a time on the
+// page the operator is signed in to, where they can watch, stop the run, or
+// roll back a bot that didn't come back. Fleet UI restarts last, when no bot
+// is mid-update, and only if every bot came back: a restart signs a password
+// session out, and nobody should have to sign back in to fix a bot that's down.
+// A Fleet UI restart doesn't touch the bots, which keep trading through it.
+//
+// Three stores feed the strip, in this order of precedence:
+// - `PanelUpdate`: the Fleet UI update in flight (download, restart, reconnect).
+// - `FleetUpgrade`: the bot updates that come before it.
+// - `FleetOutcome`: on the page after the restart, how it ended.
+// `AfterPanel` is the older flow, Fleet UI first and bots after the reload,
+// which pages from v0.1.399 and v0.1.400 still start. See panelHandoff.ts.
 
 import { type FleetUpdateRun, runActive, runCounts } from './fleetUpdate'
 import { HANDOFF_TTL_MS, type AfterPanelSkip } from './panelHandoff'
 
+/** Shared by every step of a Fleet UI update. */
+interface FleetUiStep {
+  /** Bots updated before it in this flow; 0 for Fleet UI alone. */
+  bots: number
+  /** A password session, which the restart signs out. */
+  signsOut: boolean
+}
+
 export type PanelUpdate =
   | { phase: 'idle' }
-  /** POST /api/panel/update is in flight: the panel is pulling the image. */
-  | { phase: 'pulling'; bots: number }
-  /** Swap is scheduled; the old panel still answers. */
-  | { phase: 'armed'; bots: number }
-  /** A session poll failed, so the container is being recreated. */
-  | { phase: 'restarting'; bots: number }
-  /** The panel answered again; the page is reloading onto the new UI. */
-  | { phase: 'reloading'; bots: number }
-  /** Polling gave up before the panel came back. */
-  | { phase: 'slow'; bots: number }
+  /** POST /api/panel/update is in flight: the new version is downloading. */
+  | ({ phase: 'pulling' } & FleetUiStep)
+  /** The restart is scheduled; the old Fleet UI still answers. */
+  | ({ phase: 'armed' } & FleetUiStep)
+  /** Fleet UI stopped answering: it's restarting. */
+  | ({ phase: 'restarting' } & FleetUiStep)
+  /** Fleet UI is back (or signed us out); the page is reloading onto it. */
+  | ({ phase: 'reloading' } & FleetUiStep)
+  /** Polling gave up before Fleet UI came back. */
+  | ({ phase: 'slow' } & FleetUiStep)
   /** The update request itself was refused or errored. */
-  | { phase: 'failed'; error: string; bots: number }
+  | ({ phase: 'failed'; error: string } & FleetUiStep)
 
-/** On the new panel, what became of the bots the old page handed over. */
+/** The bot updates that run before Fleet UI, on the same page. */
+export type FleetUpgrade =
+  | { phase: 'idle' }
+  /** Bots are updating; Fleet UI updates after the last one. */
+  | { phase: 'bots'; from: string; signsOut: boolean }
+  /** Not every bot came back, or the operator stopped the run, so Fleet UI waits. */
+  | {
+      phase: 'held'
+      from: string
+      signsOut: boolean
+      done: number
+      failed: number
+      total: number
+      stopped: boolean
+    }
+
+/** On the page that loads after Fleet UI restarted. */
+export type FleetOutcome =
+  | { phase: 'none' }
+  | { phase: 'updated'; from: string; version: string; bots: number; failed: number }
+  /** It came back still reporting an update: the new version didn't land. */
+  | { phase: 'not-moved'; bots: number }
+
+/** Older flow: on the new Fleet UI, the bots an older page handed over. */
 export type AfterPanel =
   | { phase: 'none' }
   /** Reading the fleet and the registry before deciding which bots run. */
@@ -47,13 +85,23 @@ export type AfterPanel =
       error?: string
     }
 
-export const PANEL_UPDATE_STEPS = ['Download', 'Restart', 'Reconnect'] as const
-const WITH_BOTS_STEPS = [...PANEL_UPDATE_STEPS, 'Update bots'] as const
-const BOTS_STEP = WITH_BOTS_STEPS.length - 1
+export const FLEET_UI_STEPS = ['Download', 'Restart', 'Reconnect'] as const
+const BOTS_FIRST_STEPS = ['Update bots', ...FLEET_UI_STEPS] as const
+/** What a v0.1.399–v0.1.400 page showed before the reload: Fleet UI, then bots. */
+const LEGACY_STEPS = [...FLEET_UI_STEPS, 'Update bots'] as const
+const LEGACY_BOTS_STEP = LEGACY_STEPS.length - 1
 
-export function panelUpdateSteps(bots: number): readonly string[] {
-  return bots > 0 ? WITH_BOTS_STEPS : PANEL_UPDATE_STEPS
+/** The steps of a flow that updates `bots` bots before Fleet UI. */
+export function fleetUpdateSteps(bots: number): readonly string[] {
+  return bots > 0 ? BOTS_FIRST_STEPS : FLEET_UI_STEPS
 }
+
+export type StripAction =
+  | 'reload'
+  /** A link to the Fleet page; hidden when already on it. */
+  | 'fleet'
+  /** Go on and update Fleet UI after the bots were held. */
+  | 'fleet-ui'
 
 export interface PanelUpdateView {
   tone: 'progress' | 'success' | 'warning' | 'danger'
@@ -65,59 +113,155 @@ export interface PanelUpdateView {
    * null hides them.
    */
   step: number | null
-  /** The one button worth offering next to the message. */
-  action: 'reload' | 'fleet' | null
+  actions: StripAction[]
   dismissible: boolean
 }
 
 export function panelUpdateView(u: PanelUpdate): PanelUpdateView | null {
+  if (u.phase === 'idle') return null
+  // With bots first, "Update bots" is step 0 and already done.
+  const offset = u.bots > 0 ? 1 : 0
+  const progress = (step: number, detail: string): PanelUpdateView => ({
+    ...base(fleetUpdateSteps(u.bots)),
+    tone: 'progress',
+    title: u.bots > 0 ? 'Bots updated · updating Fleet UI' : 'Updating Fleet UI',
+    detail,
+    step: step + offset,
+  })
   switch (u.phase) {
-    case 'idle':
-      return null
     case 'pulling':
-      return progress(
-        u.bots,
-        0,
-        u.bots > 0
-          ? "Downloading the update. Your bots keep trading, and update once Fleet is back."
-          : 'Downloading the update. Your bots keep trading.',
-      )
+      return progress(0, 'Downloading the update. Your bots keep trading.')
     case 'armed':
-      return progress(u.bots, 1, 'Fleet restarts in a moment. This page goes quiet for a few seconds.')
+      return progress(
+        1,
+        u.signsOut
+          ? "Fleet UI restarts in a moment. Your bots keep trading. You'll sign in again once it's back."
+          : 'Fleet UI restarts in a moment. Your bots keep trading.',
+      )
     case 'restarting':
       return progress(
-        u.bots,
         1,
-        u.bots > 0
-          ? 'Your bots keep trading. This page comes back by itself, then the bots update.'
-          : 'Your bots keep trading. This page comes back by itself.',
+        u.signsOut
+          ? 'Your bots keep trading. This page comes back in a few seconds and asks you to sign in again.'
+          : 'Your bots keep trading. This page comes back by itself in a few seconds.',
       )
     case 'reloading':
-      return progress(u.bots, 2, 'Fleet is back. Opening the new version.')
+      return progress(2, 'Fleet UI is back. Opening the new version.')
     case 'slow':
       return {
-        ...base(u.bots),
+        ...base(fleetUpdateSteps(u.bots)),
         tone: 'warning',
-        title: 'Fleet is taking a while',
-        detail:
-          "It isn't back yet. Your bots keep trading. Reload in a moment." +
-          (u.bots > 0 ? " The bot updates start once it's back." : ''),
-        action: 'reload',
+        title: 'Fleet UI is taking a while',
+        detail: "It isn't back yet. Your bots keep trading. Reload in a moment.",
+        actions: ['reload'],
       }
     case 'failed':
       return {
-        ...base(u.bots),
+        ...base(fleetUpdateSteps(u.bots)),
         tone: 'danger',
-        title: "Fleet update didn't start",
-        detail: u.bots > 0 ? `${u.error} Your bots weren't touched.` : u.error,
+        title: "Fleet UI update didn't start",
+        detail: u.bots > 0 ? `${u.error} Your bots are updated and trading.` : u.error,
         dismissible: true,
       }
   }
 }
 
 /**
- * The strip on the new panel, from the handover and the bot run it started.
- * `onFleet` is true on the Fleet page, where the run's own card lists each bot.
+ * The bot updates before Fleet UI. `onFleet` is true on the Fleet page, where
+ * the run's own card lists each bot.
+ */
+export function upgradeView(
+  g: FleetUpgrade,
+  run: FleetUpdateRun | null,
+  onFleet = false,
+): PanelUpdateView | null {
+  if (g.phase === 'idle') return null
+  if (g.phase === 'held') return heldView(g, onFleet)
+  if (!run) return null
+  const c = runCounts(run)
+  return {
+    ...base(BOTS_FIRST_STEPS),
+    tone: 'progress',
+    title: `Updating bots · ${c.settled} of ${c.total}${c.failed > 0 ? ` · ${c.failed} failed` : ''}`,
+    detail:
+      run.phase === 'stopping'
+        ? "Finishing the current bot, then stopping. Fleet UI won't update."
+        : onFleet
+          ? "Each bot's progress is below. Fleet UI updates after the last one. Keep this tab open."
+          : 'One at a time. Fleet UI updates after the last one. Keep this tab open.',
+    step: 0,
+    actions: ['fleet'],
+  }
+}
+
+function heldView(g: Extract<FleetUpgrade, { phase: 'held' }>, onFleet: boolean): PanelUpdateView {
+  const held = {
+    ...base(BOTS_FIRST_STEPS),
+    actions: ['fleet-ui', 'fleet'] as StripAction[],
+    dismissible: true,
+  }
+  if (g.failed > 0) {
+    const one = g.failed === 1
+    return {
+      ...held,
+      tone: 'danger',
+      title: `Fleet UI on hold · ${g.failed} of ${botCount(g.total)} didn't come back`,
+      detail:
+        `${g.done} updated fine. Fleet UI waits so you can deal with ${one ? 'it' : 'them'} first: ` +
+        (onFleet
+          ? `open ${one ? 'the one' : 'the ones'} that failed, below, to see what happened or go back to the previous version.`
+          : `view your bots to see which ${one ? 'one' : 'ones'}.`),
+    }
+  }
+  return {
+    ...held,
+    tone: 'warning',
+    title: 'Fleet UI on hold · bot updates stopped',
+    detail: `${g.done} of ${botCount(g.total)} updated before you stopped. The rest stay on their current version.`,
+  }
+}
+
+/** On the page after the restart. */
+export function outcomeView(o: FleetOutcome): PanelUpdateView | null {
+  switch (o.phase) {
+    case 'none':
+      return null
+    case 'updated': {
+      const steps = fleetUpdateSteps(o.bots)
+      const one = o.failed === 1
+      return {
+        ...base(steps),
+        // Updated anyway after a hold: a bot is still down, so not all green.
+        tone: o.failed > 0 ? 'warning' : 'success',
+        title: o.bots > 0 ? `Fleet UI and ${botCount(o.bots)} updated` : 'Fleet UI updated',
+        detail:
+          fleetNow(o.from, o.version) +
+          (o.failed > 0
+            ? ` ${botCount(o.failed)} didn't come back up after ${one ? 'its' : 'their'} update. Open ${one ? 'it' : 'them'} from your bots to see what happened.`
+            : o.bots > 0
+              ? ' Your bots updated first and all came back up.'
+              : ''),
+        step: steps.length,
+        actions: o.failed > 0 ? ['fleet'] : [],
+        dismissible: true,
+      }
+    }
+    case 'not-moved':
+      return {
+        ...base(fleetUpdateSteps(o.bots)),
+        tone: 'warning',
+        title: "Fleet UI didn't update",
+        detail:
+          'It came back on the same version. Try Update again in a few minutes.' +
+          (o.bots > 0 ? ' Your bots were updated and are trading.' : ''),
+        dismissible: true,
+      }
+  }
+}
+
+/**
+ * The older flow's strip on the new Fleet UI, from the handover and the bot
+ * run it started.
  */
 export function afterPanelView(
   a: AfterPanel,
@@ -129,20 +273,20 @@ export function afterPanelView(
       return null
     case 'checking':
       return {
-        ...base(a.bots),
+        ...base(LEGACY_STEPS),
         tone: 'progress',
-        title: 'Fleet updated',
+        title: 'Fleet UI updated',
         detail: `${fleetNow(a.from, a.version)} Checking which bots still need the update.`,
-        step: BOTS_STEP,
+        step: LEGACY_BOTS_STEP,
       }
     case 'bots':
-      return run ? botsView(a, run, onFleet) : null
+      return run ? legacyBotsView(a, run, onFleet) : null
     case 'skipped':
       return skippedView(a)
   }
 }
 
-function botsView(
+function legacyBotsView(
   a: { from: string; version: string },
   run: FleetUpdateRun,
   onFleet: boolean,
@@ -151,43 +295,43 @@ function botsView(
   const now = fleetNow(a.from, a.version)
   if (runActive(run)) {
     return {
-      ...base(c.total),
+      ...base(LEGACY_STEPS),
       tone: 'progress',
-      title: `Fleet updated · bots ${c.settled} of ${c.total}${c.failed > 0 ? ` · ${c.failed} failed` : ''}`,
+      title: `Fleet UI updated · bots ${c.settled} of ${c.total}${c.failed > 0 ? ` · ${c.failed} failed` : ''}`,
       detail:
         run.phase === 'stopping'
           ? 'Finishing the current bot, then stopping.'
           : `${now} Your bots update one at a time${onFleet ? ', below' : ''}. Keep this tab open until they're done.`,
-      step: BOTS_STEP,
-      action: 'fleet',
+      step: LEGACY_BOTS_STEP,
+      actions: ['fleet'],
     }
   }
   if (c.failed > 0) {
     return {
-      ...base(c.total),
+      ...base(LEGACY_STEPS),
       tone: 'danger',
-      title: `Fleet updated · ${c.failed} of ${botCount(c.total)} didn't come back`,
+      title: `Fleet UI updated · ${c.failed} of ${botCount(c.total)} didn't come back`,
       detail: failedDetail(c.done, c.failed, onFleet),
-      action: 'fleet',
+      actions: ['fleet'],
       dismissible: true,
     }
   }
   if (run.phase === 'cancelled') {
     return {
-      ...base(c.total),
+      ...base(LEGACY_STEPS),
       tone: 'warning',
-      title: 'Fleet updated · bot updates stopped',
+      title: 'Fleet UI updated · bot updates stopped',
       detail: `${c.done} of ${botCount(c.total)} updated before you stopped. The rest stay on their current version.`,
-      action: 'fleet',
+      actions: ['fleet'],
       dismissible: true,
     }
   }
   return {
-    ...base(c.total),
+    ...base(LEGACY_STEPS),
     tone: 'success',
-    title: `Fleet and ${botCount(c.total)} updated`,
+    title: `Fleet UI and ${botCount(c.total)} updated`,
     detail: `${now} Every bot is back up on the latest version.`,
-    step: WITH_BOTS_STEPS.length,
+    step: LEGACY_STEPS.length,
     dismissible: true,
   }
 }
@@ -202,13 +346,13 @@ function failedDetail(done: number, failed: number, onFleet: boolean): string {
 
 function skippedView(a: Extract<AfterPanel, { phase: 'skipped' }>): PanelUpdateView {
   const now = fleetNow(a.from, a.version)
-  const done = { ...base(0), dismissible: true }
+  const done = { ...base(FLEET_UI_STEPS), dismissible: true }
   switch (a.reason) {
     case 'panel-not-moved':
       return {
         ...done,
         tone: 'warning',
-        title: "Fleet didn't update",
+        title: "Fleet UI didn't update",
         detail:
           "It came back on the same version, so your bots weren't touched. Try Update again in a few minutes.",
       }
@@ -216,17 +360,17 @@ function skippedView(a: Extract<AfterPanel, { phase: 'skipped' }>): PanelUpdateV
       return {
         ...done,
         tone: 'warning',
-        title: 'Fleet updated, bots not checked',
+        title: 'Fleet UI updated, bots not checked',
         detail: `${now} We couldn't check for new bot versions, so no bots were updated. Try Update all in a few minutes.`,
-        action: 'fleet',
+        actions: ['fleet'],
       }
     case 'check-failed':
       return {
         ...done,
         tone: 'warning',
-        title: 'Fleet updated, bots not checked',
+        title: 'Fleet UI updated, bots not checked',
         detail: `${now} We couldn't load your bots, so none were updated. Try Update all in a few minutes.`,
-        action: 'fleet',
+        actions: ['fleet'],
       }
     case 'expired':
       return {
@@ -234,56 +378,43 @@ function skippedView(a: Extract<AfterPanel, { phase: 'skipped' }>): PanelUpdateV
         tone: 'warning',
         title: 'Bot updates not started',
         detail: `They were queued more than ${Math.round(HANDOFF_TTL_MS / 60_000)} minutes ago, so they didn't start. If your bots still need it, use Update all.`,
-        action: 'fleet',
+        actions: ['fleet'],
       }
     case 'nothing-behind':
       return {
         ...done,
         tone: 'success',
-        title: 'Fleet updated',
+        title: 'Fleet UI updated',
         detail: `${now} Your bots were already up to date.`,
       }
   }
 }
 
-/** True while an update is under way and the header button should stay busy. */
+/** True while a Fleet UI update is under way and the header button should stay busy. */
 export function panelUpdateBusy(u: PanelUpdate): boolean {
   return u.phase !== 'idle' && u.phase !== 'failed' && u.phase !== 'slow'
 }
 
 /**
- * True while the panel is swapping or deciding which bots to hand to the run.
- * Update all stays out of the way then: the panel shouldn't be recreating bots
- * while it's being replaced, and the handover is about to start a run itself.
+ * True while bots are updating ahead of Fleet UI, Fleet UI is restarting, or
+ * the older handover is deciding which bots to run. Update all stays out of
+ * the way then: the flow is about to start, or is running, a run of its own.
  */
-export function panelFlowBusy(u: PanelUpdate, a: AfterPanel): boolean {
-  return panelUpdateBusy(u) || a.phase === 'checking'
+export function panelFlowBusy(u: PanelUpdate, a: AfterPanel, g: FleetUpgrade): boolean {
+  return panelUpdateBusy(u) || a.phase === 'checking' || g.phase === 'bots'
 }
 
-function progress(bots: number, step: number, detail: string): PanelUpdateView {
-  return {
-    ...base(bots),
-    tone: 'progress',
-    title: bots > 0 ? `Updating Fleet and ${botCount(bots)}` : 'Updating Fleet',
-    detail,
-    step,
-  }
-}
-
-function base(bots: number): Omit<PanelUpdateView, 'tone' | 'title' | 'detail'> {
-  return {
-    steps: panelUpdateSteps(bots),
-    step: null,
-    action: null,
-    dismissible: false,
-  }
+function base(steps: readonly string[]): Omit<PanelUpdateView, 'tone' | 'title' | 'detail'> {
+  return { steps, step: null, actions: [], dismissible: false }
 }
 
 function botCount(n: number): string {
   return `${n} ${n === 1 ? 'bot' : 'bots'}`
 }
 
-/** "Fleet is now on v0.1.240 (was v0.1.233).", or without the "was" when it held. */
+/** "Fleet UI is now on v0.1.240 (was v0.1.233).", or without the "was" when it held. */
 export function fleetNow(from: string, to: string): string {
-  return from && from !== to ? `Fleet is now on v${to} (was v${from}).` : `Fleet is now on v${to}.`
+  return from && from !== to
+    ? `Fleet UI is now on v${to} (was v${from}).`
+    : `Fleet UI is now on v${to}.`
 }
