@@ -242,7 +242,7 @@ password independently of the proxy.
 
 Existing operators can migrate entirely in the browser:
 
-1. Click **Update panel** in the existing panel. Image updates preserve the
+1. Click **Update** in the existing panel's header. Image updates preserve the
    current login settings and mounted fleet directory. Existing operators retain
    access; bot containers keep running.
 2. The updated panel shows a persistent **Secure your panel with a password**
@@ -682,7 +682,7 @@ it; the compose export is there for when you want to go back.
 | Upgrade a bot | edit the image tag, `up -d` | **Update** when a newer digest is available (pulls `STITCH_PANEL_BOT_IMAGE` and recreates that bot). **Recreate** rebuilds on the configured image for recovery, keeping a pinned bot's own build. |
 | Upgrade every bot | edit each tag, `up -d` | **Update all…** on the Fleet page when bots are behind. It updates them one at a time, waits for each to stay up, and lists any that didn't at the end. Pinned and flat-layout bots are left as they are. Keep the tab open until it finishes. |
 | Downgrade a bot | edit the image tag back, `up -d` | **Tools → Roll back** — pick one of the last 10 published builds |
-| Upgrade the panel | `docker compose pull && up -d` | **Update panel** in the header when a newer `textile-stitch-panel` digest is published |
+| Upgrade the panel | `docker compose pull && up -d` | **Update** in the header when a newer `textile-stitch-panel` digest is published. **Stitch bots** is on by default, so one confirm updates the panel and then every bot that's behind. |
 
 **Approve needs the operator wallet to itself.** It runs in a throwaway container
 with its own copy of the key, and it broadcasts. So does a bot's taker or closer
@@ -882,11 +882,29 @@ image and of its own panel image. Results are cached for about 15 minutes; pass
   `STITCH_PANEL_BOT_IMAGE`, except for a bot already pinned to one build of that
   repository (a `sha-*` / digest ref, or a rollback), which keeps its own image —
   recovering a stuck container must not quietly move it onto another release.
-- **Update panel** pulls a newer `textile-stitch-panel` image (pinned `sha-*`
+- **Update** (in the header) pulls a newer `textile-stitch-panel` image (pinned `sha-*`
   tags resolve to `:latest` of the same repo) and schedules a self-recreate via a
   short-lived helper on the Docker socket. The UI disconnects briefly; bots keep
   running. Local-only images (`stitch-panel` with no registry path) can't
   self-update — rebuild or set `PANEL_IMAGE` to the published GHCR image.
+
+  The confirm sheet (**Update Stitch Fleet**) has a **Stitch bots** switch, on by
+  default, so every bot that's behind updates after the panel. Turn it off to
+  update the panel alone, or open **Choose bots** to untick single bots. The
+  panel always goes first, because it's the panel that recreates the bot
+  containers and the new release should be the one doing it. After the reload,
+  the new panel runs the ticked bots through the same one-at-a-time loop as
+  **Update all**. Each has to stay up for about ten seconds, and failures are
+  listed at the end. The strip under the header follows the whole flow.
+
+  The new panel only updates a ticked bot that it still sees as behind and
+  that Update all would take: pinned and flat-layout bots are left alone, and
+  nothing that wasn't ticked is added. If the panel comes back still reporting
+  itself behind, the swap didn't land and no bot is touched. The list lives in
+  the tab's `sessionStorage` for 30 minutes, so another open tab never runs it
+  twice. A password session doesn't survive the restart: sign back in in the
+  same tab and the bots start. Closing the tab before then drops the list, and
+  the bots stay where they were (use **Update all** later).
 
 Offline or private registries that reject anonymous pulls soft-fail: the UI
 simply doesn't show an update, rather than erroring the fleet page.

@@ -57,7 +57,7 @@ describe('createFleetUpdateRunner', () => {
     expect(updated).toEqual(['a', 'b', 'c'])
     const steps = runner.get()!.steps
     expect(steps.map((s) => s.status)).toEqual(['done', 'failed', 'done'])
-    expect(steps[1]?.detail).toMatch(/stopped after the update \(exited\)/)
+    expect(steps[1]?.detail).toBe('It stopped after the update.')
     expect(runner.get()?.phase).toBe('done')
   })
 
@@ -74,7 +74,7 @@ describe('createFleetUpdateRunner', () => {
     const runner = createFleetUpdateRunner(deps)
     await runner.start(TARGET, [candidate('a')])
     expect(runner.get()?.steps[0]?.status).toBe('failed')
-    expect(runner.get()?.steps[0]?.detail).toMatch(/didn't stay up within 10s/)
+    expect(runner.get()?.steps[0]?.detail).toMatch(/didn't come back up within 10 seconds/)
   })
 
   it('finishes the bot in flight on stop and leaves the rest untouched', async () => {

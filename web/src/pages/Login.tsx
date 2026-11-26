@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { ApiError, api } from './../api'
 import { Banner, Button, Card, Field, Input } from '../components/ui'
 import type { SessionInfo } from '../types'
+import { afterPanel } from '../usePanelUpdate'
 
 /**
  * The sign-in screen.
@@ -21,6 +22,9 @@ export default function Login({
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // A panel update with bots ticked ends here for a password session: the
+  // restart dropped it. Say what signing in will pick up.
+  const [waiting] = useState(afterPanel.pending)
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -43,6 +47,13 @@ export default function Login({
         <h1 className="text-center text-lg font-bold">
           Stitch
         </h1>
+
+        {waiting > 0 && (
+          <Banner tone="info">
+            Stitch Fleet restarted to finish its update. Sign in again and your{' '}
+            {waiting === 1 ? 'bot updates' : `${waiting} bots update`} right after.
+          </Banner>
+        )}
 
         {session.passwordLogin ? (
           <Card>

@@ -14,7 +14,7 @@ import {
   Tag,
   VaultButton,
 } from '../components/ui'
-import { formatUsd, shortImage } from '../format'
+import { formatUsd } from '../format'
 import {
   arrangeFleet,
   rankFleet,
@@ -44,6 +44,8 @@ import UpdateAllSheet from '../components/UpdateAllSheet'
 import FleetUpdateProgress from '../components/FleetUpdateProgress'
 import { planFleetUpdate, runActive, type StepStatus } from '../fleetUpdate'
 import { fleetUpdate, useFleetUpdate } from '../useFleetUpdate'
+import { panelFlowBusy } from '../panelUpdate'
+import { useAfterPanel, usePanelUpdate } from '../usePanelUpdate'
 import type { Bot, Fleet as FleetData, UpdatesStatus } from '../types'
 import { useProfile } from '../profile'
 
@@ -79,6 +81,8 @@ export default function Fleet() {
   // The filter is the URL, saved between visits and tabs (see useFleetFilter).
   const [filter, setFilter] = useFleetFilter()
   const run = useFleetUpdate()
+  // The panel is being replaced, or is about to start a run of its own.
+  const panelFlow = panelFlowBusy(usePanelUpdate(), useAfterPanel())
   const [sheetOpen, setSheetOpen] = useState(false)
   // Hosted: no Add corridor and no Update all. Bots are added by the host's
   // administrators and move only to a digest, one bot at a time.
@@ -223,10 +227,9 @@ export default function Fleet() {
         behind.size > 0 && (
           <div className="flex flex-wrap items-center gap-3 rounded-lg bg-hover px-3 py-2 text-sm">
             <span className="flex-1">
-              {behind.size} {behind.size === 1 ? 'bot is' : 'bots are'} behind the latest
-              stitch image ({shortImage(updates?.bot.targetImage ?? null)}).
+              {behind.size} {behind.size === 1 ? 'bot has' : 'bots have'} an update available.
             </span>
-            {updatable > 0 && (
+            {updatable > 0 && !panelFlow && (
               // Secondary on purpose: Add corridor stays the page's one primary action.
               <Button onClick={() => setSheetOpen(true)}>
                 Update {updatable === 1 ? 'bot' : 'all'}…
@@ -239,7 +242,6 @@ export default function Fleet() {
         <UpdateAllSheet
           open={sheetOpen}
           plan={plan}
-          target={updates.bot.targetImage}
           onClose={() => setSheetOpen(false)}
           onStart={(picked) => fleetUpdate.start(updates.bot.targetImage, picked)}
         />

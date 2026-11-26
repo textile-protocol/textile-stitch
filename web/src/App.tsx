@@ -2,7 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { ApiError, api, setUnauthorizedHandler } from './api'
 import OverflowMenu from './components/OverflowMenu'
-import PanelUpdateStatus, { usePanelUpdate } from './components/PanelUpdateStatus'
+import PanelUpdateStatus from './components/PanelUpdateStatus'
+import PanelUpdateSheet, { type BotsSection } from './components/PanelUpdateSheet'
 import TextileIcon from './components/TextileIcon'
 import PanelPasswordSetup from './components/PanelPasswordSetup'
 import { Banner, Button, Loading } from './components/ui'
@@ -11,8 +12,11 @@ import Fleet from './pages/Fleet'
 import AddBot from './pages/AddBot'
 import BotDetail from './pages/BotDetail'
 import FleetChanges from './pages/FleetChanges'
-import { shortImage } from './format'
-import { panelUpdateBusy } from './panelUpdate'
+import { arrangeFleet, readFleetOrder } from './fleetOrder'
+import { planFleetUpdate, runActive } from './fleetUpdate'
+import { afterPanelView, panelUpdateBusy, panelUpdateView } from './panelUpdate'
+import { afterPanel, panelUpdate, useAfterPanel, usePanelUpdate } from './usePanelUpdate'
+import { fleetUpdate, useFleetUpdate } from './useFleetUpdate'
 import { ProfileContext, allows, profileOf } from './profile'
 import type { SessionInfo, UpdatesStatus } from './types'
 
@@ -144,10 +148,53 @@ function Header({
 }) {
   const { pathname } = useLocation()
   const [updates, setUpdates] = useState<UpdatesStatus | null>(null)
-  const panelUpdate = usePanelUpdate()
-  const panelBusy = panelUpdateBusy(panelUpdate.state)
+  const panel = usePanelUpdate()
+  const after = useAfterPanel()
+  const run = useFleetUpdate()
+  const panelBusy = panelUpdateBusy(panel)
+  const botsUpdating = runActive(run)
+  const profile = profileOf(session)
   // Hosted panels are updated by the host's Terraform, by digest.
-  const canSelfUpdate = allows(profileOf(session), 'panelUpdate')
+  const canSelfUpdate = allows(profile, 'panelUpdate')
+  const canUpdateBots = allows(profile, 'updateAll')
+  const [sheetOpen, setSheetOpen] = useState(false)
+  const [sheetBots, setSheetBots] = useState<BotsSection | null>(null)
+
+  // This page may be the one a panel update reloaded onto, with bots handed
+  // over to update now. Only the first call in a page load acts.
+  useEffect(() => {
+    afterPanel.resume(session.version, canUpdateBots)
+  }, [session.version, canUpdateBots])
+
+  async function openSheet() {
+    setSheetOpen(true)
+    if (!canUpdateBots) {
+      setSheetBots(null)
+      return
+    }
+    setSheetBots({ state: 'loading' })
+    try {
+      const [fleet, u] = await Promise.all([api.fleet(), api.updates()])
+      setUpdates(u)
+      setSheetBots({
+        state: 'ready',
+        // Fleet order, so the run goes down the list the operator knows.
+        plan: planFleetUpdate(arrangeFleet(fleet.bots, readFleetOrder()), u),
+      })
+    } catch (e) {
+      setSheetBots({ state: 'error', error: e instanceof ApiError ? e.message : String(e) })
+    }
+  }
+
+  function dismissStrip() {
+    if (panel.phase === 'failed') {
+      panelUpdate.dismiss()
+      return
+    }
+    // The strip and the Fleet card are one outcome; clearing one clears both.
+    if (after.phase === 'bots' && !botsUpdating) fleetUpdate.dismiss()
+    afterPanel.dismiss()
+  }
 
   // Soft check on every navigation (and mount); forced registry refresh on a
   // timer so a parked tab still learns about a newer panel image.
@@ -187,14 +234,17 @@ function Header({
             <Button
               variant="primary"
               busy={panelBusy}
-              onClick={() => void panelUpdate.start(updates.panel.targetImage)}
-              title={`Update panel to ${shortImage(updates.panel.targetImage)}`}
+              // Restarting the panel mid-run would cut a bot's swap short.
+              disabled={botsUpdating}
+              onClick={() => void openSheet()}
+              title={
+                botsUpdating
+                  ? 'Your bots are updating. You can update Fleet once they finish.'
+                  : 'Update Stitch Fleet and your bots'
+              }
               className="max-sm:px-2 max-sm:text-xs"
             >
-              <span className="sm:hidden">{panelBusy ? 'Updating' : 'Update'}</span>
-              <span className="hidden sm:inline">
-                {panelBusy ? 'Updating panel' : 'Update panel'}
-              </span>
+              {panelBusy ? 'Updating' : 'Update'}
             </Button>
           )}
           <button
@@ -208,7 +258,27 @@ function Header({
           <OverflowMenu session={session} onSignedOut={onSignedOut} />
         </div>
       </div>
-      <PanelUpdateStatus state={panelUpdate.state} onDismiss={panelUpdate.dismiss} />
+      <PanelUpdateStatus
+        view={panelUpdateView(panel) ?? afterPanelView(after, run, pathname === '/')}
+        showFleetLink={pathname !== '/'}
+        onDismiss={dismissStrip}
+      />
+      {updates && (
+        <PanelUpdateSheet
+          open={sheetOpen}
+          panelTarget={updates.panel.targetImage}
+          version={session.version}
+          bots={sheetBots}
+          signsOut={session.identity === 'password'}
+          onClose={() => setSheetOpen(false)}
+          onStart={(bots) => {
+            // The button is disabled mid-run too; this covers a run that
+            // started while the sheet was open.
+            if (botsUpdating) return
+            panelUpdate.start({ bots, from: session.version })
+          }}
+        />
+      )}
     </header>
   )
 }

@@ -1,6 +1,5 @@
 import { Link } from 'react-router-dom'
 import { botPath } from '../botRoutes'
-import { shortImage } from '../format'
 import { type FleetUpdateRun, type UpdateStep, runActive, runCounts } from '../fleetUpdate'
 import { Button, Spinner } from './ui'
 
@@ -62,29 +61,30 @@ export default function FleetUpdateProgress({
 }
 
 function headline(run: FleetUpdateRun, c: ReturnType<typeof runCounts>): string {
-  const target = shortImage(run.target)
   const bots = (n: number) => `${n} ${n === 1 ? 'bot' : 'bots'}`
   if (runActive(run)) {
     const failed = c.failed > 0 ? ` · ${c.failed} failed` : ''
-    return `Updating bots to ${target} · ${c.settled} of ${c.total}${failed}`
+    return `Updating bots · ${c.settled} of ${c.total}${failed}`
   }
-  if (c.failed === 0 && run.phase === 'done') return `Updated ${bots(c.total)} to ${target}`
+  if (c.failed === 0 && run.phase === 'done') return `Updated ${bots(c.total)} to the latest version`
   const failed = c.failed > 0 ? `, ${c.failed} failed` : ''
-  return `Updated ${c.done} of ${bots(c.total)} to ${target}${failed}`
+  return `Updated ${c.done} of ${bots(c.total)}${failed}`
 }
 
 function subline(run: FleetUpdateRun, failures: UpdateStep[], untouched: number): string {
   if (run.phase === 'running') {
-    return 'One at a time. You can open a bot meanwhile; keep this tab open until it finishes.'
+    return "One at a time. You can open a bot meanwhile. Keep this tab open until it's done."
   }
-  if (run.phase === 'stopping') return 'Finishing the bot in flight, then stopping.'
+  if (run.phase === 'stopping') return 'Finishing the current bot, then stopping.'
   const parts = [
-    failures.length === 1 && `${failures[0]?.label} didn't come back up. Open it to read its logs or roll it back.`,
-    failures.length > 1 && "These didn't come back up. Open each to read its logs or roll it back.",
+    failures.length === 1 &&
+      `${failures[0]?.label} didn't come back up. Open it to see what happened, or go back to its previous version.`,
+    failures.length > 1 &&
+      "These didn't come back up. Open each one to see what happened, or go back to its previous version.",
     run.phase === 'cancelled' &&
-      `You stopped the run. ${untouched} ${untouched === 1 ? 'bot was' : 'bots were'} left on the build ${untouched === 1 ? 'it' : 'they'} had.`,
+      `You stopped the updates. ${untouched} ${untouched === 1 ? 'bot stays' : 'bots stay'} on ${untouched === 1 ? 'its' : 'their'} current version.`,
   ].filter(Boolean)
-  return parts.length > 0 ? parts.join(' ') : 'Each one came back up on the new image.'
+  return parts.length > 0 ? parts.join(' ') : 'Every bot came back up on the latest version.'
 }
 
 function ProgressBar({ settled, total }: { settled: number; total: number }) {
@@ -131,9 +131,9 @@ function stepView(step: UpdateStep): { icon: React.ReactNode; text: string; tone
     case 'queued':
       return { icon: '·', text: 'Queued', tone: 'text-faint' }
     case 'updating':
-      return { icon: <Spinner />, text: 'Pulling and recreating', tone: 'text-accent' }
+      return { icon: <Spinner />, text: 'Updating', tone: 'text-accent' }
     case 'checking':
-      return { icon: <Spinner />, text: 'Waiting for it to stay up', tone: 'text-accent' }
+      return { icon: <Spinner />, text: 'Checking it stays up', tone: 'text-accent' }
     case 'done':
       return {
         icon: '✓',

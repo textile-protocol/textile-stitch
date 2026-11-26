@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { imageLabel, shortImage } from '../format'
+import { imageLabel } from '../format'
 import {
   type FleetUpdatePlan,
   type UpdateCandidate,
@@ -15,13 +15,11 @@ import { Button } from './ui'
 export default function UpdateAllSheet({
   open,
   plan,
-  target,
   onClose,
   onStart,
 }: {
   open: boolean
   plan: FleetUpdatePlan
-  target: string
   onClose: () => void
   onStart: (picked: UpdateCandidate[]) => void
 }) {
@@ -64,7 +62,7 @@ export default function UpdateAllSheet({
         <div>
           <h2 className="text-base font-bold">Update bots</h2>
           <p className="text-muted mt-0.5 text-sm">
-            To <span className="font-mono">{shortImage(target)}</span>
+            To the latest version
           </p>
         </div>
         <button
@@ -79,13 +77,12 @@ export default function UpdateAllSheet({
 
       <div className="max-h-[60vh] space-y-5 overflow-y-auto px-5 py-4">
         <p className="text-muted text-sm">
-          One bot at a time: pull the image, recreate the container, wait for it to stay up,
-          then the next. A running bot stops quoting for a few seconds while it's replaced.
-          Config and keys stay on disk.
+          One bot at a time. Each pauses trading for a few seconds while it updates, and has to
+          stay up before the next one starts. Settings and keys aren&rsquo;t touched.
         </p>
 
         {plan.ready.length > 0 && (
-          <Group title={`Behind (${plan.ready.length})`}>
+          <Group title={`Need an update (${plan.ready.length})`}>
             {plan.ready.map((c) => (
               <CandidateRow
                 key={c.name}
@@ -98,7 +95,7 @@ export default function UpdateAllSheet({
         )}
 
         {plan.skipped.length > 0 && (
-          <Group title={`Left as they are (${plan.skipped.length})`}>
+          <Group title={`Not updated (${plan.skipped.length})`}>
             {plan.skipped.map((s) => (
               <li key={s.name} className="flex gap-3 px-3 py-2.5">
                 <span className="text-faint mt-0.5 w-4 shrink-0 text-center">–</span>
@@ -134,7 +131,7 @@ export default function UpdateAllSheet({
   )
 }
 
-function Group({
+export function Group({
   title,
   note,
   children,
@@ -152,7 +149,7 @@ function Group({
   )
 }
 
-function CandidateRow({
+export function CandidateRow({
   c,
   checked,
   onToggle,
@@ -180,7 +177,7 @@ function CandidateRow({
           <div className="text-muted font-mono text-xs">{imageLabel(c.image, c.version)}</div>
         </div>
         <span className="text-muted shrink-0 text-xs">
-          {c.wantsUp ? 'restarts' : 'stays stopped'}
+          {c.wantsUp ? 'pauses briefly' : 'stays stopped'}
         </span>
       </label>
     </li>

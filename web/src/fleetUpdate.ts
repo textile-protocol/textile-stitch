@@ -76,14 +76,14 @@ export function planFleetUpdate(bots: Bot[], updates: UpdatesStatus | null): Fle
  */
 function skipReason(bot: Bot): string | null {
   if (isPinnedImage(bot.image)) {
-    return 'Pinned to a build, usually after a rollback. Use Update on its page to leave the pin.'
+    return 'Kept on an earlier version on purpose, usually after a rollback. Update it from its own page.'
   }
   if (bot.canMigrate || bot.layout === 'flat-files') {
-    return 'Still on the flat layout. Migrate it first so the nonce ledger survives.'
+    return 'Needs a one-time migration first. Open it and click Migrate.'
   }
-  if (!bot.container) return 'Has no container. Recreate it from its page.'
+  if (!bot.container) return 'Needs a repair first. Open it and click Recreate.'
   const blocking = bot.warnings.find((w) => w.blocksEditing)
-  if (!bot.editable) return blocking?.message ?? "The panel can't edit this bot."
+  if (!bot.editable) return blocking?.message ?? "Fleet can't change this bot."
   return null
 }
 

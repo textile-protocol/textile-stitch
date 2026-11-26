@@ -77,10 +77,10 @@ export function createFleetUpdateRunner(deps: RunnerDeps): FleetUpdateRunner {
       }
       const verdict = healthVerdict(wantsUp, seen)
       if (verdict === 'up') return null
-      if (verdict === 'down') return `It stopped after the update (${seen[seen.length - 1]}).`
+      if (verdict === 'down') return 'It stopped after the update.'
       await deps.sleep(pollMs)
     }
-    return `It didn't stay up within ${Math.round(timeout / 1000)}s of the update.`
+    return `It didn't come back up within ${Math.round(timeout / 1000)} seconds.`
   }
 
   async function updateOne(name: string, wantsUp: boolean): Promise<void> {

@@ -119,7 +119,7 @@ describe('planFleetUpdate', () => {
     expect(plan.ready.map((c) => c.name)).toEqual(['a'])
     expect(plan.skipped).toHaveLength(1)
     expect(plan.skipped[0]?.name).toBe('p')
-    expect(plan.skipped[0]?.reason).toMatch(/Pinned/)
+    expect(plan.skipped[0]?.reason).toMatch(/earlier version on purpose/)
   })
 
   it('skips the bots the single-bot Update would refuse, saying why', () => {
@@ -135,9 +135,9 @@ describe('planFleetUpdate', () => {
     const plan = planFleetUpdate(bots, updates(bots.map((b) => b.name)))
     expect(plan.ready).toEqual([])
     const reasons = Object.fromEntries(plan.skipped.map((s) => [s.name, s.reason]))
-    expect(reasons.flat).toMatch(/flat layout/)
-    expect(reasons.migrate).toMatch(/flat layout/)
-    expect(reasons.gone).toMatch(/no container/)
+    expect(reasons.flat).toMatch(/click Migrate/)
+    expect(reasons.migrate).toMatch(/click Migrate/)
+    expect(reasons.gone).toMatch(/click Recreate/)
     expect(reasons.locked).toBe('Config is read-only.')
   })
 
