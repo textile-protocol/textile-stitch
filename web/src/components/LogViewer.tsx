@@ -1,59 +1,77 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { appendLine, LEVEL_CLASS, MAX_LINES } from '../logBuffer'
+import { followLog, isDivider, type LogEntry } from '../logFollow'
 import { streamSse } from '../sse'
 import { Button, Banner } from './ui'
-import type { LogLine } from '../types'
 
 /** How many historical lines to replay when the tail opens. */
 const REPLAY = 500
 
-export default function LogViewer({ bot }: { bot: string }) {
-  const [lines, setLines] = useState<LogLine[]>([])
+export default function LogViewer({
+  bot,
+  live,
+  attachKey = 0,
+}: {
+  bot: string
+  /**
+   * The bot has a process running or about to run (`Bot.canStop`). A stream
+   * that ends is re-attached only while this holds: a stopped container's log
+   * ends straight away, and there's nothing to follow until it starts again.
+   */
+  live: boolean
+  /**
+   * Changed by the page each time it starts, stops, restarts or replaces the
+   * container, so the tail re-attaches right away instead of waiting for its
+   * next retry. The desktop runtime needs this one: its stream follows a log
+   * file, and a recreate swaps the file out without ending the stream.
+   */
+  attachKey?: number
+}) {
+  const [lines, setLines] = useState<LogEntry[]>([])
+  // Everything received for this bot, bounded like the screen but untouched by
+  // Clear. A re-attach lines its replay up against this rather than the screen,
+  // so clearing and then resuming doesn't bring the cleared lines back.
+  const seen = useRef<LogEntry[]>([])
   const [error, setError] = useState<string | null>(null)
+  // The stream ended and the tail is trying to get back onto the bot.
+  const [reconnecting, setReconnecting] = useState(false)
   const [paused, setPaused] = useState(false)
   const [follow, setFollow] = useState(true)
   const bottom = useRef<HTMLDivElement>(null)
   // Which bot the buffer currently holds, so a switch to another bot clears and
   // replays instead of appending onto the previous bot's lines.
   const streamedBot = useRef<string | null>(null)
-  // Whether the last effect run left us paused. A resume — the only case that should
-  // skip the replay — is this flipping back off for the same bot.
-  const wasPaused = useRef(false)
 
   useEffect(() => {
     if (paused) {
-      wasPaused.current = true
+      setReconnecting(false)
       return
     }
     setError(null)
-    const differentBot = streamedBot.current !== bot
-    // Replay the tail on every attach except a genuine resume: pausing keeps the lines
-    // on screen, so resuming the same bot must not replay the last REPLAY of them again
-    // (it would duplicate the overlap and evict older lines from the bounded buffer). A
-    // resume is specifically the pause toggle flipping back off for the same bot —
-    // *not* a bot switch, and not React StrictMode's dev remount, which re-runs this
-    // effect with paused still false and must still replay or the viewer opens empty.
-    const resuming = wasPaused.current && !differentBot
-    wasPaused.current = false
-    if (differentBot) setLines([])
+    // Every attach replays the tail: the first one, a resume, a re-attach after a
+    // restart. For the same bot `followLog` skips the lines already on screen, so a
+    // resume fills in what was printed while paused without repeating the overlap.
+    if (streamedBot.current !== bot) {
+      seen.current = []
+      setLines([])
+      setReconnecting(false)
+    }
     streamedBot.current = bot
-    const stream = streamSse(
-      api.logsUrl(bot, resuming ? 0 : REPLAY),
-      { method: 'GET' },
-      {
-        onEvent: (event, data) => {
-          if (event === 'line') {
-            setLines((prev) => appendLine(prev, data as LogLine))
-          } else if (event === 'error') {
-            setError((data as { message: string }).message)
-          }
-        },
-        onError: setError,
+    return followLog({
+      open: (tail, handlers) =>
+        streamSse(api.logsUrl(bot, tail), { method: 'GET' }, handlers),
+      replay: REPLAY,
+      live,
+      current: () => seen.current,
+      onAppend: (entries) => {
+        seen.current = appendAll(seen.current, entries)
+        setLines((prev) => appendAll(prev, entries))
       },
-    )
-    return () => stream.abort()
-  }, [bot, paused])
+      onError: setError,
+      onReconnecting: setReconnecting,
+    })
+  }, [bot, paused, live, attachKey])
 
   useEffect(() => {
     if (follow) bottom.current?.scrollIntoView({ block: 'end' })
@@ -85,17 +103,35 @@ export default function LogViewer({ bot }: { bot: string }) {
         </label>
       </div>
 
-      {error && <Banner tone="danger">{error}</Banner>}
+      {/*
+        While it's reconnecting, an error is one failed attempt (mid-swap there is
+        briefly no container to attach to), not news. Say what's going on instead.
+      */}
+      {reconnecting ? (
+        <p className="text-sm text-muted" role="status">
+          The log stream ended. Reconnecting…
+          {error && <span className="text-faint"> ({error})</span>}
+        </p>
+      ) : (
+        error && <Banner tone="danger">{error}</Banner>
+      )}
 
-      {lines.length === 0 && !error ? (
+      {lines.length === 0 && (!error || reconnecting) ? (
         <p className="py-8 text-center text-sm text-muted">
           {paused ? 'Paused.' : 'Waiting for output…'}
         </p>
       ) : (
         <div className="max-h-96 overflow-auto rounded-lg bg-canvas p-3 font-mono text-xs leading-relaxed">
-          {lines.map((line, i) => (
-            <div key={i} className={`whitespace-pre-wrap ${LEVEL_CLASS[line.level]}`}>
-              {line.text}
+          {lines.map((entry, i) => (
+            <div
+              key={i}
+              className={
+                isDivider(entry)
+                  ? 'my-1 text-center text-faint'
+                  : `whitespace-pre-wrap ${LEVEL_CLASS[entry.level]}`
+              }
+            >
+              {entry.text}
             </div>
           ))}
           <div ref={bottom} />
@@ -110,4 +146,8 @@ export default function LogViewer({ bot }: { bot: string }) {
       )}
     </div>
   )
+}
+
+function appendAll(lines: LogEntry[], entries: LogEntry[]): LogEntry[] {
+  return entries.reduce((acc, entry) => appendLine(acc, entry), lines)
 }

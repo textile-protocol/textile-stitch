@@ -7,6 +7,8 @@
 import { notifyUnauthorized } from './api'
 
 export interface SseHandlers {
+  /** The panel accepted the request and the stream is open. */
+  onOpen?: () => void
   /** A named event with a parsed JSON payload. */
   onEvent: (event: string, data: unknown) => void
   /** The stream ended cleanly. */
@@ -54,6 +56,7 @@ export function streamSse(
         handlers.onError?.('the panel returned no stream')
         return
       }
+      handlers.onOpen?.()
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()

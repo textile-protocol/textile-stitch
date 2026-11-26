@@ -81,6 +81,10 @@ export default function BotDetail() {
     () => !!handoff?.needsPermit2,
   )
   const [busy, setBusy] = useState<string | null>(null)
+  // Bumped whenever this page starts, stops, restarts or replaces the container,
+  // so an open log tail re-attaches to whatever is running now.
+  const [containerChanges, setContainerChanges] = useState(0)
+  const containerChanged = () => setContainerChanges((n) => n + 1)
   // Hosted panels refuse these server-side; hide them so nobody tries.
   const hosted = useProfile() === 'hosted'
   // After create, land on Tools so Approve allowances is the next obvious step.
@@ -180,6 +184,7 @@ export default function BotDetail() {
       // Stopping a sibling to unblock approval returns *that* bot. Keep this
       // page on the selected one and re-read so canApprove can flip.
       setBot(target === name ? res.bot : await api.bot(name))
+      if (target === name) containerChanged()
       setNote(res.message)
       void loadUpdates()
     } catch (e) {
@@ -434,7 +439,15 @@ export default function BotDetail() {
         </Card>
       )}
 
-      {!hosted && <MigrationPrompt bot={bot} onMigrated={setBot} />}
+      {!hosted && (
+        <MigrationPrompt
+          bot={bot}
+          onMigrated={(next) => {
+            setBot(next)
+            containerChanged()
+          }}
+        />
+      )}
 
       {/*
         Five labels don't fit a phone width. Scroll horizontally in a clipped
@@ -516,7 +529,7 @@ export default function BotDetail() {
 
       {tab === 'logs' && (
         <Card title="Logs">
-          <LogViewer bot={bot.name} />
+          <LogViewer bot={bot.name} live={bot.canStop} attachKey={containerChanges} />
         </Card>
       )}
 
@@ -528,6 +541,7 @@ export default function BotDetail() {
             bot={bot}
             onDeployed={(message) => {
               setNote(message)
+              containerChanged()
               void load()
             }}
           />
@@ -574,6 +588,7 @@ export default function BotDetail() {
               bot={bot}
               onRolledBack={(message) => {
                 setNote(message)
+                containerChanged()
                 void load()
                 void loadUpdates()
               }}
