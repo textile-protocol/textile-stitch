@@ -272,6 +272,12 @@ pub enum RejectReason {
     /// A policy answer, not a failure to quote: the venue does not count it
     /// as a miss against this maker's health.
     TakerNotAllowed,
+    /// The taker is an OTC desk's wallet and its account on this bot has no
+    /// room left on this side ([`crate::rfq::desk`]). Over the room but not at
+    /// zero, the bot sizes the quote down instead. A limit of that taker's,
+    /// not a failure to quote: the venue excuses it from the maker's bench
+    /// when its own desk records back it.
+    TakerLimit,
 }
 
 // --- NAV attestation co-signing ---
@@ -490,6 +496,7 @@ mod tests {
             (RejectReason::Size, "size"),
             (RejectReason::Busy, "busy"),
             (RejectReason::TakerNotAllowed, "taker_not_allowed"),
+            (RejectReason::TakerLimit, "taker_limit"),
         ] {
             assert_eq!(
                 serde_json::to_value(reason).unwrap(),

@@ -10,8 +10,10 @@
 //!   that side, less what the bot has already promised it: signed quotes
 //!   still live, and quotes that filled in the last [`FILL_HOLD_SECS`]
 //!   (the account trails a fill by up to a minute). The debt leg is also
-//!   held to the feed's `maxOrderDebt` and the TOML `max_order_debt`. Over
-//!   a cap is a refusal, never a smaller fill.
+//!   held to the feed's `maxOrderDebt` and the TOML `max_order_debt`. A
+//!   request over the room is quoted for what fits, the way inventory sizes
+//!   a quote down, so the venue can fill the rest from other makers. Only a
+//!   side with no room left is refused, with `taker_limit`.
 //! - **Price.** While the desk's feed is live and its midpoint sits within
 //!   `max_deviation_bps` of the pool's own feed price, the bot builds a flat
 //!   plan at the desk's bid and ask, next to the public plan, and sends
@@ -239,6 +241,85 @@ pub fn cap_refusal(
     let debt_leg = if plan.bid { plan.input } else { plan.output };
     let max = toml_max.map_or(info.max_order_debt, |m| m.min(info.max_order_debt));
     (debt_leg > max).then_some(CapRefusal::MaxOrderDebt)
+}
+
+/// What the bot may still pay the desk on one side, in one quote: the
+/// payout ceiling (the side's account less what's in flight) and the debt-leg
+/// ceiling (the lower of `maxOrderDebt` and the TOML `max_order_debt`). Both
+/// atomic. The two ceilings [`cap_refusal`] checks, as numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeskRoom {
+    pub bid: bool,
+    /// Most the bot may pay: debt on a bid, collateral on an ask.
+    pub payout: U256,
+    /// Most the debt leg may be: what the bot pays on a bid, what it
+    /// receives on an ask.
+    pub debt_leg: U256,
+}
+
+/// [`DeskRoom`] for one side. A side whose account is already used up (in
+/// flight past it, or a negative account read as zero) has no payout room.
+pub fn room(info: &DeskInfo, bid: bool, held: U256, toml_max: Option<U256>) -> DeskRoom {
+    let account = if bid {
+        info.account_debt
+    } else {
+        info.account_collateral
+    };
+    DeskRoom {
+        bid,
+        payout: account.saturating_sub(held),
+        debt_leg: toml_max.map_or(info.max_order_debt, |m| m.min(info.max_order_debt)),
+    }
+}
+
+/// `plan` sized down to fit `room`, at the plan's own price, or `None` when
+/// nothing fits (no room, or what fits is below the smallest feeable
+/// output). A plan that already fits comes back unchanged.
+///
+/// Rounding favours the bot: the input (what it pays) is floored to the
+/// room, and the output (what it receives) is the plan's output scaled by the
+/// same share, rounded up, so the clamped quote is never priced better for
+/// the taker than the plan. Rounding up can't push the ask's debt leg over
+/// its ceiling: the input is floored so that `output * input' <= ceiling *
+/// input`. The taker's gross is rebuilt from the new output, as the
+/// inventory clamp in `quote_at_price` does.
+pub fn fit_to_room(plan: &QuotePlan, room: &DeskRoom, fee_bps: u32) -> Option<QuotePlan> {
+    debug_assert_eq!(plan.bid, room.bid);
+    if plan.input.is_zero() || plan.output.is_zero() {
+        return None;
+    }
+    let by_debt_leg = if plan.bid {
+        room.debt_leg
+    } else {
+        // input' with output * input' / input <= debt_leg.
+        let wide = U512::from(room.debt_leg) * U512::from(plan.input) / U512::from(plan.output);
+        wide.saturating_to::<U256>()
+    };
+    let input = plan.input.min(room.payout).min(by_debt_leg);
+    if input == plan.input {
+        return Some(plan.clone());
+    }
+    if input.is_zero() {
+        return None;
+    }
+    let scaled = U512::from(plan.output) * U512::from(input);
+    let divisor = U512::from(plan.input);
+    let output = (scaled + divisor - U512::from(1u8)) / divisor;
+    // At most `plan.output` (input' < input), so it fits 256 bits.
+    let output = output.to::<U256>();
+    let fee = super::math::fee_on(output, fee_bps);
+    let gross = super::math::gross_of(output, fee_bps)?;
+    if output < super::math::min_feeable_output(fee_bps) || fee.is_zero() {
+        return None;
+    }
+    Some(QuotePlan {
+        input,
+        output,
+        fee,
+        sell_amount: gross,
+        buy_amount: input,
+        ..plan.clone()
+    })
 }
 
 /// One quote promised to a desk's wallet.
@@ -588,6 +669,20 @@ impl super::Engine {
         Ok((plan, unsided, desk_quote))
     }
 
+    /// [`room`] on one side, against what's in flight on top of the account
+    /// in `info`, read at `read_at`.
+    pub(super) fn desk_room(
+        &self,
+        feed: usize,
+        info: &DeskInfo,
+        bid: bool,
+        read_at: u64,
+    ) -> DeskRoom {
+        let feed = &self.desks.feeds[feed];
+        let held = self.desks.claims().held(&feed.spec.feed_url, bid, read_at);
+        room(info, bid, held, feed.spec.max_order_debt)
+    }
+
     /// [`cap_refusal`] against what's in flight on top of the account in
     /// `info`, read at `read_at`.
     pub(super) fn desk_cap_refusal(
@@ -669,7 +764,7 @@ impl super::Engine {
                     }
                 }
                 match self.desk_cap_refusal(feed, &info, plan, read_at) {
-                    Some(_) => Err(RejectReason::Size),
+                    Some(_) => Err(RejectReason::TakerLimit),
                     None => Ok(()),
                 }
             }
@@ -913,6 +1008,101 @@ mod tests {
             cap_refusal(&plan(false, 1_001, 100), &i, U256::ZERO, None),
             Some(CapRefusal::Account)
         );
+    }
+
+    fn room_of(bid: bool, payout: u64, debt_leg: u64) -> DeskRoom {
+        DeskRoom {
+            bid,
+            payout: U256::from(payout),
+            debt_leg: U256::from(debt_leg),
+        }
+    }
+
+    #[test]
+    fn room_is_the_account_less_what_is_held_and_the_lower_order_cap() {
+        let i = info(DeskStatus::Live);
+        // account.debt 500, account.collateral 1000 (see `info`).
+        let r = room(&i, true, U256::from(200u64), None);
+        assert_eq!(r.payout, U256::from(300u64));
+        assert_eq!(r.debt_leg, i.max_order_debt);
+        let r = room(&i, false, U256::from(2_000u64), Some(U256::from(7u64)));
+        assert_eq!(r.payout, U256::ZERO, "held past the account: no room");
+        assert_eq!(r.debt_leg, U256::from(7u64).min(i.max_order_debt));
+    }
+
+    #[test]
+    fn a_plan_that_fits_comes_back_unchanged() {
+        let p = plan(true, 300, 600);
+        assert_eq!(
+            fit_to_room(&p, &room_of(true, 300, 300), 1),
+            Some(p.clone())
+        );
+        let p = plan(false, 600, 300);
+        assert_eq!(fit_to_room(&p, &room_of(false, 600, 300), 1), Some(p));
+    }
+
+    #[test]
+    fn a_bid_is_cut_to_the_lower_of_payout_and_debt_leg() {
+        let fit = |payout, debt_leg| {
+            fit_to_room(
+                &plan(true, 1_000_000, 2_000_000),
+                &room_of(true, payout, debt_leg),
+                1,
+            )
+            .unwrap()
+        };
+        assert_eq!(fit(999_999, 2_000_000).input, U256::from(999_999u64));
+        assert_eq!(fit(2_000_000, 400_000).input, U256::from(400_000u64));
+        // Output scales with it, rounded up: never better for the taker.
+        // 2_000_001 * 333_333 / 1_000_000 = 666_666.33…
+        let p = fit_to_room(
+            &plan(true, 1_000_000, 2_000_001),
+            &room_of(true, 333_333, u64::MAX),
+            1,
+        )
+        .unwrap();
+        assert_eq!(p.output, U256::from(666_667u64));
+        assert_eq!(p.buy_amount, p.input);
+        assert_eq!(
+            p.sell_amount,
+            super::super::math::gross_of(p.output, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_ask_keeps_its_debt_leg_under_the_cap_after_rounding_up() {
+        // Pays ~3 collateral per debt received, with an odd output so the
+        // scaled output never divides evenly. Every debt cap must hold after
+        // the output is rounded up.
+        let p = plan(false, 3_000_000_000, 1_000_000_001);
+        for cap in [
+            10_000u64,
+            10_001,
+            99_999,
+            333_333_333,
+            999_999_999,
+            1_000_000_000,
+        ] {
+            let fit = fit_to_room(&p, &room_of(false, u64::MAX, cap), 1)
+                .unwrap_or_else(|| panic!("cap {cap} leaves room"));
+            assert!(fit.output <= U256::from(cap), "cap {cap}: {}", fit.output);
+            assert!(fit.input < p.input, "cap {cap}");
+            // Price never better for the taker than the plan's.
+            assert!(
+                U512::from(fit.output) * U512::from(p.input)
+                    >= U512::from(p.output) * U512::from(fit.input),
+                "cap {cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_fits_without_room_or_below_the_feeable_minimum() {
+        let p = plan(true, 1_000_000, 1_000_000);
+        assert_eq!(fit_to_room(&p, &room_of(true, 0, u64::MAX), 1), None);
+        // At 1 bps the smallest feeable output is 10_000 atoms.
+        assert_eq!(fit_to_room(&p, &room_of(true, 9_999, u64::MAX), 1), None);
+        assert!(fit_to_room(&p, &room_of(true, 10_000, u64::MAX), 1).is_some());
     }
 
     #[test]

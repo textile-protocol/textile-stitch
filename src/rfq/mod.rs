@@ -2403,31 +2403,69 @@ impl Engine {
         if let (Some(modules), Some(note)) = (&self.modules, notes.unwind) {
             modules.unwind_quote(unwind_quote_status(&book, &plan, note, now_secs));
         }
-        // A desk's wallet gets the desk's own price when that beats the public
-        // one; a recall reply keeps its own pricing.
+        // A desk's wallet: both the public plan and the desk-priced one are
+        // sized down to what the desk's account still has room for, then the
+        // one better for the taker goes out. Sizing first means a request
+        // past the room still gets the desk's price on the part that fits,
+        // and the venue fills the rest from other makers. A recall reply
+        // keeps its own pricing and is only capped below.
         let mut desk_priced = None;
         let plan = match (&desk, &recall_offer) {
-            (desk::Gate::Desk { feed, info, .. }, None) => {
-                match self.desk_plan(*feed, info, &book, &req, &quote, prices, now_secs) {
-                    Ok((desk_plan, desk_book, desk_quote))
-                        if desk::taker_prefers(&desk_plan, &plan) =>
-                    {
-                        debug!(
-                            rfq_id = %req.rfq_id,
-                            %taker,
-                            public = %plan.buy_amount,
-                            desk = %desk_plan.buy_amount,
-                            "desk price beats the public price; quoting the desk"
-                        );
-                        desk_priced = Some((desk_book, desk_quote));
-                        desk_plan
+            (
+                desk::Gate::Desk {
+                    feed,
+                    info,
+                    read_at,
+                },
+                None,
+            ) => {
+                let room = self.desk_room(*feed, info, plan.bid, *read_at);
+                let public = desk::fit_to_room(&plan, &room, req.fee_bps);
+                let priced = match self
+                    .desk_plan(*feed, info, &book, &req, &quote, prices, now_secs)
+                {
+                    Ok((desk_plan, desk_book, desk_quote)) => {
+                        desk::fit_to_room(&desk_plan, &room, req.fee_bps)
+                            .map(|fit| (desk_plan, fit, desk_book, desk_quote))
                     }
-                    Ok(_) => plan,
                     Err(why) => {
                         debug!(rfq_id = %req.rfq_id, %taker, why, "desk price unusable; quoting public");
-                        plan
+                        None
                     }
+                };
+                let (asked, chosen, price) = match (priced, public) {
+                    (Some((asked, fit, desk_book, desk_quote)), public)
+                        if public.as_ref().is_none_or(|p| desk::taker_prefers(&fit, p)) =>
+                    {
+                        desk_priced = Some((desk_book, desk_quote));
+                        (asked, fit, "desk")
+                    }
+                    (_, Some(fit)) => (plan.clone(), fit, "public"),
+                    (_, None) => {
+                        info!(
+                            rfq_id = %req.rfq_id,
+                            bid = plan.bid,
+                            room = %room.payout,
+                            debt_leg_cap = %room.debt_leg,
+                            asked = %plan.input,
+                            "desk account has no room on this side; refusing (taker_limit)"
+                        );
+                        return reject(RejectReason::TakerLimit);
+                    }
+                };
+                if chosen.input < asked.input {
+                    info!(
+                        rfq_id = %req.rfq_id,
+                        bid = chosen.bid,
+                        price,
+                        room = %room.payout,
+                        debt_leg_cap = %room.debt_leg,
+                        asked = %asked.input,
+                        signed = %chosen.input,
+                        "desk quote sized down to the desk's room"
+                    );
                 }
+                chosen
             }
             _ => plan,
         };
@@ -2512,16 +2550,16 @@ impl Engine {
         } = &desk
         {
             if let Some(why) = self.desk_cap_refusal(*feed, info, &plan, *read_at) {
-                debug!(
+                warn!(
                     rfq_id = %req.rfq_id,
                     %taker,
                     ?why,
                     bid = plan.bid,
                     input = %plan.input,
                     output = %plan.output,
-                    "desk quote is over the desk's cap; refusing it whole"
+                    "desk quote is over the desk's cap; refusing it (taker_limit)"
                 );
-                return reject(RejectReason::Size);
+                return reject(RejectReason::TakerLimit);
             }
         }
 
@@ -5780,21 +5818,40 @@ mod tests {
         }
     }
 
+    /// The quote `engine` sends for `req`; panics on a refusal.
+    async fn quoted(
+        engine: &mut Engine,
+        req: QuoteRequestFrame,
+        prices: &PriceCache,
+    ) -> QuoteResponseFrame {
+        match engine.respond(req, prices).await {
+            MakerFrame::QuoteResponse(r) => r,
+            other => panic!("expected a quote, got {other:?}"),
+        }
+    }
+
+    fn atoms(raw: &str) -> U256 {
+        raw.parse().unwrap()
+    }
+
     #[tokio::test]
-    async fn each_side_is_refused_whole_past_the_desks_account() {
+    async fn each_side_is_sized_down_to_the_desks_account() {
         let prices = desk_prices(0.995, 1.005);
-        // The bid pays ~995 USDT (995e6 atomic); the account has 900.
+        // The bid would pay ~995 USDT (995e6 atomic); the account has 900.
         let mut engine = desk_engine();
         record_desk(
             &engine,
             DeskReading::Shared(desk_info(u64::MAX, 900_000_000, u64::MAX)),
             unix_now(),
         );
+        let r = quoted(&mut engine, exact_input_request("rfq_bid"), &prices).await;
+        assert_eq!(atoms(&r.buy_amount), U256::from(900_000_000u64));
+        assert!(atoms(&r.sell_amount) < U256::from(1_000_000_000u64));
         assert_eq!(
-            reject_reason(&mut engine, exact_input_request("rfq_bid"), &prices).await,
-            RejectReason::Size
+            desk_held(&engine, true, unix_now()),
+            U256::from(900_000_000u64),
+            "the sized quote is what's held"
         );
-        assert!(engine.reservations.is_empty() && engine.desks.claims().is_empty());
         // The same account has room on the other side: the ask pays collateral.
         assert!(matches!(
             engine.respond(ask_request("rfq_ask"), &prices).await,
@@ -5807,10 +5864,8 @@ mod tests {
             DeskReading::Shared(desk_info(900_000_000, u64::MAX, u64::MAX)),
             unix_now(),
         );
-        assert_eq!(
-            reject_reason(&mut engine, ask_request("rfq_ask"), &prices).await,
-            RejectReason::Size
-        );
+        let r = quoted(&mut engine, ask_request("rfq_ask"), &prices).await;
+        assert_eq!(atoms(&r.buy_amount), U256::from(900_000_000u64));
         assert!(matches!(
             engine
                 .respond(exact_input_request("rfq_bid"), &prices)
@@ -5828,22 +5883,20 @@ mod tests {
             DeskReading::Shared(desk_info(u64::MAX, u64::MAX, 900_000_000)),
             unix_now(),
         );
-        assert_eq!(
-            reject_reason(&mut engine, exact_input_request("rfq_feed_cap"), &prices).await,
-            RejectReason::Size
-        );
-        // On an ask the debt leg is what the taker pays in: 1000 USDT.
-        assert_eq!(
-            reject_reason(&mut engine, ask_request("rfq_ask_cap"), &prices).await,
-            RejectReason::Size
-        );
+        let cap = U256::from(900_000_000u64);
+        let r = quoted(&mut engine, exact_input_request("rfq_feed_cap"), &prices).await;
+        assert_eq!(atoms(&r.buy_amount), cap);
+        // On an ask the debt leg is what the bot receives: the taker's 1000
+        // USDT less the fee, cut to 900.
+        let r = quoted(&mut engine, ask_request("rfq_ask_cap"), &prices).await;
+        let gross = atoms(&r.sell_amount);
+        assert!(gross <= math::gross_of(cap, 1).unwrap(), "{gross}");
+        assert!(gross > U256::from(899_000_000u64), "{gross}");
 
         let mut engine = desk_engine();
-        engine.desks.feeds[0].spec.max_order_debt = Some(U256::from(900_000_000u64));
-        assert_eq!(
-            reject_reason(&mut engine, exact_input_request("rfq_toml_cap"), &prices).await,
-            RejectReason::Size
-        );
+        engine.desks.feeds[0].spec.max_order_debt = Some(cap);
+        let r = quoted(&mut engine, exact_input_request("rfq_toml_cap"), &prices).await;
+        assert_eq!(atoms(&r.buy_amount), cap);
         engine.desks.feeds[0].spec.max_order_debt = Some(U256::from(2_000_000_000u64));
         assert!(matches!(
             engine
@@ -5858,22 +5911,33 @@ mod tests {
         let prices = desk_prices(0.995, 1.005);
         let mut engine = desk_engine();
         // Room for one ~995 bid, not two. Under the wallet's own 1500, so the
-        // desk cap is what refuses the second, not the pool sizing it down.
+        // desk cap is what sizes the second, not the pool.
+        let account = U256::from(1_200_000_000u64);
         record_desk(
             &engine,
             DeskReading::Shared(desk_info(u64::MAX, 1_200_000_000, u64::MAX)),
             unix_now(),
         );
-        let MakerFrame::QuoteResponse(first) =
-            engine.respond(exact_input_request("rfq_1"), &prices).await
-        else {
-            panic!("the first quote fits");
-        };
+        let first = quoted(&mut engine, exact_input_request("rfq_1"), &prices).await;
+        let paid = atoms(&first.buy_amount);
+        let second = quoted(&mut engine, exact_input_request("rfq_2"), &prices).await;
         assert_eq!(
-            reject_reason(&mut engine, exact_input_request("rfq_2"), &prices).await,
-            RejectReason::Size,
+            atoms(&second.buy_amount),
+            account - paid,
             "the signed first quote is still in flight"
         );
+        // Both are held, so nothing is left.
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_full"), &prices).await,
+            RejectReason::TakerLimit
+        );
+        let lose = |id: &str| {
+            VenueFrame::QuoteResult(QuoteResultFrame {
+                rfq_id: id.into(),
+                result: "lost_price".into(),
+            })
+        };
+        engine.dispatch(lose("rfq_2"), &prices).await;
 
         // It wins and fills: the reservation goes, the desk claim holds.
         engine
@@ -5888,17 +5952,18 @@ mod tests {
         let nonces = engine.reservations.watched_nonces(unix_now());
         assert_eq!(nonces.len(), 1);
         engine.fills.saw_spent(nonces);
+        let third = quoted(&mut engine, exact_input_request("rfq_3"), &prices).await;
         assert_eq!(
-            reject_reason(&mut engine, exact_input_request("rfq_3"), &prices).await,
-            RejectReason::Size,
+            atoms(&third.buy_amount),
+            account - paid,
             "a fill keeps counting until the account can show it"
         );
+        engine.dispatch(lose("rfq_3"), &prices).await;
         assert!(
             engine.reservations.is_empty(),
             "the fill released the wallet claim"
         );
         let now = unix_now();
-        let paid = first.buy_amount.parse::<U256>().unwrap();
         assert_eq!(desk_held(&engine, true, now), paid);
         assert_eq!(
             desk_held(&engine, true, now + desk::FILL_HOLD_SECS - 1),
@@ -5928,6 +5993,55 @@ mod tests {
             )
             .await;
         assert!(engine.desks.claims().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_side_with_no_room_is_refused_as_a_taker_limit() {
+        let prices = desk_prices(0.995, 1.005);
+        let mut engine = desk_engine();
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(u64::MAX, 0, u64::MAX)),
+            unix_now(),
+        );
+        assert_eq!(
+            reject_reason(&mut engine, exact_input_request("rfq_empty"), &prices).await,
+            RejectReason::TakerLimit
+        );
+        assert!(engine.reservations.is_empty() && engine.desks.claims().is_empty());
+        // So is a per-trade cap of zero, on either side.
+        let mut engine = desk_engine();
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(u64::MAX, u64::MAX, 0)),
+            unix_now(),
+        );
+        assert_eq!(
+            reject_reason(&mut engine, ask_request("rfq_no_cap"), &prices).await,
+            RejectReason::TakerLimit
+        );
+    }
+
+    #[tokio::test]
+    async fn the_desk_price_still_wins_when_only_part_of_the_request_fits() {
+        // The desk bids 0.995, the pool 0.98 (200 bps). At the desk price the
+        // full request pays ~995, past the 990 room; at the pool price it
+        // pays ~980, which fits. Sizing first keeps the better price on what
+        // fits instead of the worse price on everything.
+        let prices = desk_prices(0.995, 1.005);
+        let mut engine = desk_engine();
+        record_desk(
+            &engine,
+            DeskReading::Shared(desk_info(u64::MAX, 990_000_000, u64::MAX)),
+            unix_now(),
+        );
+        let r = quoted(&mut engine, exact_input_request("rfq_part"), &prices).await;
+        let (buy, sell) = (atoms(&r.buy_amount), atoms(&r.sell_amount));
+        assert_eq!(buy, U256::from(990_000_000u64));
+        assert!(sell < U256::from(1_000_000_000u64));
+        // At the desk's bid: 990 USDT for ~995 cNGN, not 0.98 per cNGN.
+        let rate = buy.to::<u128>() as f64 / sell.to::<u128>() as f64;
+        assert!((rate - 0.995).abs() < 0.0005, "{rate}");
     }
 
     #[tokio::test]
@@ -6206,11 +6320,9 @@ mod tests {
             claims.mark_filled(&["rfq_filled".into()], now - 130);
         }
         // By the clock its fill hold is over, but the account was read before
-        // the fill could show: the fill still counts.
-        assert_eq!(
-            reject_reason(&mut engine, exact_input_request("rfq_next"), &prices).await,
-            RejectReason::Size
-        );
+        // the fill could show: the fill still counts, leaving 300.
+        let r = quoted(&mut engine, exact_input_request("rfq_next"), &prices).await;
+        assert_eq!(atoms(&r.buy_amount), U256::from(300_000_000u64));
         // A reading from after the hold shows the fill itself, and the claim
         // stops counting on top of it.
         record_desk(
@@ -6258,9 +6370,10 @@ mod tests {
             prices.get(DESK_URL).is_none(),
             "no desk price off a desk-less body"
         );
+        let r = quoted(&mut engine, exact_input_request("rfq_capped"), &prices).await;
         assert_eq!(
-            reject_reason(&mut engine, exact_input_request("rfq_capped"), &prices).await,
-            RejectReason::Size,
+            atoms(&r.buy_amount),
+            U256::from(900_000_000u64),
             "still capped by the last good account"
         );
 

@@ -1261,8 +1261,13 @@ fill up to a minute late). That's judged
 on the reading, not the clock, so while the feed is down a fill keeps counting
 on top of the last account it read. The debt leg (what the bot pays on a
 bid, what it receives on an ask) must also be at most `maxOrderDebt` and, when
-you set it, `max_order_debt`. A quote over any cap is refused with `size`,
-never sized down. The debug log says which cap it hit.
+you set it, `max_order_debt`. A request over the room is sized down to what
+fits, the way inventory sizes a quote down, so the venue can fill the rest
+from other makers. Both the public and the desk-priced quote are sized first,
+then the one better for the taker goes out, so the desk keeps its own price
+on the part that fits. Only a side with no room left is refused, with
+`taker_limit`, which the venue doesn't count against the bot. Every sized or
+refused desk quote logs one `info` line with the room and what was asked.
 
 The in-flight list is saved to `rfq-desk-claims.json` next to `stitch.toml`
 before each desk quote goes out, so a restart doesn't forget a quote the desk
